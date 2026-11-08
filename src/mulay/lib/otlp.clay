@@ -1,0 +1,156 @@
+(ns mulay.lib.otlp (:require [clay.bytes :as bytes] [mulay.lib.uni :as uni]))
+
+(defvariant AVal (AStr s: Str) (ABool b: Bool))
+(defrecord Attr [key: Str val: AVal])
+(defvariant NVal (NInt n: Int) (NDouble x: Float))
+(defrecord Point [attrs: Vec(Attr) value: NVal])
+
+(def MONOTONIC 0)
+(def UPDOWN 1)
+(def GAUGE 2)
+
+(defrecord Metric [name: Str desc: Str unit: Str kind: Int points: Vec(Point)])
+(defrecord Scope [name: Str version: Str metrics: Vec(Metric)])
+(defrecord Resource [attrs: Vec(Attr) scopes: Vec(Scope)])
+
+(defn attr Attr [k: &Str v: &Str] (->Attr (str k) (->AStr (str v))))
+(defn battr Attr [k: &Str b: Bool] (->Attr (str k) (->ABool b)))
+(defn ipoint Point [as: Vec(Attr) n: Int] (->Point as (->NInt n)))
+(defn dpoint Point [as: Vec(Attr) x: Float] (->Point as (->NDouble x)))
+
+(def CUMULATIVE 2)
+
+(defn varint Str [n: Int]
+  (loop [v n out ""]
+    (let [low (bit-and v 127)
+          rest (unsigned-bit-shift-right v 7)]
+      (if (= rest 0) (str out (chr low))
+        (recur rest (str out (chr (bit-or low 128))))))))
+
+(defn- tag Str [field: Int wire: Int] (varint (bit-or (bit-shift-left field 3) wire)))
+
+(defn- ld Str [field: Int body: &Str] (str (tag field 2) (varint (count body)) body))
+
+(defn- ld-opt Str [field: Int body: &Str] (if (= (count body) 0) "" (ld field body)))
+
+(defn- fixed64 Str [field: Int v: Int] (str (tag field 1) (bytes/pack v 8 false)))
+
+(defn key-value Str [a: &Attr]
+  (let [any (match (:val a) (AStr s) (ld 1 s) (ABool b) (str (tag 2 0) (varint (if b 1 0))))
+        kf (ld 1 (:key a))]
+    (str kf (ld 2 any))))
+
+(defn- attrs Str [field: Int as: &Vec(Attr)]
+  (loop [i 0 out ""]
+    (if (>= i (count as)) out
+      (let [kv (key-value (nth as i))]
+        (recur (+ i 1) (str out (ld field kv)))))))
+
+(defn- point Str [p: &Point start-ns: Int time-ns: Int]
+  (let [as (attrs 7 (:attrs p))
+        v (match (:value p) (NInt n) (fixed64 6 n) (NDouble x) (fixed64 4 (float->bits x)))
+        b (str (fixed64 2 start-ns) (fixed64 3 time-ns) v)]
+    (str b as)))
+
+(defn metric Str [m: &Metric start-ns: Int time-ns: Int]
+  (let [ps (:points m)
+        pts (loop [i 0 out ""]
+              (if (>= i (count ps)) out
+                (let [b (point (nth ps i) start-ns time-ns)] (recur (+ i 1) (str out (ld 1 b))))))
+        k (:kind m)
+        data (cond (= k GAUGE) (ld 5 pts)
+                   (= k UPDOWN) (ld 7 (str pts (tag 2 0) (varint CUMULATIVE)))
+                   :else (ld 7 (str pts (tag 2 0) (varint CUMULATIVE) (tag 3 0) (varint 1))))
+        head (str (ld 1 (:name m)) (ld-opt 2 (:desc m)) (ld-opt 3 (:unit m)))]
+    (str head data)))
+
+(defn- scope Str [sc: &Scope start-ns: Int time-ns: Int]
+  (let [ms (:metrics sc)
+        body (loop [i 0 out ""]
+               (if (>= i (count ms)) out
+                 (let [b (metric (nth ms i) start-ns time-ns)] (recur (+ i 1) (str out (ld 2 b))))))
+        is (str (ld 1 (:name sc)) (ld-opt 2 (:version sc)))]
+    (str (ld 1 is) body)))
+
+(defn- resource Str [r: &Resource start-ns: Int time-ns: Int]
+  (let [scs (:scopes r)
+        sms (loop [i 0 out ""]
+              (if (>= i (count scs)) out
+                (let [b (scope (nth scs i) start-ns time-ns)] (recur (+ i 1) (str out (ld 2 b))))))
+        res (attrs 1 (:attrs r))]
+    (str (ld 1 res) sms)))
+
+(defn export-request Str [rs: &Vec(Resource) start-ns: Int time-ns: Int]
+  (loop [i 0 out ""]
+    (if (>= i (count rs)) out
+      (let [b (resource (nth rs i) start-ns time-ns)] (recur (+ i 1) (str out (ld 1 b)))))))
+
+(defn- read-varint Values(Int Int) [b: &Str i: Int]
+  (loop [j i v 0 sh 0]
+    (cond (or (>= j (count b)) (> sh 63)) (values 0 -1)
+          (< (bit-and (nth b j) 255) 128) (values (bit-or v (bit-shift-left (bit-and (nth b j) 255) sh)) (+ j 1))
+          :else (recur (+ j 1) (bit-or v (bit-shift-left (bit-and (nth b j) 127) sh)) (+ sh 7)))))
+
+(defn- skip-field Int [b: &Str i: Int wire: Int]
+  (cond (= wire 0) (let [[v j] (read-varint b i)] j)
+        (= wire 1) (if (<= (+ i 8) (count b)) (+ i 8) -1)
+        (= wire 2) (let [[n j] (read-varint b i)] (if (and (>= j 0) (>= n 0) (<= n (- (count b) j))) (+ j n) -1))
+        (= wire 5) (if (<= (+ i 4) (count b)) (+ i 4) -1)
+        (= wire 4) i
+        :else -1))
+
+(defn- skip-group Int [b: &Str i: Int field: Int]
+  (loop [j i]
+    (if (>= j (count b)) -1
+      (let [[t k] (read-varint b j)
+            f (bit-shift-right t 3)
+            w (bit-and t 7)]
+        (cond (or (< k 0) (= f 0)) -1
+              (= w 4) (if (= f field) k -1)
+              (= w 3) (let [e (skip-group b k f)] (if (< e 0) -1 (recur e)))
+              :else (let [e (skip-field b k w)] (if (< e 0) -1 (recur e))))))))
+
+(defn status-message Values(Str Bool) [b: &Str]
+  (loop [i 0]
+    (if (>= i (count b)) (values "" true)
+      (let [[t j] (read-varint b i)
+            f (bit-shift-right t 3)
+            w (bit-and t 7)]
+        (cond (or (< j 0) (= f 0)) (values "" false)
+              (= t 18) (let [[n k] (read-varint b j)]
+                         (if (and (>= k 0) (>= n 0) (<= n (- (count b) k)))
+                           (let [s (subs b k (+ k n))] (if (uni/valid? s) (values s true) (values "" false)))
+                           (values "" false)))
+              (= w 3) (let [e (skip-group b j f)] (if (< e 0) (values "" false) (recur e)))
+              :else (let [e (skip-field b j w)] (if (< e 0) (values "" false) (recur e))))))))
+
+(def INTERNAL 1)
+(def SERVER 2)
+(def CLIENT 3)
+
+(def UNSET 0)
+(def OK 1)
+(def ERROR 2)
+
+(defrecord SEvent [time: Int name: Str attrs: Vec(Attr)])
+(defrecord Span [trace: Str id: Str parent: Str state: Str flags: Int name: Str kind: Int start: Int end: Int
+                 attrs: Vec(Attr) events: Vec(SEvent) status: Int msg: Str])
+
+(defn- fixed32 Str [field: Int v: Int] (str (tag field 5) (bytes/pack v 4 false)))
+
+(defn- vint Str [field: Int v: Int] (str (tag field 0) (varint v)))
+
+(defn- event Str [e: &SEvent] (str (fixed64 1 (:time e)) (ld 2 (:name e)) (attrs 3 (:attrs e))))
+
+(defn span Str [s: &Span]
+  (let [es (:events s)
+        evs (loop [i 0 out ""] (if (>= i (count es)) out (let [b (event (nth es i))] (recur (+ i 1) (str out (ld 11 b))))))
+        st (str (ld-opt 2 (:msg s)) (if (= (:status s) UNSET) "" (vint 3 (:status s))))
+        head (str (ld 1 (:trace s)) (ld 2 (:id s)) (ld-opt 3 (:state s)) (ld-opt 4 (:parent s)) (ld 5 (:name s)) (vint 6 (:kind s)))]
+    (str head (fixed64 7 (:start s)) (fixed64 8 (:end s)) (attrs 9 (:attrs s)) evs (ld 15 st) (fixed32 16 (:flags s)))))
+
+(defn trace-request Str [res: &Vec(Attr) scope: &Str version: &Str spans: &Vec(Span)]
+  (let [ss (loop [i 0 out ""] (if (>= i (count spans)) out (let [b (span (nth spans i))] (recur (+ i 1) (str out (ld 2 b))))))
+        sc (str (ld 1 (str (ld 1 scope) (ld-opt 2 version))) ss)
+        rs (str (ld 1 (attrs 1 res)) (ld 2 sc))]
+    (ld 1 rs)))

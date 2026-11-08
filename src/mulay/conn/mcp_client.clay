@@ -1,0 +1,411 @@
+(ns mulay.conn.mcp_client
+  (:require [mulay.rt.conn :as conn] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.dw.val :as v] [mulay.dw.num :as num]
+            [mulay.mule.model :as m] [mulay.lib.xml :as xml] [mulay.dw.fmt.json :as json] [mulay.conn.mcp :as mcp]
+            [clay.http :as http] [clay.httpmsg :as hm] [clay.base64 :as b64] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/mcp")
+
+(def SESSIONS: Atom(Map(Str Str)) (atom (let [m: Map(Str Str) {}] m)))
+(def REQ-ID: Atom(Int) (atom 0))
+
+(defn- mcp-err err/MErr [id: Str desc: Str] (err/mk "MCP" id desc))
+
+(defn- no-headers Vec(hm/Header) [] (let [h: Vec(hm/Header) []] h))
+
+(defn- fget v/Val [x: &v/Val k: &Str]
+  (match (v/unmeta x) (v/VObj fs) (let [r (v/obj-get fs k)] (if (= (count r) 0) (v/null-v) (nth r 0))) _ (v/null-v)))
+
+(defn- sget Str [x: &v/Val k: &Str default: Str]
+  (let [r (fget x k)] (match (v/unmeta r) (v/VStr s) (str s) _ default)))
+
+(defn- items Vec(v/Val) [x: &v/Val] (match (v/unmeta x) (v/VArr xs) xs _ (let [e: Vec(v/Val) []] e)))
+
+(defn- vstr-or-null v/Val [x: &v/Val] (match (v/unmeta x) (v/VStr s) (v/->VStr (str s)) _ (v/null-v)))
+
+(defn- conn-node Vec(xml/XNode) [cfg: &m/Config]
+  (let [h (conn/child-elem (:children cfg) "streamable-http-client-connection")]
+    (if (> (count h) 0) h (conn/child-elem (:children cfg) "sse-client-connection"))))
+
+(defn- sse? Bool [cn: &xml/XNode] (= (xml/elem-local cn) "sse-client-connection"))
+
+(defn- server-base Str [cn: &xml/XNode]
+  (let [u (xml/attr cn "" "serverUrl" "")] (if (str/ends-with? u "/") (subs u 0 (- (count u) 1)) u)))
+
+(defn- endpoint Str [cn: &xml/XNode]
+  (let [u (xml/attr cn "" "serverUrl" "") p (xml/attr cn "" "mcpEndpointPath" "/mcp")
+        base (if (str/ends-with? u "/") (subs u 0 (- (count u) 1)) u)]
+    (str base p)))
+
+(defn- timeout-ms Int [cn: &xml/XNode]
+  (let [[k e] (parse-long (xml/attr cn "" "requestTimeout" "30"))
+        unit (str/upper-case (xml/attr cn "" "requestTimeoutUnit" "SECONDS"))
+        per (cond (= unit "MILLISECONDS") 1 (= unit "MINUTES") 60000 (= unit "HOURS") 3600000 :else 1000)]
+    (if (not= e "") 30000 (* k per))))
+
+(defn- default-headers Vec(hm/Header) [cn: &xml/XNode]
+  (let [b (conn/child-elem (xml/child-elems cn) "default-request-headers")]
+    (if (= (count b) 0) (no-headers)
+      (let [kids (xml/child-elems (nth b 0))]
+        (loop [i 0 acc (no-headers)]
+          (if (>= i (count kids)) acc
+            (recur (+ i 1) (conj acc (hm/->Header (xml/attr (nth kids i) "" "key" "") (xml/attr (nth kids i) "" "value" ""))))))))))
+
+(defn- rpc-headers Vec(hm/Header) [cn: &xml/XNode sid: &Str]
+  (let [h0 [(hm/->Header "Content-Type" "application/json") (hm/->Header "Accept" "application/json, text/event-stream")
+            (hm/->Header "User-Agent" "Mule HTTP Client")]
+        h1 (loop [i 0 acc h0] (let [d (default-headers cn)] (if (>= i (count d)) acc (recur (+ i 1) (conj acc (nth d i))))))
+        h2 (if (= sid "") h1 (conj (conj h1 (hm/->Header "Mcp-Session-Id" sid)) (hm/->Header "Mcp-Protocol-Version" mcp/LATEST)))]
+    h2))
+
+(defn- post-to Values(hm/Resp Str) [url: &Str hs: Vec(hm/Header) cn: &xml/XNode body: &Str]
+  (http/request (assoc (assoc (assoc (assoc (http/request-opts url) :method "POST") :headers hs)
+                             :body (str body)) :timeout-ms (timeout-ms cn))))
+
+(defn- post Values(hm/Resp Str) [cn: &xml/XNode sid: &Str body: &Str]
+  (post-to (endpoint cn) (rpc-headers cn sid) cn body))
+
+(defn- sse-headers Vec(hm/Header) [cn: &xml/XNode]
+  (let [h0 [(hm/->Header "Content-Type" "application/json") (hm/->Header "Accept" "*/*") (hm/->Header "User-Agent" "Mule HTTP Client")]
+        h1 (loop [i 0 acc h0] (let [d (default-headers cn)] (if (>= i (count d)) acc (recur (+ i 1) (conj acc (nth d i))))))]
+    (conj h1 (hm/->Header "Mcp-Protocol-Version" mcp/LATEST))))
+
+(defn- message-of Values(v/Val Str) [r: &hm/Resp]
+  (let [sse (match (hm/header-of (:headers r) "content-type") (Some ct) (str/includes? (str/lower-case ct) "text/event-stream") (None) false)
+        body (:body r)
+        txt (if sse (sse-data body) body)]
+    (json/read txt)))
+
+(defn- sse-data Str [body: &Str]
+  (let [i (str/index-of body "data:")]
+    (if (< i 0) ""
+      (let [rest (subs body (+ i 5) (count body))
+            e (str/index-of rest "\n")
+            line (if (< e 0) rest (subs rest 0 e))]
+        (str/trim line)))))
+
+(defn- next-id Int [] (swap! REQ-ID (fn Int [x: Int] (+ x 1))))
+
+(defn- rpc-body Str [method: &Str id: Int params: v/Val]
+  (mcp/compact (v/->VObj [(v/field "jsonrpc" (v/->VStr "2.0")) (v/field "id" (v/int-v id)) (v/field "method" (v/->VStr (str method))) (v/field "params" params)])))
+
+(def INIT-FAIL "Client failed to initialize by explicit API call")
+
+(defn- ensure-session Values(Str Vec(err/MErr)) [cfg: &m/Config cn: &xml/XNode]
+  (let [m (deref SESSIONS) key (:name cfg)]
+    (if (contains? m key) (values (get! m key) [])
+      (let [cinfo (v/->VObj [(v/field "name" (v/->VStr (conn/param-lit (:params cfg) "clientName" ""))) (v/field "version" (v/->VStr (conn/param-lit (:params cfg) "clientVersion" "")))])
+            params (v/->VObj [(v/field "protocolVersion" (v/->VStr mcp/LATEST)) (v/field "capabilities" (v/->VObj [])) (v/field "clientInfo" cinfo)])
+            body (rpc-body "initialize" (next-id) params)
+            [r e] (post cn "" body)]
+        (cond
+          (not= e "") (values "" [(mcp-err "CONNECTIVITY" INIT-FAIL)])
+          (or (< (:status r) 200) (>= (:status r) 300)) (values "" [(mcp-err "SERVER_ERROR" INIT-FAIL)])
+          :else
+          (let [[msg me] (message-of r)]
+            (if (or (not= me "") (not (v/null? (fget msg "error")))) (values "" [(mcp-err "SERVER_ERROR" INIT-FAIL)])
+              (let [sid: Str (match (hm/header-of (:headers r) "mcp-session-id") (Some sv) sv (None) "")
+                    [zr ze] (post cn sid (mcp/compact (v/->VObj [(v/field "jsonrpc" (v/->VStr "2.0")) (v/field "method" (v/->VStr "notifications/initialized"))])))
+                    z2 (swap! SESSIONS (fn Map(Str Str) [o: Map(Str Str)] (assoc o key (str sid))))]
+                (values sid [])))))))))
+
+(defn- drop-session Int [cfg: &m/Config]
+  (let [key (:name cfg) z (swap! SESSIONS (fn Map(Str Str) [o: Map(Str Str)] (dissoc o key)))] 0))
+
+(defn code-type Str [code: Int]
+  (cond (= code -32700) "PARSE_ERROR" (= code -32600) "INVALID_REQUEST" (= code -32601) "METHOD_NOT_FOUND" (= code -32602) "INVALID_PARAMS"
+        (= code -32603) "INTERNAL_ERROR" (= code -32005) "UNAUTHORIZED"
+        (and (>= code -32099) (<= code -32000)) "SERVER_ERROR"
+        :else "JSON_RPC_ERROR"))
+
+(defn- result-of Values(v/Val Vec(err/MErr)) [msg: &v/Val]
+  (if (not (v/null? (fget msg "error")))
+    (let [er (fget msg "error")
+          code (match (v/unmeta (fget er "code")) (v/VInt i) i _ -32603)]
+      (values (v/null-v) [(mcp-err (code-type code) (sget er "message" ""))]))
+    (values (fget msg "result") [])))
+
+(defn- rpc Values(v/Val Vec(err/MErr)) [cfg: &m/Config cn: &xml/XNode method: &Str params: v/Val retry: Bool]
+  (if (sse? cn) (sse-rpc cfg cn method params) (http-rpc cfg cn method params retry)))
+
+(defn- http-rpc Values(v/Val Vec(err/MErr)) [cfg: &m/Config cn: &xml/XNode method: &Str params: v/Val retry: Bool]
+  (let [[sid sx] (ensure-session cfg cn)]
+    (if (> (count sx) 0) (values (v/null-v) sx)
+      (let [[r e] (post cn sid (rpc-body method (next-id) params))]
+        (cond
+          (not= e "") (values (v/null-v) [(mcp-err "CONNECTIVITY" e)])
+          (and (= (:status r) 404) retry) (let [z (drop-session cfg)] (http-rpc cfg cn method params false))
+          (or (< (:status r) 200) (>= (:status r) 300)) (values (v/null-v) [(mcp-err "SERVER_ERROR" (str "HTTP " (:status r) " " (:body r)))])
+          :else
+          (let [[msg me] (message-of r)]
+            (if (not= me "") (values (v/null-v) [(mcp-err "PARSE_ERROR" me)]) (result-of msg))))))))
+
+(def SSE-EP: Atom(Map(Str Str)) (atom (let [m: Map(Str Str) {}] m)))
+(def SSE-MSG: Atom(Map(Str Str)) (atom (let [m: Map(Str Str) {}] m)))
+(def SSE-DONE: Atom(Map(Str Str)) (atom (let [m: Map(Str Str) {}] m)))
+
+(defrecord SseJob [key: Str url: Str base: Str hs: Vec(hm/Header)])
+
+(defn- sse-event Int [key: &Str base: &Str name: &Str data: &Str]
+  (cond
+    (= name "endpoint")
+    (let [url (if (str/starts-with? (str/lower-case data) "http") (str data) (str base data))
+          z (swap! SSE-EP (fn Map(Str Str) [o: Map(Str Str)] (assoc o (str key) url)))] 0)
+    (= name "message")
+    (let [[x e] (json/read data)]
+      (if (not= e "") 0
+        (let [id (mcp/compact (fget x "id"))
+              z (swap! SSE-MSG (fn Map(Str Str) [o: Map(Str Str)] (assoc o (str key "/" id) (str data))))] 0)))
+    :else 0))
+
+(defn- sse-run Int [j: SseJob]
+  (let [key (:key j) base (:base j)
+        o (assoc (assoc (assoc (http/request-opts (:url j)) :method "GET") :headers (:hs j)) :timeout-ms 0)
+        o2 (assoc o :as (http/->EventStream (fn http/Flow [name: Str data: Str] (let [z (sse-event key base name data)] (http/->Continue)))))
+        [r e] (http/request o2)
+        z1 (swap! SSE-EP (fn Map(Str Str) [o: Map(Str Str)] (dissoc o (str key))))
+        z2 (swap! SESSIONS (fn Map(Str Str) [o: Map(Str Str)] (dissoc o (str key))))
+        z3 (swap! SSE-DONE (fn Map(Str Str) [o: Map(Str Str)] (assoc o (str key) "1")))]
+    0))
+
+(defn- sse-wait-endpoint Str [key: &Str limit-ms: Int]
+  (loop [i 0]
+    (let [m (deref SSE-EP)]
+      (cond (contains? m key) (get! m key)
+            (contains? (deref SSE-DONE) key) ""
+            (>= i limit-ms) ""
+            :else (let [z (sleep-ms 1)] (recur (+ i 1)))))))
+
+(defn- sse-connect Values(Str Vec(err/MErr)) [cfg: &m/Config cn: &xml/XNode]
+  (let [key (:name cfg) m (deref SSE-EP)]
+    (if (contains? m key) (values (get! m key) [])
+      (let [z (swap! SSE-DONE (fn Map(Str Str) [o: Map(Str Str)] (dissoc o (str key))))
+            hs0 [(hm/->Header "Accept" "text/event-stream") (hm/->Header "User-Agent" "Mule HTTP Client")]
+            hs (loop [i 0 acc hs0] (let [d (default-headers cn)] (if (>= i (count d)) acc (recur (+ i 1) (conj acc (nth d i))))))
+            base (server-base cn)
+            job (->SseJob (str key) (str base (xml/attr cn "" "sseEndpointPath" "/sse")) base hs)
+            f (future-detach (future (fn Int [j: SseJob] (sse-run j)) job))
+            ep (sse-wait-endpoint key (timeout-ms cn))]
+        (if (= ep "") (values "" [(mcp-err "CONNECTIVITY" "Message endpoint not received")]) (values ep []))))))
+
+(defn- sse-call Values(v/Val Vec(err/MErr)) [cfg: &m/Config cn: &xml/XNode ep: &Str method: &Str params: v/Val]
+  (let [id (next-id)
+        [r e] (post-to ep (sse-headers cn) cn (rpc-body method id params))
+        key (str (:name cfg) "/" id)
+        limit (timeout-ms cn)]
+    (cond
+      (not= e "") (values (v/null-v) [(mcp-err "CONNECTIVITY" e)])
+      (or (< (:status r) 200) (>= (:status r) 300)) (values (v/null-v) [(mcp-err "SERVER_ERROR" (str "HTTP " (:status r) " " (:body r)))])
+      :else
+      (let [txt (loop [i 0] (let [m (deref SSE-MSG)] (cond (contains? m key) (get! m key) (>= i limit) "" :else (let [z (sleep-ms 1)] (recur (+ i 1))))))]
+        (if (= txt "") (values (v/null-v) [(mcp-err "REQUEST_TIMEOUT" (str "Did not observe any item or terminal signal within " limit "ms"))])
+          (let [z (swap! SSE-MSG (fn Map(Str Str) [o: Map(Str Str)] (dissoc o key)))
+                [msg me] (json/read txt)]
+            (if (not= me "") (values (v/null-v) [(mcp-err "PARSE_ERROR" me)]) (result-of msg))))))))
+
+(defn- sse-ensure Values(Str Vec(err/MErr)) [cfg: &m/Config cn: &xml/XNode]
+  (let [m (deref SESSIONS) key (:name cfg)]
+    (if (contains? m key) (values (get! m key) [])
+      (let [[ep ex] (sse-connect cfg cn)]
+        (if (> (count ex) 0) (values "" ex)
+          (let [cinfo (v/->VObj [(v/field "name" (v/->VStr (conn/param-lit (:params cfg) "clientName" ""))) (v/field "version" (v/->VStr (conn/param-lit (:params cfg) "clientVersion" "")))])
+                params (v/->VObj [(v/field "protocolVersion" (v/->VStr mcp/LATEST)) (v/field "capabilities" (v/->VObj [])) (v/field "clientInfo" cinfo)])
+                [res ix] (sse-call cfg cn ep "initialize" params)]
+            (if (> (count ix) 0) (values "" ix)
+              (let [[zr ze] (post-to ep (sse-headers cn) cn (mcp/compact (v/->VObj [(v/field "jsonrpc" (v/->VStr "2.0")) (v/field "method" (v/->VStr "notifications/initialized"))])))
+                    z (swap! SESSIONS (fn Map(Str Str) [o: Map(Str Str)] (assoc o (str key) (str ep))))]
+                (values ep [])))))))))
+
+(defn- sse-rpc Values(v/Val Vec(err/MErr)) [cfg: &m/Config cn: &xml/XNode method: &Str params: v/Val]
+  (let [[ep ex] (sse-ensure cfg cn)]
+    (if (> (count ex) 0) (values (v/null-v) ex) (sse-call cfg cn ep method params))))
+
+(defn- decoded Str [s: &Str] (let [[d e] (b64/decode s)] (if (not= e "") (str s) d)))
+
+(defn- resource-obj v/Val [r: &v/Val]
+  (let [blob (fget r "blob") text (fget r "text")]
+    (v/->VObj [(v/field "mimeType" (vstr-or-null (fget r "mimeType"))) (v/field "uri" (vstr-or-null (fget r "uri")))
+               (v/field "blob" (match (v/unmeta blob) (v/VStr s) (v/->VStr (decoded s)) _ (v/null-v)))
+               (v/field "text" (vstr-or-null text))])))
+
+(defn- audience-of v/Val [it: &v/Val]
+  (let [xs (items (fget (fget it "annotations") "audience"))]
+    (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                (if (>= i (count xs)) acc
+                  (recur (+ i 1) (conj acc (v/->VStr (str/upper-case (match (v/unmeta (nth xs i)) (v/VStr s) (str s) _ ""))))))))))
+
+(defn- content-item v/Val [it: &v/Val]
+  (let [ty (sget it "type" "")
+        pri (fget (fget it "annotations") "priority")
+        data (fget it "data")]
+    (v/->VObj [(v/field "audience" (audience-of it))
+               (v/field "data" (match (v/unmeta data) (v/VStr s) (v/->VStr (decoded s)) _ (v/null-v)))
+               (v/field "resource" (if (= ty "resource") (resource-obj (fget it "resource")) (v/null-v)))
+               (v/field "mimeType" (vstr-or-null (fget it "mimeType")))
+               (v/field "priority" pri)
+               (v/field "type" (v/->VStr ty))
+               (v/field "text" (vstr-or-null (fget it "text")))])))
+
+(defn call-response v/Val [res: &v/Val]
+  (let [xs (items (fget res "content"))
+        cs (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (content-item (nth xs i))))))
+        er (match (v/unmeta (fget res "isError")) (v/VBool b) b _ false)]
+    (v/->VObj [(v/field "error" (v/bool-v er)) (v/field "contents" (v/->VArr cs))])))
+
+(defn structured Vec(v/Val) [res: &v/Val]
+  (let [xs (items (fget res "content"))]
+    (if (not= (count xs) 1) []
+      (if (not= (sget (nth xs 0) "type" "") "text") []
+        (let [t (str/trim (sget (nth xs 0) "text" ""))]
+          (if (not (str/starts-with? t "{")) []
+            (let [[x e] (json/read (first-object t))]
+              (if (not= e "") [] [x]))))))))
+
+(defn first-object Str [t: &Str]
+  (loop [i 0 depth 0 in-str false esc false]
+    (if (>= i (count t)) (str t)
+      (let [c (nth t i)]
+        (cond
+          in-str (recur (+ i 1) depth (not (and (not esc) (= c 34))) (and (not esc) (= c 92)))
+          (= c 34) (recur (+ i 1) depth true false)
+          (= c 123) (recur (+ i 1) (+ depth 1) false false)
+          (= c 125) (if (= depth 1) (subs t 0 (+ i 1)) (recur (+ i 1) (- depth 1) false false))
+          :else (recur (+ i 1) depth false false))))))
+
+(defn- tool-obj v/Val [t: &v/Val]
+  (v/->VObj [(v/field "inputSchema" (v/->VStr (mcp/compact (fget t "inputSchema"))))
+             (v/field "description" (vstr-or-null (fget t "description")))
+             (v/field "name" (vstr-or-null (fget t "name")))]))
+
+(defn- resource-info v/Val [t: &v/Val]
+  (v/->VObj [(v/field "description" (vstr-or-null (fget t "description"))) (v/field "mimeType" (vstr-or-null (fget t "mimeType")))
+             (v/field "uri" (vstr-or-null (fget t "uri"))) (v/field "name" (vstr-or-null (fget t "name")))]))
+
+(defn- prompt-arg v/Val [a: &v/Val]
+  (v/->VObj [(v/field "description" (vstr-or-null (fget a "description"))) (v/field "title" (vstr-or-null (fget a "title")))
+             (v/field "required" (v/bool-v (match (v/unmeta (fget a "required")) (v/VBool b) b _ false)))
+             (v/field "name" (vstr-or-null (fget a "name")))]))
+
+(defn- prompt-info v/Val [t: &v/Val]
+  (let [as (items (fget t "arguments"))
+        args (loop [j 0 acc: Vec(v/Val) []] (if (>= j (count as)) acc (recur (+ j 1) (conj acc (prompt-arg (nth as j))))))]
+    (v/->VObj [(v/field "description" (vstr-or-null (fget t "description"))) (v/field "title" (vstr-or-null (fget t "title")))
+               (v/field "name" (vstr-or-null (fget t "name"))) (v/field "arguments" (v/->VArr args))])))
+
+(defn- tools-list v/Val [res: &v/Val]
+  (let [xs (items (fget res "tools"))] (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (tool-obj (nth xs i)))))))))
+
+(defn- resources-list v/Val [res: &v/Val]
+  (let [xs (items (fget res "resources"))] (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (resource-info (nth xs i)))))))))
+
+(defn- prompts-list v/Val [res: &v/Val]
+  (let [xs (items (fget res "prompts"))] (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (prompt-info (nth xs i)))))))))
+
+(defn- message-content v/Val [c: &v/Val]
+  (let [ty (sget c "type" "")]
+    (cond
+      (= ty "text") (v/->VObj [(v/field "text" (vstr-or-null (fget c "text")))])
+      (= ty "image") (v/->VObj [(v/field "data" (match (v/unmeta (fget c "data")) (v/VStr s) (v/->VStr (decoded s)) _ (v/null-v)))
+                                (v/field "mimeType" (vstr-or-null (fget c "mimeType")))])
+      (= ty "resource_link") (v/->VObj [(v/field "description" (vstr-or-null (fget c "description"))) (v/field "mimeType" (vstr-or-null (fget c "mimeType")))
+                                        (v/field "uri" (vstr-or-null (fget c "uri"))) (v/field "size" (fget c "size")) (v/field "name" (vstr-or-null (fget c "name")))])
+      :else (v/->VObj [(v/field "resource" (resource-obj (fget c "resource")))]))))
+
+(defn- prompt-result v/Val [res: &v/Val]
+  (let [xs (items (fget res "messages"))]
+    (v/->VObj [(v/field "description" (vstr-or-null (fget res "description")))
+               (v/field "messages" (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                                               (if (>= i (count xs)) acc
+                                                 (let [mm (nth xs i)]
+                                                   (recur (+ i 1) (conj acc (v/->VObj [(v/field "role" (v/->VStr (str/upper-case (sget mm "role" ""))))
+                                                                                       (v/field "content" (message-content (fget mm "content")))]))))))))])))
+
+(defn- java-tv ev/TV [x: v/Val] (ev/tv-val x ev/JAVA))
+
+(defn- setup Values(Vec(m/Config) Vec(err/MErr)) [c: &conn/OpCall]
+  (let [cfgs (:config c)]
+    (if (or (= (count cfgs) 0) (= (count (conn-node (nth cfgs 0))) 0))
+      (values [] [(err/mk "MULE" "UNKNOWN" "mcp: missing config-ref to an <mcp:client-config> with a <mcp:streamable-http-client-connection> or <mcp:sse-client-connection>")])
+      (values [(nth cfgs 0)] []))))
+
+(defn- map-arg Values(v/Val Vec(err/MErr)) [c: &conn/OpCall local: &Str use-payload: Bool]
+  (let [[ts x] (conn/child-tv c local)]
+    (cond
+      (> (count x) 0) (values (v/null-v) x)
+      (> (count ts) 0) (as-map (nth ts 0))
+      use-payload (as-map (:payload (:event c)))
+      :else (values (v/->VObj []) []))))
+
+(defn- as-map Values(v/Val Vec(err/MErr)) [t: &ev/TV]
+  (match (v/unmeta (:val t))
+    (v/VObj fs) (values (v/unmeta (:val t)) [])
+    (v/VNull) (values (v/->VObj []) [])
+    _ (let [[b be] (ev/bytes t)]
+        (if (or (not= be "") (= (str/trim b) "")) (values (v/null-v) [(err/mk "MULE" "EXPRESSION" "Cannot coerce Binary to Object evaluating expression: \"payload\".")])
+          (let [[x e] (json/read b)]
+            (if (not= e "") (values (v/null-v) [(err/mk "MULE" "EXPRESSION" (str "Cannot coerce String (" b ") to Object"))]) (values x [])))))))
+
+(defn- call-tool conn/OpResult [c: &conn/OpCall cfg: &m/Config cn: &xml/XNode]
+  (let [[name nx] (conn/required-str c "toolName")
+        [extract ex] (conn/attr-bool c "extractStructuredContent" true)
+        [args ax] (map-arg c "arguments" true)]
+    (cond
+      (> (count nx) 0) (conn/fail-result (nth nx 0))
+      (> (count ex) 0) (conn/fail-result (nth ex 0))
+      (> (count ax) 0) (conn/fail-result (nth ax 0))
+      :else
+      (let [params (v/->VObj [(v/field "name" (v/->VStr name)) (v/field "arguments" args)])
+            [res rx] (rpc cfg cn "tools/call" params true)]
+        (if (> (count rx) 0) (conn/fail-result (nth rx 0))
+          (let [full (call-response res)
+                st (if extract (structured res) [])
+                attrs (v/->VObj [(v/field "rawMcpResponse" full)])]
+            (conn/ok-result (java-tv (if (> (count st) 0) (nth st 0) full)) (java-tv attrs))))))))
+
+(defn- simple conn/OpResult [c: &conn/OpCall cfg: &m/Config cn: &xml/XNode method: &Str params: v/Val build: Fn(v/Val v/Val)]
+  (let [[res rx] (rpc cfg cn method params true)]
+    (if (> (count rx) 0) (conn/fail-result (nth rx 0))
+      (conn/ok-result (java-tv (build res)) (ev/tv-null)))))
+
+(defn- list-tools conn/OpResult [c: &conn/OpCall cfg: &m/Config cn: &xml/XNode]
+  (simple c cfg cn "tools/list" (v/->VObj []) (fn v/Val [r: v/Val] (tools-list r))))
+(defn- list-resources conn/OpResult [c: &conn/OpCall cfg: &m/Config cn: &xml/XNode]
+  (simple c cfg cn "resources/list" (v/->VObj []) (fn v/Val [r: v/Val] (resources-list r))))
+(defn- list-prompts conn/OpResult [c: &conn/OpCall cfg: &m/Config cn: &xml/XNode]
+  (simple c cfg cn "prompts/list" (v/->VObj []) (fn v/Val [r: v/Val] (prompts-list r))))
+
+(defn- read-resource conn/OpResult [c: &conn/OpCall cfg: &m/Config cn: &xml/XNode]
+  (let [[uri ux] (conn/required-str c "uri")]
+    (if (> (count ux) 0) (conn/fail-result (nth ux 0))
+      (simple c cfg cn "resources/read" (v/->VObj [(v/field "uri" (v/->VStr uri))])
+              (fn v/Val [r: v/Val] (let [cs (items (fget r "contents"))] (if (= (count cs) 0) (v/null-v) (resource-obj (nth cs 0)))))))))
+
+(defn- get-prompt conn/OpResult [c: &conn/OpCall cfg: &m/Config cn: &xml/XNode]
+  (let [[name nx] (conn/required-str c "promptName")
+        [args ax] (map-arg c "prompt-args" false)]
+    (cond
+      (> (count nx) 0) (conn/fail-result (nth nx 0))
+      (> (count ax) 0) (conn/fail-result (nth ax 0))
+      :else (simple c cfg cn "prompts/get" (v/->VObj [(v/field "name" (v/->VStr name)) (v/field "arguments" args)])
+                    (fn v/Val [r: v/Val] (prompt-result r))))))
+
+(defn- ping conn/OpResult [c: &conn/OpCall cfg: &m/Config cn: &xml/XNode]
+  (let [[res rx] (rpc cfg cn "ping" (v/->VObj []) true)]
+    (if (> (count rx) 0) (conn/fail-result (nth rx 0)) (conn/keep-result c))))
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (let [[cs sx] (setup c)]
+    (if (> (count sx) 0) (conn/fail-result (nth sx 0))
+      (let [cfg (nth cs 0) cn (nth (conn-node cfg) 0) op (:op c)]
+        (cond
+          (= op "call-tool") (call-tool c cfg cn)
+          (= op "list-tools") (list-tools c cfg cn)
+          (= op "list-resources") (list-resources c cfg cn)
+          (= op "read-resource") (read-resource c cfg cn)
+          (= op "list-prompts") (list-prompts c cfg cn)
+          (= op "get-prompt") (get-prompt c cfg cn)
+          (= op "ping") (ping c cfg cn)
+          :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation <mcp:" op ">"))))))))
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "mcp" NS (fn conn/OpResult [c: conn/OpCall] (run-op c)))
+         :mounts mcp/server-mounts :routed mcp/ROUTED))

@@ -1,0 +1,111 @@
+(ns mulay.lib.textsplit
+  (:require [clay.utf8 :as u8] [mulay.lib.regex :as re] [mulay.lib.uni :as u] [clay.string :as str]))
+
+(defn- pat re/Pattern [s: &Str] (let [[p e] (re/compile s 0)] p))
+
+(def PARA-RE (pat "\\s*(?>\\R)\\s*(?>\\R)\\s*"))
+(def LINE-RE (pat "\\s*\\R\\s*"))
+(def WORD-RE (pat "\\s+"))
+
+(defn- delim Str [lv: Int] (cond (= lv 0) "\n\n" (= lv 1) "\n" (= lv 4) "" :else " "))
+
+(defn- len Int [s: &Str]
+  (loop [i 0 n 0] (if (>= i (count s)) n (let [[cp nxt] (u/decode-at s i)] (recur nxt (+ n (if (> cp 0xFFFF) 2 1)))))))
+
+(defn- jsplit Vec(Str) [p: &re/Pattern s: &Str] (let [[xs e] (re/split p s 0)] xs))
+
+(def ABBREVS ["mr" "ms" "dr" "prof" "sr" "jr" "st" "vs" "etc" "e.g" "i.e" "a.m" "no" "inc" "ltd" "co" "corp" "fig" "approx"
+              "dept" "u.s" "mt" "gen" "col" "lt" "sgt" "capt" "rev" "est" "vol" "ph.d" "u.k"])
+
+(defn- abbrev? Bool [w0: &Str]
+  (let [w (str/lower-case (str/trim w0))
+        w2 (loop [i 0] (if (and (< i (count w)) (let [c (nth w i)] (or (= c 40) (= c 34) (= c 39) (= c 91)))) (recur (+ i 1)) (subs w i (count w))))]
+    (or (and (= (u8/codepoint-count w2) 1) (u/letter? (nth (u/cps w2) 0)))
+        (loop [i 0] (if (>= i (count ABBREVS)) false (if (= (nth ABBREVS i) w2) true (recur (+ i 1))))))))
+
+(defn- closer? Bool [c: Int] (or (= c 34) (= c 39) (= c 41) (= c 93) (= c 0x201D) (= c 0x2019)))
+(defn- opener? Bool [c: Int] (or (= c 34) (= c 39) (= c 40) (= c 91) (= c 0x201C) (= c 0x2018)))
+
+(defn- starts-sentence? Bool [c: Int] (or (u/upper-case? c) (u/java-digit? c) (opener? c)))
+
+(defn sentences Vec(Str) [text: &Str]
+  (let [cps (u/cps text)
+        n (count cps)]
+    (loop [i 0 start 0 acc: Vec(Str) []]
+      (if (>= i n)
+        (let [s (str/trim (u/from-cps (subvec cps start n)))] (if (= (count s) 0) acc (conj acc s)))
+        (let [c (nth cps i)]
+          (if (not (or (= c 46) (= c 33) (= c 63)))
+            (recur (+ i 1) start acc)
+            (let [j (loop [k (+ i 1)] (if (and (< k n) (or (= (nth cps k) 46) (= (nth cps k) 33) (= (nth cps k) 63) (closer? (nth cps k)))) (recur (+ k 1)) k))
+                  ws (loop [k j] (if (and (< k n) (u/java-whitespace? (nth cps k))) (recur (+ k 1)) k))]
+              (if (or (= ws j) (>= ws n) (not (starts-sentence? (nth cps ws))))
+                (recur j start acc)
+                (let [wb (loop [k (- i 1)] (if (and (>= k start) (not (u/java-whitespace? (nth cps k)))) (recur (- k 1)) (+ k 1)))
+                      word (u/from-cps (subvec cps wb i))
+                      bare (loop [k start] (if (>= k i) true (if (u/letter-or-digit? (nth cps k)) false (recur (+ k 1)))))]
+                  (if (or bare (and (= c 46) (abbrev? word)))
+                    (recur j start acc)
+                    (let [s (str/trim (u/from-cps (subvec cps start j)))]
+                      (recur ws ws (if (= (count s) 0) acc (conj acc s))))))))))))))
+
+(defn- parts Vec(Str) [lv: Int text: &Str]
+  (cond (= lv 0) (jsplit PARA-RE text)
+        (= lv 1) (jsplit LINE-RE text)
+        (= lv 2) (sentences text)
+        (= lv 3) (jsplit WORD-RE text)
+        :else (let [cps (u/cps text)] (loop [i 0 acc: Vec(Str) []] (if (>= i (count cps)) acc (recur (+ i 1) (conj acc (u/encode (nth cps i)))))))))
+
+(defn- sb-has Bool [seg: &Str size: Int max: Int d: &Str]
+  (<= (+ size (if (> (count seg) 0) (+ (len seg) (len d)) 0)) max))
+
+(defn- sb-append Str [seg: Str text: &Str d: &Str] (if (> (count seg) 0) (str seg d text) (str seg text)))
+
+(defn- jtrim Str [s: &Str] (u/java-trim s))
+
+(defn- overlap-from Str [text: &Str lv: Int ov: Int]
+  (if (= ov 0) ""
+    (let [ss (sentences text)
+          d (delim lv)]
+      (loop [i (- (count ss) 1) seg ""]
+        (if (< i 0) (jtrim seg)
+          (let [s (nth ss i)]
+            (if (sb-has seg (len s) ov d)
+              (recur (- i 1) (if (> (count seg) 0) (str s d seg) (str s)))
+              (jtrim seg))))))))
+
+(defn- split-level Values(Vec(Str) Str) [text: &Str lv: Int max: Int ov: Int]
+  (let [d (delim lv)
+        ps (parts lv text)
+        [segs seg overlap err]
+        (loop [i 0 segs: Vec(Str) [] seg "" overlap: Vec(Str) []]
+          (if (>= i (count ps)) (values segs seg overlap "")
+            (let [part (nth ps i)
+                  psize (len part)]
+              (if (sb-has seg psize max d) (recur (+ i 1) segs (sb-append seg part d) overlap)
+                (let [st (jtrim seg)
+                      flushed (and (> (count seg) 0) (not (and (= (count overlap) 1) (= st (nth overlap 0)))))
+                      segs2 (if flushed (conj segs st) segs)
+                      ov2 (if flushed [(overlap-from st lv ov)] overlap)
+                      seg2 (if flushed (sb-append "" (nth ov2 0) d) seg)]
+                  (if (and flushed (sb-has seg2 psize max d)) (recur (+ i 1) segs2 (sb-append seg2 part d) ov2)
+                    (if (>= lv 4)
+                      (values segs2 seg2 ov2 (str "The text \"" (first-chars part 30) "...\" (" (len part) " characters long) doesn't fit into the maximum segment size ("
+                                                 max " characters), and there is no subSplitter defined to split it further."))
+                      (let [[pieces pe] (split-level (jtrim (sb-append seg2 part d)) (+ lv 1) max ov)
+                            segs3 (loop [k 0 acc segs2] (if (>= k (count pieces)) acc (recur (+ k 1) (conj acc (nth pieces k)))))
+                            last (if (> (count segs3) 0) (nth segs3 (- (count segs3) 1)) "")
+                            o (overlap-from last lv ov)]
+                        (if (not= pe "") (values segs3 "" [] pe)
+                          (recur (+ i 1) segs3 (sb-append "" o d) [o]))))))))))
+        st (jtrim seg)]
+    (cond (not= err "") (values [] err)
+          (and (> (count seg) 0) (not (and (= (count overlap) 1) (= st (nth overlap 0))))) (values (conj segs st) "")
+          :else (values segs ""))))
+
+(defn- first-chars Str [s: &Str n: Int] (let [cps (u/cps s)] (if (<= (count cps) n) (str s) (u/from-cps (subvec cps 0 n)))))
+
+(defn recursive Values(Vec(Str) Str) [text: &Str max: Int overlap: Int]
+  (cond (<= max 0) (values [] (str "maxSegmentSize must be greater than zero, but is: " max))
+        (or (< overlap 0) (> overlap max)) (values [] (str "maxOverlapSize must be between 0 and " max ", but is: " overlap))
+        :else (split-level text 0 max overlap)))

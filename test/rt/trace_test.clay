@@ -1,0 +1,166 @@
+(ns trace-test (:require [mulay.rt.trace :as tr] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.lib.otlp :as o] [mulay.lib.tracectx :as tc]))
+
+(defn- on! Int [sampler: Str ratio: Float level: Int]
+  (let [z (tr/configure! (tr/->Conf true level sampler ratio "app" 2048)) z2 (tr/take-batch 100000)] 0))
+
+(defn- ev0 ev/Event [] (ev/new-event (ev/tv-null) (ev/tv-null) "corr-1" "f"))
+
+(defn- attr Str [s: &o/Span k: &Str]
+  (let [as (:attrs s)]
+    (loop [i 0] (if (>= i (count as)) "<none>" (if (= (:key (nth as i)) k) (match (:val (nth as i)) (o/AStr v) (str v) (o/ABool b) (if b "true" "false")) (recur (+ i 1)))))))
+
+;; 送る設定でなければ、根も子も何もしない (イベントの文脈は空のまま)
+(deftest off
+  (let [z (tr/configure! (tr/->Conf false tr/MONITORING "always_on" 1.0 "app" 2048))
+        [r e1] (tr/start-root (ev0) "GET /x" o/SERVER "f" "" "" [])
+        [c e2] (tr/start e1 "mule:logger" "f/processors/0")
+        z2 (tr/finish c e2 [])
+        z3 (tr/finish r e1 [])]
+    (is (not (ev/traced? (:span e2))))
+    (is (= (tr/traceparent e2) ""))
+    (is (= (count (tr/take-batch 100)) 0))))
+
+;; 根 (親の無い SERVER) と子: 子の親は根、flags は根も子も 257、根は受けた tracestate を持たない
+(deftest root-and-child
+  (let [z (on! "always_on" 1.0 tr/MONITORING)
+        [r e1] (tr/start-root (ev0) "GET /x" o/SERVER "f" "" "" [(o/attr "http.method" "GET")])
+        [c e2] (tr/start e1 "mule:logger" "f/processors/0")
+        z2 (tr/finish c e2 [])
+        e3 (tr/restore e2 (:span e1))
+        z3 (tr/finish r e3 [])
+        b (tr/take-batch 100)
+        child (nth b 0)
+        root (nth b 1)]
+    (is (= (count b) 2))
+    (is (= (:name child) "mule:logger"))
+    (is (= (:kind child) o/INTERNAL))
+    (is (= (:parent child) (:id root)))
+    (is (= (:trace child) (:trace root)))
+    (is (= (:parent root) ""))
+    (is (= (:flags root) 257))
+    (is (= (:flags child) 257))
+    (is (= (:kind root) o/SERVER))
+    (is (= (attr root "http.method") "GET"))
+    (is (= (attr child "location") "f/processors/0"))
+    (is (= (attr child "correlation.id") "corr-1"))
+    (is (= (attr child "artifact.id") "app"))
+    (is (= (attr child "artifact.type") "app"))
+    (is (= (:status child) o/UNSET))))
+
+;; 有効な traceparent: 同じ trace、親はその span、flags 769、tracestate を引き継ぐ。送る traceparent は今のスパン
+(deftest remote-parent
+  (let [z (on! "always_on" 1.0 tr/MONITORING)
+        [r e1] (tr/start-root (ev0) "GET /x" o/SERVER "f" "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01" "a=b" [])
+        tp (tr/traceparent e1)
+        z3 (tr/finish r e1 [])
+        s (nth (tr/take-batch 100) 0)]
+    (is (= (tc/hex (:trace s)) "0af7651916cd43dd8448eb211c80319c"))
+    (is (= (tc/hex (:parent s)) "b7ad6b7169203331"))
+    (is (= (:flags s) 769))
+    (is (= (:state s) "a=b"))
+    (is (= (tr/tracestate e1) "a=b"))
+    (is (= tp (str "00-0af7651916cd43dd8448eb211c80319c-" (tc/hex (:id s)) "-01")))))
+
+;; 形の合わない traceparent は無いのと同じ (257)。ID が不正なら新しい trace だが 769
+(deftest bad-parents
+  (let [z (on! "always_on" 1.0 tr/MONITORING)
+        [r1 e1] (tr/start-root (ev0) "a" o/SERVER "f" "garbage" "a=b" [])
+        z1 (tr/finish r1 e1 [])
+        [r2 e2] (tr/start-root (ev0) "b" o/SERVER "f" "00-00000000000000000000000000000000-b7ad6b7169203331-01" "a=b" [])
+        z2 (tr/finish r2 e2 [])
+        b (tr/take-batch 100)]
+    (is (= (:flags (nth b 0)) 257))
+    (is (= (:flags (nth b 1)) 769))
+    (is (= (:parent (nth b 1)) ""))
+    (is (= (:state (nth b 1)) ""))))
+
+;; 親が sampled でない (parentbased): スパンは送らないが、traceparent は -00 で渡す
+(deftest unsampled
+  (let [z (on! "parentbased_traceidratio" 1.0 tr/MONITORING)
+        [r e1] (tr/start-root (ev0) "a" o/SERVER "f" "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00" "x=y" [])
+        [c e2] (tr/start e1 "mule:logger" "f/processors/0")
+        z1 (tr/finish c e2 [])
+        z2 (tr/finish r e1 [])]
+    (is (= (count (tr/take-batch 100)) 0))
+    (is (= (subs (tr/traceparent e2) 0 36) "00-0af7651916cd43dd8448eb211c80319c-"))
+    (is (= (subs (tr/traceparent e2) 52 55) "-00"))
+    (is (= (tr/tracestate e2) "x=y"))))
+
+;; エラーで終わったスパン: ERROR と "Exceptions have been recorded."、exception のイベント
+(deftest error-span
+  (let [z (on! "always_on" 1.0 tr/MONITORING)
+        [r e1] (tr/start-root (ev0) "mule:flow" o/INTERNAL "f" "" "" [])
+        [c e2] (tr/start e1 "mule:raise-error" "f/processors/0")
+        x (assoc (err/mk "APP" "BOOM" "boom") :stack "at f(f/processors/0 @ app:a.xml:3)")
+        z1 (tr/finish c e2 [x])
+        z2 (tr/finish r e1 [x])
+        b (tr/take-batch 100)
+        s (nth b 0)
+        ev (nth (:events s) 0)]
+    (is (= (:status s) o/ERROR))
+    (is (= (:msg s) "Exceptions have been recorded."))
+    (is (= (:name ev) "exception"))
+    (is (= (count (:attrs ev)) 4))
+    (is (= (:status (nth b 1)) o/ERROR))))
+
+;; 根の状態は status.override が決める (HTTP の 500 以外は UNSET)。エラーのイベントは付ける。子では上書きよりエラーが勝つ
+(deftest status-override
+  (let [z (on! "always_on" 1.0 tr/MONITORING)
+        [r e1] (tr/start-root (ev0) "GET /x" o/SERVER "f" "" "" [])
+        [c e2] (tr/start e1 "http:request" "f/processors/0")
+        z0 (tr/add-attr! e2 "status.override" "ERROR")
+        z0b (tr/add-attr! e2 "span.kind.override" "CLIENT")
+        z0c (tr/set-name! e2 "GET")
+        x (err/mk "HTTP" "INTERNAL_SERVER_ERROR" "x")
+        z1 (tr/finish c e2 [x])
+        z2 (tr/add-attr! e1 "status.override" "UNSET")
+        z3 (tr/finish r e1 [x])
+        b (tr/take-batch 100)
+        child (nth b 0)
+        root (nth b 1)]
+    (is (= (:name child) "GET"))
+    (is (= (:kind child) o/CLIENT))
+    (is (= (:status child) o/ERROR))
+    (is (= (:msg child) "Exceptions have been recorded."))
+    (is (= (attr child "status.override") "<none>"))
+    (is (= (attr child "span.kind.override") "<none>"))
+    (is (= (:status root) o/UNSET))
+    (is (= (count (:events root)) 1))))
+
+;; 仮のスパン (OVERVIEW のコネクタの操作): 種類が上書きされなければ送らず、その間の子は 1 つ上を親にする
+(deftest provisional
+  (let [z (on! "always_on" 1.0 tr/OVERVIEW)
+        [r e1] (tr/start-root (ev0) "GET /x" o/SERVER "f" "" "" [])
+        [p e2] (tr/start-provisional e1 "db:select" "f/processors/0")
+        [c e3] (tr/start e2 "mule:flow" "g")
+        z1 (tr/finish c e3 [])
+        z2 (tr/finish p e2 [])
+        [q e4] (tr/start-provisional e1 "http:request" "f/processors/1")
+        z3 (tr/add-attr! e4 "span.kind.override" "CLIENT")
+        [d e5] (tr/start e4 "mule:flow" "h")
+        z4 (tr/finish d e5 [])
+        z5 (tr/finish q e4 [])
+        z6 (tr/finish r e1 [])
+        b (tr/take-batch 100)
+        root (nth b 3)]
+    (is (= (count b) 4))
+    (is (= (:parent (nth b 0)) (:id root)))
+    (is (= (:parent (nth b 1)) (:id (nth b 2))))
+    (is (= (:kind (nth b 2)) o/CLIENT))))
+
+;; 送る列は queueSize で切り、あふれた数を数える
+(deftest queue-cap
+  (let [z (tr/configure! (tr/->Conf true tr/MONITORING "always_on" 1.0 "app" 2))
+        z0 (tr/take-batch 100)
+        z00 (tr/take-dropped)
+        [r1 e1] (tr/start-root (ev0) "a" o/SERVER "f" "" "" [])
+        z1 (tr/finish r1 e1 [])
+        z2 (tr/finish r1 e1 [])
+        z3 (tr/finish r1 e1 [])
+        n (tr/queued)
+        b1 (tr/take-batch 1)
+        b2 (tr/take-batch 5)]
+    (is (= n 2))
+    (is (= (tr/take-dropped) 1))
+    (is (= (count b1) 1))
+    (is (= (count b2) 1))))

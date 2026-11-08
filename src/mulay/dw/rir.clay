@@ -1,0 +1,168 @@
+(ns mulay.dw.rir (:require [mulay.dw.ast :as ast] [mulay.dw.val :as v] [clay.string :as str]))
+
+(defvariant Rx
+  (RConst v: v/Val)
+  (RInterp parts: Vec(R))
+  (RSlot i: Int)
+  (RCap i: Int)
+  (RGlob i: Int)
+  (RInput i: Int)
+  (RBuiltinRef id: Int)
+  (RArr elems: Vec(RElem))
+  (RObj entries: Vec(REntry))
+  (RCall f: R args: Vec(R))
+  (RCallB id: Int args: Vec(R))
+  (RNumOp op: Int id: Int l: R r: R)
+  (RCallG def: Int args: Vec(R))
+  (RClosure def: Int caps: Vec(R))
+  (RSibling def: Int)
+  (RSel target: R sel: RSelK)
+  (RExists target: R)
+  (RAssert target: R)
+  (RIf cond: R then: R else: R)
+  (RAnd l: R r: R)
+  (ROr l: R r: R)
+  (RNot e: R)
+  (RDefault e: R fallback: R)
+  (RMatch target: R slot: Int cases: Vec(RCase))
+  (RAs e: R ty: RType)
+  (RIs e: R ty: RType)
+  (RMetaSet e: R schema: R)
+  (RLet slot: Int value: R body: R)
+  (RUpdate target: R slot: Int cases: Vec(RUpd))
+  (RTypeV ty: RType)
+  (RFail msg: Str)
+  (RNoVar name: Str))
+
+(defrecord R [x: Rx sp: ast/Span])
+
+(def NUM-OPS ["+" "-" "*" "mod" "==" "!=" "<" ">" "<=" ">=" "++"])
+(defn num-op Int [name: &Str]
+  (loop [i 0] (if (>= i (count NUM-OPS)) 0 (if (= (nth NUM-OPS i) name) (+ i 1) (recur (+ i 1))))))
+
+(defrecord RElem [value: R cond: Vec(R)])
+
+(defvariant RKey
+  (RKName ns: Vec(R) name: Str)
+  (RKExpr ns: Vec(R) e: R))
+(defrecord RAttr [ns: Vec(R) name: Str value: R cond: Vec(R) spread: Bool])
+
+(defvariant REntry
+  (REKV key: RKey attrs: Vec(RAttr) value: R cond: Vec(R))
+  (RESpread e: R cond: Vec(R)))
+
+(defvariant RSelK
+  (SKey ns: Vec(R) name: Str)
+  (SMulti ns: Vec(R) name: Str)
+  (SDesc ns: Vec(R) name: Str)
+  (SDescMulti ns: Vec(R) name: Str)
+  (SAttr name: Str)
+  (SAllAttrs)
+  (SKV name: Str)
+  (SDescKV name: Str)
+  (SAllKV)
+  (SNs)
+  (SMeta name: Str)
+  (SDyn e: R)
+  (SQDyn ns: Vec(R) e: R)
+  (SRange from: R to: R)
+  (SFilter pred: R)
+  (SAttrDyn e: R))
+
+(defrecord RType [t: v/TypeV])
+
+(defvariant RPat
+  (PLitR value: R)
+  (PGuardR cond: R)
+  (PTypeR ty: RType)
+  (PRegexR re: R)
+  (PArrR head: Int tail: Int)
+  (PObjR key: Int value: Int tail: Int)
+  (PElseR))
+(defrecord RCase [bind: Int pat: RPat body: R sp: ast/Span])
+
+(defrecord RUpd [bind: Int idx: Int path: Vec(RSelK) cond: Vec(R) body: R upsert: Bool sp: ast/Span])
+
+(defrecord Param [name: Str ty: Vec(RType) default: Vec(R)])
+(defrecord FnDef [name: Str params: Vec(Param) nslots: Int ncaps: Int body: R sp: ast/Span alts: Vec(Int)])
+
+(defrecord Global [name: Str body: R nslots: Int])
+
+(defrecord Output [mime: Str props: Vec(v/Field) nss: Vec(v/Ns)])
+(defrecord InputDecl [name: Str mime: Str props: Vec(v/Field)])
+
+(defrecord Prog
+  [fns: Vec(FnDef)
+   globals: Vec(Global)
+   inputs: Vec(Str)
+   body: R
+   nslots: Int
+   output: Vec(Output)
+   input-decls: Vec(InputDecl)])
+
+(defn glob-name Str [p: &Prog i: Int]
+  (let [q (:name (nth (:globals p) i))
+        k (str/last-index-of q "::")]
+    (if (< k 0) (str q) (subs q (+ k 2) (count q)))))
+
+(defn kids Vec(R) [n: &R]
+  (match (:x n)
+    (RInterp parts) parts
+    (RArr elems) (loop [i 0 acc: Vec(R) []]
+                     (if (>= i (count elems)) acc
+                       (let [el (nth elems i)] (recur (+ i 1) (cat (conj acc (:value el)) (:cond el))))))
+    (RObj entries) (loop [i 0 acc: Vec(R) []]
+                       (if (>= i (count entries)) acc (recur (+ i 1) (entry-kids acc (nth entries i)))))
+    (RNumOp op id l rr) [l rr]
+    (RCall fe args) (cat [fe] args)
+    (RCallB id args) args
+    (RCallG d args) args
+    (RClosure d caps) caps
+    (RSel t s) (cat [t] (sel-kids s))
+    (RExists t) [t]
+    (RAssert t) [t]
+    (RIf cnd th el) [cnd th el]
+    (RAnd l rr) [l rr]
+    (ROr l rr) [l rr]
+    (RNot x) [x]
+    (RDefault x fb) [x fb]
+    (RMatch t slot cases) (loop [i 0 acc: Vec(R) [t]]
+                              (if (>= i (count cases)) acc
+                                (let [cs (nth cases i)
+                                      pk: Vec(R) (match (:pat cs) (PLitR x) [x] (PGuardR x) [x] (PRegexR x) [x] _ [])]
+                                  (recur (+ i 1) (conj (cat acc pk) (:body cs))))))
+    (RAs x ty) [x]
+    (RIs x ty) [x]
+    (RMetaSet x sch) [x sch]
+    (RLet slot x body) [x body]
+    (RUpdate t slot cases) (loop [i 0 acc: Vec(R) [t]]
+                               (if (>= i (count cases)) acc
+                                 (let [u (nth cases i)
+                                       ps (loop [j 0 a: Vec(R) []] (if (>= j (count (:path u))) a (recur (+ j 1) (cat a (sel-kids (nth (:path u) j))))))]
+                                   (recur (+ i 1) (conj (cat (cat acc ps) (:cond u)) (:body u))))))
+    _ []))
+
+(defn- entry-kids Vec(R) [acc: Vec(R) e: &REntry]
+  (match e
+    (REKV k attrs x cnd) (let [a1 (match k (RKName nsx name) (cat acc nsx) (RKExpr nsx ke) (conj (cat acc nsx) ke))
+                                 a2 (loop [i 0 a a1]
+                                      (if (>= i (count attrs)) a
+                                        (let [at (nth attrs i)] (recur (+ i 1) (cat (conj (cat a (:ns at)) (:value at)) (:cond at))))))]
+                             (cat (conj a2 x) cnd))
+    (RESpread x cnd) (cat (conj acc x) cnd)))
+
+(defn- sel-kids Vec(R) [s: &RSelK]
+  (match s
+    (SKey nsx name) nsx
+    (SMulti nsx name) nsx
+    (SDesc nsx name) nsx
+    (SDescMulti nsx name) nsx
+    (SDyn e) [e]
+    (SQDyn nsx e) (conj (cat [] nsx) e)
+    (SRange a b) [a b]
+    (SFilter pe) [pe]
+    (SAttrDyn e) [e]
+    _ []))
+
+(defn cat Vec(R) [a: Vec(R) b: &Vec(R)]
+  (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))

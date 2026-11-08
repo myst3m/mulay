@@ -1,0 +1,57 @@
+(ns mulay.lib.ieee)
+
+(defn- scale2 Float [x: Float n: Int]
+  (if (>= n 0)
+    (loop [i 0 v x] (if (>= i n) v (recur (+ i 1) (* v 2.0))))
+    (loop [i 0 v x] (if (>= i (- 0 n)) v (recur (+ i 1) (* v 0.5))))))
+
+(defn- inf Float [] (scale2 1.0 2000))
+
+(defn- build Float [neg: Bool e: Int m: Int mbits: Int emax: Int bias: Int]
+  (let [v (cond
+            (and (= e emax) (= m 0)) (inf)
+            (= e emax) (- (inf) (inf))
+            (= e 0) (scale2 (float m) (- (- 1 bias) mbits))
+            :else (scale2 (float (+ m (bit-shift-left 1 mbits))) (- (- e bias) mbits)))]
+    (if neg (* v -1.0) v)))
+
+(defn bits->double Float [b: Int] (bits->float b))
+
+(defn bits->float32 Float [b: Int]
+  (build (not= (bit-and b 2147483648) 0) (bit-and (bit-shift-right b 23) 255) (bit-and b 8388607) 23 255 127))
+
+(defn double->bits Int [x: Float] (if (not= x x) 9221120237041090560 (float->bits x)))
+
+(defn to-float32 Float [x: Float]
+  (if (or (not= x x) (= x 0.0) (= x (* x 2.0))) x
+    (let [b (double->bits x)
+          neg (< b 0)
+          exp (bit-and (bit-shift-right b 52) 2047)]
+      (if (= exp 0) (if neg (* -1.0 0.0) 0.0)
+        (let [e (- exp 1023)
+              m (bit-or (bit-and b 4503599627370495) 4503599627370496)
+              shift (if (< e -126) (+ 29 (- -126 e)) 29)]
+          (if (> shift 54) (if neg (* -1.0 0.0) 0.0)
+            (let [q (bit-shift-right m shift)
+                  r (bit-and m (- (bit-shift-left 1 shift) 1))
+                  half (bit-shift-left 1 (- shift 1))
+                  q2 (if (or (> r half) (and (= r half) (= (bit-and q 1) 1))) (+ q 1) q)
+                  v (scale2 (float q2) (+ (- e 52) shift))
+                  v2 (if (> v 3.4028234663852886e38) (inf) v)]
+              (if neg (* -1.0 v2) v2))))))))
+
+(defn float32->bits Int [x: Float]
+  (if (not= x x) 2143289344
+    (let [b (double->bits (to-float32 x))
+          sign (if (< b 0) 2147483648 0)
+          exp (bit-and (bit-shift-right b 52) 2047)
+          m (bit-and b 4503599627370495)]
+      (cond
+        (= exp 2047) (bit-or sign 2139095040)
+        (= exp 0) sign
+        :else
+        (let [e (+ (- exp 1023) 127)]
+          (cond
+            (>= e 255) (bit-or sign 2139095040)
+            (> e 0) (bit-or sign (bit-or (bit-shift-left e 23) (bit-shift-right m 29)))
+            :else (bit-or sign (bit-shift-right (bit-or m 4503599627370496) (+ 29 (- 1 e))))))))))

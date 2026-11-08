@@ -1,0 +1,109 @@
+(ns samples-test (:require [mulay.conn.registry :as creg] [mulay.mule.load :as ld] [mulay.mule.model :as m] [mulay.mule.dump :as dump]
+                           [clay.string :as str] [clay.io :as io]))
+
+(defn- env Str [k: Str] (getenv k ""))
+
+;; mulet から移した samples (test/fixtures/mulet-samples/*/) と Exchange の例の JAR (MULAY_EXCHANGE_EXAMPLES、既定 ~/mule-work/dist/exchange-examples) をすべて読み込み、
+;; フロー数・プロセッサの種類・診断を分類して表示する。パーサ由来の診断 (未対応要素、構造の誤り、
+;; プロパティ) が 0 であることを確かめる。DW 側の未実装 (標準ライブラリに無い関数) は別に数える。
+
+(def SAMPLES "test/fixtures/mulet-samples")
+(defn- exchange-dir Str [] (match (getenv "MULAY_EXCHANGE_EXAMPLES") (Some v) v (None) (str (env "HOME") "/mule-work/dist/exchange-examples")))
+
+(defn- projects Vec(Str) []
+  (let [[fs err] (io/list-dir SAMPLES)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count fs)) acc
+        (let [d (str SAMPLES "/" (nth fs i))
+              [ms e2] (io/list-dir (str d "/src/main/mule"))]
+          (recur (+ i 1) (if (= e2 "") (conj acc d) acc)))))))
+
+(defn- jars Vec(Str) []
+  (let [dir (exchange-dir)
+        [fs err] (io/list-dir dir)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count fs)) acc
+        (recur (+ i 1) (if (str/ends-with? (nth fs i) ".jar") (conj acc (str dir "/" (nth fs i))) acc))))))
+
+(defn- category Str [d: &Str]
+  (cond (str/includes? d "DataWeave compile error: Unable to resolve reference") "dw-unresolved-name"
+        (str/includes? d "DataWeave compile error") "dw-other"
+        (str/includes? d "not a Mule application") "not-a-mule-app"
+        (str/includes? d "unsupported") "unsupported-element"
+        (or (str/includes? d "propert") (str/includes? d "configuration-properties")) "property"
+        (str/includes? d "XML") "xml"
+        :else "other"))
+
+;; samples の yaml は db.user / db.password を自分自身で参照している (実行時に -D で渡す前提)
+(defn- opts ld/LoadOpts []
+  (ld/->LoadOpts [(m/->Param "db.user" (m/->PLit "u")) (m/->Param "db.password" (m/->PLit "p"))] false (creg/hints)))
+
+(defrecord Tally [apps: Int flows: Int procs: Int cats: Map(Str Int) kinds: Map(Str Int)])
+
+(defn- tally Tally [t: Tally a: &m/App]
+  (let [ds (m/diag-strs (:diags a))
+        cats (loop [i 0 c (:cats t)] (if (>= i (count ds)) c (recur (+ i 1) (let [k (category (nth ds i))] (assoc c k (+ (get c k 0) 1))))))
+        kc (dump/kind-counts a)
+        kinds (loop [i 0 k (:kinds t)] (if (>= i (count kc)) k (recur (+ i 1) (let [x (nth kc i)] (assoc k (:kind x) (+ (get k (:kind x) 0) (:n x)))))))]
+    (->Tally (+ (:apps t) 1) (+ (:flows t) (count (:flows a))) (+ (:procs t) (dump/count-procs a)) cats kinds)))
+
+(defn- run-all Tally [paths: &Vec(Str)]
+  (let [c0: Map(Str Int) {} k0: Map(Str Int) {}]
+    (loop [i 0 t (->Tally 0 0 0 c0 k0)]
+      (if (>= i (count paths)) t
+        (let [l (ld/load-path (nth paths i) (opts))
+              a (:app l)
+              z (println (str "  " (dump/summary a)))
+              ds (m/diag-strs (:diags a))
+              y (loop [k 0] (if (>= k (count ds)) 0 (let [w (println (str "      [" (category (nth ds k)) "] " (nth ds k)))] (recur (+ k 1)))))]
+          (recur (+ i 1) (tally t a)))))))
+
+(defn- print-map Int [title: &Str mp: &Map(Str Int)]
+  (let [ks: Vec(Str) (sort (keys mp))
+        z (println title)]
+    (loop [i 0] (if (>= i (count ks)) 0 (let [w (println (str "    " (nth ks i) ": " (get mp (nth ks i) 0)))] (recur (+ i 1)))))))
+
+(defn- bad Int [t: &Tally]
+  (+ (get (:cats t) "unsupported-element" 0) (get (:cats t) "property" 0) (get (:cats t) "xml" 0) (get (:cats t) "other" 0)))
+
+(deftest projects-load
+  (let [ps (projects)
+        z (println (str "== mulet samples (" (count ps) " projects)"))
+        t (run-all ps)
+        y (print-map "  diag categories:" (:cats t))
+        x (print-map "  processor kinds:" (:kinds t))
+        w (println (str "  total: " (:apps t) " apps, " (:flows t) " flows, " (:procs t) " processors"))]
+    (is (>= (count ps) 12))
+    (is (= (bad t) 0))
+    (is (= (get (:cats t) "dw-other" 0) 0))
+    (is (> (:flows t) 100))))
+
+(deftest exchange-jars-load
+  (let [js (jars)
+        z (println (str "== exchange examples (" (count js) " JARs)"))
+        t (run-all js)
+        y (print-map "  diag categories:" (:cats t))
+        x (print-map "  processor kinds:" (:kinds t))
+        w (println (str "  total: " (:apps t) " apps, " (:flows t) " flows, " (:procs t) " processors"))
+        none (= (count js) 0)]
+    (is (or none (= (count js) 18)))
+    (is (= (bad t) 0))
+    (is (or none (= (get (:cats t) "not-a-mule-app" 0) 4)))
+    (is (= (get (:cats t) "dw-other" 0) 0))
+    (is (or none (>= (:flows t) 25)))))
+
+;; 単体の XML: .../src/main/mule/x.xml なら資源は .../src/main/resources (config.yaml が読める)
+(deftest single-xml-file
+  (let [l (ld/load-path (str SAMPLES "/http-test/src/main/mule/http-test.xml") (opts))
+        a (:app l)
+        ds (m/diag-strs (:diags a))
+        nprop (loop [i 0 n 0] (if (>= i (count ds)) n (recur (+ i 1) (if (= (category (nth ds i)) "property") (+ n 1) n))))]
+    (is (= (:name a) "http-test"))
+    (is (= (:files l) ["http-test.xml"]))
+    (is (= (count (:flows a)) 16))
+    (is (= nprop 0))))
+
+(deftest missing-path
+  (let [a (:app (ld/load-path "/nonexistent/app.xml" (opts)))]
+    (is (= (count (:diags a)) 1))
+    (is (str/includes? (m/diag-str (nth (:diags a) 0)) "cannot read"))))

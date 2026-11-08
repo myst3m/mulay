@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:salesforce-pub-sub="http://www.mulesoft.org/schema/mule/salesforce-pub-sub"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/salesforce-pub-sub http://www.mulesoft.org/schema/mule/salesforce-pub-sub/current/mule-salesforce-pub-sub.xsd">
+
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18561"/>
+    </http:listener-config>
+
+    <os:object-store name="Got" persistent="false"/>
+
+    <salesforce-pub-sub:pubsub-config name="PS">
+        <salesforce-pub-sub:oauth-client-credentials-connection>
+            <salesforce-pub-sub:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce-pub-sub:oauth-client-credentials-connection>
+    </salesforce-pub-sub:pubsub-config>
+
+    <salesforce:sfdc-config name="SF">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 受けたイベント: 型と、変わらない値。CreatedDate と ID は型だけ -->
+    <flow name="on-event">
+        <salesforce-pub-sub:subscribe-channel-listener config-ref="PS" channelName="/event/MulayPubSub__e" eventBatchSize="5">
+            <salesforce-pub-sub:replay-option><salesforce-pub-sub:latest/></salesforce-pub-sub:replay-option>
+        </salesforce-pub-sub:subscribe-channel-listener>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+fun shape(x) = x match {
+  case o is Object -> {"^class": x.^class default null} ++ (o mapObject (v, k) -> {(k): shape(v)})
+  case a is Array -> {"^class": x.^class default null, items: a map shape($)}
+  else -> {"^type": typeOf(x) as String, "^class": x.^class default null}
+}
+var e = payload.event
+---
+{payloadClass: payload.^class, payloadMime: payload.^mimeType, attributes: attributes,
+ shape: shape(payload), keys: keysOf(payload) map ($ as String), eventKeys: keysOf(e) map ($ as String),
+ values: e - "CreatedDate" - "CreatedById", createdBy: e.CreatedById,
+ replayIdIsPositive: payload.replayId > 0, eventIdLength: sizeOf(payload.eventId default "")}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <os:store key="#[payload.values.Message__c default 'none']" objectStore="Got"><os:value>#[write(payload, "application/json")]</os:value></os:store>
+    </flow>
+
+    <sub-flow name="publish-shape">
+        <salesforce-pub-sub:publish-event config-ref="PS" topic="#[vars.topic default '/event/MulayPubSub__e']"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{class: payload.^class, mime: payload.^mimeType, attributes: attributes,
+ results: payload map (r) -> {class: r.^class, keys: keysOf(r) map ($ as String), hasError: r.hasError,
+   error: r.error, errorClass: r.error.^class, eventBody: r.eventBody,
+   replayIdClass: r.replayId.^class, replayIdIsPositive: if (r.replayId != null) r.replayId > 0 else null,
+   correlationKeyLength: sizeOf(r.correlationKey default "")}}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <flow name="pub">
+        <http:listener config-ref="HTTP" path="/pub/{kind}" allowedMethods="POST"/>
+        <set-variable variableName="kind" value="#[attributes.uriParams.kind]"/>
+        <set-variable variableName="now" value="#[1792600000000]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+var base = {CreatedDate: vars.now, CreatedById: "005000000000000AAA"}
+---
+vars.kind match {
+  case "one" -> [base ++ {Message__c: "one", Count__c: 42, Amount__c: 12.5, Flag__c: true, When__c: 1792600000123, Day__c: 20500}]
+  case "two" -> [base ++ {Message__c: "two-a", Count__c: 1}, base ++ {Message__c: "two-b", Flag__c: false}]
+  case "bigint" -> [base ++ {Message__c: "bigint", Count__c: 9007199254740993, Amount__c: 0.1}]
+  case "nulls" -> [base ++ {Message__c: "nulls", Count__c: null, Flag__c: null}]
+  case "missing-required" -> [{Message__c: "x"}]
+  case "unknown-field" -> [base ++ {Bogus__c: 1}]
+  case "string-in-number" -> [base ++ {Count__c: "abc"}]
+  case "number-in-string" -> [base ++ {Message__c: 5}]
+  case "decimal-in-long" -> [base ++ {Message__c: "decimal-in-long", When__c: 1.9}]
+  case "empty" -> []
+  case "object" -> base ++ {Message__c: "object"}
+  else -> []
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <flow-ref name="publish-shape"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="pub-topic">
+        <http:listener config-ref="HTTP" path="/pub-topic" allowedMethods="POST"/>
+        <set-variable variableName="topic" value="#[attributes.queryParams.topic]"/>
+        <set-payload value="#[output application/java --- [{CreatedDate: 1792600000000, CreatedById: '005000000000000AAA'}]]"/>
+        <flow-ref name="publish-shape"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="got">
+        <http:listener config-ref="HTTP" path="/got/{key}"/>
+        <until-successful maxRetries="40" millisBetweenRetries="500">
+            <os:retrieve key="#[attributes.uriParams.key]" objectStore="Got"/>
+        </until-successful>
+        <set-payload value="#[output application/json --- read(payload, 'application/json')]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- CDC (SyncItem__c の変更。templates/org-sync/sfdx のオブジェクトと sfdx/ の PlatformEventChannelMember を d30 に配備しておく) -->
+    <flow name="on-change">
+        <salesforce-pub-sub:subscribe-channel-listener config-ref="PS" channelName="/data/SyncItem__ChangeEvent">
+            <salesforce-pub-sub:replay-option><salesforce-pub-sub:latest/></salesforce-pub-sub:replay-option>
+        </salesforce-pub-sub:subscribe-channel-listener>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+var e = payload.event
+var h = e.ChangeEventHeader
+---
+{eventKeys: keysOf(e) map ($ as String), headerClass: h.^class,
+ headerKeys: keysOf(h) map ($ as String),
+ entityName: h.entityName, changeType: h.changeType, changedFields: h.changedFields, nulledFields: h.nulledFields,
+ diffFields: h.diffFields, recordIds: sizeOf(h.recordIds default []), sequenceNumber: h.sequenceNumber,
+ commitTimestampType: typeOf(h.commitTimestamp) as String, commitUserLength: sizeOf(h.commitUser default ""),
+ transactionKeyType: typeOf(h.transactionKey) as String, changedFieldsClass: h.changedFields.^class,
+ values: {Name: e.Name, Status__c: e.Status__c, Amount__c: e.Amount__c, Due__c: e.Due__c, Phone__c: e.Phone__c}}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <os:store key="#['cdc-' ++ payload.changeType]" objectStore="Got"><os:value>#[write(payload, "application/json")]</os:value></os:store>
+    </flow>
+
+    <flow name="cdc">
+        <http:listener config-ref="HTTP" path="/cdc/{step}" allowedMethods="POST"/>
+        <set-variable variableName="step" value="#[attributes.uriParams.step]"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>SELECT Id FROM SyncItem__c WHERE Name = 'mulay cdc'</salesforce:salesforce-query>
+        </salesforce:query>
+        <choice>
+            <when expression="#[vars.step == 'create']">
+                <choice>
+                    <when expression="#[sizeOf(vars.found) > 0]">
+                        <salesforce:delete config-ref="SF"><salesforce:ids>#[vars.found map $.Id]</salesforce:ids></salesforce:delete>
+                    </when>
+                </choice>
+                <salesforce:create config-ref="SF" type="SyncItem__c">
+                    <salesforce:records>#[[{Name: "mulay cdc", Status__c: "new", Amount__c: 5, Due__c: |2026-12-24|}]]</salesforce:records>
+                </salesforce:create>
+            </when>
+            <when expression="#[vars.step == 'update']">
+                <salesforce:update config-ref="SF" type="SyncItem__c">
+                    <salesforce:records>#[[{Id: vars.found[0].Id, Status__c: "changed", Amount__c: 7}]]</salesforce:records>
+                </salesforce:update>
+            </when>
+            <otherwise>
+                <salesforce:delete config-ref="SF"><salesforce:ids>#[vars.found map $.Id]</salesforce:ids></salesforce:delete>
+            </otherwise>
+        </choice>
+        <set-payload value="#[output application/json --- {ok: payload.successful, errors: (payload.items default []) map ((it) -> it.message)}]"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

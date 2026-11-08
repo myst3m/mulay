@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  管理用の MCP サーバー (docs-admin、admin.path。既定 /admin/mcp)。RAG の文書を入れる・消す・一覧する・探す・作り直す。
+  エージェントが使う /mcp (tools.xml) とは別のサーバーにしてある: /mcp のツールは LLM に渡るので、ここに置くと
+  会話や文書に紛れた指示で文書を消されうる。パスの先頭も分けてあるので、ゲートウェイで /admin/* にだけポリシーを付けられる。
+
+  認証: Authorization: Bearer <admin.key>。admin.key が空 (既定) なら、どの要求も断る (管理用の口は閉じている)。
+  セッションの開始 (initialize) で 401 を返し、ツールの呼び出しでも確かめる (セッションを経ない呼び出しもあるため)。
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd">
+
+    <mcp:server-config name="Admin" serverName="docs-admin" serverVersion="1.0.0">
+        <mcp:streamable-http-server-connection listenerConfig="Http" mcpEndpointPath="${admin.path}" responseContentType="JSON"/>
+    </mcp:server-config>
+
+    <flow name="admin-session">
+        <mcp:on-new-session-listener config-ref="Admin">
+            <mcp:rejection rejectWithStatusCode="#[vars.rejectCode]" rejectWithMessage="#[vars.rejectMessage]"/>
+        </mcp:on-new-session-listener>
+        <choice>
+            <when expression="#[isEmpty(p('admin.key'))]">
+                <set-variable variableName="rejectCode" value="#[403]"/>
+                <set-variable variableName="rejectMessage" value="the admin MCP server is disabled: set admin.key"/>
+            </when>
+            <when expression="#[(payload.additionalProperties.authorization default '') != ('Bearer ' ++ p('admin.key'))]">
+                <set-variable variableName="rejectCode" value="#[401]"/>
+                <set-variable variableName="rejectMessage" value="Authorization: Bearer &lt;admin.key&gt; is required"/>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- ツールの呼び出しの認証 (attributes は MCP の RequestAttributes。additionalProperties が要求のヘッダ) -->
+    <sub-flow name="admin-auth">
+        <choice>
+            <when expression="#[isEmpty(p('admin.key'))]">
+                <raise-error type="ADMIN:DISABLED" description="the admin MCP server is disabled: set admin.key"/>
+            </when>
+            <when expression="#[(attributes.additionalProperties.authorization default '') != ('Bearer ' ++ p('admin.key'))]">
+                <raise-error type="ADMIN:UNAUTHORIZED" description="Authorization: Bearer &lt;admin.key&gt; is required"/>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <flow name="admin-add_document">
+        <mcp:tool-listener config-ref="Admin" name="add_document">
+            <mcp:description>Adds a document to the knowledge base that the agent's search_docs tool searches. The text is split into passages (docs.chunkSize characters), embedded and stored. A document with the same id is replaced. Returns {id, chunks, replaced}.</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"text":{"type":"string","description":"The document's text (plain text or Markdown)."},"id":{"type":"string","description":"Document id: 1 to 128 of A-Z a-z 0-9 _ . : -. Give the same id to replace a document. Leave it out to get a new id."},"source":{"type":"string","description":"Where the document came from (for example faq or a URL). Search results carry it."}},"required":["text"]}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="#[write(payload, 'application/json', {indent: false})]"/></mcp:responses>
+        </mcp:tool-listener>
+        <flow-ref name="admin-auth"/>
+        <set-variable variableName="doc" value="#[output application/java --- {id: payload.id default uuid(), text: payload.text default '', source: payload.source default 'mcp'}]"/>
+        <flow-ref name="docs-put"/>
+    </flow>
+
+    <flow name="admin-delete_document">
+        <mcp:tool-listener config-ref="Admin" name="delete_document">
+            <mcp:description>Deletes a document and its passages from the knowledge base. Returns {id, deleted} (deleted is false when there was no such document).</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"id":{"type":"string","description":"The document id (see list_documents)."}},"required":["id"]}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="#[write(payload, 'application/json', {indent: false})]"/></mcp:responses>
+        </mcp:tool-listener>
+        <flow-ref name="admin-auth"/>
+        <validation:matches-regex value="#[payload.id default '']" regex="[A-Za-z0-9_.:-]{1,128}"
+                                  message="id must be 1 to 128 letters, digits, '_', '.', ':' or '-'"/>
+        <set-variable variableName="docId" value="#[payload.id]"/>
+        <os:contains key="#[vars.docId]" objectStore="DocsIndex" target="existed"/>
+        <flow-ref name="docs-remove"/>
+        <choice>
+            <when expression="#[vars.existed]">
+                <os:remove key="#[vars.docId]" objectStore="DocsIndex"/>
+            </when>
+        </choice>
+        <set-payload value="#[output application/java --- {id: vars.docId, deleted: vars.existed}]"/>
+    </flow>
+
+    <flow name="admin-list_documents">
+        <mcp:tool-listener config-ref="Admin" name="list_documents">
+            <mcp:description>Lists the documents in the knowledge base, sorted by id: [{id, source, chars, chunks, added, model}] (model is the embedding model the passages were made with).</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{}}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="#[write(payload, 'application/json', {indent: false})]"/></mcp:responses>
+        </mcp:tool-listener>
+        <flow-ref name="admin-auth"/>
+        <os:retrieve-all objectStore="DocsIndex"/>
+        <set-payload value="#[output application/java --- (valuesOf(payload) map {id: $.id, source: $.source, chars: $.chars, chunks: $.chunks, added: $.added, model: $.model}) orderBy $.id]"/>
+    </flow>
+
+    <flow name="admin-search_documents">
+        <mcp:tool-listener config-ref="Admin" name="search_documents">
+            <mcp:description>Searches the knowledge base the same way the agent's search_docs tool does, and shows the scores: [{score, id, source, text}], closest first. Only passages scoring at least docs.minScore are returned.</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"query":{"type":"string","description":"What to look for."},"maxResults":{"type":"integer","minimum":1,"maximum":50,"description":"How many passages to return at most (default docs.maxResults)."}},"required":["query"]}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="#[write(payload, 'application/json', {indent: false})]"/></mcp:responses>
+        </mcp:tool-listener>
+        <flow-ref name="admin-auth"/>
+        <set-variable variableName="query" value="#[payload.query default '']"/>
+        <set-variable variableName="maxResults" value="#[payload.maxResults]"/>
+        <flow-ref name="docs-search"/>
+        <set-payload value="#[output application/java --- (payload.sources default []) map {score: $.score, id: $.metadata.docId, source: $.metadata.source, text: $.text}]"/>
+    </flow>
+
+    <flow name="admin-reindex_documents">
+        <mcp:tool-listener config-ref="Admin" name="reindex_documents">
+            <mcp:description>Embeds and stores every document again from its saved text, with the current embedding model (embed.model). Use it after changing the embedding model, or when the passage store was lost (for example after a redeploy). Returns {reindexed, model}.</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{}}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="#[write(payload, 'application/json', {indent: false})]"/></mcp:responses>
+        </mcp:tool-listener>
+        <flow-ref name="admin-auth"/>
+        <os:retrieve-all objectStore="DocsIndex"/>
+        <set-variable variableName="all" value="#[output application/java --- valuesOf(payload) orderBy $.id]"/>
+        <foreach collection="#[vars.all]">
+            <set-variable variableName="doc" value="#[output application/java --- {id: payload.id, text: payload.text, source: payload.source, added: payload.added}]"/>
+            <flow-ref name="docs-put"/>
+        </foreach>
+        <set-payload value="#[output application/java --- {reindexed: sizeOf(vars.all), model: p('embed.model')}]"/>
+    </flow>
+</mule>

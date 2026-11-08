@@ -1,0 +1,123 @@
+(ns mulay.lib.sshkex (:require [mulay.lib.sshwire :as w] [mulay.lib.hash :as hash]))
+
+(def MSG-KEXINIT 20)
+
+(defrecord Kexinit [cookie: Str lists: Vec(Vec(Str)) first-follows: Bool])
+
+(defn kexinit-payload Str [k: &Kexinit]
+  (let [head (str (w/byte MSG-KEXINIT) (:cookie k))
+        body (loop [i 0 out head] (if (>= i (count (:lists k))) out (recur (+ i 1) (str out (w/name-list (nth (:lists k) i))))))]
+    (str body (w/flag (:first-follows k)) (w/u32 0))))
+
+(defn parse-kexinit Values(Kexinit Bool) [p: &Str]
+  (let [empty: Vec(Vec(Str)) []]
+    (if (or (< (count p) 17) (not= (nth p 0) MSG-KEXINIT)) (values (->Kexinit "" empty false) false)
+      (let [[lists pos ok] (loop [i 0 acc empty pos 17]
+                             (if (>= i 10) (values acc pos true)
+                               (let [[l np ok] (w/get-name-list p pos)]
+                                 (if ok (recur (+ i 1) (conj acc l) np) (values acc pos false)))))
+            [follows p2 ok2] (w/get-bool p pos)
+            [res p3 ok3] (w/get-u32 p p2)]
+        (if (and ok ok2 ok3) (values (->Kexinit (subs p 1 17) lists follows) true)
+          (values (->Kexinit "" empty false) false))))))
+
+(defn aead? Bool [cipher: &Str]
+  (or (= cipher "chacha20-poly1305@openssh.com") (= cipher "aes128-gcm@openssh.com") (= cipher "aes256-gcm@openssh.com")))
+
+(defn key-len Int [cipher: &Str]
+  (cond (= cipher "chacha20-poly1305@openssh.com") 64
+        (or (= cipher "aes128-gcm@openssh.com") (= cipher "aes128-ctr")) 16
+        (= cipher "aes192-ctr") 24
+        (or (= cipher "aes256-gcm@openssh.com") (= cipher "aes256-ctr")) 32
+        :else 0))
+
+(defn iv-len Int [cipher: &Str]
+  (cond (= cipher "chacha20-poly1305@openssh.com") 0
+        (or (= cipher "aes128-gcm@openssh.com") (= cipher "aes256-gcm@openssh.com")) 12
+        :else 16))
+
+(defn mac-key-len Int [mac: &Str]
+  (cond (or (= mac "hmac-sha2-256") (= mac "hmac-sha2-256-etm@openssh.com")) 32
+        (or (= mac "hmac-sha2-512") (= mac "hmac-sha2-512-etm@openssh.com")) 64
+        :else 0))
+
+(defn client-lists Vec(Vec(Str)) [aes-first?: Bool]
+  (let [ciphers (if aes-first?
+                  ["aes128-gcm@openssh.com" "aes256-gcm@openssh.com" "chacha20-poly1305@openssh.com" "aes128-ctr" "aes192-ctr" "aes256-ctr"]
+                  ["chacha20-poly1305@openssh.com" "aes128-gcm@openssh.com" "aes256-gcm@openssh.com" "aes128-ctr" "aes192-ctr" "aes256-ctr"])
+        macs ["hmac-sha2-256-etm@openssh.com" "hmac-sha2-512-etm@openssh.com" "hmac-sha2-256" "hmac-sha2-512"]
+        none ["none"]
+        empty: Vec(Str) []]
+    [["curve25519-sha256" "curve25519-sha256@libssh.org" "diffie-hellman-group16-sha512" "diffie-hellman-group14-sha256"
+      "kex-strict-c-v00@openssh.com"]
+     ["ssh-ed25519" "ecdsa-sha2-nistp256" "rsa-sha2-512" "rsa-sha2-256"]
+     ciphers ciphers macs macs none none empty empty]))
+
+(defn- member? Bool [x: &Str xs: &Vec(Str)]
+  (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) x) true (recur (+ i 1))))))
+
+(defn- pick Str [c: &Vec(Str) s: &Vec(Str)]
+  (loop [i 0] (if (>= i (count c)) "" (if (member? (nth c i) s) (nth c i) (recur (+ i 1))))))
+
+(defrecord Agreed [kex: Str hostkey: Str enc-cs: Str enc-sc: Str mac-cs: Str mac-sc: Str strict: Bool])
+
+(def NAMES ["key exchange" "host key" "cipher (client to server)" "cipher (server to client)"
+            "MAC (client to server)" "MAC (server to client)" "compression (client to server)" "compression (server to client)"])
+
+(defn negotiate Values(Agreed Str) [client: &Kexinit server: &Kexinit]
+  (let [c (:lists client) s (:lists server)
+        got (loop [i 0 acc: Vec(Str) []] (if (>= i 8) acc (recur (+ i 1) (conj acc (pick (nth c i) (nth s i))))))
+        enc-cs (nth got 2) enc-sc (nth got 3)
+        mac-cs (if (aead? enc-cs) "" (nth got 4))
+        mac-sc (if (aead? enc-sc) "" (nth got 5))
+        missing (loop [i 0]
+                  (cond (>= i 8) -1
+                        (and (= (nth got i) "") (not (and (= i 4) (aead? enc-cs))) (not (and (= i 5) (aead? enc-sc)))) i
+                        :else (recur (+ i 1))))
+        strict (and (member? "kex-strict-c-v00@openssh.com" (nth c 0)) (member? "kex-strict-s-v00@openssh.com" (nth s 0)))
+        a (->Agreed (nth got 0) (nth got 1) enc-cs enc-sc mac-cs mac-sc strict)]
+    (if (>= missing 0) (values a (str "no common " (nth NAMES missing) " algorithm")) (values a ""))))
+
+(defn exchange-hash Str [hash-name: &Str vc: &Str vs: &Str ic: &Str is: &Str ks: &Str qc: &Str qs: &Str k: &Str]
+  (let [m (str (w/string vc) (w/string vs) (w/string ic) (w/string is) (w/string ks) (w/string qc) (w/string qs) (w/mpint k))
+        [x ok] (hash/digest hash-name m)]
+    x))
+
+(defn exchange-hash-dh Str [hash-name: &Str vc: &Str vs: &Str ic: &Str is: &Str ks: &Str e: &Str f: &Str k: &Str]
+  (let [m (str (w/string vc) (w/string vs) (w/string ic) (w/string is) (w/string ks) (w/mpint e) (w/mpint f) (w/mpint k))
+        [x ok] (hash/digest hash-name m)]
+    x))
+
+(defn- hexd Int [c: Int] (if (<= c 57) (- c 48) (- c 87)))
+(defn- unhex Str [h: &Str]
+  (loop [i 0 out ""] (if (>= i (count h)) out (recur (+ i 2) (str out (chr (+ (* 16 (hexd (nth h i))) (hexd (nth h (+ i 1))))))))))
+
+(def GROUP14-P: Str (unhex (str
+  "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f1437"
+  "4fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf05"
+  "98da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3b"
+  "e39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aacaa68ffffffffffffffff")))
+
+(def GROUP16-P: Str (unhex (str
+  "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f1437"
+  "4fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf05"
+  "98da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3b"
+  "e39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aaac42dad33170d04507a33"
+  "a85521abdf1cba64ecfb850458dbef0a8aea71575d060c7db3970f85a6e1e4c7abf5ae8cdb0933d71e8c94e04a25619dcee3d2261ad2ee6bf12ffa06d98a0864"
+  "d87602733ec86a64521f2b18177b200cbbe117577a615d6c770988c0bad946e208e24fa074e5ab3143db5bfce0fd108e4b82d120a92108011a723c12a787e6d7"
+  "88719a10bdba5b2699c327186af4e23c1a946834b6150bda2583e9ca2ad44ce8dbbbc2db04de8ef92e8efc141fbecaa6287c59474e6bc05d99b2964fa090c3a2"
+  "233ba186515be7ed1f612970cee2d7afb81bdd762170481cd0069127d5b05aa993b4ea988d8fddc186ffb7dc90a6c08f4df435c934063199ffffffffffffffff")))
+
+(defn dh-prime Str [kex: &Str]
+  (cond (= kex "diffie-hellman-group14-sha256") GROUP14-P
+        (= kex "diffie-hellman-group16-sha512") GROUP16-P
+        :else ""))
+
+(defn kex-hash Str [kex: &Str] (if (= kex "diffie-hellman-group16-sha512") "SHA512" "SHA256"))
+
+(defn derive Str [hash-name: &Str k: &Str h: &Str letter: &Str session-id: &Str n: Int]
+  (let [kh (str (w/mpint k) h)
+        [k1 ok] (hash/digest hash-name (str kh letter session-id))]
+    (loop [out k1]
+      (if (>= (count out) n) (subs out 0 n)
+        (let [[kn ok2] (hash/digest hash-name (str kh out))] (recur (str out kn)))))))

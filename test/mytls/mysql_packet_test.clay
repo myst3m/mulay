@@ -1,0 +1,40 @@
+(ns mysql-packet-test (:require [mulay.db.mysql :as my] [mulay.db.mywire :as w] [mulay.db.sql :as sql] [clay.net :as net]))
+
+;; 0xffffff バイトのパケットが続くと 1 つのパケットに継ぐ。継いだ大きさが maxAllowedPacket (既定 64 MiB) を
+;; 超えたら、読み続けずに PacketTooBigException (Connector/J の文言) にする。前は上限なく継いだので、偽の
+;; サーバーがメモリを使い切らせることができた
+(c-flags "-DCLAY_PARALLEL")
+
+(def FULL 16777215)
+
+(defn- header Str [len: Int seq: Int] (w/w8 (w/w24 "" len) seq))
+
+(defn- serve Str [srv: net/Sock packets: Int]
+  (let [[s ae] (net/accept srv)
+        body (str-from-bytes (repeat FULL 120))
+        e (loop [i 0] (if (>= i packets) "" (let [we (net/write s (str (header FULL i) body))] (if (not= we "") we (recur (+ i 1))))))
+        z (net/close s)]
+    (if (= e "") "sent all" "stopped")))
+
+(defn- run Str [packets: Int kvs: Vec(Str)]
+  (let [[srv le] (net/listen 0 4)
+        port (net/local-port srv)
+        f (future (fn Str [x: Int] (serve srv packets)) 0)
+        [cs e] (my/open "127.0.0.1" port "db" "mulay" "pw" kvs)
+        z (if (> (count cs) 0) (my/close (nth cs 0)) 0)
+        seen (deref f)
+        z2 (net/close srv)]
+    (str (:exc e) " " (:state e) " " (:msg e))))
+
+(deftest continuation-past-the-default-limit
+  (is (= (run 6 [])
+         "com.mysql.cj.jdbc.exceptions.PacketTooBigException S1000 Packet for query is too large (83886075 > 67108864). You can change this value on the server by setting the 'max_allowed_packet' variable.")))
+
+(deftest the-limit-from-max-allowed-packet
+  (is (= (run 1 ["maxAllowedPacket=1000"])
+         "com.mysql.cj.jdbc.exceptions.PacketTooBigException S1000 Packet for query is too large (16777215 > 1000). You can change this value on the server by setting the 'max_allowed_packet' variable.")))
+
+(deftest a-max-allowed-packet-that-is-not-a-number
+  (let [[cs e] (my/open "127.0.0.1" 1 "db" "mulay" "pw" ["maxAllowedPacket=abc"])]
+    (is (= (str (:exc e) " " (:state e) " " (:msg e))
+           "java.sql.SQLException S1009 The connection property 'maxAllowedPacket' only accepts integer values. The value 'abc' can not be converted to an integer."))))

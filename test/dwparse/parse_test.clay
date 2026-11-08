@@ -1,0 +1,175 @@
+(ns dwparse-test
+  (:require [clay.core] [clay.string :as str]
+            [mulay.dw.parse :as p] [mulay.dw.astdump :as d] [mulay.dw.ast :as a] [mulay.dw.src :as src]))
+
+;; golden (実 DW との一致) で見ないこと: 位置、診断の中身と回復、入れ子の上限、表示。
+
+(defn- dump Str [s: Str]
+  (let [[sc ds] (p/parse s)]
+    (if (= (count ds) 0) (d/dump-script sc) (str "ERR " (:msg (nth ds 0))))))
+
+(defn- ndiags Int [s: Str] (let [[sc ds] (p/parse s)] (count ds)))
+
+(defn- diag-at Str [s: Str]
+  (let [[sc ds] (p/parse s)]
+    (if (= (count ds) 0) "no diag"
+      (let [[ln col] (src/line-col s (:start (:sp (nth ds 0))))] (str ln ":" col)))))
+
+(defn- body-span Str [s: Str]
+  (let [[sc ds] (p/parse s) sp (:sp (:body sc))] (str (:start sp) "-" (:end sp))))
+
+(defn- rep Str [x: &Str n: Int] (loop [i 0 acc ""] (if (>= i n) acc (recur (+ i 1) (str acc x)))))
+
+(deftest spans
+  (is (= (body-span "a + b") "0-5"))
+  (is (= (body-span "  a  ") "2-3"))
+  (is (= (body-span "(a + b) * c") "0-11"))
+  (is (= (body-span "x.a.b[0]") "0-8"))
+  (is (= (body-span "f(1, 2)") "0-7"))
+  (is (= (body-span "\"a$(b)c\"") "0-8"))
+  (is (= (body-span "%dw 2.0\n---\n{a: 1}") "12-18"))
+  (is (= (body-span "-1") "0-2"))
+  (is (= (body-span "x map (v) -> v + 1") "0-18"))
+  ;; 部分木の位置: 中置呼び出しの関数名と右辺
+  (is (= (infix-spans "payload map $.a") "8-11 12-15")))
+
+(defn- infix-spans Str [s: Str]
+  (let [[sc ds] (p/parse s)]
+    (match (:e (:body sc))
+      (a/ECall f args) (str (:start (:sp f)) "-" (:end (:sp f)) " " (:start (:sp (nth args 1))) "-" (:end (:sp (nth args 1))))
+      _ "?")))
+
+(deftest literals
+  (is (= (dump "\"\\u00e9\\n\\t\\\"\\\\\\/\\$\"") "(script \"é\\n\\t\\\"\\\\/$\")"))
+  (is (= (dump "\"\\uD83D\\uDE00\"") "(script \"😀\")"))
+  (is (= (dump "\"\\q\"") "(script \"\\\\q\")"))
+  (is (= (dump "''") "(script \"\")"))
+  (is (= (dump "`a b`") "(script \"a b\")"))
+  (is (= (dump "|2020-01-01T10:00:00.5+09:00|") "(script (datetime \"2020-01-01T10:00:00.5+09:00\"))"))
+  (is (= (dump "|2020-01-01Z|") "(script (date \"2020-01-01\"))"))
+  (is (= (dump "|PT1H30M|") "(script (period \"PT1H30M\"))"))
+  ;; 期間: 日数と時刻部を混ぜた Duration の形 (P1DT2H) も読む。年・月と時刻部は混ぜられない (DW 2.11/2.12 と同じ)
+  (is (= (dump "|P1DT2H|") "(script (period \"P1DT2H\"))"))
+  (is (= (dump "|P1DT2H3M4.5S|") "(script (period \"P1DT2H3M4.5S\"))"))
+  (is (= (dump "|P-1D|") "(script (period \"P-1D\"))"))
+  (is (= (dump "|P1DT-2H|") "(script (period \"P1DT-2H\"))"))
+  (is (= (dump "|P1DT|") "(script (period \"P1DT\"))"))
+  (is (= (dump "|P1Y2M3D|") "(script (period \"P1Y2M3D\"))"))
+  (is (= (dump "|P1Y2M3DT4H|") "ERR Invalid date literal |P1Y2M3DT4H|, expected a Date, DateTime, LocalDateTime, Time, LocalTime, TimeZone or Period"))
+  (is (= (dump "|P1YT1S|") "ERR Invalid date literal |P1YT1S|, expected a Date, DateTime, LocalDateTime, Time, LocalTime, TimeZone or Period"))
+  (is (= (dump "|-P1D|") "ERR Invalid date literal |-P1D|, expected a Date, DateTime, LocalDateTime, Time, LocalTime, TimeZone or Period"))
+  (is (= (dump "|P1W|") "ERR Invalid date literal |P1W|, expected a Date, DateTime, LocalDateTime, Time, LocalTime, TimeZone or Period"))
+  (is (= (dump "|PT1.5H|") "ERR Invalid date literal |PT1.5H|, expected a Date, DateTime, LocalDateTime, Time, LocalTime, TimeZone or Period"))
+  (is (= (dump "|P1M1Y|") "ERR Invalid date literal |P1M1Y|, expected a Date, DateTime, LocalDateTime, Time, LocalTime, TimeZone or Period"))
+  ;; 実 DW: 1_000 と 01 は "Unexpected end of input, expected AlphaNum"、/a\/b[/]/ は "expected Function Call" (文言は未対応)
+  (is (= (dump "1_000") "ERR Missing Expression"))
+  (is (= (dump "01") "ERR Invalid input \"01\", expected Expression (line 1, column 1):\n"))
+  (is (= (dump "/a\\/b[/]/") "ERR Invalid input ']', expected end of input (line 1, column 8):\n")))
+
+(deftest names-and-calls
+  (is (= (dump "dw::core::Strings::camelize(\"a b\")") "(script (call dw::core::Strings::camelize \"a b\"))"))
+  (is (= (dump "mod(10, 3)") "(script (call mod 10 3))"))
+  (is (= (dump "10 mod 3") "(script (call mod 10 3))"))
+  (is (= (dump "a myFun b myFun c") "(script (call myFun (call myFun a b) c))"))
+  (is (= (dump "compose `x/$(a)/y`") "(script (call compose (arr \"x/\" \"/y\") (arr a)))"))
+  (is (= (dump "%dw 2.5\n---\nf<String>(1)") "(script :version \"2.5\" (call f 1))"))
+  (is (= (dump "%dw 2.0\n---\nf<String>(1)") "(script :version \"2.0\" (> (< f String) 1))"))
+  (is (= (dump "java!a::B::m(1)") "(script (call java!a::B::m 1))"))
+  (is (= (dump "x.map") "(script (sel x .map))"))
+  (is (= (dump "x.'input'") "(script (sel x .input))")))
+
+(deftest header-forms
+  (is (= (dump "output application/json\n---\n1") "(script (dirs (output \"application/json\")) 1)"))
+  (is (= (dump "%dw 2.0\ninput payload: String application/csv separator=\";\", header=false\noutput application/json with binary indent=2\n---\n1")
+         "(script :version \"2.0\" (dirs (input payload :type String \"application/csv\" (obj (separator \";\") (header false))) (output \"application/json\" :with binary (obj (indent 2)))) 1)"))
+  (is (= (dump "import * from jsonschema!a::b\nimport c as d from e::f\nimport g::h as H\n---\n1")
+         "(script (decls (import jsonschema!a::b :star) (import e::f :names ((c :as d))) (import g::h :as H)) 1)"))
+  (is (= (dump "fun f<T>(@StreamCapable x: T = 1): T = x\n---\nf(2)")
+         "(script (decls (fun f :generics (T) ((x :type T :default 1)) :ret T x)) (call f 2))"))
+  (is (= (dump "@Since(version = \"2.1\") fun f() = 1\n---\n1")
+         "(script (decls (fun f :annots ((@Since (obj (version \"2.1\")))) () 1)) 1)"))
+  (is (= (dump "type T = {| a?: String, b*: Number |}\ntype U = T.a\n---\n1")
+         "(script (decls (type T (tobj :closed (a? String) (b* Number))) (type U (tsel T a))) 1)"))
+  (is (= (dump "ns x http://a/b?c=1#d\n---\n{x#a @(x#b: 1, (c: 2) if d, ((e))): 1}")
+         "(script (decls (ns x \"http://a/b?c=1#d\")) (obj (x#a :attrs ((x#b 1) (c 2 :if d) (spread e)) 1)))"))
+  (is (= (dump "%dw 2.0\noutput application/json") "ERR Missing Mapping Expression ie. var a = 1 --- a"))
+  (is (= (dump "---\n1") "ERR Invalid input \"---\", expected document (line 1, column 1):\n"))
+  (is (= (dump "type Name = String\n---\n1") "ERR Cannot use `Name` as a type name. It is a system reserved type.")))
+
+(defn- dump-mod Str [s: Str]
+  (let [[sc ds] (p/parse-module s)]
+    (if (= (count ds) 0) (d/dump-script sc) (str "ERR " (:msg (nth ds 0))))))
+
+(deftest modules
+  (is (= (dump-mod "fun f(x) = x\nvar y = 1") "(script (decls (fun f (x) x) (var y 1)) null)"))
+  (is (= (dump-mod "fun f(x) = x\n---\n1") "ERR A module can not have a body ('---')")))
+
+(deftest diag-positions
+  (is (= (diag-at "a +") "1:4"))
+  (is (= (diag-at "%dw 2.0\n---\n{a: 1,\n b: }") "4:4"))
+  (is (= (diag-at "x.if") "1:3"))
+  (is (= (diag-at "\"é\" ++ ") "1:7"))
+  (is (= (diag-at "[1, 2") "1:6"))
+  (is (= (diag-at "\"abc") "1:5"))
+  (is (= (dump "x.if") (str "ERR Invalid field name identifier. Reason: The name `if` is a reserved word. List of reserved words: "
+                             "\n - if\n - else\n - unless\n - using\n - ---\n - as\n - is\n - null\n - true\n - false\n - default"
+                             "\n - case\n - fun\n - input\n - output\n - ns\n - type\n - import\n - var\n - and\n - or\n - throw"
+                             "\n - do\n - for\n - yield\n - enum\n - private\n - async. Possible solution wrap `if` into quotes e.g payload.'if'")))
+  (is (= (dump "\"abc") "ERR Unexpected end of input, expected cut (line 1, column 5):\n"))
+    ;; 実 DW: Invalid input "- 1", expected document (文言は未対応)
+  (is (= (dump "- 1") "ERR Invalid input \"- 1\", expected a number right after '-' (line 1, column 1):\n")))
+
+;; 最初の誤りで止まらず、後ろの誤りも報告し、正しい部分の木も作る
+(deftest recovery
+  (is (= (ndiags "{a: , b: 2, c: }") 2))
+  (is (= (ndiags "[1, }, 3, )]") 2))
+  (is (= (ndiags "f(1,, 2)") 1))
+  (is (>= (ndiags "%dw 2.0\nvar a = \nvar b = 2\nfun f( = 1\n---\n{x: [1,,], y: }") 3))
+  (is (= (dump-any "{a: , b: 2}") "1 (script (obj (a (err \"expected expression\")) (b 2)))"))
+  (is (= (dump-any "%dw 2.0\noutput application/json\npayload") "1 (script :version \"2.0\" (dirs (output \"application/json\")) payload)")))
+
+;; 診断があっても木をダンプする: "<診断の数> <ダンプ>"
+(defn- dump-any Str [s: Str]
+  (let [[sc ds] (p/parse s)] (str (count ds) " " (d/dump-script sc))))
+
+(deftest nesting-limit
+  ;; 上限の手前はすべて読める
+  (is (= (ndiags (str (rep "[" 300) (rep "]" 300))) 0))
+  (is (= (ndiags (str (rep "(" 300) "1" (rep ")" 300))) 0))
+  (is (= (ndiags (str (rep "{a: " 300) "1" (rep "}" 300))) 0))
+  (is (= (ndiags (str (rep "\"$(" 150) "1" (rep ")\"" 150))) 0))
+  (is (= (ndiags (str (rep "if (a) b else " 300) "c")) 0))
+  (is (= (ndiags (str "x as " (rep "Array<" 300) "String" (rep ">" 300))) 0))
+  (is (= (ndiags (str (rep "- " 300) "a")) 0))
+  (is (= (ndiags (str (rep "(x) -> " 300) "1")) 0))
+  ;; 上限を超えると C スタックを使い切る前に 1 つの診断で止まる
+  (is (= (dump (str (rep "[" 100000) (rep "]" 100000))) "ERR The expression is nested too deeply (the limit is 400 levels)"))
+  (is (= (ndiags (str (rep "[" 100000) (rep "]" 100000))) 1))
+  (is (= (ndiags (str (rep "- " 50000) "a")) 1))
+  (is (= (ndiags (str "x as " (rep "Array<" 50000) "String")) 1))
+  ;; 反復で読むもの (連鎖) も、後の段 (名前解決・評価) は鎖の長さだけ再帰するので、深さに数える
+  (is (= (ndiags (str "a" (rep " + a" 300))) 0))
+  (is (= (ndiags (str "a" (rep ".b" 300))) 0))
+  (is (= (ndiags (str "a" (rep " map f" 300))) 0))
+  (is (= (ndiags (str "a" (rep "[0]" 300))) 0))
+  (is (= (ndiags (str "a" (rep "()" 300))) 0))
+  (is (= (ndiags (str "a" (rep " as Any" 300))) 0))
+  (is (= (dump (str "a" (rep " + a" 20000))) "ERR The expression is nested too deeply (the limit is 400 levels)"))
+  (is (= (ndiags (str "a" (rep " + a" 20000))) 1))
+  (is (= (ndiags (str "a" (rep ".b" 20000))) 1))
+  (is (= (ndiags (str "a" (rep " map f" 20000))) 1))
+  (is (= (ndiags (str "a" (rep "[0]" 20000))) 1))
+  (is (= (ndiags (str "a" (rep "()" 20000))) 1))
+  (is (= (ndiags (str "a" (rep " as Any" 20000))) 1))
+  (is (= (ndiags (str (rep "[" 200) "a" (rep ".b" 300) (rep "]" 200))) 1)))
+
+(defn- render Str [s: Str]
+  (let [[sc ds] (p/parse s)] (src/render-diags s "main.dwl" ds)))
+
+(defn- lc Str [s: Str off: Int] (let [[l c] (src/line-col s off)] (str l ":" c)))
+
+(deftest render
+  (is (= (render "%dw 2.0\n---\npayload map ($ +")
+         "Unexpected end of input, expected ')' for the enclosed expression. (line 3, column 17):\n\n\n3| payload map ($ +\n                   ^\nLocation:\nmain.dwl (line: 3, column: 17)"))
+  (is (= (lc "ab\ncé\nd" 5) "2:3"))
+  (is (= (lc "ab\ncé\nd" 7) "3:1")))

@@ -1,0 +1,37 @@
+(ns mulay.conn.catalog (:require [mulay.conn.catalog_gen :as g] [mulay.mule.amodel :as am] [mulay.lib.xml :as xml] [clay.string :as str]))
+
+(def PURE ["validation" "os" "vm" "mule-apikit" "munit" "munit-tools" "jmx"])
+
+(defn- has? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn- attr-val Str [as: &Vec(xml/XAttr) local: &Str default: Str]
+  (loop [i 0] (if (>= i (count as)) default (let [q (:name (nth as i))] (if (and (= (:uri q) "") (= (:local q) local)) (str (:value (nth as i))) (recur (+ i 1)))))))
+
+(defn- sf-read? Bool [op: &Str]
+  (or (str/starts-with? op "query") (str/starts-with? op "retrieve") (str/starts-with? op "describe")
+      (str/starts-with? op "search") (str/starts-with? op "get-")))
+
+(defn op-effect Str [name: &Str op: &Str as: &Vec(xml/XAttr)]
+  (cond
+    (has? PURE name) "none"
+    (= name "http") (if (= op "request")
+                      (let [mt (str/upper-case (str/trim (attr-val as "method" "GET")))]
+                        (if (or (= mt "GET") (= mt "HEAD") (= mt "OPTIONS")) "read" "write"))
+                      "write")
+    (= name "db") (if (= op "select") "read" "write")
+    (= name "mcp") (if (= op "list-tools") "read" "write")
+    (= name "salesforce") (if (sf-read? op) "read" "write")
+    (or (= name "file") (= name "sftp")) (if (or (= op "read") (= op "list")) "read" "write")
+    :else "write"))
+
+(defn conn-name Vec(Str) [uri: &Str]
+  (let [cs g/CONNS] (loop [i 0] (if (>= i (count cs)) [] (if (= (nth (nth cs i) 1) uri) [(str (nth (nth cs i) 0))] (recur (+ i 1)))))))
+
+(defn component-info am/Info [uri: Str local: Str as: Vec(xml/XAttr)]
+  (let [n (conn-name uri)]
+    (if (= (count n) 0) (am/->Info "unsupported" "none")
+      (let [e (op-effect (nth n 0) local as)]
+        (am/->Info (if (= e "none") "browser" "relay") e)))))
+
+(defn conn-name-of Vec(Str) [name: &Str]
+  (let [cs g/CONNS] (loop [i 0] (if (>= i (count cs)) [] (if (= (nth (nth cs i) 0) name) [(str name)] (recur (+ i 1)))))))

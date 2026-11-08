@@ -1,0 +1,25 @@
+(ns depth-test (:require [mulay.lib.sqlparse :as sp]))
+
+;; 期待値は SQLite 3.53 (python3 の sqlite3) で確かめたもの。式の木の高さは 1000 まで。括弧・CASE・関数の入れ子は
+;; mulay では合わせて 250 段まで (SQLite の構文解析の上限は構文ごとに違う。docs/compat/deviations.md)
+(defn- pr Str [sql: Str] (let [[st e] (sp/parse sql)] (if (= e "") "OK" (str "E:" e))))
+(defn- rep Str [s: Str sep: Str n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (if (= i 0) (str s) (str out sep s))))))
+(defn- nest Str [open: Str mid: Str close: Str n: Int] (str (rep open "" n) mid (rep close "" n)))
+
+(def TOO-LARGE "E:Expression tree is too large (maximum depth 1000)")
+
+(deftest expression-depth
+  (is (= (pr (str "SELECT 1 WHERE " (rep "1=2" " OR " 999))) "OK"))
+  (is (= (pr (str "SELECT 1 WHERE " (rep "1=2" " OR " 1000))) TOO-LARGE))
+  (is (= (pr (str "SELECT 1 WHERE " (rep "1=2" " OR " 100000))) TOO-LARGE))
+  (is (= (pr (str "SELECT " (rep "1" "+" 1000))) "OK"))
+  (is (= (pr (str "SELECT " (rep "1" "+" 1001))) TOO-LARGE))
+  (is (= (pr (str "SELECT " (rep "1" " AND " 1001))) TOO-LARGE))
+  (is (= (pr (str "SELECT " (rep "- " "" 2000) "1")) TOO-LARGE))
+  (is (= (pr (str "SELECT " (rep "NOT " "" 2000) "1")) TOO-LARGE))
+  (is (= (pr (str "SELECT " (nest "(" "1" ")" 250))) "OK"))
+  (is (= (pr (str "SELECT " (nest "(" "1" ")" 251))) "E:Recursion limit"))
+  (is (= (pr (str "SELECT " (nest "(" "1" ")" 100000))) "E:Recursion limit"))
+  (is (= (pr (str "SELECT " (nest "CASE WHEN 1 THEN " "1" " END" 5000))) "E:Recursion limit"))
+  (is (= (pr (str "SELECT " (nest "abs(" "1" ")" 5000))) "E:Recursion limit"))
+  (is (= (pr (str "SELECT 1 WHERE x IN (" (rep "1" "," 100000) ")")) "OK")))

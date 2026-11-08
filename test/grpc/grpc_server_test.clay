@@ -1,0 +1,61 @@
+(ns grpc-server-test (:require [mulay.conn.registry :as creg] [mulay.conn.grpc :as g] [clay.httpmsg :as hm] [mulay.dw.val :as v] [mulay.mule.load :as ld] [mulay.lib.res :as res] [mulay.mule.model :as m]))
+
+(defn- rq Str [body: Str max: Int] (let [[c m b] (g/read-request body max)] (str c "|" m "|" b)))
+
+(defn- hs Str [xs: Vec(hm/Header)]
+  (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (str out (:hd-name (nth xs i)) ": " (:hd-value (nth xs i)) ";")))))
+
+(defn- hdr Str [n: Int] (str (chr 0) (chr 0) (chr 0) (chr 0) (chr n)))
+
+;; 要求の本文の読み方。期待値は実 Mule 4.11.3 + mule-grpc-connector 1.0.4 (test/fixtures/apps/grpc-basic、grpc-java の文言)
+(deftest request-message
+  (is (= (rq (g/frame "abc") 64) "0||abc"))
+  (is (= (rq (g/frame "") 64) "0||"))
+  (is (= (rq "" 64) "13|Half-closed without a request|"))
+  (is (= (rq (str (hdr 9) "abc") 64) "13|Encountered end-of-stream mid-frame|"))
+  (is (= (rq (str (chr 0) (chr 0)) 64) "13|Encountered end-of-stream mid-frame|"))
+  (is (= (rq (str (chr 1) (chr 0) (chr 0) (chr 0) (chr 2) "ab") 64) "13|Can't decode compressed gRPC message as compression not configured|"))
+  (is (= (rq (str (g/frame "one") (g/frame "two")) 64) "13|Too many requests|"))
+  (is (= (rq (g/frame (str "0123456789" "0123456789" "0123456789" "0123456789" "0123456789" "0123456789" "01")) 61) "8|gRPC message exceeds maximum size 61: 62|"))
+  (is (= (rq (str (chr 2) (chr 0) (chr 0) (chr 0) (chr 1) "a") 64) "13|gRPC frame header malformed: reserved bits not zero|")))
+
+(deftest replies
+  (is (= (hs (g/status-trailers 0 "")) "grpc-status: 0;"))
+  (is (= (hs (g/status-trailers 5 "no such ü 100%")) "grpc-status: 5;grpc-message: no such %C3%BC 100%25;"))
+  (is (= (hs (g/response-headers)) "content-type: application/grpc;grpc-encoding: identity;grpc-accept-encoding: identity,deflate,gzip;"))
+  (is (= (g/error-status "NOT_FOUND") 5))
+  (is (= (g/error-status "") 2))
+  (is (= (g/error-status "OK") 2)))
+
+(deftest attributes
+  (let [a (g/server-attributes "demo.Lab/Inspect" [(hm/->Header ":path" "/demo.Lab/Inspect") (hm/->Header "Content-Type" "application/grpc")
+                                                   (hm/->Header "x-trace" "abc")])]
+    (is (v/equal? (v/unmeta a) (v/->VObj [(v/field "headers" (v/->VObj [(v/field "content-type" (v/str-v "application/grpc")) (v/field "x-trace" (v/str-v "abc"))]))
+                                   (v/field "methodName" (v/str-v "demo.Lab/Inspect")) (v/field "connectionId" (v/str-v ""))])))))
+
+(def APP (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\" xmlns:grpc=\"http://www.mulesoft.org/schema/mule/grpc\">\n"
+              "<http:listener-config name=\"G\"><http:listener-connection host=\"0.0.0.0\" port=\"9101\"/></http:listener-config>\n"
+              "<grpc:server-config name=\"Srv\" maxInboundMessageSize=\"64\"><grpc:grpc-server-connection listenerConfig=\"G\"><grpc:idl-definition>"
+              "<grpc:single-binary-protobuf protobufDescriptorFile=\"test/fixtures/apps/grpc-basic/src/main/resources/demo.desc\"/></grpc:idl-definition></grpc:grpc-server-connection></grpc:server-config>\n"
+              "<flow name=\"hello\"><grpc:unary-method config-ref=\"Srv\" methodName=\"demo.Greeter/SayHello\"/><logger message=\"x\"/></flow>\n"
+              "</mule>"))
+
+(defn- app m/App [] (:app (ld/load-texts "t" ["a.xml"] [APP] (res/res-none) (ld/->LoadOpts [] false (creg/hints)))))
+
+(defn- find-m Vec(g/GMethod) [ms: &Vec(g/GMethod) full: &Str]
+  (loop [i 0] (if (>= i (count ms)) [] (if (= (:full (nth ms i)) full) [(nth ms i)] (recur (+ i 1))))))
+
+;; 記述子のメソッドごとに、そのメソッドを受けるフロー (unary-method の methodName) と上限を引く
+(deftest method-table
+  (let [[ms errs] (g/server-methods (app))
+        h (find-m ms "demo.Greeter/SayHello")
+        n (find-m ms "demo.Lab/NoFlow")]
+    (is (= errs []))
+    (is (= (count h) 1))
+    (is (= (:flow (nth h 0)) 0))
+    (is (= (:src-kind (nth h 0)) "unary-method"))
+    (is (= (:max-in (nth h 0)) 64))
+    (is (= (:listener (nth h 0)) "G"))
+    (is (= (:input (nth h 0)) "demo.HelloRequest"))
+    (is (= (count n) 1))
+    (is (= (:flow (nth n 0)) -1))))

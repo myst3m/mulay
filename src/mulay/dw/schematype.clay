@@ -1,0 +1,93 @@
+(ns mulay.dw.schematype (:require [mulay.lib.yaml :as y] [clay.string :as str]))
+
+(defn- field Values(y/YVal Bool) [m: &y/YVal k: &Str] (y/get-key m k))
+
+(defn- text-of Str [x: &y/YVal] (match x (y/YStr s) (str s) (y/YInt t) (str t) (y/YFloat t) (str t) _ ""))
+
+(defn- ident? Bool [k: &Str]
+  (and (> (count k) 0)
+       (let [c (nth k 0)] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 95)))
+       (loop [i 1] (if (>= i (count k)) true
+                     (let [c (nth k i)] (if (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 95)) (recur (+ i 1)) false))))))
+
+(defn- dw-str Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1) (cond (= c 34) (str out "\\\"") (= c 92) (str out "\\\\") (= c 36) (str out "\\$") (= c 10) (str out "\\n") :else (str out (chr c))))))))
+
+(defn- key-text Str [k: &Str] (if (ident? k) (str k) (dw-str k)))
+
+(defn- literal Str [x: &y/YVal]
+  (match x
+    (y/YStr s) (dw-str s)
+    (y/YInt t) (str t)
+    (y/YFloat t) (str t)
+    (y/YBool b) (if b "true" "false")
+    (y/YNull) "Null"
+    _ "Any"))
+
+(defn- join-types Str [ts: &Vec(Str) op: &Str]
+  (cond (= (count ts) 0) "Nothing"
+        (= (count ts) 1) (str (nth ts 0))
+        :else (loop [i 0 out "("] (if (>= i (count ts)) (str out ")") (recur (+ i 1) (str out (if (> i 0) (str " " op " ") "") (nth ts i)))))))
+
+(defn- items-of Vec(y/YVal) [x: &y/YVal] (match x (y/YSeq xs) xs _ []))
+
+(defn- simple Str [t: &Str]
+  (cond (= t "string") "String" (= t "integer") "Number" (= t "number") "Number" (= t "boolean") "Boolean"
+        (= t "null") "Null" (= t "array") "Array" (= t "object") "Object" :else "Any"))
+
+(defn- ref-name Str [r: &Str]
+  (let [k (str/last-index-of r "/")] (if (< k 0) (str r) (subs r (+ k 1) (count r)))))
+
+(defn type-of Str [s: &y/YVal]
+  (let [[rf hr] (field s "$ref") [cn hc] (field s "const") [en he] (field s "enum")
+        [an ha] (field s "anyOf") [on ho] (field s "oneOf") [al hl] (field s "allOf")
+        [ty ht] (field s "type") [ps hp] (field s "properties")]
+    (cond
+      hr (ref-name (text-of rf))
+      hc (literal cn)
+      he (join-types (loop [i 0 acc: Vec(Str) []] (let [xs (items-of en)] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (literal (nth xs i))))))) "|")
+      ha (join-types (sub-types an) "|")
+      ho (join-types (sub-types on) "|")
+      hl (join-types (sub-types al) "&")
+      (and ht (match ty (y/YSeq xs) true _ false))
+      (join-types (loop [i 0 acc: Vec(Str) []] (let [xs (items-of ty)] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (one-type s (text-of (nth xs i)))))))) "|")
+      ht (one-type s (text-of ty))
+      hp (object-type s)
+      :else "Any")))
+
+(defn- sub-types Vec(Str) [x: &y/YVal]
+  (let [xs (items-of x)] (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (type-of (nth xs i))))))))
+
+(defn- one-type Str [s: &y/YVal t: &Str]
+  (if (= t "object") (let [[ps hp] (field s "properties")] (if hp (object-type s) "Object")) (simple t)))
+
+(defn- object-type Str [s: &y/YVal]
+  (let [[ps hp] (field s "properties")
+        [rq hq] (field s "required")
+        [ap ha] (field s "additionalProperties")
+        req (loop [i 0 acc: Vec(Str) []] (let [xs (items-of rq)] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (text-of (nth xs i)))))))
+        closed (match ap (y/YBool b) (not b) _ false)
+        body (match ps
+               (y/YMap ks vs) (loop [i 0 out ""]
+                                (if (>= i (count ks)) out
+                                  (let [k (text-of (nth ks i))
+                                        opt (loop [j 0] (if (>= j (count req)) true (if (= (nth req j) k) false (recur (+ j 1)))))]
+                                    (recur (+ i 1) (str out (if (> i 0) ", " "") (key-text k) (if opt "?" "") ": " (type-of (nth vs i)))))))
+               _ "")]
+    (if closed (str "{| " body " |}") (str "{ " body " }"))))
+
+(defn- defs-into Str [out: Str s: &y/YVal k: &Str]
+  (let [[ds hd] (field s k)]
+    (match ds
+      (y/YMap ks vs) (loop [i 0 o out] (if (>= i (count ks)) o (recur (+ i 1) (str o "type " (text-of (nth ks i)) " = " (type-of (nth vs i)) "\n"))))
+      _ out)))
+
+(defn json-schema-module Values(Str Str) [text: &Str]
+  (let [[s e] (y/parse text)]
+    (if (not= e "") (values "" e)
+      (let [o1 (defs-into "%dw 2.0\n" s "definitions")
+            o2 (defs-into o1 s "$defs")]
+        (values (str o2 "type Root = " (type-of s) "\n") "")))))

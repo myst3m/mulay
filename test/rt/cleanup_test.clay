@@ -1,0 +1,71 @@
+(ns cleanup-test (:require [mulay.rt.ops :as ops] [mulay.rt.engine :as en] [mulay.rt.stream :as stream] [mulay.rt.ostore :as os] [mulay.dw.val :as v]
+                           [clay.http :as http] [clay.httpmsg :as hm]))
+
+(def SLOTS (atom 0))
+(def CLOSED (atom 0))
+(def UNDONE (atom 0))
+(def PORT 18977)
+
+(defn- work Int [k: Int] (let [s "ab"] (nth s k)))
+
+(defn- src stream/Source []
+  (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (let [z: Vec(v/Val) []] (values z false "")))
+                   (fn Int [broken: Bool] (swap! CLOSED (fn Int [x: Int] (+ x 1)))) false))
+
+(defn- route hm/Response [req: hm/Request]
+  (let [body (case (:uri req)
+               "/bg" (str (ops/spawn-bg-try-in SLOTS 10 (fn Int [k: Int] (work 5))))
+               "/tracked" (str (ops/tracked (fn Int [] (work 5))))
+               "/owned" (str (stream/owned "o1" (fn Int [] (let [id (stream/open "o1" (src))] (work 5)))))
+               "/sem-fail" (str (en/with-sem "k" 1 (fn Int [] (work 5))))
+               "/sem-ok" (str (en/with-sem "k" 1 (fn Int [] 7)))
+               "/turn-fail" (str (os/with-turn (fn Int [] (work 5))))
+               "/turn-ok" (str (os/with-turn (fn Int [] 7)))
+               "/on-fail" (str (ops/on-fail (fn Int [] (work 5)) (fn Int [] (swap! UNDONE (fn Int [x: Int] (+ x 1))))))
+               "/on-fail-ok" (str (ops/on-fail (fn Int [] (work 1)) (fn Int [] (swap! UNDONE (fn Int [x: Int] (+ x 10))))))
+               "?")]
+    (hm/response 200 [] body false)))
+
+(defn- get-status Int [path: Str]
+  (let [[r e] (http/get (str "http://127.0.0.1:" PORT path))] (if (= e "") (:status r) -1)))
+
+(defn- settle Bool [f: Fn(Bool)]
+  (loop [t 0] (cond (f) true (> t 3000) false :else (let [z (sleep-ms 1)] (recur (+ t 1))))))
+
+(deftest cleanup-runs-when-the-work-fails
+  (let [sv (http/new-server)
+        o (assoc (assoc (http/default-server-opts) :port PORT) :server sv)
+        z0 (future-detach (future (fn Int [o2: http/ServerOpts] (let [[rc e] (http/run-server route o2)] rc)) o))
+        [p we] (http/wait-listening sv 5000)
+        s1 (get-status "/bg")
+        bg (settle (fn Bool [] (= (deref SLOTS) 0)))
+        s2 (get-status "/tracked")
+        tr (= (ops/in-flight) 0)
+        s3 (get-status "/owned")
+        ow (and (= (stream/live) 0) (= (deref CLOSED) 1))
+        s4 (get-status "/sem-fail")
+        r5 (future (fn Int [u: Str] (get-status u)) "/sem-ok")
+        sd (loop [t 0] (cond (future-done? r5) true (> t 3000) false :else (let [z (sleep-ms 1)] (recur (+ t 1)))))
+        s5 (if sd (deref r5) (let [c (future-detach r5)] -2))
+        s6 (get-status "/turn-fail")
+        r7 (future (fn Int [u: Str] (get-status u)) "/turn-ok")
+        td (loop [t 0] (cond (future-done? r7) true (> t 3000) false :else (let [z (sleep-ms 1)] (recur (+ t 1)))))
+        s7 (if td (deref r7) (let [c (future-detach r7)] -2))
+        s8 (get-status "/on-fail")
+        s9 (get-status "/on-fail-ok")
+        ud (deref UNDONE)
+        stopped (http/stop sv 1000)]
+    (is (= we ""))
+        (is (= s1 200))
+        (is bg)
+        (is (= s2 500))
+        (is tr)
+        (is (= s3 500))
+        (is ow)
+        (is (= s4 500))
+        (is (= s5 200))
+        (is (= s6 500))
+        (is (= s7 200))
+        (is (= s8 500))
+        (is (= s9 200))
+        (is (= ud 1))))

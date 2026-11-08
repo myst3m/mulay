@@ -1,0 +1,203 @@
+(ns mulay.dw.fmt.multipart
+  (:require [mulay.lib.host :as host] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.fmt.props :as p] [mulay.dw.fmt.csv :as csv]
+            [clay.string :as str]))
+
+(defn- index-from Int [s: &Str pat: &Str from: Int]
+  (if (> from (count s)) -1 (str/index-of-after s pat from)))
+
+(defn- delim-at? Bool [s: &Str i: Int delim: &Str]
+  (and (starts-at? s i delim)
+       (let [j (+ i (count delim))]
+         (or (starts-at? s j "--")
+             (let [k (loop [k j] (if (and (< k (count s)) (let [c (nth s k)] (or (= c 32) (= c 9)))) (recur (+ k 1)) k))]
+               (or (>= k (count s)) (= (nth s k) 10) (starts-at? s k "\r\n")))))))
+
+(defn- next-delim Int [s: &Str delim: &Str from: Int]
+  (loop [f from]
+    (let [j (index-from s (str "\n" delim) f)]
+      (cond (< j 0) -1
+            (delim-at? s (+ j 1) delim) j
+            :else (recur (+ j 1))))))
+
+(defn- first-delim Int [s: &Str delim: &Str]
+  (if (delim-at? s 0 delim) 0
+    (let [j (next-delim s delim 0)] (if (< j 0) -1 (+ j 1)))))
+
+(defn- starts-at? Bool [s: &Str pos: Int pat: &Str]
+  (and (<= (+ pos (count pat)) (count s))
+       (loop [i 0] (if (>= i (count pat)) true (if (= (nth s (+ pos i)) (nth pat i)) (recur (+ i 1)) false)))))
+
+(defn- trim-eol Str [s: &Str]
+  (if (str/ends-with? s "\r\n") (subs s 0 (- (count s) 2))
+    (if (str/ends-with? s "\n") (subs s 0 (- (count s) 1)) (str s))))
+
+(defn- find-boundary Str [s: &Str given: &Str]
+  (if (and (not= given "") (>= (str/index-of s (str "--" given)) 0)) (str given)
+    (let [lines: Vec(Str) (str/split (str/replace (str s) "\r\n" "\n") "\n")]
+      (loop [i 0]
+        (if (>= i (count lines)) (str given)
+          (let [ln (nth lines i)]
+            (if (str/starts-with? ln "--") (str/trim (subs ln 2 (count ln))) (recur (+ i 1)))))))))
+
+(defn- disposition v/Val [val: &Str]
+  (let [ps: Vec(Str) (str/split (str val) ";")
+        sub (str/trim (nth ps 0))
+        fs (loop [i 1 acc: Vec(v/Field) []]
+             (if (>= i (count ps)) acc
+               (let [pp (str/trim (nth ps i)) eq (str/index-of pp "=")]
+                 (if (< eq 0) (recur (+ i 1) acc)
+                   (let [k (str/trim (subs pp 0 eq))
+                         x0 (str/trim (subs pp (+ eq 1) (count pp)))
+                         x (if (and (>= (count x0) 2) (= (nth x0 0) 34) (= (nth x0 (- (count x0) 1)) 34)) (subs x0 1 (- (count x0) 1)) x0)]
+                     (recur (+ i 1) (conj acc (v/field k (v/->VStr x)))))))))]
+    (v/->VObj (conj fs (v/field "subtype" (v/->VStr sub))))))
+
+(defn- mime-base Str [m: &Str]
+  (let [i (str/index-of m ";")] (str/lower-case (str/trim (if (< i 0) (str m) (subs m 0 i))))))
+
+(def MAX-NEST 100)
+
+(defn read Values(v/Val Str) [text: &Str props: &Vec(v/Field) mime: &Str rd: Fn(Str Str Int Values(v/Val Str))]
+  (read-at text props mime rd 0))
+
+(defn read-at Values(v/Val Str) [text: &Str props: &Vec(v/Field) mime: &Str rd: Fn(Str Str Int Values(v/Val Str)) depth: Int]
+ (if (> depth MAX-NEST) (values (v/null-v) (str "Multipart content is nested too deeply (the limit is " MAX-NEST " levels)"))
+  (let [[given e1] (p/pstr props "boundary" "")
+        [dct e2] (p/pstr props "defaultContentType" "application/octet-stream")
+        b (find-boundary text given)]
+    (if (= b "") (values (v/null-v) "No boundary found in multipart content")
+      (let [delim (str "--" b)
+            first (first-delim text delim)]
+        (if (< first 0) (values (v/null-v) (str "Unable to find boundary `" b "` in multipart content"))
+          (let [pre (subs text 0 first)
+                [parts err] (loop [pos (+ first (count delim)) acc: Vec(v/Field) []]
+                              (if (or (>= pos (count text)) (starts-at? text pos "--")) (values acc "")
+                                (let [pw (loop [k pos] (if (and (< k (count text)) (let [c (nth text k)] (or (= c 32) (= c 9)))) (recur (+ k 1)) k))
+                                      st (if (starts-at? text pw "\r\n") (+ pw 2)
+                                           (if (starts-at? text pw "\n") (+ pw 1) pos))
+                                      [hend cst] (header-end text st delim)
+                                      nx (next-delim text delim (max st (- cst 1)))
+                                      end (if (< nx 0) (count text) nx)
+                                      body0 (subs text (min cst end) end)
+                                      body (if (str/ends-with? body0 "\r") (subs body0 0 (- (count body0) 1)) body0)
+                                      [f e] (read-part (subs text st hend) body dct rd depth (count acc))]
+                                  (if (not= e "") (values acc e)
+                                    (if (< nx 0) (values (conj acc f) "")
+                                      (recur (+ nx 1 (count delim)) (conj acc f)))))))]
+            (if (not= err "") (values (v/null-v) err)
+              (let [fs0: Vec(v/Field) (if (= (count pre) 0) [] [(v/field "preamble" (v/->VStr pre))])]
+                (values (v/->VMeta (v/->VObj (conj fs0 (v/field "parts" (v/->VObj parts)))) (p/reader-meta mime)) ""))))))))))
+
+(defn- blank-line Values(Int Int) [text: &Str from: Int upto: Int]
+  (let [n (count text) lim (min upto (- n 2))]
+    (loop [i from]
+      (if (> i lim) (values -1 -1)
+        (let [c (nth text i)]
+          (cond (and (= c 10) (= (nth text (+ i 1)) 10)) (values i (+ i 2))
+                (and (= c 13) (starts-at? text i "\r\n\r\n")) (values i (+ i 4))
+                :else (recur (+ i 1))))))))
+
+(defn- header-end Values(Int Int) [text: &Str st: Int delim: &Str]
+  (if (starts-at? text st "\r\n") (values st (+ st 2))
+    (if (starts-at? text st "\n") (values st (+ st 1))
+      (let [nx (next-delim text delim st)
+            [h c] (blank-line text st (if (< nx 0) (count text) nx))]
+        (if (>= h 0) (values h c)
+          (let [[h2 c2] (blank-line text (if (< nx 0) (count text) (+ nx 1)) (count text))]
+            (if (>= h2 0) (values h2 c2) (values (count text) (count text)))))))))
+
+(defn- read-part Values(v/Field Str) [hdr: &Str content: &Str dct: &Str rd: Fn(Str Str Int Values(v/Val Str)) depth: Int idx: Int]
+  (let [lines: Vec(Str) (str/split (str/replace hdr "\r\n" "\n") "\n")
+        [hs name ctype] (loop [i 0 acc: Vec(v/Field) [] name "" ct ""]
+                          (if (>= i (count lines)) (values acc name ct)
+                            (let [ln (nth lines i) c (str/index-of ln ":")]
+                              (if (= (count (str/trim ln)) 0) (recur (+ i 1) acc name ct)
+                                (let [k (str/trim (if (< c 0) ln (subs ln 0 c)))
+                                      x (str/trim (if (< c 0) ln (subs ln (+ c 1) (count ln))))]
+                                  (if (= (str/lower-case k) "content-disposition")
+                                    (let [d (disposition x)
+                                          nm (match d (v/VObj fs) (let [r (v/obj-get fs "name")] (if (= (count r) 0) "" (match (nth r 0) (v/VStr s) s _ ""))) _ "")]
+                                      (recur (+ i 1) (conj acc (v/field k d)) (if (= name "") nm name) ct))
+                                    (recur (+ i 1) (conj acc (v/field k (v/->VStr x))) name (if (and (= ct "") (= (str/lower-case k) "content-type")) x ct))))))))
+        mt (if (= ctype "") (str dct) ctype)
+        [cv ce] (rd mt content depth)
+        inner (if (= ce "") (strip-reader-meta cv) (v/->VBin content))
+        meta [(v/field "raw" (v/->VBin content)) (v/field "mediaType" (v/->VStr mt)) (v/field "mimeType" (v/->VStr (mime-base mt)))]]
+    (values (v/field (if (= name "") (str "part" idx) name) (v/->VObj [(v/field "headers" (v/->VObj hs)) (v/field "content" (v/->VMeta inner meta))])) "")))
+
+(defn- strip-reader-meta v/Val [x: &v/Val]
+  (match x
+    (v/VMeta y m) (let [keep (loop [i 0 acc: Vec(v/Field) []]
+                               (if (>= i (count m)) acc
+                                 (let [k (:name (:key (nth m i)))]
+                                   (recur (+ i 1) (if (or (= k "encoding") (= k "mediaType")) acc (conj acc (nth m i)))))))]
+                    (if (= (count keep) 0) y (v/->VMeta y keep)))
+    _ x))
+
+(defn gen-boundary Str []
+  (str "----=_Part_" (host/rand-below 10000) "_" (host/rand-below 2000000000) "." (host/now-ms)))
+
+(defn- get-str Str [fs: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get fs k)] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) s _ ""))))
+
+(defn write Values(Str Str) [x0: &v/Val props: &Vec(v/Field) form?: Bool wr: Fn(Str v/Val Values(Str Str))]
+  (let [[b0 e0] (p/pstr props "boundary" "")
+        b (if (and (= b0 "") (not (p/has? props "boundary"))) (gen-boundary) b0)
+        x (v/unmeta x0)
+        parts-r (match x (v/VObj fs) (v/obj-get fs "parts") _ [])]
+    (if (= (count parts-r) 0)
+      (values "" "Multipart Object does not have `parts` field defined. Expecting type is\n{ parts: { _?: { headers?: Object, content: Any } } }")
+      (let [[names vals] (match (v/unmeta (nth parts-r 0))
+                           (v/VObj fs) (loop [i 0 ns: Vec(Str) [] vs: Vec(v/Val) []]
+                                         (if (>= i (count fs)) (values ns vs)
+                                           (recur (+ i 1) (conj ns (:name (:key (nth fs i)))) (conj vs (:value (nth fs i))))))
+                           (v/VArr xs) (loop [i 0 ns: Vec(Str) []] (if (>= i (count xs)) (values ns xs) (recur (+ i 1) (conj ns ""))))
+                           _ (values [] []))]
+        (loop [i 0 out ""]
+          (if (>= i (count vals)) (values (str out "--" b "--\r\n") "")
+            (let [[t e] (write-part (nth names i) (nth vals i) b form? wr)]
+              (if (not= e "") (values "" e) (recur (+ i 1) (str out t))))))))))
+
+(defn- write-part Values(Str Str) [key: &Str part: &v/Val b: &Str form?: Bool wr: Fn(Str v/Val Values(Str Str))]
+  (match (v/unmeta part)
+    (v/VObj fs)
+    (let [hs: Vec(v/Field) (let [r (v/obj-get fs "headers")] (if (= (count r) 0) [] (match (v/unmeta (nth r 0)) (v/VObj gs) gs _ [])))
+          cr (v/obj-get fs "content")]
+      (if (= (count cr) 0) (values "" "Missing required property: `content` required by `MultipartPart`.")
+        (let [content (nth cr 0)
+              [head cd ctype] (loop [i 0 out "" cd: Vec(v/Val) [] ct ""]
+                                (if (>= i (count hs)) (values out cd ct)
+                                  (let [f (nth hs i) k (:name (:key f))]
+                                    (if (= (str/lower-case k) "content-disposition") (recur (+ i 1) out [(:value f)] ct)
+                                      (let [[t e] (header-text (:value f))]
+                                        (recur (+ i 1) (str out k ": " t "\r\n") cd (if (= k "Content-Type") t ct)))))))
+              [nm fname] (if (= (count cd) 0) (values (str key) "")
+                           (match (v/unmeta (nth cd 0))
+                             (v/VObj gs) (let [n (get-str gs "name")] (values (if (= n "") (str key) n) (get-str gs "filename")))
+                             _ (values (str key) "")))
+              dispo (if (not form?) "" (str "Content-Disposition: form-data; name=\"" nm "\"" (if (= fname "") "" (str "; filename=\"" fname "\"")) "\r\n"))
+              [body be] (content-bytes content ctype wr)]
+          (if (not= be "") (values "" be)
+            (values (str "--" b "\r\n" head dispo "\r\n" body "\r\n") "")))))
+    _ (values "" (str "Cannot coerce " (v/type-name (v/unmeta part)) " (" (csv/show part) ") to Object"))))
+
+(defn- header-text Values(Str Str) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VStr s) (values s "")
+    (v/VNum n) (values (num/to-string n) "")
+    (v/VInt n-i) (let [n (num/from-int n-i)] (values (num/to-string n) ""))
+    (v/VBool b) (values (if b "true" "false") "")
+    _ (values "" "")))
+
+(defn- content-bytes Values(Str Str) [c: &v/Val ctype: &Str wr: Fn(Str v/Val Values(Str Str))]
+  (let [raw (p/meta-get c "raw")]
+    (if (> (count raw) 0) (match (v/unmeta (nth raw 0)) (v/VBin b) (values b "") (v/VStr s) (values s "") _ (values "" ""))
+      (if (not= ctype "") (wr ctype c)
+        (let [x (v/unmeta c)]
+          (match x
+            (v/VStr s) (values s "")
+            (v/VBin b) (values b "")
+            (v/VNull) (values "" "")
+            (v/VNum n) (let [[i e] (num/to-int n)] (values (if (and (= e "") (>= i 0) (< i 256)) (chr i) "") ""))
+            (v/VInt n-i) (let [n (num/from-int n-i)] (let [[i e] (num/to-int n)] (values (if (and (= e "") (>= i 0) (< i 256)) (chr i) "") "")))
+            _ (values "" (str "Cannot coerce " (v/type-name x) " (" (csv/show x) ") to Binary"))))))))

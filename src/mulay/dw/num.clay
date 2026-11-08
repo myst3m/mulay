@@ -1,0 +1,179 @@
+(ns mulay.dw.num (:require [mulay.lib.bigint :as bi] [mulay.lib.dec :as d]))
+
+(defvariant Num
+  (NInt i: Int)
+  (NDec x: d/Dec))
+
+(def DIV-PREC 34)
+
+(defn from-int Num [i: Int] (->NInt i))
+
+(defn mk Num [x: d/Dec]
+  (if (= (d/scale x) 0)
+    (let [[i ok] (d/unscaled-long x)]
+      (if ok (->NInt i) (->NDec x)))
+    (->NDec x)))
+
+(defn- strip-pos d/Dec [x: d/Dec]
+  (if (> (d/scale x) 0)
+    (let [s (d/strip-trailing-zeros x)]
+      (if (< (d/scale s) 0)
+        (let [[r e] (d/set-scale s 0 d/UNNECESSARY)] r)
+        s))
+    x))
+
+(defn of-scaled Num [m: Int scale: Int]
+  (if (= scale 0) (->NInt m) (mk (strip-pos (d/of-long m scale)))))
+
+(defn norm-result Num [x: d/Dec]
+  (if (d/is-zero? x) (->NInt 0) (mk (strip-pos x))))
+
+(defn- long-of Values(Int Bool) [n: &Num]
+  (match n
+    (NInt i) (values i true)
+    (NDec x) (if (> (- (d/precision x) (d/scale x)) 19) (values 0 false)
+               (let [[i e] (d/to-int-exact x)] (values i (= e ""))))))
+
+(defn to-dec d/Dec [n: &Num]
+  (match n
+    (NInt i) (d/from-int i)
+    (NDec x) x))
+
+(defn parse-lit Values(Num Str) [s: &Str]
+  (let [[x err] (d/parse s)]
+    (if (= err "") (values (mk (strip-pos x)) "")
+      (values (->NInt 0) err))))
+
+(defn from-float Values(Num Str) [f: Float]
+  (let [[x err] (d/from-float f)]
+    (if (= err "") (values (mk (strip-pos x)) "")
+      (values (->NInt 0) err))))
+
+(defn to-float Float [n: &Num]
+  (match n
+    (NInt i) (float i)
+    (NDec x) (d/to-float x)))
+
+(defn integer? Bool [n: &Num]
+  (match n
+    (NInt i) true
+    (NDec x) (d/integer? x)))
+
+(defn to-int Values(Int Str) [n: &Num]
+  (match n
+    (NInt i) (values i "")
+    (NDec x) (d/to-int-exact x)))
+
+(defn signum Int [n: &Num]
+  (match n
+    (NInt i) (if (> i 0) 1 (if (< i 0) -1 0))
+    (NDec x) (d/signum x)))
+
+(defn cmp Int [a: &Num b: &Num]
+  (match a
+    (NInt x) (match b
+               (NInt y) (if (< x y) -1 (if (> x y) 1 0))
+               _ (d/cmp (to-dec a) (to-dec b)))
+    _ (d/cmp (to-dec a) (to-dec b))))
+
+(defn eq? Bool [a: &Num b: &Num] (= (cmp a b) 0))
+
+(defn- small Values(Int Int Bool) [n: &Num]
+  (match n
+    (NInt i) (values i 0 true)
+    (NDec x) (if (or (< (d/scale x) 0) (> (d/scale x) 18)) (values 0 0 false)
+               (let [[u ok] (d/unscaled-long x)] (values u (d/scale x) ok)))))
+
+(defn- scale-up Values(Int Bool) [u: Int k: Int]
+  (loop [x u i 0]
+    (if (>= i k) (values x true)
+      (if (bi/mul-ov? x 10) (values 0 false) (recur (* x 10) (+ i 1))))))
+
+(defn- small-num Num [u0: Int s0: Int]
+  (loop [u u0 s s0]
+    (if (and (> s 0) (= (rem u 10) 0)) (recur (quot u 10) (- s 1))
+      (if (= s 0) (->NInt u) (->NDec (d/of-long u s))))))
+
+(defn- small-addsub Values(Num Bool) [a: &Num b: &Num op: Int]
+  (let [[ua sa oka] (small a) [ub sb okb] (small b)]
+    (if (not (and oka okb)) (values (->NInt 0) false)
+      (let [s (max sa sb)
+            [xa ea] (scale-up ua (- s sa))
+            [xb eb] (scale-up ub (- s sb))]
+        (if (not (and ea eb)) (values (->NInt 0) false)
+          (if (= op 0)
+            (if (bi/add-ov? xa xb) (values (->NInt 0) false) (values (small-num (+ xa xb) s) true))
+            (if (bi/sub-ov? xa xb) (values (->NInt 0) false) (values (small-num (- xa xb) s) true))))))))
+
+(defn- small-mul Values(Num Bool) [a: &Num b: &Num]
+  (let [[ua sa oka] (small a) [ub sb okb] (small b)]
+    (if (or (not (and oka okb)) (bi/mul-ov? ua ub)) (values (->NInt 0) false)
+      (values (small-num (* ua ub) (+ sa sb)) true))))
+
+(defn add Values(Num Str) [a: &Num b: &Num]
+  (let [[x okx] (long-of a) [y oky] (long-of b)]
+    (if (and okx oky)
+      (if (bi/add-ov? x y) (let [[r e] (d/add (d/from-int x) (d/from-int y))] (dec-res r e)) (values (->NInt (+ x y)) ""))
+      (let [[r ok] (small-addsub a b 0)] (if ok (values r "") (let [[q e] (d/add (to-dec a) (to-dec b))] (dec-res q e)))))))
+
+(defn sub Values(Num Str) [a: &Num b: &Num]
+  (let [[x okx] (long-of a) [y oky] (long-of b)]
+    (if (and okx oky)
+      (if (bi/sub-ov? x y) (let [[r e] (d/sub (d/from-int x) (d/from-int y))] (dec-res r e)) (values (->NInt (- x y)) ""))
+      (let [[r ok] (small-addsub a b 1)] (if ok (values r "") (let [[q e] (d/sub (to-dec a) (to-dec b))] (dec-res q e)))))))
+
+(defn mul Values(Num Str) [a: &Num b: &Num]
+  (let [[x okx] (long-of a) [y oky] (long-of b)]
+    (if (and okx oky)
+      (if (bi/mul-ov? x y) (values (norm-result (d/mul (d/from-int x) (d/from-int y))) "") (values (->NInt (* x y)) ""))
+      (let [[r ok] (small-mul a b)]
+        (if ok (values r "")
+          (let [xa (to-dec a) xb (to-dec b) sc (+ (d/scale xa) (d/scale xb))]
+            (cond (> sc d/INT32-MAX) (values (->NInt 0) "Underflow")
+                  (< sc d/INT32-MIN) (values (->NInt 0) "Overflow")
+                  :else (values (norm-result (d/mul xa xb)) ""))))))))
+
+(defn- dec-res Values(Num Str) [x: d/Dec e: Str]
+  (if (= e "") (values (norm-result x) "") (values (->NInt 0) e)))
+
+(defn op-error Str [op: Int a: &Num b: &Num reason: &Str]
+  (let [[name sym why] (cond (= op 1) (values "addition" "+" (str "java.lang.ArithmeticException: " reason))
+                             (= op 2) (values "subtraction" "-" (str reason))
+                             :else (values "multiplication" "*" (str reason)))]
+    (str "Unable to resolve " name " operation: `" (to-string a) " " sym " " (to-string b) "`. Reason: " why)))
+
+(defn neg Num [a: &Num]
+  (match a
+    (NInt x) (if (= x bi/INT-MIN) (mk (d/neg (d/from-int x))) (->NInt (- 0 x)))
+    (NDec x) (mk (d/neg x))))
+
+(defn abs-num Num [a: &Num]
+  (if (< (signum a) 0) (neg a) (match a (NInt x) (->NInt x) (NDec x) (->NDec x))))
+
+(defn div Values(Num Str) [a: &Num b: &Num]
+  (if (or (= (signum b) 0) (let [ps (- (d/scale (to-dec a)) (d/scale (to-dec b)))] (or (> ps d/INT32-MAX) (< ps d/INT32-MIN))))
+    (values (->NInt 0) "Division by zero")
+    (let [[x okx] (long-of a) [y oky] (long-of b)
+          [q err] (if (and okx oky) (d/div (d/from-int x) (d/from-int y) DIV-PREC d/HALF-EVEN) (d/div (to-dec a) (to-dec b) DIV-PREC d/HALF-EVEN))]
+      (if (= err "") (values (norm-result q) "")
+        (values (->NInt 0) err)))))
+
+(defn rem-num Values(Num Str) [a: &Num b: &Num]
+  (if (= (signum b) 0) (values (->NInt 0) "Division by zero")
+    (let [[x okx] (long-of a) [y oky] (long-of b)]
+      (if (and okx oky)
+        (if (= y -1) (values (->NInt 0) "") (values (->NInt (rem x y)) ""))
+        (let [[r err] (d/rem-dec (to-dec a) (to-dec b))]
+          (cond (= err "") (values (norm-result r) "")
+                (= err d/TOO-BIG) (values (->NInt 0) "Division by zero")
+                :else (values (->NInt 0) err)))))))
+
+(defn to-string Str [n: &Num]
+  (match n
+    (NInt i) (str i)
+    (NDec x) (d/to-string x)))
+
+(defn to-plain-str Str [n: &Num]
+  (match n
+    (NInt i) (str i)
+    (NDec x) (d/to-plain-str x)))

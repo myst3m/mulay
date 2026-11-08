@@ -1,0 +1,155 @@
+(ns mulay.db.orawire)
+
+(def SHORT -1)
+(def BAD -2)
+
+(def T-CONNECT 1)
+(def T-ACCEPT 2)
+(def T-REFUSE 4)
+(def T-REDIRECT 5)
+(def T-DATA 6)
+(def T-RESEND 11)
+(def T-MARKER 12)
+(def T-CONTROL 14)
+
+(defn w8 Str [out: Str x: Int] (str out (chr (bit-and x 255))))
+
+(defn w16 Str [out: Str x: Int] (let [o (w8 out (bit-shift-right x 8))] (w8 o x)))
+
+(defn w32 Str [out: Str x: Int]
+  (let [o1 (w8 out (bit-shift-right x 24)) o2 (w8 o1 (bit-shift-right x 16)) o3 (w8 o2 (bit-shift-right x 8))] (w8 o3 x)))
+
+(defn w16le Str [out: Str x: Int] (let [o (w8 out x)] (w8 o (bit-shift-right x 8))))
+
+(defn- wbe Str [out: Str x: Int n: Int]
+  (loop [i (- n 1) o out] (if (< i 0) o (recur (- i 1) (w8 o (bit-shift-right x (* 8 i)))))))
+
+(defn wub Str [out: Str x: Int]
+  (cond
+    (= x 0) (w8 out 0)
+    (and (> x 0) (<= x 255)) (wbe (w8 out 1) x 1)
+    (and (> x 0) (<= x 65535)) (wbe (w8 out 2) x 2)
+    (and (> x 0) (<= x 4294967295)) (wbe (w8 out 4) x 4)
+    :else (wbe (w8 out 8) x 8)))
+
+(defn wsb Str [out: Str x: Int]
+  (if (>= x 0) (wub out x)
+    (let [m (- 0 x)]
+      (cond
+        (<= m 255) (wbe (w8 out 129) m 1)
+        (<= m 65535) (wbe (w8 out 130) m 2)
+        :else (wbe (w8 out 132) m 4)))))
+
+(defn wbytes Str [out: Str s: &Str]
+  (let [n (count s)]
+    (if (<= n 252) (str (w8 out n) s)
+      (loop [i 0 o (w8 out 254)]
+        (if (>= i n) (w8 o 0)
+          (let [e (if (> (+ i 32767) n) n (+ i 32767))
+                o2 (wub o (- e i))]
+            (recur e (str o2 (subs s i e)))))))))
+
+(defn wbytes2 Str [out: Str s: &Str]
+  (let [o (wub out (count s))] (if (= (count s) 0) o (wbytes o s))))
+
+(defn r8 Values(Int Int) [b: &Str p: Int]
+  (cond (< p 0) (values 0 p) (>= p (count b)) (values 0 SHORT) :else (values (nth b p) (+ p 1))))
+
+(defn rbe Values(Int Int) [b: &Str p: Int n: Int]
+  (cond (< p 0) (values 0 p) (> (+ p n) (count b)) (values 0 SHORT)
+        :else (values (loop [i 0 acc 0] (if (>= i n) acc (recur (+ i 1) (+ (* acc 256) (nth b (+ p i)))))) (+ p n))))
+
+(defn r16 Values(Int Int) [b: &Str p: Int] (rbe b p 2))
+(defn r32 Values(Int Int) [b: &Str p: Int] (rbe b p 4))
+
+(defn r16le Values(Int Int) [b: &Str p: Int]
+  (let [[lo p1] (r8 b p) [hi p2] (r8 b p1)] (values (+ lo (* hi 256)) p2)))
+
+(defn rub Values(Int Int) [b: &Str p: Int max: Int]
+  (let [[n p1] (r8 b p)]
+    (cond (< p1 0) (values 0 p1)
+          (or (>= n 128) (> n max)) (values 0 BAD)
+          :else (rbe b p1 n))))
+
+(defn rub2 Values(Int Int) [b: &Str p: Int] (rub b p 2))
+(defn rub4 Values(Int Int) [b: &Str p: Int] (rub b p 4))
+(defn rub8 Values(Int Int) [b: &Str p: Int] (rub b p 8))
+
+(defn rsb Values(Int Int) [b: &Str p: Int max: Int]
+  (let [[n p1] (r8 b p)
+        neg (>= n 128)
+        len (bit-and n 127)]
+    (cond (< p1 0) (values 0 p1)
+          (> len max) (values 0 BAD)
+          :else (let [[v p2] (rbe b p1 len)] (values (if neg (- 0 v) v) p2)))))
+
+(defn rraw Values(Str Int) [b: &Str p: Int n: Int]
+  (cond (< p 0) (values "" p) (> (+ p n) (count b)) (values "" SHORT) :else (values (subs b p (+ p n)) (+ p n))))
+
+(defn rbytes Values(Str Int Bool) [b: &Str p: Int]
+  (let [[n p1] (r8 b p)]
+    (cond
+      (< p1 0) (values "" p1 true)
+      (or (= n 0) (= n 255)) (values "" p1 true)
+      (= n 254) (loop [q p1 acc ""]
+                  (let [[len q1] (rub4 b q)]
+                    (cond (< q1 0) (values "" q1 true)
+                          (= len 0) (values acc q1 false)
+                          :else (let [[chunk q2] (rraw b q1 len)]
+                                  (if (< q2 0) (values "" q2 true) (recur q2 (str acc chunk)))))))
+      :else (let [[s p2] (rraw b p1 n)] (values s p2 (< p2 0))))))
+
+(defn rbytes2 Values(Str Int) [b: &Str p: Int]
+  (let [[n p1] (rub4 b p)]
+    (if (or (< p1 0) (= n 0)) (values "" p1)
+      (let [[s p2 z] (rbytes b p1)] (values s p2)))))
+
+(defn skip-bytes Int [b: &Str p: Int] (let [[s p1 z] (rbytes b p)] p1))
+
+(defn rcstr Values(Str Int) [b: &Str p: Int]
+  (if (< p 0) (values "" p)
+    (loop [i p] (cond (>= i (count b)) (values "" SHORT)
+                      (= (nth b i) 0) (values (subs b p i) (+ i 1))
+                      :else (recur (+ i 1))))))
+
+(defn packet Str [typ: Int flags: Int body: &Str large: Bool]
+  (let [n (+ 8 (count body))
+        o (if large (w32 "" n) (w16 (w16 "" n) 0))
+        o2 (w8 (w8 o typ) flags)]
+    (str (w16 o2 0) body)))
+
+(defn marker Str [kind: Int data: Int] (packet T-MARKER 0 (str (chr kind) (chr 0) (chr data)) true))
+
+(defn marker-reset? Bool [pk: &Str] (and (>= (count pk) 11) (= (nth pk 8) 1) (= (nth pk 10) 2)))
+
+(def DATA-END-OF-REQUEST 2048)
+
+(defn data-packets Str [payload: &Str sdu: Int large: Bool eor: Bool]
+  (let [room (- sdu 10)]
+    (loop [i 0 out ""]
+      (if (and (>= i (count payload)) (> i 0)) out
+        (let [e (if (> (+ i room) (count payload)) (count payload) (+ i room))
+              fl (if (and eor (= e (count payload))) DATA-END-OF-REQUEST 0)
+              pk (packet T-DATA 0 (str (w16 "" fl) (subs payload i e)) large)]
+          (if (= (count payload) 0) pk (recur e (str out pk))))))))
+
+(defn packet-len Int [buf: &Str large: Bool]
+  (cond (< (count buf) 8) 0
+        large (let [[n p] (r32 buf 0)] n)
+        :else (let [[n p] (r16 buf 0)] n)))
+
+(def MAX-PACKET 2097152)
+
+(defn take-packet Values(Str Str Int) [buf: &Str large: Bool]
+  (let [n (packet-len buf large)]
+    (cond
+      (< (count buf) 8) (values "" (str buf) 1)
+      (or (< n 8) (> n MAX-PACKET)) (values "" (str buf) 2)
+      (>= (count buf) n) (values (subs buf 0 n) (subs buf n (count buf)) 0)
+      :else (values "" (str buf) 1))))
+
+(defn packet-type Int [pk: &Str] (nth pk 4))
+(defn packet-flags Int [pk: &Str] (nth pk 5))
+
+(defn data-flags Int [pk: &Str] (if (< (count pk) 10) 0 (let [[f p] (r16 pk 8)] f)))
+(defn data-payload Str [pk: &Str] (if (< (count pk) 10) "" (subs pk 10 (count pk))))

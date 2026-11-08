@@ -1,0 +1,1 @@
+payload.username == 'admin' and payload.password == 'secret'

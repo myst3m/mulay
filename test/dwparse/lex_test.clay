@@ -1,0 +1,34 @@
+(ns dwlex-test (:require [mulay.dw.lex :as l]))
+
+(defn- kinds Str [s: Str mode: Int]
+  (loop [p 0 acc ""]
+    (let [t (l/next-tok s p mode)]
+      (if (= (:k t) l/K-EOF) acc
+        (recur (:e t) (str acc (if (= (count acc) 0) "" " ") (:k t) ":" (l/tok-text s t)))))))
+
+(deftest lex-basic
+  (is (= (kinds "a + b1 // c\n /* d */ 12.5e3" l/M-INFIX) "2:a 36:+ 2:b1 3:12.5e3"))
+  (is (= (kinds "dw::core::Strings::camelize(x)" l/M-INFIX) "2:dw::core::Strings::camelize 20:( 2:x 21:)"))
+  (is (= (kinds "if else null notx" l/M-INFIX) "100:if 101:else 106:null 2:notx"))
+  (is (= (kinds "--- -- - -> -1" l/M-INFIX) "8:--- 41:-- 37:- 28:-> 37:- 3:1"))
+  (is (= (kinds "\"a$(\"b)\")c\" 'x' `y`" l/M-INFIX) "4:\"a$(\"b)\")c\" 4:'x' 4:`y`"))
+  (is (= (kinds "/a\\/b/" l/M-PREFIX) "5:/a\\/b/"))
+  (is (= (kinds "|2020-01-01|" l/M-PREFIX) "6:|2020-01-01|"))
+  (is (= (kinds ">> <~ <= != ~=" l/M-INFIX) "49:>> 51:<~ 47:<= 43:!= 44:~="))
+  (is (= (kinds ">>" l/M-TYPE) "46:> 46:>"))
+  (is (= (kinds "$ $$ $$$" l/M-INFIX) "7:$ 7:$$ 7:$$$"))
+  ;; DW は 1_000 を 1 と名前 _000 (中置の関数呼び出し) と読み、01 は誤り
+  (is (= (kinds "1_000" l/M-INFIX) "3:1 2:_000"))
+  (is (= (kinds "01 0 0.5" l/M-INFIX) "1:01 3:0 3:0.5")))
+
+(defn- rep Str [x: Str n: Int] (loop [i 0 o ""] (if (>= i n) o (recur (+ i 1) (str o x)))))
+
+;; 文字列の補間の入れ子は C のスタックを使わずに読む (前は "$( を 20 万回重ねた 600KB の入力でプロセスごと落ちた)
+(deftest nested-interpolation-does-not-use-the-c-stack
+  (let [open (rep "\"$(" 200000)
+        closed (str open "a" (rep ")\"" 200000))]
+    (is (= (l/skip-string open 0) -1))
+    (is (= (l/skip-string closed 0) (count closed)))
+    (is (= (l/skip-balanced "(a \"$(b)\" (c) ')' d) e" 0) 20))
+    (is (= (l/skip-string "\"a$(b + \")\")c\" rest" 0) 14))
+    (is (= (l/skip-balanced "(a" 0) -1))))

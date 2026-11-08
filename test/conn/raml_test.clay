@@ -1,0 +1,109 @@
+(ns raml-test (:require [mulay.conn.apikit :as apikit] [mulay.conn.apispec :as sp] [mulay.conn.amf31 :as am31] [mulay.lib.yaml :as y] [mulay.lib.jsonschema :as js] [clay.string :as str]))
+(defn- rd Values(Str Bool) [p: Str] (let [[s e] (read-file (str "test/fixtures/apps/apikit-raml2/src/main/resources/" p))] (values s (= e ""))))
+(defn- dump Str [a: &sp/Api]
+  (let [rs (:res a)]
+    (loop [i 0 out ""]
+      (if (>= i (count rs)) out
+        (let [r (nth rs i)
+              o2 (loop [k 0 o (str out "\n" (:path r))]
+                   (if (>= k (count (:ops r))) o
+                     (let [op (nth (:ops r) k) ps (:params op) bd (:body op)
+                           o1 (str o "\n  " (:method op) " body=" (count bd) (if (> (count bd) 0) (str " " (:mime (nth bd 0)) " " (js/to-json (:schema (nth bd 0)))) ""))]
+                       (recur (+ k 1) (loop [j 0 oo o1] (if (>= j (count ps)) oo (let [p (nth ps j)] (recur (+ j 1) (str oo "\n    " (:in p) " " (:name p) " " (:required p) " " (js/to-json (:schema p)))))))))))]
+          (recur (+ i 1) o2))))))
+(def EXPECTED "
+/pets
+  get body=0
+    query q false {\"type\":\"string\",\"minLength\":2}
+  post body=1 application/json {\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\",\"maxLength\":4},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"size\":{\"enum\":[\"small\",\"large\"]},\"owner\":{\"anyOf\":[{\"type\":\"object\",\"properties\":{\"first\":{\"type\":\"string\"}},\"required\":[\"first\"]},{\"type\":\"null\"}]}},\"required\":[\"id\",\"name\",\"tags\"]}
+/pets/{petId}
+  get body=0
+    path petId true {\"type\":\"integer\",\"minimum\":1}
+    header X-Version false {\"type\":\"integer\"}
+/pets/{petId}/toys/{toyId}
+  get body=0
+    path petId true {\"type\":\"integer\",\"minimum\":1}
+    path toyId true {\"type\":\"string\"}
+/owners
+  get body=0
+/orders
+  post body=1 application/json {\"$schema\":\"http://json-schema.org/draft-04/schema#\",\"definitions\":{\"line\":{\"type\":\"object\",\"required\":[\"sku\"],\"properties\":{\"sku\":{\"type\":\"string\"},\"n\":{\"type\":\"integer\",\"minimum\":1}}}},\"type\":\"object\",\"required\":[\"lines\"],\"properties\":{\"lines\":{\"type\":\"array\",\"items\":{\"$ref\":\"#/definitions/line\"}}}}
+/notes
+  post body=1 application/json {\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"pri\":{\"type\":\"integer\",\"maximum\":5}},\"required\":[\"text\"]}")
+
+;; ライブラリ (uses)、引数付きの resourceType / trait、継承、union、入れ子の uriParameters、!include の JSON Schema
+(deftest raml-model
+  (let [[src e0] (read-file "test/fixtures/apps/apikit-raml2/src/main/resources/api/api.raml")
+        [a e] (apikit/parse-api src "api/api.raml" rd "")]
+    (is (= e ""))
+    (is (= (dump a) EXPECTED))))
+
+(deftest raml-errors
+  (let [[a e] (apikit/parse-api "#%RAML 1.0\ntitle: x\n/a:\n  post:\n    body:\n      application/json:\n        type: Nope\n" "api.raml" rd "")
+        [a2 e2] (apikit/parse-api "#%RAML 1.0\ntitle: x\ntypes:\n  T: !include missing.raml\n" "api.raml" rd "")]
+    (is (str/includes? e "Invalid reference 'Nope'"))
+    (is (str/includes? e2 "missing.raml"))))
+
+(defn- exs Str [a: &sp/Api ri: Int oi: Int]
+  (let [xs (:examples (nth (:ops (nth (:res a) ri)) oi))]
+    (str/join "|" (mapv (fn Str [x: sp/Example] (str (:code x) " " (:mime x) " " (:json x))) xs))))
+
+(deftest oas-examples
+  (let [[t e] (read-file "test/fixtures/livenote/apikit/src/main/resources/api/orders.yaml")
+        [a ae] (sp/parse-oas t "orders.yaml" (fn Values(Str Bool) [p: Str] (values "" false)) "")]
+    (is (= ae ""))
+    (is (= (exs a 1 0) "200 application/json {\"item\":\"pen\",\"qty\":1}|404 application/json {\"message\":\"gone\"}"))
+    (is (= (exs a 0 0) ""))))
+
+(def RAML-EX (str "#%RAML 1.0\ntitle: t\n/a:\n  get:\n    responses:\n      200:\n        body:\n          application/json:\n            example: |\n              {\"x\": 1}\n"
+                  "  post:\n    responses:\n      201:\n        body:\n          application/json:\n            examples:\n              one:\n                value:\n                  y: 2\n"
+                  "  put:\n    responses:\n      200:\n        body:\n          application/json:\n            example:\n              z: [1, true]\n"))
+
+(deftest raml-examples
+  (let [[a ae] (apikit/parse-api RAML-EX "api.raml" (fn Values(Str Bool) [p: Str] (values "" false)) "")]
+    (is (= ae ""))
+    (is (= (exs a 0 0) "200 application/json {\"x\": 1}"))
+    (is (= (exs a 0 2) "201 application/json {\"y\":2}"))
+    (is (= (exs a 0 1) "200 application/json {\"z\":[1,true]}"))))
+
+(deftest oas31-external-refs-and-const
+  (let [spec "openapi: 3.1.0\ninfo: {title: t, version: '1'}\npaths:\n  /d:\n    post:\n      requestBody:\n        content:\n          application/json:\n            schema: {$ref: '../schemas/D.json'}\n      responses: {'201': {description: ok}}\n"
+        files (fn Values(Str Bool) [p: Str]
+                (cond (= p "schemas/D.json") (values "{\"$defs\": {\"k\": {\"enum\": [\"A\"]}}, \"type\": \"object\", \"properties\": {\"kind\": {\"$ref\": \"#/$defs/k\"}, \"sub\": {\"$ref\": \"Sub.json\"}}}" true)
+                      (= p "schemas/Sub.json") (values "{\"type\": \"integer\"}" true)
+                      :else (values "" false)))
+        [a ae] (sp/parse-oas spec "api/bank.yaml" files "")
+        body (:schema (nth (:body (nth (:ops (nth (:res a) 0)) 0)) 0))
+        [m1 e1] (sp/parse-oas (str/replace spec "../schemas/D.json" "../schemas/Nope.json") "api/bank.yaml" files "")
+        [m2 e2] (sp/parse-oas (str/replace spec "schema: {$ref: '../schemas/D.json'}" "schema: {properties: {c: {const: 1}}}") "api/bank.yaml" files "")
+        [m3 e3] (sp/parse-oas (str/replace spec "schema: {$ref: '../schemas/D.json'}" "schema: {properties: {const: {type: string}}}") "api/bank.yaml" files "")
+        [m4 e4] (sp/parse-oas (str/replace (str/replace spec "schema: {$ref: '../schemas/D.json'}" "schema: {properties: {c: {const: 1}}}") "3.1.0" "3.0.3") "api/bank.yaml" files "")]
+    (is (= ae ""))
+    (is (= (js/to-json body) "{\"$defs\":{\"k\":{\"enum\":[\"A\"]}},\"type\":\"object\",\"properties\":{\"kind\":{\"enum\":[\"A\"]},\"sub\":{\"type\":\"integer\"}}}"))
+    (is (= e1 "Errors while parsing API definition 'api/bank.yaml': File Not Found: schemas/Nope.json (Unresolved reference '../schemas/Nope.json')"))
+    (is (str/includes? e2 "Property 'const' not supported in a OAS 3.1 schema node"))
+    (is (= e3 ""))
+    (is (= e4 ""))))
+
+(deftest amf31-normalize-and-java-double
+  (let [[s se] (y/parse "{\"type\": [\"integer\", \"null\"], \"minimum\": 3, \"description\": \"d\"}")
+        [o oe] (y/parse "{\"type\": \"object\", \"properties\": {\"r\": {\"type\": \"number\", \"maximum\": 2}, \"k\": {\"const\": \"A\"}, \"i\": {\"type\": \"integer\", \"minimum\": 2.5}, \"u\": {\"minimum\": 1}}}")]
+    (is (= (js/to-json (am31/normalize s 0)) "{\"anyOf\":[{\"type\":\"integer\",\"minimum\":3},{\"type\":\"null\"}],\"description\":\"d\"}"))
+    (is (= (js/to-json (am31/normalize o 0)) "{\"type\":\"object\",\"properties\":{\"r\":{\"type\":\"number\",\"maximum\":2.0},\"k\":{\"enum\":[\"A\"]},\"i\":{\"type\":\"integer\",\"minimum\":2},\"u\":{\"minimum\":1.0}}}"))
+    (is (= (am31/java-double "1") "1.0"))
+    (is (= (am31/java-double "0.50") "0.5"))
+    (is (= (am31/java-double "-2") "-2.0"))
+    (is (= (am31/java-double "12345678") "1.2345678E7"))
+    (is (sp/version-at-least? "1.13.4" "1.13"))
+    (is (sp/version-at-least? "2.0.0" "1.13"))
+    (is (not (sp/version-at-least? "1.12.6" "1.13")))
+    (is (not (sp/version-at-least? "" "1.13")))))
+
+(deftest oas31-const-accepted-from-apikit-1-13
+  (let [spec "openapi: 3.1.0\ninfo: {title: t, version: '1'}\npaths:\n  /d:\n    post:\n      requestBody:\n        content:\n          application/json:\n            schema: {properties: {c: {const: 1}}}\n      responses: {'201': {description: ok}}\n"
+        none (fn Values(Str Bool) [p: Str] (values "" false))
+        [a e] (sp/parse-oas spec "api.yaml" none "1.13.4")
+        [b e2] (sp/parse-oas spec "api.yaml" none "1.12.6")]
+    (is (= e ""))
+    (is (:skema a))
+    (is (str/includes? e2 "Property 'const' not supported"))))

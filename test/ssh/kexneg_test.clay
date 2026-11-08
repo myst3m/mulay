@@ -1,0 +1,57 @@
+(ns kexneg-test (:require [mulay.lib.sshkex :as kx]))
+
+;; 鍵交換の方式の交渉 (RFC 4253 7.1)
+
+(defn- ki Vec(Vec(Str)) [kex: Vec(Str) hk: Vec(Str) enc: Vec(Str) mac: Vec(Str)]
+  (let [e: Vec(Str) []] [kex hk enc enc mac mac ["none"] ["none"] e e]))
+
+(defn- neg Values(kx/Agreed Str) [c: Vec(Vec(Str)) s: Vec(Vec(Str))]
+  (kx/negotiate (kx/->Kexinit "0123456789abcdef" c false) (kx/->Kexinit "0123456789abcdef" s false)))
+
+;; 実サーバー (OpenSSH 9.2、ポート 2222) が出した並びに、mulay の並びを当てたもの
+(def SERVER: Vec(Vec(Str))
+  (ki ["sntrup761x25519-sha512" "sntrup761x25519-sha512@openssh.com" "curve25519-sha256" "curve25519-sha256@libssh.org" "ecdh-sha2-nistp256"
+       "diffie-hellman-group14-sha256" "kex-strict-s-v00@openssh.com"]
+      ["ssh-ed25519" "rsa-sha2-512" "rsa-sha2-256"]
+      ["chacha20-poly1305@openssh.com" "aes128-ctr" "aes192-ctr" "aes256-ctr" "aes128-gcm@openssh.com" "aes256-gcm@openssh.com"]
+      ["umac-64-etm@openssh.com" "hmac-sha2-256-etm@openssh.com" "hmac-sha2-512-etm@openssh.com" "hmac-sha2-256" "hmac-sha2-512" "hmac-sha1"]))
+
+(deftest against-openssh
+  (let [[a e] (neg (kx/client-lists true) SERVER)
+        [b e2] (neg (kx/client-lists false) SERVER)]
+    (is (= e ""))
+    (is (= (:kex a) "curve25519-sha256"))
+    (is (= (:hostkey a) "ssh-ed25519"))
+    (is (= (:enc-cs a) "aes128-gcm@openssh.com"))
+    (is (= (:enc-sc a) "aes128-gcm@openssh.com"))
+    (is (= (:mac-cs a) ""))
+    (is (:strict a))
+    (is (= (:enc-cs b) "chacha20-poly1305@openssh.com"))))
+
+;; 暗号が CTR なら MAC も決める。サーバーが strict を出さなければ strict でない
+(deftest ctr-and-mac
+  (let [[a e] (neg (ki ["curve25519-sha256" "kex-strict-c-v00@openssh.com"] ["rsa-sha2-256"] ["aes256-ctr"] ["hmac-sha2-512" "hmac-sha2-256"])
+                   (ki ["curve25519-sha256"] ["ssh-ed25519" "rsa-sha2-256"] ["aes128-ctr" "aes256-ctr"] ["hmac-sha2-256" "hmac-sha2-512"]))]
+    (is (= e ""))
+    (is (= (:hostkey a) "rsa-sha2-256"))
+    (is (= (:enc-cs a) "aes256-ctr"))
+    (is (= (:mac-cs a) "hmac-sha2-512"))
+    (is (not (:strict a)))))
+
+;; 合うものが無い項目は理由に出る。暗号が CTR で MAC が合わなければ失敗
+(deftest no-common
+  (let [[a e] (neg (ki ["curve25519-sha256"] ["ssh-ed25519"] ["aes128-ctr"] ["hmac-sha2-256"])
+                   (ki ["diffie-hellman-group1-sha1"] ["ssh-ed25519"] ["aes128-ctr"] ["hmac-sha2-256"]))
+        [b e2] (neg (ki ["curve25519-sha256"] ["ssh-ed25519"] ["aes128-ctr"] ["hmac-sha2-256"])
+                    (ki ["curve25519-sha256"] ["ssh-ed25519"] ["aes128-ctr"] ["hmac-sha1"]))]
+    (is (= e "no common key exchange algorithm"))
+    (is (= e2 "no common MAC (client to server) algorithm"))))
+
+(deftest material-lengths
+  (is (= (kx/key-len "chacha20-poly1305@openssh.com") 64))
+  (is (= (kx/key-len "aes192-ctr") 24))
+  (is (= (kx/iv-len "aes256-gcm@openssh.com") 12))
+  (is (= (kx/iv-len "aes128-ctr") 16))
+  (is (= (kx/mac-key-len "hmac-sha2-512-etm@openssh.com") 64))
+  (is (kx/aead? "aes128-gcm@openssh.com"))
+  (is (not (kx/aead? "aes128-ctr"))))

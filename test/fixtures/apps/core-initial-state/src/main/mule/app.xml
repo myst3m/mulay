@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <configuration-properties file="app.yaml"/>
+    <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18440"/></http:listener-config>
+    <os:object-store name="S" persistent="false"/>
+
+    <!-- initialState を直接、プロパティで -->
+    <flow name="on" initialState="${onState}">
+        <http:listener config-ref="L" path="/on"/>
+        <set-payload value="on"/>
+    </flow>
+    <flow name="off" initialState="stopped">
+        <http:listener config-ref="L" path="/off"/>
+        <set-payload value="off"/>
+    </flow>
+    <flow name="off-prop" initialState="${offState}">
+        <http:listener config-ref="L" path="/off-prop"/>
+        <set-payload value="off-prop"/>
+    </flow>
+    <!-- 同じ path を、止まった flow と動いている flow が持つ (止まった方は登録されない) -->
+    <flow name="dup-off" initialState="stopped">
+        <http:listener config-ref="L" path="/dup"/>
+        <set-payload value="dup-off"/>
+    </flow>
+    <flow name="dup-on">
+        <http:listener config-ref="L" path="/dup"/>
+        <set-payload value="dup-on"/>
+    </flow>
+
+    <!-- 止まった flow を flow-ref で呼ぶ -->
+    <flow name="stopped-target" initialState="stopped">
+        <set-payload value="target ran"/>
+    </flow>
+    <flow name="stopped-target-src" initialState="stopped">
+        <http:listener config-ref="L" path="/target-src"/>
+        <set-payload value="target-src ran"/>
+    </flow>
+    <flow name="call">
+        <http:listener config-ref="L" path="/call/{n}"/>
+        <try>
+            <flow-ref name="#[attributes.uriParams.n]"/>
+            <error-handler><on-error-continue>
+                <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue></error-handler>
+        </try>
+    </flow>
+
+    <!-- 止まったスケジューラーは動かない -->
+    <flow name="tick-off" initialState="stopped">
+        <scheduler><scheduling-strategy><fixed-frequency frequency="100"/></scheduling-strategy></scheduler>
+        <os:store key="ticked" objectStore="S"><os:value>#['yes']</os:value></os:store>
+    </flow>
+    <flow name="ticked">
+        <http:listener config-ref="L" path="/ticked"/>
+        <os:retrieve key="ticked" objectStore="S"><os:default-value>#['no']</os:default-value></os:retrieve>
+    </flow>
+</mule>

@@ -1,0 +1,179 @@
+(ns crypto-test (:require [mulay.lib.crypto :as lc] [mulay.dw.lib.binaries :as bin]))
+
+;; 期待値は Python の hashlib.pbkdf2_hmac と openssl enc -nopad
+
+(defn- hexd Int [c: Int] (if (<= c 57) (- c 48) (- c 87)))
+
+(defn- unhex Str [h: &Str]
+  (loop [i 0 out ""] (if (>= i (count h)) out
+    (recur (+ i 2) (str out (chr (+ (* 16 (hexd (nth h i))) (hexd (nth h (+ i 1))))))))))
+
+(defn- pb Str [pwd: Str salt: Str it: Int n: Int]
+  (let [[k ok] (lc/pbkdf2 "SHA512" pwd salt it n)] (if ok (bin/hex-lower k) "FAIL")))
+
+(defn- aes Str [enc: Bool key: Str data: Str]
+  (let [[x ok] (lc/aes-cbc enc (unhex key) (unhex "00000000000000000000000000000000") (unhex data))] (if ok (bin/hex-lower x) "FAIL")))
+
+(deftest pbkdf2-sha512
+  (is (= (pb "password" "salt" 1 64) "867f70cf1ade02cff3752599a3a53dc4af34c7a669815ae5d513554e1c8cf252c02d470a285a0501bad999bfe943c08f050235d7d68b1da55e63f73b60a57fce"))
+  (is (= (pb "password" "salt" 4096 32) "d197b1b33db0143e018b12f3d1d1479e6cdebdcc97c5c0f87f6902e072f457b5"))
+  (is (= (pb "" "salt" 2 16) "cc5eacbb057f2a5982fce67bf70f79fc"))
+  (is (= (pb "p" "s" 0 16) "FAIL")))
+
+;; 要約 (MD2 は自前、他は lib/hash)。期待値は hashlib
+(defn- dg Str [name: Str data: Str] (let [[x ok] (lc/digest name data)] (if ok (bin/hex-lower x) "FAIL")))
+(deftest digest-names
+  (is (= (dg "MD5" "abc") "900150983cd24fb0d6963f7d28e17f72"))
+  (is (= (dg "SHA1" "abc") "a9993e364706816aba3e25717850c26c9cd0d89d"))
+  (is (= (dg "SHA224" "abc") "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"))
+  (is (= (dg "SHA256" "abc") "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"))
+  (is (= (dg "SHA384" "abc") "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"))
+  (is (= (dg "SHA3-256" "abc") "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532"))
+  (is (= (dg "SHA512" "abc") "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"))
+  (is (= (dg "SHA512-224" "abc") "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa"))
+  (is (= (dg "SHA512-256" "abc") "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23"))
+  (is (= (dg "SHA3-224" "abc") "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf"))
+  (is (= (dg "SHA3-384" "abc") "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b298d88cea927ac7f539f1edf228376d25"))
+  (is (= (dg "SHA3-512" "abc") "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0"))
+  (is (= (dg "MD2" "abc") "da853b0d3f88d99b30283a69e6ded6bb"))
+  (is (= (dg "SHA999" "abc") "FAIL")))
+
+;; HMAC。期待値は Python の hmac。鍵が空のものと、ブロックより長い鍵 (200 バイト、要約してから使う) を含む
+(defn- mc Str [name: Str key: Str data: Str] (let [[x ok] (lc/hmac name key data)] (if ok (bin/hex-lower x) "FAIL")))
+(defn- seq-bytes Str [n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out (chr i))))))
+(deftest hmac-names
+  (is (= (mc "MD5" "0123456789abcdef0123456789abcdef" "mulay hmac") "e791b9d7ffc530ef04c313ce385bbcad"))
+  (is (= (mc "SHA1" "0123456789abcdef0123456789abcdef" "mulay hmac") "c67852a99a1fdab3f8e12072868c7e9d2a0f42d5"))
+  (is (= (mc "SHA256" "0123456789abcdef0123456789abcdef" "mulay hmac") "b00faca9ca42e6e092f2c82bd1a00a0a3172975ae004e4cf97f00cdf9f57333a"))
+  (is (= (mc "SHA512" "0123456789abcdef0123456789abcdef" "mulay hmac") "d09f37c106334cceac9ac86d867d97aecd4ca24f789ca87841aa3e3fce18ab25c7c67fe37dddee894b12150a3178907c1287d587917310275aadc35e0cd48ea0"))
+  (is (= (mc "SHA3-256" "0123456789abcdef0123456789abcdef" "mulay hmac") "74b03dbbde231450d3e0d3c3b8e9fc58d69e519e0060066dcf5b06abbb13ac97"))
+  (is (= (mc "SHA256" "" "mulay hmac") "0e40a293d23ed3a234e2e2fd8a6b473c769648e36229ed8bd0ef8da2f490d963"))
+  (is (= (mc "SHA384" (seq-bytes 200) "mulay hmac") "bc85ca4ea2918b89b65d627f1d84a2b186ab811e309245f0976ba658996b78707e472850f63f02d8ffb6efff41b86fe1"))
+  (is (= (mc "SHA999" "k" "x") "FAIL")))
+
+;; lib/seal が使う SHA-256 と、知らない名前
+(deftest pbkdf2-names
+  (let [[k ok] (lc/pbkdf2 "SHA256" "password" "salt" 4096 32)
+        [k2 ok2] (lc/pbkdf2 "SHA999" "password" "salt" 1 16)]
+    (is ok)
+    (is (= (bin/hex-lower k) "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"))
+    (is (not ok2))))
+
+(deftest aes-cbc-nopad
+  (is (= (aes true "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+         "8ea2b7ca516745bfeafc49904b496089b6ac2f11b522ecb5d26ffc21280d647b"))
+  (is (= (aes false "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" "8ea2b7ca516745bfeafc49904b496089b6ac2f11b522ecb5d26ffc21280d647b")
+         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"))
+  (is (= (aes true "000102030405060708090a0b0c0d0e0f1011121314151617" "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+         "dda97ca4864cdfe06eaf70a0ec0d71913c99c1c442900da326f30ca78be3530c"))
+  (is (= (aes true "0001" "00112233445566778899aabbccddeeff") "FAIL"))
+  (is (= (aes true "000102030405060708090a0b0c0d0e0f" "0011") "FAIL")))
+
+;; AES のモードごとの生の変換 (パディングなし)。期待値は Java 17 の Cipher "AES/<mode>/NoPadding"。
+;; 鍵は (11i + 5) mod 256、IV は (13i + 7) mod 256、平文は (7i + 3) mod 256。CFB (CFB128) と OFB は 16 の倍数でない長さ (37)
+(defn- apat Str [n: Int m: Int a: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out (chr (mod (+ (* i m) a) 256)))))))
+(defn- araw Str [mode: Str enc: Bool kl: Int n: Int]
+  (let [[x ok] (lc/aes-raw mode enc (apat kl 11 5) (apat 16 13 7) (apat n 7 3))] (if ok (bin/hex-lower x) "FAIL")))
+(defn- araw-dec Str [mode: Str kl: Int ct: Str]
+  (let [[x ok] (lc/aes-raw mode false (apat kl 11 5) (apat 16 13 7) (unhex ct))] (if ok (bin/hex-lower x) "FAIL")))
+
+(deftest aes-raw-modes
+  (is (= (araw "CBC" true 16 48) "b6b8a5c6e743b34fe0405cb42b24a0fd7e9af0a5277869a7f77ae44ca6e19f32681683ea74d18834c8cb3e5cd27d06ce"))
+  (is (= (araw-dec "CBC" 16 "b6b8a5c6e743b34fe0405cb42b24a0fd7e9af0a5277869a7f77ae44ca6e19f32681683ea74d18834c8cb3e5cd27d06ce") (bin/hex-lower (apat 48 7 3))))
+  (is (= (araw "CBC" true 24 48) "78562e35b5025c91d51bee7faea76d3e18e124577c09455758ac0dbe2e221744048e7d24f0ed379095b8303e21dca24f"))
+  (is (= (araw-dec "CBC" 24 "78562e35b5025c91d51bee7faea76d3e18e124577c09455758ac0dbe2e221744048e7d24f0ed379095b8303e21dca24f") (bin/hex-lower (apat 48 7 3))))
+  (is (= (araw "CBC" true 32 48) "18579cbd7422cc0fce2f7d6b7c75957fd8deecd5a83b8ea705422699fce92ee414d0631f6f15f376187409ae220fe01c"))
+  (is (= (araw-dec "CBC" 32 "18579cbd7422cc0fce2f7d6b7c75957fd8deecd5a83b8ea705422699fce92ee414d0631f6f15f376187409ae220fe01c") (bin/hex-lower (apat 48 7 3))))
+  (is (= (araw "ECB" true 16 48) "ce5d464340915059276b79f336bab417368adf15bd0eea3e3ed985eb3b55da3dcd38bbebde25b806cde9804ce625f645"))
+  (is (= (araw-dec "ECB" 16 "ce5d464340915059276b79f336bab417368adf15bd0eea3e3ed985eb3b55da3dcd38bbebde25b806cde9804ce625f645") (bin/hex-lower (apat 48 7 3))))
+  (is (= (araw "ECB" true 24 48) "959176d2dc3288e072be27fcf56aebe88d859f21de7368017d7e9c03c200fc69aac7e4c5a04a555854c33788f3f7ecb5"))
+  (is (= (araw-dec "ECB" 24 "959176d2dc3288e072be27fcf56aebe88d859f21de7368017d7e9c03c200fc69aac7e4c5a04a555854c33788f3f7ecb5") (bin/hex-lower (apat 48 7 3))))
+  (is (= (araw "ECB" true 32 48) "cb3dcb37e3e9f044a7cf70c3d9918a723244d960c6542553f63a17dcd22444eb79bac4c73d18d2ff41e7ecad52bd01f9"))
+  (is (= (araw-dec "ECB" 32 "cb3dcb37e3e9f044a7cf70c3d9918a723244d960c6542553f63a17dcd22444eb79bac4c73d18d2ff41e7ecad52bd01f9") (bin/hex-lower (apat 48 7 3))))
+  (is (= (araw "CFB" true 16 37) "5a15f6e22c1b15c8b554138a26a090056ee846927bc4f72b76c07d2a2610b48ddcff93f766"))
+  (is (= (araw-dec "CFB" 16 "5a15f6e22c1b15c8b554138a26a090056ee846927bc4f72b76c07d2a2610b48ddcff93f766") (bin/hex-lower (apat 37 7 3))))
+  (is (= (araw "CFB" true 24 37) "5481b705f66f25e0333fdc30496dd2133e0f68855007fca440c310fae252fd9cd29c914a6f"))
+  (is (= (araw-dec "CFB" 24 "5481b705f66f25e0333fdc30496dd2133e0f68855007fca440c310fae252fd9cd29c914a6f") (bin/hex-lower (apat 37 7 3))))
+  (is (= (araw "CFB" true 32 37) "5eb9e887656bcee79ac6e131c338de4d993ad126e8e00738fa2615fc1a6cb004664f00409c"))
+  (is (= (araw-dec "CFB" 32 "5eb9e887656bcee79ac6e131c338de4d993ad126e8e00738fa2615fc1a6cb004664f00409c") (bin/hex-lower (apat 37 7 3))))
+  (is (= (araw "OFB" true 16 37) "5a15f6e22c1b15c8b554138a26a09005754a3cb79b64a8f25e944a8fec9da6bc636b147dba"))
+  (is (= (araw-dec "OFB" 16 "5a15f6e22c1b15c8b554138a26a09005754a3cb79b64a8f25e944a8fec9da6bc636b147dba") (bin/hex-lower (apat 37 7 3))))
+  (is (= (araw "OFB" true 24 37) "5481b705f66f25e0333fdc30496dd213ae67bc9e03603fcb091aae44f7923c24743d768419"))
+  (is (= (araw-dec "OFB" 24 "5481b705f66f25e0333fdc30496dd213ae67bc9e03603fcb091aae44f7923c24743d768419") (bin/hex-lower (apat 37 7 3))))
+  (is (= (araw "OFB" true 32 37) "5eb9e887656bcee79ac6e131c338de4d220b76d628c028c559d7a35bf609f0c69e26419a99"))
+  (is (= (araw-dec "OFB" 32 "5eb9e887656bcee79ac6e131c338de4d220b76d628c028c559d7a35bf609f0c69e26419a99") (bin/hex-lower (apat 37 7 3)))))
+
+;; 鍵の長さ、IV の長さ (ECB は見ない)、空の入力、知らないモード、CBC と ECB の 16 の倍数でない長さ (以前は OpenSSL が
+;; 完全なブロックだけを返し、ok = true だった) は失敗
+(deftest aes-raw-errors
+  (is (= (araw "CBC" true 15 48) "FAIL"))
+  (is (= (araw "CFB" true 33 37) "FAIL"))
+  (is (= (araw "CBC" true 16 0) "FAIL"))
+  (is (= (araw "XTS" true 16 48) "FAIL"))
+  (is (= (araw "CBC" true 16 37) "FAIL"))
+  (is (= (araw "ECB" true 16 37) "FAIL")))
+
+(deftest aes-raw-iv
+  (let [[x ok] (lc/aes-raw "OFB" true (apat 16 11 5) "short" "abc")
+        [y ok2] (lc/aes-raw "ECB" true (apat 16 11 5) "" (apat 16 7 3))]
+    (is (not ok))
+    (is ok2)))
+
+(deftest random
+  (is (= (rb 16) 16))
+  (is (not= (rbs 16) (rbs 16))))
+
+;; RSA の署名 (PKCS#1 v1.5 は決まった値になる)。鍵は openssl genpkey で作った 1024 ビットの PKCS#8 (DER)、
+;; 期待値は openssl dgst -sha256 -sign
+(def RSA-KEY "30820275020100300d06092a864886f70d01010105000482025f3082025b02010002818100c0f390e3ce62fc043fb847aad9aba91e9ef76236b440f7fc511a7ed442eaf00b8826d5a29aa93d073721a6e3e9f14ebc9ae96f58b20c81d6edda02f3ae512cc0f82a4ab45b13e3441d1b9a63c13e5c11aa46d4eccd8c5f3c27d215051b4bc985ad9f7e87bd62350fbfec34f17b009f5e7f866fdef6c747cd69e6d727a3d1d3ab02030100010281803847124c8f86e970a7d12cfe150cef7fe1e7cfba9aea942a00d1d48a3e965dbb4f53dc5dd7f462bb770616b2452abfc75cfb97216c951f4dbc0429763fb2a775837fe56685eb7be2beaf67b9972a66dddb9f03b3a11891f032d711858727488a95dc3abf4563c61cc4fa54c8d3759a50f84c577268f07d4d3fdc49e2a88f1549024100e2b1920d8bd54cfbf89a1ce325a2d5e5040b78786d71c090071e9adbdf98f17b5c1abd22e9b9e5c3a4d8cb52cbb8037b8d92c6895279619e295fb4856832d095024100d9e54bf024ad09e24549f8ea5b82b19a6c11c5d1b2aab5e963791ee54f66d4dac85a92ed9a93d6cf5a2e36e2f19245783976d87adad04958d8edc0c2d9f3c33f024068ac5f691bd928cbebf59543191cc031181607d16b8fabbf9559ff5d693860c07a3dea79557cbde801950d053505c9ade22814be51b3b46c686445a1980466a5024072f288bdf5cb2734abd2db325ef63255417f9ab9062512743ddaae96cfed728abc3933db8eb941100005f34483a5e36a09fe8d333a6db8d3db1489a5012f9c27024020a03a51a58056855a3d8f0172ccc2b66bff6283ba89ae05eb32c4f7656632d7be05c94fe486ccdcc0dd33a7666371684ed8b5982f73144595d266ef0240597a")
+
+(deftest rsa-sign
+  (let [[s ok] (lc/sign "SHA256" (unhex RSA-KEY) "mulay jwt test")
+        [s2 ok2] (lc/sign "SHA256" "not a key" "x")]
+    (is ok)
+    (is (= (bin/hex-lower s) "2e9a68fbf5c4e0ce1fcf9aae948f4d2e2c94298ff040fcb1641cb3ace75c9352a2270c511dcbd305b8a4a10444bf3f13a97ea975ab19b50a8367a4b0f441583bc227589a2520604d489e42efbde7cca377a0c51a17dd48b97be2f1fafd9a82255c2f798d2c0c2f3d829db1dd0101a2608b3b7af8b43ef8aa8e9d45070de509f9"))
+    (is (not ok2))))
+
+;; 従来の形 (PKCS#1 の RSAPrivateKey、openssl pkey -traditional) の同じ鍵でも同じ署名。SHA-1 は使えない (RS256〜RS512 だけ)
+(def RSA-KEY-PKCS1 "3082025b02010002818100c0f390e3ce62fc043fb847aad9aba91e9ef76236b440f7fc511a7ed442eaf00b8826d5a29aa93d073721a6e3e9f14ebc9ae96f58b20c81d6edda02f3ae512cc0f82a4ab45b13e3441d1b9a63c13e5c11aa46d4eccd8c5f3c27d215051b4bc985ad9f7e87bd62350fbfec34f17b009f5e7f866fdef6c747cd69e6d727a3d1d3ab02030100010281803847124c8f86e970a7d12cfe150cef7fe1e7cfba9aea942a00d1d48a3e965dbb4f53dc5dd7f462bb770616b2452abfc75cfb97216c951f4dbc0429763fb2a775837fe56685eb7be2beaf67b9972a66dddb9f03b3a11891f032d711858727488a95dc3abf4563c61cc4fa54c8d3759a50f84c577268f07d4d3fdc49e2a88f1549024100e2b1920d8bd54cfbf89a1ce325a2d5e5040b78786d71c090071e9adbdf98f17b5c1abd22e9b9e5c3a4d8cb52cbb8037b8d92c6895279619e295fb4856832d095024100d9e54bf024ad09e24549f8ea5b82b19a6c11c5d1b2aab5e963791ee54f66d4dac85a92ed9a93d6cf5a2e36e2f19245783976d87adad04958d8edc0c2d9f3c33f024068ac5f691bd928cbebf59543191cc031181607d16b8fabbf9559ff5d693860c07a3dea79557cbde801950d053505c9ade22814be51b3b46c686445a1980466a5024072f288bdf5cb2734abd2db325ef63255417f9ab9062512743ddaae96cfed728abc3933db8eb941100005f34483a5e36a09fe8d333a6db8d3db1489a5012f9c27024020a03a51a58056855a3d8f0172ccc2b66bff6283ba89ae05eb32c4f7656632d7be05c94fe486ccdcc0dd33a7666371684ed8b5982f73144595d266ef0240597a")
+
+(deftest rsa-sign-pkcs1
+  (let [[s ok] (lc/sign "SHA256" (unhex RSA-KEY-PKCS1) "mulay jwt test")
+        [s8 ok8] (lc/sign "SHA256" (unhex RSA-KEY) "mulay jwt test")
+        [s3 ok3] (lc/sign "SHA512" (unhex RSA-KEY) "mulay jwt test")]
+    (is ok)
+    (is (= s s8))
+    (is ok3)
+    (is (= (count s3) 128))))
+
+;; RSA-KEY と自己署名の証明書を openssl pkcs12 -export (PBES2、AES-256-CBC。Java 17 の keytool と同じ方式) で包んだもの。
+;; パスワードは changeit
+(def P12 "308206d20201033082068006092a864886f70d010701a08206710482066d308206693082030a06092a864886f70d010706a08202fb308202f7020100308202f006092a864886f70d010701305f06092a864886f70d01050d3052303106092a864886f70d01050c30240410a475442f83be2d37ceb5c95f664753c802020800300c06082a864886f70d02090500301d060960864801650304012a0410b60d80f70967ce35da2c68e805c30f0780820280d7011c2dd7f5e42adcc8dc4b264936e9ae85aab2d308b1e7871b937e9d8591de2e518c4a079e635d93186812830c334c77d21bbe4c17e2c1741ea0f46906e43fcedd7a84ae70ff805026b9c29aa8136a8a12c0fd2adb7bb24e56d7f5ce6142c3a1315b50627bfdf4e98889dcfd87e03fba112f6c7b7a521592c152874c000330d4a26d4aaa1627c11409221dcd44423bd718e1676091fbdadcb8d36c70228750137e1608de7137f288e2e13a854cd5c5a09e3c639483173efcfff12d2c893bb106f4429691aa65073e75ae6fcb0eeda06c56533ae31916b1a90f9c5c0d89e678133e3948483cf4c87f56f666c10222c864a0c76468d0fe94fc588b71cc014f2e63fdd80ed00d63619d0fab8c70a60936f2914642cbbbf7c05c346db4b91096677aa561d4f5ead6fbcbe3236e7f0101dee49545b42735f1e1d88947672db149dcaac8852b9c1e6bad82693bf67ee072baf70f09941dc28112d034bdb4f48597a73d2247fe32ebdbc704117d75e07bc677d290eefd54a6b43569e38bff0d94bebe14281f6d9f426ca7fedc4400042ffeb9e9660ca42ce1cc4ef5ca463e9559569f72c7da80dab11f23b9cfacaf1d460e48588c8f8c6e49936692cf52e1afe9de4e69d71aec1ca386babe11104d619cb325b043efddab4ac6b8f77f860dd340751f8c17757d1734dd8b15cb014b3a490e2bdd38b119fe0358aa7de545925b1c40e21bb5b0cbca467ad47bc0b523f90cb22cfd5f7dcdb2423924562375930b26cca8ab7b254a993e1a659daa2c497cd3a27a650e3fab26fddd7f594025192043e2470b9e5e32ce12a610e30e8a004314d64c0ae2611d7c21fccdb47d42af857bc0bf2d87a8ccae58b885a4400fa7e2af5836ff08ef63f1d7a3141d6792d45432bfde3082035706092a864886f70d010701a082034804820344308203403082033c060b2a864886f70d010c0a0102a08202e9308202e5305f06092a864886f70d01050d3052303106092a864886f70d01050c302404102448ba499a492d8abbce188f35da31ff02020800300c06082a864886f70d02090500301d060960864801650304012a0410ab0f12bc91cd5a6d697160e657c3e9c104820280d2cd57735e4536b25aa1b9ec84328ad015a1fd019f95f1b32f6f5c5b1aef1ddcc7c36c00216d486a90f48617b9bf805018443a163891188f8794409ae447679039eba55624d17034267ba0258dd9ee6df38c478b3f8fb981a2c963db13c31cce4e66b5575ce801edb39b3e31109c1d68eccc2339a8629929e26cd14298b841969cd9ccd92703cc64135a110f1d42356246354632cf317b0770c7fd8f2a5c8a310d58c72303ceb7c4c528acb07f390188daf8a330743c67be4c87fd3c61013d76f2f34c212a019a2bb2f15a5b662940c5f8af9b1ad7c228024e8ea2a13f5c93ecf60386582b14a451de066259dd76f50edc2f1c51a7429816d7abfd8e1d5706eff751fc25521fc1c7d8f6c2fdbcaf37051bf90fbcda7358af338fdd5a20d484dc4545fef624e959d3c4dbe427c6b7f0ccb0df9e8d99e480e0c5d7feca3664b2db1e5fcec85634aa5d6d0df6f54ddbba26ad3a206d2aad5befed2a9b89436c069a8ffe64b00aee4c18ffe00384c8f14658035556d272cc50da1061b19627462ef9da6e1c55233685ac9ef1e3ec50471e7c3692a5d5ff53871727c597119485f713640d39e4a4cbbcc04b4f23b241daaaa89fab23bfd30d9b5943ef1397e9ca2a2bad88ce0b5933991ec224e1d143ca0c8d61a4378f2ed676a2e293bd99b3c9a5dc8d6e83d18e04cfca91f1e4275639dc4345195317a855c3edc33151ce8f6e53acb3a190a11b0f0d3c075989ad059357ccdf9362cc8c053bae81f3b2c83f2dfa8d8a6df22fd868a21e4a00f8dfa877f7931f90590710ca3858499ca3aaae1182791c9f5a01fc5609cbc6ef0fcb83cb2da1fcee68d1f6a356e1f0e15a05d3530be8ef12720269063e1f43f8a059a37479892ab8e265bb4cfc073dc3c6fafc1a8a953140301906092a864886f70d010914310c1e0a006d0075006c00610079302306092a864886f70d0109153116041405eaf226c050c7f74f2a6704283b2deb01c2f74d30493031300d060960864801650304020105000420f302601e8dcd8e9c77b184227be62836732d6cd83dcb04633c812305c89899b30410c49a9b417258e5edca732de4a888242a02020800")
+
+(deftest pkcs12-private-key
+  (let [[k e] (lc/pkcs12-key (unhex P12) "changeit")
+        [k2 e2] (lc/pkcs12-key (unhex P12) "wrong")
+        [k3 e3] (lc/pkcs12-key "not a p12" "changeit")]
+    (is (= e ""))
+    (is (= (bin/hex-lower k) RSA-KEY))
+    (is (= k2 ""))
+    (is (not= e2 ""))
+    (is (not= e3 ""))))
+
+;; random-bytes は成否を返す (以前は RAND_bytes の失敗を見ずに、初期化していないバイト列を返した)
+(defn- rbs Str [n: Int] (let [[b ok] (lc/random-bytes n)] b))
+(defn- rb Int [n: Int] (count (rbs n)))
+
+(deftest random-bytes-ok
+  (let [[a ok] (lc/random-bytes 32)
+        [b ok2] (lc/random-bytes 0)
+        [c ok3] (lc/random-bytes -1)
+        ;; OS の乱数 (clay の prim/random-bytes) は 1 回に 1 MB まで。それを超える長さも返す
+        [d ok4] (lc/random-bytes 1048577)]
+    (is ok)
+    (is (= (count a) 32))
+    (is ok2)
+    (is (= b ""))
+    (is (not ok3))
+    (is ok4)
+    (is (= (count d) 1048577))))

@@ -1,0 +1,98 @@
+(ns logfile-test (:require [mulay.lib.logfile :as lf] [mulay.lib.fs :as fs] [clay.string :as str]))
+
+;; jmx モジュールのログファイル操作。期待値は実モジュール (test/fixtures/apps/jmx-logs) の記録に合わせる。
+
+(def DIR "/tmp/mulay-logfile-test")
+
+(defn- put Str [name: &Str body: &Str]
+  (let [m (fs/mkdirs DIR) w (write-file (fs/join DIR name) body)] (fs/join DIR name)))
+
+(defn- joined Str [v: &Vec(Str)] (str/join "|" v))
+
+(defn- tail-of Str [f: &Str body: &Str n: Int]
+  (let [p (put f body) [v e] (lf/tail p n)] (if (= e "") (joined v) (str "ERR " e))))
+
+(deftest tail-takes-the-last-lines
+  (is (= (tail-of "tail-takes-the-last-lines" "a\nb\nc\nd" 2) "c|d"))
+  (is (= (tail-of "tail-takes-the-last-lines" "a\nb\nc\nd" 10) "a|b|c|d")))
+
+(deftest tail-skips-one-trailing-newline
+  (is (= (tail-of "tail-skips-one-trailing-newline" "a\nb\nc\n" 2) "b|c"))
+  (is (= (tail-of "tail-skips-one-trailing-newline" "a\n\n" 5) "a|")))
+
+(deftest tail-keeps-carriage-returns
+  (is (= (tail-of "tail-keeps-carriage-returns" "x\r\ny\r\n" 5) (str "x" (chr 13) "|y" (chr 13)))))
+
+(deftest tail-of-nothing
+  (is (= (tail-of "tail-of-nothing" "" 3) ""))
+  (is (= (tail-of "tail-of-nothing" "\n" 3) ""))
+  (is (= (tail-of "tail-of-nothing" "a\nb" 0) ""))
+  (is (= (tail-of "tail-of-nothing" "a\nb" -2) "")))
+
+(deftest tail-drops-an-empty-first-line
+  (is (= (tail-of "tail-drops-an-empty-first-line" "\n\nb" 9) "|b")))
+
+(deftest tail-needs-more-than-one-window
+  (let [line (str/join "" (mapv (fn Str [i: Int] "0123456789") [1 2 3 4 5 6 7 8 9 10]))
+        body (loop [i 0 out ""] (if (>= i 3000) out (recur (+ i 1) (str out line (str i) "\n"))))
+        p (put "big.log" body)
+        [v e] (lf/tail p 3)
+        [w e2] (lf/tail p 100000)]
+    (is (= e ""))
+    (is (= (count v) 3))
+    (is (str/ends-with? (nth v 2) "2999"))
+    (is (str/ends-with? (nth v 0) "2997"))
+    (is (= (count w) 3000))))
+
+(deftest latin1-to-utf8-turns-each-byte-into-a-character
+  (is (= (lf/latin1->utf8 "ab") "ab"))
+  (is (= (count (lf/latin1->utf8 (str (chr 228) (chr 184)))) 4))
+  (is (= (nth (lf/latin1->utf8 (chr 228)) 0) 195))
+  (is (= (nth (lf/latin1->utf8 (chr 228)) 1) 164)))
+
+(defn- search-of Str [f: &Str body: &Str pat: &Str n: Int]
+  (let [p (put f body) [v e fatal] (lf/search p pat n)]
+    (if (= e "") (joined v) (str (if fatal "FATAL " "ERR ") e))))
+
+(deftest search-ignores-case-and-keeps-the-last-matches
+  (is (= (search-of "search-ignores-case-and-keeps-the-last-matches" "INFO a\nwarn b\ninfo c\nInfo d" "info" 50) "INFO a|info c|Info d"))
+  (is (= (search-of "search-ignores-case-and-keeps-the-last-matches" "INFO a\nwarn b\ninfo c\nInfo d" "info" 2) "info c|Info d"))
+  (is (= (search-of "search-ignores-case-and-keeps-the-last-matches" "a\nb" "zzz" 5) "")))
+
+(deftest search-line-splitting
+  (is (= (search-of "search-line-splitting" (str "a1" (chr 13) "b" (chr 13) (chr 10) "a2" (chr 10)) "a" 9) "a1|a2"))
+  (is (= (search-of "search-line-splitting" "x\n" "" 9) "x"))
+  (is (= (search-of "search-line-splitting" "" "" 9) "")))
+
+(deftest search-with-no-room
+  (is (= (search-of "search-with-no-room" "a\na" "a" 0) "")))
+
+(deftest search-with-a-negative-max-fails-like-the-module
+  (is (= (search-of "search-with-a-negative-max-fails-like-the-module" "info\ninfo" "info" -1) "FATAL fromIndex(2) > toIndex(1)"))
+  (is (= (search-of "search-with-a-negative-max-fails-like-the-module" "x" "info" -1) "FATAL fromIndex(1) > toIndex(0)")))
+
+(deftest search-rejects-bad-utf8
+  (is (= (search-of "search-rejects-bad-utf8" (str "ok" (chr 255)) "ok" 9) "ERR Input length = 1")))
+
+(deftest search-matches-non-ascii-case-insensitively
+  (is (= (search-of "search-matches-non-ascii-case-insensitively" "ÄBC\nabc" "äbc" 9) "ÄBC")))
+
+(deftest list-files-returns-regular-files-by-name
+  (let [r (fs/remove-tree "/tmp/mulay-logfile-list")
+        m (fs/mkdirs "/tmp/mulay-logfile-list/sub")
+        a (write-file "/tmp/mulay-logfile-list/b.log" "12345")
+        b (write-file "/tmp/mulay-logfile-list/a.log" "")
+        fs (lf/list-files "/tmp/mulay-logfile-list")]
+    (is (= (count fs) 2))
+    (is (= (:name (nth fs 0)) "a.log"))
+    (is (= (:size (nth fs 1)) 5))
+    (is (> (:mtime-ms (nth fs 0)) 1700000000000))
+    (is (= (count (lf/list-files "/tmp/mulay-logfile-nothing")) 0))))
+
+(deftest tail-lines-of-an-empty-read
+  (let [a (lf/tail-lines "" false 3)
+        b (lf/tail-lines "" true 3)
+        c (lf/tail-lines "x\ny\n" true 1)]
+    (is (= (count a) 0))
+    (is (= (count b) 0))
+    (is (= c ["y"]))))

@@ -1,0 +1,385 @@
+(ns mulay.dw.engine
+  (:require [mulay.dw.schematype :as st] [mulay.dw.xsdtype :as xst] [mulay.dw.stdmods :as stdm] [mulay.dw.purity :as pur] [mulay.dw.ast :as a] [mulay.dw.parse :as p] [mulay.dw.resolve :as res] [mulay.dw.eval :as ev] [mulay.dw.gen :as gen] [mulay.dw.genreg :as gr] [mulay.dw.gencode :as gc]
+            [mulay.dw.rir :as r] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.val :as v] [mulay.dw.src :as src]
+            [mulay.dw.fmt.registry :as reg] [mulay.dw.lib.core :as core] [mulay.dw.loc :as loc] [clay.string :as str]
+            [mulay.dw.lib.strings :as l-strings] [mulay.dw.lib.arrays :as l-arrays] [mulay.dw.lib.objects :as l-objects] [mulay.dw.lib.types :as l-types] [mulay.dw.lib.dates :as l-dates] [mulay.dw.lib.periods :as l-periods] [mulay.dw.lib.numbers :as l-numbers] [mulay.dw.lib.binaries :as l-binaries] [mulay.dw.lib.url :as l-url] [mulay.dw.lib.math :as l-math] [mulay.dw.lib.coercions :as l-coercions] [mulay.dw.lib.diff :as l-diff] [mulay.dw.lib.testdiff :as l-testdiff] [mulay.dw.lib.testio :as l-testio] [mulay.dw.lib.timer :as l-timer] [mulay.dw.lib.tree :as l-tree] [mulay.dw.lib.values :as l-values] [mulay.dw.lib.mime :as l-mime] [mulay.dw.lib.multipart :as l-multipart] [mulay.dw.lib.crypto :as l-crypto] [mulay.dw.lib.runtime :as l-runtime] [mulay.dw.lib.system :as l-system] [mulay.dw.lib.mule :as l-mule] [mulay.dw.lib.validation :as l-validation] [mulay.dw.lib.dtd :as l-dtd] [mulay.dw.lib.core_coll :as l-core_coll] [mulay.dw.lib.core_text :as l-core_text] [mulay.dw.lib.core_misc :as l-core_misc] [mulay.dw.lib.core_num :as l-core_num] [mulay.dw.lib.core_io :as l-core_io] [mulay.dw.lib.core_dates :as l-core_dates]))
+
+(defrecord Compiled [prog: r/Prog code: ev/CProg builtins: Vec(rt/Builtin) errors: Vec(Str) diags: Vec(a/Diag)])
+
+(defn all-builtins Vec(rt/Builtin) []
+  (let [parts: Vec(Vec(rt/Builtin))
+        [(core/builtins)
+        (l-strings/builtins)
+        (l-arrays/builtins)
+        (l-objects/builtins)
+        (l-types/builtins)
+        (l-dates/builtins)
+        (l-periods/builtins)
+        (l-numbers/builtins)
+        (l-binaries/builtins)
+        (l-url/builtins)
+        (l-math/builtins)
+        (l-coercions/builtins)
+        (l-diff/builtins)
+        (l-testdiff/builtins)
+        (l-testio/builtins)
+        (l-timer/builtins)
+        (l-tree/builtins)
+        (l-values/builtins)
+        (l-mime/builtins)
+        (l-multipart/builtins)
+        (l-crypto/builtins)
+        (l-runtime/builtins)
+        (l-system/builtins)
+        (l-mule/builtins)
+        (l-validation/builtins)
+        (l-dtd/builtins)
+        (l-core_coll/builtins)
+        (l-core_text/builtins)
+        (l-core_misc/builtins)
+        (l-core_num/builtins)
+        (l-core_io/builtins)
+        (l-core_dates/builtins)]]
+    (merge-builtins parts)))
+
+(defn merge-builtins Vec(rt/Builtin) [parts: &Vec(Vec(rt/Builtin))]
+  (loop [acc: Vec(rt/Builtin) [] i 0]
+    (if (>= i (count parts)) acc
+      (recur (loop [a acc k 0]
+               (if (>= k (count (nth parts i))) a
+                 (let [b (nth (nth parts i) k)
+                       j (loop [q 0] (if (>= q (count a)) -1
+                                       (if (and (= (:name (nth a q)) (:name b)) (= (:module (nth a q)) (:module b))) q (recur (+ q 1)))))]
+                   (if (< j 0) (recur (conj a b) (+ k 1))
+                     (let [old (nth a j)
+                           os (loop [o (:overloads old) z 0] (if (>= z (count (:overloads b))) o (recur (conj o (nth (:overloads b) z)) (+ z 1))))]
+                       (recur (assoc a j (rt/builtin (:name b) (:module b) os)) (+ k 1)))))))
+             (+ i 1)))))
+
+(defn- diag-msgs Vec(Str) [text: &Str ds: &Vec(a/Diag)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count ds)) acc
+      (recur (+ i 1) (conj acc (:msg (nth ds i)))))))
+
+(def BUILTINS: Delay(Vec(rt/Builtin)) (delay (fn Vec(rt/Builtin) [] (all-builtins))))
+
+(defn compile Compiled [text: &Str inputs: Vec(Str)] (compile-with text inputs no-modules))
+
+(defn no-modules Values(Str Bool) [name: Str] (values "" false))
+
+(defn module-path Str [m: &Str]
+  (cond (str/starts-with? m "jsonschema!") (str (str/replace (subs m 11 (count m)) "::" "/") ".json")
+        (str/starts-with? m "xmlschema!") (str (str/replace (subs m 10 (count m)) "::" "/") ".xsd")
+        :else (str (str/replace m "::" "/") ".dwl")))
+
+(defn- module-source Values(Str Bool Str) [m: &Str loader: &Fn(Str Values(Str Bool))]
+  (let [[src found] (if (stdm/std? m) (stdm/source m) (loader (str m)))]
+    (cond (not found) (values "" false "")
+          (str/starts-with? m "jsonschema!") (let [[t e] (st/json-schema-module src)] (values t true (if (= e "") "" (str "Module " m ": " e))))
+          (str/starts-with? m "xmlschema!") (let [[t e] (xst/xml-schema-module src m loader)] (values t true (if (= e "") "" (str "Module " m ": " e))))
+          :else (values src true ""))))
+
+(defn- ident-char? Bool [c: Int] (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57)) (= c 95)))
+
+(defn- qualified-mods Vec(Str) [t: &Str]
+  (let [n (count t)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i n) acc
+        (if (and (ident-char? (nth t i)) (or (= i 0) (not (ident-char? (nth t (- i 1))))))
+          (let [[e last-sep] (loop [j i ls -1]
+                               (let [k (loop [x j] (if (and (< x n) (ident-char? (nth t x))) (recur (+ x 1)) x))]
+                                 (if (and (< (+ k 2) n) (= (nth t k) 58) (= (nth t (+ k 1)) 58) (ident-char? (nth t (+ k 2))))
+                                   (recur (+ k 2) k)
+                                   (values k ls))))]
+            (recur e (if (< last-sep 0) acc (conj acc (subs t i last-sep)))))
+          (recur (+ i 1) acc))))))
+
+(defn- module-refs Vec(Str) [sc: &a/Script text: &Str]
+  (let [ds (:decls sc)
+        imps (loop [i 0 acc: Vec(Str) []]
+               (if (>= i (count ds)) acc
+                 (recur (+ i 1) (match (:d (nth ds i)) (a/DImport m names star alias) (conj acc (str m)) _ acc))))]
+    (loop [i 0 acc imps q (qualified-mods text)] (if (>= i (count q)) acc (recur (+ i 1) (conj acc (nth q i)) q)))))
+
+(defn- has? Bool [xs: &Vec(Str) x: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) x) true (recur (+ i 1))))))
+
+(defn- spaces Str [n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out " ")))))
+
+(defn- load-modules Values(Vec(res/ModSrc) Int Vec(Str) Vec(Str) Vec(rt/SrcSeg)) [refs: &Vec(Str) loader: &Fn(Str Values(Str Bool)) base: Int seen0: Vec(Str) depth: Int]
+  (loop [i 0 mods: Vec(res/ModSrc) [] b base seen seen0 errs: Vec(Str) [] segs: Vec(rt/SrcSeg) []]
+    (if (or (>= i (count refs)) (> depth 32)) (values mods b seen errs segs)
+      (let [m (nth refs i)]
+        (if (or (has? seen m) (and (str/starts-with? m "dw::") (not (stdm/std? m))) (= m "dw")) (recur (+ i 1) mods b seen errs segs)
+          (let [[src found serr] (module-source m loader)]
+            (if (not= serr "") (recur (+ i 1) mods b (conj seen m) (conj errs serr) segs)
+            (if (not found) (recur (+ i 1) mods b (conj seen m) errs segs)
+              (let [[sc0 d0] (p/parse-module src)]
+                (if (> (count d0) 0) (recur (+ i 1) mods b (conj seen m) (conj errs (str "Module " m ": " (nth (diag-msgs src d0) 0))) segs)
+                  (let [[sc pd] (p/parse-module (str (spaces b) src))
+                        [sub b2 seen2 errs2 segs2] (load-modules (module-refs sc src) loader (+ b (count src) 1) (conj seen m) (+ depth 1))
+                        mods2 (loop [k 0 acc mods] (if (>= k (count sub)) acc (recur (+ k 1) (conj acc (nth sub k)))))
+                        errs3 (loop [k 0 acc errs] (if (>= k (count errs2)) acc (recur (+ k 1) (conj acc (nth errs2 k)))))
+                        segs3 (loop [k 0 acc (conj segs (rt/->SrcSeg m b src))] (if (>= k (count segs2)) acc (recur (+ k 1) (conj acc (nth segs2 k)))))]
+                    (recur (+ i 1) (conj mods2 (res/->ModSrc m (:decls sc))) b2 seen2 errs3 segs3))))))))))))
+
+(defn compile-with Compiled [text: &Str inputs: Vec(Str) loader: Fn(Str Values(Str Bool))]
+  (let [bs (deref BUILTINS)
+        [sc pd] (p/parse text)]
+    (if (> (count pd) 0)
+      (let [pr (r/->Prog [] [] inputs (r/->R (r/->RConst (v/null-v)) (a/->Span 0 0)) 0 [] [])]
+        (->Compiled pr (ev/compile-prog pr) bs (diag-msgs text pd) pd))
+      (let [h (gen/script-hash text inputs)
+            [mods b seen merrs segs] (load-modules (module-refs sc text) loader (+ (count text) 1) [] 0)
+            rr (res/resolve-with sc inputs bs mods)
+            pr (:prog rr)
+            z (if (and (dyn->bool (deref RECORDING)) (= (count (:diags rr)) 0)) (record! h pr bs) 0)]
+        (->Compiled pr (assoc (code-of h pr) :srcs (rt/->Srcs (str text) "anonymous" segs) :runner run-script :pure (pur/of-fns pr bs)) bs
+                    (let [ds (diag-msgs text (:diags rr))] (loop [k 0 acc merrs] (if (>= k (count ds)) acc (recur (+ k 1) (conj acc (nth ds k))))))
+                    (:diags rr))))))
+
+(def RECORDING (atom (->dyn false)))
+(def RECORD-NS (atom (->dyn "")))
+(def RECORDED (atom (let [m: Map(Str Dyn) {}] (->dyn m))))
+
+(defn start-recording! Int [prefix: &Str] (let [z (reset! RECORD-NS (->dyn (str prefix))) z2 (reset! RECORDING (->dyn true))] 0))
+
+(defn- record! Int [h: &Str pr: &r/Prog bs: &Vec(rt/Builtin)]
+  (let [src (gc/module (str (dyn->str (deref RECORD-NS)) "_s" h) pr bs)
+        hk (str h)
+        z (swap! RECORDED (fn Dyn [old: Dyn] (let [m: Map (dyn->map old)] (->dyn (assoc m hk (->dyn src))))))]
+    0))
+
+(defn recorded Values(Vec(Str) Vec(Str)) []
+  (let [m: Map (dyn->map (deref RECORDED))
+        ks: Vec(Str) (keys m)]
+    (loop [i 0 hs: Vec(Str) [] ss: Vec(Str) []]
+      (if (>= i (count ks)) (values hs ss)
+        (recur (+ i 1) (conj hs (nth ks i)) (conj ss (dyn->str (get! m (nth ks i)))))))))
+
+(def GENERATED (atom (->dyn false)))
+
+(defn set-generated! Int [t: Vec(gr/Gen)] (let [z (reset! GENERATED (->dyn (gr/->Gens t)))] 0))
+
+(defn- generated Vec(gr/Gen) []
+  (let [d (deref GENERATED)]
+    (if (boolean? d) (let [t: Vec(gr/Gen) []] t) (let [g: gr/Gens (dyn->rec d)] (:v g)))))
+
+(defn- code-of ev/CProg [h: &Str p: &r/Prog]
+  (let [gs (generated)
+        i (loop [i 0] (if (>= i (count gs)) -1 (if (= (:hash (nth gs i)) h) i (recur (+ i 1)))))]
+    (if (< i 0) (ev/compile-prog p) ((:build (nth gs i)) p))))
+
+(defn generated-count Int [] (count (generated)))
+
+(defn out-charset Str [mime: &Str props: &Vec(v/Field)]
+  (let [id (reg/format-id mime)
+        enc (loop [i 0] (if (>= i (count props)) ""
+                          (if (= (:name (:key (nth props i))) "encoding")
+                            (let [[s e] (rt/to-text (:value (nth props i)))] s)
+                            (recur (+ i 1)))))
+        cs (if (= enc "") "" (l-binaries/charset-id enc))]
+    (if (or (= cs "UTF-8") (= id "binary") (= id "java") (= id "multipart")) "" cs)))
+
+(defn encode-output Str [text: &Str mime: &Str props: &Vec(v/Field)]
+  (let [cs (out-charset mime props)] (if (= cs "") (str text) (l-binaries/cs-encode text cs))))
+
+(defn- err-obj v/Val [e: &dwe/DwErr srcs: &rt/Srcs]
+  (let [ex (loc/err-excerpt e srcs)
+      fr (dwe/stack-of e)
+      trace (loop [i 0 out ""]
+              (if (>= i (count fr)) out
+                (let [f (nth fr i)
+            w (:where f)
+            line (if (not= w "")
+                   (let [[m ln col] (loc/split-where w)]
+                     (str m "::" (:name f) " (line: " ln ", column: " col ")"))
+                   (let [[ln col xx id] (rt/excerpt-in srcs (:sp f))]
+                     (str id "::" (rt/short-name (:name f)) " (line: " ln ", column: " col ")")))]
+        (recur (+ i 1) (str out "\n  at " line)))))
+      msg (if (= ex "Unknown location") (str (:msg e)) (str (:msg e) "\n" ex "\nTrace:" trace))
+      st (match (loc/stack-v e srcs) (v/VArr xs) xs _ [])]
+  (fail-obj (loc/dw-kind (:kind e)) msg (loc/err-loc e srcs) st)))
+
+(defn write-output Values(Str Str dwe/DwErr) [out: &Vec(r/Output) x: &v/Val]
+  (let [mime (if (= (count out) 0) "application/json" (reg/norm-mime (:mime (nth out 0))))
+        props: Vec(v/Field) (if (= (count out) 0) [] (:props (nth out 0)))
+        nss: Vec(v/Ns) (if (= (count out) 0) [] (:nss (nth out 0)))
+        [t e] (reg/write-script-output mime props nss x)
+        cs (out-charset mime props)]
+    (if (or (= cs "") (not (dwe/ok? e))) (values mime t e)
+      (let [[back k n] (l-binaries/cs-decode (l-binaries/cs-encode t cs) cs false)] (values mime back e)))))
+
+(defrecord Input [name: Str mime: Str props: Vec(v/Field) text: Str])
+
+(defn input-decl Vec(r/InputDecl) [p: &r/Prog name: &Str]
+  (let [ds (:input-decls p)]
+    (loop [i 0] (if (>= i (count ds)) [] (if (= (:name (nth ds i)) name) [(nth ds i)] (recur (+ i 1)))))))
+
+(defn run-text Values(Str Str Str) [script: &Str ins: &Vec(Input)]
+  (let [[mime out err c e] (run-text-full script ins)] (values mime out err)))
+
+(defn run-text-full Values(Str Str Str Compiled dwe/DwErr) [script: &Str ins: &Vec(Input)]
+  (run-text-with script ins no-modules))
+
+(defn run-text-with Values(Str Str Str Compiled dwe/DwErr) [script: &Str ins: &Vec(Input) loader: Fn(Str Values(Str Bool))]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count ins)) acc (recur (+ i 1) (conj acc (:name (nth ins i))))))
+        c (compile-with script names loader)]
+    (if (> (count (:errors c)) 0) (values "" "" (nth (:errors c) 0) c (dwe/ok))
+      (let [[vals re] (loop [i 0 acc: Vec(v/Val) []]
+                        (if (>= i (count ins)) (values acc "")
+                          (let [in (nth ins i)
+                                decl (input-decl (:prog c) (:name in))
+                                mime (if (= (count decl) 0) (:mime in) (:mime (nth decl 0)))
+                                props (if (= (count decl) 0) (:props in) (:props (nth decl 0)))
+                                [x e] (reg/read-named mime props (:text in) (:name in))]
+                            (if (= e "") (recur (+ i 1) (conj acc (v/lazy-input x))) (values acc e)))))]
+        (if (not= re "") (values "" "" re c (dwe/ok))
+          (let [[x e] (ev/run-code (:code c) (:builtins c) vals)]
+            (if (not (dwe/ok? e)) (values "" "" (:msg e) c e)
+              (let [[m o we] (write-output (:output (:prog c)) x)]
+                (cond (dwe/ok? we) (values m o "" c (dwe/ok))
+                      (= (:kind we) "WriterException") (values m o (:msg we) c (dwe/ok))
+                      :else (values "" "" (:msg we) c we))))))))))
+
+(defn eval-compiled Values(v/Val dwe/DwErr) [c: &Compiled inputs: Vec(v/Val)]
+  (ev/run-code (:code c) (:builtins c) inputs))
+
+(defn eval-compiled-w Values(v/Val dwe/DwErr ev/Ctx) [c: &Compiled inputs: Vec(v/Val)
+                                                     wrap: Option(Fn(Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) v/FnV v/Val))]
+  (ev/run-code-w (:code c) (:builtins c) inputs wrap))
+
+(defrecord Staged [src: Compiled fnc: Compiled])
+
+(defn stage-map Vec(Staged) [c: &Compiled]
+  (let [p (:prog c)
+        bs (:builtins c)]
+    (match (:x (:body p))
+      (r/RCallB id args)
+      (if (and (= (count args) 2) (>= id 0) (< id (count bs))
+               (= (:name (nth bs id)) "map") (= (:module (nth bs id)) "dw::Core"))
+        [(->Staged (sub-compiled c (nth args 0)) (sub-compiled c (nth args 1)))]
+        [])
+      _ [])))
+
+(defn- sub-compiled Compiled [c: &Compiled body: &r/R]
+  (let [p (:prog c)
+        p2 (r/->Prog (:fns p) (:globals p) (:inputs p) body (:nslots p) (:output p) (:input-decls p))
+        code (assoc (ev/compile-prog p2) :srcs (:srcs (:code c)) :pure (:pure (:code c)))]
+    (->Compiled p2 code (:builtins c) [] [])))
+
+(defn stage-src-input? Bool [st: &Staged name: &Str]
+  (let [p (:prog (:src st))]
+    (match (:x (:body p)) (r/RInput k) (= (nth (:inputs p) k) name) _ false)))
+
+(defn stage-fn Values(ev/Ctx v/Val dwe/DwErr) [st: &Staged inputs: Vec(v/Val)]
+  (stage-fn-w st inputs ev/NO-WRAP))
+
+(defn stage-fn-w Values(ev/Ctx v/Val dwe/DwErr) [st: &Staged inputs: Vec(v/Val)
+                                                wrap: Option(Fn(Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) v/FnV v/Val))]
+  (let [fc (:fnc st)
+        [c e] (ev/prep-ctx-w (:code fc) (:builtins fc) inputs wrap)]
+    (if (not (dwe/ok? e)) (values c (v/null-v) e)
+      (let [[f fe] (ev/run-body c)] (values c f fe)))))
+
+(defn stage-apply Values(v/Val dwe/DwErr) [c: &ev/Ctx f: &v/FnV x: v/Val i: Int]
+  (ev/call-fnv c f [x (v/int-v i)] 0 true))
+
+(defn output-mime Str [c: &Compiled]
+  (let [o (:output (:prog c))]
+    (if (= (count o) 0) "" (reg/norm-mime (:mime (nth o 0))))))
+
+(defn output-nss Vec(v/Ns) [c: &Compiled]
+  (let [o (:output (:prog c))]
+    (if (= (count o) 0) [] (:nss (nth o 0)))))
+
+(defn output-props Vec(v/Field) [c: &Compiled]
+  (let [o (:output (:prog c))]
+    (if (= (count o) 0) [] (:props (nth o 0)))))
+
+(defn ok? Bool [c: &Compiled] (= (count (:errors c)) 0))
+
+(defn render-first-error Str [text: &Str c: &Compiled name: &Str]
+  (cond (> (count (:errors c)) (count (:diags c))) (nth (:errors c) 0)
+        (= (count (:diags c)) 0) ""
+        :else (let [d (nth (:diags c) 0)
+                    sp (:sp d)
+                    [mtext id base] (rt/seg-of (srcs-of c) (:start sp))]
+                (if (= base 0) (src/render-diag text name d)
+                  (src/render-diag mtext id (a/->Diag (:msg d) (a/->Span (- (:start sp) base) (- (:end sp) base))))))))
+
+(defn- fobj Vec(v/Field) [x: &v/Val] (match (v/unmeta x) (v/VObj fs) fs _ []))
+(defn- vtext Str [x: &v/Val] (match (v/unmeta x) (v/VStr s) (str s) (v/VBin b) (str b) _ ""))
+(defn- empty-logs v/Val [] (v/->VArr []))
+
+(defn- fs-loader Fn(Str Values(Str Bool)) [fs: Vec(v/Field)]
+  (fn Values(Str Bool) [m: Str]
+    (let [key (str "/" (module-path m))
+          r (v/obj-get fs key)]
+      (if (= (count r) 0) (values "" false) (values (vtext (nth r 0)) true)))))
+
+(defn- fail-obj v/Val [kind: Str msg: Str location: v/Val stack: Vec(v/Val)]
+  (let [base [(v/field "kind" (v/->VStr kind)) (v/field "message" (v/->VStr msg)) (v/field "location" location)]
+        fs (if (= (count stack) 0) base (conj base (v/field "stack" (v/->VArr stack))))]
+    (v/->VObj [(v/field "success" (v/bool-v false)) (v/field "error" (v/->VObj (conj fs (v/field "logs" (empty-logs)))))])))
+
+(defn srcs-of rt/Srcs [c: &Compiled] (:srcs (:code c)))
+
+(defn with-source-id Compiled [c: Compiled id: &Str]
+  (let [s (:srcs (:code c))] (assoc c :code (assoc (:code c) :srcs (rt/->Srcs (str (:main s)) (str id) (:segs s))))))
+
+(defn run-script Values(v/Val dwe/DwErr) [file: Str fs0: v/Val readers: v/Val vals0: v/Val write: Bool]
+  (let [fs (fobj fs0)
+        hit (v/obj-get fs file)]
+    (if (= (count hit) 0) (rt/failure "ResourceNotFound" (str "Unable to find resource with name " file))
+      (let [src (vtext (nth hit 0))
+            base (let [k (str/last-index-of file "/") b (if (< k 0) (str file) (subs file (+ k 1) (count file)))]
+                   (if (str/ends-with? b ".dwl") (subs b 0 (- (count b) 4)) b))
+            rd (fobj readers) vs (fobj vals0)
+            names (loop [i 0 acc: Vec(Str) []]
+                    (if (>= i (+ (count rd) (count vs))) acc
+                      (recur (+ i 1) (conj acc (:name (:key (if (< i (count rd)) (nth rd i) (nth vs (- i (count rd))))))))))
+            [ins ie] (loop [i 0 acc: Vec(v/Val) []]
+                       (if (>= i (count rd)) (values acc "")
+                         (let [ri (fobj (:value (nth rd i)))
+                               mime (let [m (v/obj-get ri "mimeType")] (if (= (count m) 0) "application/json" (vtext (nth m 0))))
+                               text (let [m (v/obj-get ri "value")] (if (= (count m) 0) "" (vtext (nth m 0))))
+                               props (let [m (v/obj-get ri "properties")] (if (= (count m) 0) [] (fobj (nth m 0))))
+                               [x e] (reg/read-named mime props text (nth names i))]
+                           (if (not= e "") (values acc e) (recur (+ i 1) (conj acc (v/lazy-input x)))))))
+            inputs (loop [i 0 acc ins] (if (>= i (count vs)) acc (recur (+ i 1) (conj acc (:value (nth vs i))))))
+            c (compile-with src names (fs-loader fs))]
+      (cond
+        (not= ie "") (values (fail-obj "ReaderException" ie (loc/unknown-loc) []) (dwe/ok))
+        (> (count (:errors c)) 0)
+        (let [ds (:diags c)
+              srcs (rt/->Srcs (str src) base (:segs (:srcs (:code c))))
+              [locv ex] (if (= (count ds) 0) (values (loc/unknown-loc) "")
+                          (let [sp (:sp (nth ds 0))
+                                [l col x id] (rt/excerpt-in srcs sp)]
+                            (values (loc/script-loc-in srcs (:start sp) (:end sp))
+                                    (if (= l 0) "" (str "\n" x "\nLocation:\n" id " (line: " l ", column:" col ")")))))]
+          (values (fail-obj "CompilationException" (str (nth (:errors c) 0) ex) locv []) (dwe/ok)))
+        :else
+        (let [code (assoc (:code c) :srcs (rt/->Srcs (str src) base (:segs (:srcs (:code c)))))
+              srcs (:srcs code)
+              [x e cx] (ev/run-code-w code (:builtins c) inputs ev/NO-WRAP)]
+          (if (not (dwe/ok? e)) (values (err-obj e srcs) (dwe/ok))
+            (if (not write)
+              (let [[xw xe] (v/whole-deep x)]
+                (if (not (dwe/ok? xe)) (values (err-obj xe srcs) (dwe/ok))
+                  (values (v/->VObj [(v/field "success" (v/bool-v true))
+                                     (v/field "result" (v/->VObj [(v/field "value" (ev/export-val (fn v/Val [g: v/FnV] (ev/plain-export cx g)) xw))
+                                                                  (v/field "logs" (empty-logs))]))]) (dwe/ok))))
+              (let [out (:output (:prog c))
+                    mime (if (= (count out) 0) "application/dw" (reg/norm-mime (:mime (nth out 0))))
+                    props: Vec(v/Field) (if (= (count out) 0) [] (:props (nth out 0)))
+                    nss: Vec(v/Ns) (if (= (count out) 0) [] (:nss (nth out 0)))
+                    [t we] (reg/write-script-output mime props nss x)
+                    cs (out-charset mime props)]
+                (cond (= (:kind we) "WriterException") (values (fail-obj "WriterException" (:msg we) (loc/unknown-loc) []) (dwe/ok))
+                      (not (dwe/ok? we)) (values (err-obj we srcs) (dwe/ok))
+                      :else
+                  (values (v/->VObj [(v/field "success" (v/bool-v true))
+                                     (v/field "result" (v/->VObj [(v/field "value" (v/->VStr t)) (v/field "mimeType" (v/->VStr mime))
+                                                                   (v/field "encoding" (v/->VStr (if (= cs "") "UTF-8" cs)))
+                                                                   (v/field "logs" (empty-logs))]))]) (dwe/ok))))))))))))

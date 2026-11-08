@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ms-inference="http://www.mulesoft.org/schema/mule/ms-inference"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ms-inference http://www.mulesoft.org/schema/mule/ms-inference/current/mule-ms-inference.xsd">
+
+    <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18420"/></http:listener-config>
+    <http:listener-config name="M"><http:listener-connection host="0.0.0.0" port="18421"/></http:listener-config>
+    <os:object-store name="STORE" persistent="false"/>
+
+    <ms-inference:text-generation-config name="LLM">
+        <ms-inference:openai-compatible-connection apiKey="sk-test" openAICompatibleURL="http://localhost:18421/v1" openAICompatibleModelName="test-model"/>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLM2">
+        <ms-inference:openai-compatible-connection apiKey="sk-two" openAICompatibleURL="http://localhost:18421/v2/" openAICompatibleModelName="m2"
+            maxTokens="123" temperature="0.2" topP="0.5" timeout="2" timeoutUnit="SECONDS">
+            <ms-inference:custom-headers><ms-inference:default-header key="X-Test" value="abc"/></ms-inference:custom-headers>
+        </ms-inference:openai-compatible-connection>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLMDEAD">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18499/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <!-- 壊れた相手 (scenario の rawserver) -->
+    <ms-inference:text-generation-config name="LLMCLOSE">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18422/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLMRESET">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18423/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLMGARBAGE">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18424/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLMNOCOLON">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18425/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLMSHORT">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18426/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLMCHUNKCUT">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18427/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+
+    <!-- 偽の OpenAI 互換の口: 受けた要求を覚えて、mode に応じた応答を返す -->
+    <flow name="mock">
+        <http:listener config-ref="M" path="/v1/*" allowedMethods="POST"><http:response statusCode="#[vars.st default 200]"/></http:listener>
+        <flow-ref name="mock-body"/>
+    </flow>
+    <flow name="mock2">
+        <http:listener config-ref="M" path="/v2/*" allowedMethods="POST"><http:response statusCode="#[vars.st default 200]"/></http:listener>
+        <flow-ref name="mock-body"/>
+    </flow>
+    <flow name="mock-body">
+        <set-variable variableName="seen" value="#[output application/json --- {path: attributes.requestPath, auth: attributes.headers.authorization default null, contentType: attributes.headers.'content-type' default null, xtest: attributes.headers.'x-test' default null, body: payload}]"/>
+        <os:store key="last" objectStore="STORE"><os:value>#[vars.seen]</os:value></os:store>
+        <set-variable variableName="trig" value="#[payload.messages[-1].content default '']"/>
+        <choice>
+            <when expression="#[vars.trig == 'tool']">
+                <set-payload value="#[output application/json --- {id: 'chatcmpl-2', object: 'chat.completion', model: 'test-model', choices: [{index: 0, message: {role: 'assistant', content: null, tool_calls: [{id: 'call_1', 'type': 'function', 'function': {name: 'get_weather', arguments: '{&quot;city&quot;:&quot;Tokyo&quot;}'}}]}, finish_reason: 'tool_calls'}], usage: {prompt_tokens: 5, completion_tokens: 6, total_tokens: 11}}]"/>
+            </when>
+            <when expression="#[vars.trig == 'e401']">
+                <set-variable variableName="st" value="#[401]"/>
+                <set-payload value="#[output application/json --- {error: {message: 'Incorrect API key', 'type': 'invalid_request_error', code: 'invalid_api_key'}}]"/>
+            </when>
+            <when expression="#[vars.trig == 'e500']">
+                <set-variable variableName="st" value="#[500]"/>
+                <set-payload value="#[output application/json --- {error: {message: 'boom'}}]"/>
+            </when>
+            <when expression="#[vars.trig == 'e429']">
+                <set-variable variableName="st" value="#[429]"/>
+                <set-payload value="#[output application/json --- {error: {message: 'slow down'}}]"/>
+            </when>
+            <when expression="#[vars.trig == 'e400']">
+                <set-variable variableName="st" value="#[400]"/>
+                <set-payload value="not json"/>
+            </when>
+            <when expression="#[vars.trig == 'badjson']">
+                <set-payload value="this is not json"/>
+            </when>
+            <when expression="#[vars.trig == 'nochoices']">
+                <set-payload value="#[output application/json --- {id: 'x', choices: []}]"/>
+            </when>
+            <otherwise>
+                <set-payload value="#[output application/json --- {id: 'chatcmpl-1', object: 'chat.completion', model: 'test-model', choices: [{index: 0, message: {role: 'assistant', content: 'hello from mock'}, finish_reason: 'stop'}], usage: {prompt_tokens: 3, completion_tokens: 4, total_tokens: 7}}]"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <flow name="last">
+        <http:listener config-ref="M" path="/last"/>
+        <os:retrieve key="last" objectStore="STORE"><os:default-value>#[null]</os:default-value></os:retrieve>
+    </flow>
+
+    <!-- 操作の結果 (payload、attributes、型) を JSON にして返す -->
+    <sub-flow name="report">
+        <set-payload value="#[output application/json --- {payload: vars.out, attributes: vars.attrs, 'class': vars.out.^class default null, mime: vars.out.^mimeType default null}]"/>
+    </sub-flow>
+    <sub-flow name="fail">
+        <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+    </sub-flow>
+
+    <flow name="answer">
+        <http:listener config-ref="L" path="/answer/{p}"/>
+        <try>
+            <ms-inference:chat-answer-prompt config-ref="LLM">
+                <ms-inference:prompt>#[attributes.uriParams.p]</ms-inference:prompt>
+            </ms-inference:chat-answer-prompt>
+            <set-variable variableName="out" value="#[payload]"/>
+            <set-variable variableName="attrs" value="#[attributes]"/>
+            <flow-ref name="report"/>
+            <error-handler><on-error-continue><flow-ref name="fail"/></on-error-continue></error-handler>
+        </try>
+    </flow>
+    <flow name="answer2">
+        <http:listener config-ref="L" path="/answer2/{p}"/>
+        <try>
+            <ms-inference:chat-answer-prompt config-ref="LLM2">
+                <ms-inference:prompt>#[attributes.uriParams.p]</ms-inference:prompt>
+            </ms-inference:chat-answer-prompt>
+            <set-variable variableName="out" value="#[payload]"/>
+            <set-variable variableName="attrs" value="#[attributes]"/>
+            <flow-ref name="report"/>
+            <error-handler><on-error-continue><flow-ref name="fail"/></on-error-continue></error-handler>
+        </try>
+    </flow>
+    <flow name="dead">
+        <http:listener config-ref="L" path="/dead"/>
+        <try>
+            <ms-inference:chat-answer-prompt config-ref="LLMDEAD">
+                <ms-inference:prompt>#["hi"]</ms-inference:prompt>
+            </ms-inference:chat-answer-prompt>
+            <error-handler><on-error-continue><flow-ref name="fail"/></on-error-continue></error-handler>
+        </try>
+    </flow>
+    <ms-inference:text-generation-config name="LLMRAWSTATUS4096">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18445/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLMRAWSTATUS4097">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18446/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLMRAWHEAD8192">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18447/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <ms-inference:text-generation-config name="LLMRAWHEAD8193">
+        <ms-inference:openai-compatible-connection apiKey="k" openAICompatibleURL="http://localhost:18448/v1" openAICompatibleModelName="m"/>
+    </ms-inference:text-generation-config>
+    <flow name="broken">
+        <http:listener config-ref="L" path="/broken/{k}"/>
+        <try>
+            <choice>
+                <when expression="#[attributes.uriParams.k == 'status-4096']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMRAWSTATUS4096"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+                <when expression="#[attributes.uriParams.k == 'status-4097']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMRAWSTATUS4097"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+                <when expression="#[attributes.uriParams.k == 'head-8192']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMRAWHEAD8192"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+                <when expression="#[attributes.uriParams.k == 'head-8193']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMRAWHEAD8193"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+                <when expression="#[attributes.uriParams.k == 'close']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMCLOSE"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+                <when expression="#[attributes.uriParams.k == 'reset']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMRESET"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+                <when expression="#[attributes.uriParams.k == 'garbage']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMGARBAGE"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+                <when expression="#[attributes.uriParams.k == 'nocolon']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMNOCOLON"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+                <when expression="#[attributes.uriParams.k == 'short']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMSHORT"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+                <when expression="#[attributes.uriParams.k == 'chunkcut']">
+                    <ms-inference:chat-answer-prompt config-ref="LLMCHUNKCUT"><ms-inference:prompt>#["hi"]</ms-inference:prompt></ms-inference:chat-answer-prompt>
+                </when>
+            </choice>
+            <error-handler><on-error-continue><flow-ref name="fail"/></on-error-continue></error-handler>
+        </try>
+    </flow>
+    <flow name="completions">
+        <http:listener config-ref="L" path="/completions" allowedMethods="POST"/>
+        <try>
+            <ms-inference:chat-completions config-ref="LLM">
+                <ms-inference:messages>#[payload]</ms-inference:messages>
+            </ms-inference:chat-completions>
+            <set-variable variableName="out" value="#[payload]"/>
+            <set-variable variableName="attrs" value="#[attributes]"/>
+            <flow-ref name="report"/>
+            <error-handler><on-error-continue><flow-ref name="fail"/></on-error-continue></error-handler>
+        </try>
+    </flow>
+    <flow name="template">
+        <http:listener config-ref="L" path="/template/{p}"/>
+        <try>
+            <ms-inference:agent-define-prompt-template config-ref="LLM">
+                <ms-inference:template>#["You are a helper."]</ms-inference:template>
+                <ms-inference:instructions>#["Answer briefly."]</ms-inference:instructions>
+                <ms-inference:data>#[attributes.uriParams.p]</ms-inference:data>
+            </ms-inference:agent-define-prompt-template>
+            <set-variable variableName="out" value="#[payload]"/>
+            <set-variable variableName="attrs" value="#[attributes]"/>
+            <flow-ref name="report"/>
+            <error-handler><on-error-continue><flow-ref name="fail"/></on-error-continue></error-handler>
+        </try>
+    </flow>
+    <flow name="tools">
+        <http:listener config-ref="L" path="/tools/{p}"/>
+        <try>
+            <ms-inference:tools-native-template config-ref="LLM">
+                <ms-inference:template>#[attributes.uriParams.p]</ms-inference:template>
+                <ms-inference:instructions>#["Use tools."]</ms-inference:instructions>
+                <ms-inference:data>#[attributes.uriParams.p]</ms-inference:data>
+                <ms-inference:tools>#[output application/json --- [{'type': 'function', 'function': {name: 'get_weather', description: 'Weather', parameters: {'type': 'object', properties: {city: {'type': 'string'}}, required: ['city']}}}]]</ms-inference:tools>
+            </ms-inference:tools-native-template>
+            <set-variable variableName="out" value="#[payload]"/>
+            <set-variable variableName="attrs" value="#[attributes]"/>
+            <flow-ref name="report"/>
+            <error-handler><on-error-continue><flow-ref name="fail"/></on-error-continue></error-handler>
+        </try>
+    </flow>
+    <!-- String の引数は値として評価する (出力形式を推論しないので、JSON と Java の変数を混ぜても失敗しない) -->
+    <flow name="mixed">
+        <http:listener config-ref="L" path="/mixed"/>
+        <set-variable variableName="j" value="#[output application/json --- {a: 1}]"/>
+        <set-variable variableName="k" value="#[output application/java --- {b: 2}]"/>
+        <try>
+            <ms-inference:chat-answer-prompt config-ref="LLM">
+                <ms-inference:prompt>#[write({j: vars.j, k: vars.k}, 'application/json', {indent: false})]</ms-inference:prompt>
+            </ms-inference:chat-answer-prompt>
+            <error-handler><on-error-continue><flow-ref name="fail"/></on-error-continue></error-handler>
+        </try>
+    </flow>
+</mule>

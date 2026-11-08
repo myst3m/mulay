@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18117"/>
+    </http:listener-config>
+
+    <!-- 値の型: 文字列そのまま / 式 / 式の数値・真偽・null / 埋め込み式 -->
+    <flow name="kinds">
+        <http:listener config-ref="L" path="/kinds"/>
+        <set-variable variableName="literal" value="plain literal"/>
+        <set-variable variableName="literalNumber" value="42"/>
+        <set-variable variableName="exprNumber" value="#[42]"/>
+        <set-variable variableName="exprBool" value="#[true]"/>
+        <set-variable variableName="exprNull" value="#[null]"/>
+        <set-variable variableName="exprObject" value="#[{a: 1, b: [true, 'x']}]"/>
+        <set-variable variableName="my-dashed" value="dash"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  literal: vars.literal, literalType: typeOf(vars.literal) as String,
+  literalNumber: vars.literalNumber, literalNumberType: typeOf(vars.literalNumber) as String,
+  exprNumber: vars.exprNumber, exprNumberType: typeOf(vars.exprNumber) as String,
+  exprBool: vars.exprBool,
+  exprNull: vars.exprNull, hasExprNull: vars.exprNull != null,
+  exprObject: vars.exprObject,
+  dashed: vars.'my-dashed',
+  missing: vars.nope
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 文字列の中に #[...] を埋め込む (logger の message では使えるが、set-variable では?) -->
+    <flow name="embedded">
+        <http:listener config-ref="L" path="/embedded"/>
+        <set-variable variableName="embedded" value="Hello #[upper('world')]!"/>
+        <set-payload value="#[vars.embedded]"/>
+    </flow>
+
+    <!-- 上書き、remove-variable (存在しないものを消しても失敗しない) -->
+    <flow name="remove">
+        <http:listener config-ref="L" path="/remove"/>
+        <set-variable variableName="a" value="first"/>
+        <set-variable variableName="a" value="second"/>
+        <set-variable variableName="b" value="to be removed"/>
+        <remove-variable variableName="b"/>
+        <remove-variable variableName="neverExisted"/>
+        <set-payload value="#[output application/json --- {a: vars.a, b: vars.b default 'removed', keys: keysOf(vars)}]"/>
+    </flow>
+
+    <!-- 変数の mime: JSON 文字列を mimeType 付きで入れると、あとで選択できるか -->
+    <flow name="var-mime">
+        <http:listener config-ref="L" path="/var-mime"/>
+        <set-variable variableName="asJson" value='{"k": "v"}' mimeType="application/json"/>
+        <set-variable variableName="asText" value='{"k": "v"}'/>
+        <set-payload value="#[output application/json --- {fromJson: vars.asJson.k, textIsString: vars.asText is String}]"/>
+    </flow>
+
+    <!-- set-payload: mimeType と encoding、式で作った値の mime -->
+    <flow name="payload-mime">
+        <http:listener config-ref="L" path="/payload/{kind}"/>
+        <choice>
+            <when expression="#[attributes.uriParams.kind == 'text']">
+                <set-payload value="text payload" mimeType="text/plain"/>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'text-latin1']">
+                <set-payload value="café" mimeType="text/plain" encoding="ISO-8859-1"/>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'json-literal']">
+                <set-payload value='{"literal": true}' mimeType="application/json"/>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'json-expr']">
+                <set-payload value="#[output application/json --- {expr: true}]"/>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'java-object']">
+                <set-payload value="#[{javaObject: true}]"/>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'number']">
+                <set-payload value="#[12.50]"/>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'null']">
+                <set-payload value="#[null]"/>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'xml-expr']">
+                <set-payload value="#[output application/xml --- {root: {child: 'x'}}]"/>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'csv-expr']">
+                <set-payload value="#[output application/csv --- [{a: 1, b: 'x'}, {a: 2, b: 'y,z'}]]"/>
+            </when>
+            <otherwise>
+                <set-payload value="#[attributes.uriParams.kind]"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- attributes は置き換えられず、set-payload のあとも残る -->
+    <flow name="attributes-survive">
+        <http:listener config-ref="L" path="/attributes"/>
+        <set-payload value="replaced"/>
+        <set-payload value="#[output application/json --- {method: attributes.method, path: attributes.requestPath, q: attributes.queryParams, uri: attributes.requestUri, listenerPath: attributes.listenerPath, relativePath: attributes.relativePath, rawRequestPath: attributes.rawRequestPath, version: attributes.version, scheme: attributes.scheme, queryString: attributes.queryString, maskedRequestPath: attributes.maskedRequestPath}]"/>
+    </flow>
+
+</mule>

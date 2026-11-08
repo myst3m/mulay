@@ -1,0 +1,91 @@
+(ns mulay.rt.deferred
+  (:require [mulay.dw.fmt.out :as fo] [mulay.dw.val :as v] [mulay.dw.engine :as eng] [mulay.dw.eval :as dev] [mulay.dw.rt :as drt] [mulay.dw.err :as dwe]
+            [mulay.dw.fmt.registry :as reg] [mulay.dw.fmt.json :as json] [mulay.rt.stream :as stream] [clay.string :as str]))
+
+(defrecord Gen [cmp: eng/Compiled staged: Vec(eng/Staged) inputs: Vec(v/Val) text: Vec(Str)
+                mime: Str props: Vec(v/Field) nss: Vec(v/Ns)
+                wrap: Option(Fn(Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) v/FnV v/Val))])
+
+(defrecord St [phase: Int i: Int n: Int pos: Int items: Vec(v/Val) ctx: Vec(dev/Ctx) f: Vec(v/FnV) opts: json/Opts])
+
+(defn open Str [owner: &Str g: Gen]
+  (let [s (atom (->St 0 0 0 0 [] [] [] (json/opts-of true "")))]
+    (stream/open owner (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (gen-next g s n))
+                                        (fn Int [broken: Bool] 0)
+                                        false))))
+
+(defn- prop Str [props: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get props k)] (if (= (count r) 0) "" (let [[s e] (drt/to-text (nth r 0))] s))))
+
+(defn- per-elem? Bool [g: &Gen]
+  (and (> (count (:staged g)) 0) (reg/json-like? (reg/norm-mime (:mime g)))))
+
+(defn- out Vec(v/Val) [text: &Str g: &Gen]
+  (if (= (count text) 0) [] [(v/->VStr (eng/encode-output text (:mime g) (:props g)))]))
+
+(defn- whole Values(Vec(v/Val) Bool Str) [g: &Gen]
+  (let [[x e c] (eng/eval-compiled-w (:cmp g) (:inputs g) (:wrap g))]
+    (if (not (dwe/ok? e)) (values [] true (:msg e))
+      (let [[text we] (reg/write-script-output (:mime g) (:props g) (:nss g) x)]
+        (if (not (dwe/ok? we)) (values [] true (:msg we)) (values (out text g) true ""))))))
+
+(defn- gen-next Values(Vec(v/Val) Bool Str) [g: &Gen s: &Atom(St) n: Int]
+  (let [st (deref s)]
+    (cond
+      (= (:phase st) 2) (values [] true "")
+      (= (:phase st) 0) (if (per-elem? g) (start g s n) (let [z (reset! s (phase-done st))] (whole g)))
+      :else (let [[rows done e] (elems g s n "")] (values (encode-rows rows g) done e)))))
+
+(defn- encode-rows Vec(v/Val) [rows: Vec(v/Val) g: &Gen]
+  (if (= (count rows) 0) rows (match (nth rows 0) (v/VStr t) (out t g) _ rows)))
+
+(defn- phase-done St [st: &St] (->St 2 0 0 0 [] [] [] (:opts st)))
+
+(defn- start Values(Vec(v/Val) Bool Str) [g: &Gen s: &Atom(St) n: Int]
+  (let [stg (nth (:staged g) 0)
+        lazy (> (count (:text g)) 0)
+        [items ae] (if lazy (values [] (dwe/ok))
+                     (let [[a e c0] (eng/eval-compiled-w (:src stg) (:inputs g) (:wrap g))]
+                       (values (match (v/unmeta a) (v/VArr xs) xs _ [(v/null-v)]) e)))
+        [c f fe] (eng/stage-fn-w stg (:inputs g) (:wrap g))
+        pos0 (if lazy (let [[p ok] (json/array-start (nth (:text g) 0))] p) 0)]
+    (cond
+      (not (dwe/ok? ae)) (let [z (reset! s (phase-done (deref s)))] (values [] true (:msg ae)))
+      (not (dwe/ok? fe)) (let [z (reset! s (phase-done (deref s)))] (values [] true (:msg fe)))
+      :else
+      (match (v/unmeta f)
+        (v/VFn fv)
+        (if (and (not lazy) (= (count items) 1) (null-only? items))
+          (let [z (reset! s (phase-done (deref s)))] (whole g))
+          (let [z (reset! s (->St 1 0 0 pos0 items [c] [fv] (reg/json-opts (:mime g) (:props g))))
+                [rows done e] (elems g s n (json/arr-open ""))]
+            (values (encode-rows rows g) done e)))
+        _ (let [z (reset! s (phase-done (deref s)))] (whole g))))))
+
+(defn- null-only? Bool [xs: &Vec(v/Val)] (match (v/unmeta (nth xs 0)) (v/VNull) true _ false))
+
+(defn- elems Values(Vec(v/Val) Bool Str) [g: &Gen s: &Atom(St) k: Int acc0: Str]
+  (let [st (deref s)
+        lazy (> (count (:text g)) 0)
+        c (nth (:ctx st) 0)
+        f (nth (:f st) 0)
+        o (:opts st)]
+    (loop [m 0 i (:i st) n (:n st) pos (:pos st) acc acc0]
+      (if (>= m k)
+        (let [z (reset! s (->St 1 i n pos (:items st) (:ctx st) (:f st) o))] (values (out-raw acc) false ""))
+        (let [[x j done re] (if lazy (json/array-next (nth (:text g) 0) pos "payload")
+                              (if (>= i (count (:items st))) (values (v/null-v) pos true "") (values (nth (:items st) i) pos false "")))]
+          (cond
+            (not= re "") (failure s acc re)
+            done (let [z (reset! s (phase-done st))] (values (out-raw (json/arr-close acc o 0 n)) true ""))
+            :else
+            (let [[y e] (eng/stage-apply c f x i)]
+              (if (not (dwe/ok? e)) (failure s acc (:msg e))
+                (let [[a2 we wrote] (json/arr-elem acc y o 0 n (fo/whole))]
+                  (if (not (dwe/ok? we)) (failure s a2 (:msg we))
+                    (recur (+ m 1) (+ i 1) (if wrote (+ n 1) n) j a2)))))))))))
+
+(defn- out-raw Vec(v/Val) [t: &Str] (if (= (count t) 0) [] [(v/->VStr t)]))
+
+(defn- failure Values(Vec(v/Val) Bool Str) [s: &Atom(St) acc: &Str msg: &Str]
+  (let [z (reset! s (phase-done (deref s)))] (values (out-raw acc) true (str msg))))

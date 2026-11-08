@@ -1,0 +1,82 @@
+(ns yaml-test (:require [mulay.lib.yaml :as y] [clay.string :as str]))
+(deftest core-schema
+  (is (= (y/scalar-text (y/resolve-plain "0x1F")) "0x1F"))
+  (is (let [[i ok] (y/int-value (y/resolve-plain "0x1F"))] (= i 31)))
+  (is (let [[i ok] (y/int-value (y/resolve-plain "-12"))] (= i -12)))
+  (is (match (y/resolve-plain "1.5e3") (y/YFloat t) true _ false))
+  (is (match (y/resolve-plain ".inf") (y/YFloat t) true _ false))
+  (is (match (y/resolve-plain "1_000") (y/YStr t) true _ false))
+  (is (match (y/resolve-plain "~") (y/YNull) true _ false))
+  (is (match (y/resolve-plain "yes") (y/YStr t) true _ false))
+  ;; YAML 1.2 core schema (PyYAML, being 1.1, disagrees on these)
+  (is (match (y/resolve-plain "+.5") (y/YFloat t) true _ false))
+  (is (let [[i ok] (y/int-value (y/resolve-plain "0o17"))] (and ok (= i 15))))
+  (is (match (y/resolve-plain "017") (y/YInt t) true _ false))
+  (is (match (y/resolve-plain "0b101") (y/YStr t) true _ false))
+  (is (match (y/resolve-plain "1e3") (y/YFloat t) true _ false))
+  (is (match (y/resolve-plain "1_000") (y/YStr t) true _ false))
+  (is (match (y/resolve-plain "on") (y/YStr t) true _ false)))
+(defn rt Str [src: Str]
+  (let [[v err] (y/parse src)]
+    (if (not (= err "")) (str "ERR " err) (y/dump v (y/default-dump-opts)))))
+(deftest dump-basic
+  (is (= (rt "a: 1\nb: [x, 'y z', '']\nc: {d: null, e: true}\nf: []\ng: {}\n")
+         "a: 1\nb:\n  - x\n  - y z\n  - \"\"\nc:\n  d: null\n  e: true\nf: []\ng: {}\n"))
+  (is (= (rt "- a: 1\n  b: 2\n- - x\n  - y\n- plain\n") "- a: 1\n  b: 2\n- - x\n  - y\n- plain\n"))
+  (is (= (rt "s: ['123', 'true', 'null', '~', ' lead', 'a: b', 'a #b', '- x', '-x', '#c', 'multi\nline', 'tab\there', '0x1F', '1.5', 'x:', '[a]', 'ok text']\n")
+         "s:\n  - \"123\"\n  - \"true\"\n  - \"null\"\n  - \"~\"\n  - \" lead\"\n  - \"a: b\"\n  - \"a #b\"\n  - \"- x\"\n  - -x\n  - \"#c\"\n  - multi line\n  - \"tab\\there\"\n  - \"0x1F\"\n  - \"1.5\"\n  - \"x:\"\n  - \"[a]\"\n  - ok text\n"))
+  (is (= (y/dump (y/->YStr "plain") (y/default-dump-opts)) "plain\n"))
+  (is (= (y/dump (y/->YMap [(y/->YStr "k")] [(y/->YSeq [(y/->YInt "1")])]) (assoc (y/default-dump-opts) :seq-indent false)) "k:\n- 1\n")))
+;; dump then parse gives back the same value for every generated case
+(deftest dump-roundtrip
+  (is (let [srcs ["a: 1\nb: [x, 'y z', '']\n" "q: \"a\\tb\\u0001\\\\\"\n" "- - - x\n" "k: |\n  line\n  two\n" "{? [a, b] : c}"
+                  "x: 'it''s: fine'\n" "e: {a: [], b: {}}\n" "n: [~, true, -1, 0o17, .inf, 2.5]\n"]]
+        (loop [i 0 ok true]
+          (if (>= i (count srcs)) ok
+            (let [[v err] (y/parse (nth srcs i))
+                  d (y/dump v (y/default-dump-opts))
+                  [v2 err2] (y/parse d)
+                  d2 (y/dump v2 (y/default-dump-opts))]
+              (if (and (= err "") (= err2 "") (= d d2)) (recur (+ i 1) ok)
+                (do (println (str "roundtrip " i ": " err err2 "\n" d "\n" d2)) (recur (+ i 1) false)))))))))
+(deftest yaml-errors
+  (is (= (rt "a: [1, 2") "ERR line 1, column 4: unterminated flow sequence"))
+  (is (= (rt "a: 1\n b: 2") "ERR line 2, column 2: bad indentation of a mapping entry"))
+  (is (= (rt "x: *nope") "ERR line 1, column 4: undefined alias 'nope'"))
+  (is (= (rt "a: \"x\\qy\"") "ERR line 1, column 6: invalid escape sequence '\\q'"))
+  (is (= (rt "a: b: c") "ERR line 1, column 4: mapping values are not allowed here"))
+  (is (= (rt "a: 'open") "ERR line 1, column 4: unterminated single-quoted scalar"))
+  (is (= (rt "key: - x") "ERR line 1, column 6: block sequence entries are not allowed here"))
+  (is (= (rt "- a\nb: 1") "ERR line 2, column 1: expected the end of the document (bad indentation?)")))
+(deftest alias-bomb
+  (is (let [src (str "a: &a [x, x, x, x, x, x, x, x, x]\nb: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a]\n"
+                     "c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b]\nd: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c]\n"
+                     "e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d]\nf: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e]\n"
+                     "g: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f]\nh: &h [*g, *g, *g, *g, *g, *g, *g, *g, *g]\n")
+            [v err] (y/parse src)]
+        (str/includes? err "alias expansion exceeds the node limit"))))
+(deftest deep-flow
+  (is (let [src (loop [i 0 s ""] (if (>= i 100000) s (recur (+ i 1) (str s "["))))
+            [v err] (y/parse src)]
+        (str/includes? err "maximum depth")))
+  (is (let [src (loop [i 0 s "x"] (if (>= i 300) s (recur (+ i 1) (str "[" s "]"))))
+            [v err] (y/parse src)]
+        (= err ""))))
+(deftest lookups
+  (is (let [[v err] (y/parse "http:\n  port: 8082\ndb:\n  host: \"localhost\"\n  port: 1521\n")
+            [db f1] (y/get-key v "db")
+            [port f2] (y/get-key db "port")
+            [p ok] (y/int-value port)]
+        (and f1 f2 ok (= p 1521) (= (y/scalar-text port) "1521")))))
+
+;; max-aliases: エイリアスを使える回数 (DataWeave の maxEntityCount。-1 は無制限)。
+;; 小さな文書のエイリアスで大きな値を何度も展開させない (10KB の文字列のアンカー → 1GB の JSON)。
+(defn- with-aliases Str [text: Str n: Int]
+  (let [[docs e] (y/parse-all-with text (assoc (y/default-opts) :max-aliases n))] (if (= e "") "ok" e)))
+
+(deftest alias-limit
+  (is (= (with-aliases "a: &x 1\nb: *x\n" 1) "ok"))
+  (is (= (with-aliases "a: &x 1\nb: *x\nc: *x\n" 1) "line 3, column 4: Max number of anchor expansion `maxEntityCount=1` has been exceeded"))
+  (is (= (with-aliases "a: &x 1\nb: *x\nc: *x\nd: *x\n" 3) "ok"))
+  (is (= (with-aliases "a: &x 1\nb: *x\nc: *x\nd: *x\ne: *x\n" 3) "line 5, column 4: Max number of anchor expansion `maxEntityCount=3` has been exceeded"))
+  (is (= (with-aliases "a: &x 1\nb: *x\nc: *x\n" -1) "ok")))

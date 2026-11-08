@@ -1,0 +1,89 @@
+(ns mulay.dw.lib.periods
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.lib.dec :as d]
+            [mulay.dw.coerce_time :as ct] [mulay.lib.time.types :as tt] [mulay.lib.time.local :as tl]))
+
+(def M "dw::core::Periods")
+
+(defn- field-num Values(num/Num Bool Bool) [fs: &Vec(v/Field) name: Str]
+  (let [vs (v/obj-get fs name)]
+    (if (= (count vs) 0) (values (num/from-int 0) false true)
+      (match (v/unmeta (nth vs 0))
+        (v/VNum n) (values n true true)
+        (v/VInt n-i) (let [n (num/from-int n-i)] (values n true true))
+        (v/VNull) (values (num/from-int 0) false true)
+        _ (values (num/from-int 0) false false)))))
+
+(defn- floor-num Values(num/Num Str) [n: &num/Num]
+  (let [[r e] (d/floor-int (num/to-dec n))] (values (num/mk r) e)))
+
+(defn- frac-to Values(num/Num Str) [x: &num/Num whole: &num/Num k: Int]
+  (let [[f e] (num/sub x whole)]
+    (if (not= e "") (values f e) (num/mul f (num/from-int k)))))
+
+(defn- parse-iso Values(v/Val dwe/DwErr) [s: Str]
+  (let [[p e] (ct/parse-period s)]
+    (if (= e "") (rt/ret (v/->VPeriod p))
+      (rt/failure "CoercionException" (str "Cannot coerce String (\"" s "\") to Period, caused by: " e)))))
+
+(defn duration-of Values(v/Val dwe/DwErr) [fs: &Vec(v/Field) fname: &Str args: &Vec(v/Val)]
+  (let [[nd hd okd] (field-num fs "days")
+        [h0 hh okh] (field-num fs "hours")
+        [m0 hm okm] (field-num fs "minutes")
+        [s0 hs oks] (field-num fs "seconds")]
+    (if (not (and okd okh okm oks)) (ct/bad-args fname args)
+      (let [[days e1] (floor-num nd)
+            [nh e2] (if hh (values h0 "") (frac-to nd days 24))
+            [hours e3] (floor-num nh)
+            [nm e4] (if hm (values m0 "") (frac-to nh hours 60))
+            [minutes e5] (floor-num nm)
+            [secs e6] (if hs (values s0 "") (frac-to nm minutes 60))
+            err (loop [es [e1 e2 e3 e4 e5 e6] i 0] (if (>= i (count es)) "" (if (not= (nth es i) "") (nth es i) (recur es (+ i 1)))))]
+        (if (not= err "") (rt/failure "ArithmeticException" (str "java.lang.ArithmeticException " err))
+          (let [ds (num/to-plain-str days) hs2 (num/to-plain-str hours) ms (num/to-plain-str minutes) ss (num/to-string secs)]
+            (parse-iso (str "P" ds "DT" hs2 "H" ms "M" ss "S"))))))))
+
+(defn period-of Values(v/Val dwe/DwErr) [fs: &Vec(v/Field) fname: &Str args: &Vec(v/Val)]
+  (let [[y hy oky] (field-num fs "years")
+        [m hm okm] (field-num fs "months")
+        [dd hd okd] (field-num fs "days")]
+    (if (not (and oky okm okd)) (ct/bad-args fname args)
+      (if (not (num/integer? y)) (rt/failure "UserException" (str "Field years: `" (num/to-string y) "`, can not be decimal."))
+        (if (not (num/integer? m)) (rt/failure "UserException" (str "Field months: `" (num/to-string m) "`, can not be decimal."))
+          (if (not (num/integer? dd)) (rt/failure "UserException" (str "Field days: `" (num/to-string dd) "`, can not be decimal."))
+            (let [ys (num/to-plain-str y) mss (num/to-plain-str m) dss (num/to-plain-str dd)]
+              (parse-iso (str "P" ys "Y" mss "M" dss "D")))))))))
+
+(defn- arg-fields Vec(v/Field) [a: &Vec(v/Val)] (match (v/unmeta (nth a 0)) (v/VObj fs) fs _ []))
+(defn- arg-num num/Num [a: &Vec(v/Val) i: Int] (match (v/unmeta (nth a i)) (v/VNum n) n (v/VInt n-i) (num/from-int n-i) _ (num/from-int 0)))
+(defn- one Vec(v/Field) [name: Str n: num/Num] [(v/field name (v/num-v n))])
+
+(defn- between Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (match (v/unmeta (nth a 0))
+    (v/VDate e) (match (v/unmeta (nth a 1))
+                  (v/VDate s) (rt/ret (v/->VPeriod (tt/->PerDate (tl/period-between s e))))
+                  _ (ct/bad-args "between" a))
+    _ (ct/bad-args "between" a)))
+
+(defn- duration-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (duration-of (arg-fields a) "duration" a))
+(defn- period-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (period-of (arg-fields a) "period" a))
+(defn- years-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (period-of (one "years" (arg-num a 0)) "years" a))
+(defn- months-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (period-of (one "months" (arg-num a 0)) "months" a))
+(defn- days-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [n (arg-num a 0)]
+    (if (num/integer? n) (period-of (one "days" n) "days" a) (duration-of (one "days" n) "days" a))))
+(defn- hours-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (duration-of (one "hours" (arg-num a 0)) "hours" a))
+(defn- minutes-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (duration-of (one "minutes" (arg-num a 0)) "minutes" a))
+(defn- seconds-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (duration-of (one "seconds" (arg-num a 0)) "seconds" a))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "between" [(rt/b2 "Date" "Date" between)])
+   (B "duration" [(rt/b1 "Object" duration-f)])
+   (B "period" [(rt/b1 "Object" period-f)])
+   (B "years" [(rt/b1 "Number" years-f)])
+   (B "months" [(rt/b1 "Number" months-f)])
+   (B "days" [(rt/b1 "Number" days-f)])
+   (B "hours" [(rt/b1 "Number" hours-f)])
+   (B "minutes" [(rt/b1 "Number" minutes-f)])
+   (B "seconds" [(rt/b1 "Number" seconds-f)])])

@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18118"/>
+    </http:listener-config>
+
+    <!-- 出力形式を query の fmt で選ぶ。本文と content-type を見る -->
+    <flow name="formats">
+        <http:listener config-ref="L" path="/format/{fmt}"/>
+        <set-variable variableName="data" value="#[output application/java --- [{id: 1, name: 'Ann', tags: ['a', 'b']}, {id: 2, name: 'Bob, Jr.', tags: []}]]"/>
+        <choice>
+            <when expression="#[attributes.uriParams.fmt == 'json']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.data]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'json-compact']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json indent=false
+---
+vars.data]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'xml']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/xml
+---
+{people: {(vars.data map {person @(id: $.id): {name: $.name, tags: {($.tags map {tag: $})}}})}}]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'csv']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/csv
+---
+vars.data map {id: $.id, name: $.name, tagCount: sizeOf($.tags)}]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'csv-noheader']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/csv header=false, separator=";"
+---
+vars.data map {id: $.id, name: $.name}]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'text']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output text/plain
+---
+(vars.data map $.name) joinBy "|"]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'text-object']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output text/plain
+---
+vars.data[0]]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'java']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+vars.data]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'yaml']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/yaml
+---
+vars.data]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'urlencoded']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/x-www-form-urlencoded
+---
+{name: vars.data[1].name, id: vars.data[1].id}]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <when expression="#[attributes.uriParams.fmt == 'dw']">
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/dw
+---
+vars.data[0]]]></ee:set-payload></ee:message></ee:transform>
+            </when>
+            <otherwise>
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{unknownFormat: attributes.uriParams.fmt}]]></ee:set-payload></ee:message></ee:transform>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- 入力形式: 受け取った Content-Type で読み、JSON にする -->
+    <flow name="read">
+        <http:listener config-ref="L" path="/read"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{kind: typeOf(payload) as String, value: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 1 つの transform で payload と attributes と変数を同時に作る -->
+    <flow name="all-targets">
+        <http:listener config-ref="L" path="/all"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{newPayload: payload.x}]]></ee:set-payload>
+                <ee:set-attributes><![CDATA[%dw 2.0
+output application/java
+---
+{custom: "attr", fromOld: attributes.method}]]></ee:set-attributes>
+            </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="v1"><![CDATA[%dw 2.0
+output application/java
+---
+payload.x * 2]]></ee:set-variable>
+                <ee:set-variable variableName="v2"><![CDATA[%dw 2.0
+output application/json
+---
+{nested: [payload.x]}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payload: payload, attributes: attributes, v1: vars.v1, v2: vars.v2, v2Type: typeOf(vars.v2) as String}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- variables だけの transform は payload を変えない -->
+    <flow name="vars-only">
+        <http:listener config-ref="L" path="/vars-only"/>
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="len"><![CDATA[%dw 2.0
+output application/java
+---
+sizeOf(payload)]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <set-variable variableName="payloadStill" value="#[payload]"/>
+        <set-payload value="#[output application/json --- {len: vars.len, payload: vars.payloadStill}]"/>
+    </flow>
+
+    <!-- 外部ファイルの DW (resource=) -->
+    <flow name="resource">
+        <http:listener config-ref="L" path="/resource"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload resource="dwl/summary.dwl"/>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 変換の失敗: 書き出しで失敗 (Object を CSV に) -->
+    <flow name="write-error">
+        <http:listener config-ref="L" path="/write-error"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/csv
+---
+{not: "an array", deep: {x: 1}}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>

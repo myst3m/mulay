@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18114"/>
+    </http:listener-config>
+
+    <!-- エラーを起こす: kind で種類を選ぶ -->
+    <sub-flow name="fail-by-kind">
+        <choice>
+            <when expression="#[vars.kind == 'notfound']">
+                <raise-error type="APP:NOT_FOUND" description="no such thing"/>
+            </when>
+            <when expression="#[vars.kind == 'bad']">
+                <raise-error type="APP:BAD_INPUT" description="bad input"/>
+            </when>
+            <when expression="#[vars.kind == 'conflict']">
+                <raise-error type="APP:CONFLICT" description="conflict"/>
+            </when>
+            <when expression="#[vars.kind == 'special']">
+                <raise-error type="APP:OTHER" description="a special case"/>
+            </when>
+            <when expression="#[vars.kind == 'other']">
+                <raise-error type="APP:OTHER" description="some other error"/>
+            </when>
+            <when expression="#[vars.kind == 'expr']">
+                <set-payload value="#[1 / 0]"/>
+            </when>
+            <when expression="#[vars.kind == 'nodesc']">
+                <raise-error type="APP:NO_DESC"/>
+            </when>
+            <otherwise>
+                <set-payload value="no error"/>
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <!-- 上から順に照合され、最初に当たったハンドラだけが動く -->
+    <flow name="try-select">
+        <http:listener config-ref="L" path="/select"/>
+        <set-variable variableName="kind" value="#[attributes.queryParams.kind]"/>
+        <try>
+            <flow-ref name="fail-by-kind"/>
+            <error-handler>
+                <on-error-continue type="APP:NOT_FOUND">
+                    <set-variable variableName="handler" value="h1-notfound"/>
+                </on-error-continue>
+                <on-error-continue type="APP:BAD_INPUT, APP:CONFLICT">
+                    <set-variable variableName="handler" value="h2-bad-or-conflict"/>
+                </on-error-continue>
+                <on-error-continue when="#[error.description contains 'special']">
+                    <set-variable variableName="handler" value="h3-when"/>
+                </on-error-continue>
+                <on-error-continue type="EXPRESSION">
+                    <set-variable variableName="handler" value="h4-expression-short-name"/>
+                </on-error-continue>
+                <on-error-continue type="ANY">
+                    <set-variable variableName="handler" value="h5-any"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{handler: vars.handler default null, payload: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- error オブジェクトの中身 -->
+    <flow name="try-error-info">
+        <http:listener config-ref="L" path="/info"/>
+        <set-variable variableName="kind" value="#[attributes.queryParams.kind]"/>
+        <try>
+            <flow-ref name="fail-by-kind"/>
+            <error-handler>
+                <on-error-continue>
+                    <ee:transform>
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  namespace: error.errorType.namespace,
+  identifier: error.errorType.identifier,
+  asString: error.errorType as String default "not-coercible",
+  parent: error.errorType.parentErrorType.namespace ++ ":" ++ error.errorType.parentErrorType.identifier,
+  grandParent: (error.errorType.parentErrorType.parentErrorType.identifier) default null,
+  description: error.description,
+  detailedDescription: error.detailedDescription,
+  hasErrorMessage: error.errorMessage != null,
+  childErrors: sizeOf(error.childErrors default [])
+}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <!-- on-error-propagate の中で変えた payload と変数は外側のハンドラに見えるか -->
+    <flow name="try-propagate">
+        <http:listener config-ref="L" path="/propagate"/>
+        <set-variable variableName="trail" value="#[['start']]"/>
+        <try>
+            <set-variable variableName="trail" value="#[vars.trail + 'in-try']"/>
+            <raise-error type="APP:INNER" description="inner failure"/>
+            <set-variable variableName="trail" value="#[vars.trail + 'unreachable']"/>
+            <error-handler>
+                <on-error-propagate>
+                    <set-variable variableName="trail" value="#[vars.trail + 'inner-propagate']"/>
+                    <set-payload value="payload-from-propagate"/>
+                </on-error-propagate>
+            </error-handler>
+        </try>
+        <set-variable variableName="trail" value="#[vars.trail + 'after-try-unreachable']"/>
+        <error-handler>
+            <on-error-continue>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{trail: vars.trail + "flow-continue", payloadSeen: payload, errorType: error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- 入れ子の try: 内側の continue でフローは続く -->
+    <flow name="try-nested">
+        <http:listener config-ref="L" path="/nested"/>
+        <set-variable variableName="trail" value="#[[]]"/>
+        <try>
+            <try>
+                <raise-error type="APP:DEEP" description="deep"/>
+                <error-handler>
+                    <on-error-propagate type="APP:DEEP">
+                        <set-variable variableName="trail" value="#[vars.trail + 'inner-propagate']"/>
+                    </on-error-propagate>
+                </error-handler>
+            </try>
+            <error-handler>
+                <on-error-continue>
+                    <set-variable variableName="trail" value="#[vars.trail + ('outer-continue:' ++ error.errorType.identifier)]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+        <set-variable variableName="trail" value="#[vars.trail + 'after']"/>
+        <set-payload value="#[output application/json --- vars.trail]"/>
+    </flow>
+
+    <!-- try のハンドラに当たらないエラーはフローへ抜ける (フローにハンドラが無い → 既定の応答) -->
+    <flow name="try-no-match">
+        <http:listener config-ref="L" path="/no-match"/>
+        <try>
+            <raise-error type="APP:UNMATCHED" description="nobody catches me"/>
+            <error-handler>
+                <on-error-continue type="APP:NOT_FOUND">
+                    <set-payload value="wrong handler"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <!-- フローの on-error-propagate: payload を作っても既定のエラー応答には何が出るか -->
+    <flow name="flow-propagate">
+        <http:listener config-ref="L" path="/flow-propagate"/>
+        <raise-error type="APP:FLOW_LEVEL" description="flow level failure"/>
+        <error-handler>
+            <on-error-propagate>
+                <set-payload value="#[output application/json --- {fromHandler: true}]"/>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <!-- フローの on-error-continue: 応答は 200 で handler の payload -->
+    <flow name="flow-continue">
+        <http:listener config-ref="L" path="/flow-continue"/>
+        <raise-error type="APP:FLOW_LEVEL" description="flow level failure"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {recovered: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ハンドラの中でエラーが起きたとき -->
+    <flow name="handler-fails">
+        <http:listener config-ref="L" path="/handler-fails"/>
+        <raise-error type="APP:FIRST" description="first failure"/>
+        <error-handler>
+            <on-error-continue>
+                <raise-error type="APP:SECOND" description="failure inside handler"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- 空の try、ハンドラ無しの try -->
+    <flow name="try-plain">
+        <http:listener config-ref="L" path="/plain"/>
+        <try>
+            <set-payload value="inside plain try"/>
+        </try>
+    </flow>
+
+</mule>

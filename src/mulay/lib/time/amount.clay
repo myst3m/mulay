@@ -1,0 +1,208 @@
+(ns mulay.lib.time.amount
+  (:require [mulay.lib.time.types :as t]
+            [mulay.lib.time.num :as n]))
+
+(defn period t/Period [y: Int m: Int d: Int] (t/->Period y m d))
+
+(defn period-zero? Bool [p: &t/Period]
+  (and (= (:years p) 0) (= (:months p) 0) (= (:days p) 0)))
+
+(defn period-negative? Bool [p: &t/Period]
+  (or (< (:years p) 0) (< (:months p) 0) (< (:days p) 0)))
+
+(defn period-plus t/Period [a: &t/Period b: &t/Period]
+  (t/->Period (+ (:years a) (:years b))
+              (+ (:months a) (:months b))
+              (+ (:days a) (:days b))))
+
+(defn period-negated t/Period [p: &t/Period]
+  (t/->Period (- 0 (:years p)) (- 0 (:months p)) (- 0 (:days p))))
+
+(defn period-minus t/Period [a: &t/Period b: &t/Period]
+  (period-plus a (period-negated b)))
+
+(defn period-multiplied t/Period [p: &t/Period k: Int]
+  (t/->Period (* k (:years p)) (* k (:months p)) (* k (:days p))))
+
+(defn period-total-months Int [p: &t/Period]
+  (+ (* (:years p) 12) (:months p)))
+
+(defn period-normalized t/Period [p: &t/Period]
+  (let [tm (period-total-months p)]
+    (t/->Period (/ tm 12) (rem tm 12) (:days p))))
+
+(defn period-str Str [p: &t/Period]
+  (if (period-zero? p) "P0D"
+    (let [y (:years p) m (:months p) d (:days p)]
+      (str "P" (if (= y 0) "" (str y "Y")) (if (= m 0) "" (str m "M")) (if (= d 0) "" (str d "D"))))))
+
+(defn- scan-signed Values(Int Int Bool) [s: &Str pos: Int]
+  (let [c (n/byte-at s pos)
+        neg (= c 45)
+        p0 (if (or neg (= c 43)) (+ pos 1) pos)
+        [v e ovf] (n/scan-digits s p0 100)]
+    (values (if neg (- 0 v) v) e (and (> e p0) (not ovf)))))
+
+(defn- up Int [c: Int] (n/ascii-upper c))
+
+(defn parse-period Values(t/Period Str) [s: &Str]
+  (let [bad (str "Text cannot be parsed to a Period")
+        z (t/->Period 0 0 0)
+        c0 (n/byte-at s 0)
+        neg (= c0 45)
+        p0 (if (or neg (= c0 43)) 1 0)]
+    (if (not= (up (n/byte-at s p0)) 80) (values z bad)
+      (loop [pos (+ p0 1) stage 0 y 0 m 0 w 0 d 0 any false]
+        (if (>= pos (count s))
+          (if (not any) (values z bad)
+            (let [[w7 ok1] (n/mul-exact w 7)
+                  [dd ok2] (n/add-exact d w7)
+                  sg (if neg -1 1)]
+              (if (and ok1 ok2 (n/int32? dd))
+                (values (t/->Period (* sg y) (* sg m) (* sg dd)) "")
+                (values z bad))))
+          (let [[v e ok] (scan-signed s pos)
+                u (up (n/byte-at s e))
+                st (case u 89 1 77 2 87 3 68 4 0)]
+            (if (or (not ok) (= st 0) (<= st stage) (not (n/int32? v))) (values z bad)
+              (recur (+ e 1) st
+                     (if (= st 1) v y) (if (= st 2) v m) (if (= st 3) v w) (if (= st 4) v d) true))))))))
+
+(defn duration t/Duration [secs: Int nanos: Int]
+  (let [q (/ nanos t/NANOS-PER-SECOND)
+        r (rem nanos t/NANOS-PER-SECOND)]
+    (if (< r 0)
+      (t/->Duration (+ secs q -1) (+ r t/NANOS-PER-SECOND))
+      (t/->Duration (+ secs q) r))))
+
+(defn duration-of-days t/Duration [n: Int] (t/->Duration (* n 86400) 0))
+(defn duration-of-hours t/Duration [n: Int] (t/->Duration (* n 3600) 0))
+(defn duration-of-minutes t/Duration [n: Int] (t/->Duration (* n 60) 0))
+(defn duration-of-millis t/Duration [n: Int] (duration (/ n 1000) (* (rem n 1000) 1000000)))
+(defn duration-of-nanos t/Duration [n: Int] (duration 0 n))
+
+(defn duration-zero? Bool [d: &t/Duration]
+  (and (= (:seconds d) 0) (= (:nanos d) 0)))
+
+(defn duration-negative? Bool [d: &t/Duration] (< (:seconds d) 0))
+
+(defn duration-plus t/Duration [a: &t/Duration b: &t/Duration]
+  (duration (+ (:seconds a) (:seconds b))
+            (+ (:nanos a) (:nanos b))))
+
+(defn duration-negated t/Duration [d: &t/Duration]
+  (duration (- 0 (:seconds d)) (- 0 (:nanos d))))
+
+(defn duration-minus t/Duration [a: &t/Duration b: &t/Duration]
+  (duration-plus a (duration-negated b)))
+
+(defn duration-abs t/Duration [d: &t/Duration]
+  (if (duration-negative? d) (duration-negated d) (duration (:seconds d) (:nanos d))))
+
+(defn duration-compare Int [a: &t/Duration b: &t/Duration]
+  (let [sa (:seconds a) sb (:seconds b)]
+    (if (< sa sb) -1
+      (if (> sa sb) 1
+        (let [na (:nanos a) nb (:nanos b)]
+          (if (< na nb) -1 (if (> na nb) 1 0)))))))
+
+(defn duration-multiplied Values(t/Duration Str) [d: &t/Duration k: Int]
+  (let [[s1 ok1] (n/mul-exact (:seconds d) k)
+        [n1 ok2] (n/mul-exact (:nanos d) k)
+        extra (/ n1 t/NANOS-PER-SECOND)
+        [s2 ok3] (n/add-exact s1 extra)]
+    (if (and ok1 ok2 ok3)
+      (values (duration s2 (rem n1 t/NANOS-PER-SECOND)) "")
+      (values (t/->Duration 0 0) "Multiplication overflows a long"))))
+
+(defn duration-to-millis Values(Int Str) [d: &t/Duration]
+  (let [[a ok1] (n/mul-exact (:seconds d) 1000)
+        [b ok2] (n/add-exact a (/ (:nanos d) 1000000))]
+    (if (and ok1 ok2) (values b "") (values 0 "long overflow"))))
+
+(defn duration-to-nanos Values(Int Str) [d: &t/Duration]
+  (let [[a ok1] (n/mul-exact (:seconds d) t/NANOS-PER-SECOND)
+        [b ok2] (n/add-exact a (:nanos d))]
+    (if (and ok1 ok2) (values b "") (values 0 "long overflow"))))
+
+(defn duration-to-days Int [d: &t/Duration] (/ (:seconds d) 86400))
+(defn duration-to-hours Int [d: &t/Duration] (/ (:seconds d) 3600))
+(defn duration-to-minutes Int [d: &t/Duration] (/ (:seconds d) 60))
+
+(defn- strip-zeros Str [s: Str]
+  (loop [e (count s)]
+    (if (and (> e 0) (= (nth s (- e 1)) 48)) (recur (- e 1)) (subs s 0 e))))
+
+(defn duration-str Str [d: &t/Duration]
+  (if (duration-zero? d) "PT0S"
+    (let [seconds (:seconds d)
+          nanos (:nanos d)
+          eff (if (and (< seconds 0) (> nanos 0)) (+ seconds 1) seconds)
+          hours (/ eff 3600)
+          minutes (/ (rem eff 3600) 60)
+          secs (rem eff 60)
+          head (str "PT" (if (= hours 0) "" (str hours "H")) (if (= minutes 0) "" (str minutes "M")))]
+      (if (and (= secs 0) (= nanos 0) (> (count head) 2)) head
+        (let [sp (if (and (< seconds 0) (> nanos 0))
+                   (if (= secs 0) "-0" (str secs))
+                   (str secs))
+              frac (if (> nanos 0)
+                     (let [digits (if (< seconds 0) (str (- (* 2 t/NANOS-PER-SECOND) nanos))
+                                    (str (+ nanos t/NANOS-PER-SECOND)))]
+                       (str "." (strip-zeros (subs digits 1 (count digits)))))
+                     "")]
+          (str head sp frac "S"))))))
+
+(defn parse-duration Values(t/Duration Str) [s: &Str]
+  (let [bad "Text cannot be parsed to a Duration"
+        z (t/->Duration 0 0)
+        c0 (n/byte-at s 0)
+        neg (= c0 45)
+        p0 (if (or neg (= c0 43)) 1 0)
+        len (count s)]
+    (if (not= (up (n/byte-at s p0)) 80) (values z bad)
+      (let [
+            [dv de dok] (scan-signed s (+ p0 1))
+            has-d (and dok (= (up (n/byte-at s de)) 68))
+            p1 (if has-d (+ de 1) (+ p0 1))
+            has-t (= (up (n/byte-at s p1)) 84)]
+        (if (and (not has-t) (not= p1 len)) (values z bad)
+          (if (and (not has-t) (not has-d)) (values z bad)
+            (if (and has-t (= (+ p1 1) len)) (values z bad)
+              (loop [pos (if has-t (+ p1 1) p1) stage 0 h 0 m 0 sec 0 frac 0 fneg false]
+                (if (>= pos len)
+                  (let [[a1 o1] (n/mul-exact (if has-d dv 0) 86400)
+                        [a2 o2] (n/mul-exact h 3600)
+                        [a3 o3] (n/mul-exact m 60)
+                        [b1 o4] (n/add-exact a3 sec)
+                        [b2 o5] (n/add-exact a2 b1)
+                        [b3 o6] (n/add-exact a1 b2)]
+                    (if (and o1 o2 o3 o4 o5 o6)
+                      (let [dd (duration b3 (if fneg (- 0 frac) frac))]
+                        (values (if neg (duration-negated dd) dd) ""))
+                      (values z bad)))
+                  (let [[v e ok] (scan-signed s pos)
+                        u (up (n/byte-at s e))]
+                    (if (not ok) (values z bad)
+                      (if (and (= u 72) (< stage 1)) (recur (+ e 1) 1 v m sec frac fneg)
+                        (if (and (= u 77) (< stage 2)) (recur (+ e 1) 2 h v sec frac fneg)
+                          (if (and (= u 83) (< stage 3)) (recur (+ e 1) 3 h m v 0 false)
+                            (if (and (or (= u 46) (= u 44)) (< stage 3))
+                              (let [[fv fe fovf] (n/scan-digits s (+ e 1) 9)
+                                    nd (- fe (+ e 1))
+                                    scaled (loop [x fv k nd] (if (>= k 9) x (recur (* x 10) (+ k 1))))]
+                                (if (not= (up (n/byte-at s fe)) 83) (values z bad)
+                                  (recur (+ fe 1) 3 h m v scaled (= (n/byte-at s pos) 45))))
+                              (values z bad))))))))))))))))
+
+(defn parse-dw-period Values(t/DwPeriod Str) [s: &Str]
+  (let [[p e1] (parse-period s)]
+    (if (= e1 "") (values (t/->PerDate p) "")
+      (let [[d e2] (parse-duration s)]
+        (if (= e2 "") (values (t/->PerTime d) "")
+          (values (t/->PerDate (t/->Period 0 0 0)) e2))))))
+
+(defn dw-period-str Str [p: &t/DwPeriod]
+  (match p
+    (t/PerDate q) (period-str q)
+    (t/PerTime d) (duration-str d)))

@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <!-- 認証情報はリポジトリに入れない (scenario.scn の requires)。sf.authorizeUrl は sf.tokenUrl の .../authorize -->
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <!-- OAuth の認可コード: /authorize で Salesforce の認可へ送り、/callback でトークンを受ける -->
+    <salesforce:sfdc-config name="SF">
+        <salesforce:config-with-oauth-connection>
+            <salesforce:oauth-authorization-code consumerKey="${sf.clientId}" consumerSecret="${sf.clientSecret}"
+                                                 authorizationUrl="${sf.authorizeUrl}" accessTokenUrl="${sf.tokenUrl}"
+                                                 scopes="api refresh_token"/>
+            <salesforce:oauth-callback-config listenerConfig="HTTP" callbackPath="/callback" authorizePath="/authorize"
+                                              externalCallbackUrl="http://localhost:${http.port}/callback"/>
+        </salesforce:config-with-oauth-connection>
+    </salesforce:sfdc-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 認可された接続で問い合わせる -->
+    <flow name="org">
+        <http:listener config-ref="HTTP" path="/org" allowedMethods="GET"/>
+        <salesforce:query config-ref="SF">
+            <salesforce:salesforce-query>SELECT Id FROM Organization</salesforce:salesforce-query>
+        </salesforce:query>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{count: sizeOf(payload), keys: keysOf(payload[0]) map ($ as String)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- トークンを捨てる -->
+    <flow name="unauthorize">
+        <http:listener config-ref="HTTP" path="/unauthorize" allowedMethods="POST"/>
+        <salesforce:unauthorize config-ref="SF"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": typeOf(payload) as String, mime: payload.^mimeType}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

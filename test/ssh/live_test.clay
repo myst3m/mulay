@@ -1,0 +1,93 @@
+(ns live-test (:require [mulay.lib.ssh :as ssh] [mulay.lib.sshkey :as hk]))
+
+;; 検査用の SFTP サーバー (OpenSSH 9.2、127.0.0.1:2222、mulay / mulay) との接続。つながらなければ何も確かめない。
+;; 方式ごとに: 鍵交換、パスワード認証、sftp の subsystem、SSH_FXP_INIT への VERSION、こちらからの鍵交換のやり直し、
+;; やり直した後の INIT と VERSION
+
+(def INIT: Str (str (chr 0) (chr 0) (chr 0) (chr 5) (chr 1) (chr 0) (chr 0) (chr 0) (chr 3)))
+
+;; 0 はつながらない、1 は通った、2 以上はどこかで失敗
+(defn- session Int [kex: Str enc: Str mac: Str]
+  (let [[c kind e] (ssh/connect-with "127.0.0.1" 2222 10000 [] kex enc mac)]
+    (cond
+      (= kind ssh/CANNOT-REACH) 0
+      (not= kind 0) 2
+      :else
+      (let [[c2 ae] (ssh/auth-password c "mulay" "mulay")
+            [c3 oe] (if (= ae "") (ssh/open-subsystem c2 "sftp") (values c2 ae))
+            [c4 se] (if (= oe "") (ssh/chan-send c3 INIT) (values c3 oe))
+            [c5 d re] (if (= se "") (ssh/chan-recv c4) (values c4 "" se))
+            [c6 ke] (if (= re "") (ssh/rekey c5) (values c5 re))
+            [c7 se2] (if (= ke "") (ssh/chan-send c6 INIT) (values c6 ke))
+            [c8 d2 re2] (if (= se2 "") (ssh/chan-recv c7) (values c7 "" se2))
+            z (ssh/close c8)]
+        (cond (not= re2 "") 3
+              (or (< (count d) 5) (not= (nth d 4) 2)) 4
+              (or (< (count d2) 5) (not= (nth d2 4) 2)) 5
+              :else 1)))))
+
+(deftest ciphers
+  (let [up (not= (session "" "" "") 0)]
+    (is (or (not up) (= (session "" "chacha20-poly1305@openssh.com" "") 1)))
+    (is (or (not up) (= (session "" "aes128-gcm@openssh.com" "") 1)))
+    (is (or (not up) (= (session "" "aes256-gcm@openssh.com" "") 1)))
+    (is (or (not up) (= (session "" "aes128-ctr" "hmac-sha2-256") 1)))
+    (is (or (not up) (= (session "" "aes192-ctr" "hmac-sha2-256-etm@openssh.com") 1)))
+    (is (or (not up) (= (session "" "aes256-ctr" "hmac-sha2-512-etm@openssh.com") 1)))
+    (is (or (not up) (= (session "" "aes256-ctr" "hmac-sha2-512") 1)))))
+
+;; DH の鍵交換 (group14-sha256、group16-sha512。鍵の導出も SHA-512 になる)
+(deftest dh-kex
+  (let [up (not= (session "" "" "") 0)]
+    (is (or (not up) (= (session "diffie-hellman-group14-sha256" "" "") 1)))
+    (is (or (not up) (= (session "diffie-hellman-group16-sha512" "aes256-ctr" "hmac-sha2-512-etm@openssh.com") 1)))))
+
+(defn- kh Str [name: Str] (let [[s e] (read-file (str "test/fixtures/apps/sftp-ops/src/main/resources/" name))] s))
+
+;; サーバーのホスト鍵 (署名を確かめたもの) が known_hosts の行に合う。違うパスワードは認証で失敗
+(deftest hostkey-and-auth
+  (let [[c kind e] (ssh/connect "127.0.0.1" 2222 10000)
+        up (not= kind ssh/CANNOT-REACH)
+        key (ssh/host-key c)
+        [c2 ae] (if up (ssh/auth-password c "mulay" "wrong") (values c ""))
+        z (if up (ssh/close c2) 0)]
+    (is (or (not up) (= kind 0)))
+    (is (or (not up) (hk/known? (kh "known_hosts_good") "127.0.0.1" 2222 key)))
+    (is (or (not up) (hk/known? (kh "known_hosts_good") "localhost" 2222 key)))
+    (is (or (not up) (not (hk/known? (kh "known_hosts_bad") "127.0.0.1" 2222 key))))
+    (is (or (not up) (not= ae "")))))
+
+(deftest no-server
+  (let [[c kind e] (ssh/connect "127.0.0.1" 2299 2000)]
+    (is (= kind ssh/CANNOT-REACH))))
+
+;; 答えを待っている間に鍵交換をやり直す: STAT を 12 件重ねて出し、rekey (サーバーの KEXINIT より前に届いた答えは貯めて
+;; 後で渡す)、それから 12 件の答えを受ける
+(defn- stat-req Str [id: Int]
+  (str (chr 0) (chr 0) (chr 0) (chr 11) (chr 17) (chr 0) (chr 0) (chr 0) (chr id) (chr 0) (chr 0) (chr 0) (chr 2) "/u"))
+
+;; data に入っている SFTP のパケットの数 (途中で切れたものは数えない)
+(defn- packets Int [d: &Str]
+  (loop [p 0 n 0]
+    (if (> (+ p 4) (count d)) n
+      (let [len (+ (* 256 (nth d (+ p 2))) (nth d (+ p 3)))]
+        (if (> (+ p (+ 4 len)) (count d)) n (recur (+ p (+ 4 len)) (+ n 1)))))))
+
+(defn- busy-rekey Int []
+  (let [[c kind e] (ssh/connect "127.0.0.1" 2222 10000)]
+    (if (= kind ssh/CANNOT-REACH) -1
+      (let [[c2 ae] (ssh/auth-password c "mulay" "mulay")
+            [c3 oe] (ssh/open-subsystem c2 "sftp")
+            [c4 se] (ssh/chan-send c3 INIT)
+            [c5 d re] (ssh/chan-recv c4)
+            [c6 se2] (loop [cc c5 i 0] (if (>= i 12) (values cc "") (let [[cx ex] (ssh/chan-send cc (stat-req i))] (recur cx (+ i 1)))))
+            [c7 ke] (ssh/rekey c6)
+            [c8 got err] (loop [cc c7 acc ""]
+                           (if (>= (packets acc) 12) (values cc acc "")
+                             (let [[cx dx ex] (ssh/chan-recv cc)] (if (not= ex "") (values cx acc ex) (recur cx (str acc dx))))))
+            z (ssh/close c8)]
+        (if (or (not= ke "") (not= err "")) -2 (packets got))))))
+
+(deftest rekey-while-busy
+  (let [n (busy-rekey)]
+    (is (or (= n -1) (= n 12)))))

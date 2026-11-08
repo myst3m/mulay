@@ -1,0 +1,85 @@
+(ns tracectx-test (:require [mulay.lib.tracectx :as t]))
+
+(defn- kind Int [s: Str] (let [[k tr sp fl] (t/parse-parent s)] k))
+
+;; 形が合わない値は無かったことにする (NONE)。形は合うが ID が不正 (大文字、全 0) なら、遠隔の親だが無効 (BAD)。
+;; どれも実 Mule 4.11.3 で確かめた (test/fixtures/otel/traces/propagation.case)
+(deftest parent-kinds
+  (is (= (kind "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01") t/VALID))
+  (is (= (kind "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00") t/VALID))
+  (is (= (kind "garbage") t/NONE))
+  (is (= (kind "") t/NONE))
+  (is (= (kind "00-2AF7651916CD43DD8448EB211C80319C-D7AD6B7169203331-01") t/BAD))
+  (is (= (kind "00-00000000000000000000000000000000-d7ad6b7169203331-01") t/BAD))
+  (is (= (kind "00-4af7651916cd43dd8448eb211c80319c-0000000000000000-01") t/BAD))
+  (is (= (kind "01-3af7651916cd43dd8448eb211c80319c-e7ad6b7169203331-01-extra") t/VALID))
+  (is (= (kind "01-3af7651916cd43dd8448eb211c80319c-e7ad6b7169203331-01x") t/NONE))
+  (is (= (kind "00-5af7651916cd43dd8448eb211c80319c-e7ad6b7169203331-01-extra") t/NONE))
+  (is (= (kind "ff-6af7651916cd43dd8448eb211c80319c-e7ad6b7169203331-01") t/NONE))
+  (is (= (kind "0A-6af7651916cd43dd8448eb211c80319c-e7ad6b7169203331-01") t/NONE))
+  (is (= (kind "00-7af7651916cd43dd8448eb211c80319c-e7ad6b7169203331-0g") t/NONE))
+  (is (= (kind "00_7af7651916cd43dd8448eb211c80319c-e7ad6b7169203331-01") t/NONE)))
+
+(deftest parent-fields
+  (let [[k tr sp fl] (t/parse-parent "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-03")]
+    (is (= (t/hex tr) "0af7651916cd43dd8448eb211c80319c"))
+    (is (= (t/hex sp) "b7ad6b7169203331"))
+    (is (= fl 3))))
+
+(deftest format-parent
+  (is (= (t/format-parent (t/unhex "0af7651916cd43dd8448eb211c80319c") (t/unhex "b7ad6b7169203331") true)
+         "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"))
+  (is (= (t/format-parent (t/unhex "0af7651916cd43dd8448eb211c80319c") (t/unhex "b7ad6b7169203331") false)
+         "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00")))
+
+;; tracestate (W3C): 区切りの前後の空白は除き、空の項は飛ばす。1 つでも不正な項があれば全体を捨てる。32 項まで
+(deftest state
+  (is (= (t/parse-state "congo=t61rcWkgMzE,rojo=00f067aa0ba902b7") "congo=t61rcWkgMzE,rojo=00f067aa0ba902b7"))
+  (is (= (t/parse-state " a=b ,, c=d\t") "a=b,c=d"))
+  (is (= (t/parse-state "") ""))
+  (is (= (t/parse-state "A=b") ""))
+  (is (= (t/parse-state "a=b,bad") ""))
+  (is (= (t/parse-state "a=b,c=d=e") ""))
+  (is (= (t/parse-state "t@s=1,x_y-z*/9=v") "t@s=1,x_y-z*/9=v"))
+  (is (= (t/parse-state "a=b c") "a=b c"))
+  (is (= (t/parse-state "a=") "")))
+
+(deftest state-limit
+  (let [s32 (loop [i 0 s ""] (if (>= i 32) s (recur (+ i 1) (str s (if (= i 0) "" ",") "k" i "=v"))))]
+    (is (= (t/parse-state s32) s32))
+    (is (= (t/parse-state (str s32 ",z=1")) ""))))
+
+;; TraceIdRatioBased (OTel Java SDK): 下位 64 ビット (16 進の後半 16 文字) を符号付きで読んだ絶対値が、比率 × Long.MAX より小さければ送る
+(deftest ratio
+  (is (= (t/ratio-bound 0.0) -9223372036854775808))
+  (is (= (t/ratio-bound 1.0) 9223372036854775807))
+  (is (= (t/ratio-bound 0.5) 4611686018427387904))
+  (is (t/ratio-sampled? (t/unhex "ffffffffffffffff0000000000000001") (t/ratio-bound 0.1)))
+  (is (not (t/ratio-sampled? (t/unhex "000000000000000040000000000000ff") (t/ratio-bound 0.1))))
+  (is (t/ratio-sampled? (t/unhex "0000000000000000ffffffffffffff00") (t/ratio-bound 0.1)))
+  (is (not (t/ratio-sampled? (t/unhex "00000000000000000000000000000001") (t/ratio-bound 0.0))))
+  (is (t/ratio-sampled? (t/unhex "00000000000000007ffffffffffffffe") (t/ratio-bound 1.0)))
+  (is (not (t/ratio-sampled? (t/unhex "00000000000000007fffffffffffffff") (t/ratio-bound 1.0))))
+  (is (t/ratio-sampled? (t/unhex "00000000000000008000000000000000") (t/ratio-bound 0.1))))
+
+;; サンプラー: parentbased_* は有効な遠隔の親があれば親の sampled に従う
+(deftest sampler
+  (let [tid (t/unhex "000000000000000040000000000000ff")]
+    (is (t/sample? "always_on" 0.0 t/NONE false tid))
+    (is (not (t/sample? "always_off" 1.0 t/VALID true tid)))
+    (is (t/sample? "parentbased_traceidratio" 0.0 t/VALID true tid))
+    (is (not (t/sample? "parentbased_traceidratio" 1.0 t/VALID false tid)))
+    (is (t/sample? "parentbased_traceidratio" 1.0 t/BAD false tid))
+    (is (not (t/sample? "parentbased_traceidratio" 0.1 t/NONE false tid)))
+    (is (t/sample? "parentbased_always_on" 0.0 t/NONE false tid))
+    (is (not (t/sample? "parentbased_always_off" 1.0 t/NONE false tid)))
+    (is (t/sample? "parentbased_always_off" 1.0 t/VALID true tid))
+    (is (t/sample? "traceidratio" 1.0 t/VALID false tid))))
+
+(deftest ids
+  (let [a (t/new-trace-id) b (t/new-trace-id) s (t/new-span-id)]
+    (is (= (count a) 16))
+    (is (= (count s) 8))
+    (is (not= a b))
+    (is (t/valid-id? a))
+    (is (not (t/valid-id? (t/unhex "00000000"))))))

@@ -1,0 +1,138 @@
+(ns mulay.dw.lib.core_misc
+  (:require [mulay.lib.random :as lr] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.fmt.registry :as reg] [mulay.dw.fmt.json :as json] [mulay.lib.uni :as uni]))
+
+(def M "dw::Core")
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+
+(def FLAGS ["com.mulesoft.dw.date_minus_back_compatibility" "false"
+            "com.mulesoft.dw.valueSelector.selectsAlwaysFirst" "false"
+            "com.mulesoft.dw.stripTrailingZeroes" "true"
+            "com.mulesoft.dw.javaSqlDateToDate" "true"
+            "com.mulesoft.dw.defaultOperator.disableExceptionHandling" "true"
+            "com.mulesoft.dw.stableOrderBy" "true"
+            "com.mulesoft.dw.legacySizeOfNumber" "false"
+            "com.mulesoft.dw.surrogateCharCodeSupport" "true"
+            "com.mulesoft.dw.base64ChunksEnabled" "true"
+            "com.mulesoft.dw.xml_reader.honourMixedContentStructure" "true"
+            "com.mulesoft.dw.xml_reader.honourXmlDeclarationEncoding" "true"
+            "com.mulesoft.dw.xml_reader.allowIndexedLatin1" "false"
+            "com.mulesoft.dw.xml_writer.declareXmlNamespace" "false"
+            "com.mulesoft.dw.csv_reader.indexed.retainStringValueInMemory" "false"
+            "com.mulesoft.dw.csv_writer.alwaysEscapeQuotesInCSV" "true"
+            "com.mulesoft.dw.java.disable_set_accessible" "true"
+            "com.mulesoft.dw.java.honour_bean_definition_accessor" "true"
+            "com.mulesoft.dw.java.enabled_class_definition_lookup" "true"
+            "com.mulesoft.dw.java.output_types_as_string" "true"])
+
+(defn compat-flag Vec(Bool) [name: &Str]
+  (loop [i 0]
+    (if (>= i (count FLAGS)) []
+      (if (= (nth FLAGS i) name) [(= (nth FLAGS (+ i 1)) "true")] (recur (+ i 2))))))
+
+(defn- eval-flag Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [n (core/arg-str a 0) r (compat-flag n)]
+    (if (= (count r) 0) (rt/failure "WeaveIllegalArgument" (str "Invalid compatibility flag name: `" n "`"))
+      (ok (v/bool-v (nth r 0))))))
+
+(defn- internal Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [name: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (rt/failure "InvalidAccess" (str "`" name "` can not be access from `anonymous` as it is constrained to: `dw::` or `bat::` subdomain."))))
+
+(defn- level-label Str [level: &Str]
+  (if (= level "Warn") "WARNING" (if (= level "Error") "SEVERE" "INFO")))
+
+(defn- show Str [x: &v/Val]
+  (let [[t e] (reg/write-fmt "application/dw" [] x)]
+    (if (dwe/ok? e) t
+      (let [[t2 e2] (json/write x (json/default-opts))] (if (dwe/ok? e2) t2 (v/type-name (v/unmeta x)))))))
+
+(defn log-line Str [prefix: &Str x: &v/Val]
+  (let [t (show x)] (if (= prefix "") t (str prefix " - " t))))
+
+(defn- emit Values(v/Val dwe/DwErr) [level: &Str prefix: &Str x: v/Val]
+  (let [z (if (= level "Debug") 0 (do (eprintln (str (level-label level) ": " (log-line prefix x))) 0))]
+    (ok x)))
+
+(defn- valid-level? Bool [l: &Str] (or (= l "Debug") (= l "Info") (= l "Warn") (= l "Error")))
+
+(defn- log-with Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [l (core/arg-str a 0)]
+    (if (not (valid-level? l))
+      (rt/failure "InvalidFunctionArgs" (str "- Expecting Type: `\"Debug\"`, but got: `\"" l "\"`."))
+      (emit l (core/arg-str a 1) (nth a 2)))))
+
+(defn- log-at Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [level: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (if (= (count a) 1) (emit level "" (nth a 0)) (emit level (core/arg-str a 0) (nth a 1)))))
+
+(defn uuid4 Str []
+  (let [[b ok] (lr/seeded-bytes 16)
+        d "0123456789abcdef"]
+    (loop [i 0 out ""]
+      (if (>= i 16) out
+        (let [x0 (nth b i)
+              x (if (= i 6) (bit-or (bit-and x0 0x0F) 0x40) (if (= i 8) (bit-or (bit-and x0 0x3F) 0x80) x0))
+              hi (bit-shift-right x 4) lo (bit-and x 15)
+              sep (if (or (= i 4) (= i 6) (= i 8) (= i 10)) "-" "")]
+          (recur (+ i 1) (str out sep (subs d hi (+ hi 1)) (subs d lo (+ lo 1)))))))))
+
+(defn- uuid-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/->VStr (uuid4))))
+
+(def XSI "http://www.w3.org/2001/XMLSchema-instance")
+
+(defn- xsi-type Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (match (v/unmeta (nth a 1))
+    (v/VNsV n)
+    (let [pre (:prefix n)
+          val (v/->VMeta (v/->VStr (str pre ":" (core/arg-str a 0)))
+                         [(v/field "nsPrefix" (v/->VStr pre)) (v/field "nsUri" (v/->VStr (:uri n)))])]
+      (ok (v/->VObj [(v/->Field (v/->Key [(v/->Ns "xsi" XSI)] "type" []) val)])))
+    _ (rt/failure "InvalidFunctionArgs" "xsiType expects a Namespace")))
+
+(defn- with-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (rt/env-call env (core/arg-fn a 0) [(nth a 1)]))
+
+(defn- then-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (rt/env-call env (core/arg-fn a 1) [(nth a 0)]))
+(defn- null-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/null-v)))
+
+(defn- on-null Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (match (v/unmeta (nth a 1))
+    (v/VFn f) (rt/env-call env f [])
+    _ (ok (nth a 1))))
+(defn- first-arg Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (nth a 0)))
+
+(defn- is-empty Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (v/->VBool
+        (match (v/unmeta (nth a 0))
+          (v/VArr xs) (= (count xs) 0)
+          (v/VRange x y) false
+          (v/VStr s) (= (count s) 0)
+          (v/VKey k) (= (count (:name k)) 0)
+          (v/VObj fs) (= (count fs) 0)
+          (v/VBin b) (= (count b) 0)
+          _ true))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+(defn- b0 rt/Overload [f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] (rt/overload [] f))
+(defn- b3 rt/Overload [t: Str u: Str w: Str f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] (rt/overload [t u w] f))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "evaluateCompatibilityFlag" [(rt/b1 "String" eval-flag)])
+   (B "isDefaultOperatorDisabledExceptionHandling" [(b0 (internal "isDefaultOperatorDisabledExceptionHandling"))])
+   (B "isLegacySizeOfNumber" [(b0 (internal "isLegacySizeOfNumber"))])
+   (B "logWith" [(b3 "String" "String" "Any" log-with)])
+   (B "logDebug" [(rt/b2 "String" "Any" (log-at "Debug")) (rt/b1 "Any" (log-at "Debug"))])
+   (B "logInfo" [(rt/b2 "String" "Any" (log-at "Info")) (rt/b1 "Any" (log-at "Info"))])
+   (B "logWarn" [(rt/b2 "String" "Any" (log-at "Warn")) (rt/b1 "Any" (log-at "Warn"))])
+   (B "logError" [(rt/b2 "String" "Any" (log-at "Error")) (rt/b1 "Any" (log-at "Error"))])
+   (B "log" [(rt/b2 "String" "Any" (log-at "Info")) (rt/b1 "Any" (log-at "Info"))])
+   (B "uuid" [(b0 uuid-fn)])
+   (B "xsiType" [(rt/b2 "String" "Namespace" xsi-type)])
+   (B "with" [(rt/b2 "Function" "Any" with-fn)])
+   (B "isEmpty" [(rt/b1 "Array" is-empty) (rt/b1 "String" is-empty) (rt/b1 "Object" is-empty)
+                 (rt/b1 "Binary" is-empty) (rt/b1 "Null" is-empty)])
+   (B "then" [(rt/b2 "Null" "Function" null-fn) (rt/b2 "Any" "Function" then-fn)])
+   (B "onNull" [(rt/b2 "Null" "Any" on-null) (rt/b2 "Any" "Any" first-arg)])])

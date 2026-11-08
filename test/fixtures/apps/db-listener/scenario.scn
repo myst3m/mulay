@@ -1,0 +1,318 @@
+%%% note
+DB コネクタ (1.16.4) の db:listener。PostgreSQL (localhost:15432) の表を 300ms ごとに見る。表は startsql で起動前に作り直す。
+受けた行は li_seen に書き、/dump で (src, id) ごとの回数と中身を見る。
+l1: watermarkColumn と idColumn。payload の形と型、後から足した行 (watermark より大きい・小さい・同じ)。
+l2: 列の名前を大文字で書いたとき。l3: 起動の時点で無い表 (できてから読む)。
+%%% port 18541
+%%% startsql postgresql://mulay:mulay@127.0.0.1:15432/mulay
+DROP TABLE IF EXISTS li_rows, li_rows2, li_later, li_seen;
+CREATE TABLE li_rows (id INT PRIMARY KEY, ts INT, name TEXT, amount NUMERIC(10,2), created TIMESTAMP, flag BOOLEAN);
+INSERT INTO li_rows VALUES (1, 10, 'a', 1.50, '2024-01-02 03:04:05', true), (2, 20, 'b', NULL, NULL, false), (3, 30, 'c', 3, '2024-05-06 07:08:09.5', NULL);
+CREATE TABLE li_rows2 (id INT PRIMARY KEY, ts INT, name TEXT);
+INSERT INTO li_rows2 VALUES (1, 10, 'x'), (2, 20, 'y');
+CREATE TABLE li_seen (seq SERIAL, src TEXT, row_id INT, info TEXT);
+%%% wait 1500
+%%% request GET /dump
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "src": "l1",
+    "id": 1,
+    "n": 1,
+    "info": {
+      "keys": [
+        "id",
+        "ts",
+        "name",
+        "amount",
+        "created",
+        "flag"
+      ],
+      "types": {
+        "id": "Number",
+        "ts": "Number",
+        "name": "String",
+        "amount": "Number",
+        "created": "LocalDateTime",
+        "flag": "Boolean"
+      },
+      "row": {
+        "id": 1,
+        "ts": 10,
+        "name": "a",
+        "amount": 1.5,
+        "created": "2024-01-02T03:04:05",
+        "flag": true
+      },
+      "attrs": "Null"
+    }
+  },
+  {
+    "src": "l1",
+    "id": 2,
+    "n": 1,
+    "info": {
+      "keys": [
+        "id",
+        "ts",
+        "name",
+        "amount",
+        "created",
+        "flag"
+      ],
+      "types": {
+        "id": "Number",
+        "ts": "Number",
+        "name": "String",
+        "amount": "Null",
+        "created": "Null",
+        "flag": "Boolean"
+      },
+      "row": {
+        "id": 2,
+        "ts": 20,
+        "name": "b",
+        "amount": null,
+        "created": null,
+        "flag": false
+      },
+      "attrs": "Null"
+    }
+  },
+  {
+    "src": "l1",
+    "id": 3,
+    "n": 1,
+    "info": {
+      "keys": [
+        "id",
+        "ts",
+        "name",
+        "amount",
+        "created",
+        "flag"
+      ],
+      "types": {
+        "id": "Number",
+        "ts": "Number",
+        "name": "String",
+        "amount": "Number",
+        "created": "LocalDateTime",
+        "flag": "Null"
+      },
+      "row": {
+        "id": 3,
+        "ts": 30,
+        "name": "c",
+        "amount": 3,
+        "created": "2024-05-06T07:08:09.5",
+        "flag": null
+      },
+      "attrs": "Null"
+    }
+  },
+  {
+    "src": "l2",
+    "id": 1,
+    "n": 1,
+    "info": {
+      "id": 1,
+      "ts": 10,
+      "name": "x"
+    }
+  },
+  {
+    "src": "l2",
+    "id": 2,
+    "n": 1,
+    "info": {
+      "id": 2,
+      "ts": 20,
+      "name": "y"
+    }
+  }
+]
+%%% request POST /add?table=li_rows&id=4&ts=40&name=d
+%%% response 200
+
+added
+%%% request POST /add?table=li_rows&id=5&ts=5&name=e
+%%% response 200
+
+added
+%%% wait 1200
+%%% request POST /add?table=li_rows&id=6&ts=40&name=f
+%%% response 200
+
+added
+%%% request POST /later
+%%% response 200
+
+created
+%%% wait 1500
+%%% request GET /dump
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "src": "l1",
+    "id": 1,
+    "n": 1,
+    "info": {
+      "keys": [
+        "id",
+        "ts",
+        "name",
+        "amount",
+        "created",
+        "flag"
+      ],
+      "types": {
+        "id": "Number",
+        "ts": "Number",
+        "name": "String",
+        "amount": "Number",
+        "created": "LocalDateTime",
+        "flag": "Boolean"
+      },
+      "row": {
+        "id": 1,
+        "ts": 10,
+        "name": "a",
+        "amount": 1.5,
+        "created": "2024-01-02T03:04:05",
+        "flag": true
+      },
+      "attrs": "Null"
+    }
+  },
+  {
+    "src": "l1",
+    "id": 2,
+    "n": 1,
+    "info": {
+      "keys": [
+        "id",
+        "ts",
+        "name",
+        "amount",
+        "created",
+        "flag"
+      ],
+      "types": {
+        "id": "Number",
+        "ts": "Number",
+        "name": "String",
+        "amount": "Null",
+        "created": "Null",
+        "flag": "Boolean"
+      },
+      "row": {
+        "id": 2,
+        "ts": 20,
+        "name": "b",
+        "amount": null,
+        "created": null,
+        "flag": false
+      },
+      "attrs": "Null"
+    }
+  },
+  {
+    "src": "l1",
+    "id": 3,
+    "n": 1,
+    "info": {
+      "keys": [
+        "id",
+        "ts",
+        "name",
+        "amount",
+        "created",
+        "flag"
+      ],
+      "types": {
+        "id": "Number",
+        "ts": "Number",
+        "name": "String",
+        "amount": "Number",
+        "created": "LocalDateTime",
+        "flag": "Null"
+      },
+      "row": {
+        "id": 3,
+        "ts": 30,
+        "name": "c",
+        "amount": 3,
+        "created": "2024-05-06T07:08:09.5",
+        "flag": null
+      },
+      "attrs": "Null"
+    }
+  },
+  {
+    "src": "l1",
+    "id": 4,
+    "n": 1,
+    "info": {
+      "keys": [
+        "id",
+        "ts",
+        "name",
+        "amount",
+        "created",
+        "flag"
+      ],
+      "types": {
+        "id": "Number",
+        "ts": "Number",
+        "name": "String",
+        "amount": "Null",
+        "created": "Null",
+        "flag": "Null"
+      },
+      "row": {
+        "id": 4,
+        "ts": 40,
+        "name": "d",
+        "amount": null,
+        "created": null,
+        "flag": null
+      },
+      "attrs": "Null"
+    }
+  },
+  {
+    "src": "l2",
+    "id": 1,
+    "n": 1,
+    "info": {
+      "id": 1,
+      "ts": 10,
+      "name": "x"
+    }
+  },
+  {
+    "src": "l2",
+    "id": 2,
+    "n": 1,
+    "info": {
+      "id": 2,
+      "ts": 20,
+      "name": "y"
+    }
+  },
+  {
+    "src": "l3",
+    "id": 1,
+    "n": 1,
+    "info": {
+      "id": 1,
+      "ts": 100,
+      "name": "late"
+    }
+  }
+]

@@ -1,0 +1,511 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <http:request-config name="Self">
+        <http:request-connection host="localhost" port="${http.port}"/>
+    </http:request-config>
+
+    <file:config name="F">
+        <file:connection workingDir="${file.workingDir}"/>
+    </file:config>
+
+    <file:matcher name="csvOnly" filenamePattern="*.csv"/>
+    <file:matcher name="bigOnly" minSize="5" directories="EXCLUDE"/>
+    <!-- 時刻の条件 (文字列で書いたもの) -->
+    <file:matcher name="since2000" updatedSince="2000-01-01T00:00:00" directories="EXCLUDE" filenamePattern="*.txt"/>
+    <file:matcher name="until2000" updatedUntil="2000-01-01T00:00:00" directories="EXCLUDE"/>
+
+    <!-- 失敗は 200 で型と説明を返す -->
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="seed">
+        <http:listener config-ref="HTTP" path="/seed" allowedMethods="POST"/>
+        <file:write config-ref="F" path="a.json"><file:content>{"a": 1, "b": [true, null]}</file:content></file:write>
+        <file:write config-ref="F" path="b.xml"><file:content><![CDATA[<r><x>1</x></r>]]></file:content></file:write>
+        <file:write config-ref="F" path="c.csv"><file:content>h1,h2
+1,2</file:content></file:write>
+        <file:write config-ref="F" path="d.txt"><file:content>plain</file:content></file:write>
+        <file:write config-ref="F" path="e.weird"><file:content>zz</file:content></file:write>
+        <file:write config-ref="F" path="noext"><file:content>no extension</file:content></file:write>
+        <file:write config-ref="F" path="f.yaml"><file:content>k: v</file:content></file:write>
+        <file:write config-ref="F" path="g.html"><file:content>&lt;p&gt;hi&lt;/p&gt;</file:content></file:write>
+        <file:write config-ref="F" path="tree/one.txt"><file:content>1</file:content></file:write>
+        <file:write config-ref="F" path="tree/deeper/two.txt"><file:content>22</file:content></file:write>
+        <set-payload value="seeded"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- read: 推定した mime と属性 -->
+    <flow name="read-meta">
+        <http:listener config-ref="HTTP" path="/read/meta" allowedMethods="GET"/>
+        <file:read config-ref="F" path="#[attributes.queryParams.path]" outputMimeType="#[attributes.queryParams.mime]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  mime: payload.^mimeType,
+  encoding: payload.^encoding,
+  attrClass: attributes.^class,
+  fileName: attributes.fileName,
+  path: attributes.path,
+  size: attributes.size,
+  directory: attributes.directory,
+  regularFile: attributes.regularFile,
+  symbolicLink: attributes.symbolicLink,
+  lmType: typeOf(attributes.lastModifiedTime),
+  laType: typeOf(attributes.lastAccessTime),
+  ctType: typeOf(attributes.creationTime)
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- read: そのまま返す (応答の content-type) -->
+    <flow name="read-raw">
+        <http:listener config-ref="HTTP" path="/read/raw" allowedMethods="GET"/>
+        <file:read config-ref="F" path="#[attributes.queryParams.path]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- lock: 読み切ってからもう一度 lock して読む。(読み切る前にもう一度 lock すると実 Mule は MULE:UNKNOWN
+         "Could not lock file .. because it's already owned by another process"。mulay は表せない: deviations.md) -->
+    <flow name="read-lock-seq">
+        <http:listener config-ref="HTTP" path="/read/lock-seq" allowedMethods="GET"/>
+        <file:read config-ref="F" path="d.txt" lock="true"/>
+        <set-variable variableName="first" value="#[payload as String]"/>
+        <file:read config-ref="F" path="d.txt" lock="true"/>
+        <set-payload value="#[output application/json --- {first: vars.first, second: payload as String}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- timeBetweenSizeCheck: 大きさが変わらなければそのまま読める -->
+    <flow name="read-sizecheck">
+        <http:listener config-ref="HTTP" path="/read/sizecheck" allowedMethods="GET"/>
+        <file:read config-ref="F" path="#[attributes.queryParams.path]" timeBetweenSizeCheck="200"/>
+        <set-payload value="#[output application/json --- {content: payload as String}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- timeBetweenSizeCheck: 書き続けているファイル (もう一方の経路が 50 ms ごとに追記する) -->
+    <flow name="read-sizecheck-growing">
+        <http:listener config-ref="HTTP" path="/read/sizecheck-growing" allowedMethods="GET"/>
+        <file:write config-ref="F" path="grow.txt"><file:content>#["x"]</file:content></file:write>
+        <scatter-gather>
+            <route>
+                <try>
+                    <file:read config-ref="F" path="grow.txt" timeBetweenSizeCheck="200"/>
+                    <set-payload value="#[output application/json --- {read: sizeOf(payload as String) > 0}]"/>
+                    <error-handler ref="report"/>
+                </try>
+            </route>
+            <route>
+                <foreach collection="#[1 to 40]">
+                    <set-payload value="#[%dw 2.0 import wait from dw::Runtime --- wait('x', 50)]"/>
+                    <file:write config-ref="F" path="grow.txt" mode="APPEND"><file:content>#["x"]</file:content></file:write>
+                </foreach>
+                <set-payload value="#[output application/json --- {wrote: true}]"/>
+            </route>
+        </scatter-gather>
+        <file:delete config-ref="F" path="grow.txt"/>
+        <set-payload value="#[output application/json --- payload pluck $.payload]"/>
+    </flow>
+
+    <!-- read: 読んだ値を DW で使う -->
+    <flow name="read-value">
+        <http:listener config-ref="HTTP" path="/read/value" allowedMethods="GET"/>
+        <file:read config-ref="F" path="#[attributes.queryParams.path]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 属性を JSON で (時刻は伏せる) -->
+    <flow name="attrs-json">
+        <http:listener config-ref="HTTP" path="/attrs" allowedMethods="GET"/>
+        <file:read config-ref="F" path="#[attributes.queryParams.path]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+attributes]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- list の要素の形 -->
+    <flow name="list-shape">
+        <http:listener config-ref="HTTP" path="/list/shape" allowedMethods="GET"/>
+        <file:list config-ref="F" directoryPath="#[attributes.queryParams.dir default '.']" recursive="#[(attributes.queryParams.rec default 'false') == 'true']"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  items: payload orderBy ((item) -> item.attributes.path) map ((item) -> {
+    keys: keysOf(item),
+    name: item.attributes.fileName,
+    dir: item.attributes.directory,
+    mime: item.payload.^mimeType,
+    body: if (item.attributes.directory) null else item.payload
+  })
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- list の属性だけを使う (FIFO や /dev/zero への symlink があっても中身は読まない) -->
+    <flow name="list-attrs">
+        <http:listener config-ref="HTTP" path="/list/attrs" allowedMethods="GET"/>
+        <file:list config-ref="F" directoryPath="#[attributes.queryParams.dir]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload orderBy ((item) -> item.attributes.fileName) map ((item) -> {
+  name: item.attributes.fileName,
+  dir: item.attributes.directory,
+  regular: item.attributes.regularFile,
+  link: item.attributes.symbolicLink,
+  size: item.attributes.size
+})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- list と matcher -->
+    <flow name="list-matcher">
+        <http:listener config-ref="HTTP" path="/list/matcher" allowedMethods="GET"/>
+        <file:list config-ref="F" directoryPath="." recursive="true">
+            <file:matcher filenamePattern="#[attributes.queryParams.pattern]" directories="#[attributes.queryParams.dirs default 'INCLUDE']"/>
+        </file:list>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(payload map ((item) -> item.attributes.fileName)) orderBy $]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="list-matcher-ref">
+        <http:listener config-ref="HTTP" path="/list/matcher-ref" allowedMethods="GET"/>
+        <file:list config-ref="F" directoryPath="." recursive="true" matcher="bigOnly"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(payload map ((item) -> item.attributes.fileName)) orderBy $]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- matcher の時刻の条件。q の名前の属性に t (LocalDateTime) を入れる。accessedUntil は実コネクタでは Since と同じ比較 -->
+    <flow name="list-time">
+        <http:listener config-ref="HTTP" path="/list/time" allowedMethods="GET"/>
+        <set-variable variableName="t" value="#[attributes.queryParams.t as LocalDateTime]"/>
+        <set-variable variableName="q" value="#[attributes.queryParams.q]"/>
+        <file:list config-ref="F" directoryPath="." recursive="true">
+            <file:matcher directories="EXCLUDE" filenamePattern="*.txt"
+                          createdSince="#[if (vars.q == 'createdSince') vars.t else null]"
+                          createdUntil="#[if (vars.q == 'createdUntil') vars.t else null]"
+                          updatedSince="#[if (vars.q == 'updatedSince') vars.t else null]"
+                          updatedUntil="#[if (vars.q == 'updatedUntil') vars.t else null]"
+                          accessedSince="#[if (vars.q == 'accessedSince') vars.t else null]"
+                          accessedUntil="#[if (vars.q == 'accessedUntil') vars.t else null]"/>
+        </file:list>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(payload map ((item) -> item.attributes.fileName)) orderBy $]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="list-since2000">
+        <http:listener config-ref="HTTP" path="/list/since2000" allowedMethods="GET"/>
+        <file:list config-ref="F" directoryPath="." recursive="true" matcher="since2000"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(payload map ((item) -> item.attributes.fileName)) orderBy $]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="list-until2000">
+        <http:listener config-ref="HTTP" path="/list/until2000" allowedMethods="GET"/>
+        <file:list config-ref="F" directoryPath="." recursive="true" matcher="until2000"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(payload map ((item) -> item.attributes.fileName)) orderBy $]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- write のいろいろ -->
+    <flow name="write-json">
+        <http:listener config-ref="HTTP" path="/write/json" allowedMethods="POST"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{written: [1, 2], at: "x"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <file:write config-ref="F" path="out/w.json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadAfter: payload, attrsAfter: attributes.requestPath}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- パスに NUL (%00) を含む: Java の Paths.get が拒む (C の open に渡すと NUL で切れて別のファイルになる) -->
+    <flow name="write-param">
+        <http:listener config-ref="HTTP" path="/write/param" allowedMethods="POST"/>
+        <file:write config-ref="F" path="#[attributes.queryParams.path]"><file:content>x</file:content></file:write>
+        <set-payload value="written"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="write-java">
+        <http:listener config-ref="HTTP" path="/write/java" allowedMethods="POST"/>
+        <set-payload value="#[{a: 1}]"/>
+        <file:write config-ref="F" path="out/java.bin"/>
+        <set-payload value="ok"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="write-number">
+        <http:listener config-ref="HTTP" path="/write/number" allowedMethods="POST"/>
+        <file:write config-ref="F" path="out/num.txt"><file:content>#[42]</file:content></file:write>
+        <set-payload value="ok"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="write-noparent">
+        <http:listener config-ref="HTTP" path="/write/noparent" allowedMethods="POST"/>
+        <file:write config-ref="F" path="nowhere/x.txt" createParentDirectories="false"><file:content>x</file:content></file:write>
+        <set-payload value="ok"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="write-todir">
+        <http:listener config-ref="HTTP" path="/write/todir" allowedMethods="POST"/>
+        <file:write config-ref="F" path="tree"><file:content>x</file:content></file:write>
+        <set-payload value="ok"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="write-encoding">
+        <http:listener config-ref="HTTP" path="/write/encoding" allowedMethods="POST"/>
+        <set-payload value="café" mimeType="text/plain" encoding="ISO-8859-1"/>
+        <file:write config-ref="F" path="out/latin1.txt"/>
+        <file:read config-ref="F" path="out/latin1.txt" outputMimeType="application/octet-stream"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import toBase64 from dw::core::Binaries
+output application/json
+---
+toBase64(payload as Binary)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- copy / move / rename / delete / create-directory の失敗と変種 -->
+    <flow name="copy">
+        <http:listener config-ref="HTTP" path="/copy" allowedMethods="POST"/>
+        <file:copy config-ref="F" sourcePath="#[attributes.queryParams.src]" targetPath="#[attributes.queryParams.dst]"
+                   overwrite="#[(attributes.queryParams.ow default 'false') == 'true']"
+                   createParentDirectories="#[(attributes.queryParams.cpd default 'true') == 'true']"
+                   renameTo="#[attributes.queryParams.rename]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ok: true, payloadAfter: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="move">
+        <http:listener config-ref="HTTP" path="/move" allowedMethods="POST"/>
+        <file:move config-ref="F" sourcePath="#[attributes.queryParams.src]" targetPath="#[attributes.queryParams.dst]"
+                   overwrite="#[(attributes.queryParams.ow default 'false') == 'true']"
+                   renameTo="#[attributes.queryParams.rename]"/>
+        <set-payload value="ok"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="rename">
+        <http:listener config-ref="HTTP" path="/rename" allowedMethods="POST"/>
+        <file:rename config-ref="F" path="#[attributes.queryParams.path]" to="#[attributes.queryParams.to]"
+                     overwrite="#[(attributes.queryParams.ow default 'false') == 'true']"/>
+        <set-payload value="ok"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="delete">
+        <http:listener config-ref="HTTP" path="/delete" allowedMethods="POST"/>
+        <file:delete config-ref="F" path="#[attributes.queryParams.path]"/>
+        <set-payload value="ok"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="mkdir">
+        <http:listener config-ref="HTTP" path="/mkdir" allowedMethods="POST"/>
+        <file:create-directory config-ref="F" directoryPath="#[attributes.queryParams.dir]"/>
+        <set-payload value="ok"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="list-names">
+        <http:listener config-ref="HTTP" path="/names" allowedMethods="GET"/>
+        <file:list config-ref="F" directoryPath="#[attributes.queryParams.dir default '.']" recursive="true"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var base = attributes.queryParams.base default ""
+---
+(payload map ((item) -> item.attributes.path[sizeOf(base) to -1] ++ (if (item.attributes.directory) "/" else ""))) orderBy $]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- listener: inbox の *.csv を処理して done へ移す。結果は seen/ に書く -->
+    <flow name="inbox-listener">
+        <file:listener config-ref="F" directory="inbox" moveToDirectory="done" matcher="csvOnly">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </file:listener>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{mime: payload.^mimeType, fileName: attributes.fileName, size: attributes.size, attrClass: attributes.^class, body: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <file:write config-ref="F" path="#['seen/' ++ attributes.fileName ++ '.json']"/>
+    </flow>
+
+    <!-- listener: inbox2 のファイルを読んで消す -->
+    <flow name="inbox2-listener">
+        <file:listener config-ref="F" directory="inbox2" autoDelete="true" outputMimeType="application/json">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </file:listener>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{mime: payload.^mimeType, value: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <file:write config-ref="F" path="#['seen2/' ++ attributes.fileName]"/>
+    </flow>
+
+    <!-- listener: inbox3 のファイルを done3 へ移す。bad* はフローが失敗し、applyPostActionWhenFailed=false なので inbox3 に残る -->
+    <flow name="inbox3-listener">
+        <file:listener config-ref="F" directory="inbox3" moveToDirectory="done3" applyPostActionWhenFailed="false">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </file:listener>
+        <choice>
+            <when expression="#[attributes.fileName startsWith 'bad']">
+                <raise-error type="APP:BAD" description="bad file"/>
+            </when>
+        </choice>
+    </flow>
+
+    <flow name="drop">
+        <http:listener config-ref="HTTP" path="/drop" allowedMethods="POST"/>
+        <file:write config-ref="F" path="#[attributes.queryParams.path]"/>
+        <set-payload value="dropped"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 読んだファイルを http:request で送る (requestStreamingMode=AUTO の Content-Length か chunked か) -->
+    <flow name="fwd-back">
+        <http:listener config-ref="HTTP" path="/fwd/back"/>
+        <set-payload value="#[output application/json --- {te: attributes.headers.'transfer-encoding' default null, cl: attributes.headers.'content-length' default null, ct: attributes.headers.'content-type' default null, body: payload.^raw as String default null}]"/>
+    </flow>
+    <flow name="fwd-file">
+        <http:listener config-ref="HTTP" path="/fwd/file"/>
+        <file:write config-ref="F" path="fwd.txt"><file:content>fwd-body</file:content></file:write>
+        <file:read config-ref="F" path="fwd.txt"/>
+        <http:request config-ref="Self" method="POST" path="/fwd/back"/>
+        <file:delete config-ref="F" path="fwd.txt"/>
+    </flow>
+
+</mule>

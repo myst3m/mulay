@@ -1,0 +1,280 @@
+(ns mulay.dw.lib.core_text
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.lib.uni :as uni] [mulay.lib.regex :as re] [clay.string :as cs]))
+
+(def M "dw::Core")
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- nul v/Val [] (v/null-v))
+(defn- sv v/Val [s: Str] (v/->VStr s))
+(defn- bv v/Val [b: Bool] (v/bool-v b))
+(defn- iv v/Val [i: Int] (v/int-v i))
+
+(defn first-line Str [s: &Str] (let [i (cs/index-of s "\n")] (if (< i 0) (str s) (subs s 0 i))))
+
+(defn cp-adv Int [s: &Str b0: Int c0: Int b: Int]
+  (if (< b b0) (uni/cp-index-of-byte-index s b)
+    (loop [i b0 k c0] (if (>= i b) k (recur (uni/next-index s i) (+ k 1))))))
+
+(defn bytes->cps Vec(Int) [s: &Str bs: &Vec(Int)]
+  (loop [i 0 b 0 c 0 acc: Vec(Int) []]
+    (if (>= i (count bs)) acc
+      (let [x (nth bs i) k (cp-adv s b c x)]
+        (recur (+ i 1) x k (conj acc k))))))
+
+(defn find-lit Vec(Int) [s: &Str t: &Str]
+  (let [n (count s) k (count t)]
+    (if (= k 0)
+      (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (uni/next-index s i) (conj acc i))))
+      (loop [i 0 acc: Vec(Int) []]
+        (if (> (+ i k) n) acc
+          (let [j (cs/index-of-after s t i)]
+            (if (< j 0) acc (recur (+ j k) (conj acc j)))))))))
+
+(defn drop-trailing-empty Vec(Str) [xs: Vec(Str)]
+  (let [keep (loop [k (count xs)] (if (and (> k 0) (= (count (nth xs (- k 1))) 0)) (recur (- k 1)) k))]
+    (if (= keep (count xs)) xs (subvec xs 0 keep))))
+
+(defn split-lit Vec(Str) [s: &Str t: &Str]
+  (let [n (count s) k (count t)]
+    (if (= n 0) [""]
+      (if (= k 0)
+        (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (let [j (uni/next-index s i)] (recur j (conj acc (subs s i j))))))
+        (let [ps (find-lit s t)]
+          (if (= (count ps) 0) [(str s)]
+            (drop-trailing-empty
+              (loop [i 0 last 0 acc: Vec(Str) []]
+                (if (>= i (count ps)) (conj acc (subs s last n))
+                  (let [p (nth ps i)] (recur (+ i 1) (+ p k) (conj acc (subs s last p)))))))))))))
+
+(defn- re-flags Int [f: &Str]
+  (loop [i 0 acc 0]
+    (if (>= i (count f)) acc
+      (let [c (nth f i)
+            b (if (= c 105) re/CASE-INSENSITIVE (if (= c 109) re/MULTILINE (if (= c 115) re/DOTALL (if (= c 120) re/COMMENTS 0))))]
+        (recur (+ i 1) (bit-or acc b))))))
+
+(defn compile-re Values(re/Pattern dwe/DwErr) [src: &Str fl: &Str]
+  (let [[p e] (re/compile src (re-flags fl))]
+    (if (= e "") (values p (dwe/ok))
+      (values p (dwe/err "InvalidRegex" (str "Invalid Regex: " (first-line e)))))))
+
+(defn arg-re Values(re/Pattern dwe/DwErr) [a: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth a i))
+    (v/VRegex s f) (compile-re s f)
+    _ (compile-re (core/arg-str a i) "")))
+
+(defn re-fail Values(v/Val dwe/DwErr) [e: Str] (rt/failure "RegexException" e))
+
+(defn match-groups v/Val [m: &re/Match s: &Str]
+  (let [n (re/groups m)]
+    (v/->VArr (loop [g 0 acc: Vec(v/Val) []]
+                (if (> g n) acc
+                  (recur (+ g 1) (conj acc (if (re/group-matched? m g) (sv (re/group m s g)) (nul)))))))))
+
+(defn find-all-re Values(Vec(re/Match) dwe/DwErr) [a: &Vec(v/Val) s: &Str]
+  (let [[p pe] (arg-re a 1)]
+    (if (not (dwe/ok? pe)) (let [none: Vec(re/Match) []] (values none pe))
+      (let [[ms e] (re/find-all p s)]
+        (if (= e "") (values ms (dwe/ok)) (values ms (dwe/err "RegexException" e)))))))
+
+(defn- strs v/Val [xs: &Vec(Str)]
+  (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (sv (nth xs i))))))))
+
+(defn- split-re Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) [p pe] (arg-re a 1)]
+    (if (not (dwe/ok? pe)) (values (nul) pe)
+      (let [[xs e] (re/split p s 0)]
+        (if (= e "") (ok (strs xs)) (re-fail e))))))
+
+(defn- split-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (strs (split-lit (core/arg-str a 0) (core/arg-str a 1)))))
+
+(defn- ints v/Val [xs: &Vec(Int)]
+  (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (iv (nth xs i))))))))
+
+(defn- find-lit-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0)] (ok (ints (bytes->cps s (find-lit s (core/arg-str a 1)))))))
+
+(defn- find-re Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) [ms e] (find-all-re a s)]
+    (if (not (dwe/ok? e)) (values (nul) e)
+      (loop [i 0 acc: Vec(v/Val) []]
+        (if (>= i (count ms)) (ok (v/->VArr acc))
+          (let [m (nth ms i) ng (re/groups m)
+                row (loop [g 0 r: Vec(v/Val) []]
+                      (if (> g ng) r
+                        (recur (+ g 1) (conj r (iv (if (re/group-matched? m g) (uni/cp-index-of-byte-index s (re/start m g)) -1))))))]
+            (recur (+ i 1) (conj acc (v/->VArr row)))))))))
+
+(defn- empty-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/->VArr [])))
+(defn- null-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (nul)))
+(defn- false-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv false)))
+(defn- true-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv true)))
+(defn- minus-one Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (iv -1)))
+
+(defn- match-re Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) [p pe] (arg-re a 1)]
+    (if (not (dwe/ok? pe)) (values (nul) pe)
+      (let [[ms e] (re/match-full p s)]
+        (if (not= e "") (re-fail e)
+          (if (= (count ms) 0) (ok (v/->VArr [])) (ok (match-groups (nth ms 0) s))))))))
+
+(defn- matches-re Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) [p pe] (arg-re a 1)]
+    (if (not (dwe/ok? pe)) (values (nul) pe)
+      (let [[b e] (re/matches? p s)]
+        (if (= e "") (ok (bv b)) (re-fail e))))))
+
+(defn- scan-re Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) [ms e] (find-all-re a s)]
+    (if (not (dwe/ok? e)) (values (nul) e)
+      (loop [i 0 acc: Vec(v/Val) []]
+        (if (>= i (count ms)) (ok (v/->VArr acc))
+          (recur (+ i 1) (conj acc (match-groups (nth ms i) s))))))))
+
+(defn- contains-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) t (core/arg-str a 1)]
+    (ok (bv (or (= (count t) 0) (>= (cs/index-of s t) 0))))))
+
+(defn- contains-re Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) [p pe] (arg-re a 1)]
+    (if (not (dwe/ok? pe)) (values (nul) pe)
+      (let [[ms e] (re/search p s 0)]
+        (if (= e "") (ok (bv (> (count ms) 0))) (re-fail e))))))
+
+(defn- starts-with Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (bv (cs/starts-with? (core/arg-str a 0) (core/arg-str a 1)))))
+
+(defn- ends-with Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (bv (cs/ends-with? (core/arg-str a 0) (core/arg-str a 1)))))
+
+(defn- index-of-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) ps (find-lit s (core/arg-str a 1))]
+    (ok (iv (if (= (count ps) 0) -1 (uni/cp-index-of-byte-index s (nth ps 0)))))))
+
+(defn- last-index-of-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) ps (find-lit s (core/arg-str a 1))]
+    (ok (iv (if (= (count ps) 0) -1 (uni/cp-index-of-byte-index s (nth ps (- (count ps) 1))))))))
+
+(defn- trim-s Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (sv (uni/java-trim (core/arg-str a 0)))))
+
+(defn- is-blank Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (bv (= (count (uni/java-trim (core/arg-str a 0))) 0))))
+
+(defn- is-empty-s Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv (= (count (core/arg-str a 0)) 0))))
+
+(defn- repl-text Values(Str dwe/DwErr) [y0: &v/Val]
+  (let [y (v/unmeta y0)]
+    (match y
+      (v/VStr s) (values s (dwe/ok))
+      (v/VNum n) (values (num/to-string n) (dwe/ok))
+      (v/VInt n-i) (let [n (num/from-int n-i)] (values (num/to-string n) (dwe/ok)))
+      (v/VBool b) (values (if b "true" "false") (dwe/ok))
+      (v/VKey k) (values (:name k) (dwe/ok))
+      (v/VType t) (values (:name t) (dwe/ok))
+      _ (values "" (dwe/err "TypeMismatch" (str "Expecting Type: `String`, but got: `" (v/type-name y) "`."))))))
+
+(defn- replacement Values(Str dwe/DwErr) [env: &rt/Env r: &v/Val groups: v/Val idx: Int]
+  (match (v/unmeta r)
+    (v/VFn f) (let [[y e] (core/call env f [groups (iv idx)])]
+                (if (dwe/ok? e) (repl-text y) (values "" e)))
+    _ (repl-text r)))
+
+(defn- replace-re-run Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) [ms e] (find-all-re a s)]
+    (if (not (dwe/ok? e)) (values (nul) e)
+      (let [n (count s)]
+        (loop [i 0 last 0 out ""]
+          (if (>= i (count ms)) (ok (sv (str out (subs s last n))))
+            (let [m (nth ms i)
+                  [r re2] (replacement env (nth a 2) (match-groups m s) i)]
+              (if (not (dwe/ok? re2)) (values (nul) re2)
+                (let [st (re/start m 0)]
+                  (recur (+ i 1) (re/end m 0) (str out (subs s last st) r)))))))))))
+
+(defn- replace-positions Vec(Int) [s: &Str t: &Str]
+  (if (= (count t) 0) (conj (find-lit s t) (count s)) (find-lit s t)))
+
+(defn- replace-str-run Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) t (core/arg-str a 1) k (count t) n (count s)
+        ps (replace-positions s t)]
+    (loop [i 0 last 0 out ""]
+      (if (>= i (count ps)) (ok (sv (str out (subs s last n))))
+        (let [p (nth ps i)
+              [r e] (replacement env (nth a 2) (v/->VArr [(sv t)]) i)]
+          (if (not (dwe/ok? e)) (values (nul) e)
+            (recur (+ i 1) (+ p k) (str out (subs s last p) r))))))))
+
+(defn- replace-re Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[p pe] (arg-re a 1)]
+    (if (not (dwe/ok? pe)) (values (nul) pe)
+      (rt/bind-builtin env M "replace#regex" [(nth a 0) (nth a 1)] 1))))
+
+(defn- replace-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (rt/bind-builtin env M "replace#string" [(nth a 0) (nth a 1)] 1))
+
+(defn- replace-null Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (rt/bind-builtin env M "replace#null" [] 1))
+
+(defn- with-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (core/call env (core/arg-fn a 0) [(nth a 1)]))
+
+(defn- truthy Values(Bool dwe/DwErr) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VBool b) (values b (dwe/ok))
+    _ (values false (dwe/err "CoercionException" (str "Cannot coerce " (v/type-name (v/unmeta x)) " to Boolean")))))
+
+(defn- filter-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) f (core/arg-fn a 1) n (count s)]
+    (loop [i 0 k 0 out ""]
+      (if (>= i n) (ok (sv out))
+        (let [j (uni/next-index s i)
+              ch (subs s i j)
+              [y e] (core/call env f [(sv ch) (iv k)])]
+          (if (not (dwe/ok? e)) (values y e)
+            (let [[b e2] (truthy y)]
+              (if (not (dwe/ok? e2)) (values (nul) e2)
+                (recur j (+ k 1) (if b (str out ch) out))))))))))
+
+(defn- group-by-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) f (core/arg-fn a 1) n (count s)]
+    (loop [i 0 k 0 keys: Vec(Str) [] vals: Vec(Str) []]
+      (if (>= i n)
+        (ok (v/->VObj (loop [q 0 acc: Vec(v/Field) []]
+                        (if (>= q (count keys)) acc (recur (+ q 1) (conj acc (v/field (nth keys q) (sv (nth vals q)))))))))
+        (let [j (uni/next-index s i)
+              ch (subs s i j)
+              [y e] (core/call env f [(sv ch) (iv k)])]
+          (if (not (dwe/ok? e)) (values y e)
+            (let [[key e2] (rt/to-text y)]
+              (if (not (dwe/ok? e2)) (values (nul) e2)
+                (let [at (loop [q 0] (if (>= q (count keys)) -1 (if (= (nth keys q) key) q (recur (+ q 1)))))]
+                  (if (< at 0) (recur j (+ k 1) (conj keys key) (conj vals ch))
+                    (let [old (nth vals at)]
+                      (recur j (+ k 1) keys (assoc vals at (str old ch))))))))))))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+(defn- b3 rt/Overload [t: Str u: Str w: Str f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] (rt/overload [t u w] f))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "splitBy" [(rt/b2 "String" "Regex" split-re) (rt/b2 "String" "String" split-str) (rt/b2 "Null" "Any" null-fn)])
+   (B "replace" [(rt/b2 "String" "Regex" replace-re) (rt/b2 "String" "String" replace-str) (rt/b2 "Null" "Any" replace-null)])
+   (B "replace#regex" [(b3 "String" "Regex" "Any" replace-re-run)])
+   (B "replace#string" [(b3 "String" "String" "Any" replace-str-run)])
+   (B "replace#null" [(rt/b1 "Any" null-fn)])
+   (B "with" [(rt/b2 "Function" "Function" with-fn) (rt/b2 "Function" "Any" with-fn)])
+   (B "match" [(rt/b2 "String" "Regex" match-re) (rt/b2 "String" "String" match-re) (rt/b2 "Null" "Any" null-fn)])
+   (B "matches" [(rt/b2 "String" "Regex" matches-re) (rt/b2 "String" "String" matches-re) (rt/b2 "Null" "Any" false-fn)])
+   (B "scan" [(rt/b2 "String" "Regex" scan-re) (rt/b2 "String" "String" scan-re) (rt/b2 "Null" "Any" null-fn)])
+   (B "find" [(rt/b2 "String" "Regex" find-re) (rt/b2 "String" "String" find-lit-fn) (rt/b2 "Null" "Any" empty-arr)])
+   (B "contains" [(rt/b2 "String" "String" contains-str) (rt/b2 "String" "Regex" contains-re) (rt/b2 "Null" "Any" false-fn)])
+   (B "startsWith" [(rt/b2 "String" "String" starts-with) (rt/b2 "Null" "Any" false-fn)])
+   (B "endsWith" [(rt/b2 "String" "String" ends-with) (rt/b2 "Null" "Any" false-fn)])
+   (B "indexOf" [(rt/b2 "String" "String" index-of-str) (rt/b2 "Null" "Any" minus-one)])
+   (B "lastIndexOf" [(rt/b2 "String" "String" last-index-of-str) (rt/b2 "Null" "Any" minus-one)])
+   (B "trim" [(rt/b1 "String" trim-s) (rt/b1 "Null" null-fn)])
+   (B "isBlank" [(rt/b1 "String" is-blank) (rt/b1 "Null" true-fn)])
+   (B "isEmpty" [(rt/b1 "String" is-empty-s) (rt/b1 "Null" true-fn)])
+   (B "filter" [(rt/b2 "String" "Function" filter-str) (rt/b2 "Null" "Function" null-fn)])
+   (B "groupBy" [(rt/b2 "String" "Function" group-by-str) (rt/b2 "Null" "Function" null-fn)])])

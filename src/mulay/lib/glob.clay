@@ -1,0 +1,146 @@
+(ns mulay.lib.glob
+  (:require [clay.core] [clay.string :as str]))
+
+(defn- cp-len Int [s: &Str i: Int]
+  (let [c (nth s i)] (cond (< c 128) 1 (< c 224) 2 (< c 240) 3 :else 4)))
+
+(defn- cp-at Int [s: &Str i: Int]
+  (let [n (cp-len s i) c (nth s i)]
+    (cond (= n 1) c
+          (>= (+ i n) (+ (count s) 1)) c
+          :else (loop [k 1 v (bit-and c (case n 2 31 3 15 7))]
+                  (if (or (>= k n) (>= (+ i k) (count s))) v (recur (+ k 1) (+ (* v 64) (bit-and (nth s (+ i k)) 63))))))))
+
+(defn- class-end Int [pat: &Str p: Int b: Int]
+  (let [p1 (if (and (< p b) (= (nth pat p) 33)) (+ p 1) p)
+        p2 (if (and (< p1 b) (= (nth pat p1) 93)) (+ p1 1) p1)]
+    (loop [k p2] (cond (>= k b) -1 (= (nth pat k) 93) k :else (recur (+ k 1))))))
+
+(defn- class-match Bool [pat: &Str a: Int b: Int c: Int]
+  (let [neg (and (< a b) (= (nth pat a) 33))
+        s0 (if neg (+ a 1) a)
+        hit (loop [k s0]
+              (if (>= k b) false
+                (let [lo (cp-at pat k) kn (+ k (cp-len pat k))]
+                  (if (and (< (+ kn 1) b) (= (nth pat kn) 45))
+                    (let [hi (cp-at pat (+ kn 1))]
+                      (if (and (>= c lo) (<= c hi)) true (recur (+ kn 1 (cp-len pat (+ kn 1))))))
+                    (if (= c lo) true (recur kn))))))]
+    (if neg (not hit) hit)))
+
+(defn- brace-end Int [pat: &Str p: Int]
+  (loop [k p] (cond (>= k (count pat)) -1 (= (nth pat k) 125) k (= (nth pat k) 92) (recur (+ k 2)) :else (recur (+ k 1)))))
+
+(defn- alt-bounds Vec(Int) [pat: &Str a: Int b: Int]
+  (loop [k a start a acc: Vec(Int) []]
+    (cond (>= k b) (conj (conj acc start) b)
+          (= (nth pat k) 92) (recur (+ k 2) start acc)
+          (= (nth pat k) 44) (recur (+ k 1) (+ k 1) (conj (conj acc start) k))
+          :else (recur (+ k 1) start acc))))
+
+(defrecord Ins [op: Int a: Int b: Int])
+
+(def LIT 0)
+(def ANY 1)
+(def STAR 2)
+(def DSTAR 3)
+(def CLASS 4)
+(def SPLIT 5)
+(def JMP 6)
+(def MATCH 7)
+(def FAIL 8)
+
+(defn- emit-range Values(Vec(Ins) Int Bool) [pat: &Str a: Int b: Int prog: Vec(Ins)]
+  (loop [p a out prog]
+    (if (>= p b) (values out b true)
+      (let [c (nth pat p)]
+        (cond
+          (= c 42) (if (and (< (+ p 1) b) (= (nth pat (+ p 1)) 42))
+                     (recur (+ p 2) (conj out (->Ins DSTAR 0 0)))
+                     (recur (+ p 1) (conj out (->Ins STAR 0 0))))
+          (= c 63) (recur (+ p 1) (conj out (->Ins ANY 0 0)))
+          (= c 91) (let [e (class-end pat (+ p 1) b)]
+                     (if (< e 0) (values out p false) (recur (+ e 1) (conj out (->Ins CLASS (+ p 1) e)))))
+          (= c 123) (values out p true)
+          (= c 92) (if (< (+ p 1) b)
+                     (recur (+ p 1 (cp-len pat (+ p 1))) (conj out (->Ins LIT (cp-at pat (+ p 1)) 0)))
+                     (recur b (conj out (->Ins FAIL 0 0))))
+          :else (recur (+ p (cp-len pat p)) (conj out (->Ins LIT (cp-at pat p) 0))))))))
+
+(defn- emit-group Values(Vec(Ins) Bool) [pat: &Str bs: &Vec(Int) prog: Vec(Ins)]
+  (let [n (quot (count bs) 2)]
+    (loop [k 0 out prog jmps: Vec(Int) []]
+      (if (>= k n)
+        (let [end (count out)]
+          (values (loop [j 0 o out] (if (>= j (count jmps)) o (recur (+ j 1) (assoc o (nth jmps j) (->Ins JMP end 0))))) true))
+        (let [a (nth bs (* 2 k))
+              b (nth bs (+ (* 2 k) 1))
+              sp (count out)
+              o1 (if (< k (- n 1)) (conj out (->Ins SPLIT (+ sp 1) 0)) out)
+              [o2 q ok] (emit-range pat a b o1)]
+          (if (or (not ok) (< q b)) (values o2 false)
+            (let [jp (count o2)
+                  o3 (conj o2 (->Ins JMP 0 0))
+                  o4 (if (< k (- n 1)) (assoc o3 sp (->Ins SPLIT (+ sp 1) (count o3))) o3)]
+              (recur (+ k 1) o4 (conj jmps jp)))))))))
+
+(defn- compile-glob Values(Vec(Ins) Bool) [pat: &Str]
+  (let [n (count pat)]
+    (loop [p 0 out: Vec(Ins) []]
+      (let [[o1 q ok] (emit-range pat p n out)]
+        (cond (not ok) (values o1 false)
+              (>= q n) (values (conj o1 (->Ins MATCH 0 0)) true)
+              :else
+              (let [e (brace-end pat (+ q 1))]
+                (if (< e 0) (values o1 false)
+                  (let [[o2 ok2] (emit-group pat (alt-bounds pat (+ q 1) e) o1)]
+                    (if ok2 (recur (+ e 1) o2) (values o2 false))))))))))
+
+(defn- put Vec(Int) [v: Vec(Int) i: Int x: Int] (if (< i (count v)) (assoc v i x) (conj v x)))
+
+(defn- close Values(Vec(Int) Vec(Int) Vec(Int)) [prog: &Vec(Ins) pc0: Int gen: Int marks0: Vec(Int) lst0: Vec(Int) st0: Vec(Int)]
+  (loop [sp 1 st (put st0 0 pc0) marks marks0 lst lst0]
+    (if (= sp 0) (values marks lst st)
+      (let [pc (nth st (- sp 1))
+            sp1 (- sp 1)]
+        (if (= (nth marks pc) gen) (recur sp1 st marks lst)
+          (let [ins: Ins (nth prog pc)
+                op (:op ins)
+                m2 (assoc marks pc gen)]
+            (cond
+              (= op SPLIT) (recur (+ sp1 2) (put (put st sp1 (:a ins)) (+ sp1 1) (:b ins)) m2 lst)
+              (= op JMP) (recur (+ sp1 1) (put st sp1 (:a ins)) m2 lst)
+              (or (= op STAR) (= op DSTAR)) (recur (+ sp1 1) (put st sp1 (+ pc 1)) m2 (conj lst pc))
+              :else (recur sp1 st m2 (conj lst pc)))))))))
+
+(defn- next-pc Int [pat: &Str ins: &Ins pc: Int cp: Int]
+  (let [op (:op ins)]
+    (cond (= op LIT) (if (= cp (:a ins)) (+ pc 1) -1)
+          (= op ANY) (if (not= cp 47) (+ pc 1) -1)
+          (= op STAR) (if (not= cp 47) pc -1)
+          (= op DSTAR) pc
+          (= op CLASS) (if (and (not= cp 47) (class-match pat (:a ins) (:b ins) cp)) (+ pc 1) -1)
+          :else -1)))
+
+(defn- has-match? Bool [prog: &Vec(Ins) cl: &Vec(Int)]
+  (loop [k 0] (cond (>= k (count cl)) false (= (:op (nth prog (nth cl k))) MATCH) true :else (recur (+ k 1)))))
+
+(defn glob-match Bool [pat: &Str s: &Str]
+  (let [[prog ok] (compile-glob pat)]
+    (if (not ok) false
+      (let [np (count prog)
+            marks0: Vec(Int) (loop [k 0 v: Vec(Int) []] (if (>= k np) v (recur (+ k 1) (conj v -1))))
+            [m1 l1 st1] (close prog 0 0 marks0 [] [])]
+        (loop [i 0 gen 0 marks m1 cl l1 st st1]
+          (cond (= (count cl) 0) false
+                (>= i (count s)) (has-match? prog cl)
+                :else
+                (let [cp (cp-at s i)
+                      g2 (+ gen 1)
+                      [m2 nl st2] (loop [k 0 mk marks nl: Vec(Int) [] stk st]
+                                    (if (>= k (count cl)) (values mk nl stk)
+                                      (let [pc (nth cl k)
+                                            nx (next-pc pat (nth prog pc) pc cp)]
+                                        (if (< nx 0) (recur (+ k 1) mk nl stk)
+                                          (let [[mk2 nl2 stk2] (close prog nx g2 mk nl stk)] (recur (+ k 1) mk2 nl2 stk2))))))]
+                  (recur (+ i (cp-len s i)) g2 m2 nl st2))))))))

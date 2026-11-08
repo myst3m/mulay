@@ -1,0 +1,1414 @@
+(ns mulay.lib.regex (:require [clay.utf8 :as u8] [mulay.lib.uni :as u] [clay.string :as cs]))
+
+(def UNIX-LINES 1)
+(def CASE-INSENSITIVE 2)
+(def COMMENTS 4)
+(def MULTILINE 8)
+(def LITERAL 16)
+(def DOTALL 32)
+(def UNICODE-CASE 64)
+(def CANON-EQ 128)
+(def UNICODE-CHARACTER-CLASS 256)
+
+(def DEFAULT-LIMIT 100000000)
+
+(defn- has? Bool [fl: Int f: Int] (not= (bit-and fl f) 0))
+
+(defrecord Pattern [source: Str flags: Int prog: Vec(Int) cls: Vec(Int) ngroups: Int
+                    nregs: Int names: Map(Str Int) limit: Int fset: Vec(Int) anchored: Bool])
+
+(defrecord Match [spans: Vec(Int) names: Map(Str Int)])
+
+(defrecord St [i: Int fl: Int ng: Int nr: Int names: Map(Str Int) cls: Vec(Int) err: Str ep: Int])
+
+(defrecord Fr [code: Vec(Int) mn: Int mx: Int det: Bool grp: Bool])
+
+(def MAXR 2147483647)
+(def INV 1099511627776)
+
+(defn- wrap32 Int [x: Int]
+  (let [y (bit-and x 4294967295)] (if (>= y 2147483648) (- y 4294967296) y)))
+
+(defn- err? Bool [st: &St] (not= (:err st) ""))
+
+(defn- st-i St [st: St i: Int]
+  (->St i (:fl st) (:ng st) (:nr st) (:names st) (:cls st) (:err st) (:ep st)))
+
+(defn- st-fl St [st: St fl: Int]
+  (->St (:i st) fl (:ng st) (:nr st) (:names st) (:cls st) (:err st) (:ep st)))
+
+(defn- st-fail St [st: St msg: Str pos: Int]
+  (if (err? st) st
+    (->St (:i st) (:fl st) (:ng st) (:nr st) (:names st) (:cls st) msg pos)))
+
+(defn- st-new-reg Values(Int St) [st: St]
+  (let [r (:nr st)]
+    (values r (->St (:i st) (:fl st) (:ng st) (+ r 1) (:names st) (:cls st) (:err st) (:ep st)))))
+
+(defn- st-new-group Values(Int St) [st: St]
+  (let [g (+ (:ng st) 1)]
+    (values g (->St (:i st) (:fl st) g (:nr st) (:names st) (:cls st) (:err st) (:ep st)))))
+
+(defn- st-name St [st: St name: Str g: Int]
+  (->St (:i st) (:fl st) (:ng st) (:nr st) (assoc (:names st) name g) (:cls st) (:err st) (:ep st)))
+
+(defn- app Vec(Int) [xs: Vec(Int) ys: &Vec(Int)]
+  (loop [i 0 v xs] (if (>= i (count ys)) v (recur (+ i 1) (conj v (nth ys i))))))
+
+(defn- add-node Values(Int St) [st: St node: &Vec(Int)]
+  (let [o (count (:cls st))]
+    (values o (->St (:i st) (:fl st) (:ng st) (:nr st) (:names st)
+                    (app (:cls st) node) (:err st) (:ep st)))))
+
+(defn- ins Vec(Int) [op: Int a: Int b: Int c: Int] [op a b c])
+
+(defn- no-fr Fr [] (let [v: Vec(Int) []] (->Fr v 0 0 true false)))
+
+(defn- fr1 Fr [op: Int a: Int b: Int c: Int mn: Int mx: Int] (->Fr (ins op a b c) mn mx true false))
+
+(defn- add-mx Int [a: Int b: Int]
+  (if (or (= a INV) (= b INV)) INV (wrap32 (+ a b))))
+
+(defn- mul-mx Int [a: Int b: Int]
+  (if (= a INV) INV (let [t (wrap32 (* a b))] (if (< t 0) INV t))))
+
+(defn- at Int [p: &Vec(Int) i: Int] (if (and (>= i 0) (< i (count p))) (nth p i) -1))
+
+(defn- ascii-space? Bool [c: Int] (or (= c 32) (and (>= c 9) (<= c 13))))
+(defn- ascii-digit? Bool [c: Int] (and (>= c 48) (<= c 57)))
+(defn- ascii-alpha? Bool [c: Int] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+(defn- ascii-alnum? Bool [c: Int] (or (ascii-alpha? c) (ascii-digit? c)))
+(defn- hex-digit? Bool [c: Int] (or (ascii-digit? c) (and (>= c 65) (<= c 70)) (and (>= c 97) (<= c 102))))
+(defn- hex-val Int [c: Int] (if (<= c 57) (- c 48) (if (<= c 70) (- c 55) (- c 87))))
+
+(defn- line-sep? Bool [c: Int fl: Int]
+  (if (has? fl UNIX-LINES) (= c 10)
+    (or (= c 10) (= c 13) (= c 0x85) (= c 0x2028) (= c 0x2029))))
+
+(defn- skipws Int [p: &Vec(Int) i0: Int fl: Int]
+  (if (not (has? fl COMMENTS)) i0
+    (loop [i i0]
+      (let [c (at p i)]
+        (if (ascii-space? c) (recur (+ i 1))
+          (if (= c 35)
+            (recur (loop [j (+ i 1)] (let [d (at p j)] (if (or (< d 0) (line-sep? d fl)) j (recur (+ j 1))))))
+            i))))))
+
+(defn- cps->str Str [p: &Vec(Int) a: Int b: Int]
+  (loop [i a out ""] (if (>= i b) out (recur (+ i 1) (str out (u/encode (nth p i)))))))
+
+(defn- remove-qe Vec(Int) [p: Vec(Int)]
+  (let [n (count p)
+        q (loop [i 0] (if (>= i (- n 1)) -1
+                        (if (not= (nth p i) 92) (recur (+ i 1))
+                          (if (not= (nth p (+ i 1)) 81) (recur (+ i 2)) i))))]
+    (if (< q 0) p
+      (loop [i (+ q 2) out: Vec(Int) (let [v: Vec(Int) []] (loop [k 0 w v] (if (>= k q) w (recur (+ k 1) (conj w (nth p k))))))
+             inq true beg true]
+        (if (>= i n) out
+          (let [c (nth p i)
+                nx (at p (+ i 1))]
+            (if (or (>= c 128) (ascii-alpha? c))
+              (recur (+ i 1) (conj out c) inq false)
+              (if (ascii-digit? c)
+                (recur (+ i 1) (if beg (conj (conj (conj (conj out 92) 120) 51) c) (conj out c)) inq false)
+                (if (not= c 92)
+                  (recur (+ i 1) (if inq (conj (conj out 92) c) (conj out c)) inq false)
+                  (if inq
+                    (if (= nx 69) (recur (+ i 2) out false false)
+                      (recur (+ i 1) (conj (conj out 92) 92) inq false))
+                    (if (= nx 81) (recur (+ i 2) out true true)
+                      (if (< (+ i 1) n)
+                        (recur (+ i 2) (conj (conj out c) nx) inq false)
+                        (recur (+ i 1) (conj out c) inq false)))))))))))))
+
+(defn- literal-cps Vec(Int) [p: &Vec(Int)]
+  (loop [i 0 out: Vec(Int) []]
+    (if (>= i (count p)) out
+      (let [c (nth p i)]
+        (recur (+ i 1)
+               (if (or (>= c 128) (ascii-alpha? c)) (conj out c)
+                 (if (ascii-digit? c) (conj (conj (conj (conj out 92) 120) 51) c)
+                   (conj (conj out 92) c))))))))
+
+(defn- single? Bool [f: &Fr]
+  (let [c (:code f)]
+    (and (= (count c) 4) (let [op (nth c 0)] (or (= op 1) (= op 2) (= op 3))))))
+
+(defn- wrap-look Fr [kind: Int f: Fr mm: Int mn: Int mx: Int]
+  (let [det (if (= kind 4) (:det f) true)
+        body (:code f)
+        code (app (app (ins 9 kind (+ (count body) 4) mm) body) (ins 0 0 0 0))]
+    (->Fr code mn mx det false)))
+
+(defn- atomic Fr [f: Fr]
+  (let [mn (:mn f) mx (:mx f)] (wrap-look 4 f 0 mn mx)))
+
+(defn- seq2 Fr [f: Fr g: &Fr]
+  (->Fr (app (:code f) (:code g)) (+ (:mn f) (:mn g)) (add-mx (:mx f) (:mx g)) (and (:det f) (:det g)) false))
+
+(defn- alt2 Fr [f: Fr g: Fr]
+  (let [a (:code f) b (:code g)
+        la (count a) lb (count b)
+        code (app (app (app (ins 4 4 (+ la 8) 0) a) (ins 5 (+ lb 4) 0 0)) b)
+        mx (if (or (= (:mx f) INV) (= (:mx g) INV)) INV (if (> (:mx f) (:mx g)) (:mx f) (:mx g)))
+        mn (if (< (:mn f) (:mn g)) (:mn f) (:mn g))]
+    (->Fr code mn mx false false)))
+
+(defn- rep-mx Int [f: &Fr single-mx: Int m: Int]
+  (if (single? f) single-mx
+    (if (and (:grp f) (not (:det f))) INV (mul-mx (:mx f) m))))
+
+(defn- poss-body Fr [f: Fr qt: Int]
+  (if (and (= qt 2) (not (single? f))) (atomic f) f))
+
+(defn- star Values(Fr St) [f0: Fr lo: Int qt: Int st: St]
+  (let [f (poss-body f0 qt)
+        mx (rep-mx f MAXR MAXR)
+        mn (* (:mn f) lo)
+        chk (= (:mn f) 0)
+        failmode (and chk (:grp f) (:det f) (not= qt 2))]
+    (if (and (single? f) (not= qt 1))
+      (values (->Fr (app (ins 18 lo -1 (if (= qt 2) 1 0)) (:code f)) mn mx false false) st)
+      (if (and failmode (= lo 1)) (counted f 1 -1 qt st)
+      (let [[r st2] (if chk (st-new-reg st) (values -1 st))
+            body (if chk (app (app (ins 10 r 0 0) (:code f)) (if failmode (ins 22 r 8 0) (ins 11 r 8 0))) (:code f))
+            bl (count body)
+            code (if (= lo 0)
+                   (app (app (if (= qt 1) (ins 4 (+ bl 8) 4 0) (ins 4 4 (+ bl 8) 0)) body)
+                        (ins 5 (- 0 (+ bl 4)) 0 0))
+                   (app body (if (= qt 1) (ins 4 4 (- 0 bl) 0) (ins 4 (- 0 bl) 4 0))))
+            g (->Fr code mn mx false false)]
+        (values (if (= qt 2) (atomic g) g) st2))))))
+
+(defn- opt Fr [f: Fr qt: Int]
+  (let [c (:code f)
+        l (count c)
+        g (->Fr (app (if (= qt 1) (ins 4 (+ l 4) 4 0) (ins 4 4 (+ l 4) 0)) c) 0 (:mx f) false false)]
+    (if (= qt 2) (atomic g) g)))
+
+(defn- counted Values(Fr St) [f0: Fr lo: Int hi: Int qt: Int st: St]
+  (let [f (poss-body f0 qt)
+        mn (* (:mn f) lo)
+        mx (rep-mx f (if (< hi 0) MAXR hi) (if (< hi 0) MAXR hi))
+        det (and (:det f) (= lo hi))]
+    (if (and (= lo 0) (= hi 1)) (values (opt f qt) st)
+      (if (and (single? f) (not= qt 1))
+        (values (->Fr (app (ins 18 lo hi (if (= qt 2) 1 0)) (:code f)) mn mx det false) st)
+        (if (= hi 0) (values (no-fr) st)
+          (if (and (= lo 1) (= hi 1)) (values (if (= qt 2) (atomic f) f) st)
+            (let [[r st2] (st-new-reg st)
+                  chk (= (:mn f) 0)
+                  [sr st3] (if chk (st-new-reg st2) (values -1 st2))
+                  body (if chk (app (ins 10 sr 0 0) (:code f)) (:code f))
+                  bl (count body)
+                  mm (+ lo (* (+ hi 1) 4294967296))
+                  failmode (and chk (:grp f) (:det f) (not= qt 2))
+                  code (app (app (app (ins 14 r 0 0) (ins (if (= qt 1) 16 15) r (+ bl 8) mm)) body)
+                            (ins (if failmode 21 17) r (- 0 (+ bl 4)) sr))
+                  g (->Fr code mn mx det false)]
+              (values (if (= qt 2) (atomic g) g) st3))))))))
+
+(defn- set-node Vec(Int) [ci: Int ranges: &Vec(Int)]
+  (app [1 ci (quot (count ranges) 2)] ranges))
+
+(defn- ci-mode Int [fl: Int]
+  (if (has? fl CASE-INSENSITIVE) (if (has? fl UNICODE-CASE) 2 1) 0))
+
+(defn- add-set Values(Int St) [st: St ci: Int ranges: &Vec(Int)]
+  (add-node st (set-node ci ranges)))
+
+(defn- add-prop Values(Int St) [st: St kind: Int arg: Int]
+  (add-node st [2 kind arg]))
+
+(defn- add-not Values(Int St) [st: St a: Int] (add-node st [5 a]))
+(defn- add-union Values(Int St) [st: St a: Int b: Int] (if (< a 0) (values b st) (add-node st [3 a b])))
+(defn- add-and Values(Int St) [st: St a: Int b: Int] (add-node st [4 a b]))
+
+(defn- gcm Int [names: Str]
+  (loop [i 0 m 0]
+    (if (>= i (count names)) m
+      (recur (+ i 2) (bit-or m (bit-shift-left 1 (u/gc-id-of-name (subs names i (+ i 2)))))))))
+
+(defn- posix-ascii Vec(Int) [name: &Str]
+  (case name
+    "ASCII" [0 127]
+    "Alnum" [48 57 65 90 97 122]
+    "Alpha" [65 90 97 122]
+    "Blank" [9 9 32 32]
+    "Cntrl" [0 31 127 127]
+    "Digit" [48 57]
+    "Graph" [33 126]
+    "Lower" [97 122]
+    "Print" [32 126]
+    "Punct" [33 47 58 64 91 96 123 126]
+    "Space" [9 13 32 32]
+    "Upper" [65 90]
+    "XDigit" [48 57 65 70 97 102]
+    "L1" [0 255]
+    "all" [0 0x10FFFF]
+    []))
+
+(defn- for-property Values(Int St) [name: &Str ci: Bool st: St]
+  (let [cased (gcm "LuLlLt")
+        g (if (= (count name) 2) (u/gc-id-of-name name) -1)]
+    (if (and ci (or (= name "Lu") (= name "Ll") (= name "Lt"))) (add-prop st 1 cased)
+      (if (>= g 0) (add-prop st 1 (bit-shift-left 1 g))
+        (if (and ci (or (= name "Lower") (= name "Upper"))) (add-set st 0 [65 90 97 122])
+          (let [r (posix-ascii name)]
+            (if (> (count r) 0) (add-set st 0 r)
+              (case name
+                "L" (add-prop st 1 u/MASK-L)
+                "M" (add-prop st 1 u/MASK-M)
+                "N" (add-prop st 1 u/MASK-N)
+                "Z" (add-prop st 1 u/MASK-Z)
+                "C" (add-prop st 1 u/MASK-C)
+                "P" (add-prop st 1 u/MASK-P)
+                "S" (add-prop st 1 u/MASK-S)
+                "LC" (add-prop st 1 cased)
+                "LD" (add-prop st 1 (bit-or u/MASK-L (gcm "Nd")))
+                "javaLowerCase" (add-prop st (if ci 16 4) 0)
+                "javaUpperCase" (add-prop st (if ci 16 5) 0)
+                "javaTitleCase" (if ci (add-prop st 16 0) (add-prop st 1 (gcm "Lt")))
+                "javaAlphabetic" (add-prop st 3 0)
+                "javaIdeographic" (add-prop st 8 0)
+                "javaDigit" (add-prop st 1 (gcm "Nd"))
+                "javaDefined" (add-prop st 1 (bit-xor (- (bit-shift-left 1 30) 1) 1))
+                "javaLetter" (add-prop st 1 u/MASK-L)
+                "javaLetterOrDigit" (add-prop st 1 (bit-or u/MASK-L (gcm "Nd")))
+                "javaJavaIdentifierStart" (add-prop st 17 0)
+                "javaJavaIdentifierPart" (add-prop st 18 0)
+                "javaUnicodeIdentifierStart" (add-prop st 19 0)
+                "javaUnicodeIdentifierPart" (add-prop st 20 0)
+                "javaIdentifierIgnorable" (add-prop st 21 0)
+                "javaSpaceChar" (add-prop st 1 u/MASK-Z)
+                "javaWhitespace" (add-prop st 7 0)
+                "javaISOControl" (add-set st 0 [0 31 127 159])
+                (values -1 st)))))))))
+
+(defn- upper-ascii Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [b (nth s i)] (recur (+ i 1) (str out (chr (if (and (>= b 97) (<= b 122)) (- b 32) b))))))))
+
+(defn- for-posix-name Values(Int St) [name: &Str ci: Bool st: St]
+  (case name
+    "ALPHA" (add-prop st 3 0)
+    "LOWER" (add-prop st (if ci 16 4) 0)
+    "UPPER" (add-prop st (if ci 16 5) 0)
+    "SPACE" (add-prop st 6 0)
+    "PUNCT" (add-prop st 1 u/MASK-P)
+    "XDIGIT" (add-prop st 9 0)
+    "ALNUM" (add-prop st 12 0)
+    "CNTRL" (add-prop st 1 (gcm "Cc"))
+    "DIGIT" (add-prop st 1 (gcm "Nd"))
+    "BLANK" (add-prop st 13 0)
+    "GRAPH" (add-prop st 14 0)
+    "PRINT" (add-prop st 15 0)
+    (values -1 st)))
+
+(defn- for-unicode-property Values(Int St) [name0: &Str ci: Bool st: St]
+  (let [name (upper-ascii name0)]
+    (case name
+      "ALPHABETIC" (add-prop st 3 0)
+      "ASSIGNED" (add-prop st 1 (bit-xor (- (bit-shift-left 1 30) 1) 1))
+      "CONTROL" (add-prop st 1 (gcm "Cc"))
+      "HEXDIGIT" (add-prop st 9 0)
+      "HEX_DIGIT" (add-prop st 9 0)
+      "IDEOGRAPHIC" (add-prop st 8 0)
+      "JOINCONTROL" (add-set st 0 [0x200C 0x200D])
+      "JOIN_CONTROL" (add-set st 0 [0x200C 0x200D])
+      "LETTER" (add-prop st 1 u/MASK-L)
+      "LOWERCASE" (add-prop st (if ci 16 4) 0)
+      "NONCHARACTERCODEPOINT" (add-prop st 10 0)
+      "NONCHARACTER_CODE_POINT" (add-prop st 10 0)
+      "TITLECASE" (if ci (add-prop st 16 0) (add-prop st 1 (gcm "Lt")))
+      "PUNCTUATION" (add-prop st 1 u/MASK-P)
+      "UPPERCASE" (add-prop st (if ci 16 5) 0)
+      "WHITESPACE" (add-prop st 6 0)
+      "WHITE_SPACE" (add-prop st 6 0)
+      "WORD" (add-prop st 11 0)
+      (for-posix-name name ci st))))
+
+(defn- for-script Values(Int St) [name: &Str st: St]
+  (let [id (u/script-of-name name)]
+    (if (< id 0) (values -1 st) (add-prop st 2 id))))
+
+(defn- for-block Values(Int St) [name: &Str st: St]
+  (let [[lo hi] (u/block-of-name name)]
+    (if (< lo 0) (values -1 st) (add-set st 0 [lo hi]))))
+
+(defn- lower-ascii Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [b (nth s i)] (recur (+ i 1) (str out (chr (if (and (>= b 65) (<= b 90)) (+ b 32) b))))))))
+
+(defn- family Values(Int St) [p: &Vec(Int) st0: St comp: Bool]
+  (let [fl (:fl st0)
+        ci (has? fl CASE-INSENSITIVE)
+        i0 (skipws p (:i st0) fl)
+        braced (= (at p i0) 123)
+        a (if braced (+ i0 1) (:i st0))
+        close (if braced (loop [j a] (let [c (at p j)] (if (or (< c 0) (= c 125)) j (recur (+ j 1))))) -1)]
+    (if (and braced (< (at p close) 0))
+      (values -1 (st-fail st0 "Unclosed character family" (count p)))
+      (if (and braced (= close a))
+        (values -1 (st-fail st0 "Empty character family" close))
+        (if (and (not braced) (< (at p a) 0))
+          (values -1 (st-fail st0 "Unknown character property name {}" a))
+          (let [b (if braced close (+ a 1))
+                after (+ b (if braced 1 0))
+                name (cps->str p a b)
+                eq (cs/index-of name "=")
+                st (st-i st0 after)
+                [node st2]
+                (if (>= eq 0)
+                  (let [key (lower-ascii (subs name 0 eq))
+                        val (subs name (+ eq 1) (count name))
+                        [nd s2] (case key
+                                  "sc" (for-script val st)
+                                  "script" (for-script val st)
+                                  "blk" (for-block val st)
+                                  "block" (for-block val st)
+                                  "gc" (for-property val ci st)
+                                  "general_category" (for-property val ci st)
+                                  (values -1 st))]
+                    (if (< nd 0)
+                      (values -1 (st-fail s2 (str "Unknown Unicode property {name=<" key ">, value=<" val ">}") (- after 1)))
+                      (values nd s2)))
+                  (let [[nd s2] (if (cs/starts-with? name "In")
+                                  (for-block (subs name 2 (count name)) st)
+                                  (if (cs/starts-with? name "Is")
+                                    (let [sn (subs name 2 (count name))
+                                          [n1 t1] (for-unicode-property sn ci st)]
+                                      (if (>= n1 0) (values n1 t1)
+                                        (let [[n2 t2] (for-property sn ci t1)]
+                                          (if (>= n2 0) (values n2 t2) (for-script sn t2)))))
+                                    (let [[n1 t1] (if (has? fl UNICODE-CHARACTER-CLASS)
+                                                    (for-posix-name (upper-ascii name) ci st)
+                                                    (values -1 st))]
+                                      (if (>= n1 0) (values n1 t1) (for-property name ci t1)))))]
+                    (if (< nd 0)
+                      (values -1 (st-fail s2 (str "Unknown character property name {" name "}") (- after 1)))
+                      (values nd s2))))]
+            (if (or (err? st2) (not comp)) (values node st2)
+              (add-not st2 node))))))))
+
+(defn- esc-err Values(Int Int St) [st: St msg: Str pos: Int] (values 0 0 (st-fail st msg pos)))
+
+(defn- class-esc Values(Int Int St) [st: St node-v: &Vec(Int) neg: Bool]
+  (let [[o st2] (add-node st node-v)]
+    (if neg (let [[o2 st3] (add-not st2 o)] (values 1 o2 st3)) (values 1 o st2))))
+
+(defn- prop-esc Values(Int Int St) [st: St kind: Int arg: Int neg: Bool]
+  (class-esc st [2 kind arg] neg))
+
+(defn- parse-escape Values(Int Int St) [p: &Vec(Int) st: St inclass: Bool isrange: Bool]
+  (let [i (:i st)
+        c (at p i)
+        fl (:fl st)
+        uc (has? fl UNICODE-CHARACTER-CLASS)
+        nx (+ i 1)]
+    (if (< c 0) (esc-err st "Unexpected internal error" i)
+      (case c
+        48
+        (let [n (at p nx)]
+          (if (and (>= n 48) (<= n 55))
+            (let [m (at p (+ nx 1))]
+              (if (and (>= m 48) (<= m 55))
+                (let [o (at p (+ nx 2))]
+                  (if (and (>= o 48) (<= o 55) (<= n 51))
+                    (values 0 (+ (* (- n 48) 64) (+ (* (- m 48) 8) (- o 48))) (st-i st (+ nx 3)))
+                    (values 0 (+ (* (- n 48) 8) (- m 48)) (st-i st (+ nx 2)))))
+                (values 0 (- n 48) (st-i st (+ nx 1)))))
+            (esc-err st "Illegal octal escape sequence" nx)))
+        120
+        (let [n (at p nx)]
+          (if (hex-digit? n)
+            (let [m (at p (+ nx 1))]
+              (if (hex-digit? m)
+                (values 0 (+ (* (hex-val n) 16) (hex-val m)) (st-i st (+ nx 2)))
+                (esc-err st "Illegal hexadecimal escape sequence" (+ nx 1))))
+            (if (and (= n 123) (hex-digit? (at p (+ nx 1))))
+              (let [[v j bad] (loop [j (+ nx 1) v 0]
+                                (let [d (at p j)]
+                                  (if (hex-digit? d)
+                                    (let [v2 (+ (* v 16) (hex-val d))]
+                                      (if (> v2 0x10FFFF) (values v2 j 1) (recur (+ j 1) v2)))
+                                    (values v j 0))))]
+                (if (= bad 1) (esc-err st "Hexadecimal codepoint is too big" j)
+                  (if (not= (at p j) 125) (esc-err st "Unclosed hexadecimal escape sequence" j)
+                    (values 0 v (st-i st (+ j 1))))))
+              (esc-err st "Illegal hexadecimal escape sequence" nx))))
+        117
+        (let [ok (and (hex-digit? (at p nx)) (hex-digit? (at p (+ nx 1)))
+                      (hex-digit? (at p (+ nx 2))) (hex-digit? (at p (+ nx 3))))]
+          (if (not ok) (esc-err st "Illegal Unicode escape sequence"
+                                (loop [k nx] (if (and (< k (+ nx 4)) (hex-digit? (at p k))) (recur (+ k 1)) k)))
+            (let [v (loop [k 0 v 0] (if (>= k 4) v (recur (+ k 1) (+ (* v 16) (hex-val (at p (+ nx k)))))))
+                  j (+ nx 4)]
+              (if (and (>= v 0xD800) (<= v 0xDBFF) (= (at p j) 92) (= (at p (+ j 1)) 117)
+                       (hex-digit? (at p (+ j 2))) (hex-digit? (at p (+ j 3)))
+                       (hex-digit? (at p (+ j 4))) (hex-digit? (at p (+ j 5))))
+                (let [v2 (loop [k 0 w 0] (if (>= k 4) w (recur (+ k 1) (+ (* w 16) (hex-val (at p (+ j (+ 2 k))))))))]
+                  (if (and (>= v2 0xDC00) (<= v2 0xDFFF))
+                    (values 0 (+ 0x10000 (+ (* (- v 0xD800) 1024) (- v2 0xDC00))) (st-i st (+ j 6)))
+                    (values 0 v (st-i st j))))
+                (values 0 v (st-i st j))))))
+        99
+        (if (< (at p nx) 0) (esc-err st "Illegal control escape sequence" i)
+          (values 0 (bit-xor (at p nx) 64) (st-i st (+ nx 1))))
+        97 (values 0 7 (st-i st nx))
+        101 (values 0 27 (st-i st nx))
+        102 (values 0 12 (st-i st nx))
+        110 (values 0 10 (st-i st nx))
+        114 (values 0 13 (st-i st nx))
+        116 (values 0 9 (st-i st nx))
+        100 (if uc (prop-esc (st-i st nx) 1 (u/gc-mask 48) false) (class-esc (st-i st nx) [1 0 1 48 57] false))
+        68 (if uc (prop-esc (st-i st nx) 1 (u/gc-mask 48) true) (class-esc (st-i st nx) [1 0 1 48 57] true))
+        119 (if uc (prop-esc (st-i st nx) 11 0 false) (class-esc (st-i st nx) [1 0 4 48 57 65 90 95 95 97 122] false))
+        87 (if uc (prop-esc (st-i st nx) 11 0 true) (class-esc (st-i st nx) [1 0 4 48 57 65 90 95 95 97 122] true))
+        115 (if uc (prop-esc (st-i st nx) 6 0 false) (class-esc (st-i st nx) [1 0 2 9 13 32 32] false))
+        83 (if uc (prop-esc (st-i st nx) 6 0 true) (class-esc (st-i st nx) [1 0 2 9 13 32 32] true))
+        104 (class-esc (st-i st nx) [1 0 9 9 9 32 32 0xA0 0xA0 0x1680 0x1680 0x180E 0x180E 0x2000 0x200A 0x202F 0x202F 0x205F 0x205F 0x3000 0x3000] false)
+        72 (class-esc (st-i st nx) [1 0 9 9 9 32 32 0xA0 0xA0 0x1680 0x1680 0x180E 0x180E 0x2000 0x200A 0x202F 0x202F 0x205F 0x205F 0x3000 0x3000] true)
+        118 (if isrange (values 0 11 (st-i st nx))
+              (class-esc (st-i st nx) [1 0 3 10 13 0x85 0x85 0x2028 0x2029] false))
+        86 (class-esc (st-i st nx) [1 0 3 10 13 0x85 0x85 0x2028 0x2029] true)
+        65 (if inclass (esc-err st "Illegal/unsupported escape sequence" i) (values 2 0 (st-i st nx)))
+        122 (if inclass (esc-err st "Illegal/unsupported escape sequence" i) (values 2 6 (st-i st nx)))
+        90 (if inclass (esc-err st "Illegal/unsupported escape sequence" i)
+             (values 2 (if (has? fl UNIX-LINES) 3 2) (st-i st nx)))
+        71 (if inclass (esc-err st "Illegal/unsupported escape sequence" i) (values 2 11 (st-i st nx)))
+        98 (if inclass (esc-err st "Illegal/unsupported escape sequence" i)
+             (if (and (= (at p nx) 123) (= (at p (+ nx 1)) 103)) (esc-err st "\\b{g} is not supported" i)
+               (values 2 (if uc 9 7) (st-i st nx))))
+        66 (if inclass (esc-err st "Illegal/unsupported escape sequence" i) (values 2 (if uc 10 8) (st-i st nx)))
+        82 (if inclass (esc-err st "Illegal/unsupported escape sequence" i) (values 4 0 (st-i st nx)))
+        88 (if inclass (esc-err st "Illegal/unsupported escape sequence" i) (esc-err st "\\X is not supported" i))
+        78 (esc-err st "\\N{name} is not supported" i)
+        107
+        (if inclass (esc-err st "Illegal/unsupported escape sequence" i)
+          (let [j (skipws p nx fl)]
+            (if (not= (at p j) 60) (esc-err st "\\k is not followed by '<' for named capturing group" j)
+              (let [a (skipws p (+ j 1) fl)
+                    c0 (at p a)]
+                (if (not (ascii-alpha? c0)) (esc-err st "capturing group name does not start with a Latin letter" a)
+                  (let [e (loop [k (+ a 1)] (if (ascii-alnum? (at p k)) (recur (+ k 1)) k))]
+                    (if (not= (at p e) 62) (esc-err st "named capturing group is missing trailing '>'" e)
+                      (let [name (cps->str p a e)
+                            g (get (:names st) name -1)]
+                        (if (< g 0) (esc-err st (str "named capturing group <" name "> does not exist") e)
+                          (values 3 g (st-i st (+ e 1))))))))))))
+        (if (and (>= c 49) (<= c 57))
+          (if inclass (esc-err st "Illegal/unsupported escape sequence" i)
+            (let [[g j] (loop [g (- c 48) j nx]
+                          (let [jj (skipws p j fl)
+                                d (at p jj)]
+                            (if (and (ascii-digit? d) (<= (+ (* g 10) (- d 48)) (:ng st)))
+                              (recur (+ (* g 10) (- d 48)) (+ jj 1))
+                              (values g j))))]
+              (values 3 g (st-i st j))))
+          (if (ascii-alpha? c)
+            (esc-err st "Illegal/unsupported escape sequence" i)
+            (values 0 c (st-i st nx))))))))
+
+(defn- class-range Values(Int St) [p: &Vec(Int) st: St]
+  (let [i (:i st)
+        fl (:fl st)
+        c (at p i)]
+    (if (= c 92)
+      (let [e (at p (+ i 1))]
+        (if (or (= e 112) (= e 80))
+          (family p (st-i st (+ i 2)) (= e 80))
+          (let [isr (= (at p (+ i 2)) 45)
+                [kind v st2] (parse-escape p (st-i st (+ i 1)) true isr)]
+            (if (err? st2) (values -1 st2)
+              (if (= kind 1) (values v st2)
+                (class-range-tail p st2 v))))))
+      (class-range-tail p (st-i st (+ i 1)) c))))
+
+(defn- class-range-tail Values(Int St) [p: &Vec(Int) st: St ch: Int]
+  (let [fl (:fl st)
+        j (skipws p (:i st) fl)]
+    (if (= (at p j) 45)
+      (let [endr (at p (+ j 1))]
+        (if (or (= endr 91) (= endr 93) (< endr 0))
+          (values (- -2 ch) (st-i st j))
+          (let [k (skipws p (+ j 1) fl)
+                m0 (at p k)
+                [m st2] (if (= m0 92)
+                          (let [[kind v s2] (parse-escape p (st-i st (+ k 1)) true true)]
+                            (if (err? s2) (values -1 s2) (values (if (= kind 0) v -1) s2)))
+                          (values m0 (st-i st (+ k 1))))]
+            (if (err? st2) (values -1 st2)
+              (if (< m ch) (values -1 (st-fail st2 "Illegal character range" (- (:i st2) 1)))
+                (add-set st2 (ci-mode fl) [ch m]))))))
+      (values (- -2 ch) (st-i st j)))))
+
+(defn- flush-bits Values(Int St) [st: St prev: Int bits: &Vec(Int)]
+  (let [[b st2] (add-set st (ci-mode (:fl st)) bits)]
+    (if (< prev 0) (values b st2) (add-union st2 prev b))))
+
+(defn- parse-class Values(Int St) [p: &Vec(Int) st0: St consume: Bool]
+  (let [start (:i st0)
+        fl (:fl st0)
+        i1 (skipws p (+ start 1) fl)
+        neg (and (= (at p i1) 94) (= (at p (- i1 1)) 91))
+        i2 (if neg (skipws p (+ i1 1) fl) i1)
+        empty: Vec(Int) []]
+    (loop [st (st-i st0 i2) prev -1 curr -1 bits empty has-bits false]
+      (if (err? st) (values -1 st)
+        (let [i (skipws p (:i st) fl)
+              ch (at p i)]
+          (if (< ch 0)
+            (values -1 (st-fail st "Unclosed character class" (- (count p) 1)))
+            (if (= ch 91)
+              (let [[nd st2] (parse-class p (st-i st i) true)]
+                (if (err? st2) (values -1 st2)
+                  (let [[pv st3] (add-union st2 prev nd)]
+                    (recur st3 pv nd bits has-bits))))
+              (if (and (= ch 93) (or (>= prev 0) has-bits))
+                (let [st2 (st-i st (if consume (+ i 1) i))
+                      [pv st3] (if has-bits (flush-bits st2 prev bits) (values prev st2))]
+                  (if neg (add-not st3 pv) (values pv st3)))
+                (if (and (= ch 38) (= (at p (skipws p (+ i 1) fl)) 38))
+                  (let [amp2 (skipws p (+ i 1) fl)
+                        [st2 prev2 curr2 right]
+                        (loop [st2 (st-i st (skipws p (+ amp2 1) fl)) prev2 prev curr2 curr right -1 hb has-bits]
+                          (if (err? st2) (values st2 prev2 curr2 right)
+                            (let [k (skipws p (:i st2) fl)
+                                  c2 (at p k)]
+                              (if (or (= c2 93) (= c2 38) (< c2 0))
+                                (if hb
+                                  (let [[pv s3] (flush-bits st2 prev2 bits)]
+                                    (values (st-i s3 k) pv (if (< prev2 0) pv curr2) right))
+                                  (values (st-i st2 k) prev2 curr2 right))
+                                (if (= c2 91)
+                                  (let [[nd s3] (parse-class p (st-i st2 k) true)]
+                                    (if (err? s3) (values s3 prev2 curr2 right)
+                                      (let [[r2 s4] (if (< right 0) (values nd s3) (add-union s3 right nd))]
+                                        (recur s4 prev2 curr2 r2 hb))))
+                                  (let [[pv s3 cv] (if hb
+                                                     (let [[pv s3] (flush-bits st2 prev2 bits)]
+                                                       (values pv s3 (if (< prev2 0) pv curr2)))
+                                                     (values prev2 st2 curr2))
+                                        [nd s4] (parse-class p (st-i s3 (- k 1)) false)]
+                                    (recur s4 pv cv nd false)))))))]
+                    (if (err? st2) (values -1 st2)
+                      (let [cur3 (if (>= right 0) right curr2)]
+                        (if (< prev2 0)
+                          (if (< right 0) (values -1 (st-fail st2 "Bad class syntax" (:i st2)))
+                            (recur st2 right cur3 empty false))
+                          (let [[pv st3] (add-and st2 prev2 cur3)]
+                            (recur st3 pv cur3 empty false))))))
+                  (let [[nd st2] (class-range p (st-i st i))]
+                    (if (err? st2) (values -1 st2)
+                      (if (<= nd -2)
+                        (let [c (- -2 nd)] (recur st2 prev curr (conj (conj bits c) c) true))
+                        (let [[pv st3] (if (< prev 0) (values nd st2) (add-union st2 prev nd))]
+                          (recur st3 pv nd bits has-bits))))))))))))))
+
+(defn- char-fr Fr [c: Int fl: Int]
+  (if (has? fl CASE-INSENSITIVE)
+    (if (has? fl UNICODE-CASE)
+      (let [up (u/upper-cp c) lo (u/lower-cp up)]
+        (if (not= up lo) (fr1 1 lo 2 0 1 1) (fr1 1 c 0 0 1 1)))
+      (if (ascii-alpha? c)
+        (fr1 1 (bit-or c 32) 1 0 1 1)
+        (fr1 1 c 0 0 1 1)))
+    (fr1 1 c 0 0 1 1)))
+
+(defn- assert-fr Fr [kind: Int] (fr1 7 kind 0 0 0 0))
+
+(defn- bref-fr Fr [g: Int fl: Int]
+  (fr1 8 g (if (has? fl CASE-INSENSITIVE) (if (has? fl UNICODE-CASE) 2 1) 0) 0 0 INV))
+
+(defn- parse-alt Values(Fr St) [p: &Vec(Int) st0: St]
+  (loop [st st0 acc: Vec(Fr) []]
+    (let [[f st1] (parse-seq p st)]
+      (if (err? st1) (values f st1)
+        (let [i (skipws p (:i st1) (:fl st1))
+              acc2 (conj acc f)]
+          (if (= (at p i) 124) (recur (st-i st1 (+ i 1)) acc2)
+            (values (alt-n acc2) (st-i st1 i))))))))
+
+(defn- alt-n Fr [fs: &Vec(Fr)]
+  (let [n (count fs)]
+    (if (= n 1) (nth fs 0)
+      (let [rest (loop [i (- n 2) acc: Vec(Int) [(count (:code (nth fs (- n 1))))]]
+                   (if (< i 0) acc
+                     (recur (- i 1) (conj acc (+ 8 (count (:code (nth fs i))) (nth acc (- (count acc) 1)))))))
+            code (loop [i 0 out: Vec(Int) []]
+                   (if (>= i (- n 1)) (app out (:code (nth fs i)))
+                     (let [f (nth fs i)
+                           la (count (:code f))
+                           after (nth rest (- n 2 i))
+                           o1 (app out (ins 4 4 (+ la 8) 0))
+                           o2 (app o1 (:code f))]
+                       (recur (+ i 1) (app o2 (ins 5 (+ after 4) 0 0))))))
+            [mn mx] (loop [i 1 mn (:mn (nth fs 0)) mx (:mx (nth fs 0))]
+                      (if (>= i n) (values mn mx)
+                        (let [f (nth fs i)]
+                          (recur (+ i 1) (if (< (:mn f) mn) (:mn f) mn)
+                                 (if (or (= mx INV) (= (:mx f) INV)) INV (if (> (:mx f) mx) (:mx f) mx))))))]
+        (->Fr code mn mx false false)))))
+
+(def MAX-NESTING 1000)
+
+(defn- nesting-overflow Int [p: &Vec(Int)]
+  (loop [i 0 d 0 cd 0]
+    (if (>= i (count p)) -1
+      (let [c (nth p i)]
+        (cond
+          (= c 92) (recur (+ i 2) d cd)
+          (> d MAX-NESTING) i
+          (> cd 0) (cond (= c 91) (recur (+ i 1) (+ d 1) (+ cd 1))
+                         (= c 93) (recur (+ i 1) (- d 1) (- cd 1))
+                         :else (recur (+ i 1) d cd))
+          (= c 91) (recur (+ i 1) (+ d 1) 1)
+          (= c 40) (recur (+ i 1) (+ d 1) 0)
+          (= c 41) (recur (+ i 1) (if (> d 0) (- d 1) 0) 0)
+          :else (recur (+ i 1) d cd))))))
+
+(defn- parse-seq Values(Fr St) [p: &Vec(Int) st0: St]
+  (loop [acc (no-fr) st st0]
+    (let [i (skipws p (:i st) (:fl st))
+          c (at p i)]
+      (if (or (< c 0) (= c 124) (= c 41))
+        (values acc (st-i st i))
+        (if (or (= c 63) (= c 42) (= c 43))
+          (values acc (st-fail st (str "Dangling meta character '" (u/encode c) "'") i))
+          (let [[f st2 kind] (parse-atom p (st-i st i))]
+            (if (err? st2) (values acc st2)
+              (if (= kind 1) (recur acc st2)
+                (let [[q st3] (parse-quant p st2 f)]
+                  (if (err? st3) (values acc st3)
+                    (recur (seq2 acc q) st3)))))))))))
+
+(defn- quant-type Values(Int Int) [p: &Vec(Int) i: Int fl: Int]
+  (let [j (skipws p i fl)
+        c (at p j)]
+    (if (= c 63) (values 1 (+ j 1))
+      (if (= c 43) (values 2 (+ j 1)) (values 0 j)))))
+
+(defn- parse-quant Values(Fr St) [p: &Vec(Int) st: St f: Fr]
+  (let [fl (:fl st)
+        i (skipws p (:i st) fl)
+        c (at p i)]
+    (if (= c 63)
+      (let [[qt j] (quant-type p (+ i 1) fl)] (values (opt f qt) (st-i st j)))
+      (if (or (= c 42) (= c 43))
+        (let [[qt j] (quant-type p (+ i 1) fl)] (star f (if (= c 42) 0 1) qt (st-i st j)))
+        (if (= c 123)
+          (let [d (at p (+ i 1))]
+            (if (not (ascii-digit? d))
+              (values f (st-fail st "Illegal repetition" (+ i 1)))
+              (let [[lo j over] (loop [j (+ i 1) v 0]
+                                  (let [jj (skipws p j fl) dd (at p jj)]
+                                    (if (ascii-digit? dd)
+                                      (let [v2 (+ (* v 10) (- dd 48))]
+                                        (if (> v2 2147483647) (values v2 jj 1) (recur (+ jj 1) v2)))
+                                      (values v jj 0))))]
+                (if (= over 1) (values f (st-fail st "Illegal repetition range" j))
+                  (let [[hi k over2 unb]
+                        (if (= (at p j) 44)
+                          (let [jj (skipws p (+ j 1) fl)]
+                            (if (= (at p jj) 125) (values -1 jj 0 1)
+                              (loop [k jj v 0]
+                                (let [kk (skipws p k fl) dd (at p kk)]
+                                  (if (ascii-digit? dd)
+                                    (let [v2 (+ (* v 10) (- dd 48))]
+                                      (if (> v2 2147483647) (values v2 kk 1 0) (recur (+ kk 1) v2)))
+                                    (values v kk 0 0))))))
+                          (values lo j 0 0))]
+                    (if (= over2 1) (values f (st-fail st "Illegal repetition range" k))
+                      (if (not= (at p k) 125) (values f (st-fail st "Unclosed counted closure" k))
+                        (if (and (= unb 0) (< hi lo)) (values f (st-fail st "Illegal repetition range" k))
+                          (let [[qt j2] (quant-type p (+ k 1) fl)]
+                            (counted f lo hi qt (st-i st j2)))))))))))
+          (values f st))))))
+
+(defn- parse-flags Values(Int Int) [p: &Vec(Int) i0: Int fl0: Int]
+  (loop [i (skipws p i0 fl0) fl fl0 on true]
+    (let [c (at p i)
+          bit (case c 105 CASE-INSENSITIVE 109 MULTILINE 115 DOTALL 100 UNIX-LINES
+                      117 UNICODE-CASE 99 CANON-EQ 120 COMMENTS
+                      85 (bit-or UNICODE-CHARACTER-CLASS UNICODE-CASE) 0)]
+      (if (and on (= c 45)) (recur (skipws p (+ i 1) fl) fl false)
+        (if (= bit 0) (values fl i)
+          (let [nf (if on (bit-or fl bit) (bit-and fl (bit-not bit)))]
+            (recur (skipws p (+ i 1) nf) nf on)))))))
+
+(defn- as-group Fr [f: Fr]
+  (let [mn (:mn f) mx (:mx f) det (:det f)] (->Fr (:code f) mn mx det true)))
+
+(defn- capture-fr Fr [g: Int r: Int f: Fr]
+  (let [mn (:mn f) mx (:mx f) det (:det f)]
+    (->Fr (app (app (ins 19 r 0 0) (:code f)) (ins 20 g r 0)) mn mx det true)))
+
+(defn- group-body Values(Fr St Int) [p: &Vec(Int) st0: St saved-fl: Int]
+  (let [[f st] (parse-alt p st0)]
+    (if (err? st) (values f st 0)
+      (let [i (skipws p (:i st) (:fl st))]
+        (if (not= (at p i) 41)
+          (values f (st-fail st "Unclosed group" (if (< (at p i) 0) (count p) i)) 0)
+          (values f (st-fl (st-i st (+ i 1)) saved-fl) i))))))
+
+(defn- parse-group Values(Fr St Int) [p: &Vec(Int) st: St]
+  (let [fl (:fl st)
+        i (:i st)
+        j (skipws p (+ i 1) fl)]
+    (if (= (at p j) 63)
+      (let [k (+ j 1)
+            c (at p k)]
+        (case c
+          58 (let [[f st2 x] (group-body p (st-i st (+ k 1)) fl)] (values (as-group f) st2 0))
+          61 (let [[f st2 x] (group-body p (st-i st (+ k 1)) fl)]
+               (values (wrap-look 0 f 0 0 0) st2 0))
+          33 (let [[f st2 x] (group-body p (st-i st (+ k 1)) fl)]
+               (values (wrap-look 1 f 0 0 0) st2 0))
+          62 (let [[f st2 x] (group-body p (st-i st (+ k 1)) fl)]
+               (values (atomic f) st2 0))
+          36 (values (no-fr) (st-fail st "Unknown group type" k) 0)
+          64 (values (no-fr) (st-fail st "Unknown group type" k) 0)
+          60 (let [m (skipws p (+ k 1) fl)
+                   d (at p m)]
+               (if (or (= d 61) (= d 33))
+                 (let [[f st2 rp] (group-body p (st-i st (+ m 1)) fl)]
+                   (if (err? st2) (values f st2 0)
+                     (if (= (:mx f) INV)
+                       (values f (st-fail st2 "Look-behind group does not have an obvious maximum length" (- rp 1)) 0)
+                       (let [mn (:mn f) mx (:mx f)]
+                         (values (wrap-look (if (= d 61) 2 3) f (+ mn (* mx 4294967296)) 0 0) st2 0)))))
+                 (if (not (ascii-alpha? d))
+                   (values (no-fr) (st-fail st "capturing group name does not start with a Latin letter" m) 0)
+                   (let [e (loop [q (+ m 1)] (if (ascii-alnum? (at p q)) (recur (+ q 1)) q))]
+                     (if (not= (at p e) 62)
+                       (values (no-fr) (st-fail st "named capturing group is missing trailing '>'" e) 0)
+                       (let [name (cps->str p m e)]
+                         (if (contains? (:names st) name)
+                           (values (no-fr) (st-fail st (str "Named capturing group <" name "> is already defined") e) 0)
+                           (let [[g st2] (st-new-group st)
+                                 [r st3] (st-new-reg (st-name st2 name g))
+                                 [f st4 x] (group-body p (st-i st3 (+ e 1)) fl)]
+                             (values (capture-fr g r f) st4 0)))))))))
+          (let [[nf e] (parse-flags p k fl)
+                c2 (at p e)]
+            (if (has? nf CANON-EQ)
+              (values (no-fr) (st-fail st "CANON_EQ is not supported" e) 0)
+              (if (= c2 41) (values (no-fr) (st-fl (st-i st (+ e 1)) nf) 1)
+                (if (not= c2 58)
+                  (values (no-fr) (st-fail st "Unknown inline modifier" e) 0)
+                  (let [[f st2 x] (group-body p (st-fl (st-i st (+ e 1)) nf) fl)]
+                    (values (as-group f) st2 0))))))))
+      (let [[g st2] (st-new-group st)
+            [r st2b] (st-new-reg st2)
+            [f st3 x] (group-body p (st-i st2b (+ i 1)) fl)]
+        (values (capture-fr g r f) st3 0)))))
+
+(defn- parse-atom Values(Fr St Int) [p: &Vec(Int) st: St]
+  (let [fl (:fl st)
+        i (:i st)
+        c (at p i)]
+    (case c
+      40 (parse-group p st)
+      91 (let [[nd st2] (parse-class p st true)]
+           (values (fr1 3 nd 0 0 1 1) st2 0))
+      94 (values (assert-fr (if (has? fl MULTILINE) (if (has? fl UNIX-LINES) 12 1) 0)) (st-i st (+ i 1)) 0)
+      36 (values (assert-fr (if (has? fl UNIX-LINES) (if (has? fl MULTILINE) 5 3) (if (has? fl MULTILINE) 4 2)))
+                 (st-i st (+ i 1)) 0)
+      46 (values (fr1 2 (if (has? fl DOTALL) 1 (if (has? fl UNIX-LINES) 2 0)) 0 0 1 1) (st-i st (+ i 1)) 0)
+      123 (values (no-fr) st 0)
+      92 (let [e (at p (+ i 1))]
+           (if (or (= e 112) (= e 80))
+             (let [[nd st2] (family p (st-i st (+ i 2)) (= e 80))]
+               (values (fr1 3 nd 0 0 1 1) st2 0))
+             (let [[kind v st2] (parse-escape p (st-i st (+ i 1)) false false)]
+               (if (err? st2) (values (no-fr) st2 0)
+                 (case kind
+                   0 (values (char-fr v fl) st2 0)
+                   1 (values (fr1 3 v 0 0 1 1) st2 0)
+                   2 (values (assert-fr v) st2 0)
+                   3 (values (bref-fr v fl) st2 0)
+                   (let [[nd st3] (add-set st2 0 [10 13 0x85 0x85 0x2028 0x2029])
+                         crlf (->Fr (app (ins 1 13 0 0) (ins 1 10 0 0)) 2 2 true false)]
+                     (values (alt2 crlf (fr1 3 nd 0 0 1 1)) st3 0)))))))
+      (values (char-fr c fl) (st-i st (+ i 1)) 0))))
+
+(defn- mark-atom Vec(Int) [fs: Vec(Int) prog: &Vec(Int) cls: &Vec(Int) pc: Int]
+  (let [op (nth prog pc) a (nth prog (+ pc 1)) mode (nth prog (+ pc 2))
+        hi (loop [b 128 v fs] (if (>= b 256) v (recur (+ b 1) (assoc v b 1))))]
+    (case op
+      1 (if (>= a 128) hi
+          (let [v (assoc fs a 1)
+                v2 (if (and (>= mode 1) (>= a 97) (<= a 122)) (assoc v (- a 32) 1) v)]
+            (if (= mode 2) (loop [b 128 w v2] (if (>= b 256) w (recur (+ b 1) (assoc w b 1)))) v2)))
+      3 (loop [b 0 v hi] (if (>= b 128) v (recur (+ b 1) (if (cls-match? cls a b) (assoc v b 1) v))))
+      (loop [b 0 v hi] (if (>= b 128) v (recur (+ b 1) (assoc v b 1)))))))
+
+(defn- first-set Vec(Int) [prog: &Vec(Int) cls: &Vec(Int)]
+  (let [n (quot (count prog) 4)
+        none: Vec(Int) []]
+    (loop [work: Vec(Int) [4] seen (repeat n 0) fs (repeat 256 0)]
+      (if (= (count work) 0) fs
+        (let [pc (nth work (- (count work) 1))
+              rest (pop work)]
+          (if (= (nth seen (quot pc 4)) 1) (recur rest seen fs)
+            (let [seen2 (assoc seen (quot pc 4) 1)
+                  op (nth prog pc) a (nth prog (+ pc 1)) b (nth prog (+ pc 2))]
+              (case op
+                1 (recur rest seen2 (mark-atom fs prog cls pc))
+                2 (recur rest seen2 (mark-atom fs prog cls pc))
+                3 (recur rest seen2 (mark-atom fs prog cls pc))
+                4 (recur (conj (conj rest (+ pc a)) (+ pc b)) seen2 fs)
+                5 (recur (conj rest (+ pc a)) seen2 fs)
+                6 (recur (conj rest (+ pc 4)) seen2 fs)
+                7 (recur (conj rest (+ pc 4)) seen2 fs)
+                9 (if (= a 4) none (recur (conj rest (+ pc (+ 4 b))) seen2 fs))
+                10 (recur (conj rest (+ pc 4)) seen2 fs)
+                11 (recur (conj (conj rest (+ pc 4)) (+ pc b)) seen2 fs)
+                22 (recur (conj rest (+ pc 4)) seen2 fs)
+                14 (recur (conj rest (+ pc 4)) seen2 fs)
+                15 (recur (conj (conj rest (+ pc 4)) (+ pc b)) seen2 fs)
+                16 (recur (conj (conj rest (+ pc 4)) (+ pc b)) seen2 fs)
+                17 (let [h (+ pc b)] (recur (conj (conj rest h) (+ h (nth prog (+ h 2)))) seen2 fs))
+                21 (let [h (+ pc b)] (recur (conj (conj rest h) (+ h (nth prog (+ h 2)))) seen2 fs))
+                18 (let [fs2 (mark-atom fs prog cls (+ pc 4))]
+                     (recur (if (= a 0) (conj rest (+ pc 8)) rest) seen2 fs2))
+                19 (recur (conj rest (+ pc 4)) seen2 fs)
+                20 (recur (conj rest (+ pc 4)) seen2 fs)
+                none))))))))
+
+(defn- syntax-error Str [desc: Str pattern: &Str index: Int]
+  (let [head (if (>= index 0) (str desc " near index " index) desc)
+        n (u8/codepoint-count pattern)]
+    (if (and (>= index 0) (< index n))
+      (str head "\n" pattern "\n" (loop [k 0 sp ""] (if (>= k index) sp (recur (+ k 1) (str sp " ")))) "^")
+      (str head "\n" pattern))))
+
+(defn- empty-pattern Pattern [src: &Str fl: Int]
+  (let [v: Vec(Int) [] w: Vec(Int) [] m: Map(Str Int) {}]
+    (->Pattern (subs src 0 (count src)) fl v w 0 0 m DEFAULT-LIMIT (let [z: Vec(Int) []] z) false)))
+
+(defn compile Values(Pattern Str) [pattern: &Str flags: Int]
+  (if (has? flags CANON-EQ)
+    (values (empty-pattern pattern flags) "CANON_EQ is not supported")
+    (let [raw (u/cps pattern)
+          p (if (has? flags LITERAL) (literal-cps raw) (remove-qe raw))
+          fl0 (if (has? flags LITERAL) (bit-and flags (bit-not COMMENTS)) flags)
+          fl (if (has? fl0 UNICODE-CHARACTER-CLASS) (bit-or fl0 UNICODE-CASE) fl0)
+          names: Map(Str Int) {}
+          pool: Vec(Int) []
+          deep (if (has? flags LITERAL) -1 (nesting-overflow p))
+          [f st] (if (>= deep 0) (values (no-fr) (->St 0 fl 0 0 names pool (str "Pattern is nested too deeply (the limit is " MAX-NESTING " levels)") deep))
+                   (parse-alt p (->St 0 fl 0 0 names pool "" -1)))
+          i (:i st)]
+      (if (err? st)
+        (values (empty-pattern pattern flags) (syntax-error (:err st) pattern (:ep st)))
+        (if (< i (count p))
+          (values (empty-pattern pattern flags) (syntax-error "Unmatched closing ')'" pattern (- i 1)))
+          (let [prog (app (app (ins 6 0 0 0) (:code f)) (app (ins 6 1 0 0) (ins 0 0 0 0)))
+                op1 (nth prog 4)
+                anchored (and (= op1 7) (= (nth prog 5) 0))
+                cls (:cls st)
+                fset (first-set prog cls)]
+            (values (->Pattern (subs pattern 0 (count pattern)) flags prog cls (:ng st) (:nr st)
+                               (:names st) DEFAULT-LIMIT fset anchored)
+                    "")))))))
+
+(defn with-limit Pattern [re: Pattern limit: Int]
+  (->Pattern (:source re) (:flags re) (:prog re) (:cls re) (:ngroups re)
+             (:nregs re) (:names re) limit (:fset re) (:anchored re)))
+
+(defn group-count Int [re: &Pattern] (:ngroups re))
+(defn source Str [re: &Pattern] (:source re))
+(defn flags Int [re: &Pattern] (:flags re))
+
+(defn- line-term? Bool [c: Int] (or (= c 10) (= c 13) (= c 0x85) (= c 0x2028) (= c 0x2029)))
+
+(defn- in-set? Bool [cls: &Vec(Int) o: Int n: Int c: Int]
+  (loop [k 0]
+    (if (>= k n) false
+      (let [j (+ o (* k 2))]
+        (if (and (>= c (nth cls j)) (<= c (nth cls (+ j 1)))) true (recur (+ k 1)))))))
+
+(defn- ascii-lower Int [c: Int] (if (and (>= c 65) (<= c 90)) (+ c 32) c))
+(defn- ascii-upper Int [c: Int] (if (and (>= c 97) (<= c 122)) (- c 32) c))
+
+(defn- uword? Bool [c: Int]
+  (or (u/alphabetic? c)
+      (not= (bit-and (u/gc-mask c) (bit-or u/MASK-M (bit-or (bit-shift-left 1 u/GC-ND) (bit-shift-left 1 u/GC-PC)))) 0)
+      (= c 0x200C) (= c 0x200D)))
+
+(defn- prop? Bool [kind: Int arg: Int c: Int]
+  (case kind
+    1 (not= (bit-and arg (u/gc-mask c)) 0)
+    2 (= (u/script-id c) arg)
+    3 (u/alphabetic? c)
+    4 (u/lower-case? c)
+    5 (u/upper-case? c)
+    6 (or (not= (bit-and (u/gc-mask c) u/MASK-Z) 0) (and (>= c 9) (<= c 13)) (= c 0x85))
+    7 (u/java-whitespace? c)
+    8 (u/ideographic? c)
+    9 (or (u/java-digit? c) (and (>= c 65) (<= c 70)) (and (>= c 97) (<= c 102))
+          (and (>= c 0xFF21) (<= c 0xFF26)) (and (>= c 0xFF41) (<= c 0xFF46)))
+    10 (or (= (bit-and c 0xFFFE) 0xFFFE) (and (>= c 0xFDD0) (<= c 0xFDEF)))
+    11 (uword? c)
+    12 (or (u/alphabetic? c) (u/java-digit? c))
+    13 (or (= (u/gc-id c) u/GC-ZS) (= c 9))
+    14 (= (bit-and (u/gc-mask c) (bit-or u/MASK-Z (bit-or (bit-shift-left 1 u/GC-CC) (bit-or (bit-shift-left 1 u/GC-CS) 1)))) 0)
+    15 (and (or (prop? 14 0 c) (prop? 13 0 c)) (not= (u/gc-id c) u/GC-CC))
+    16 (u/cased? c)
+    17 (or (u/letter? c) (not= (bit-and (u/gc-mask c) (gcm "NlScPc")) 0))
+    18 (or (prop? 17 0 c) (not= (bit-and (u/gc-mask c) (gcm "NdMnMc")) 0) (prop? 21 0 c))
+    19 (or (u/letter? c) (= (u/gc-id c) u/GC-NL) (= c 0x2118) (= c 0x212E) (= c 0x309B) (= c 0x309C)
+           (= c 0x1885) (= c 0x1886))
+    20 (or (prop? 19 0 c) (not= (bit-and (u/gc-mask c) (gcm "MnMcNdPc")) 0) (prop? 21 0 c))
+    21 (or (and (>= c 0) (<= c 8)) (and (>= c 14) (<= c 27)) (and (>= c 127) (<= c 159)) (= (u/gc-id c) u/GC-CF))
+    false))
+
+(defn- cls-match? Bool [cls: &Vec(Int) o: Int c: Int]
+  (case (nth cls o)
+    1 (let [ci (nth cls (+ o 1))
+            n (nth cls (+ o 2))
+            r (+ o 3)]
+        (if (in-set? cls r n c) true
+          (if (= ci 1)
+            (and (< c 128) (or (in-set? cls r n (ascii-upper c)) (in-set? cls r n (ascii-lower c))))
+            (if (= ci 2)
+              (let [up (u/upper-cp c)] (or (in-set? cls r n up) (in-set? cls r n (u/lower-cp up))))
+              false))))
+    2 (prop? (nth cls (+ o 1)) (nth cls (+ o 2)) c)
+    3 (or (cls-match? cls (nth cls (+ o 1)) c) (cls-match? cls (nth cls (+ o 2)) c))
+    4 (and (cls-match? cls (nth cls (+ o 1)) c) (cls-match? cls (nth cls (+ o 2)) c))
+    5 (not (cls-match? cls (nth cls (+ o 1)) c))
+    false))
+
+(defn- char-ok? Bool [a: Int mode: Int c: Int]
+  (if (= c a) true
+    (if (= mode 1) (= c (- a 32))
+      (if (= mode 2) (= (u/fold-cp c) a) false))))
+
+(defn- atom-step Int [prog: &Vec(Int) cls: &Vec(Int) s: &Str pc: Int pos: Int n: Int]
+  (if (>= pos n) -1
+    (let [b0 (nth s pos)
+          [c np] (if (< b0 128) (values b0 (+ pos 1)) (u/decode-at s pos))
+          op (nth prog pc)
+          a (nth prog (+ pc 1))
+          ok (case op
+               1 (char-ok? a (nth prog (+ pc 2)) c)
+               2 (if (= a 1) true (if (= a 2) (not= c 10) (not (line-term? c))))
+               3 (cls-match? cls a c)
+               false)]
+      (if ok np -1))))
+
+(defn- word-at? Bool [s: &Str p: Int uword: Bool]
+  (let [c (u/cp-at s p)]
+    (if (if uword (uword? c) (or (= c 95) (u/letter-or-digit? c))) true
+      (if (not= (u/gc-id c) u/GC-MN) false
+        (loop [x p]
+          (let [d (u/cp-at s x)]
+            (if (u/letter-or-digit? d) true
+              (if (and (= (u/gc-id d) u/GC-MN) (> x 0)) (recur (u/prev-index s x)) false))))))))
+
+(defn- boundary? Bool [s: &Str pos: Int n: Int uword: Bool]
+  (let [left (if (> pos 0) (word-at? s (u/prev-index s pos) uword) false)
+        right (if (< pos n) (word-at? s pos uword) false)]
+    (not= left right)))
+
+(defn- assert-ok? Bool [kind: Int s: &Str pos: Int n: Int gpos: Int]
+  (case kind
+    0 (= pos 0)
+    1 (if (= pos n) false
+        (if (= pos 0) true
+          (let [c (u/cp-at s (u/prev-index s pos))]
+            (and (line-term? c) (not (and (= c 13) (= (nth s pos) 10)))))))
+    12 (and (not= pos n) (or (= pos 0) (= (nth s (- pos 1)) 10)))
+    2 (if (= pos n) true
+        (let [[c j] (u/decode-at s pos)]
+          (if (= j n)
+            (if (= c 10) (not (and (> pos 0) (= (nth s (- pos 1)) 13)))
+              (or (= c 13) (= c 0x85) (= c 0x2028) (= c 0x2029)))
+            (and (= c 13) (= (+ j 1) n) (= (nth s j) 10)))))
+    3 (or (= pos n) (and (= pos (- n 1)) (= (nth s pos) 10)))
+    4 (if (= pos n) true
+        (let [c (u/cp-at s pos)]
+          (if (= c 10) (not (and (> pos 0) (= (nth s (- pos 1)) 13)))
+            (or (= c 13) (= c 0x85) (= c 0x2028) (= c 0x2029)))))
+    5 (or (= pos n) (= (nth s pos) 10))
+    6 (= pos n)
+    7 (boundary? s pos n false)
+    8 (not (boundary? s pos n false))
+    9 (boundary? s pos n true)
+    10 (not (boundary? s pos n true))
+    11 (= pos gpos)
+    false))
+
+(defn- bref-step Int [s: &Str caps: &Vec(Int) g: Int mode: Int pos: Int n: Int]
+  (if (>= (+ (* 2 g) 1) (count caps)) -1
+    (let [gs (nth caps (* 2 g))
+          ge (nth caps (+ (* 2 g) 1))]
+      (if (or (< gs 0) (< ge 0)) -1
+        (if (= mode 0)
+          (let [len (- ge gs)]
+            (if (> (+ pos len) n) -1
+              (loop [k 0]
+                (if (>= k len) (+ pos len)
+                  (if (= (nth s (+ gs k)) (nth s (+ pos k))) (recur (+ k 1)) -1)))))
+          (loop [x pos j gs]
+            (if (>= j ge) x
+              (if (>= x n) -1
+                (let [[c1 x2] (u/decode-at s x)
+                      [c2 j2] (u/decode-at s j)
+                      ok (if (= c1 c2) true
+                           (if (= mode 2)
+                             (let [u1 (u/upper-cp c1) u2 (u/upper-cp c2)]
+                               (or (= u1 u2) (= (u/lower-cp u1) (u/lower-cp u2))))
+                             (= (ascii-lower c1) (ascii-lower c2))))]
+                  (if ok (recur x2 j2) -1))))))))))
+
+(defn- push Vec(Int) [stk: Vec(Int) sp: Int k: Int a: Int b: Int c: Int]
+  (if (< sp (count stk))
+    (assoc (assoc (assoc (assoc stk sp k) (+ sp 1) a) (+ sp 2) b) (+ sp 3) c)
+    (conj (conj (conj (conj stk k) a) b) c)))
+
+(defn- merge-caps Values(Vec(Int) Vec(Int) Int) [old: Vec(Int) new: Vec(Int) stk: Vec(Int) sp: Int]
+  (loop [k 0 st stk p sp]
+    (if (>= k (count old)) (values new st p)
+      (if (= (nth old k) (nth new k)) (recur (+ k 1) st p)
+        (recur (+ k 1) (push st p 1 k (nth old k) 0) (+ p 4))))))
+
+(defn- back-cps Int [s: &Str pos: Int k: Int]
+  (loop [p pos j 0] (if (>= j k) p (if (<= p 0) -1 (recur (u/prev-index s p) (+ j 1))))))
+
+(defn- undo-close Values(Vec(Int) Int) [prog: &Vec(Int) pc: Int caps: Vec(Int) stk: &Vec(Int) sp: Int]
+  (if (and (>= pc 4) (= (nth prog (- pc 4)) 20) (>= sp 8))
+    (let [k1 (- sp 4) k2 (- sp 8)]
+      (values (assoc (assoc caps (nth stk (+ k1 1)) (nth stk (+ k1 2))) (nth stk (+ k2 1)) (nth stk (+ k2 2)))
+              k2))
+    (values caps sp)))
+
+(def MAX-STACK 1000000)
+
+(defn- run Values(Int Vec(Int) Int) [re: &Pattern s: &Str pc0: Int pos0: Int endreq: Int
+                                     caps0: Vec(Int) gpos: Int budget: Int]
+  (let [prog (:prog re)
+        cls (:cls re)
+        n (count s)
+        regs0 (repeat (+ (:nregs re) 1) -1)
+        stk0: Vec(Int) []]
+    (loop [pc pc0 pos pos0 caps caps0 regs regs0 stk stk0 sp 0 steps 0]
+      (cond
+       (> steps budget) (values -2 caps steps)
+       (> sp (* 4 MAX-STACK)) (values -3 caps steps)
+       :else
+        (if (< pc 0)
+          (if (= sp 0) (values -1 caps steps)
+            (let [k (- sp 4)
+                  kind (nth stk k)
+                  a (nth stk (+ k 1))
+                  b (nth stk (+ k 2))]
+              (if (= kind 0) (recur a b caps regs stk k (+ steps 1))
+                (if (= kind 1) (recur -1 pos (assoc caps a b) regs stk k steps)
+                  (if (= kind 2) (recur -1 pos caps (assoc regs a b) stk k steps)
+                    (let [np (u/prev-index s (nth stk (+ k 3)))]
+                      (if (> np b)
+                        (recur a np caps regs (assoc stk (+ k 3) np) sp (+ steps 1))
+                        (recur a np caps regs stk k (+ steps 1)))))))))
+          (let [op (nth prog pc)
+                a (nth prog (+ pc 1))
+                b (nth prog (+ pc 2))
+                c (nth prog (+ pc 3))
+                st1 (+ steps 1)]
+            (case op
+              0 (if (and (>= endreq 0) (not= pos endreq))
+                  (recur -1 pos caps regs stk sp st1)
+                  (values pos caps st1))
+              1 (let [np (atom-step prog cls s pc pos n)]
+                  (recur (if (< np 0) -1 (+ pc 4)) (if (< np 0) pos np) caps regs stk sp st1))
+              2 (let [np (atom-step prog cls s pc pos n)]
+                  (recur (if (< np 0) -1 (+ pc 4)) (if (< np 0) pos np) caps regs stk sp st1))
+              3 (let [np (atom-step prog cls s pc pos n)]
+                  (recur (if (< np 0) -1 (+ pc 4)) (if (< np 0) pos np) caps regs stk sp st1))
+              4 (recur (+ pc a) pos caps regs (push stk sp 0 (+ pc b) pos 0) (+ sp 4) st1)
+              5 (recur (+ pc a) pos caps regs stk sp st1)
+              6 (let [old (nth caps a)]
+                  (recur (+ pc 4) pos (assoc caps a pos) regs (push stk sp 1 a old 0) (+ sp 4) st1))
+              7 (recur (if (assert-ok? a s pos n gpos) (+ pc 4) -1) pos caps regs stk sp st1)
+              8 (let [np (bref-step s caps a b pos n)]
+                  (recur (if (< np 0) -1 (+ pc 4)) (if (< np 0) pos np) caps regs stk sp st1))
+              9 (let [after (+ pc (+ 4 b))]
+                  (if (or (= a 0) (= a 1) (= a 4))
+                    (let [[r caps2 used] (run re s (+ pc 4) pos -1 (copy caps) gpos (- budget st1))
+                          steps2 (+ st1 used)]
+                      (if (<= r -2) (values r caps steps2)
+                        (if (= a 1)
+                          (recur (if (>= r 0) -1 after) pos caps regs stk sp steps2)
+                          (if (< r 0) (recur -1 pos caps regs stk sp steps2)
+                            (let [[caps3 stk2 sp2] (merge-caps caps caps2 stk sp)]
+                              (recur after (if (= a 4) r pos) caps3 regs stk2 sp2 steps2))))))
+                    (let [mn (bit-and c 4294967295)
+                          mx0 (bit-shift-right c 32)
+                          mx (if (>= mx0 0) mx0
+                               (let [ci (u/cp-index-of-byte-index s pos)]
+                                 (if (>= ci (+ 2147483648 mx0)) ci -1)))
+                          [r caps2 steps2]
+                          (loop [k mn p0 (back-cps s pos mn) stp st1]
+                            (if (or (> k mx) (< p0 0)) (values -1 caps stp)
+                              (let [[r2 c2 used] (run re s (+ pc 4) p0 pos (copy caps) gpos (- budget stp))]
+                                (if (<= r2 -2) (values r2 c2 (+ stp used))
+                                  (if (>= r2 0) (values r2 c2 (+ stp used))
+                                    (recur (+ k 1) (if (<= p0 0) -1 (u/prev-index s p0)) (+ stp used)))))))]
+                      (if (<= r -2) (values r caps steps2)
+                        (if (= a 3)
+                          (recur (if (>= r 0) -1 after) pos caps regs stk sp steps2)
+                          (if (< r 0) (recur -1 pos caps regs stk sp steps2)
+                            (let [[caps3 stk2 sp2] (merge-caps caps caps2 stk sp)]
+                              (recur after pos caps3 regs stk2 sp2 steps2))))))))
+              10 (let [old (nth regs a)]
+                   (recur (+ pc 4) pos caps (assoc regs a pos) (push stk sp 2 a old 0) (+ sp 4) st1))
+              11 (recur (if (= pos (nth regs a)) (+ pc b) (+ pc 4)) pos caps regs stk sp st1)
+              22 (if (not= pos (nth regs a)) (recur (+ pc 4) pos caps regs stk sp st1)
+                   (let [[caps2 sp2] (undo-close prog pc caps stk sp)]
+                     (recur (+ pc b) pos caps2 regs stk sp2 st1)))
+              19 (let [old (nth regs a)]
+                   (recur (+ pc 4) pos caps (assoc regs a pos) (push stk sp 2 a old 0) (+ sp 4) st1))
+              20 (let [s0 (* 2 a)
+                       o0 (nth caps s0)
+                       o1 (nth caps (+ s0 1))
+                       stk2 (push (push stk sp 1 s0 o0 0) (+ sp 4) 1 (+ s0 1) o1 0)]
+                   (recur (+ pc 4) pos (assoc (assoc caps s0 (nth regs b)) (+ s0 1) pos) regs stk2 (+ sp 8) st1))
+              21 (let [cnt (nth regs a)
+                       head (+ pc b)
+                       lo (bit-and (nth prog (+ head 3)) 4294967295)
+                       empty-iter (and (>= c 0) (= pos (nth regs c)) (>= cnt lo))]
+                   (if empty-iter
+                     (let [[caps2 sp2] (undo-close prog pc caps stk sp)]
+                       (recur (+ head (nth prog (+ head 2))) pos caps2 regs stk sp2 st1))
+                     (recur head pos caps (assoc regs a (+ cnt 1)) (push stk sp 2 a cnt 0) (+ sp 4) st1)))
+              14 (let [old (nth regs a)]
+                   (recur (+ pc 4) pos caps (assoc regs a 0) (push stk sp 2 a old 0) (+ sp 4) st1))
+              15 (let [cnt (nth regs a)
+                       lo (bit-and c 4294967295)
+                       hi (- (bit-shift-right c 32) 1)]
+                   (if (< cnt lo) (recur (+ pc 4) pos caps regs stk sp st1)
+                     (if (and (>= hi 0) (>= cnt hi)) (recur (+ pc b) pos caps regs stk sp st1)
+                       (recur (+ pc 4) pos caps regs (push stk sp 0 (+ pc b) pos 0) (+ sp 4) st1))))
+              16 (let [cnt (nth regs a)
+                       lo (bit-and c 4294967295)
+                       hi (- (bit-shift-right c 32) 1)]
+                   (if (< cnt lo) (recur (+ pc 4) pos caps regs stk sp st1)
+                     (if (and (>= hi 0) (>= cnt hi)) (recur (+ pc b) pos caps regs stk sp st1)
+                       (recur (+ pc b) pos caps regs (push stk sp 0 (+ pc 4) pos 0) (+ sp 4) st1))))
+              17 (let [cnt (nth regs a)
+                       head (+ pc b)
+                       exit (+ head (nth prog (+ head 2)))
+                       empty-iter (and (>= c 0) (= pos (nth regs c)))]
+                   (recur (if empty-iter exit head) pos caps (assoc regs a (+ cnt 1))
+                          (push stk sp 2 a cnt 0) (+ sp 4) st1))
+              18 (let [apc (+ pc 4)
+                       [endp k minp] (loop [p pos k 0 minp (if (= a 0) pos -1)]
+                                       (if (and (>= b 0) (>= k b)) (values p k minp)
+                                         (let [np (atom-step prog cls s apc p n)]
+                                           (if (< np 0) (values p k minp)
+                                             (recur np (+ k 1) (if (= (+ k 1) a) np minp))))))]
+                   (if (< k a) (recur -1 pos caps regs stk sp (+ st1 k))
+                     (if (or (= c 1) (= k a))
+                       (recur (+ pc 8) endp caps regs stk sp (+ st1 k))
+                       (recur (+ pc 8) endp caps regs (push stk sp 3 (+ pc 8) minp endp) (+ sp 4) (+ st1 k)))))
+              (recur -1 pos caps regs stk sp st1))))))))
+
+(defn- fresh-caps Vec(Int) [re: &Pattern] (repeat (* 2 (+ (:ngroups re) 1)) -1))
+
+(defn- budget-for Int [re: &Pattern n: Int start: Int]
+  (+ (:limit re) (* 64 (- n start))))
+
+(defn- limit-error Str [re: &Pattern]
+  (str "regex step limit exceeded (" (:limit re) " steps + 64 per input byte) for pattern: "
+       (:source re)))
+
+(defn- stack-error Str [re: &Pattern]
+  (str "regex backtracking stack limit exceeded (" MAX-STACK " entries) for pattern: " (:source re)))
+
+(defn- run-error Str [re: &Pattern r: Int] (if (= r -2) (limit-error re) (stack-error re)))
+
+(defn- exec Values(Vec(Int) Str) [re: &Pattern s: &Str start: Int gpos: Int mode: Int]
+  (let [[caps e used] (exec-b re s start gpos mode (budget-for re (count s) start))] (values caps e)))
+
+(defn- exec-b Values(Vec(Int) Str Int) [re: &Pattern s: &Str start: Int gpos: Int mode: Int budget: Int]
+  (let [n (count s)
+        fset (:fset re)
+        filt (> (count fset) 0)
+        none: Vec(Int) []]
+    (if (or (< start 0) (> start n)) (values none "" 0)
+      (if (> mode 0)
+        (let [[r caps used] (run re s 0 start (if (= mode 2) n -1) (fresh-caps re) gpos budget)]
+          (if (<= r -2) (values none (run-error re r) used)
+            (if (< r 0) (values none "" used) (values caps "" used))))
+        (loop [pos start spent 0]
+          (let [p (if filt (loop [q pos] (if (and (< q n) (= (nth fset (nth s q)) 0)) (recur (+ q 1)) q)) pos)]
+            (if (or (> p n) (and filt (>= p n)) (and (:anchored re) (> p 0)))
+              (values none "" spent)
+              (let [[r caps used] (run re s 0 p -1 (fresh-caps re) gpos (- budget spent))]
+                (if (<= r -2) (values none (run-error re r) (+ spent used))
+                  (if (>= r 0) (values caps "" (+ spent (+ used 1)))
+                    (if (>= p n) (values none "" (+ spent used))
+                      (recur (if (< (nth s p) 128) (+ p 1) (u/next-index s p)) (+ spent (+ used 1))))))))))))))
+
+(defn- mk-match Match [re: &Pattern caps: Vec(Int)] (->Match caps (:names re)))
+
+(defn search Values(Vec(Match) Str) [re: &Pattern s: &Str start: Int]
+  (let [[caps e] (exec re s start start 0)
+        none: Vec(Match) []]
+    (if (= (count caps) 0) (values none e) (values [(mk-match re caps)] e))))
+
+(defn search-within Values(Vec(Match) Str Int) [re: &Pattern s: &Str start: Int budget: Int]
+  (let [[caps e used] (exec-b re s start start 0 budget)
+        none: Vec(Match) []]
+    (if (= (count caps) 0) (values none e used) (values [(mk-match re caps)] e used))))
+
+(defn match-full Values(Vec(Match) Str) [re: &Pattern s: &Str]
+  (let [[caps e] (exec re s 0 0 2)
+        none: Vec(Match) []]
+    (if (= (count caps) 0) (values none e) (values [(mk-match re caps)] e))))
+
+(defn matches? Values(Bool Str) [re: &Pattern s: &Str]
+  (let [[caps e] (exec re s 0 0 2)] (values (> (count caps) 0) e)))
+
+(defn looking-at Values(Vec(Match) Str) [re: &Pattern s: &Str]
+  (let [[caps e] (exec re s 0 0 1)
+        none: Vec(Match) []]
+    (if (= (count caps) 0) (values none e) (values [(mk-match re caps)] e))))
+
+(defn looking-at? Values(Bool Str) [re: &Pattern s: &Str]
+  (let [[caps e] (exec re s 0 0 1)] (values (> (count caps) 0) e)))
+
+(defn- next-from Int [s: &Str caps: &Vec(Int)]
+  (let [a (nth caps 0) b (nth caps 1)]
+    (if (not= a b) b
+      (if (>= b (count s)) (+ b 1) (u/next-index s b)))))
+
+(defn find-all Values(Vec(Match) Str) [re: &Pattern s: &Str]
+  (let [n (count s)
+        budget (budget-for re n 0)]
+    (loop [from 0 gpos 0 out: Vec(Match) [] spent 0]
+      (if (> from n) (values out "")
+        (let [[caps e used] (exec-b re s from gpos 0 (- budget spent))]
+          (if (not= e "") (values out e)
+            (if (= (count caps) 0) (values out "")
+              (let [nf (next-from s caps) g (nth caps 1)]
+                (recur nf g (conj out (mk-match re caps)) (+ spent used))))))))))
+
+(defn start Int [m: &Match g: Int]
+  (let [v (:spans m)] (if (< (+ (* 2 g) 1) (count v)) (nth v (* 2 g)) -1)))
+
+(defn end Int [m: &Match g: Int]
+  (let [v (:spans m)] (if (< (+ (* 2 g) 1) (count v)) (nth v (+ (* 2 g) 1)) -1)))
+
+(defn group-matched? Bool [m: &Match g: Int] (>= (start m g) 0))
+
+(defn groups Int [m: &Match] (- (quot (count (:spans m)) 2) 1))
+
+(defn group Str [m: &Match s: &Str g: Int]
+  (let [a (start m g) b (end m g)] (if (or (< a 0) (< b 0)) "" (subs s a b))))
+
+(defn group-index Int [m: &Match name: &Str]
+  (get (:names m) name -1))
+
+(defn named Str [m: &Match s: &Str name: &Str]
+  (let [g (group-index m name)] (if (< g 0) "" (group m s g))))
+
+(defn- expand Values(Str Str) [re: &Pattern m: &Match s: &Str repl: &Str]
+  (let [n (count repl)
+        ng (:ngroups re)]
+    (loop [i 0 out ""]
+      (if (>= i n) (values out "")
+        (let [c (nth repl i)]
+          (if (= c 92)
+            (if (>= (+ i 1) n) (values out "character to be escaped is missing")
+              (let [j (u/next-index repl (+ i 1))]
+                (recur j (str out (subs repl (+ i 1) j)))))
+            (if (= c 36)
+              (if (>= (+ i 1) n) (values out "Illegal group reference: group index is missing")
+                (let [d (nth repl (+ i 1))]
+                  (if (= d 123)
+                    (let [e (loop [k (+ i 2)] (if (and (< k n) (ascii-alnum? (nth repl k))) (recur (+ k 1)) k))
+                          name (subs repl (+ i 2) e)]
+                      (if (= (count name) 0) (values out "named capturing group has 0 length name")
+                        (if (or (>= e n) (not= (nth repl e) 125))
+                          (values out "named capturing group is missing trailing '}'")
+                          (if (ascii-digit? (nth name 0))
+                            (values out (str "capturing group name {" name "} starts with digit character"))
+                            (let [g (get (:names re) name -1)]
+                              (if (< g 0) (values out (str "No group with name {" name "}"))
+                                (recur (+ e 1) (str out (group m s g)))))))))
+                    (if (not (ascii-digit? d)) (values out "Illegal group reference")
+                      (let [[g j] (loop [g (- d 48) j (+ i 2)]
+                                    (if (and (< j n) (ascii-digit? (nth repl j))
+                                             (<= (+ (* g 10) (- (nth repl j) 48)) ng))
+                                      (recur (+ (* g 10) (- (nth repl j) 48)) (+ j 1))
+                                      (values g j)))]
+                        (if (> g ng) (values out (str "No group " g))
+                          (recur j (str out (group m s g)))))))))
+              (let [j (+ i 1)] (recur j (str out (subs repl i j)))))))))))
+
+(defn- replace-n Values(Str Str) [re: &Pattern s: &Str repl: &Str all: Bool]
+  (let [n (count s)
+        budget (budget-for re n 0)]
+    (loop [from 0 gpos 0 last 0 out "" any false spent 0]
+      (let [[caps e used] (if (> from n) (let [v: Vec(Int) []] (values v "" 0)) (exec-b re s from gpos 0 (- budget spent)))]
+        (if (not= e "") (values "" e)
+          (if (= (count caps) 0)
+            (values (if any (str out (subs s last n)) (subs s 0 n)) "")
+            (let [m (mk-match re caps)
+                  [r e2] (expand re m s repl)]
+              (if (not= e2 "") (values "" e2)
+                (let [out2 (str out (subs s last (nth caps 0)) r)
+                      nl (nth caps 1)]
+                  (if all
+                    (recur (next-from s caps) nl nl out2 true (+ spent used))
+                    (values (str out2 (subs s nl n)) "")))))))))))
+
+(defn replace-all Values(Str Str) [re: &Pattern s: &Str repl: &Str]
+  (replace-n re s repl true))
+
+(defn replace-first Values(Str Str) [re: &Pattern s: &Str repl: &Str]
+  (replace-n re s repl false))
+
+(defn split Values(Vec(Str) Str) [re: &Pattern s: &Str limit: Int]
+  (let [n (count s)
+        budget (budget-for re n 0)]
+    (loop [from 0 gpos 0 index 0 out: Vec(Str) [] spent 0]
+      (let [[caps e used] (if (> from n) (let [v: Vec(Int) []] (values v "" 0)) (exec-b re s from gpos 0 (- budget spent)))
+            sp2 (+ spent used)]
+        (if (not= e "") (values out e)
+          (if (> (count caps) 0)
+            (let [ms (nth caps 0) me (nth caps 1)
+                  nf (next-from s caps)]
+              (if (or (<= limit 0) (< (count out) (- limit 1)))
+                (if (and (= index 0) (= ms 0) (= me 0))
+                  (recur nf me index out sp2)
+                  (recur nf me me (conj out (subs s index ms)) sp2))
+                (if (= (count out) (- limit 1))
+                  (recur nf me me (conj out (subs s index n)) sp2)
+                  (recur nf me index out sp2))))
+            (if (= index 0) (values [(subs s 0 n)] "")
+              (let [all (if (or (<= limit 0) (< (count out) limit)) (conj out (subs s index n)) out)
+                    keep (if (= limit 0)
+                           (loop [k (count all)] (if (and (> k 0) (= (count (nth all (- k 1))) 0)) (recur (- k 1)) k))
+                           (count all))]
+                (values (loop [k 0 v: Vec(Str) []] (if (>= k keep) v (recur (+ k 1) (conj v (nth all k))))) "")))))))))
+
+(defn quote-pattern Str [s: &Str]
+  (if (< (cs/index-of s "\\E") 0) (str "\\Q" s "\\E")
+    (loop [cur 0 out "\\Q"]
+      (let [k (cs/index-of-after s "\\E" cur)]
+        (if (< k 0) (str out (subs s cur (count s)) "\\E")
+          (recur (+ k 2) (str out (subs s cur k) "\\E\\\\E\\Q")))))))
+
+(defn quote-replacement Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1) (if (or (= c 92) (= c 36)) (str out "\\" (chr c)) (str out (chr c))))))))

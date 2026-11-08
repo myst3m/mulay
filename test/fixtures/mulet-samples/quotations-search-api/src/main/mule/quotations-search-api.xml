@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="HTTP_Listener_Config">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <db:config name="Oracle_Config">
+        <db:oracle-connection host="${db.host}" port="${db.port}" serviceName="${db.service}"
+                              user="${db.user}" password="${db.password}"/>
+    </db:config>
+
+    <!-- GET /quotations/search?customer_id=xxx - 顧客ID検索 -->
+    <flow name="search-quotations-by-customer-flow">
+        <http:listener config-ref="HTTP_Listener_Config" path="/quotations/search"/>
+        <choice>
+            <when expression="#[attributes.queryParams.customer_id != null]">
+                <db:select config-ref="Oracle_Config">
+                    <db:sql>SELECT * FROM SAL_QUOTATIONS WHERE CUSTOMER_ID = :customerId ORDER BY QUOTATION_DATE DESC</db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        customerId: attributes.queryParams.customer_id
+                    }]]]></db:input-parameters>
+                </db:select>
+            </when>
+            <when expression="#[attributes.queryParams.status != null]">
+                <db:select config-ref="Oracle_Config">
+                    <db:sql>SELECT * FROM SAL_QUOTATIONS WHERE STATUS = :status ORDER BY QUOTATION_DATE DESC</db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        status: attributes.queryParams.status
+                    }]]]></db:input-parameters>
+                </db:select>
+            </when>
+            <otherwise>
+                <db:select config-ref="Oracle_Config">
+                    <db:sql>SELECT * FROM SAL_QUOTATIONS ORDER BY QUOTATION_DATE DESC FETCH FIRST 100 ROWS ONLY</db:sql>
+                </db:select>
+            </otherwise>
+        </choice>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    count: sizeOf(payload),
+    results: payload
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- GET /quotations/recent - 最新の見積取得 -->
+    <flow name="get-recent-quotations-flow">
+        <http:listener config-ref="HTTP_Listener_Config" path="/quotations/recent"/>
+        <set-variable variableName="limit" value="#[attributes.queryParams.limit default '10']"/>
+        <db:select config-ref="Oracle_Config">
+            <db:sql>SELECT * FROM SAL_QUOTATIONS ORDER BY QUOTATION_DATE DESC FETCH FIRST :limit ROWS ONLY</db:sql>
+            <db:input-parameters><![CDATA[#[{
+                limit: vars.limit as Number
+            }]]]></db:input-parameters>
+        </db:select>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>

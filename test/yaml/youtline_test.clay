@@ -1,0 +1,56 @@
+(ns youtline-test (:require [mulay.lib.youtline :as yo] [clay.string :as str]))
+
+(def OAS (str "openapi: 3.0.0\n"
+              "paths:\n"
+              "  /orders:\n"
+              "    get:\n"
+              "      parameters:\n"
+              "        - name: status\n"
+              "          in: query\n"
+              "      description: |\n"
+              "        not: a key\n"
+              "\n"
+              "    # comment\n"
+              "    post:\n"
+              "      x: {a: 1,\n"
+              "          b: 2}\n"
+              "  \"/orders/{id}\":\n"
+              "    get: {}\n"
+              "\n"
+              "components: {}\n"))
+
+(defn- at Str [ks: &Vec(yo/YKey) path: Vec(Str)]
+  (let [i (yo/find-path ks path)] (if (< i 0) "none" (let [k (nth ks i)] (str (subs OAS (:ks k) (:ke k)) "|" (subs OAS (:bs k) (:be k)))))))
+
+(deftest keys-and-blocks
+  (let [ks (yo/outline OAS)]
+    (is (= (at ks ["openapi"]) "openapi|openapi: 3.0.0\n"))
+    (is (= (at ks ["paths" "/orders" "post"]) "post|    post:\n      x: {a: 1,\n          b: 2}\n"))
+    (is (= (at ks ["paths" "/orders" "get"])
+           "get|    get:\n      parameters:\n        - name: status\n          in: query\n      description: |\n        not: a key\n"))
+    (is (= (at ks ["paths" "/orders/{id}" "get"]) "get|    get: {}\n"))
+    (is (= (at ks ["paths" "/orders/{id}"]) "\"/orders/{id}\"|  \"/orders/{id}\":\n    get: {}\n"))
+    (is (= (at ks ["paths" "/orders" "get" "description" "not"]) "none"))
+    (is (= (at ks ["paths" "/orders" "post" "b"]) "none"))
+    (is (= (at ks ["components"]) "components|components: {}\n"))
+    (is (= (count (yo/children ks (yo/find-path ks ["paths"]))) 2))))
+
+(deftest sequences
+  (let [t "a:\n- name: x\n  in: q\n- name: y\nb: 1\n"
+        ks (yo/outline t)
+        a (yo/find-path ks ["a"])
+        items (yo/children ks a)]
+    (is (= (count items) 2))
+    (is (= (count (yo/children ks (nth items 0))) 2))
+    (is (= (:key (nth ks (nth (yo/children ks (nth items 1)) 0))) "name"))
+    (is (= (yo/find-path ks ["b"]) (- (count ks) 1)))))
+
+(deftest raml-and-crlf
+  (let [t "#%RAML 1.0\r\ntitle: x\r\n/orders:\r\n  get:\r\n  /{id}:\r\n    get:\r\n---\r\nz: 1\r\n"
+        ks (yo/outline t)
+        g (yo/find-path ks ["/orders" "/{id}" "get"])]
+    (is (>= g 0))
+    (is (= (subs t (:bs (nth ks g)) (:be (nth ks g))) "    get:\r\n"))
+    (is (= (yo/find-path ks ["z"]) (- (count ks) 1)))
+    (is (= (count (yo/outline "")) 0))
+    (is (= (count (yo/outline "{\"a\": 1}")) 0))))

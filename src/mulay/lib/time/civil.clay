@@ -1,0 +1,101 @@
+(ns mulay.lib.time.civil)
+
+(def MIN-YEAR -999999999)
+(def MAX-YEAR 999999999)
+
+(defn fdiv Int [a: Int b: Int]
+  (let [q (/ a b)] (if (and (not= (* q b) a) (< (bit-xor a b) 0)) (- q 1) q)))
+
+(defn leap? Bool [y: Int]
+  (and (= (mod y 4) 0) (or (not= (mod y 100) 0) (= (mod y 400) 0))))
+
+(defn month-length Int [y: Int m: Int]
+  (case m
+    2 (if (leap? y) 29 28)
+    4 30 6 30 9 30 11 30
+    31))
+
+(defn year-length Int [y: Int] (if (leap? y) 366 365))
+
+(defn days-before-month Int [y: Int m: Int]
+  (let [base (case m 1 0 2 31 3 59 4 90 5 120 6 151 7 181 8 212 9 243 10 273 11 304 334)]
+    (if (and (> m 2) (leap? y)) (+ base 1) base)))
+
+(defn epoch-day Int [y: Int m: Int d: Int]
+  (let [yy (if (<= m 2) (- y 1) y)
+        era (fdiv yy 400)
+        yoe (- yy (* era 400))
+        mp (if (> m 2) (- m 3) (+ m 9))
+        doy (+ (/ (+ (* 153 mp) 2) 5) (- d 1))
+        doe (+ (* yoe 365) (/ yoe 4) (- 0 (/ yoe 100)) doy)]
+    (+ (* era 146097) doe -719468)))
+
+(defn from-epoch-day Values(Int Int Int) [ed: Int]
+  (let [z (+ ed 719468)
+        era (fdiv z 146097)
+        doe (- z (* era 146097))
+        yoe (/ (- (+ (- doe (/ doe 1460)) (/ doe 36524)) (/ doe 146096)) 365)
+        doy (- doe (- (+ (* 365 yoe) (/ yoe 4)) (/ yoe 100)))
+        mp (/ (+ (* 5 doy) 2) 153)
+        d (+ (- doy (/ (+ (* 153 mp) 2) 5)) 1)
+        m (if (< mp 10) (+ mp 3) (- mp 9))
+        y (+ (+ yoe (* era 400)) (if (<= m 2) 1 0))]
+    (values y m d)))
+
+(defn day-of-week Int [ed: Int]
+  (+ (mod (+ ed 3) 7) 1))
+
+(defn day-of-year Int [y: Int m: Int d: Int]
+  (+ (days-before-month y m) d))
+
+(defn valid-date? Bool [y: Int m: Int d: Int]
+  (and (>= y MIN-YEAR) (<= y MAX-YEAR) (>= m 1) (<= m 12) (>= d 1) (<= d (month-length y m))))
+
+(defn localized-dow Int [ed: Int first: Int]
+  (+ (mod (- (day-of-week ed) first) 7) 1))
+
+(defn week-start-offset Int [day: Int dow: Int min: Int]
+  (let [ws (mod (- day dow) 7)]
+    (if (> (+ ws 1) min) (- 7 ws) (- 0 ws))))
+
+(defn week-compute Int [off: Int day: Int]
+  (/ (+ 7 off (- day 1)) 7))
+
+(defn week-of-month Int [y: Int m: Int d: Int first: Int min: Int]
+  (let [ldow (localized-dow (epoch-day y m d) first)]
+    (week-compute (week-start-offset d ldow min) d)))
+
+(defn week-of-year Int [y: Int m: Int d: Int first: Int min: Int]
+  (let [ldow (localized-dow (epoch-day y m d) first)
+        doy (day-of-year y m d)]
+    (week-compute (week-start-offset doy ldow min) doy)))
+
+(defn week-of-wby Int [y: Int m: Int d: Int first: Int min: Int]
+  (let [ed (epoch-day y m d)
+        ldow (localized-dow ed first)
+        doy (day-of-year y m d)
+        off (week-start-offset doy ldow min)
+        wk (week-compute off doy)]
+    (if (= wk 0)
+      (let [[py pm pd] (from-epoch-day (- ed doy))] (week-of-wby py pm pd first min))
+      (if (> wk 50)
+        (let [nyw (week-compute off (+ (year-length y) min))]
+          (if (>= wk nyw) (+ (- wk nyw) 1) wk))
+        wk))))
+
+(defn week-based-year Int [y: Int m: Int d: Int first: Int min: Int]
+  (let [ldow (localized-dow (epoch-day y m d) first)
+        doy (day-of-year y m d)
+        off (week-start-offset doy ldow min)
+        wk (week-compute off doy)]
+    (if (= wk 0) (- y 1)
+      (let [nyw (week-compute off (+ (year-length y) min))]
+        (if (>= wk nyw) (+ y 1) y)))))
+
+(defn date-of-week-based Int [ywby: Int w: Int ldow: Int first: Int min: Int]
+  (let [ed0 (epoch-day ywby 1 1)
+        l0 (localized-dow ed0 first)
+        off (week-start-offset 1 l0 min)
+        nyw (week-compute off (+ (year-length ywby) min))
+        ww (if (< w (- nyw 1)) w (- nyw 1))]
+    (+ ed0 (- 0 off) (- ldow 1) (* (- ww 1) 7))))

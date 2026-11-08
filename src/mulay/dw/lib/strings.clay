@@ -1,0 +1,469 @@
+(ns mulay.dw.lib.strings
+  (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.sel :as sel]
+            [mulay.dw.lib.core :as core] [mulay.dw.lib.core_text :as ct]
+            [mulay.lib.uni :as uni] [mulay.lib.regex :as re] [mulay.lib.dec :as d] [clay.string :as cs]))
+
+(def M "dw::core::Strings")
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- nul v/Val [] (v/null-v))
+(defn- sv v/Val [s: Str] (v/->VStr s))
+(defn- bv v/Val [b: Bool] (v/bool-v b))
+(defn- iv v/Val [i: Int] (v/int-v i))
+(defn- S Str [a: &Vec(v/Val) i: Int] (core/arg-str a i))
+(defn- N num/Num [a: &Vec(v/Val) i: Int] (core/arg-num a i))
+
+(def BIG 4611686018427387904)
+
+(defn- trunc Int [n: &num/Num]
+  (match n
+    (num/NInt i) i
+    (num/NDec x) (if (> (- (d/precision x) (d/scale x)) 19) (if (< (d/signum x) 0) (- 0 BIG) BIG)
+                   (let [[t e] (d/set-scale x 0 d/DOWN)
+                         [i e2] (d/to-int-exact t)]
+                     (if (= e2 "") i (if (< (d/signum x) 0) (- 0 BIG) BIG))))))
+
+(defn- sub-clamp num/Num [a: &num/Num b: &num/Num]
+  (let [[r e] (num/sub a b)]
+    (if (= e "") r (num/from-int (if (> (num/cmp a b) 0) BIG (- 0 BIG))))))
+
+(defn- num-lt? Bool [a: &num/Num b: &num/Num] (< (num/cmp a b) 0))
+(defn- zero num/Num [] (num/from-int 0))
+
+(defn- rep-count Int [times: &num/Num]
+  (if (<= (num/signum times) 0) 0
+    (let [t (trunc times)] (if (< t 1) 1 t))))
+
+(def MAX-STR-BYTES 134217728)
+(def TOO-LONG "Requested array size exceeds VM limit")
+
+(defn- rep Str [s: &Str n: Int]
+  (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out s)))))
+
+(defn- rep-ok? Bool [s: &Str n: Int] (or (= (count s) 0) (<= n (quot MAX-STR-BYTES (count s)))))
+
+(defn- str-range Vec(Str) [s: &Str a: Int b: Int]
+  (let [[x e] (sel/range-sel (sv s) a b)]
+    (match x (v/VStr t) [t] _ [])))
+
+(defn- chars Vec(Str) [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (let [j (uni/next-index s i)] (recur j (conj acc (subs s i j))))))))
+
+(defn- all-cps? Bool [s: &Str p: Fn(Int Bool) empty: Bool]
+  (let [n (count s)]
+    (if (= n 0) empty
+      (loop [i 0] (if (>= i n) true (let [[c j] (uni/decode-at s i)] (if (p c) (recur j) false)))))))
+
+(defn- first-upper Str [s: &Str]
+  (if (= (count s) 0) "" (let [j (uni/next-index s 0) h (uni/upper (subs s 0 j))] (str h (subs s j (count s))))))
+(defn- first-lower Str [s: &Str]
+  (if (= (count s) 0) "" (let [j (uni/next-index s 0) h (uni/lower (subs s 0 j))] (str h (subs s j (count s))))))
+
+(defn- strs v/Val [xs: &Vec(Str)]
+  (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (sv (nth xs i))))))))
+
+(defn- truthy Values(Bool dwe/DwErr) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VBool b) (values b (dwe/ok))
+    _ (values false (dwe/err "CoercionException" (str "Cannot coerce " (v/type-name (v/unmeta x)) " to Boolean")))))
+
+(defn- null-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (nul)))
+(defn- false-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv false)))
+(defn- true-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv true)))
+
+(defn- char-code Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0)]
+    (if (= (count s) 0) (rt/failure "InvalidArgs" "Unexpected empty string.")
+      (ok (iv (uni/cp-at s 0))))))
+
+(defn- char-code-at Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) i (trunc (N a 1)) n (u8/codepoint-count s)
+        j (if (< i 0) (+ n i) i)]
+    (if (or (< j 0) (>= j n))
+      (rt/failure "IndexOutOfBounds" (str "Index " i " is out of bounds. Boundary is defined as [0 to " n "]."))
+      (ok (iv (uni/cp-at s (uni/byte-index-of-cp-index s j)))))))
+
+(defn- from-char-code Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [c (trunc (N a 0))]
+    (if (or (< c 0) (> c 1114111))
+      (rt/failure "InvalidArgs" (str "Unable to convert to character from invalid unicode code point. Code point: `" c "`."))
+      (ok (sv (if (and (>= c 55296) (<= c 57343)) "?" (uni/encode c)))))))
+
+(def UNCOUNTABLE ["equipment" "information" "rice" "money" "species" "series" "fish" "sheep" "deer" "aircraft"])
+
+(def IRREGULAR [["person" "people"] ["man" "men"] ["child" "children"] ["sex" "sexes"] ["move" "moves"]
+                ["goose" "geese"] ["alumna" "alumnae"] ["cow" "kine"] ["die" "dice"] ["yes" "yeses"]
+                ["foot" "feet"] ["eave" "eaves"] ["goose" "geese"] ["tooth" "teeth"] ["quiz" "quizzes"]
+                ["human" "humans"] ["proof" "proofs"] ["carve" "carves"] ["valve" "valves"] ["thief" "thieves"]
+                ["genie" "genies"] ["groove" "grooves"] ["pickaxe" "pickaxes"] ["whiskey" "whiskies"]])
+
+(def PLURAL-RULES
+  [["$" "s"] ["s$" "s"] ["(ax|test)is$" "$1es"] ["(octop|vir|alumn|fung)us$" "$1i"] ["(alias|status)$" "$1es"]
+   ["(bu)s$" "$1ses"] ["(buffal|tomat|volcan)o$" "$1oes"] ["([ti])um$" "$1a"] ["sis$" "ses"]
+   ["(?:([^f])fe|([lr])f)$" "$1$2ves"] ["(hive)$" "$1s"] ["([^aeiouy]|qu)y$" "$1ies"] ["(x|ch|ss|sh)$" "$1es"]
+   ["(matr|vert|ind)ix|ex$" "$1ices"] ["([m|l])ouse$" "$1ice"] ["^(ox)$" "$1en"] ["(quiz)$" "$1zes"]])
+
+(def SINGULAR-RULES
+  [["s$" ""] ["(n)ews$" "$1ews"] ["([ti])a$" "$1um"]
+   ["((a)naly|(b)a|(d)iagno|(p)arenthe|(p)rogno|(s)ynop|(t)he)ses$" "$1$2sis"] ["(^analy)ses$" "$1sis"]
+   ["([^f])ves$" "$1fe"] ["(hive)s$" "$1"] ["(tive)s$" "$1"] ["([lr])ves$" "$1f"] ["([^aeiouy]|qu)ies$" "$1y"]
+   ["(s)eries$" "$1eries"] ["(m)ovies$" "$1ovie"] ["(x|ch|ss|sh)es$" "$1"] ["([m|l])ice$" "$1ouse"]
+   ["(bus)es$" "$1"] ["(o)es$" "$1"] ["(shoe)s$" "$1"] ["(cris|ax|test)es$" "$1is"]
+   ["(octop|vir|alumn|fung)i$" "$1us"] ["(alias|status)es$" "$1"] ["(alias|status)$" "$1"] ["^(ox)en" "$1"]
+   ["(vert|ind)ices$" "$1ex"] ["(matr)ices$" "$1ix"] ["(quiz)zes$" "$1"]])
+
+(defrecord CRule [re: re/Pattern repl: Str])
+
+(defn- fixed-re re/Pattern [pat: &Str flags: Int]
+  (let [[p e] (re/compile pat flags)] p))
+
+(defn- rules Vec(CRule) [plural: Bool]
+  (let [base (if plural PLURAL-RULES SINGULAR-RULES)
+        ci re/CASE-INSENSITIVE
+        irr (loop [i (- (count IRREGULAR) 1) acc: Vec(CRule) []]
+              (if (< i 0) acc
+                (let [pair (nth IRREGULAR i)
+                      from (if plural (nth pair 0) (nth pair 1))
+                      to (if plural (nth pair 1) (nth pair 0))
+                      pat (str "(" (subs from 0 1) ")" (subs from 1 (count from)) "$")]
+                  (recur (- i 1) (conj acc (->CRule (fixed-re pat ci) (str "$1" (subs to 1 (count to)))))))))]
+    (loop [i (- (count base) 1) acc irr]
+      (if (< i 0) acc (recur (- i 1) (conj acc (->CRule (fixed-re (nth (nth base i) 0) ci) (nth (nth base i) 1))))))))
+
+(def PLURALS: Delay(Vec(CRule)) (delay (fn Vec(CRule) [] (rules true))))
+(def SINGULARS: Delay(Vec(CRule)) (delay (fn Vec(CRule) [] (rules false))))
+(def RE-UPPER-RUN (fixed-re "([A-Z]+)([A-Z][a-z])" 0))
+(def RE-LOWER-UPPER (fixed-re "([a-z\\d])([A-Z])" 0))
+(def RE-DASH-SPACE (fixed-re "[-\\s]" 0))
+(def RE-WORD-START (fixed-re "\\b([a-z])" 0))
+
+(defn- inflect Str [word: &Str plural: Bool]
+  (if (= (count word) 0) ""
+    (let [lw (uni/lower word)
+          unc (loop [i 0] (if (>= i (count UNCOUNTABLE)) false (if (= (nth UNCOUNTABLE i) lw) true (recur (+ i 1)))))]
+      (if unc (str word)
+        (let [rs (if plural (deref PLURALS) (deref SINGULARS))]
+          (loop [i 0]
+            (if (>= i (count rs)) (str word)
+              (let [r (nth rs i)
+                    [ms e2] (re/search (:re r) word 0)]
+                (if (or (not= e2 "") (= (count ms) 0)) (recur (+ i 1))
+                  (let [[out e3] (re/replace-all (:re r) word (:repl r))]
+                    (if (or (not= e3 "") (= (count (uni/java-trim out)) 0)) (recur (+ i 1)) out)))))))))))
+
+(defn- re-replace-all Str [p: &re/Pattern s: &Str repl: Str]
+  (let [[r e2] (re/replace-all p s repl)] (if (= e2 "") r (str s))))
+
+(defn underscore-str Str [s: &Str]
+  (let [a (re-replace-all RE-UPPER-RUN s "$1_$2")
+        b (re-replace-all RE-LOWER-UPPER a "$1_$2")
+        c (re-replace-all RE-DASH-SPACE b "_")]
+    (uni/lower c)))
+
+(defn camelize-str Str [s: &Str]
+  (let [ps: Vec(Str) (cs/split s "_")
+        joined (loop [i 0 out ""]
+                 (if (>= i (count ps)) out
+                   (let [w (nth ps i)] (recur (+ i 1) (str out (if (= i 0) w (first-upper w)))))))]
+    (first-lower joined)))
+
+(defn capitalize-str Str [s: &Str]
+  (if (= (count s) 0) ""
+    (let [u (cs/replace (underscore-str s) "_" " ")
+          j (uni/next-index u 0)
+          hd (uni/upper (subs u 0 j))
+          tl (uni/lower (subs u j (count u)))
+          h (str hd tl)
+          [ms e2] (re/find-all RE-WORD-START h)]
+      (if (not= e2 "") h
+        (loop [i 0 last 0 out ""]
+          (if (>= i (count ms)) (str out (subs h last (count h)))
+            (let [m (nth ms i) st (re/start m 1) en (re/end m 1) up (uni/upper (subs h st en))]
+              (recur (+ i 1) en (str out (subs h last st) up)))))))))
+
+(defn- pluralize Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (sv (inflect (S a 0) true))))
+(defn- singularize Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (sv (inflect (S a 0) false))))
+(defn- camelize Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (sv (camelize-str (S a 0)))))
+(defn- capitalize Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (sv (capitalize-str (S a 0)))))
+(defn- underscore Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (sv (underscore-str (S a 0)))))
+(defn- dasherize Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (sv (cs/replace (underscore-str (S a 0)) "_" "-"))))
+
+(defn- wrap32 Int [x: Int]
+  (let [lo (bit-and x 4294967295)] (if (>= lo 2147483648) (- lo 4294967296) lo)))
+
+(defn- ordinalize Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [n (wrap32 (trunc (N a 0))) m100 (rem n 100) m10 (rem n 10)
+        suf (if (and (>= m100 11) (<= m100 13)) "th"
+              (if (= m10 1) "st" (if (= m10 2) "nd" (if (= m10 3) "rd" "th"))))]
+    (ok (sv (str n suf)))))
+
+(defn- pad Values(v/Val dwe/DwErr) [a: &Vec(v/Val) left: Bool]
+  (let [s (S a 0) size (N a 1) padt (if (> (count a) 2) (S a 2) " ")
+        actual (num/from-int (u8/codepoint-count s))]
+    (if (not (num-lt? actual size)) (ok (sv s))
+      (let [n (rep-count (sub-clamp size actual))]
+        (if (not (rep-ok? padt n)) (rt/failure "OutOfMemoryError" TOO-LONG)
+          (let [p (rep padt n)]
+            (ok (sv (if left (str p s) (str s p))))))))))
+
+(defn- left-pad Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (pad a true))
+(defn- right-pad Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (pad a false))
+
+(defn- wrap-with Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [w (S a 1) s (S a 0)] (ok (sv (str w s w)))))
+
+(defn- wrap-if-missing Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) w (S a 1)
+        h (if (cs/starts-with? s w) (str s) (str w s))]
+    (ok (sv (if (cs/ends-with? h w) h (str h w))))))
+
+(defn- unwrap Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) w (S a 1)]
+    (if (or (not (cs/starts-with? s w)) (not (cs/ends-with? s w))) (ok (sv s))
+      (let [n (u8/codepoint-count s)]
+        (if (= n 2) (ok (sv ""))
+          (let [r (str-range s 1 -2)] (ok (sv (if (= (count r) 0) s (nth r 0))))))))))
+
+(defn- prepend-if-missing Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) p (S a 1)] (ok (sv (if (cs/starts-with? s p) (str s) (str p s))))))
+
+(defn- append-if-missing Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) p (S a 1)] (ok (sv (if (cs/ends-with? s p) (str s) (str s p))))))
+
+(defn- substring-before Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) ps (ct/find-lit s (S a 1))]
+    (ok (sv (if (= (count ps) 0) "" (subs s 0 (nth ps 0)))))))
+
+(defn- substring-before-last Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) ps (ct/find-lit s (S a 1))]
+    (ok (sv (if (= (count ps) 0) "" (subs s 0 (nth ps (- (count ps) 1))))))))
+
+(defn- substring-after Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) t (S a 1) ps (ct/find-lit s t)]
+    (ok (sv (if (= (count ps) 0) "" (subs s (+ (nth ps 0) (count t)) (count s)))))))
+
+(defn- substring-after-last Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) t (S a 1) ps (ct/find-lit s t)]
+    (ok (sv (if (or (= (count t) 0) (= (count ps) 0)) ""
+              (subs s (+ (nth ps (- (count ps) 1)) (count t)) (count s)))))))
+
+(defn- repeat-s Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) n (rep-count (N a 1))]
+    (if (rep-ok? s n) (ok (sv (rep s n))) (rt/failure "OutOfMemoryError" TOO-LONG))))
+
+(defn- with-max-size Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) m (N a 1)]
+    (if (< (num/signum m) 0) (rt/failure "UserException" "maxLength should be a positive number")
+      (if (not (num-lt? m (num/from-int (u8/codepoint-count s)))) (ok (sv s))
+        (let [r (str-range s 0 (trunc (sub-clamp m (num/from-int 1))))]
+          (ok (sv (if (= (count r) 0) "" (nth r 0)))))))))
+
+(defn- replace-all Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) t (S a 1) r (S a 2)
+        ps (if (= (count t) 0) (conj (ct/find-lit s t) (count s)) (ct/find-lit s t))
+        n (count s) k (count t)]
+    (ok (sv (loop [i 0 last 0 out ""]
+              (if (>= i (count ps)) (str out (subs s last n))
+                (let [p (nth ps i)] (recur (+ i 1) (+ p k) (str out (subs s last p) r)))))))))
+
+(defn- reverse-s Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0)]
+    (ok (sv (loop [i (count s) out ""]
+              (if (<= i 0) out (let [j (uni/prev-index s i)] (recur j (str out (subs s j i))))))))))
+
+(defn substring-num Str [s: &Str from0: &num/Num until: &num/Num]
+  (let [from (if (< (num/signum from0) 0) (zero) from0)]
+    (if (not (num-lt? from until)) ""
+      (let [f (trunc from)
+            r (str-range s f (trunc (sub-clamp until (num/from-int 1))))]
+        (if (> (count r) 0) (nth r 0)
+          (let [r2 (str-range s f -1)] (if (> (count r2) 0) (nth r2 0) "")))))))
+
+(defn- substring Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (sv (substring-num (S a 0) (N a 1) (N a 2)))))
+
+(defn- first-s Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (sv (substring-num (S a 0) (zero) (N a 1)))))
+
+(defn- last-s Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) n (num/from-int (u8/codepoint-count s))]
+    (ok (sv (substring-num s (sub-clamp n (N a 1)) n)))))
+
+(defn- substring-every Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) amt (N a 1)]
+    (if (<= (num/signum amt) 0) (ok (v/->VArr []))
+      (let [t (trunc amt)
+            k (if (num/eq? amt (num/from-int t)) t (+ t 1))
+            cs0 (chars s)]
+        (ok (strs (loop [i 0 cur "" n 0 acc: Vec(Str) []]
+                    (if (>= i (count cs0)) (if (> n 0) (conj acc cur) acc)
+                      (if (>= n k) (recur (+ i 1) (nth cs0 i) 1 (conj acc cur))
+                        (recur (+ i 1) (str cur (nth cs0 i)) (+ n 1) acc))))))))))
+
+(defn- substring-by Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [cs0 (chars (S a 0)) f (core/arg-fn a 1)]
+    (loop [i 0 cur "" acc: Vec(Str) []]
+      (if (>= i (count cs0)) (ok (strs (conj acc cur)))
+        (let [[y e] (core/call env f [(sv (nth cs0 i)) (iv i)])]
+          (if (not (dwe/ok? e)) (values y e)
+            (let [[b e2] (truthy y)]
+              (if (not (dwe/ok? e2)) (values (nul) e2)
+                (if b (recur (+ i 1) "" (conj acc cur))
+                  (recur (+ i 1) (str cur (nth cs0 i)) acc))))))))))
+
+(defn- collapse Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [cs0 (chars (S a 0))]
+    (ok (strs (loop [i 0 cur "" prev "" acc: Vec(Str) []]
+                (if (>= i (count cs0)) (conj acc cur)
+                  (let [c (nth cs0 i)]
+                    (if (= i 0) (recur 1 (str c) (str c) acc)
+                      (if (= c prev) (recur (+ i 1) (str cur c) prev acc)
+                        (recur (+ i 1) (str c) (str c) (conj acc cur)))))))))))
+
+(defn- words Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) n (count s)
+        ps (loop [i 0 start 0 acc: Vec(Str) []]
+             (if (>= i n) (conj acc (subs s start n))
+               (let [c (nth s i)]
+                 (if (or (= c 32) (and (>= c 9) (<= c 13)))
+                   (recur (+ i 1) (+ i 1) (conj acc (subs s start i)))
+                   (recur (+ i 1) start acc)))))]
+    (ok (strs (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count ps)) acc
+                  (recur (+ i 1) (if (= (count (uni/java-trim (nth ps i))) 0) acc (conj acc (nth ps i))))))))))
+
+(defn- lines Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) n (count s)]
+    (if (= n 0) (ok (strs [""]))
+      (let [[ps found] (loop [i 0 start 0 acc: Vec(Str) [] f false]
+                         (if (>= i n) (values (conj acc (subs s start n)) f)
+                           (let [c (nth s i)]
+                             (if (= c 13)
+                               (let [j (if (and (< (+ i 1) n) (= (nth s (+ i 1)) 10)) (+ i 2) (+ i 1))]
+                                 (recur j j (conj acc (subs s start i)) true))
+                               (if (= c 10) (recur (+ i 1) (+ i 1) (conj acc (subs s start i)) true)
+                                 (recur (+ i 1) start acc f))))))]
+        (ok (strs (if found (ct/drop-trailing-empty ps) [(str s)])))))))
+
+(defn- count-matches-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (iv (count (ct/find-lit (S a 0) (S a 1))))))
+
+(defn- count-matches-re Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[ms e] (ct/find-all-re a (S a 0))]
+    (if (dwe/ok? e) (ok (iv (count ms))) (values (nul) e))))
+
+(defn- count-by Values(Int Int dwe/DwErr) [env: &rt/Env s: &Str f: &v/FnV]
+  (let [cs0 (chars s)]
+    (loop [i 0 t 0 fl 0]
+      (if (>= i (count cs0)) (values t fl (dwe/ok))
+        (let [[y e] (core/call env f [(sv (nth cs0 i))])]
+          (if (not (dwe/ok? e)) (values t fl e)
+            (let [[b e2] (truthy y)]
+              (if (not (dwe/ok? e2)) (values t fl e2)
+                (recur (+ i 1) (if b (+ t 1) t) (if b fl (+ fl 1)))))))))))
+
+(defn- count-characters-by Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[t f e] (count-by env (S a 0) (core/arg-fn a 1))] (if (dwe/ok? e) (ok (iv t)) (values (nul) e))))
+
+(defn- every-character Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[t f e] (count-by env (S a 0) (core/arg-fn a 1))] (if (dwe/ok? e) (ok (bv (= f 0))) (values (nul) e))))
+
+(defn- some-character Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[t f e] (count-by env (S a 0) (core/arg-fn a 1))] (if (dwe/ok? e) (ok (bv (> t 0))) (values (nul) e))))
+
+(defn- remove-s Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (S a 0) t (S a 1)]
+    (if (= (count t) 0) (ok (sv s)) (ok (sv (cs/replace s t ""))))))
+
+(defn- map-string Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [cs0 (chars (S a 0)) f (core/arg-fn a 1)]
+    (loop [i 0 out ""]
+      (if (>= i (count cs0)) (ok (sv out))
+        (let [[y e] (core/call env f [(sv (nth cs0 i)) (iv i)])]
+          (if (not (dwe/ok? e)) (values y e)
+            (let [[t e2] (rt/to-text y)]
+              (if (dwe/ok? e2) (recur (+ i 1) (str out t)) (values (nul) e2)))))))))
+
+(defn- hamming-distance Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [x (uni/cps (S a 0)) y (uni/cps (S a 1))]
+    (if (not= (count x) (count y)) (ok (nul))
+      (ok (iv (loop [i 0 k 0] (if (>= i (count x)) k (recur (+ i 1) (if (= (nth x i) (nth y i)) k (+ k 1))))))))))
+
+(defn- levenshtein-distance Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [x (uni/cps (S a 0)) y (uni/cps (S a 1)) nb (count y)
+        row0 (loop [j 0 acc: Vec(Int) []] (if (> j nb) acc (recur (+ j 1) (conj acc j))))
+        last (loop [i 1 prev row0]
+               (if (> i (count x)) prev
+                 (let [cur (loop [j 1 acc: Vec(Int) [i]]
+                             (if (> j nb) acc
+                               (let [cost (if (= (nth x (- i 1)) (nth y (- j 1))) 0 1)
+                                     del (+ (nth prev j) 1)
+                                     ins (+ (nth acc (- j 1)) 1)
+                                     sub (+ (nth prev (- j 1)) cost)]
+                                 (recur (+ j 1) (conj acc (min del (min ins sub)))))))]
+                   (recur (+ i 1) cur))))]
+    (ok (iv (nth last nb)))))
+
+(defn- is-numeric Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv (all-cps? (S a 0) uni/java-digit? false))))
+(defn- is-whitespace Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv (all-cps? (S a 0) uni/java-whitespace? true))))
+(defn- is-alpha Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv (all-cps? (S a 0) uni/letter? false))))
+(defn- is-alphanumeric Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv (all-cps? (S a 0) uni/letter-or-digit? false))))
+(defn- is-upper-case Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv (all-cps? (S a 0) uni/upper-case? false))))
+(defn- is-lower-case Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (bv (all-cps? (S a 0) uni/lower-case? false))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+(defn- b3 rt/Overload [t: Str u: Str w: Str f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] (rt/overload [t u w] f))
+(defn- str1 Vec(rt/Overload) [f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] [(rt/b1 "String" f) (rt/b1 "Null" null-fn)])
+(defn- pred1 Vec(rt/Overload) [f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] [(rt/b1 "String" f) (rt/b1 "Null" false-fn)])
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "charCode" (str1 char-code))
+   (B "charCodeAt" [(rt/b2 "String" "Number" char-code-at) (rt/b2 "Null" "Any" null-fn)])
+   (B "fromCharCode" [(rt/b1 "Number" from-char-code) (rt/b1 "Null" null-fn)])
+   (B "pluralize" (str1 pluralize))
+   (B "singularize" (str1 singularize))
+   (B "camelize" (str1 camelize))
+   (B "capitalize" (str1 capitalize))
+   (B "ordinalize" [(rt/b1 "Number" ordinalize) (rt/b1 "Null" null-fn)])
+   (B "underscore" (str1 underscore))
+   (B "dasherize" (str1 dasherize))
+   (B "leftPad" [(rt/b2 "String" "Number" left-pad) (b3 "String" "Number" "String" left-pad)
+                 (rt/b2 "Null" "Any" null-fn) (b3 "Null" "Any" "Any" null-fn)])
+   (B "rightPad" [(rt/b2 "String" "Number" right-pad) (b3 "String" "Number" "String" right-pad)
+                  (rt/b2 "Null" "Any" null-fn) (b3 "Null" "Any" "Any" null-fn)])
+   (B "wrapWith" [(rt/b2 "String" "String" wrap-with) (rt/b2 "Null" "Any" null-fn)])
+   (B "wrapIfMissing" [(rt/b2 "String" "String" wrap-if-missing) (rt/b2 "Null" "String" null-fn)])
+   (B "substringBefore" [(rt/b2 "String" "String" substring-before) (rt/b2 "Null" "String" null-fn)])
+   (B "substringBeforeLast" [(rt/b2 "String" "String" substring-before-last) (rt/b2 "Null" "String" null-fn)])
+   (B "substringAfter" [(rt/b2 "String" "String" substring-after) (rt/b2 "Null" "String" null-fn)])
+   (B "substringAfterLast" [(rt/b2 "String" "String" substring-after-last) (rt/b2 "Null" "String" null-fn)])
+   (B "repeat" [(rt/b2 "String" "Number" repeat-s) (rt/b2 "Null" "Any" null-fn)])
+   (B "unwrap" [(rt/b2 "String" "String" unwrap) (rt/b2 "Null" "String" null-fn)])
+   (B "prependIfMissing" [(rt/b2 "String" "String" prepend-if-missing) (rt/b2 "Null" "String" null-fn)])
+   (B "appendIfMissing" [(rt/b2 "String" "String" append-if-missing) (rt/b2 "Null" "String" null-fn)])
+   (B "isNumeric" (pred1 is-numeric))
+   (B "isWhitespace" (pred1 is-whitespace))
+   (B "isAlpha" (pred1 is-alpha))
+   (B "isAlphanumeric" (pred1 is-alphanumeric))
+   (B "isUpperCase" (pred1 is-upper-case))
+   (B "isLowerCase" (pred1 is-lower-case))
+   (B "withMaxSize" [(rt/b2 "String" "Number" with-max-size) (rt/b2 "Null" "Number" null-fn)])
+   (B "replaceAll" [(b3 "String" "String" "String" replace-all) (b3 "Null" "String" "String" null-fn)])
+   (B "reverse" (str1 reverse-s))
+   (B "substring" [(b3 "String" "Number" "Number" substring) (b3 "Null" "Any" "Any" null-fn)])
+   (B "substringEvery" [(rt/b2 "String" "Number" substring-every) (rt/b2 "Null" "Any" null-fn)])
+   (B "substringBy" [(rt/b2 "String" "Function" substring-by) (rt/b2 "Null" "Function" null-fn)])
+   (B "collapse" (str1 collapse))
+   (B "words" (str1 words))
+   (B "lines" (str1 lines))
+   (B "first" [(rt/b2 "String" "Number" first-s) (rt/b2 "Null" "Any" null-fn)])
+   (B "last" [(rt/b2 "String" "Number" last-s) (rt/b2 "Null" "Any" null-fn)])
+   (B "countMatches" [(rt/b2 "String" "String" count-matches-str) (rt/b2 "String" "Regex" count-matches-re) (rt/b2 "Null" "Any" null-fn)])
+   (B "countCharactersBy" [(rt/b2 "String" "Function" count-characters-by) (rt/b2 "Null" "Function" null-fn)])
+   (B "everyCharacter" [(rt/b2 "String" "Function" every-character) (rt/b2 "Null" "Function" true-fn)])
+   (B "someCharacter" [(rt/b2 "String" "Function" some-character) (rt/b2 "Null" "Function" false-fn)])
+   (B "remove" [(rt/b2 "String" "String" remove-s) (rt/b2 "Null" "Any" null-fn)])
+   (B "mapString" [(rt/b2 "String" "Function" map-string) (rt/b2 "Null" "Function" null-fn)])
+   (B "hammingDistance" [(rt/b2 "String" "String" hamming-distance)])
+   (B "levenshteinDistance" [(rt/b2 "String" "String" levenshtein-distance)])])

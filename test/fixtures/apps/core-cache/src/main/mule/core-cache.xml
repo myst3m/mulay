@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core" xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+  <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18531"/></http:listener-config>
+  <ee:object-store-caching-strategy name="SK" keyGenerationExpression="#[attributes.queryParams.k]"/>
+  <ee:object-store-caching-strategy name="SF" keyGenerationExpression="#[attributes.queryParams.k]"/>
+  <ee:object-store-caching-strategy name="SE" keyGenerationExpression="#[attributes.queryParams.k]"/>
+  <os:object-store name="CS" persistent="false"/>
+  <ee:object-store-caching-strategy name="SO" keyGenerationExpression="#[attributes.queryParams.k]" objectStore="CS"/>
+
+  <flow name="c1">
+    <http:listener config-ref="L" path="/c1"/>
+    <ee:cache>
+      <logger level="INFO" message="#['exec c1 ' ++ (payload as String)]"/>
+      <set-variable variableName="v" value="#['set ' ++ (payload as String)]"/>
+      <set-payload value="#['R:' ++ (payload as String)]"/>
+    </ee:cache>
+    <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType, v: vars.v default null}]"/>
+  </flow>
+
+  <flow name="c2">
+    <http:listener config-ref="L" path="/c2"/>
+    <ee:cache cachingStrategy-ref="SK">
+      <logger level="INFO" message="#['exec c2 ' ++ attributes.queryParams.k]"/>
+      <set-payload value="#['value for ' ++ attributes.queryParams.k ++ ' q=' ++ (attributes.queryParams.q default '')]" mimeType="text/plain"/>
+    </ee:cache>
+  </flow>
+
+  <flow name="c3">
+    <http:listener config-ref="L" path="/c3"/>
+    <ee:cache cachingStrategy-ref="SF" filterExpression="#[attributes.queryParams.nocache != 'true']">
+      <logger level="INFO" message="#['exec c3 ' ++ attributes.queryParams.k]"/>
+      <set-payload value="#['c3 ' ++ attributes.queryParams.k ++ ' q=' ++ (attributes.queryParams.q default '')]"/>
+    </ee:cache>
+  </flow>
+
+  <flow name="inv-key">
+    <http:listener config-ref="L" path="/inv-key"/>
+    <ee:invalidate-key cachingStrategy-ref="SK" keyGenerationExpression="#[attributes.queryParams.k]"/>
+    <set-payload value="invalidated"/>
+  </flow>
+
+  <flow name="inv-all">
+    <http:listener config-ref="L" path="/inv-all"/>
+    <ee:invalidate-cache cachingStrategy-ref="SK"/>
+    <set-payload value="invalidated all"/>
+  </flow>
+
+  <flow name="c4">
+    <http:listener config-ref="L" path="/c4"/>
+    <try>
+      <ee:cache cachingStrategy-ref="SE">
+        <logger level="INFO" message="#['exec c4 ' ++ attributes.queryParams.k]"/>
+        <raise-error type="APP:BOOM" description="boom" doc:name="r" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" />
+      </ee:cache>
+      <error-handler>
+        <on-error-continue><set-payload value="#['error ' ++ error.errorType.identifier]"/></on-error-continue>
+      </error-handler>
+    </try>
+  </flow>
+
+  <flow name="c4ok">
+    <http:listener config-ref="L" path="/c4ok"/>
+    <ee:cache cachingStrategy-ref="SE">
+      <logger level="INFO" message="#['exec c4ok ' ++ attributes.queryParams.k]"/>
+      <set-payload value="#['ok ' ++ attributes.queryParams.k]"/>
+    </ee:cache>
+  </flow>
+
+  <flow name="c5a">
+    <http:listener config-ref="L" path="/c5a"/>
+    <set-payload value="same"/>
+    <ee:cache>
+      <logger level="INFO" message="exec c5a"/>
+      <set-payload value="from a"/>
+    </ee:cache>
+  </flow>
+
+  <flow name="c5b">
+    <http:listener config-ref="L" path="/c5b"/>
+    <set-payload value="same"/>
+    <ee:cache>
+      <logger level="INFO" message="exec c5b"/>
+      <set-payload value="from b"/>
+    </ee:cache>
+  </flow>
+
+  <flow name="c6">
+    <http:listener config-ref="L" path="/c6"/>
+    <ee:cache cachingStrategy-ref="SO">
+      <logger level="INFO" message="#['exec c6 ' ++ attributes.queryParams.k]"/>
+      <set-payload value="#[output application/json --- {k: attributes.queryParams.k}]"/>
+    </ee:cache>
+  </flow>
+
+  <flow name="c6keys">
+    <http:listener config-ref="L" path="/c6keys"/>
+    <os:retrieve-all-keys objectStore="CS"/>
+    <set-payload value="#[write(payload orderBy $, 'application/json') replace /\s/ with '']"/>
+  </flow>
+
+  <flow name="c7">
+    <http:listener config-ref="L" path="/c7"/>
+    <set-payload value="#[output application/json --- {n: attributes.queryParams.n}]"/>
+    <ee:cache>
+      <logger level="INFO" message="#['exec c7 ' ++ write(payload, 'application/json', {indent: false})]"/>
+      <set-payload value="#[payload.n]"/>
+    </ee:cache>
+  </flow>
+  <ee:object-store-caching-strategy name="SA" keyGenerationExpression="#[attributes.queryParams.k]"/>
+  <flow name="c8">
+    <http:listener config-ref="L" path="/c8"/>
+    <set-variable variableName="before" value="#[attributes.queryParams.q]"/>
+    <ee:cache cachingStrategy-ref="SA">
+      <set-payload value="#['inner ' ++ attributes.queryParams.q]"/>
+    </ee:cache>
+    <set-payload value="#[payload ++ ' attr q=' ++ (attributes.queryParams.q default 'none') ++ ' before=' ++ vars.before]"/>
+  </flow>
+  <ee:object-store-caching-strategy name="ST" keyGenerationExpression="#[attributes.queryParams.k]" entryTTL="1000" expirationInterval="500"/>
+  <ee:object-store-caching-strategy name="SP" keyGenerationExpression="#[attributes.queryParams.k]">
+    <os:private-object-store entryTtl="1" entryTtlUnit="SECONDS" expirationInterval="1" expirationIntervalUnit="SECONDS" persistent="false"/>
+  </ee:object-store-caching-strategy>
+  <ee:object-store-caching-strategy name="SH" keyGenerationExpression="#[attributes.queryParams.k]"/>
+  <http:request-config name="R"><http:request-connection host="127.0.0.1" port="18531"/></http:request-config>
+
+  <flow name="c9">
+    <http:listener config-ref="L" path="/c9"/>
+    <ee:cache cachingStrategy-ref="ST">
+      <set-payload value="#['c9 q=' ++ attributes.queryParams.q]"/>
+    </ee:cache>
+  </flow>
+
+  <flow name="c10">
+    <http:listener config-ref="L" path="/c10"/>
+    <ee:cache cachingStrategy-ref="SP">
+      <set-payload value="#['c10 q=' ++ attributes.queryParams.q]"/>
+    </ee:cache>
+  </flow>
+
+  <flow name="backend">
+    <http:listener config-ref="L" path="/backend">
+      <http:response statusCode="201">
+        <http:headers>#[{'x-n': attributes.queryParams.q}]</http:headers>
+      </http:response>
+    </http:listener>
+    <logger level="INFO" message="#['backend ' ++ attributes.queryParams.q]"/>
+    <set-payload value="#[output application/json --- {q: attributes.queryParams.q}]"/>
+  </flow>
+
+  <flow name="c11">
+    <http:listener config-ref="L" path="/c11"/>
+    <ee:cache cachingStrategy-ref="SH">
+      <http:request config-ref="R" method="GET" path="/backend">
+        <http:query-params>#[{q: attributes.queryParams.q}]</http:query-params>
+      </http:request>
+    </ee:cache>
+    <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType, status: attributes.statusCode, n: attributes.headers.'x-n'}]"/>
+  </flow>
+</mule>

@@ -1,0 +1,60 @@
+(ns xml-lazy-test (:require [mulay.dw.fmt.xml :as xmlf] [mulay.dw.fmt.registry :as reg] [mulay.dw.val :as v] [mulay.dw.err :as dwe] [clay.string :as str]))
+
+(defn- json Str [x: &v/Val]
+  (let [[t e] (reg/write-fmt "application/json" [(v/field "indent" (v/bool-v false)) (v/field "writeAttributes" (v/bool-v true))] x)] (if (dwe/ok? e) t (str "WERR " (:msg e)))))
+
+(defn- src xmlf/XSrc [text: Str size: Int]
+  (let [pos (atom 0) t text n size]
+    (xmlf/->XSrc (fn Values(Str Bool Str) [k: Int]
+                   (let [p (deref pos)
+                         end (if (> (+ p n) (count t)) (count t) (+ p n))
+                         z (reset! pos end)]
+                     (values (subs t p end) (>= end (count t)) "")))
+                 (fn Int [k: Int] 0))))
+
+(defn- whole Str [text: &Str props: &Vec(v/Field)]
+  (let [[x e] (xmlf/read-named text props "application/xml" "payload")]
+    (if (not= e "") (str "ERR " e) (json x))))
+
+(defn- lazy Str [text: Str props: &Vec(v/Field) size: Int]
+  (let [t text n size
+        [x ok] (xmlf/lazy-read (fn xmlf/XSrc [k: Int] (src t n)) props "application/xml" "payload")]
+    (if (not ok) "NOT-LAZY"
+      (let [[y e] (v/whole-deep x)] (if (dwe/ok? e) (json y) (str "ERR " (:msg e)))))))
+
+(defn- same Bool [text: Str props: Vec(v/Field) want-lazy: Bool]
+  (let [w (whole text props)]
+    (loop [i 0]
+      (if (>= i 6) true
+        (let [size (nth [1 2 3 7 64 1000000] i)
+              l (lazy text props size)]
+          (cond (= l "NOT-LAZY") (if want-lazy (do (eprintln (str "not lazy size " size ": " text)) false) (recur (+ i 1)))
+                (= l w) (recur (+ i 1))
+                :else (do (eprintln (str "DIFF size " size "\n  whole: " w "\n  lazy:  " l)) false)))))))
+
+(def LAZY-DOCS
+  ["<r><a>1</a><a>2</a></r>"
+   "<?xml version='1.0' encoding='UTF-8'?>\n<orders>\n  <order id=\"1\"><c>x</c></order>\n  <order id=\"2\"><c>y</c></order>\n</orders>\n"
+   "<r k='v' xmlns='urn:a' xmlns:p='urn:p'><p:a p:x='1'>t</p:a>mid<b/><![CDATA[cd]]>  <c>  </c>tail</r>"
+   "<r>\n  <!-- c -->\n  <?pi d?>\n  <a>1</a>\n  <![CDATA[ ]]>\n  <a>2</a>\n</r>\n<!-- after -->\n"
+   "<!DOCTYPE r [<!ENTITY e \"ent\">]><r><a>&e;</a>&e;<b>&amp;</b></r>"
+   "<r>あいう<a>えお</a>かき<b/></r>"
+   "<r><a><b><c>deep</c></b></a><a/></r>"
+   "<r>\n<a>1</a>\n<a>2</a>\n</r>\n<x/>"
+   "<r>\n<a>1</a>\n<a>2</b>\n</r>"
+   "<r>\n<a>1</a>\n<a>2</a>\n"
+   "<r><a>1</a>&bad;</r>"])
+
+(deftest lazy-xml-equals-whole
+  (is (loop [i 0] (if (>= i (count LAZY-DOCS)) true (if (same (nth LAZY-DOCS i) [] true) (recur (+ i 1)) false)))))
+
+(deftest lazy-xml-options
+  (is (same "<r><a></a><a> </a><b>x</b></r>" [(v/field "nullValueOn" (v/->VStr "empty"))] true))
+  (is (same "<r><a></a><a> </a><b>x</b></r>" [(v/field "nullValueOn" (v/->VStr "none"))] true))
+  (is (same "<r><a k='toolong'>1</a></r>" [(v/field "maxAttributeSize" (v/->VStr "3"))] true)))
+
+(deftest leaf-roots-and-bad-starts-are-not-lazy
+  (is (= (lazy "<r>text</r>" [] 3) "NOT-LAZY"))
+  (is (= (lazy "<r/>" [] 3) "NOT-LAZY"))
+  (is (= (lazy "junk" [] 3) "NOT-LAZY"))
+  (is (= (lazy "<r k='toolong'><a/></r>" [(v/field "maxAttributeSize" (v/->VStr "3"))] 3) "NOT-LAZY")))

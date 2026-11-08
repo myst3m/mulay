@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:jmx="http://www.mulesoft.org/schema/mule/jmx"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/jmx http://www.mulesoft.org/schema/mule/jmx/current/mule-jmx.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18219"/>
+    </http:listener-config>
+    <file:config name="F">
+        <file:connection workingDir="/tmp"/>
+    </file:config>
+
+    <jmx:config name="J" logBufferSize="5000" logDir="/tmp/mulay-jmx-logs"/>
+    <!-- logDir 無し: mule.home/logs -->
+    <jmx:config name="Home"/>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <set-payload value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ ' | ' ++ error.description]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="seed">
+        <http:listener config-ref="L" path="/seed" allowedMethods="POST"/>
+        <file:write config-ref="F" path="mulay-jmx-logs/app.log"><file:content>2026-01-01 INFO  start
+2026-01-01 WARN  Disk Almost Full
+2026-01-01 ERROR failed to open
+2026-01-01 INFO  retry ok
+2026-01-01 error again
+2026-01-01 INFO  done</file:content></file:write>
+        <file:write config-ref="F" path="mulay-jmx-logs/trail.log"><file:content>a
+b
+c
+</file:content></file:write>
+        <file:write config-ref="F" path="mulay-jmx-logs/empty.log"><file:content></file:content></file:write>
+        <file:write config-ref="F" path="mulay-jmx-logs/日本語.log"><file:content>こんにちは
+世界</file:content></file:write>
+        <file:write config-ref="F" path="mulay-jmx-logs/crlf.log"><file:content>x&#13;
+y&#13;
+</file:content></file:write>
+        <file:write config-ref="F" path="mulay-jmx-logs/ws.log"><file:content>  
+ lead  mid  
+
+</file:content></file:write>
+        <set-payload value="seeded"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="mark">
+        <http:listener config-ref="L" path="/mark"/>
+        <logger level="INFO" message="#['MARK info ' ++ (attributes.queryParams.m default '')]"/>
+        <logger level="WARN" category="app.jmx" message="#['MARK warn ' ++ (attributes.queryParams.m default '')]"/>
+        <logger level="ERROR" category="app.jmx" message="#['MARK error ' ++ (attributes.queryParams.m default '')]"/>
+        <logger level="DEBUG" category="app.jmx" message="#['MARK debug ' ++ (attributes.queryParams.m default '')]"/>
+        <set-payload value="marked"/>
+    </flow>
+
+    <flow name="recent">
+        <http:listener config-ref="L" path="/recent"/>
+        <jmx:get-recent-logs config-ref="J"
+                             lines="#[attributes.queryParams.lines default '100']"
+                             level="#[attributes.queryParams.level]"
+                             pattern="#[attributes.queryParams.pattern]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="recent-defaults">
+        <http:listener config-ref="L" path="/recent-defaults"/>
+        <jmx:get-recent-logs config-ref="J" pattern="MARK"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 2 番目以降の jmx:config のバッファには何も入らない (実モジュールは appender に同じ名前を付けるため) -->
+    <flow name="recent-home">
+        <http:listener config-ref="L" path="/recent-home"/>
+        <jmx:get-recent-logs config-ref="Home"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="files">
+        <http:listener config-ref="L" path="/files"/>
+        <jmx:list-log-files config-ref="J"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="files-home">
+        <http:listener config-ref="L" path="/files-home"/>
+        <jmx:list-log-files config-ref="Home"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="tail">
+        <http:listener config-ref="L" path="/tail"/>
+        <jmx:tail-log-file config-ref="J"
+                           fileName="#[attributes.queryParams.file]"
+                           lines="#[attributes.queryParams.lines default '100']"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="tail-defaults">
+        <http:listener config-ref="L" path="/tail-defaults"/>
+        <jmx:tail-log-file config-ref="J" fileName="app.log"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="search">
+        <http:listener config-ref="L" path="/search"/>
+        <jmx:search-log-file config-ref="J"
+                             fileName="#[attributes.queryParams.file]"
+                             pattern="#[attributes.queryParams.pattern]"
+                             lines="#[attributes.queryParams.lines default '50']"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="search-defaults">
+        <http:listener config-ref="L" path="/search-defaults"/>
+        <jmx:search-log-file config-ref="J" fileName="app.log" pattern="info"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="metrics-cpu">
+        <http:listener config-ref="L" path="/metrics/cpu"/>
+        <jmx:collect-cpu config-ref="J"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

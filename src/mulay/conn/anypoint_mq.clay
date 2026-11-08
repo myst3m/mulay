@@ -1,0 +1,668 @@
+(ns mulay.conn.anypoint_mq
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.conn.amq_wire :as w] [mulay.lib.xml :as xml] [mulay.lib.uni :as uni]
+            [mulay.lib.random :as rnd] [mulay.dw.lib.core_misc :as misc] [mulay.dw.lib.binaries :as bin]
+            [mulay.dw.fmt.registry :as reg]
+            [clay.http :as http] [clay.httpmsg :as hm] [clay.tls :as ctls] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/anypoint-mq")
+(def USER-AGENT "Mule Anypoint MQ/4.0.23; Mule Version:4.11.3")
+(def MSG-ATTR-CLASS "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes")
+(def PUB-ATTR-CLASS "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes")
+(def DEFAULT-URL "https://mq-us-east-1.anypoint.mulesoft.com/api/v1/organizations/<organization_id>/environments/<environment_id>")
+
+(defn- mqerr err/MErr [id: Str desc: Str] (err/mk "ANYPOINT-MQ" id desc))
+
+(defrecord Link [base: Str org: Str env: Str auth: Str token: Str client-id: Str client-secret: Str v2: Bool])
+
+(defrecord Retry [max: Int initial: Int mult: Int max-interval: Int])
+
+(defrecord Buf [m: w/RMsg at: Int])
+(defrecord Sub [buf: Vec(Buf) stopped: Bool next-at: Int started: Bool fetchers: Bool errs: Vec(Str)])
+
+(defrecord St [links: Atom(Map(Str Link)) retry: Atom(Retry) subs: Atom(Map(Str Sub)) warming: Atom(Map(Str Bool))])
+
+(defrecord Resp [status: Int reason: Str body: Str err: Str])
+
+(defn- send1 Resp [method: &Str url: &Str hs: Vec(hm/Header) body: &Str timeout-ms: Int]
+  (let [hs1 (conj hs (hm/->Header "User-Agent" USER-AGENT))
+        o0 (assoc (http/request-opts (str url)) :method (str method) :headers hs1 :body (str body) :max-redirects 0 :timeout-ms timeout-ms)
+        o1 (if (str/starts-with? url "https") (assoc o0 :tls (assoc (ctls/default-config) :alpn ["http/1.1"])) o0)
+        [r e] (http/request o1)]
+    (if (not= e "") (->Resp 0 "" "" (str e))
+      (->Resp (:status r) (if (= (:reason r) "") (hm/reason-phrase (:status r)) (:reason r)) (:body r) ""))))
+
+(defn- jitter Int [ms: Int mult: Int cap: Int]
+  (let [[b ok] (rnd/seeded-bytes 2)
+        r (if (and ok (= (count b) 2)) (+ (* (nth b 0) 256) (nth b 1)) 0)
+        x (+ ms (/ (* ms (- mult 1) r) 65536))]
+    (if (> x cap) cap x)))
+
+(defn- retryable? Bool [r: &Resp] (or (not= (:err r) "") (= (:status r) 429) (and (>= (:status r) 500) (<= (:status r) 599))))
+
+(defn- process Resp [st: &St cfg: &Str method: &Str url: &Str hs: &Vec(hm/Header) body: &Str timeout-ms: Int]
+  (let [rt (deref (:retry st))]
+    (loop [left (:max rt) wait -1]
+      (let [tok (token-of st cfg)
+            r0 (send1 method url (conj hs (hm/->Header "Authorization" (str "Bearer " tok))) body timeout-ms)
+            r (if (not= (:status r0) 401) r0
+                (let [z (forget-token st cfg)
+                      [t2 te] (fresh-token st cfg)]
+                  (if (not= te "") r0 (send1 method url (conj hs (hm/->Header "Authorization" (str "Bearer " t2))) body timeout-ms))))]
+        (if (and (retryable? r) (> left 0))
+          (let [next (if (< wait 0) (min (:initial rt) (:max-interval rt)) (min (* wait (:mult rt)) (:max-interval rt)))
+                z (sleep-ms (jitter next (:mult rt) (:max-interval rt)))]
+            (recur (- left 1) next))
+          r)))))
+
+(defn- conn-elem Vec(xml/XNode) [cfg: &m/Config] (conn/child-elem (:children cfg) "connection"))
+
+(defn- link-of Vec(Link) [st: &St name: &Str]
+  (let [m (deref (:links st))] (if (contains? m name) [(get! m name)] [])))
+
+(defn- put-link Int [st: &St name: &Str l: Link]
+  (let [z (swap! (:links st) (fn Map(Str Link) [o: Map(Str Link)] (assoc o name l)))] 0))
+
+(defn- token-of Str [st: &St cfg: &Str]
+  (let [l (link-of st cfg)] (if (= (count l) 0) "" (:token (nth l 0)))))
+
+(defn- forget-token Int [st: &St cfg: &Str]
+  (let [l (link-of st cfg)] (if (= (count l) 0) 0 (put-link st cfg (assoc (nth l 0) :token "")))))
+
+(defn- friendly Str [r: &Resp client-id: &Str]
+  (cond (= (:status r) 401) "NOT AUTHORISED"
+        (= (:status r) 422) (str "CONNECTED APP CLIENT-ID " client-id " COULD NOT BE AUTHORISED ")
+        :else (str (:status r) " - " (:reason r) " (" (:body r) ")")))
+
+(defn- rest-msg Str [op: &Str msg: &Str] (str "An error occurred while executing the operation: " op ". Cause: " msg "."))
+
+(defn- json-field Str [body: &Str key: &Str]
+  (let [[x e] (reg/read-fmt "application/json" [] body)]
+    (if (not= e "") ""
+      (match (v/unmeta x)
+        (v/VObj fs) (let [f (v/obj-get fs key)] (if (= (count f) 0) "" (match (v/unmeta (nth f 0)) (v/VStr s) (str s) _ "")))
+        _ ""))))
+
+(defn- request-token Values(Str Str Int Str) [l: &Link tries: Int]
+  (let [body (str "client_id=" (:client-id l) "&client_secret=" (:client-secret l) "&grant_type=client_credentials")
+        rid (str/replace (misc/uuid4) "-" "")]
+    (loop [k 0 v2 (:v2 l) last (->Resp 0 "" "" "")]
+      (if (>= k tries)
+        (let [url (str (:auth l) (if v2 "/api/v2/oauth2/token" "/oauth2/token"))
+              fm (if (and (= (:status last) 0) (= (:err last) "")) "" (if (not= (:err last) "") "" (friendly last (:client-id l))))
+              m0 (str "Can not login into Authentication Server " url)
+              m1 (if (= (str/trim fm) "") m0 (str m0 " - " fm))
+              m2 (if (not= (:err last) "") (str m1 " - " (:err last)) m1)]
+          (values "" (rest-msg "AUTHORIZE AGAINST AUTH SERVER" m2) (:status last) (:reason last)))
+        (let [url (str (:auth l) (if v2 "/api/v2/oauth2/token" "/oauth2/token"))
+              r (send1 "POST" url [(hm/->Header "Content-Type" "application/x-www-form-urlencoded") (hm/->Header "X-Request-Id" rid)] body 60000)]
+          (cond
+            (and (= (:err r) "") (>= (:status r) 200) (< (:status r) 300))
+            (let [t (json-field (:body r) "access_token")] (if (= t "") (recur (+ k 1) v2 r) (values t "" 0 "")))
+            (= (:status r) 422) (recur (+ k 1) true r)
+            :else (recur (+ k 1) v2 r)))))))
+
+(defn- fresh-token Values(Str Str) [st: &St cfg: &Str]
+  (let [l (link-of st cfg)]
+    (if (= (count l) 0) (values "" "not connected")
+      (let [[t e status reason] (request-token (nth l 0) 5)]
+        (if (not= e "") (values "" e)
+          (let [z (put-link st cfg (assoc (nth l 0) :token t))] (values t "")))))))
+
+(defn- warming? Bool [st: &St name: &Str] (contains? (deref (:warming st)) name))
+
+(defn- connect Values(Link Vec(err/MErr)) [st: &St cfg: &m/Config]
+  (let [deadline (+ (quot (mono-us) 1000) 15000)
+        z (loop [] (if (and (warming? st (:name cfg)) (< (quot (mono-us) 1000) deadline)) (let [w (sleep-ms 10)] (recur)) 0))]
+    (connect-n st cfg 5)))
+
+(defn- connect-n Values(Link Vec(err/MErr)) [st: &St cfg: &m/Config tries: Int]
+  (let [name (:name cfg)
+        have (link-of st name)]
+    (if (and (> (count have) 0) (not= (:token (nth have 0)) "")) (values (nth have 0) [])
+      (let [ce (conn-elem cfg)
+            url (if (= (count ce) 0) DEFAULT-URL (xml/attr (nth ce 0) "" "url" DEFAULT-URL))
+            cid (if (= (count ce) 0) "" (xml/attr (nth ce 0) "" "clientId" ""))
+            csec (if (= (count ce) 0) "" (xml/attr (nth ce 0) "" "clientSecret" ""))
+            [base org env ue] (w/base-of url)
+            none (->Link "" "" "" "" "" "" "" false)]
+        (if (not= ue "") (values none [(mqerr "CONNECTIVITY" ue)])
+          (let [l0 (->Link base org env "" "" cid csec false)
+                rt (deref (:retry st))
+                reg-url (str base "/serviceRegistry")
+                r (loop [left (:max rt)]
+                    (let [r (send1 "GET" reg-url [] "" 60000)]
+                      (if (and (retryable? r) (> left 0)) (let [z (sleep-ms 1000)] (recur (- left 1))) r)))
+                auth (if (and (= (:err r) "") (>= (:status r) 200) (< (:status r) 300)) (registry-auth (:body r)) "")]
+            (if (= auth "")
+              (values none [(mqerr "CONNECTIVITY" (rest-msg "GET SERVICE REGISTRY AGAINST BROKER" (str "Can not get url from service registry " reg-url)))])
+              (let [l1 (assoc l0 :auth auth)
+                    [t e status reason] (request-token l1 tries)]
+                (cond
+                  (and (not= e "") (or (= status 401) (>= status 500)))
+                  (values none [(mqerr "CONNECTIVITY" (str "Failed to connect with Anypoint MQ Service: [" status "] " reason))])
+                  (not= e "") (values none [(mqerr "CONNECTIVITY" e)])
+                  :else (let [l2 (assoc l1 :token t) z (put-link st name l2)] (values l2 [])))))))))))
+
+(defn- registry-auth Str [body: &Str]
+  (let [[x e] (reg/read-fmt "application/json" [] body)]
+    (if (not= e "") ""
+      (match (v/unmeta x)
+        (v/VObj fs) (let [a (v/obj-get fs "authenticationServer")]
+                      (if (= (count a) 0) ""
+                        (match (v/unmeta (nth a 0))
+                          (v/VObj gs) (let [u (v/obj-get gs "url")] (if (= (count u) 0) "" (match (v/unmeta (nth u 0)) (v/VStr s) (str s) _ "")))
+                          _ "")))
+        _ ""))))
+
+(defn- config-of Vec(m/Config) [given: &Vec(m/Config) all: &Vec(m/Config)]
+  (if (> (count given) 0) [(nth given 0)]
+    (let [cs (loop [i 0 acc: Vec(m/Config) []] (if (>= i (count all)) acc (recur (+ i 1) (if (= (:kind (nth all i)) "anypoint-mq:config") (conj acc (nth all i)) acc))))]
+      (if (= (count cs) 1) cs []))))
+
+(defn- req-str Values(Str Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [[s x] (conn/required-str c name)]
+    (if (> (count x) 0)
+      (let [e (nth x 0)] (values "" [(if (= (:id e) "VALIDATION") (err/mk "MULE" "UNKNOWN" (:description e)) e)]))
+      (values s []))))
+
+(defn- opt-str Values(Vec(Str) Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [[xs x] (conn/attr-val c name)]
+    (cond (> (count x) 0) (values [] x)
+          (or (= (count xs) 0) (v/null? (nth xs 0))) (values [] [])
+          :else (match (nth xs 0) (v/VStr s) (values [(str s)] []) _ (let [[t e] (conn/attr-str c name "")] (values [t] e))))))
+
+(defn- int-param Values(Int Vec(err/MErr)) [c: &conn/OpCall name: &Str default: Int]
+  (let [[t x] (conn/attr-str c name "")]
+    (cond (> (count x) 0) (values 0 x)
+          (= (str/trim t) "") (values default [])
+          :else (let [[n e] (parse-long (str/trim t))]
+                  (if (= e "") (values n [])
+                    (values 0 [(err/mk "MULE" "EXPRESSION" (str "Invalid value '" t "' for parameter '" name "'"))]))))))
+
+(defn- to-millis Int [n: Int unit: &Str]
+  (let [u (str/upper-case (str/trim unit))]
+    (cond (= u "NANOSECONDS") (/ n 1000000) (= u "MICROSECONDS") (/ n 1000) (= u "SECONDS") (* n 1000)
+          (= u "MINUTES") (* n 60000) (= u "HOURS") (* n 3600000) (= u "DAYS") (* n 86400000) :else n)))
+
+(defn- cls Vec(v/Field) [c: &Str] [(v/field "class" (v/->VStr (str c)))])
+(def CM-HASHMAP (cls "java.util.HashMap"))
+(def CM-INT (cls "java.lang.Integer"))
+
+(defn- field-str Vec(Str) [fs: &Vec(v/Field) k: &Str]
+  (let [x (v/obj-get fs k)] (if (= (count x) 0) [] (match (v/unmeta (nth x 0)) (v/VStr s) [(str s)] _ []))))
+
+(defn delivery-count Int [m: &w/RMsg]
+  (let [d (field-str (:headers m) "deliveryCount")]
+    (if (= (count d) 0) 1 (let [[n e] (parse-long (str/trim (nth d 0)))] (if (and (= e "") (= (str/trim (nth d 0)) (nth d 0))) n 1)))))
+
+(defn- opt-val v/Val [x: &Vec(Str)] (if (= (count x) 0) (v/null-v) (v/->VStr (str (nth x 0)))))
+
+(defn msg-attrs ev/TV [dest: &Str m: &w/RMsg manual: Bool]
+  (let [id (field-str (:headers m) "messageId")
+        lock (field-str (:headers m) "lockId")
+        tok (if manual
+              (let [i (if (= (count id) 0) "" (nth id 0)) l (if (= (count lock) 0) "" (nth lock 0))] (v/->VStr (w/ack-token dest i l)))
+              (v/null-v))]
+    (ev/tv-val (v/->VMeta (v/->VObj [(v/field "headers" (v/->VMeta (v/->VObj (:headers m)) CM-HASHMAP))
+                                     (v/field "destination" (v/->VStr (str dest)))
+                                     (v/field "messageId" (opt-val id))
+                                     (v/field "ackToken" tok)
+                                     (v/field "deliveryCount" (v/->VMeta (v/int-v (delivery-count m)) CM-INT))
+                                     (v/field "contentType" (opt-val (field-str (:props m) "contentType")))
+                                     (v/field "properties" (v/->VMeta (v/->VObj (:props m)) CM-HASHMAP))])
+                          (cls MSG-ATTR-CLASS))
+               ev/JAVA)))
+
+(defn- msg-payload ev/TV [m: &w/RMsg]
+  (let [ct (field-str (:props m) "contentType")]
+    (ev/as-stream (ev/tv-raw (:body m) (if (= (count ct) 0) ev/ANY (nth ct 0))))))
+
+(defn with-output ev/TV [t: ev/TV om: &Str oe: &Str]
+  (if (and (= om "") (= oe "")) t
+    (let [mime (:mime t)
+          base (if (= om "") (reg/norm-mime mime) (str/trim om))
+          cs (cond (not= oe "") (str/trim oe) (str/includes? (str/lower-case mime) "charset=") (ev/charset-of mime) :else "")
+          m2 (if (= cs "") base (str base "; charset=" cs))]
+      (ev/->TV (:val t) m2 (:props t) (:raw t) (:state t) (:stream t)))))
+
+(defn- rest-fail err/MErr [r: &Resp id: &Str prefix: &Str op: &Str client-id: &Str]
+  (cond (not= (:err r) "") (mqerr id (str prefix (:err r)))
+        (= (:status r) 404) (mqerr "DESTINATION_NOT_FOUND" (str prefix (rest-msg op (friendly r client-id))))
+        :else (mqerr id (str prefix (rest-msg op (friendly r client-id))))))
+
+(defn- ok? Bool [r: &Resp] (and (= (:err r) "") (>= (:status r) 200) (< (:status r) 300)))
+
+(def JSON-HEADERS [(hm/->Header "Content-Type" "application/json")])
+
+(defn- do-ack Values(Resp Bool) [st: &St cfg: &Str l: &Link dest: &Str id: &Str lock: &Vec(Str)]
+  (let [url (w/message-url (:base l) (:org l) (:env l) dest id)
+        body (if (= (count lock) 0) "{}" (w/lock-json (nth lock 0)))
+        r (process st cfg "DELETE" url JSON-HEADERS body 60000)]
+    (values r (ok? r))))
+
+(defn- do-nack Values(Resp Bool) [st: &St cfg: &Str l: &Link dest: &Str id: &Str lock: &Str]
+  (let [url (w/lock-url (:base l) (:org l) (:env l) dest id lock)
+        none: Vec(hm/Header) []
+        r (process st cfg "DELETE" url none "" 60000)]
+    (values r (ok? r))))
+
+(defn- receive Values(Vec(w/RMsg) Resp Str) [st: &St cfg: &Str l: &Link dest: &Str batch: Int polling-ms: Int lock-ms: Int]
+  (let [q0: Vec(Str) []
+        q1 (if (> batch 1) (conj q0 (str "batchSize=" batch)) q0)
+        q2 (if (> polling-ms 0) (conj q1 (str "pollingTime=" polling-ms)) q1)
+        q3 (if (> lock-ms 0) (conj q2 (str "lockTtl=" lock-ms)) q2)
+        base (w/messages-url (:base l) (:org l) (:env l) dest)
+        url (if (= (count q3) 0) base (str base "?" (str/join "&" q3)))
+        none: Vec(hm/Header) []
+        r (process st cfg "GET" url none "" 60000)
+        no: Vec(w/RMsg) []]
+    (cond
+      (not (ok? r)) (values no r "")
+      (= (:status r) 204) (values no r "")
+      :else (let [[ms e] (w/parse-receive (:body r))] (values ms r e)))))
+
+(defn- fail1 conn/OpResult [x: &Vec(err/MErr)] (conn/fail-result (nth x 0)))
+
+(defn- body-bytes Values(Str Bool Str) [t: &ev/TV]
+  (if (and (= (:state t) ev/VAL) (v/null? (:val t))) (values "" true "")
+    (let [[b e] (ev/bytes t)] (values b false e))))
+
+(defn user-props Values(Vec(w/Kv) Str) [x: &v/Val]
+  (let [none: Vec(w/Kv) []]
+    (match (v/unmeta x)
+      (v/VNull) (values none "")
+      (v/VObj fs)
+      (loop [i 0 acc none]
+        (if (>= i (count fs)) (values acc "")
+          (let [f (nth fs i) k (:name (:key f)) y (v/unmeta (:value f))]
+            (match y
+              (v/VNull) (values none "Property value can not be null")
+              (v/VStr s) (recur (+ i 1) (conj acc (w/->Kv k (w/->JStr (str s)))))
+              (v/VBool b) (recur (+ i 1) (conj acc (w/->Kv k (w/->JStr (if b "true" "false")))))
+              (v/VInt n) (recur (+ i 1) (conj acc (w/->Kv k (w/->JNum (str n)))))
+              (v/VNum n) (recur (+ i 1) (conj acc (w/->Kv k (w/->JNum (num/to-plain-str n)))))
+              _ (values none "Property value accept only string or number or boolean as values")))))
+      _ (values none "Property value accept only string or number or boolean as values"))))
+
+(defn- mime-charset Str [mime: &Str]
+  (let [lm (str/lower-case mime) k (str/index-of lm "charset=")]
+    (if (< k 0) "" (let [cs (ev/charset-of mime) id (bin/charset-id cs)] (if (= id "") (str cs) id)))))
+
+(defn- run-publish conn/OpResult [st: &St c: &conn/OpCall cfg: &m/Config]
+  (let [[dest dx] (req-str c "destination")
+        [mid mx] (opt-str c "messageId")
+        [gid gx] (opt-str c "messageGroupId")
+        [dl dlx] (opt-str c "deliveryDelay")
+        [du dux] (conn/attr-str c "deliveryDelayUnit" "MILLISECONDS")
+        [sct sx] (conn/attr-bool c "sendContentType" true)
+        [bt bx] (conn/child-tv c "body")
+        [pt px] (conn/child-tv c "properties")]
+    (cond
+      (> (count dx) 0) (fail1 dx) (> (count mx) 0) (fail1 mx) (> (count gx) 0) (fail1 gx) (> (count dlx) 0) (fail1 dlx)
+      (> (count dux) 0) (fail1 dux) (> (count sx) 0) (fail1 sx) (> (count bx) 0) (fail1 bx) (> (count px) 0) (fail1 px)
+      :else
+      (let [[l ce] (connect st cfg)
+            body-tv (if (= (count bt) 0) (:payload (:event c)) (nth bt 0))
+            [delay de] (if (= (count dl) 0) (values 0 "") (parse-long (str/trim (nth dl 0))))
+            delay-ms (to-millis delay du)]
+        (cond
+          (> (count ce) 0) (fail1 ce)
+          (and (> (count gid) 0) (not (w/group-id-ok? (nth gid 0))))
+          (conn/fail-result (mqerr "ILLEGAL_MESSAGE_GROUP_ID" "The field messageGroupId can be up to 128 characters and must contain only alphanumeric characters and punctuation (!\"#$%&\\'()*+,-./:;<=>?@[\\\\]^_`{|}~) ."))
+          :else
+          (let [[raw is-null be] (body-bytes body-tv)]
+            (cond
+              is-null (conn/fail-result (mqerr "ILLEGAL_BODY" "The Body of the message cannot be 'null'"))
+              (not= be "") (conn/fail-result (err/mk "MULE" "UNKNOWN" be))
+              (not= de "") (conn/fail-result (err/mk "MULE" "EXPRESSION" (str "Invalid value '" (nth dl 0) "' for parameter 'deliveryDelay'")))
+              (and (> (count dl) 0) (or (< delay-ms 0) (> delay-ms 900000)))
+              (conn/fail-result (mqerr "ILLEGAL_DELAY" "Delivery delay must be within the range of 0 - 900000 milliseconds"))
+              :else
+              (let [mime (:mime body-tv)
+                    cs (mime-charset mime)
+                    p0: Vec(w/Kv) []
+                    p1 (if sct (conj p0 (w/->Kv "contentType" (w/->JStr (str mime)))) p0)
+                    p2 (if (and sct (not= cs "")) (conj p1 (w/->Kv "MULE_ENCODING" (w/->JStr cs))) p1)
+                    [ups ue] (if (= (count pt) 0) (let [z: Vec(w/Kv) []] (values z ""))
+                               (let [[x t2 xe] (ev/value (nth pt 0))] (if (not= xe "") (let [z: Vec(w/Kv) []] (values z xe)) (user-props x))))]
+                (if (not= ue "") (conn/fail-result (err/mk "MULE" "UNKNOWN" ue))
+                  (let [props (loop [i 0 acc p2] (if (>= i (count ups)) acc (recur (+ i 1) (conj acc (nth ups i)))))
+                        id (if (= (count mid) 0) (misc/uuid4) (nth mid 0))
+                        h0 [(w/->Kv "messageId" (w/->JStr id))]
+                        h1 (if (> (count dl) 0) (conj h0 (w/->Kv "deliveryDelay" (w/->JStr (str delay-ms)))) h0)
+                        h2 (if (> (count gid) 0) (conj h1 (w/->Kv "messageGroupId" (w/->JStr (nth gid 0)))) h1)
+                        text (uni/sanitize raw)
+                        body (w/publish-json text h2 props)
+                        url (w/message-url (:base l) (:org l) (:env l) dest id)
+                        r (process st (:name cfg) "PUT" url JSON-HEADERS body 60000)
+                        prefix (str "Failed to publish message to destination '" dest "': ")]
+                    (cond
+                      (and (= (:err r) "") (= (:status r) 413)) (conn/fail-result (mqerr "ILLEGAL_BODY" (str prefix (friendly r (:client-id l)))))
+                      (not (ok? r)) (conn/fail-result (rest-fail r "PUBLISHING" prefix "SEND ONE MESSAGE" (:client-id l)))
+                      :else
+                      (let [rid (json-field (:body r) "messageId")
+                            attrs (ev/tv-val (v/->VMeta (v/->VObj [(v/field "messageId" (if (= rid "") (v/null-v) (v/->VStr rid)))]) (cls PUB-ATTR-CLASS)) ev/JAVA)]
+                        (conn/ok-result (with-output (ev/as-stream (ev/tv-raw raw ev/ANY)) (conn/param-lit (:params c) "outputMimeType" "")
+                                                     (conn/param-lit (:params c) "outputEncoding" ""))
+                                        attrs)))))))))))))
+
+(defn- run-consume conn/OpResult [st: &St c: &conn/OpCall cfg: &m/Config]
+  (let [[dest dx] (req-str c "destination")
+        [mode mx] (conn/attr-str c "acknowledgementMode" "IMMEDIATE")
+        [at ax] (int-param c "acknowledgementTimeout" 0)
+        [atu aux] (conn/attr-str c "acknowledgementTimeoutUnit" "MILLISECONDS")
+        [pt px] (int-param c "pollingTime" 10000)
+        [ptu pux] (conn/attr-str c "pollingTimeUnit" "MILLISECONDS")
+        om (conn/param-lit (:params c) "outputMimeType" "")
+        oe (conn/param-lit (:params c) "outputEncoding" "")]
+    (cond
+      (> (count dx) 0) (fail1 dx) (> (count mx) 0) (fail1 mx) (> (count ax) 0) (fail1 ax) (> (count aux) 0) (fail1 aux)
+      (> (count px) 0) (fail1 px) (> (count pux) 0) (fail1 pux)
+      :else
+      (let [[l ce] (connect st cfg)
+            ack-ms (to-millis at atu)
+            poll-ms (to-millis pt ptu)
+            manual (= (str/upper-case (str/trim mode)) "MANUAL")]
+        (cond
+          (> (count ce) 0) (fail1 ce)
+          (< at 0) (conn/fail-result (mqerr "CONSUMING" (str "Acknowledgement timeout cannot be less than zero, but was `" at "`")))
+          (or (< poll-ms 0) (> poll-ms 20000))
+          (conn/fail-result (mqerr "CONSUMING" (str "Polling time `" poll-ms "` is not in the '0 to 20000' milliseconds range")))
+          :else
+          (let [[ms r pe] (receive st (:name cfg) l dest 1 poll-ms ack-ms)
+                prefix (str "Failed to consume from destination '" dest "': ")]
+            (cond
+              (not (ok? r)) (conn/fail-result (rest-fail r "CONSUMING" prefix "RECEIVE MESSAGES" (:client-id l)))
+              (not= pe "") (conn/fail-result (mqerr "CONSUMING" (str prefix (rest-msg "RECEIVE MESSAGES" pe))))
+              (= (count ms) 0)
+              (if (> poll-ms 0)
+                (conn/fail-result (mqerr "TIMEOUT" (str "Failed to retrieve a Message. Didn't receive any message during polling interval of '" poll-ms "' milliseconds")))
+                (conn/ok-result (ev/tv-val (v/->VMeta (v/null-v) [(v/field "encoding" (v/->VStr "UTF-8"))]) ev/ANY) (ev/tv-null)))
+              :else
+              (let [msg (nth ms 0)
+                    attrs (msg-attrs dest msg manual)
+                    id (field-str (:headers msg) "messageId")
+                    idv (if (= (count id) 0) "" (nth id 0))]
+                (if manual (conn/ok-result (with-output (msg-payload msg) om oe) attrs)
+                  (let [[ar aok] (do-ack st (:name cfg) l dest idv (field-str (:headers msg) "lockId"))]
+                    (if aok (conn/ok-result (with-output (msg-payload msg) om oe) attrs)
+                      (conn/fail-result (rest-fail ar "ACKING" (str "Failed to perform the IMMEDIATE ACK of the message with id '" idv "': ") "ACK ONE MESSAGE" (:client-id l))))))))))))))
+
+(defn- blank? Bool [s: &Str]
+  (loop [i 0] (if (>= i (count s)) true (let [ch (nth s i)] (if (or (= ch 32) (and (>= ch 9) (<= ch 13)) (and (>= ch 28) (<= ch 31))) (recur (+ i 1)) false)))))
+
+(defn- run-ack conn/OpResult [st: &St c: &conn/OpCall cfg: &m/Config nack: Bool]
+  (let [[tok tx] (req-str c "ackToken")
+        id-name (if nack "NACKING" "ACKING")
+        what (if nack "NACK" "ACK")]
+    (if (> (count tx) 0) (fail1 tx)
+      (let [[l ce] (connect st cfg)]
+        (cond
+          (> (count ce) 0) (fail1 ce)
+          (blank? tok) (conn/fail-result (mqerr id-name "Invalid token: The 'ackToken' cannot be an empty String"))
+          :else
+          (let [[t de] (w/ack-token-decode tok)]
+            (cond
+              (not= de "") (conn/fail-result (mqerr id-name (str "The provided ackToken '" tok "' is invalid and could not be decoded: " de)))
+              (:null t) (conn/fail-result (err/mk "MULE" "UNKNOWN" "Cannot invoke \"com.mulesoft.extension.mq.internal.model.AckToken.getMessageId()\" because \"token\" is null"))
+              (= (count (:dest t)) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" "unknown description"))
+              (or (= (count (:id t)) 0) (and nack (= (count (:lock t)) 0)))
+              (conn/fail-result (err/mk "MULE" "UNKNOWN" "Cannot invoke \"String.length()\" because \"s\" is null"))
+              :else
+              (let [dest (nth (:dest t) 0) id (nth (:id t) 0)
+                    [r ok] (if nack (do-nack st (:name cfg) l dest id (nth (:lock t) 0)) (do-ack st (:name cfg) l dest id (:lock t)))]
+                (if ok (conn/keep-result c)
+                  (conn/fail-result (rest-fail r id-name (str "Failed to " what " the message with id '" id "': ")
+                                               (if nack "NOT-ACK ONE MESSAGE" "ACK ONE MESSAGE") (:client-id l))))))))))))
+
+(defn- run-op conn/OpResult [st: &St c: &conn/OpCall]
+  (let [op (:op c)
+        cfgs (config-of (:config c) (:configs c))]
+    (cond
+      (= (count cfgs) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "anypoint-mq:" op ": no anypoint-mq:config")))
+      (= op "publish") (run-publish st c (nth cfgs 0))
+      (= op "consume") (run-consume st c (nth cfgs 0))
+      (= op "ack") (run-ack st c (nth cfgs 0) false)
+      (= op "nack") (run-ack st c (nth cfgs 0) true)
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation anypoint-mq:" op))))))
+
+(defrecord SubCfg [dest: Str mode: Str ack-ms: Int polling: Bool batch: Int freq-ms: Int start-ms: Int max-local: Int])
+
+(defn- elem-attr-int Int [n: &xml/XNode k: &Str default: Int]
+  (let [t (str/trim (xml/attr n "" k ""))] (if (= t "") default (let [[x e] (parse-long t)] (if (= e "") x default)))))
+
+(defn- sub-cfg SubCfg [s: &conn/SrcCall]
+  (let [ps (:params s)
+        dest (conn/param-lit ps "destination" "")
+        mode (str/upper-case (str/trim (conn/param-lit ps "acknowledgementMode" "AUTO")))
+        [at e] (parse-long (str/trim (conn/param-lit ps "acknowledgementTimeout" "0")))
+        ack-ms (to-millis (if (= e "") at 0) (conn/param-lit ps "acknowledgementTimeoutUnit" "MILLISECONDS"))
+        st (conn/child-elem (:children s) "subscriber-type")
+        kids (if (= (count st) 0) [] (xml/child-elems (nth st 0)))
+        pol (conn/child-elem kids "polling")
+        pre (conn/child-elem kids "prefetch")]
+    (if (> (count pol) 0)
+      (let [p (nth pol 0)
+            ss (loop [i 0 ks (xml/child-elems p)] (if (>= i (count ks)) [] (if (= (xml/elem-local (nth ks i)) "scheduling-strategy") [(nth ks i)] (recur (+ i 1) ks))))
+            ff (if (= (count ss) 0) [] (conn/child-elem (xml/child-elems (nth ss 0)) "fixed-frequency"))
+            unit (if (= (count ff) 0) "MILLISECONDS" (xml/attr (nth ff 0) "" "timeUnit" "MILLISECONDS"))
+            freq (if (= (count ff) 0) 1000 (to-millis (elem-attr-int (nth ff 0) "frequency" 1000) unit))
+            start (if (= (count ff) 0) 1000 (to-millis (elem-attr-int (nth ff 0) "startDelay" 0) unit))]
+        (->SubCfg dest mode ack-ms true (elem-attr-int p "fetchSize" 10) freq start 0))
+      (let [ml (if (= (count pre) 0) 30 (elem-attr-int (nth pre 0) "maxLocalMessages" 30))]
+        (->SubCfg dest mode ack-ms false (min ml 10) 0 0 ml)))))
+
+(defn- lock-ms-of Int [sc: &SubCfg] (if (> (:ack-ms sc) 0) (:ack-ms sc) (if (:polling sc) 0 120000)))
+
+(defn- st-copy St [st: &St] (->St (:links st) (:retry st) (:subs st) (:warming st)))
+
+(defn- no-sub Sub [] (let [b: Vec(Buf) [] e: Vec(Str) []] (->Sub b false 0 false false e)))
+
+(defn- sub-of Sub [st: &St key: &Str]
+  (let [m (deref (:subs st))] (if (contains? m key) (get! m key) (no-sub))))
+
+(defn- update-sub Int [st: &St key: &Str f: Fn(Sub Sub)]
+  (let [z (swap! (:subs st) (fn Map(Str Sub) [o: Map(Str Sub)]
+                              (let [cur (if (contains? o key) (get! o key) (no-sub))] (assoc o key (f cur)))))]
+    0))
+
+(defn- with-err Sub [x: Sub e: &Str] (assoc x :errs (conj (:errs x) (str e))))
+
+(defn- add-err Int [st: &St key: &Str e: Str]
+  (update-sub st key (fn Sub [x: Sub] (with-err x e))))
+
+(defn- drop-err Sub [x: Sub] (assoc x :errs (subvec (:errs x) 1 (count (:errs x)))))
+
+(defn- take-err Str [st: &St key: &Str]
+  (let [es (:errs (sub-of st key))]
+    (if (= (count es) 0) ""
+      (let [e (nth es 0) z (update-sub st key drop-err)] e))))
+
+(defn- set-stopped Sub [x: Sub] (assoc x :stopped true))
+(defn- set-fetchers Sub [x: Sub] (assoc x :fetchers true))
+(defn- drop-head Sub [x: Sub] (assoc x :buf (subvec (:buf x) 1 (count (:buf x)))))
+
+(defn- fetch-err Str [r: &Resp pe: &Str client-id: &Str]
+  (str "Can not retrieve messages: " (rest-msg "RECEIVE MESSAGES" (cond (not= pe "") pe (not= (:err r) "") (:err r) :else (friendly r client-id)))))
+
+(defn- append-buf Sub [x: Sub ms: &Vec(w/RMsg) now: Int]
+  (assoc x :buf (loop [i 0 acc (:buf x)] (if (>= i (count ms)) acc (recur (+ i 1) (conj acc (->Buf (nth ms i) now)))))))
+
+(defrecord FetchJob [st: St key: Str cfg: m/Config sc: SubCfg])
+
+(defn- prefetcher Int [j: FetchJob]
+  (let [st (:st j) key (:key j) sc (:sc j) cfg (:cfg j)]
+    (loop []
+      (let [sub (sub-of st key)]
+        (cond
+          (:stopped sub) (let [z (sleep-ms 1000)] (recur))
+          (>= (count (:buf sub)) (:max-local sc)) (let [z (sleep-ms 10)] (recur))
+          :else
+          (let [[l ce] (connect st cfg)]
+            (if (> (count ce) 0)
+              (let [z (add-err st key (:description (nth ce 0))) z2 (sleep-ms 5000)] (recur))
+              (let [[ms r pe] (receive st (:name cfg) l (:dest sc) (:batch sc) 20000 (lock-ms-of sc))]
+                (cond
+                  (and (= (:err r) "") (= (:status r) 404))
+                  (let [z (update-sub st key set-stopped)
+                        z2 (add-err st key (str "Destination '" (:dest sc) "' not found. Shutting down subscriber..."))]
+                    (recur))
+                  (or (not (ok? r)) (not= pe ""))
+                  (let [z (add-err st key (fetch-err r pe (:client-id l))) z2 (sleep-ms 1000)] (recur))
+                  :else
+                  (let [now (quot (mono-us) 1000)
+                        z (update-sub st key (fn Sub [x: Sub] (append-buf x ms now)))]
+                    (recur)))))))))))
+
+(defn- renew-lock Bool [st: &St cfg: &Str l: &Link dest: &Str m: &w/RMsg ttl: Int]
+  (let [id (field-str (:headers m) "messageId") lock (field-str (:headers m) "lockId")]
+    (if (or (= (count id) 0) (= (count lock) 0)) false
+      (let [url (w/locks-url (:base l) (:org l) (:env l) dest)
+            r (process st cfg "PATCH" url JSON-HEADERS (w/ttls-json id lock ttl) 60000)]
+        (and (ok? r) (str/includes? (:body r) "uccessful"))))))
+
+(defrecord AckJob [st: St key: Str cfg: Str l: Link dest: Str id: Str lock: Vec(Str) nack: Bool])
+
+(defn- ack-job Int [j: AckJob]
+  (let [st (:st j) l (:l j) dest (:dest j) idv (:id j) lock (:lock j) lk (if (= (count lock) 0) "" (nth lock 0))]
+    (if (:nack j)
+      (let [[r ok] (do-nack st (:cfg j) l dest idv lk)]
+        (if ok 0
+          (add-err st (:key j) (str "Failed to do AUTO 'NACK' on the message with id '" idv "' on destination '" dest "': "
+                                    (rest-msg "NOT-ACK ONE MESSAGE" (if (not= (:err r) "") (:err r) (friendly r (:client-id l))))))))
+      (let [[r ok] (do-ack st (:cfg j) l dest idv lock)]
+        (if ok 0
+          (let [[zr zok] (do-nack st (:cfg j) l dest idv lk)]
+            (add-err st (:key j) (str "Failed to do AUTO 'ACK' on the message with id '" idv "' on destination '" dest "': "
+                                      (rest-msg "ACK ONE MESSAGE" (if (not= (:err r) "") (:err r) (friendly r (:client-id l))))))))))))
+
+(defn- dispatch Str [st: &St s: &conn/SrcCall cfg: &Str l: &Link sc: &SubCfg m: &w/RMsg]
+  (let [id (field-str (:headers m) "messageId")
+        idv (if (= (count id) 0) "" (nth id 0))
+        lock (field-str (:headers m) "lockId")
+        mode (:mode sc)
+        dest (:dest sc)
+        [ar aok] (if (= mode "IMMEDIATE") (do-ack st cfg l dest idv lock) (values (->Resp 200 "" "" "") true))]
+    (if (not aok)
+      (str "ACK mode was set to IMMEDIATE for message with ID " idv ", but failed to do the acknowledge: "
+           (rest-msg "ACK ONE MESSAGE" (if (not= (:err ar) "") (:err ar) (friendly ar (:client-id l)))))
+      (let [p (with-output (msg-payload m) (conn/param-lit (:params s) "outputMimeType" "") (conn/param-lit (:params s) "outputEncoding" ""))
+            [e x] ((:run s) p (msg-attrs dest m (= mode "MANUAL")) "" "")]
+        (if (not= mode "AUTO") ""
+          (let [job (->AckJob (st-copy st) (str (:flow s)) (str cfg) l (str dest) idv lock (> (count x) 0))
+                z (future-detach (future (fn Int [j: AckJob] (ack-job j)) job))]
+            ""))))))
+
+(defn- start-fetchers Int [st: &St key: &Str cfg: &m/Config sc: &SubCfg n: Int]
+  (loop [i 0]
+    (if (>= i n) 0
+      (let [job (->FetchJob (st-copy st) (str key) cfg sc)
+            zd (future-detach (future (fn Int [j: FetchJob] (prefetcher j)) job))]
+        (recur (+ i 1))))))
+
+(defn- poll-prefetch Values(Int Str) [st: &St s: &conn/SrcCall cfg: &m/Config sc: &SubCfg]
+  (let [key (:flow s)
+        sub (sub-of st key)
+        z0 (if (:fetchers sub) 0
+             (let [z (update-sub st key set-fetchers)]
+               (start-fetchers st key cfg sc (if (> (:max-local sc) 10) (min (/ (:max-local sc) 10) 3) 1))))
+        deadline (+ (quot (mono-us) 1000) 200)
+        got (loop [] (let [n (count (:buf (sub-of st key)))]
+                       (if (or (> n 0) (>= (quot (mono-us) 1000) deadline)) n (let [w (sleep-ms 5)] (recur)))))]
+    (if (= got 0) (values 0 (take-err st key))
+      (let [b0 (nth (:buf (sub-of st key)) 0)
+            z1 (update-sub st key drop-head)
+            [l ce] (connect st cfg)
+            lock-ms (lock-ms-of sc)
+            old (> (* (- (quot (mono-us) 1000) (:at b0)) 10) (* lock-ms 8))]
+        (cond
+          (> (count ce) 0) (values 0 (:description (nth ce 0)))
+          (and old (not (renew-lock st (:name cfg) l (:dest sc) (:m b0) lock-ms))) (values 0 (take-err st key))
+          :else (let [d (dispatch st s (:name cfg) l sc (:m b0))] (values 1 (if (= d "") (take-err st key) d))))))))
+
+(defn- poll-polling Values(Int Str) [st: &St s: &conn/SrcCall cfg: &m/Config sc: &SubCfg]
+  (let [key (:flow s)
+        sub (sub-of st key)
+        now (quot (mono-us) 1000)
+        at (if (:started sub) (:next-at sub) (+ now (:start-ms sc)))
+        z0 (if (> at now) (sleep-ms (- at now)) 0)
+        t0 (quot (mono-us) 1000)
+        next (+ t0 (:freq-ms sc))
+        z1 (update-sub st key (fn Sub [x: Sub] (assoc x :started true :next-at next)))
+        [l ce] (connect st cfg)]
+    (if (> (count ce) 0) (let [z (sleep-ms 5000)] (values 0 (:description (nth ce 0))))
+      (let [[ms r pe] (receive st (:name cfg) l (:dest sc) (:batch sc) 20000 (lock-ms-of sc))]
+        (cond
+          (and (= (:err r) "") (= (:status r) 404))
+          (let [z (update-sub st key set-stopped)]
+            (values 0 (str "Destination '" (:dest sc) "' not found. Shutting down subscriber...")))
+          (or (not (ok? r)) (not= pe "")) (let [z (sleep-ms 1000)] (values 0 (fetch-err r pe (:client-id l))))
+          :else
+          (let [errs (loop [i 0 acc: Vec(Str) []]
+                       (if (>= i (count ms)) acc
+                         (let [d (dispatch st s (:name cfg) l sc (nth ms i))] (recur (+ i 1) (if (= d "") acc (conj acc d))))))
+                e (if (> (count errs) 0) (nth errs 0) (take-err st key))]
+            (values (count ms) e)))))))
+
+(defn- poll Values(Int Str) [st: &St s: conn/SrcCall]
+  (let [cfgs (config-of (:config s) (:configs s))
+        sc (sub-cfg s)]
+    (cond
+      (:stopped (sub-of st (:flow s))) (let [z (sleep-ms 1000)] (values 0 (take-err st (:flow s))))
+      (= (count cfgs) 0) (let [z (sleep-ms 1000)] (values 0 "anypoint-mq:subscriber: no anypoint-mq:config"))
+      (:polling sc) (poll-polling st s (nth cfgs 0) sc)
+      :else (poll-prefetch st s (nth cfgs 0) sc))))
+
+(defn- prop-int Int [app: &m/App key: &Str default: Int]
+  (let [ps (:properties app)]
+    (loop [i 0]
+      (if (>= i (count ps)) default
+        (if (= (:name (nth ps i)) key)
+          (match (:v (nth ps i)) (m/PLit s) (let [[n e] (parse-long (str/trim s))] (if (= e "") n default)) _ default)
+          (recur (+ i 1)))))))
+
+(defn- warm Int [st: St cfg: m/Config]
+  (let [[l e] (connect-n st cfg 1)
+        name (:name cfg)
+        z (swap! (:warming st) (fn Map(Str Bool) [o: Map(Str Bool)] (dissoc o name)))]
+    0))
+
+(defn- init Vec(Str) [st: &St app: &m/App]
+  (let [z (reset! (:retry st) (->Retry (max 0 (prop-int app "max.retries.failure.operation" 5))
+                                       (prop-int app "object.store.client.back.off.initial.wait" 1000)
+                                       (max 1 (prop-int app "object.store.client.back.off.multiplier" 2))
+                                       (prop-int app "object.store.client.back.off.max.interval" 30000)))
+        cs (:configs app)
+        z2 (loop [i 0]
+             (if (>= i (count cs)) 0
+               (let [c (nth cs i)]
+                 (if (= (:kind c) "anypoint-mq:config")
+                   (let [name (:name c)
+                         zw (swap! (:warming st) (fn Map(Str Bool) [o: Map(Str Bool)] (assoc o name true)))
+                         stc (->St (:links st) (:retry st) (:subs st) (:warming st))
+                         f (future (fn Int [x: m/Config] (warm stc x)) c)
+                         zd (future-detach f)]
+                     (recur (+ i 1)))
+                   (recur (+ i 1))))))]
+    []))
+
+(def ERROR-PARENTS
+  [
+   "ANYPOINT-MQ:ILLEGAL_MESSAGE_GROUP_ID" "ANYPOINT-MQ:PUBLISHING"
+   "ANYPOINT-MQ:ILLEGAL_BODY" "ANYPOINT-MQ:PUBLISHING"
+   "ANYPOINT-MQ:ILLEGAL_DELAY" "ANYPOINT-MQ:PUBLISHING"
+   "ANYPOINT-MQ:TIMEOUT" "ANYPOINT-MQ:CONSUMING"
+   "ANYPOINT-MQ:CONNECTIVITY" "MULE:CONNECTIVITY"
+   "ANYPOINT-MQ:RETRY_EXHAUSTED" "MULE:RETRY_EXHAUSTED"])
+
+(defn connector conn/Connector []
+  (let [ls: Map(Str Link) {}
+        ss: Map(Str Sub) {}
+        ws: Map(Str Bool) {}
+        st (->St (atom ls) (atom (->Retry 5 1000 2 30000)) (atom ss) (atom ws))]
+    (assoc (conn/connector "anypoint-mq" NS (fn conn/OpResult [c: conn/OpCall] (run-op st c)))
+           :sources ["subscriber"] :push ["subscriber"]
+           :poll (fn Values(Int Str) [s: conn/SrcCall] (poll st s))
+           :init (fn Vec(Str) [a: m/App] (init st a))
+           :error-parents ERROR-PARENTS)))

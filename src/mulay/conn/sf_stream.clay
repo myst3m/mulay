@@ -1,0 +1,195 @@
+(ns mulay.conn.sf_stream
+  (:require [mulay.dw.val :as v] [mulay.dw.fmt.registry :as reg] [mulay.mule.model :as m] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.rt.event :as ev] [mulay.lib.xml :as xml]
+            [mulay.conn.sf_core :as sc] [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(def STREAM-OPS ["publish-topic" "publish-streaming-channel" "push-generic-event" "publish-platform-event-message"])
+(def SOURCES ["replay-topic-listener" "replay-channel-listener"])
+(def RESULT-CLASS "org.mule.extension.salesforce.api.core.Result")
+
+(defn- cls-meta v/Val [x: v/Val c: &Str] (v/->VMeta x [(v/field "class" (v/->VStr (str c)))]))
+
+(defn- result-val v/Val [r: &xml/XNode]
+  (cls-meta (sc/obj-in ["success" "id" "errors"] [(sc/bval r "success") (sc/sval r "id") (sc/errors-val r)]) RESULT-CLASS))
+
+(defn- first-result Values(v/Val Vec(err/MErr)) [r: &xml/XNode]
+  (let [rs (sc/kids r "result")]
+    (if (= (count rs) 0) (values (v/null-v) [(sc/sferr "INVALID_RESPONSE" "Something went wrong while retrieving results from Salesforce")])
+      (values (result-val (nth rs 0)) []))))
+
+(defn- upsert-by-name conn/OpResult [cache: &Atom cfg: &m/Config type: &Str name: &Str fields: v/Val ufields: v/Val]
+ (let [re (sc/records-err [fields ufields])]
+  (if (> (count re) 0) (conn/fail-result (nth re 0))
+  (let [q (str "SELECT Id FROM " type " WHERE Name = '" name "'")
+        [r x] (sc/soap cache cfg (str "<urn:query><urn:queryString>" (sc/xml-esc q) "</urn:queryString></urn:query>"))]
+    (if (> (count x) 0) (conn/fail-result (nth x 0))
+      (let [recs (sc/find-desc r "records")
+            id (if (= (count recs) 0) "" (sc/text-of (nth recs 0) "Id"))
+            body (if (= id "")
+                   (str "<urn:create>" (sc/sobject-xml "" "sObjects" type fields false) "</urn:create>")
+                   (str "<urn:update>" (sc/sobject-xml "" "sObjects" type (with-id ufields id) false) "</urn:update>"))
+            [r2 x2] (sc/soap cache cfg body)]
+        (if (> (count x2) 0) (conn/fail-result (nth x2 0))
+          (let [[res rx] (first-result r2)] (if (> (count rx) 0) (conn/fail-result (nth rx 0)) (sc/java res))))))))))
+
+(defn- with-id v/Val [x: &v/Val id: &Str]
+  (match (v/unmeta x) (v/VObj fs) (v/->VObj (cat-fields [(v/field "Id" (v/->VStr (str id)))] fs)) _ x))
+
+(defn- cat-fields Vec(v/Field) [a: Vec(v/Field) b: &Vec(v/Field)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- opt-field Vec(v/Field) [k: &Str x: &Str] (if (= x "") [] [(v/field (str k) (v/->VStr (str x)))]))
+
+(defn run conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config hdr: &Str]
+  (let [op (:op c)]
+    (cond
+      (= op "publish-topic")
+      (let [[name nx] (conn/attr-str c "topicName" "")
+            [q qx] (conn/attr-str c "query" "")
+            [d dx] (conn/attr-str c "description" "")
+            desc (opt-field "Description" d)]
+        (upsert-by-name cache cfg "PushTopic" name
+                        (v/->VObj (cat-fields (cat-fields [(v/field "ApiVersion" (v/->VStr (sc/api-of cfg)))] desc) [(v/field "Name" (v/->VStr name)) (v/field "Query" (v/->VStr q))]))
+                        (v/->VObj (cat-fields desc [(v/field "Query" (v/->VStr q))]))))
+      (= op "publish-streaming-channel")
+      (let [[name nx] (conn/attr-str c "channelName" "")
+            [o ox] (conn/attr-str c "ownerId" "")
+            [d dx] (conn/attr-str c "description" "")
+            extra (cat-fields (opt-field "Description" d) (opt-field "OwnerId" o))]
+        (upsert-by-name cache cfg "StreamingChannel" name (v/->VObj (cat-fields extra [(v/field "Name" (v/->VStr name))])) (v/->VObj extra)))
+      (= op "push-generic-event")
+      (let [[cid cx] (conn/attr-str c "channelId" "")
+            [evs ex] (sc/child-val c "events")
+            [js je] (reg/write-fmt "application/json" [] (v/->VObj [(v/field "pushEvents" evs)]))]
+        (if (> (count ex) 0) (conn/fail-result (nth ex 0))
+          (let [[st body x] (sc/rest-call cache cfg "POST" (str "/sobjects/StreamingChannel/" cid "/push") "application/json" js)]
+            (if (> (count x) 0) (conn/fail-result (nth x 0))
+              (let [j (sc/json-val body)
+                    xs (match j (v/VArr a) a _ [])]
+                (sc/java (cls-meta (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                                               (if (>= i (count xs)) acc
+                                                 (let [o (match (v/unmeta (nth xs i)) (v/VObj fs) fs _ [])
+                                                       uos (v/obj-get o "userOnlineStatus")
+                                                       fc (v/obj-get o "fanoutCount")]
+                                                   (recur (+ i 1) (conj acc (cls-meta (sc/obj-in ["userOnlineStatus" "fanoutCount"]
+                                                                                                 [(if (= (count uos) 0) (v/null-v) (sc/json-map (nth uos 0))) (if (= (count fc) 0) (v/null-v) (nth fc 0))])
+                                                                                      "org.mule.extension.salesforce.api.stream.PushEventResult")))))))
+                                   "java.util.ArrayList")))))))
+      (= op "publish-platform-event-message")
+      (let [[t tx] (conn/attr-str c "platformEventName" "")
+            [msgs mx] (sc/child-val c "platform-event-messages")
+            xs (match msgs (v/VArr a) a _ [msgs])]
+        (cond
+          (> (count mx) 0) (conn/fail-result (nth mx 0))
+          (> (count (sc/records-err xs)) 0) (conn/fail-result (nth (sc/records-err xs) 0))
+          :else
+          (let [body (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (sc/sobject-xml out "sObjects" t (nth xs i) false))))
+                [r x] (sc/soap-h cache cfg hdr (str "<urn:create>" body "</urn:create>"))]
+            (if (> (count x) 0) (conn/fail-result (nth x 0))
+              (let [rs (sc/kids r "result")]
+                (sc/java (cls-meta (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count rs)) acc (recur (+ i 1) (conj acc (result-val (nth rs i)))))))
+                                   "java.util.ArrayList")))))))
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation salesforce:" op))))))
+
+(defn- st-get Str [s: &conn/SrcCall k: &Str]
+  (let [mm: Map (dyn->map (deref (:state s)))] (if (contains? mm k) (dyn->str (get! mm k)) "")))
+
+(defn- st-put Int [s: &conn/SrcCall k: Str x: Str]
+  (let [z (swap! (:state s) (fn Dyn [old: Dyn] (let [m2: Map (dyn->map old)] (->dyn (assoc m2 k (->dyn x))))))] 0))
+
+(defn- channel-of Str [s: &conn/SrcCall]
+  (if (= (:name s) "replay-topic-listener")
+    (let [t (conn/param-lit (:params s) "topic" "")] (if (str/starts-with? t "/topic/") t (str "/topic/" t)))
+    (let [c (conn/param-lit (:params s) "streamingChannel" "")] (if (str/starts-with? c "/") c (str "/" c)))))
+
+(defn- start-replay Str [s: &conn/SrcCall]
+  (let [opt (conn/param-lit (:params s) "replayOption" "ONLY_NEW")
+        last (st-get s "last")]
+    (cond (= opt "ALL") "-2"
+          (= opt "FROM_REPLAY_ID") (let [r (conn/param-lit (:params s) "replayId" "")] (if (= r "") "-1" r))
+          (and (= opt "FROM_LAST_REPLAY_ID") (not= last "")) last
+          :else "-1")))
+
+(defn- bayeux Values(Int v/Val Str) [s: &conn/SrcCall sess: &sc/Session api: &Str body: &Str]
+  (let [cookies (st-get s "cookies")
+        h0: Vec(hm/Header) [(sc/hpair "Content-Type" "application/json; charset=UTF-8") (sc/hpair "Authorization" (str "Bearer " (:token sess)))]
+        hs (if (= cookies "") h0 (conj h0 (sc/hpair "Cookie" cookies)))
+        [resp e] (http/request (assoc (http/request-opts (str (:instance sess) "/cometd/" api)) :method "POST" :headers hs :body (str body) :timeout-ms 130000))]
+    (if (not= e "") (values -1 (v/null-v) e)
+      (let [z (keep-cookies s (:headers resp))]
+        (values (:status resp) (sc/json-val (:body resp)) "")))))
+
+(defn- keep-cookies Int [s: &conn/SrcCall hl: &Vec(hm/Header)]
+  (loop [i 0 cur (st-get s "cookies")]
+    (if (>= i (count hl)) (st-put s "cookies" cur)
+      (let [k (str/lower-case (:hd-name (nth hl i)))
+            val (str (:hd-value (nth hl i)))]
+        (if (not= k "set-cookie") (recur (+ i 1) cur)
+          (let [nv (let [e (str/index-of val ";")] (str/trim (if (< e 0) val (subs val 0 e))))
+                nm (let [e (str/index-of nv "=")] (if (< e 0) nv (subs nv 0 e)))
+                kept (str/join "; " (loop [j 0 parts (if (= cur "") [] (str/split cur "; ")) acc: Vec(Str) []]
+                                      (if (>= j (count parts)) acc
+                                        (recur (+ j 1) parts (if (str/starts-with? (nth parts j) (str nm "=")) acc (conj acc (nth parts j)))))))]
+            (recur (+ i 1) (if (= kept "") nv (str kept "; " nv)))))))))
+
+(defn- msg-field v/Val [m: &v/Val k: &Str]
+  (match (v/unmeta m) (v/VObj fs) (let [r (v/obj-get fs k)] (if (= (count r) 0) (v/null-v) (nth r 0))) _ (v/null-v)))
+
+(defn- ok? Bool [m: &v/Val] (match (v/unmeta (msg-field m "successful")) (v/VBool b) b _ false))
+
+(defn- items Vec(v/Val) [x: &v/Val] (match (v/unmeta x) (v/VArr a) a _ []))
+
+(defn- handshake Str [s: &conn/SrcCall sess: &sc/Session api: &Str]
+  (let [z0 (st-put s "cookies" "")
+        [st hs e] (bayeux s sess api "[{\"channel\":\"/meta/handshake\",\"version\":\"1.0\",\"minimumVersion\":\"1.0\",\"supportedConnectionTypes\":[\"long-polling\"],\"ext\":{\"replay\":true}}]")
+        m (let [xs (items hs)] (if (= (count xs) 0) (v/null-v) (nth xs 0)))]
+    (cond
+      (not= e "") e
+      (not (ok? m)) (str "handshake failed (HTTP " st "): " (sc/field-text (msg-field m "error")))
+      :else
+      (let [cid (sc/field-text (msg-field m "clientId"))
+            ch (channel-of s)
+            z1 (st-put s "client" cid)
+            [st2 sr e2] (bayeux s sess api (str "[{\"channel\":\"/meta/subscribe\",\"clientId\":\"" cid "\",\"subscription\":\"" ch "\",\"ext\":{\"replay\":{\"" ch "\":" (start-replay s) "}}}]"))
+            m2 (let [xs (items sr)] (if (= (count xs) 0) (v/null-v) (nth xs 0)))]
+        (cond (not= e2 "") e2
+              (not (ok? m2)) (let [z (st-put s "client" "")] (str "subscribe to " ch " failed: " (sc/field-text (msg-field m2 "error"))))
+              :else "")))))
+
+(defn- deliver Int [s: &conn/SrcCall m: &v/Val]
+  (let [data (msg-field m "data")
+        event (msg-field data "event")
+        so (msg-field data "sobject")
+        payload (match so (v/VNull) (cls-meta (sc/json-map m) "org.cometd.common.HashMapMessage")
+                  _ (cls-meta so "java.util.LinkedHashMap"))
+        efs (match (v/unmeta event) (v/VObj fs) fs _ [])
+        attrs (cls-meta (sc/hashmap-obj (cat-fields [(v/field "channel" (msg-field m "channel"))] efs)) "java.util.HashMap")
+        [ok desc] ((:dispatch s) (ev/tv-val payload "*/*") (ev/tv-val attrs ev/JAVA))
+        rid (sc/field-text (msg-field event "replayId"))]
+    (if (= rid "") 0 (st-put s "last" rid))))
+
+(defn poll Values(Int Str) [cache: &Atom s: conn/SrcCall]
+  (if (= (count (:config s)) 0) (values 0 "salesforce listener needs config-ref")
+    (let [cfg (nth (:config s) 0)
+          api (sc/api-of cfg)
+          [sess se] (sc/session cache cfg (= (st-get s "relogin") "1"))
+          z0 (st-put s "relogin" "")]
+      (if (not= se "") (let [z (sleep-ms 5000)] (values 0 se))
+        (let [he (if (= (st-get s "client") "") (handshake s sess api) "")]
+          (if (not= he "") (let [z1 (st-put s "relogin" "1") z (sleep-ms 5000)] (values 0 he))
+            (let [cid (st-get s "client")
+                  [st r e] (bayeux s sess api (str "[{\"channel\":\"/meta/connect\",\"clientId\":\"" cid "\",\"connectionType\":\"long-polling\"}]"))]
+              (cond
+                (not= e "") (let [z (st-put s "client" "") z2 (sleep-ms 1000)] (values 0 e))
+                (or (= st 401) (= st 403)) (let [z (st-put s "client" "") z2 (st-put s "relogin" "1")] (values 0 ""))
+                :else
+                (let [xs (items r)
+                      ch (channel-of s)]
+                  (loop [i 0 n 0]
+                    (if (>= i (count xs)) (values n "")
+                      (let [m (nth xs i)
+                            c (sc/field-text (msg-field m "channel"))]
+                        (cond
+                          (= c "/meta/connect")
+                          (let [z (if (ok? m) 0 (st-put s "client" ""))] (recur (+ i 1) n))
+                          (= c ch) (let [z (deliver s m)] (recur (+ i 1) (+ n 1)))
+                          :else (recur (+ i 1) n))))))))))))))

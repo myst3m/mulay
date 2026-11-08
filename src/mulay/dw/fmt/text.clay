@@ -1,0 +1,329 @@
+(ns mulay.dw.fmt.text
+  (:require [mulay.lib.host :as host] [mulay.dw.lib.binaries :as bin] [mulay.dw.javaobj :as jo] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.fmt.props :as p] [mulay.dw.fmt.csv :as csv]
+            [mulay.lib.time.civil :as cv] [clay.string :as str] [mulay.dw.fmt.scalar :as sc]))
+
+(defn write-text Values(Str Str) [x0: &v/Val]
+  (let [x (v/unmeta x0)
+        [ns nf ne] (sc/number-text x0)
+        [ts tt te] (if nf (values "" false "") (sc/temporal-text x0 true))]
+    (cond
+      nf (values ns ne)
+      tt (values ts te)
+      :else
+    (match x
+      (v/VStr s) (values (str s) "")
+      (v/VBin b) (values (str b) "")
+      (v/VNum n) (values (num/to-string n) "")
+      (v/VInt n-i) (let [n (num/from-int n-i)] (values (num/to-string n) ""))
+      (v/VBool b) (values (if b "true" "false") "")
+      (v/VNull) (values "" "")
+      (v/VKey k) (values (:name k) "")
+      (v/VRegex s f) (values (str s) "")
+      (v/VNsV n) (values (:uri n) "")
+      _ (let [t (v/type-name x)]
+          (values "" (str "Text plain writer is unable to write " t ".\nReason:\nCannot coerce " t " to String, while writing TextPlain at ")))))))
+
+(defn write-binary Values(Str Str) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VStr s) (values (str s) "")
+      (v/VBin b) (values (str b) "")
+      (v/VNull) (values "" "")
+      (v/VNum n) (values "" "")
+      (v/VInt n-i) (values "" "")
+      _ (values "" (str "Cannot coerce " (v/type-name x) " (" (csv/show x) ") to Binary")))))
+
+(defn- hexv Int [c: Int]
+  (if (and (>= c 48) (<= c 57)) (- c 48)
+    (if (and (>= c 97) (<= c 102)) (- c 87)
+      (if (and (>= c 65) (<= c 70)) (- c 55) -1))))
+
+(defn url-decode Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (if (= c 43) (recur (+ i 1) (str out " "))
+          (if (and (= c 37) (< (+ i 2) (count s)) (>= (hexv (nth s (+ i 1))) 0) (>= (hexv (nth s (+ i 2))) 0))
+            (recur (+ i 3) (str out (chr (+ (* 16 (hexv (nth s (+ i 1)))) (hexv (nth s (+ i 2)))))))
+            (recur (+ i 1) (str out (subs s i (+ i 1))))))))))
+
+(defn- hex2 Str [c: Int] (let [d "0123456789ABCDEF"] (str (subs d (quot c 16) (+ (quot c 16) 1)) (subs d (mod c 16) (+ (mod c 16) 1)))))
+
+(defn url-encode Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (if (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57))
+                       (= c 46) (= c 45) (= c 42) (= c 95))
+                 (str out (subs s i (+ i 1)))
+                 (if (= c 32) (str out "+") (str out "%" (hex2 c)))))))))
+
+(defn url-encode-cs Str [s: &Str cs: &Str]
+  (if (or (= cs "") (= cs "UTF-8")) (url-encode s)
+    (let [n (count s)]
+      (loop [i 0 out ""]
+        (if (>= i n) out
+          (let [c (nth s i)]
+            (if (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57)) (= c 46) (= c 45) (= c 42) (= c 95))
+              (recur (+ i 1) (str out (subs s i (+ i 1))))
+              (if (= c 32) (recur (+ i 1) (str out "+"))
+                (let [e (loop [k i]
+                          (if (>= k n) k
+                            (let [d (nth s k)]
+                              (if (or (and (>= d 97) (<= d 122)) (and (>= d 65) (<= d 90)) (and (>= d 48) (<= d 57)) (= d 46) (= d 45) (= d 42) (= d 95) (= d 32)) k (recur (+ k 1))))))
+                      bytes (bin/cs-encode (subs s i e) cs)
+                      hx (loop [j 0 acc ""] (if (>= j (count bytes)) acc (recur (+ j 1) (str acc "%" (hex2 (nth bytes j))))))]
+                  (recur e (str out hx)))))))))))
+
+(defn read-urlencoded Values(v/Val Str) [text: &Str mime: &Str]
+  (let [parts: Vec(Str) (str/split (str text) "&")
+        fs (loop [i 0 acc: Vec(v/Field) []]
+             (if (>= i (count parts)) acc
+               (let [pp (nth parts i) eq (str/index-of pp "=")]
+                 (if (= (count pp) 0) (recur (+ i 1) acc)
+                   (if (< eq 0) (recur (+ i 1) (conj acc (v/field (url-decode pp) (v/null-v))))
+                     (recur (+ i 1) (conj acc (v/field (url-decode (subs pp 0 eq)) (v/->VStr (url-decode (subs pp (+ eq 1) (count pp))))))))))))]
+    (values (v/->VMeta (v/->VObj fs) (p/reader-meta mime)) "")))
+
+(defn scalar Values(Str Str) [x: &v/Val]
+  (let [[ts tt te] (sc/temporal-text x false)]
+    (if tt (values ts te) (scalar-plain x))))
+
+(defn- scalar-plain Values(Str Str) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VStr s) (values s "")
+    (v/VNum n) (values (num/to-string n) "")
+    (v/VInt n-i) (let [n (num/from-int n-i)] (values (num/to-string n) ""))
+    (v/VBool b) (values (if b "true" "false") "")
+    (v/VKey k) (values (:name k) "")
+    (v/VBin b) (values b "")
+    _ (values "" (str "Cannot coerce " (v/type-name (v/unmeta x)) " to String"))))
+
+(defn- not-object Str [x: &v/Val]
+  (let [y (v/unmeta x)]
+    (match y
+      (v/VStr s) (str "Cannot coerce String (\"" s "\") to Object")
+      _ (str "Cannot coerce " (v/type-name y) " (" (csv/show y) ") to Object"))))
+
+(defn write-urlencoded Values(Str Str) [x0: &v/Val cs: &Str]
+  (match (v/unmeta x0)
+    (v/VObj fs)
+    (loop [i 0 out "" first true]
+      (if (>= i (count fs)) (values out "")
+        (let [f (nth fs i)
+              k (url-encode-cs (:name (:key f)) cs)
+              vals: Vec(v/Val) (match (v/unmeta (:value f)) (v/VArr xs) xs _ [(:value f)])
+              [o2 e2 f2] (loop [j 0 o out fst first]
+                           (if (>= j (count vals)) (values o "" fst)
+                             (let [x (nth vals j)
+                                   o1 (if fst o (str o "&"))]
+                               (if (v/null? x) (recur (+ j 1) (str o1 k) false)
+                                 (let [[t e] (scalar x)]
+                                   (if (not= e "") (values "" e fst)
+                                     (recur (+ j 1) (str o1 k "=" (url-encode-cs t cs)) false)))))))]
+          (if (not= e2 "") (values "" e2) (recur (+ i 1) o2 f2)))))
+    _ (values "" (not-object x0))))
+
+(defn- ws? Bool [c: Int] (or (= c 32) (= c 9) (= c 12)))
+
+(defn- logical-lines Vec(Str) [s: &Str]
+  (let [phys: Vec(Str) (str/split (str/replace (str s) "\r\n" "\n") "\n")]
+    (loop [i 0 acc: Vec(Str) [] cur "" cont false]
+      (if (>= i (count phys)) (if cont (conj acc cur) acc)
+        (let [ln0 (nth phys i)
+              st (loop [k 0] (if (and (< k (count ln0)) (ws? (nth ln0 k))) (recur (+ k 1)) k))
+              ln (subs ln0 st (count ln0))]
+          (if (and (not cont) (or (= (count ln) 0) (= (nth ln 0) 35) (= (nth ln 0) 33)))
+            (recur (+ i 1) acc "" false)
+            (let [bs (loop [k (- (count ln) 1) c 0] (if (and (>= k 0) (= (nth ln k) 92)) (recur (- k 1) (+ c 1)) c))]
+              (if (= (mod bs 2) 1)
+                (recur (+ i 1) acc (str cur (subs ln 0 (- (count ln) 1))) true)
+                (recur (+ i 1) (conj acc (str cur ln)) "" false)))))))))
+
+(defn- utf8 Str [cp: Int]
+  (if (< cp 128) (chr cp)
+    (if (< cp 2048) (str (chr (+ 192 (quot cp 64))) (chr (+ 128 (mod cp 64))))
+      (str (chr (+ 224 (quot cp 4096))) (chr (+ 128 (mod (quot cp 64) 64))) (chr (+ 128 (mod cp 64)))))))
+
+(defn- unescape Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (if (and (= c 92) (< (+ i 1) (count s)))
+          (let [d (nth s (+ i 1))]
+            (case d
+              110 (recur (+ i 2) (str out "\n"))
+              116 (recur (+ i 2) (str out "\t"))
+              114 (recur (+ i 2) (str out "\r"))
+              102 (recur (+ i 2) (str out (chr 12)))
+              117 (if (<= (+ i 6) (count s))
+                    (let [h (loop [k 2 a 0] (if (>= k 6) a (recur (+ k 1) (+ (* a 16) (max 0 (hexv (nth s (+ i k))))))))]
+                      (recur (+ i 6) (str out (utf8 h))))
+                    (recur (+ i 2) out))
+              (recur (+ i 2) (str out (subs s (+ i 1) (+ i 2))))))
+          (recur (+ i 1) (str out (subs s i (+ i 1)))))))))
+
+(defn- split-kv Vec(Str) [ln: &Str]
+  (let [n (count ln)
+        ke (loop [k 0]
+             (if (>= k n) n
+               (let [c (nth ln k)]
+                 (if (= c 92) (recur (+ k 2))
+                   (if (or (= c 61) (= c 58) (ws? c)) k (recur (+ k 1)))))))
+        k1 (min ke n)
+        v0 (loop [k k1] (if (and (< k n) (ws? (nth ln k))) (recur (+ k 1)) k))
+        v1 (if (and (< v0 n) (or (= (nth ln v0) 61) (= (nth ln v0) 58))) (+ v0 1) v0)
+        v2 (loop [k v1] (if (and (< k n) (ws? (nth ln k))) (recur (+ k 1)) k))]
+    [(unescape (subs ln 0 k1)) (unescape (subs ln (min v2 n) n))]))
+
+(defn java-hash Int [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 h 0]
+      (if (>= i n) h
+        (let [c (nth s i)
+              [cp len] (if (< c 128) (values c 1)
+                         (if (< c 224) (values (+ (* (- c 192) 64) (- (nth s (min (+ i 1) (- n 1))) 128)) 2)
+                           (if (< c 240) (values (+ (* (- c 224) 4096) (* (- (nth s (min (+ i 1) (- n 1))) 128) 64) (- (nth s (min (+ i 2) (- n 1))) 128)) 3)
+                             (values (+ (* (- c 240) 262144) (* (- (nth s (min (+ i 1) (- n 1))) 128) 4096) (* (- (nth s (min (+ i 2) (- n 1))) 128) 64) (- (nth s (min (+ i 3) (- n 1))) 128)) 4))))
+              h2 (if (< cp 65536) (i32 (+ (* h 31) cp))
+                   (let [u (- cp 65536) hi (+ 55296 (quot u 1024)) lo (+ 56320 (mod u 1024))]
+                     (i32 (+ (* (i32 (+ (* h 31) hi)) 31) lo))))]
+          (recur (+ i len) h2))))))
+
+(defn- i32 Int [x: Int]
+  (let [m (bit-and x 4294967295)] (if (>= m 2147483648) (- m 4294967296) m)))
+
+(defn- u32 Int [x: Int] (bit-and x 4294967295))
+
+(defn- chm-order Vec(Int) [keys: &Vec(Str)]
+  (let [n (count keys)
+        cap (loop [c 16] (if (>= n (- c (quot c 4))) (recur (* c 2)) c))
+        ks (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc (+ (* (chm-index (nth keys i) cap) n) i)))))
+        sorted (sort ks)]
+    (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc (mod (nth sorted i) n)))))))
+
+(defn- chm-index Int [k: &Str cap: Int]
+  (let [h (u32 (java-hash k)) sp (bit-and (bit-xor h (bit-shift-right h 16)) 2147483647)] (bit-and sp (- cap 1))))
+
+(defn- scala-improve Int [h0: Int]
+  (let [h1 (u32 (+ h0 (u32 (bit-not (bit-shift-left h0 9)))))
+        h2 (bit-xor h1 (bit-shift-right h1 14))
+        h3 (u32 (+ h2 (bit-shift-left h2 4)))]
+    (bit-xor h3 (bit-shift-right h3 10))))
+
+(defn- trie-key Int [h: Int]
+  (loop [l 0 k 0] (if (>= l 7) k (recur (+ l 1) (+ (* k 32) (bit-and (bit-shift-right h (* 5 l)) 31))))))
+
+(defn- trie-order Vec(Int) [keys: &Vec(Str) ord: &Vec(Int)]
+  (let [n (count ord)
+        ks (loop [p 0 acc: Vec(Int) []]
+             (if (>= p n) acc
+               (recur (+ p 1) (conj acc (+ (* (trie-key (scala-improve (u32 (java-hash (nth keys (nth ord p)))))) n) p)))))
+        sorted (sort ks)]
+    (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc (nth ord (mod (nth sorted i) n))))))))
+
+(defn read-properties Values(v/Val Str) [text: &Str mime: &Str]
+  (let [lines (logical-lines text)
+        fs0 (loop [i 0 acc: Vec(v/Field) [] pos: Map(Str Int) {}]
+              (if (>= i (count lines)) acc
+                (let [kv (split-kv (nth lines i))
+                      k (nth kv 0)
+                      f (v/field k (v/->VStr (nth kv 1)))]
+                  (if (contains? pos k) (recur (+ i 1) (assoc acc (get! pos k) f) pos)
+                    (let [at (count acc)] (recur (+ i 1) (conj acc f) (assoc pos k at)))))))
+        ks (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs0)) acc (recur (+ i 1) (conj acc (:name (:key (nth fs0 i)))))))
+        o1 (chm-order ks)
+        ord (if (<= (count ks) 4) o1 (trie-order ks o1))
+        fs (loop [i 0 acc: Vec(v/Field) []]
+             (if (>= i (count ord)) acc (recur (+ i 1) (conj acc (nth fs0 (nth ord i))))))]
+    (values (v/->VMeta (v/->VObj fs) (p/reader-meta mime)) "")))
+
+(defn- save-convert Str [s: &Str key: Bool]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (case c
+                 32 (if (or (= i 0) key) (str out "\\ ") (str out " "))
+                 92 (str out "\\\\")
+                 9 (str out "\\t")
+                 10 (str out "\\n")
+                 13 (str out "\\r")
+                 12 (str out "\\f")
+                 61 (str out "\\=")
+                 58 (str out "\\:")
+                 35 (str out "\\#")
+                 33 (str out "\\!")
+                 (str out (subs s i (+ i 1)))))))))
+
+(def DAYS ["Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"])
+(def MONTHS ["Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"])
+
+(defn- two Str [n: Int] (if (< n 10) (str "0" n) (str n)))
+
+(defn- date-line Str []
+  (let [ms (host/now-ms)
+        secs (quot ms 1000)
+        ed (cv/fdiv secs 86400)
+        sod (mod secs 86400)
+        [y m d] (cv/from-epoch-day ed)
+        dow (cv/day-of-week ed)]
+    (str "#" (nth DAYS (- dow 1)) " " (nth MONTHS (- m 1)) " " (two d) " "
+         (two (quot sod 3600)) ":" (two (mod (quot sod 60) 60)) ":" (two (mod sod 60)) " UTC " y "\n")))
+
+(defn write-properties Values(Str Str) [x0: &v/Val]
+  (match (v/unmeta x0)
+    (v/VObj fs)
+    (let [[ks vs e] (loop [i 0 ks: Vec(Str) [] vs: Vec(Str) []]
+                      (if (>= i (count fs)) (values ks vs "")
+                        (let [f (nth fs i) k (:name (:key f)) [t e] (scalar (:value f))]
+                          (if (not= e "") (values ks vs (if (v/null? (:value f)) "Cannot coerce Null to String" e))
+                            (let [at (loop [j 0] (if (>= j (count ks)) -1 (if (= (nth ks j) k) j (recur (+ j 1)))))]
+                              (if (>= at 0) (recur (+ i 1) ks (assoc vs at t)) (recur (+ i 1) (conj ks k) (conj vs t))))))))]
+      (if (not= e "") (values "" e)
+        (let [ord (chm-order ks)]
+          (values (loop [i 0 out (date-line)]
+                    (if (>= i (count ord)) out
+                      (let [j (nth ord i) a (save-convert (nth ks j) true) b (save-convert (nth vs j) false)]
+                        (recur (+ i 1) (str out a "=" b "\n")))))
+                  ""))))
+    _ (values "" (str "Properties files writer expect a value of type Object but got " (v/type-name (v/unmeta x0)) ", while writing PropertiesFile at "))))
+
+(defn write-java Values(Str Str) [x0: &v/Val]
+  (java-into "" x0))
+
+(defn- java-into Values(Str Str) [out: Str x0: &v/Val]
+  (let [x (v/unmeta x0)
+        [jt known] (jo/to-string x0)]
+    (if known (values (str out jt) "")
+    (match x
+      (v/VNull) (values (str out "null") "")
+      (v/VBool b) (values (str out (if b "true" "false")) "")
+      (v/VNum n) (let [t (num/to-string n)] (values (str out t) ""))
+      (v/VInt n-i) (let [n (num/from-int n-i)] (let [t (num/to-string n)] (values (str out t) "")))
+      (v/VStr s) (values (str out s) "")
+      (v/VKey k) (values (str out (:name k)) "")
+      (v/VBin b) (values (str out b) "")
+      (v/VRegex s f) (values (str out s) "")
+      (v/VArr xs) (java-list out xs)
+      (v/VRange a b) (java-list out (v/items x))
+      (v/VObj fs)
+      (let [[ks idx] (loop [i 0 ks: Vec(Str) [] idx: Vec(Int) []]
+                       (if (>= i (count fs)) (values ks idx)
+                         (let [k (:name (:key (nth fs i)))
+                               at (loop [j 0] (if (>= j (count ks)) -1 (if (= (nth ks j) k) j (recur (+ j 1)))))]
+                           (if (>= at 0) (recur (+ i 1) ks (assoc idx at i)) (recur (+ i 1) (conj ks k) (conj idx i))))))]
+        (loop [j 0 acc (str out "{")]
+          (if (>= j (count ks)) (values (str acc "}") "")
+            (let [a1 (str (if (> j 0) (str acc ", ") acc) (nth ks j) "=")
+                  [a2 e] (java-into a1 (:value (nth fs (nth idx j))))]
+              (if (not= e "") (values a2 e) (recur (+ j 1) a2))))))
+      _ (values out (str "Cannot write " (v/type-name x) " as application/java"))))))
+
+(defn- java-list Values(Str Str) [out: Str xs: &Vec(v/Val)]
+  (loop [i 0 acc (str out "[")]
+    (if (>= i (count xs)) (values (str acc "]") "")
+      (let [a1 (if (> i 0) (str acc ", ") acc)
+            [a2 e] (java-into a1 (nth xs i))]
+        (if (not= e "") (values a2 e) (recur (+ i 1) a2))))))

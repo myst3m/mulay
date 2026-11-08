@@ -1,0 +1,67 @@
+(ns netaddr-test (:require [mulay.lib.netaddr :as na]))
+
+(defn- v6 Vec(Int) [head: Vec(Int) tail: Vec(Int)]
+  (let [n (- 16 (+ (count head) (count tail)))
+        mid (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc 0))))]
+    (concat (concat head mid) tail)))
+
+(deftest internal-ipv4-ranges-are-blocked
+  (is (na/internal? [127 0 0 1]))
+  (is (na/internal? [127 255 1 2]))
+  (is (na/internal? [10 1 2 3]))
+  (is (na/internal? [172 16 0 1]))
+  (is (na/internal? [172 31 255 255]))
+  (is (na/internal? [192 168 1 1]))
+  (is (na/internal? [169 254 169 254]))
+  (is (na/internal? [100 64 0 1]))
+  (is (na/internal? [100 127 255 255]))
+  (is (na/internal? [0 0 0 0]))
+  (is (na/internal? [0 1 2 3]))
+  (is (na/internal? [224 0 0 1]))
+  (is (na/internal? [255 255 255 255])))
+
+(deftest public-ipv4-addresses-pass
+  (is (not (na/internal? [8 8 8 8])))
+  (is (not (na/internal? [172 15 255 255])))
+  (is (not (na/internal? [172 32 0 0])))
+  (is (not (na/internal? [100 63 255 255])))
+  (is (not (na/internal? [100 128 0 0])))
+  (is (not (na/internal? [169 253 1 1])))
+  (is (not (na/internal? [93 184 216 34]))))
+
+(deftest internal-ipv6-ranges-are-blocked
+  (is (na/internal? (v6 [] [])))
+  (is (na/internal? (v6 [] [1])))
+  (is (na/internal? (v6 [254 128] [1])))
+  (is (na/internal? (v6 [254 191] [1])))
+  (is (na/internal? (v6 [252 0] [1])))
+  (is (na/internal? (v6 [253 18] [1])))
+  (is (na/internal? (v6 [255 2] [1])))
+  (is (na/internal? (v6 [] [255 255 127 0 0 1])))
+  (is (na/internal? (v6 [] [255 255 169 254 169 254])))
+  (is (na/internal? (v6 [0 100 255 155] [10 0 0 1])))
+  (is (na/internal? (v6 [32 2 192 168 0 1] [])))
+  (is (na/internal? (v6 [] [127 0 0 1]))))
+
+(deftest public-ipv6-addresses-pass
+  (is (not (na/internal? (v6 [38 7 240 208 16 0] [1]))))
+  (is (not (na/internal? (v6 [] [255 255 8 8 8 8]))))
+  (is (not (na/internal? (v6 [254 192] [1])))))
+
+(deftest literals-for-a-url
+  (is (= (na/url-host [10 0 0 1]) "10.0.0.1"))
+  (is (= (na/url-host (v6 [38 7 240 208] [1])) "[2607:f0d0:0:0:0:0:0:1]")))
+
+(deftest resolving-names-and-literals
+  (let [[a ae] (na/resolve "127.0.0.1")
+        [b be] (na/resolve "localhost")
+        [c ce] (na/resolve "no-such-host.invalid")
+        [d de] (na/resolve "[::1]")]
+    (is (= ae ""))
+    (is (= a [[127 0 0 1]]))
+    (is (= be ""))
+    (is (> (count b) 0))
+    (is (na/internal? (nth b 0)))
+    (is (not= ce ""))
+    (is (= de ""))
+    (is (= d [(v6 [] [1])]))))

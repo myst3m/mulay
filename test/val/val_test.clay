@@ -1,0 +1,46 @@
+(ns val-test (:require [mulay.dw.val :as v] [mulay.dw.num :as n]))
+
+(defn- o v/Val [ks: Vec(Str) xs: Vec(v/Val)]
+  (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (v/field (nth ks i) (nth xs i))))))))
+
+(deftest equality
+  (is (not (v/equal? (o ["a" "b"] [(v/int-v 1) (v/int-v 2)]) (o ["b" "a"] [(v/int-v 2) (v/int-v 1)]))))
+  (is (v/equal? (o ["a"] [(v/int-v 1)]) (o ["a"] [(v/->VNum (let [[x e] (n/parse-lit "1.0")] x))])))
+  (is (not (v/equal? (v/int-v 1) (v/str-v "1"))))
+  (is (v/equal? (v/->VNull) (v/->VNull)))
+  (is (v/equal? (v/->VRange 1 3) (v/->VArr [(v/int-v 1) (v/int-v 2) (v/int-v 3)])))
+  (is (not (v/equal? (v/->VArr [(v/int-v 1) (v/int-v 2)]) (v/->VArr [(v/int-v 2) (v/int-v 1)])))))
+
+(deftest types
+  (is (= (v/type-name (v/->VRange 1 3)) "Range"))
+  (is (= (v/type-name (v/->VMeta (v/str-v "x") [])) "String"))
+  (is (= (count (v/obj-get-all (VObj-fs-of (o ["a" "a"] [(v/int-v 1) (v/int-v 2)])) "a")) 2)))
+
+(defn- VObj-fs-of Vec(v/Field) [x: v/Val] (match x (v/VObj fs) fs _ []))
+
+;; 数の正規形: Int に収まる整数は VInt、それ以外 (小数・大きな整数) は VNum。
+(defn- lit v/Val [s: Str] (let [[x e] (n/parse-lit s)] (v/num-v x)))
+(defn- kind Str [x: v/Val] (match x (v/VInt i) "int" (v/VNum m) "num" _ "other"))
+
+(deftest number-canonical-form
+  (is (= (kind (lit "1")) "int"))
+  (is (= (kind (lit "1.0")) "int"))
+  (is (= (kind (lit "-9223372036854775808")) "int"))
+  (is (= (kind (lit "9223372036854775808")) "num"))
+  (is (= (kind (lit "1.5")) "num"))
+  (is (= (kind (v/int-v 3)) "int"))
+  (is (v/equal? (lit "2") (lit "2.0")))
+  (is (= (v/type-name (lit "2")) "Number"))
+  (is (= (n/to-string (v/num-of (lit "7"))) "7")))
+
+;; 共有の定数 (null、true/false、小さい整数) と作り直した値が同じに振る舞うこと。
+(deftest shared-constants
+  (is (= (kind (v/int-v 0)) "int"))
+  (is (= (kind (v/int-v 1023)) "int"))
+  (is (= (kind (v/int-v 1024)) "int"))
+  (is (= (kind (v/int-v -1)) "int"))
+  (is (v/equal? (v/int-v 7) (lit "7")))
+  (is (v/equal? (v/int-v 5000) (lit "5000")))
+  (is (v/equal? (v/bool-v true) (v/bool-v true)))
+  (is (not (v/equal? (v/bool-v true) (v/bool-v false))))
+  (is (v/null? (v/null-v))))

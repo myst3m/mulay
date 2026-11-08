@@ -1,0 +1,60 @@
+(ns lazy-obj-test (:require [mulay.dw.engine :as eng] [mulay.dw.val :as v] [mulay.dw.err :as dwe] [mulay.dw.fmt.registry :as reg]))
+
+(defn- rows Vec(v/Val) [n: Int]
+  (loop [i 1 acc: Vec(v/Val) []] (if (> i n) acc (recur (+ i 1) (conj acc (v/->VObj [(v/field "id" (v/int-v i))]))))))
+
+(defn- run Values(v/Val dwe/DwErr) [script: Str payload: v/Val]
+  (eng/eval-compiled (eng/compile (str "%dw 2.0\noutput application/json\n---\n" script) ["payload"]) [payload]))
+
+(defn- lazy? Bool [x: &v/Val] (match (v/unmeta x) (v/VOSeq q) true _ false))
+
+(defn- json Str [x: &v/Val e: &dwe/DwErr]
+  (if (not (dwe/ok? e)) (str "ERR " (:msg e))
+    (let [[t we] (reg/write-fmt "application/json" [(v/field "indent" (v/bool-v false))] x)] (if (dwe/ok? we) t (str "ERR " (:msg we))))))
+
+(defn- both Str [script: Str]
+  (let [[a ae] (run script (v/->VArr (rows 3)))
+        [b be] (run script (v/->VSeq (v/seq-of (rows 3))))]
+    (if (= (json a ae) (json b be)) (json b be) (str "DIFF " (json a ae) " / " (json b be)))))
+
+(deftest spreading-a-sequence-makes-a-lazy-object
+  (let [[x e] (run "{(payload map {(\"k\" ++ $.id): $.id})}" (v/->VSeq (v/seq-of (rows 3))))
+        [y ye] (run "{(payload map {(\"k\" ++ $.id): $.id})}" (v/->VArr (rows 3)))]
+    (is (dwe/ok? e))
+    (is (lazy? x))
+    (is (not (lazy? y)))
+    (is (= (json x e) "{\"k1\": 1,\"k2\": 2,\"k3\": 3}"))))
+
+(deftest a-lazy-object-keeps-field-order-and-reads-twice
+  (let [[x e] (run "{a: 0, (payload map {(\"k\" ++ $.id): $.id}), b: 9}" (v/->VSeq (v/seq-of (rows 3))))]
+    (is (lazy? x))
+    (is (= (json x e) "{\"a\": 0,\"k1\": 1,\"k2\": 2,\"k3\": 3,\"b\": 9}"))
+    (is (= (json x e) (json x e)))))
+
+(deftest a-lazy-object-matches-the-whole-path
+  (is (= (both "{(payload map [{a: $.id}, {b: $.id}])}") "{\"a\": 1,\"b\": 1,\"a\": 2,\"b\": 2,\"a\": 3,\"b\": 3}"))
+  (is (= (both "{(payload map (if ($.id == 2) null else {a: $.id}))}") "{\"a\": 1,\"a\": 3}"))
+  (is (= (both "({(payload map {(\"k\" ++ $.id): $.id})}).k2") "2"))
+  (is (= (both "sizeOf({(payload map {(\"k\" ++ $.id): $.id})})") "3"))
+  (is (= (both "{(payload map {(\"k\" ++ $.id): $.id})} pluck $$") "[\"k1\",\"k2\",\"k3\"]")))
+
+(deftest a-bad-element-fails-as-the-whole-path-does
+  (let [s (both "{(payload map (if ($.id == 2) 5 else {a: $.id}))}")]
+    (is (= (subs s 0 4) "ERR "))
+    (is (not= (subs s 0 4) "DIFF"))))
+
+(defn- obj-fields Vec(v/Field) []
+  [(v/field "a" (v/int-v 1)) (v/field "b" (v/int-v 2)) (v/field "a" (v/int-v 3))])
+
+(deftest multi-selecting-a-lazy-object
+  (let [[x e] (run "payload.*a" (v/->VOSeq (v/fseq-of (obj-fields))))
+        [y ye] (run "payload.*a" (v/->VObj (obj-fields)))
+        [n ne] (run "payload.*zz" (v/->VOSeq (v/fseq-of (obj-fields))))]
+    (is (match (v/unmeta x) (v/VSeq q) true _ false))
+    (is (= (json x e) (json y ye)))
+    (is (= (json x e) "[1,3]"))
+    (is (= (json n ne) "null"))))
+
+(deftest filtering-a-multi-selection-of-a-lazy-object
+  (let [[x e] (run "payload.*a[?($ > 1)]" (v/->VOSeq (v/fseq-of (obj-fields))))]
+    (is (= (json x e) "[3]"))))

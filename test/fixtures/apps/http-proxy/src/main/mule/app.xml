@@ -1,0 +1,310 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18410"/></http:listener-config>
+    <!-- 偽の proxy: 受けた要求の形をそのまま返す -->
+    <http:listener-config name="P"><http:listener-connection host="0.0.0.0" port="18411"/></http:listener-config>
+
+    <!-- 書き方 1: request-connection の中の proxy-config -->
+    <http:request-config name="RA">
+        <http:request-connection host="target.example" port="8080">
+            <http:proxy-config><http:proxy host="localhost" port="18411"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <!-- 書き方 2: 名前を付けた proxy を proxyConfig で指す。利用者と合言葉つき -->
+    <http:proxy name="PX" host="localhost" port="18411" username="u" password="p"/>
+    <http:request-config name="RB">
+        <http:request-connection host="target.example" port="8080" proxyConfig="PX"/>
+    </http:request-config>
+    <!-- nonProxyHosts -->
+    <http:request-config name="RC">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="localhost"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+
+    <flow name="proxy">
+        <http:listener config-ref="P" path="/*"/>
+        <set-payload value="#[output application/json --- {method: attributes.method, requestUri: attributes.requestUri replace /^http:\/\/[^\/]+/ with '', host: attributes.headers.host default null, proxyAuth: attributes.headers.'proxy-authorization' default null, via: 'proxy'}]"/>
+    </flow>
+    <flow name="direct">
+        <http:listener config-ref="L" path="/direct"/>
+        <set-payload value="direct"/>
+    </flow>
+
+    <flow name="via-a">
+        <http:listener config-ref="L" path="/via-a"/>
+        <http:request config-ref="RA" method="GET" path="/a/b">
+            <http:query-params>#[{q: '1'}]</http:query-params>
+        </http:request>
+    </flow>
+    <flow name="via-b">
+        <http:listener config-ref="L" path="/via-b"/>
+        <http:request config-ref="RB" method="POST" path="/c"/>
+    </flow>
+    <flow name="bypass">
+        <http:listener config-ref="L" path="/bypass"/>
+        <http:request config-ref="RC" method="GET" path="/direct"/>
+    </flow>
+    <http:request-config name="RH1">
+        <http:request-connection host="foo.example.com" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="*.example.com"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h1">
+        <http:listener config-ref="L" path="/h1"/>
+        <try>
+            <http:request config-ref="RH1" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH2">
+        <http:request-connection host="foo.example.com" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="foo.*"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h2">
+        <http:listener config-ref="L" path="/h2"/>
+        <try>
+            <http:request config-ref="RH2" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH3">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="local*"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h3">
+        <http:listener config-ref="L" path="/h3"/>
+        <try>
+            <http:request config-ref="RH3" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH4">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="*host"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h4">
+        <http:listener config-ref="L" path="/h4"/>
+        <try>
+            <http:request config-ref="RH4" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH5">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="LOCALHOST"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h5">
+        <http:listener config-ref="L" path="/h5"/>
+        <try>
+            <http:request config-ref="RH5" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH6">
+        <http:request-connection host="127.0.0.1" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="127.*"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h6">
+        <http:listener config-ref="L" path="/h6"/>
+        <try>
+            <http:request config-ref="RH6" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH7">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="*"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h7">
+        <http:listener config-ref="L" path="/h7"/>
+        <try>
+            <http:request config-ref="RH7" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH8">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="localhost"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h8">
+        <http:listener config-ref="L" path="/h8"/>
+        <try>
+            <http:request config-ref="RH8" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH9">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="x,localhost"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h9">
+        <http:listener config-ref="L" path="/h9"/>
+        <try>
+            <http:request config-ref="RH9" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH10">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="x, localhost"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h10">
+        <http:listener config-ref="L" path="/h10"/>
+        <try>
+            <http:request config-ref="RH10" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH11">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="x|localhost"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h11">
+        <http:listener config-ref="L" path="/h11"/>
+        <try>
+            <http:request config-ref="RH11" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH12">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="x;localhost"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h12">
+        <http:listener config-ref="L" path="/h12"/>
+        <try>
+            <http:request config-ref="RH12" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH13">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="localhost,"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h13">
+        <http:listener config-ref="L" path="/h13"/>
+        <try>
+            <http:request config-ref="RH13" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH14">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="localhost:18410"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h14">
+        <http:listener config-ref="L" path="/h14"/>
+        <try>
+            <http:request config-ref="RH14" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH15">
+        <http:request-connection host="127.0.0.1" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411" nonProxyHosts="127.0.0.1"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h15">
+        <http:listener config-ref="L" path="/h15"/>
+        <try>
+            <http:request config-ref="RH15" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <http:request-config name="RH16">
+        <http:request-connection host="localhost" port="18410">
+            <http:proxy-config><http:proxy host="localhost" port="18411"/></http:proxy-config>
+        </http:request-connection>
+    </http:request-config>
+    <flow name="h16">
+        <http:listener config-ref="L" path="/h16"/>
+        <try>
+            <http:request config-ref="RH16" method="GET" path="/direct" responseTimeout="3000"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': (error.errorType.namespace ++ ':' ++ error.errorType.identifier), description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+</mule>

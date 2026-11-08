@@ -1,0 +1,774 @@
+(ns mulay.lib.dec (:require [mulay.lib.numparse :as npz] [mulay.lib.bigint :as bi] [clay.bigint :as big]))
+
+(defrecord Dec [w: Int big: Vec(big/BigInt)])
+
+(def UP 0)
+(def DOWN 1)
+(def CEILING 2)
+(def FLOOR 3)
+(def HALF-UP 4)
+(def HALF-DOWN 5)
+(def HALF-EVEN 6)
+(def UNNECESSARY 7)
+
+(def DECIMAL128 34)
+
+(def INT32-MAX 2147483647)
+(def INT32-MIN -2147483648)
+
+(def MAX-DIGITS 10000000)
+(def TOO-BIG "BigInteger would overflow supported range")
+
+(def- P10 [1 10 100 1000 10000 100000 1000000 10000000 100000000 1000000000 10000000000 100000000000
+           1000000000000 10000000000000 100000000000000 1000000000000000 10000000000000000
+           100000000000000000 1000000000000000000])
+
+(defn mode-of-str Values(Int Str) [s: &Str]
+  (cond
+    (= s "UP") (values UP "")
+    (= s "DOWN") (values DOWN "")
+    (= s "CEILING") (values CEILING "")
+    (= s "FLOOR") (values FLOOR "")
+    (= s "HALF_UP") (values HALF-UP "")
+    (= s "HALF_DOWN") (values HALF-DOWN "")
+    (= s "HALF_EVEN") (values HALF-EVEN "")
+    (= s "UNNECESSARY") (values UNNECESSARY "")
+    :else (values UNNECESSARY (str "unknown rounding mode: " s))))
+
+(def- MINU -144115188075855872)
+(def- MAXU 144115188075855871)
+
+(defn- small? Bool [d: &Dec] (not (= (bit-and (:w d) 63) 63)))
+
+(defn- u-of Int [d: &Dec] (bit-shift-right (:w d) 6))
+
+(defn scale Int [d: &Dec] (if (small? d) (- (bit-and (:w d) 63) 31) (bit-shift-right (:w d) 6)))
+
+(defn- ^:cold mk-big Dec [u: big/BigInt s: Int] (->Dec (+ (* s 64) 63) [u]))
+
+(defn- mks Dec [u: Int s: Int]
+  (if (and (>= s -31) (and (<= s 31) (and (>= u MINU) (<= u MAXU)))) (->Dec (+ (* u 64) (+ s 31)) [])
+    (mk-big (bi/from-int u) s)))
+
+(defn- mkb Dec [u: big/BigInt s: Int]
+  (if (> (bi/num-digits u) 19) (mk-big u s)
+    (let [[i e] (bi/to-int u)] (if (= e "") (mks i s) (mk-big u s)))))
+
+(defn- dup Dec [d: &Dec] (->Dec (:w d) (:big d)))
+
+(defn of Dec [u: big/BigInt s: Int] (mkb u s))
+
+(defn of-long Dec [u: Int s: Int] (mks u s))
+
+(defn unscaled big/BigInt [d: &Dec] (if (small? d) (bi/from-int (u-of d)) (nth (:big d) 0)))
+
+(defn- ^:cold unscaled-long-big Values(Int Bool) [d: &Dec]
+  (let [u (nth (:big d) 0)]
+    (if (> (bi/num-digits u) 19) (values 0 false)
+      (let [[i e] (bi/to-int u)] (values i (= e ""))))))
+
+(defn unscaled-long Values(Int Bool) [d: &Dec] (if (small? d) (values (u-of d) true) (unscaled-long-big d)))
+
+(defn zero Dec [] (mks 0 0))
+
+(defn- zero-scale Dec [s: Int] (mks 0 s))
+
+(defn from-int Dec [n: Int] (mks n 0))
+
+(defn from-big Dec [b: big/BigInt] (mkb b 0))
+
+(defn- cmp-int Int [x: Int y: Int] (if (< x y) -1 (if (> x y) 1 0)))
+
+(defn signum Int [d: &Dec] (if (small? d) (cmp-int (u-of d) 0) (bi/sign (nth (:big d) 0))))
+
+(defn is-zero? Bool [d: &Dec] (if (small? d) (= (u-of d) 0) (bi/is-zero? (nth (:big d) 0))))
+
+(defn- int-digits Int [u: Int]
+  (let [v (if (< u 0) u (- 0 u))]
+    (loop [i 1] (if (and (<= i 18) (<= v (- 0 (nth P10 i)))) (recur (+ i 1)) i))))
+
+(defn precision Int [d: &Dec] (if (small? d) (int-digits (u-of d)) (bi/num-digits (nth (:big d) 0))))
+
+(defn neg Dec [d: Dec]
+  (if (and (small? d) (not= (u-of d) bi/INT-MIN)) (mks (- 0 (u-of d)) (scale d))
+    (mkb (bi/neg (unscaled d)) (scale d))))
+
+(defn abs-dec Dec [d: Dec] (if (< (signum d) 0) (neg d) d))
+
+(defn- up-int Values(Int Bool) [u: Int k: Int]
+  (cond
+    (= k 0) (values u true)
+    (= u 0) (values 0 true)
+    (> k 18) (values 0 false)
+    :else (let [[r over] (prim/checked-mul u (nth P10 k))] (values r (not over)))))
+
+(defn- ^:cold upscale-big Dec [d: &Dec k: Int]
+  (mkb (bi/mul-pow10 (unscaled d) k) (+ (scale d) k)))
+
+(defn- upscale Dec [d: &Dec k: Int]
+  (if (small? d)
+    (let [[r ok] (up-int (u-of d) k)] (if ok (mks r (+ (scale d) k)) (upscale-big d k)))
+    (upscale-big d k)))
+
+(defn- too-wide? Bool [d: &Dec k: Int]
+  (and (> k 0) (not (is-zero? d)) (> (+ (precision d) k) MAX-DIGITS)))
+
+(defn- align Values(big/BigInt big/BigInt Int Str) [a: &Dec b: &Dec]
+  (let [sa (scale a) sb (scale b)]
+    (cond
+      (= sa sb) (values (unscaled a) (unscaled b) sa "")
+      (> sa sb) (if (too-wide? b (- sa sb)) (values (bi/zero) (bi/zero) sa TOO-BIG)
+                  (values (unscaled a) (bi/mul-pow10 (unscaled b) (- sa sb)) sa ""))
+      :else (if (too-wide? a (- sb sa)) (values (bi/zero) (bi/zero) sb TOO-BIG)
+              (values (bi/mul-pow10 (unscaled a) (- sb sa)) (unscaled b) sb "")))))
+
+(defn- ^:cold cmp-big Int [a: &Dec b: &Dec] (let [[ua ub s e] (align a b)] (bi/cmp ua ub)))
+
+(defn- cmp-aligned Int [a: &Dec b: &Dec]
+  (if (and (small? a) (small? b))
+    (let [sa (scale a) sb (scale b)]
+      (if (>= sa sb)
+        (let [[y ok] (up-int (u-of b) (- sa sb))] (if ok (cmp-int (u-of a) y) (cmp-big a b)))
+        (let [[x ok] (up-int (u-of a) (- sb sa))] (if ok (cmp-int x (u-of b)) (cmp-big a b)))))
+    (cmp-big a b)))
+
+(defn cmp Int [a: &Dec b: &Dec]
+  (if (let [t (bit-and (:w a) 63)] (and (= t (bit-and (:w b) 63)) (not (= t 63)))) (cmp-int (:w a) (:w b))
+    (let [sa (signum a) sb (signum b)]
+      (if (not (= sa sb)) (if (< sa sb) -1 1)
+        (if (= sa 0) 0
+          (let [ea (- (precision a) (scale a))
+                eb (- (precision b) (scale b))]
+            (if (not (= ea eb))
+              (if (< ea eb) (- 0 sa) sa)
+              (cmp-aligned a b))))))))
+
+(defn eq-numeric? Bool [a: &Dec b: &Dec] (= (cmp a b) 0))
+
+(defn equals? Bool [a: &Dec b: &Dec]
+  (and (= (scale a) (scale b))
+       (if (small? a) (and (small? b) (= (u-of a) (u-of b)))
+         (and (not (small? b)) (bi/eq? (nth (:big a) 0) (nth (:big b) 0))))))
+
+(defn- addsub-small Values(Dec Bool) [a: &Dec b: &Dec sub: Bool]
+  (let [sa (scale a) sb (scale b) s (max sa sb)
+        [x okx] (up-int (u-of a) (- s sa))
+        [y oky] (up-int (u-of b) (- s sb))]
+    (if (and okx oky)
+      (let [[z over] (if sub (prim/checked-sub x y) (prim/checked-add x y))]
+        (if over (values (zero) false) (values (mks z s) true)))
+      (values (zero) false))))
+
+(defn- ^:cold addsub-big Values(Dec Str) [a: &Dec b: &Dec sub: Bool]
+  (let [[ua ub s e] (align a b)]
+    (if (= e "") (values (mkb (if sub (bi/sub ua ub) (bi/add ua ub)) s) "") (values (zero) e))))
+
+(defn- addsub-any Values(Dec Str) [a: &Dec b: &Dec sub: Bool]
+  (if (and (small? a) (small? b))
+    (let [[r ok] (addsub-small a b sub)] (if ok (values r "") (addsub-big a b sub)))
+    (addsub-big a b sub)))
+
+(defn- addsub Values(Dec Str) [a: &Dec b: &Dec sub: Bool]
+  (let [wa (:w a) wb (:w b) t (bit-and wa 63)]
+    (if (and (= t (bit-and wb 63)) (not (= t 63)))
+      (let [[z over] (if sub (prim/checked-sub wa (- wb t)) (prim/checked-add wa (- wb t)))]
+        (if over (addsub-any a b sub) (values (->Dec z []) "")))
+      (addsub-any a b sub))))
+
+(defn add Values(Dec Str) [a: &Dec b: &Dec] (addsub a b false))
+
+(defn sub Values(Dec Str) [a: &Dec b: &Dec] (addsub a b true))
+
+(defn mul Dec [a: &Dec b: &Dec]
+  (let [s (+ (scale a) (scale b))]
+    (if (and (small? a) (small? b))
+      (let [[z over] (prim/checked-mul (u-of a) (u-of b))]
+        (if over (mkb (bi/mul (unscaled a) (unscaled b)) s) (mks z s)))
+      (mkb (bi/mul (unscaled a) (unscaled b)) s))))
+
+(defn- round-up? Values(Bool Str) [mode: Int neg: Bool odd: Bool half: Int]
+  (cond
+    (= mode UP) (values true "")
+    (= mode DOWN) (values false "")
+    (= mode CEILING) (values (not neg) "")
+    (= mode FLOOR) (values neg "")
+    (= mode HALF-UP) (values (>= half 0) "")
+    (= mode HALF-DOWN) (values (> half 0) "")
+    (= mode HALF-EVEN) (values (if (= half 0) odd (> half 0)) "")
+    :else (values false "Rounding necessary")))
+
+(defn- round-div Values(big/BigInt Bool Str) [n: &big/BigInt d: &big/BigInt mode: Int]
+  (let [[q r e] (bi/divmod n d)
+        neg (not (= (bi/sign n) (bi/sign d)))]
+    (if (bi/is-zero? r)
+      (values q true "")
+      (let [half (bi/cmp-abs (bi/mul-int r 2) d)
+            [up err] (round-up? mode neg (not (bi/even-big? q)) half)]
+        (if (not (= err "")) (values q false err)
+          (values (if up (bi/add-int q (if neg -1 1)) q) false ""))))))
+
+(defn- round-drop Values(big/BigInt Bool Str) [u: &big/BigInt k: Int mode: Int]
+  (let [[q r] (bi/divmod-pow10 u k)]
+    (if (bi/is-zero? r)
+      (values q true "")
+      (let [neg (< (bi/sign u) 0)
+            half (if (> k (bi/num-digits u)) -1 (bi/cmp-abs (bi/mul-int r 2) (bi/pow10 k)))
+            [up err] (round-up? mode neg (not (bi/even-big? q)) half)]
+        (if (not (= err "")) (values q false err)
+          (values (if up (bi/add-int q (if neg -1 1)) q) false ""))))))
+
+(defn- round-drop-int Values(Int Bool Str) [u: Int k: Int mode: Int]
+  (let [p (nth P10 k) q (quot u p) r (rem u p)]
+    (if (= r 0)
+      (values q true "")
+      (let [neg (< u 0)
+            half (cmp-int (* (if (< r 0) (- 0 r) r) 2) p)
+            [up err] (round-up? mode neg (not (= (rem q 2) 0)) half)]
+        (if (not (= err "")) (values q false err)
+          (values (if up (+ q (if neg -1 1)) q) false ""))))))
+
+(defn- drop-digits Values(Dec Bool Str) [d: &Dec k: Int mode: Int]
+  (let [ns (- (scale d) k)]
+    (if (and (small? d) (<= k 18))
+      (let [[q exact err] (round-drop-int (u-of d) k mode)] (values (mks q ns) exact err))
+      (let [[q exact err] (round-drop (unscaled d) k mode)] (values (mkb q ns) exact err)))))
+
+(defn round-mc Values(Dec Str) [d: &Dec prec: Int mode: Int]
+  (let [p (precision d)]
+    (if (or (<= prec 0) (<= p prec))
+      (values (dup d) "")
+      (let [[q exact err] (drop-digits d (- p prec) mode)]
+        (if (not (= err "")) (values (dup d) err)
+          (if (> (precision q) prec)
+            (let [[q2 e2 r2] (drop-digits q 1 DOWN)] (values q2 ""))
+            (values q "")))))))
+
+(defn set-scale Values(Dec Str) [d: &Dec ns: Int mode: Int]
+  (let [s (scale d)]
+    (if (>= ns s)
+      (if (too-wide? d (- ns s)) (values (zero) TOO-BIG) (values (upscale d (- ns s)) ""))
+      (let [[q exact err] (drop-digits d (- s ns) mode)]
+        (values q err)))))
+
+(defn- strip-small Dec [u0: Int s0: Int room: Int]
+  (loop [u u0 s s0 k 0] (if (and (< k room) (= (rem u 10) 0)) (recur (quot u 10) (- s 1) (+ k 1)) (mks u s))))
+
+(defn strip-trailing-zeros Dec [d: &Dec]
+  (if (is-zero? d) (zero)
+    (if (small? d) (strip-small (u-of d) (scale d) 19)
+      (let [u (unscaled d) tz (bi/trailing-zeros u)]
+        (if (= tz 0) (dup d)
+          (let [[q r] (bi/divmod-pow10 u tz)] (mkb q (- (scale d) tz))))))))
+
+(defn- strip-to Dec [d: &Dec preferred: Int]
+  (let [room (- (scale d) preferred)]
+    (if (or (<= room 0) (is-zero? d)) (dup d)
+      (if (small? d) (strip-small (u-of d) (scale d) room)
+        (let [u (unscaled d)
+              tz (bi/trailing-zeros u)
+              k (if (< tz room) tz room)]
+          (if (= k 0) (dup d)
+            (let [[q r] (bi/divmod-pow10 u k)] (mkb q (- (scale d) k)))))))))
+(defn floor-int Values(Dec Str) [d: &Dec] (set-scale d 0 FLOOR))
+
+(defn ceil-int Values(Dec Str) [d: &Dec] (set-scale d 0 CEILING))
+
+(defn- div-zero-err Str [a: &Dec] (if (is-zero? a) "Division undefined" "Division by zero"))
+
+(defn- strip-pow Values(big/BigInt Int) [x0: big/BigInt p: Int pk: Int k: Int]
+  (let [[x1 n1] (loop [x x0 n 0]
+                  (let [[q r] (bi/divmod-small x pk)]
+                    (if (= r 0) (recur q (+ n k)) (values x n))))]
+    (loop [x x1 n n1]
+      (let [[q r] (bi/divmod-small x p)]
+        (if (= r 0) (recur q (+ n 1)) (values x n))))))
+
+(defn- strip-2-5 Values(big/BigInt Int Int) [x: big/BigInt]
+  (let [[x2 i] (strip-pow x 2 536870912 29)
+        [x5 j] (strip-pow x2 5 244140625 12)]
+    (values x5 i j)))
+
+(def- NON-TERMINATING "Non-terminating decimal expansion; no exact representable decimal result.")
+
+(defn- strip-int Values(Int Int) [x0: Int p: Int]
+  (loop [x x0 n 0] (if (= (rem x p) 0) (recur (quot x p) (+ n 1)) (values x n))))
+
+(defn- pow-int Values(Int Bool) [b: Int n: Int]
+  (loop [i 0 acc 1]
+    (if (>= i n) (values acc true)
+      (let [[r over] (prim/checked-mul acc b)] (if over (values 0 false) (recur (+ i 1) r))))))
+
+(defn- div-exact-small Values(Dec Str Bool) [ua: Int ub: Int preferred: Int]
+  (let [[x2 i] (strip-int (if (< ub 0) (- 0 ub) ub) 2)
+        [rest j] (strip-int x2 5)]
+    (if (not (= (rem ua rest) 0)) (values (zero) NON-TERMINATING true)
+      (let [k (if (> i j) i j)
+            [p2 o2] (pow-int 2 (- k i))
+            [p5 o5] (pow-int 5 (- k j))
+            [m om] (prim/checked-mul p2 p5)
+            [q0 oq] (prim/checked-mul (quot ua rest) m)
+            [q on] (if (< ub 0) (prim/checked-sub 0 q0) (values q0 false))]
+        (if (or (not o2) (or (not o5) (or om (or oq on)))) (values (zero) "" false)
+          (values (strip-to (mks q (+ preferred k)) preferred) "" true))))))
+
+(defn- div-exact-big Values(Dec Str) [a: &Dec b: &Dec preferred: Int]
+  (let [ua (unscaled a) ub (unscaled b)
+        [rest i j] (strip-2-5 (bi/abs-big ub))
+        [an ok] (if (bi/eq? rest (bi/one)) (values (bi/add-int ua 0) true)
+                  (let [[q r e] (bi/divmod ua rest)] (values q (bi/is-zero? r))))]
+    (if (not ok)
+      (values (zero) NON-TERMINATING)
+      (let [k (if (> i j) i j)
+            [p2 e2] (bi/pow-big (bi/from-int 2) (- k i))
+            [p5 e5] (bi/pow-big (bi/from-int 5) (- k j))
+            m (bi/mul p2 p5)
+            q0 (bi/mul an m)
+            q (if (< (bi/sign ub) 0) (bi/neg q0) q0)]
+        (values (strip-to (mkb q (+ preferred k)) preferred) "")))))
+
+(defn div-exact Values(Dec Str) [a: &Dec b: &Dec]
+  (let [preferred (- (scale a) (scale b))]
+    (cond
+      (is-zero? b) (values (zero) (div-zero-err a))
+      (is-zero? a) (values (zero-scale preferred) "")
+      (and (small? a) (and (small? b) (not (= (u-of b) bi/INT-MIN))))
+      (let [[r e ok] (div-exact-small (u-of a) (u-of b) preferred)] (if ok (values r e) (div-exact-big a b preferred)))
+      :else (div-exact-big a b preferred))))
+
+(def- B9 1000000000)
+
+(def- E18 (bi/pow10 18))
+
+(defn- limbs-big big/BigInt [l3: Int l2: Int l1: Int l0: Int neg: Bool]
+  (let [hi (+ (* l3 B9) l2) lo (+ (* l1 B9) l0)
+        m (if (= hi 0) (bi/from-int lo) (bi/add (bi/mul (bi/from-int hi) E18) (bi/from-int lo)))]
+    (if neg (bi/neg m) m)))
+
+(defn- limbs-digits Int [l3: Int l2: Int l1: Int l0: Int]
+  (cond (> l3 0) (+ 27 (int-digits l3)) (> l2 0) (+ 18 (int-digits l2)) (> l1 0) (+ 9 (int-digits l1)) :else (int-digits l0)))
+
+(defn- div-mc-limbs Values(Dec Str) [x: Int d: Int neg: Bool k: Int s: Int mode: Int prec: Int preferred: Int]
+  (let [q0 (quot x d)
+        q1 (quot q0 B9)
+        [l3 l2 l1 l0 r] (loop [l3 0 l2 (quot q1 B9) l1 (- q1 (* (quot q1 B9) B9)) l0 (- q0 (* q1 B9)) r (- x (* q0 d)) left k]
+                          (if (= left 0) (values l3 l2 l1 l0 r)
+                            (let [st (if (< left 9) left 9) p (nth P10 st) t (* r p) c (quot t d)
+                                  t0 (+ (* l0 p) c) c0 (quot t0 B9)
+                                  t1 (+ (* l1 p) c0) c1 (quot t1 B9)
+                                  t2 (+ (* l2 p) c1) c2 (quot t2 B9)]
+                              (recur (+ (* l3 p) c2) (- t2 (* c2 B9)) (- t1 (* c1 B9)) (- t0 (* c0 B9)) (- t (* c d)) (- left st)))))]
+    (if (= r 0) (values (strip-to (mkb (limbs-big l3 l2 l1 l0 neg) s) preferred) "")
+      (let [[up err] (round-up? mode neg (not (= (rem l0 2) 0)) (cmp-int (* r 2) d))]
+        (if (not (= err "")) (values (zero) err)
+          (let [[m3 m2 m1 m0] (if (not up) (values l3 l2 l1 l0)
+                                (let [u0 (+ l0 1) c0 (quot u0 B9) u1 (+ l1 c0) c1 (quot u1 B9) u2 (+ l2 c1) c2 (quot u2 B9)]
+                                  (values (+ l3 c2) (rem u2 B9) (rem u1 B9) (rem u0 B9))))]
+            (if (> (limbs-digits m3 m2 m1 m0) prec)
+              (values (mkb (if neg (bi/neg (bi/pow10 (- prec 1))) (bi/pow10 (- prec 1))) (- s 1)) "")
+              (values (mkb (limbs-big m3 m2 m1 m0 neg) s) ""))))))))
+
+(defn- div-mc-small Values(Dec Str Bool) [ua: Int ub: Int prec: Int mode: Int preferred: Int]
+  (let [x (if (< ua 0) (- 0 ua) ua) d (if (< ub 0) (- 0 ub) ub)
+        da (int-digits x) db (int-digits d)
+        [xa oka] (up-int x (if (> db da) (- db da) 0))
+        [xb okb] (up-int d (if (> da db) (- da db) 0))
+        k (- (- prec (- da db)) (if (>= xa xb) 1 0))]
+    (if (or (not oka) (or (not okb) (< k 0))) (values (zero) "" false)
+      (let [[r e] (div-mc-limbs x d (not (= (< ua 0) (< ub 0))) k (+ preferred k) mode prec preferred)] (values r e true)))))
+
+(defn- div-mc-big Values(Dec Str) [a: &Dec b: &Dec prec: Int mode: Int preferred: Int]
+  (let [ua (unscaled a) ub (unscaled b)
+        da (bi/num-digits ua) db (bi/num-digits ub)
+        xa (bi/mul-pow10 (bi/abs-big ua) (if (> db da) (- db da) 0))
+        xb (bi/mul-pow10 (bi/abs-big ub) (if (> da db) (- da db) 0))
+        big (if (>= (bi/cmp xa xb) 0) 1 0)
+        k (- (- prec (- da db)) big)
+        n (if (>= k 0) (bi/mul-pow10 ua k) ua)
+        dd (if (>= k 0) ub (bi/mul-pow10 ub (- 0 k)))
+        [q exact err] (round-div n dd mode)
+        s (+ preferred k)]
+    (if (not (= err "")) (values (zero) err)
+      (let [[q2 s2] (if (> (bi/num-digits q) prec)
+                      (let [[qq rr] (bi/divmod-pow10 q 1)] (values qq (- s 1)))
+                      (values q s))
+            r (mkb q2 s2)]
+        (values (if exact (strip-to r preferred) r) "")))))
+
+(defn div-mc Values(Dec Str) [a: &Dec b: &Dec prec: Int mode: Int]
+  (let [preferred (- (scale a) (scale b))]
+    (cond
+      (<= prec 0) (div-exact a b)
+      (is-zero? b) (values (zero) (div-zero-err a))
+      (is-zero? a) (values (zero-scale preferred) "")
+      (and (small? a) (and (small? b) (and (<= prec 34) (and (not (= (u-of a) bi/INT-MIN))
+                                                             (and (< (u-of b) B9) (> (u-of b) (- 0 B9)))))))
+      (let [[r e ok] (div-mc-small (u-of a) (u-of b) prec mode preferred)] (if ok (values r e) (div-mc-big a b prec mode preferred)))
+      :else (div-mc-big a b prec mode preferred))))
+
+(defn div-scale Values(Dec Str) [a: &Dec b: &Dec want: Int mode: Int]
+  (if (is-zero? b) (values (zero) (div-zero-err a))
+    (let [k (+ (- want (scale a)) (scale b))]
+      (if (or (too-wide? a k) (too-wide? b (- 0 k))) (values (zero) TOO-BIG)
+        (let [n (if (>= k 0) (bi/mul-pow10 (unscaled a) k) (unscaled a))
+              dd (if (>= k 0) (unscaled b) (bi/mul-pow10 (unscaled b) (- 0 k)))
+              [q exact err] (round-div n dd mode)]
+          (values (mkb q want) err))))))
+
+(defn div Values(Dec Str) [a: &Dec b: &Dec prec: Int mode: Int]
+  (let [[q err] (div-exact a b)]
+    (if (and (not (= err "")) (not (is-zero? b)))
+      (div-mc a b prec mode)
+      (values q err))))
+
+(defn- trunc-quot Values(big/BigInt Str) [a: &Dec b: &Dec]
+  (let [[ua ub s ae] (align a b)]
+    (if (not= ae "") (values (bi/zero) ae)
+      (let [[q r e] (bi/divmod ua ub)] (values q "")))))
+
+(defn rem-dec Values(Dec Str) [a: &Dec b: &Dec]
+  (if (is-zero? b) (values (zero) (div-zero-err a))
+    (let [preferred (- (scale a) (scale b))
+          [qi qe] (if (is-zero? a) (values (bi/zero) "") (trunc-quot a b))]
+      (cond
+        (not= qe "") (values (zero) qe)
+        (bi/is-zero? qi)
+        (values (dup a) "")
+        :else
+        (let [qs (if (>= preferred 0) preferred
+                   (let [tz (bi/trailing-zeros qi)] (if (> (- 0 tz) preferred) (- 0 tz) preferred)))
+              qd (if (>= qs 0)
+                   (mkb (bi/mul-pow10 qi qs) qs)
+                   (let [[qq rr] (bi/divmod-pow10 qi (- 0 qs))] (mkb qq qs)))]
+          (sub a (mul qd b)))))))
+
+(defn pow-digits Int [d: &Dec n: Int]
+  (let [u (bi/abs-big (unscaled d))
+        nd (bi/num-digits u)
+        lg (cond (bi/is-zero? u) 0.0
+                 (<= nd 17) (let [[x e] (bi/to-int u)] (log10 (float x)))
+                 :else (let [[hi lo] (bi/divmod-pow10 u (- nd 17))
+                             [x e] (bi/to-int hi)]
+                         (+ (log10 (float x)) (float (- nd 17)))))]
+    (+ (int (floor (* (float n) lg))) 1)))
+
+(defn- int-scale Values(Int Str) [s: Int over: Bool zero: Bool]
+  (cond (and (not over) (>= s INT32-MIN) (<= s INT32-MAX)) (values s "")
+        zero (values (if (> s 0) INT32-MAX INT32-MIN) "")
+        (> s 0) (values 0 "Underflow")
+        :else (values 0 "Overflow")))
+
+(defn pow-exact Values(Dec Str) [d: &Dec n: Int]
+  (let [u (unscaled d)
+        [s0 over] (prim/checked-mul (scale d) n)
+        [s se] (int-scale (if over (scale d) s0) over (is-zero? d))]
+    (cond
+      (or (< n 0) (> n 999999999)) (values (zero) "Invalid operation")
+      (not= se "") (values (zero) se)
+      (and (> n 1) (not (bi/is-zero? u)) (not (bi/eq? (bi/abs-big u) (bi/one)))
+           (> (pow-digits d n) MAX-DIGITS))
+      (values (zero) TOO-BIG)
+      :else
+      (let [[r e] (bi/pow-big u n)]
+        (values (mkb r s) "")))))
+
+(defn- mul-round Values(Dec Str) [x: &Dec y: &Dec prec: Int mode: Int]
+  (let [[s se] (int-scale (+ (scale x) (scale y)) false (is-zero? x))]
+    (cond (not= se "") (values (zero) se)
+          (is-zero? x) (round-mc (mks 0 s) prec mode)
+          :else (round-mc (mul x y) prec mode))))
+
+(defn pow-mc Values(Dec Str) [d: &Dec n: Int prec: Int mode: Int]
+  (if (<= prec 0) (pow-exact d n)
+    (if (or (< n -999999999) (> n 999999999)) (values (zero) "Invalid operation")
+      (if (= n 0) (values (from-int 1) "")
+        (let [mag (if (< n 0) (- 0 n) n)
+              elength (bi/num-digits (bi/from-int mag))]
+          (if (> elength prec) (values (zero) "Invalid operation")
+            (let [wp (+ (+ prec elength) 1)
+                  [acc err] (loop [i 1 m mag seen false lhs (from-int 1) err ""]
+                              (if (not (= err "")) (values lhs err)
+                                (let [m2 (bit-and (* m 2) 4294967295)
+                                      top (not (= (bit-and m2 2147483648) 0))
+                                      [lhs2 e2] (if top (mul-round lhs d wp mode) (values lhs ""))
+                                      seen2 (or seen top)]
+                                  (if (= i 31) (values lhs2 e2)
+                                    (if seen2
+                                      (let [[lhs3 e3] (mul-round lhs2 lhs2 wp mode)]
+                                        (recur (+ i 1) m2 seen2 lhs3 (if (= e2 "") e3 e2)))
+                                      (recur (+ i 1) m2 seen2 lhs2 e2))))))]
+              (if (not (= err "")) (values (zero) err)
+                (if (< n 0)
+                  (let [[inv e4] (div-mc (from-int 1) acc wp mode)]
+                    (if (not (= e4 "")) (values (zero) e4) (round-mc inv prec mode)))
+                  (round-mc acc prec mode))))))))))
+
+(defn integer? Bool [d: &Dec]
+  (cond
+    (or (<= (scale d) 0) (is-zero? d)) true
+    (small? d) (and (<= (scale d) 18) (= (rem (u-of d) (nth P10 (scale d))) 0))
+    :else (>= (bi/trailing-zeros (unscaled d)) (scale d))))
+
+(defn to-big Values(big/BigInt Str) [d: &Dec]
+  (let [s (scale d)]
+    (if (<= s 0)
+      (if (too-wide? d (- 0 s)) (values (bi/zero) TOO-BIG) (values (bi/mul-pow10 (unscaled d) (- 0 s)) ""))
+      (let [[q r] (bi/divmod-pow10 (unscaled d) s)] (values q "")))))
+
+(defn to-int-exact Values(Int Str) [d: &Dec]
+  (if (small? d)
+    (let [u (u-of d) s (scale d)]
+      (cond
+        (or (= s 0) (= u 0)) (values u "")
+        (> s 18) (values 0 "Rounding necessary")
+        (> s 0) (if (= (rem u (nth P10 s)) 0) (values (quot u (nth P10 s)) "") (values 0 "Rounding necessary"))
+        :else (let [[r ok] (up-int u (- 0 s))] (if ok (values r "") (values 0 "Overflow")))))
+    (to-int-slow d)))
+
+(defn- to-int-slow Values(Int Str) [d: &Dec]
+  (if (not (integer? d)) (values 0 "Rounding necessary")
+    (if (and (not (is-zero? d)) (> (- (precision d) (scale d)) 19)) (values 0 "Overflow")
+      (let [[b be] (to-big d) [n e] (bi/to-int b)]
+        (values n (if (and (= be "") (= e "")) "" "Overflow"))))))
+
+(defn- zeros Str [n: Int]
+  (loop [i 0 acc ""] (if (< i n) (recur (+ i 1) (str acc "0")) acc)))
+
+(defn- parse-plain Values(Dec Bool) [s: &Str]
+  (let [n (count s) c0 (if (> n 0) (nth s 0) 0) i0 (if (or (= c0 45) (= c0 43)) 1 0)]
+    (loop [i i0 acc 0 nd 0 dot -1]
+      (if (>= i n)
+        (if (= nd 0) (values (zero) false)
+          (values (mks (if (= c0 45) (- 0 acc) acc) (if (< dot 0) 0 (- (- n dot) 1))) true))
+        (let [c (nth s i)]
+          (cond
+            (and (>= c 48) (<= c 57)) (if (>= nd 18) (values (zero) false) (recur (+ i 1) (+ (* acc 10) (- c 48)) (+ nd 1) dot))
+            (and (= c 46) (< dot 0)) (recur (+ i 1) acc nd i)
+            :else (values (zero) false)))))))
+
+(defn parse Values(Dec Str) [s: &Str]
+  (let [[d ok] (parse-plain s)] (if ok (values d "") (parse-any s))))
+
+(defn- parse-any Values(Dec Str) [s: &Str]
+  (let [n (count s)
+        c0 (if (> n 0) (nth s 0) 0)
+        neg (= c0 45)
+        i0 (if (or (= c0 45) (= c0 43)) 1 0)
+        i1 (loop [i i0] (if (and (< i n) (let [c (nth s i)] (and (>= c 48) (<= c 57)))) (recur (+ i 1)) i))
+        dot (and (< i1 n) (= (nth s i1) 46))
+        f0 (if dot (+ i1 1) i1)
+        f1 (loop [i f0] (if (and (< i n) (let [c (nth s i)] (and (>= c 48) (<= c 57)))) (recur (+ i 1)) i))
+        ndig (+ (- i1 i0) (- f1 f0))
+        has-exp (and (< f1 n) (let [c (nth s f1)] (or (= c 101) (= c 69))))
+        e0 (if has-exp (+ f1 1) f1)
+        ec (if (< e0 n) (nth s e0) 0)
+        eneg (and has-exp (= ec 45))
+        e1 (if (and has-exp (or (= ec 45) (= ec 43))) (+ e0 1) e0)
+        e2 (loop [i e1] (if (and (< i n) (let [c (nth s i)] (and (>= c 48) (<= c 57)))) (recur (+ i 1)) i))
+        exp-ok (or (not has-exp) (> e2 e1))
+        bad (or (= ndig 0) (not exp-ok) (not (= e2 n)))]
+    (if bad (values (zero) (str "Character array is not a valid decimal number: \"" s "\""))
+      (let [es (loop [i e1] (if (and (< i (- e2 1)) (= (nth s i) 48)) (recur (+ i 1)) i))]
+        (if (> (- e2 es) 10) (values (zero) "Exponent overflow.")
+          (let [ev0 (loop [i es acc 0] (if (< i e2) (recur (+ i 1) (+ (* acc 10) (- (nth s i) 48))) acc))
+                ev (if eneg (- 0 ev0) ev0)
+                sc (- (- f1 f0) ev)
+                u (if (<= ndig 18)
+                    (let [w (loop [i i0 acc 0] (if (< i i1) (recur (+ i 1) (+ (* acc 10) (- (nth s i) 48))) acc))
+                          v (loop [i f0 acc w] (if (< i f1) (recur (+ i 1) (+ (* acc 10) (- (nth s i) 48))) acc))]
+                      (mks (if neg (- 0 v) v) sc))
+                    (let [digits (str (subs s i0 i1) (subs s f0 f1))] (mkb (bi/of-digits digits 0 (count digits) neg) sc)))]
+            (if (or (> sc INT32-MAX) (< sc INT32-MIN))
+              (values (zero) "Scale out of range.")
+              (values u ""))))))))
+
+(defn- coeff-str Str [d: &Dec]
+  (if (small? d)
+    (let [t (str (u-of d))] (if (< (u-of d) 0) (subs t 1 (count t)) t))
+    (bi/to-string (bi/abs-big (nth (:big d) 0)))))
+
+(def- ZEROS18 "000000000000000000")
+
+(defn- plain-small Str [u: Int s: Int]
+  (let [a (if (< u 0) (- 0 u) u) p (nth P10 s) ft (str (rem a p))]
+    (str (if (< u 0) "-" "") (quot a p) "." (subs ZEROS18 0 (- s (count ft))) ft)))
+
+(defn to-plain-str Str [d: &Dec]
+  (let [s (scale d)]
+    (cond
+      (not (small? d)) (to-plain-any d)
+      (= s 0) (str (u-of d))
+      (and (> s 0) (<= s 18)) (plain-small (u-of d) s)
+      :else (to-plain-any d))))
+
+(defn- to-plain-any Str [d: &Dec]
+  (let [s (scale d)
+        sign (if (< (signum d) 0) "-" "")
+        c (coeff-str d)]
+    (if (= s 0) (str sign c)
+      (if (< s 0)
+        (cond (is-zero? d) "0"
+              (too-wide? d (- 0 s)) (to-string d)
+              :else (str sign c (zeros (- 0 s))))
+        (let [len (count c)]
+          (cond (> len s) (str sign (subs c 0 (- len s)) "." (subs c (- len s) len))
+                (> (- s len) MAX-DIGITS) (to-string d)
+                :else (str sign "0." (zeros (- s len)) c)))))))
+
+(defn to-string Str [d: &Dec]
+  (let [s (scale d)]
+    (cond
+      (not (small? d)) (to-string-any d)
+      (= s 0) (str (u-of d))
+      (and (> s 0) (and (<= s 18) (>= (- (int-digits (u-of d)) s) -5))) (plain-small (u-of d) s)
+      :else (to-string-any d))))
+
+(defn- to-string-any Str [d: &Dec]
+  (let [s (scale d)
+        sign (if (< (signum d) 0) "-" "")
+        c (coeff-str d)
+        len (count c)
+        adjusted (+ (- 0 s) (- len 1))]
+    (if (= s 0) (str sign c)
+      (if (and (> s 0) (>= adjusted -6))
+        (to-plain-any d)
+        (str sign (subs c 0 1)
+             (if (> len 1) (str "." (subs c 1 len)) "")
+             "E" (if (> adjusted 0) "+" "") adjusted)))))
+
+(defn to-float Float [d: &Dec] (npz/flt (to-string d)))
+
+(defn- float-decompose Values(Int Int) [x0: Float]
+  (let [two52 4503599627370496.0
+        two53 9007199254740992.0
+        [x1 e1] (loop [x x0 e 0] (if (>= x two53) (recur (* x 0.5) (+ e 1)) (values x e)))
+        [x2 e2] (loop [x x1 e e1] (if (and (< x two52) (> e -1074)) (recur (* x 2.0) (- e 1)) (values x e)))]
+    (values (int x2) e2)))
+
+(defn- pow2 big/BigInt [n: Int]
+  (let [[p e] (bi/pow-big (bi/from-int 2) n)] p))
+
+(defn- cand-range Values(big/BigInt big/BigInt) [lo: &big/BigInt hi: &big/BigInt den: &big/BigInt q: Int inclusive: Bool]
+  (let [[mlt t] (if (>= q 0) (values (bi/one) (bi/mul-pow10 den q)) (values (bi/pow10 (- 0 q)) (bi/mul den (bi/one))))
+        [ql rl el] (bi/divmod (bi/mul lo mlt) t)
+        [qh rh eh] (bi/divmod (bi/mul hi mlt) t)
+        cmin (if (and (bi/is-zero? rl) inclusive) ql (bi/add-int ql 1))
+        cmax (if (and (bi/is-zero? rh) (not inclusive)) (bi/add-int qh -1) qh)]
+    (values cmin cmax)))
+
+(defn- closest big/BigInt [v: &big/BigInt den: &big/BigInt q: Int cmin: &big/BigInt cmax: &big/BigInt]
+  (let [[mlt t] (if (>= q 0) (values (bi/one) (bi/mul-pow10 den q)) (values (bi/pow10 (- 0 q)) (bi/mul den (bi/one))))
+        [qv rv ev] (bi/divmod (bi/mul v mlt) t)
+        h (bi/cmp (bi/mul-int rv 2) t)
+        c (if (< h 0) qv (if (> h 0) (bi/add-int qv 1) (if (bi/even-big? qv) qv (bi/add-int qv 1))))]
+    (if (< (bi/cmp c cmin) 0) (bi/mul cmin (bi/one))
+      (if (> (bi/cmp c cmax) 0) (bi/mul cmax (bi/one)) c))))
+
+(defn- closer Int [c1: &big/BigInt j1: Int c2: &big/BigInt j2: Int v: &big/BigInt den: &big/BigInt]
+  (let [[x1 x2 xv] (if (<= j2 0)
+                     (values (bi/mul (bi/mul-pow10 c1 (- j1 j2)) den) (bi/mul c2 den) (bi/mul-pow10 v (- 0 j2)))
+                     (values (bi/mul (bi/mul-pow10 c1 j1) den) (bi/mul (bi/mul-pow10 c2 j2) den) (bi/mul v (bi/one))))
+        d1 (bi/abs-big (bi/sub x1 xv))
+        d2 (bi/abs-big (bi/sub x2 xv))]
+    (bi/cmp d1 d2)))
+
+(defn- shortest-1or2 Values(Int big/BigInt) [v: &big/BigInt lo: &big/BigInt hi: &big/BigInt den: &big/BigInt q: Int inclusive: Bool]
+  (let [[a1 b1] (cand-range lo hi den (- q 1) inclusive)
+        c1 (closest v den (- q 1) a1 b1)
+        [a2 b2] (cand-range lo hi den (- q 2) inclusive)
+        a2c (if (< (bi/cmp a2 (bi/from-int 10)) 0) (bi/from-int 10) a2)
+        b2c (if (> (bi/cmp b2 (bi/from-int 99)) 0) (bi/from-int 99) b2)]
+    (if (> (bi/cmp a2c b2c) 0)
+      (values (- q 1) c1)
+      (let [c2 (closest v den (- q 2) a2c b2c)
+            w (closer c1 (- q 1) c2 (- q 2) v den)]
+        (if (< w 0) (values (- q 1) c1)
+          (if (> w 0) (values (- q 2) c2)
+            (if (bi/even-big? c2) (values (- q 2) c2) (values (- q 1) c1))))))))
+
+(def MIN-NORMAL (let [[x err] (parse-double "2.2250738585072014E-308")] x))
+
+(def JDK17-INSIGNIFICANT [0 0 0 0 1 1 1 2 2 2 3 3 3 3 4 4 4 5 5 5 6 6 6 6 7 7 7 8 8 8 9 9 9 9 10 10 10 11 11 11 12 12 12 12 13 13 13 14 14 14 15 15 15 15 16 16 16 17 17 17 18 18 18 19])
+
+(defn- jdk17-long-digits Values(Str Int) [x: Float]
+  (let [bin-exp (- (bit-and (bit-shift-right (float->bits x) 52) 2047) 1023)
+        lv (int x)
+        p2 (- bin-exp 54)
+        insig (if (and (> p2 1) (< p2 (count JDK17-INSIGNIFICANT))) (nth JDK17-INSIGNIFICANT p2) 0)
+        pow (loop [i 0 k 1] (if (>= i insig) k (recur (+ i 1) (* k 10))))
+        l2 (if (= insig 0) lv (let [res (mod lv pow) l (quot lv pow)] (if (>= res (quot pow 2)) (+ l 1) l)))
+        [l3 q] (loop [l l2 q insig] (if (and (> l 0) (= (mod l 10) 0)) (recur (quot l 10) (+ q 1)) (values l q)))]
+    (values (str l3) q)))
+
+(defn- shortest-digits Values(Str Int) [x: Float]
+  (if (and (>= x 9007199254740992.0) (< x 9223372036854775808.0)) (jdk17-long-digits x)
+  (if (>= x MIN-NORMAL)
+    (let [[c q] (float->shortest-decimal x)] (values (str c) q))
+    (let [[f e] (float-decompose x)]
+      (shortest-digits-fe x f e (and (= f 4503599627370496) (> e -1074)))))))
+
+(defn- float32-decompose Values(Int Int) [x0: Float]
+  (let [two23 8388608.0
+        two24 16777216.0
+        [x1 e1] (loop [x x0 e 0] (if (>= x two24) (recur (* x 0.5) (+ e 1)) (values x e)))
+        [x2 e2] (loop [x x1 e e1] (if (and (< x two23) (> e -149)) (recur (* x 2.0) (- e 1)) (values x e)))]
+    (values (int x2) e2)))
+
+(defn- shortest-digits-fe Values(Str Int) [x: Float f: Int e: Int asym: Bool]
+  (let [
+        inclusive (= (bit-and f 1) 0)
+        sh (- e 2)
+        [scl den] (if (>= sh 0) (values (pow2 sh) (bi/one)) (values (bi/one) (pow2 (- 0 sh))))
+        v (bi/mul (bi/from-int (* 4 f)) scl)
+        lo (bi/mul (bi/from-int (- (* 4 f) (if asym 1 2))) scl)
+        hi (bi/mul (bi/from-int (+ (* 4 f) 2)) scl)
+        q0 (+ (int (log10 x)) 2)
+        [q cmin cmax] (loop [q q0]
+                        (let [[a b] (cand-range lo hi den q inclusive)]
+                          (if (<= (bi/cmp a b) 0) (values q a b) (recur (- q 1)))))
+        m (bi/num-digits cmin)
+        [q2 c] (if (>= m 2)
+                 (values q (closest v den q cmin cmax))
+                 (shortest-1or2 v lo hi den q inclusive))
+        tz (bi/trailing-zeros c)
+        [c2 r2] (bi/divmod-pow10 c tz)]
+    (values (bi/to-string c2) (+ q2 tz))))
+
+(defn- sci-or-plain Str [ds: &Str q: Int]
+  (let [n (count ds)
+        ex (+ q (- n 1))]
+    (if (and (>= ex -3) (< ex 7))
+      (if (>= ex 0)
+        (if (<= n (+ ex 1))
+          (str ds (zeros (- (+ ex 1) n)) ".0")
+          (str (subs ds 0 (+ ex 1)) "." (subs ds (+ ex 1) n)))
+        (str "0." (zeros (- (- 0 ex) 1)) ds))
+      (str (subs ds 0 1) "." (if (> n 1) (subs ds 1 n) "0") "E" ex))))
+
+(defn- inf? Bool [x: Float] (and (not (= x 0.0)) (= x (* x 2.0))))
+
+(defn float->shortest-str Str [x: Float]
+  (cond
+    (not (= x x)) "NaN"
+    (inf? x) (if (> x 0.0) "Infinity" "-Infinity")
+    (= x 0.0) (if (< (/ 1.0 x) 0.0) "-0.0" "0.0")
+    :else
+    (let [neg (< x 0.0)
+          [ds q] (shortest-digits (if neg (- 0.0 x) x))]
+      (str (if neg "-" "") (sci-or-plain ds q)))))
+
+(defn float32->shortest-str Str [x: Float]
+  (cond
+    (not (= x x)) "NaN"
+    (inf? x) (if (> x 0.0) "Infinity" "-Infinity")
+    (= x 0.0) (if (< (/ 1.0 x) 0.0) "-0.0" "0.0")
+    :else
+    (let [neg (< x 0.0)
+          ax (if neg (- 0.0 x) x)
+          [f e] (float32-decompose ax)
+          [ds q] (shortest-digits-fe ax f e (and (= f 8388608) (> e -149)))]
+      (str (if neg "-" "") (sci-or-plain ds q)))))
+
+(defn from-float Values(Dec Str) [x: Float]
+  (if (or (not (= x x)) (inf? x))
+    (values (zero) "Infinite or NaN")
+    (parse (float->shortest-str x))))

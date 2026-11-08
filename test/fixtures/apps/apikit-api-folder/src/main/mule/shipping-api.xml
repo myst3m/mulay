@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+	<configuration-properties doc:name="設定ファイル" doc:id="36a4df51-c9e4-4b3d-984a-f4d2f03e79ab" file="config.yaml" />
+	<http:listener-config name="shipping-api-httpListenerConfig" doc:name="HTTP Listener config" doc:id="7d981de2-8707-4dc8-b6ac-53a0eafa6ccc">
+		<http:listener-connection host="0.0.0.0" port="${http.port}" />
+	</http:listener-config>
+	<apikit:config name="shipping-api-config" api="shipping-api.yaml" outboundHeadersMapName="outboundHeaders" httpStatusVarName="httpStatus" doc:name="APIkit Router config" doc:id="d145585f-c09a-4560-b98b-13e14ec331c9" />
+	<flow name="shipping-api-main" doc:id="74406ccd-d205-4075-9833-d171fb5204f4">
+		<http:listener doc:name="受け取る" doc:id="ba581fc5-e51f-4d05-b2dd-a56a9936bf1c" config-ref="shipping-api-httpListenerConfig" path="/api/*">
+			<http:response statusCode="#[vars.httpStatus default 200]">
+				<http:headers><![CDATA[#[vars.outboundHeaders default {}]]]></http:headers>
+			</http:response>
+			<http:error-response statusCode="#[vars.httpStatus default 500]">
+				<http:body><![CDATA[#[payload]]]></http:body>
+				<http:headers><![CDATA[#[vars.outboundHeaders default {}]]]></http:headers>
+			</http:error-response>
+		</http:listener>
+		<apikit:router doc:name="仕様で振り分ける" doc:id="79edcd41-1398-412b-a619-9db01586e373" config-ref="shipping-api-config" />
+		<error-handler>
+			<on-error-propagate doc:name="仕様に合わない" doc:id="3d987899-f659-4874-97ac-697cb13c4f96" type="APIKIT:BAD_REQUEST">
+				<set-variable doc:name="400 にする" doc:id="83ae4290-b2e3-4653-96ed-7b7fb52c025d" variableName="httpStatus" value="400" />
+				<ee:transform doc:name="エラーの本文" doc:id="2282d779-5c0d-45d4-9432-7d1bfea05083">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ message: error.description }]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</on-error-propagate>
+			<on-error-propagate doc:name="無いパス" doc:id="4ea60409-bca8-4a26-9f86-f79f61bd5e9b" type="APIKIT:NOT_FOUND">
+				<set-variable doc:name="404 にする" doc:id="eb73758d-4525-4ae3-aea0-218be0d2190b" variableName="httpStatus" value="404" />
+				<ee:transform doc:name="エラーの本文" doc:id="614a9f36-0962-4fbe-a431-288ab375150f">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ message: "Resource not found" }]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</on-error-propagate>
+		</error-handler>
+	</flow>
+	<flow name="post:\shipments:application\json:shipping-api-config" doc:id="cb20f6ba-a9d2-4de2-92ce-b2ec67d43fee">
+		<ee:transform doc:name="配送を作る" doc:id="56fe5f1b-4f4f-476c-9a32-923528eec976">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	shipmentId: "S-" ++ (payload.orderId[-4 to -1] default "0000"),
+	orderId: payload.orderId,
+	eta: (now() + |P3D|) as String { format: "yyyy-MM-dd" }
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<set-variable doc:name="201 にする" doc:id="be82167e-aa2c-416c-882b-4fa69015f341" variableName="httpStatus" value="201" />
+	</flow>
+	<flow name="get:\shipments\(id):shipping-api-config" doc:id="44327479-9ec2-41ea-8da3-80cd18558e04">
+		<ee:transform doc:name="配送の状態" doc:id="ed26a8f0-176e-4b71-b617-5863dc3a5e7f">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ shipmentId: attributes.uriParams.id, status: "preparing" }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+</mule>

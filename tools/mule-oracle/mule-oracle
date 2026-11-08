@@ -1,0 +1,2016 @@
+#!/usr/bin/env python3
+"""実 Mule 4 (4.11.3) をオラクルにして、アプリの golden シナリオ (.scn) を埋める・照合する。
+
+  tools/mule-oracle/mule-oracle fill  [opts] [app...]   応答を実 Mule で記録して scenario.scn に書き戻す
+  tools/mule-oracle/mule-oracle check [opts] [app...]   記録と実 Mule の食い違いを表示 (終了コード 1)
+  tools/mule-oracle/mule-oracle run   [opts] [app...]   デプロイして止まる (手で叩く用。Ctrl-C で停止)
+  tools/mule-oracle/mule-oracle mulay [-v] [-j N] [--lazy|--lazy-local] [app...]
+                                                     同じシナリオを mulay (target/mulay run <app>) で動かして照合。-j N は JVM の引数が
+                                                     同じアプリ (実 Mule では 1 つの Mule で同時に回すもの) を N 個まで同時に回す。--lazy は
+                                                     各アプリを MULAY_DW_LAZY_ALL=1 でも回す (--lazy-local は外のサービスを使わないアプリだけ)
+  tools/mule-oracle/mule-oracle mulay --record app...  '%%% oracle mulay' のアプリの期待を mulay の応答で書く
+  tools/mule-oracle/mule-oracle clean                   私的ランタイムとビルド物を消す
+
+  app は test/fixtures/apps/<name> のディレクトリか、その名前か、scenario.scn のパス。省略時は全アプリ。
+  opts: --no-build (前回のビルド物を使う)  -j N (並行ビルド数、既定 4)
+
+形式と比較の規則は docs/fixtures.md の「アプリの golden シナリオ」。
+mulay モードの環境変数: MULAY_BIN (既定 <repo>/target/mulay)。
+
+ユーザーの Mule (MULE_ORACLE_HOME、既定 ~/srv/mule-enterprise-standalone-4.11.3) は読むだけ。
+MULE_ORACLE_HOME に CE (例 ~/srv/mule-standalone-4.9.6) を渡すと、check・run を CE で走らせる。ビルドと起動は
+target/mule-oracle-{build,runtime}-ce-<版> で行い、アプリの minMuleVersion・app.runtime を CE の版に下げる。
+期待値は EE で記録するので、CE では fill を断る。
+起動は私的なコピー (<repo>/target/mule-oracle-runtime。lib/services はハードリンク) で行い、
+終了時 (例外・Ctrl-C を含む) に Mule のプロセスグループを必ず止める。
+"""
+import atexit, base64, concurrent.futures as cf, http.client, os, re, select, shutil, signal, socket, ssl
+import json, struct, subprocess, sys, threading, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+APPS_DIR = os.path.join(REPO, "test", "fixtures", "apps")
+MULE_SRC = os.environ.get("MULE_ORACLE_HOME", os.path.expanduser("~/srv/mule-enterprise-standalone-4.11.3"))
+
+
+def runtime_info(home):
+    """lib/mule の jar 名から (版, EE か) を読む。mule-core-ee-*.jar があれば EE"""
+    d = os.path.join(home, "lib", "mule")
+    names = os.listdir(d) if os.path.isdir(d) else []
+    ver = next((m.group(1) for n in names for m in [re.fullmatch(r"mule-core-(\d+\.\d+\.\d+)\.jar", n)] if m), "")
+    return ver, any(n.startswith("mule-core-ee-") for n in names)
+
+
+MULE_VER, MULE_EE = runtime_info(MULE_SRC)
+SUFFIX = "" if MULE_EE else f"-ce-{MULE_VER}"   # CE は EE と別の場所でビルド・起動する
+RT = os.environ.get("MULE_ORACLE_RUNTIME", os.path.join(REPO, "target", "mule-oracle-runtime" + SUFFIX))
+BUILD = os.path.join(REPO, "target", "mule-oracle-build" + SUFFIX)
+MARK = "%%% "
+
+# 記録・比較から外すヘッダ (headers=* のとき)。値が揺れるか、転送の都合でしかないもの。
+VOLATILE_HEADERS = {"date", "content-length", "transfer-encoding", "connection", "keep-alive"}
+
+# ---------------------------------------------------------------- .scn の読み書き
+
+class Section:
+    def __init__(self, head, body=""):
+        self.head, self.body = head, body
+        parts = head.split()
+        self.kind = parts[0] if parts else ""
+        self.args = parts[1:]
+
+    def opts(self):
+        """head の key=value と裸のフラグ (値は True)"""
+        o = {}
+        for a in self.args:
+            if "=" in a:
+                k, v = a.split("=", 1); o[k] = v
+            else:
+                o[a] = True
+        return o
+
+
+def parse_scn(text):
+    secs, cur, lines = [], None, []
+    if text.endswith("\n"):
+        text = text[:-1]
+    for line in text.split("\n"):
+        if line.startswith(MARK):
+            if cur is not None:
+                cur.body = "\n".join(lines)
+            cur = Section(line[len(MARK):].strip()); secs.append(cur); lines = []
+        elif cur is not None:
+            lines.append(line)
+        elif line.strip():
+            raise ValueError("text before the first %%% section: " + line)
+    if cur is not None:
+        cur.body = "\n".join(lines)
+    return secs
+
+
+def render_scn(secs):
+    return "".join(MARK + s.head + "\n" + (s.body + "\n" if s.body != "" else "") for s in secs)
+
+
+def split_head_body(text):
+    """ヘッダ行と本文を最初の空行で分ける。空行が無ければ全部ヘッダで本文は空。
+    先頭が空行ならヘッダは無く、残りが本文。"""
+    if text.startswith("\n"):
+        h, b = "", text[1:]
+    elif "\n\n" in text:
+        h, b = text.split("\n\n", 1)
+    elif text.endswith("\n") or text == "":
+        h, b = text.rstrip("\n"), ""
+    else:
+        h, b = text, ""
+    hs = []
+    for line in h.split("\n") if h else []:
+        if not line.strip():
+            continue
+        if ":" not in line:
+            raise ValueError("bad header line: " + line)
+        k, v = line.split(":", 1)
+        hs.append((k.strip(), v.strip()))
+    return hs, b
+
+
+def encode_body(raw):
+    """バイト列を .scn に書ける形へ。戻り値 (flag, text)。flag は '' / 'crlf' / 'base64'"""
+    try:
+        s = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "base64", base64.b64encode(raw).decode()
+    bad = any((ord(c) < 32 and c not in "\n\t\r") or ord(c) == 127 for c in s)
+    if "\r" in s:
+        if not bad and s.replace("\r\n", "").count("\r") == 0 and s.count("\n") == s.count("\r\n"):
+            return "crlf", s.replace("\r\n", "\n")
+        return "base64", base64.b64encode(raw).decode()
+    if bad:
+        return "base64", base64.b64encode(raw).decode()
+    return "", s
+
+
+def decode_body(flag_opts, text):
+    if flag_opts.get("base64"):
+        return base64.b64decode(text)
+    if flag_opts.get("crlf"):
+        return text.replace("\n", "\r\n").encode()
+    return text.encode()
+
+
+class Scenario:
+    def __init__(self, app_dir):
+        self.app_dir = app_dir
+        self.name = os.path.basename(app_dir.rstrip("/"))
+        self.path = os.path.join(app_dir, "scenario.scn")
+        with open(self.path, encoding="utf-8") as f:
+            self.secs = parse_scn(f.read())
+        ports = [s.args[0] for s in self.secs if s.kind == "port"]
+        if not ports:
+            raise ValueError(f"{self.path}: missing '%%% port <n>'")
+        self.port = int(ports[0])
+        self.jvm = tuple(x for s in self.secs if s.kind == "jvm" for x in s.args)
+        self.oracle = next((s.args[0] for s in self.secs if s.kind == "oracle" and s.args), "mule")   # %%% oracle mulay: 期待は mulay で記録する   # %%% jvm <引数>...: 実 Mule の JVM に足す引数
+        self.extra_ports = [int(x) for x in ports[1:]]   # 2 つ目以降の port: 既定の宛先ではなく、起動を待つだけ (アプリが開く他のポート)
+        # %%% tls <port> [client-cert client-key]: そのポートへは TLS で送る (パスはアプリのディレクトリから)
+        self.tls = {}
+        for s in self.secs:
+            if s.kind == "tls" and s.args:
+                self.tls[int(s.args[0])] = [os.path.join(app_dir, a) for a in s.args[1:]]
+        self.masks = []   # (regex) を出現順に。以後の request に効く
+        self.raw_ports = [int(s.args[0]) for s in self.secs if s.kind in ("rawserver", "grpcserver")]
+        # %%% protoset <パス>: gRPC の要求 (request GRPC) のメッセージを JSON と protobuf で行き来させる記述子 (アプリのディレクトリから)
+        self.protoset = next((os.path.join(app_dir, s.args[0]) for s in self.secs if s.kind == "protoset" and s.args), None)
+
+    def save(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(render_scn(self.secs))
+
+# ---------------------------------------------------------------- 正規化
+
+def apply_masks(masks, text):
+    for rx in masks:
+        def rep(m):
+            if m.re.groups:
+                s, out, pos = m.group(0), [], 0
+                base = m.start(0)
+                for g in range(1, m.re.groups + 1):
+                    if m.start(g) < 0:
+                        continue
+                    out.append(s[pos:m.start(g) - base]); out.append("***"); pos = m.end(g) - base
+                out.append(s[pos:])
+                return "".join(out)
+            return "***"
+        text = rx.sub(rep, text)
+    return text
+
+# ---------------------------------------------------------------- ログ
+
+LOG_START = re.compile(r"^(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d+ \[.*?\] "
+                       r"\[processor: ([^;]*); event: ([^\]]*)\] (\S+): ?(.*)$")
+
+
+def parse_log(text):
+    """Mule のアプリログ (既定パターン) を (level, category, processor, message) の列へ"""
+    out = []
+    for line in text.split("\n"):
+        m = LOG_START.match(line)
+        if m:
+            out.append([m.group(1), m.group(4), m.group(2), m.group(5)])
+        elif out:
+            out[-1][3] += "\n" + line
+    return [(l, c, p, msg.rstrip("\n")) for l, c, p, msg in out]
+
+
+def app_log_path(name):
+    return os.path.join(RT, "logs", f"mule-app-{name}.log")
+
+
+class LogTail:
+    def __init__(self, path):
+        self.path = path
+        self.pos = os.path.getsize(path) if os.path.exists(path) else 0
+
+    def read_settled(self, min_wait=0.4, quiet=0.3, max_wait=3.0):
+        """非同期ロガーの書き出しを待ってから、開始位置以降を読む"""
+        t0 = time.time(); last = -1; last_change = t0
+        time.sleep(min_wait)
+        while True:
+            size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+            now = time.time()
+            if size != last:
+                last, last_change = size, now
+            elif now - last_change >= quiet or now - t0 > max_wait:
+                break
+            time.sleep(0.05)
+        if not os.path.exists(self.path):
+            return ""
+        with open(self.path, "rb") as f:
+            f.seek(self.pos)
+            return f.read().decode("utf-8", "replace")
+
+class OracleLog:
+    """実 Mule のアプリログ (logs/mule-app-<name>.log) から取り出す"""
+    def __init__(self, name):
+        self.path = app_log_path(name)
+
+    def mark(self):
+        return LogTail(self.path)
+
+    def entries(self, tail, wait=0.0):
+        return [(l, c, m) for l, c, _p, m in parse_log(tail.read_settled(min_wait=max(0.4, wait), max_wait=max(3.0, wait + 2)))]
+
+
+# mulay のログ行: "INFO  2026-09-28 12:00:00,123 [[app].flow] <category>: <message>"
+MULAY_LOG_START = re.compile(r"^(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d+ "
+                             r"\[.*?\] (\S+): ?(.*)$")
+
+
+def parse_mulay_log(text):
+    out = []
+    for line in text.split("\n"):
+        m = MULAY_LOG_START.match(line)
+        if m:
+            out.append([m.group(1), m.group(2), m.group(3)])
+        elif out:
+            out[-1][2] += "\n" + line
+    return [(l, c, msg.rstrip("\n")) for l, c, msg in out]
+
+
+class ProcLog:
+    """子プロセスの stdout と stderr を 1 本の行バッファに集め、その区間を取り出す。
+    区間の始まり (mark) では、パイプに届いている分をその場で読み切る。mulay はログを書いて flush してから応答を返すので、
+    前の要求のログは応答を受け取った時にはパイプの中にある。読むスレッドが追いつくのを当てにすると、負荷が高い時に
+    前の要求のログが次の要求の区間に入る。"""
+    def __init__(self):
+        self.lines, self.lock = [], threading.Lock()
+        self.last = time.time()
+        self.fd, self.rest, self.eof = None, b"", False
+
+    def attach(self, stream):
+        self.stream = stream
+        self.fd = stream.fileno()
+        os.set_blocking(self.fd, False)
+        threading.Thread(target=self.pump, daemon=True).start()
+
+    def pump(self):
+        while True:
+            select.select([self.fd], [], [])
+            with self.lock:
+                self.drain()
+                if self.eof:
+                    self.stream.close()
+                    return
+
+    def drain(self):
+        while not self.eof:
+            try:
+                data = os.read(self.fd, 65536)
+            except BlockingIOError:
+                return
+            if not data:
+                self.eof = True
+                data = b"\n" if self.rest else b""
+            parts = (self.rest + data).split(b"\n")
+            self.rest = parts.pop()
+            if parts:
+                self.lines.extend(p.decode("utf-8", "replace") for p in parts)
+                self.last = time.time()
+
+    def text(self):
+        with self.lock:
+            self.drain()
+            return "\n".join(self.lines)
+
+    def mark(self):
+        with self.lock:
+            self.drain()
+            return len(self.lines)
+
+    def entries(self, start, wait=0.0, quiet=0.15):
+        min_wait, max_wait = max(0.15, wait), max(2.0, wait + 2)
+        t0 = time.time(); time.sleep(min_wait)
+        while time.time() - self.last < quiet and time.time() - t0 < max_wait:
+            time.sleep(0.03)
+        with self.lock:
+            self.drain()
+            chunk = "\n".join(self.lines[start:])
+        return parse_mulay_log(chunk)
+
+# ---------------------------------------------------------------- HTTP
+
+def tls_context(spec, alpn=("http/1.1",)):
+    """%%% tls の指定 (port [client-cert.pem client-key.pem]) の SSL コンテキスト。サーバの証明書は検証しない
+    (テスト用の自己署名)。既定は HTTP/1.1 だけを申し出る (h2=1 の要求は h2 を申し出る)。"""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(list(alpn))
+    if spec and len(spec) >= 2:
+        ctx.load_cert_chain(spec[0], spec[1])
+    return ctx
+
+
+class RawServer:
+    """%%% rawserver <port> <mode>: 127.0.0.1:<port> で要求を読み終えてから、壊れた応答を返す TCP の相手。
+    コネクタの接続の失敗の文言 (相手が切った、壊れた応答、本文が途中で切れた) と、応答の頭の上限の境目
+    (status-4096 / status-4097 / head-8192 / head-8193) を記録するため。シナリオの終わりに閉じる"""
+    REPLIES = {
+        "close": b"",
+        "reset": b"",
+        "garbage": b"HELLO WORLD\r\n\r\n",
+        "nocolon": b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nBadHeader\r\nContent-Length: 2\r\n\r\n{}",
+        "short": b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"a\":",
+        "chunked-cut": b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"a\":\r\n",
+    }
+    # 応答の頭の上限の境目: 状態行の長さ (CRLF を除く) と、ヘッダ行の長さ (各行の CRLF を除く) の合計
+    for n in (4096, 4097):
+        REPLIES[f"status-{n}"] = (b"HTTP/1.1 200 " + b"O" * (n - 13) + b"\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+    for n in (8192, 8193):
+        REPLIES[f"head-{n}"] = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nX-Pad: " + b"p" * (n - 54) + b"\r\n\r\n{}")
+
+    def __init__(self, port, mode):
+        if mode not in self.REPLIES:
+            raise ValueError(f"rawserver: unknown mode {mode!r} (one of {', '.join(self.REPLIES)})")
+        self.mode = mode
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.listen(16)
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.serve, args=(c,), daemon=True).start()
+
+    @staticmethod
+    def read_request(c):
+        c.settimeout(10)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            d = c.recv(65536)
+            if not d:
+                return
+            buf += d
+        head, _, body = buf.partition(b"\r\n\r\n")
+        m = re.search(rb"(?im)^content-length:\s*(\d+)", head)
+        need = int(m.group(1)) if m else 0
+        while len(body) < need:
+            d = c.recv(65536)
+            if not d:
+                return
+            body += d
+
+    def serve(self, c):
+        try:
+            self.read_request(c)
+            if self.mode == "reset":
+                c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            elif self.REPLIES[self.mode]:
+                c.sendall(self.REPLIES[self.mode])
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+    def close(self):
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class GrpcServer:
+    """%%% grpcserver <port>: 127.0.0.1:<port> で h2c (prior knowledge) を受ける gRPC の相手。gRPC のクライアント (コネクタ) の
+    応答の扱いを記録するため。振る舞いはメソッド名 (パスの最後) で決まり、メッセージはバイト列のまま扱う:
+      Echo         要求の最初のメッセージを返す (grpc-status 0)
+      Headers      要求のヘッダを "名前: 値" の行にして、フィールド 1 (string) だけのメッセージで返す
+      Fail         メッセージ無しで grpc-status 5、grpc-message は "nicht gefunden: ü 100%" (パーセント符号化)
+      TrailersOnly 最初の HEADERS に grpc-status 7 と grpc-message "denied" を入れて END_STREAM (Trailers-Only)
+      Garbage      gRPC の枠にならない DATA (長さ 9 に 3 バイト) の後に grpc-status 0
+      BadProto     protobuf として読めないメッセージ (0xFF 0xFF 0xFF) で grpc-status 0
+      Http503      :status 503、text/plain の本文、grpc-status 無し
+      NoStatus     メッセージを返して END_STREAM、trailer 無し
+      Empty        メッセージ無しで grpc-status 0
+      Two          メッセージ 2 つ (要求の最初のメッセージと、フィールド 1 が "second" のもの) で grpc-status 0
+      Bare         メッセージ無しで grpc-status 13 (grpc-message 無し)
+      Odd          メッセージ無しで grpc-status 99
+    ストリーミング (応答のメッセージはフィールド 1 が文字列、フィールド 2 が整数。要求の最初のメッセージの 1 と 2 は読まない):
+      Ticks        要求の終わりに ("tick", 1..3) を 50 ms おきに送って grpc-status 0
+      TicksSlow    ("slow", 1) の 1.2 秒後に ("slow", 2) を送って grpc-status 0
+      TicksFail    ("tick", 1)、("tick", 2) の後に grpc-status 10、grpc-message "stopped"
+      TicksDeny    Trailers-Only で grpc-status 7、grpc-message "denied"
+      Sum          要求の終わりに ("sum", 受けたメッセージの数) を返して grpc-status 0
+      SumEarly     最初のメッセージが届いた時に、メッセージ無しで grpc-status 9、grpc-message "too early" (要求の終わりを待たない)
+      Chat         メッセージが届くたびに ("echo", 何番目か) を返し、要求の終わりに grpc-status 0
+      ChatFail     1 つ目には ("echo", 1) を返し、2 つ目で grpc-status 10、grpc-message "chat stopped"
+      Hang、HangSum 何も返さない (呼び手の打ち切りを見るため)
+    呼ばれたメソッドの回数は calls に数える。シナリオの終わりに閉じる"""
+    STREAMED = ("Sum", "SumEarly", "Chat", "ChatFail")
+    def __init__(self, port):
+        self.calls = {}
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.listen(16)
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.serve, args=(c,), daemon=True).start()
+
+    @staticmethod
+    def frame(m):
+        return b"\x00" + len(m).to_bytes(4, "big") + m
+
+    @staticmethod
+    def varint(n):
+        out = b""
+        while True:
+            x = n & 0x7F; n >>= 7
+            if n: out += bytes([x | 0x80])
+            else: return out + bytes([x])
+
+    def rep(self, text, n):
+        return self.frame(self.pb_string(1, text) + bytes([0x10]) + self.varint(n))
+
+    @staticmethod
+    def pb_string(field, text):
+        b = text.encode("utf-8")
+        n, ln = len(b), b""
+        while True:
+            x = n & 0x7F; n >>= 7
+            if n: ln += bytes([x | 0x80])
+            else: ln += bytes([x]); break
+        return bytes([(field << 3) | 2]) + ln + b
+
+    def respond(self, c, sid, hs, body):
+        G = [(":status", "200"), ("content-type", "application/grpc")]
+        path = dict(hs).get(":path", "")
+        meth = path.rsplit("/", 1)[-1]
+        msgs, i = [], 0
+        while i + 5 <= len(body):
+            n = int.from_bytes(body[i + 1:i + 5], "big"); msgs.append(body[i + 5:i + 5 + n]); i += 5 + n
+        first = msgs[0] if msgs else b""
+        if meth == "Echo":
+            c.send_headers(sid, G); c.send_data(sid, self.frame(first)); c.send_headers(sid, [("grpc-status", "0")], end_stream=True)
+        elif meth == "Headers":
+            text = "\n".join(f"{k}: {v}" for k, v in sorted(hs))
+            c.send_headers(sid, G); c.send_data(sid, self.frame(self.pb_string(1, text))); c.send_headers(sid, [("grpc-status", "0")], end_stream=True)
+        elif meth == "Fail":
+            c.send_headers(sid, G); c.send_headers(sid, [("grpc-status", "5"), ("grpc-message", "nicht gefunden: %C3%BC 100%25")], end_stream=True)
+        elif meth == "TrailersOnly":
+            c.send_headers(sid, G + [("grpc-status", "7"), ("grpc-message", "denied")], end_stream=True)
+        elif meth == "Garbage":
+            c.send_headers(sid, G); c.send_data(sid, b"\x00\x00\x00\x00\x09abc"); c.send_headers(sid, [("grpc-status", "0")], end_stream=True)
+        elif meth == "BadProto":
+            c.send_headers(sid, G); c.send_data(sid, self.frame(b"\xff\xff\xff")); c.send_headers(sid, [("grpc-status", "0")], end_stream=True)
+        elif meth == "Http503":
+            c.send_headers(sid, [(":status", "503"), ("content-type", "text/plain")]); c.send_data(sid, b"busy", end_stream=True)
+        elif meth == "NoStatus":
+            c.send_headers(sid, G); c.send_data(sid, self.frame(first), end_stream=True)
+        elif meth == "Empty":
+            c.send_headers(sid, G); c.send_headers(sid, [("grpc-status", "0")], end_stream=True)
+        elif meth == "Two":
+            c.send_headers(sid, G); c.send_data(sid, self.frame(first) + self.frame(self.pb_string(1, "second"))); c.send_headers(sid, [("grpc-status", "0")], end_stream=True)
+        elif meth == "Bare":
+            c.send_headers(sid, G); c.send_headers(sid, [("grpc-status", "13")], end_stream=True)
+        elif meth == "Odd":
+            c.send_headers(sid, G); c.send_headers(sid, [("grpc-status", "99")], end_stream=True)
+        elif meth in ("Ticks", "TicksSlow", "TicksFail"):
+            threading.Thread(target=self.ticks, args=(c, sid, meth), daemon=True).start()
+        elif meth in ("Hang", "HangSum"):
+            pass
+        elif meth == "TicksDeny":
+            c.send_headers(sid, G + [("grpc-status", "7"), ("grpc-message", "denied")], end_stream=True)
+        elif meth == "Sum":
+            c.send_headers(sid, G); c.send_data(sid, self.rep("sum", len(msgs))); c.send_headers(sid, [("grpc-status", "0")], end_stream=True)
+        elif meth in ("Chat", "ChatFail", "SumEarly"):
+            st = self.st.pop((id(c), sid), {})
+            if not st.get("done"):
+                c.send_headers(sid, ([] if st.get("head") else G) + [("grpc-status", "0")], end_stream=True)
+        else:
+            c.send_headers(sid, G + [("grpc-status", "12"), ("grpc-message", "unknown stub method " + meth)], end_stream=True)
+
+    def ticks(self, c, sid, meth):
+        G = [(":status", "200"), ("content-type", "application/grpc")]
+        steps = {"Ticks": [("tick", 1, 0.05), ("tick", 2, 0.05), ("tick", 3, 0.05)],
+                 "TicksSlow": [("slow", 1, 1.2), ("slow", 2, 0)],
+                 "TicksFail": [("tick", 1, 0.05), ("tick", 2, 0.05)]}[meth]
+        try:
+            with self.lk[c]:
+                c.send_headers(sid, G); self.out[c]()
+            for text, n, gap in steps:
+                with self.lk[c]:
+                    c.send_data(sid, self.rep(text, n)); self.out[c]()
+                time.sleep(gap)
+            with self.lk[c]:
+                tr = [("grpc-status", "10"), ("grpc-message", "stopped")] if meth == "TicksFail" else [("grpc-status", "0")]
+                c.send_headers(sid, tr, end_stream=True); self.out[c]()
+        except Exception:
+            pass
+
+    @staticmethod
+    def trace(*xs):
+        """環境変数 MULE_ORACLE_GRPC_TRACE のファイルに、スタブが受けた出来事を書く (調べる時だけ)"""
+        path = os.environ.get("MULE_ORACLE_GRPC_TRACE")
+        if path:
+            with open(path, "a") as f:
+                f.write(time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d} " + " ".join(str(x) for x in xs) + "\n")
+
+    def on_message(self, c, sid, meth, k):
+        """要求のメッセージが届くたび (Chat、ChatFail、SumEarly)。k は何番目か"""
+        G = [(":status", "200"), ("content-type", "application/grpc")]
+        st = self.st.setdefault((id(c), sid), {})
+        if st.get("done"):
+            return
+        if meth == "SumEarly":
+            c.send_headers(sid, G); c.send_headers(sid, [("grpc-status", "9"), ("grpc-message", "too early")], end_stream=True); st["done"] = True
+            return
+        if not st.get("head"):
+            c.send_headers(sid, G); st["head"] = True
+        if meth == "ChatFail" and k == 2:
+            c.send_headers(sid, [("grpc-status", "10"), ("grpc-message", "chat stopped")], end_stream=True); st["done"] = True
+        else:
+            c.send_data(sid, self.rep("echo", k))
+
+    def serve(self, s):
+        import h2.connection, h2.config, h2.events
+        c = h2.connection.H2Connection(h2.config.H2Configuration(client_side=False, header_encoding="utf-8"))
+        reqs, lk = {}, threading.Lock()
+        if not hasattr(self, "lk"):
+            self.lk, self.out, self.st = {}, {}, {}
+        self.lk[c] = lk
+        self.out[c] = lambda: s.sendall(c.data_to_send())
+        try:
+            s.settimeout(30)
+            with lk:
+                c.initiate_connection(); s.sendall(c.data_to_send())
+            while True:
+                d = s.recv(65536)
+                if not d:
+                    return
+                with lk:
+                    for e in c.receive_data(d):
+                        if isinstance(e, h2.events.RequestReceived):
+                            hs = list(e.headers)
+                            meth = dict(hs).get(":path", "").rsplit("/", 1)[-1]
+                            self.calls[meth] = self.calls.get(meth, 0) + 1
+                            self.trace("open", id(c), e.stream_id, meth)
+                            reqs[e.stream_id] = [hs, b"", 0, meth]
+                        elif isinstance(e, h2.events.DataReceived):
+                            r = reqs.get(e.stream_id)
+                            c.acknowledge_received_data(e.flow_controlled_length, e.stream_id)
+                            if r is None:
+                                continue
+                            r[1] += e.data
+                            if r[3] in self.STREAMED:
+                                b = r[1]
+                                while len(b) >= 5 and len(b) >= 5 + int.from_bytes(b[1:5], "big"):
+                                    n = int.from_bytes(b[1:5], "big"); b = b[5 + n:]; r[2] += 1
+                                    self.trace("message", id(c), e.stream_id, r[3], r[2])
+                                    if r[3] != "Sum":
+                                        self.on_message(c, e.stream_id, r[3], r[2])
+                                if r[3] != "Sum":
+                                    r[1] = b
+                        elif isinstance(e, h2.events.StreamEnded):
+                            hs, body, k, meth = reqs.pop(e.stream_id)
+                            self.trace("end", id(c), e.stream_id, meth, len(body))
+                            self.respond(c, e.stream_id, hs, body)
+                        elif isinstance(e, h2.events.StreamReset):
+                            self.trace("reset", id(c), e.stream_id, e.error_code)
+                            reqs.pop(e.stream_id, None); self.st.pop((id(c), e.stream_id), None)
+                        elif isinstance(e, h2.events.ConnectionTerminated):
+                            s.sendall(c.data_to_send()); return
+                    s.sendall(c.data_to_send())
+        except Exception:
+            pass
+        finally:
+            s.close()
+
+    def close(self):
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class StreamConn:
+    """request の stream=<名前> で開く、閉じない応答 (SSE)。背景のスレッドが本文を貯める。
+    take() は新しく届いた分を、届かなくなるまで (quiet 秒) 待ってから返す"""
+    def __init__(self, port, method, target, headers, body, timeout, tls=None):
+        if target.startswith(":"):
+            p, _, rest = target[1:].partition("/")
+            port, target = int(p), "/" + rest
+        if tls is not None and port in tls:
+            self.conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=timeout, context=tls_context(tls[port]))
+        else:
+            self.conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        self.buf, self.pos, self.last = b"", 0, time.time()
+        self.lock, self.head_ready, self.done = threading.Lock(), threading.Event(), False
+        self.status, self.headers, self.error = 0, [], None
+        self.conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
+        self.conn.putheader("Host", f"localhost:{port}")
+        for k, v in headers:
+            self.conn.putheader(k, v)
+        if body or method in ("POST", "PUT", "PATCH"):
+            self.conn.putheader("Content-Length", str(len(body)))
+        self.conn.endheaders(body if body else None)
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        try:
+            r = self.conn.getresponse()
+            self.status, self.headers = r.status, r.getheaders()
+            self.head_ready.set()
+            while True:
+                chunk = r.read1(8192)
+                if not chunk:
+                    break
+                with self.lock:
+                    self.buf += chunk; self.last = time.time()
+        except Exception as e:   # noqa: 閉じられた・時間切れ
+            self.error = e
+        finally:
+            self.done = True
+            self.head_ready.set()
+
+    def take(self, min_wait=0.3, quiet=0.3, max_wait=3.0):
+        t0 = time.time(); time.sleep(min_wait)
+        while not self.done and time.time() - self.last < quiet and time.time() - t0 < max_wait:
+            time.sleep(0.03)
+        with self.lock:
+            data = self.buf[self.pos:]; self.pos = len(self.buf)
+        return data
+
+    def close(self):
+        try:
+            if self.conn.sock is not None:
+                self.conn.sock.shutdown(socket.SHUT_RDWR)   # 読んでいるスレッドがいても、相手には確かに閉じたと伝わる
+        except OSError:
+            pass
+        try:
+            self.conn.close()
+        except Exception:   # noqa
+            pass
+
+
+def do_request(port, method, target, headers, body, timeout, tls=None):
+    """tls: {port: [client-cert, client-key] or []} TLS で話すポート"""
+    if target.startswith(":"):
+        p, _, rest = target[1:].partition("/")
+        port, target = int(p), "/" + rest
+    if tls is not None and port in tls:
+        conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=timeout, context=tls_context(tls[port]))
+    else:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", f"localhost:{port}")
+        for k, v in headers:
+            conn.putheader(k, v)
+        if body or method in ("POST", "PUT", "PATCH"):
+            conn.putheader("Content-Length", str(len(body)))
+        t0 = time.perf_counter()
+        conn.endheaders(body if body else None)
+        r = conn.getresponse()
+        data = r.read()
+        if os.environ.get("MULE_ORACLE_TIMES"):
+            # 段ごとの時間を実 Mule と mulay で比べるため (要求を送ってから応答を読み終わるまで)
+            print(f"  time {(time.perf_counter() - t0) * 1000:9.1f} ms  {method} {target}", flush=True)
+        return r.status, r.getheaders(), data
+    finally:
+        conn.close()
+
+def do_request_h2(port, method, target, headers, body, timeout, tls=None):
+    """h2=1 の要求: HTTP/2 で 1 つ送る。TLS のポートは ALPN で h2 を申し出て、選ばれなければ失敗にする。平文は h2c (prior knowledge)。
+    本文は相手の流れの制御の窓に従って分けて送る (大きな本文のため)"""
+    import h2.connection, h2.config, h2.events
+    if target.startswith(":"):
+        p, _, rest = target[1:].partition("/")
+        port, target = int(p), "/" + rest
+    raw = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    secure = tls is not None and port in tls
+    s = tls_context(tls[port], ("h2",)).wrap_socket(raw, server_hostname="localhost") if secure else raw
+    try:
+        if secure and s.selected_alpn_protocol() != "h2":
+            raise OSError(f"ALPN chose {s.selected_alpn_protocol()!r}, not h2")
+        c = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True, header_encoding="utf-8"))
+        c.initiate_connection(); s.sendall(c.data_to_send())
+        hs = [(":method", method), (":scheme", "https" if secure else "http"), (":path", target), (":authority", f"localhost:{port}")]
+        hs += [(k.lower(), v) for k, v in headers]
+        if body or method in ("POST", "PUT", "PATCH"):
+            hs.append(("content-length", str(len(body))))
+        status, rh, buf, done, sent = 0, [], b"", False, 0
+        c.send_headers(1, hs, end_stream=not body); s.sendall(c.data_to_send())
+
+        def pump():
+            nonlocal sent
+            while sent < len(body):
+                n = min(c.local_flow_control_window(1), c.max_outbound_frame_size, len(body) - sent)
+                if n <= 0:
+                    return
+                c.send_data(1, body[sent:sent + n], end_stream=(sent + n == len(body)))
+                sent += n
+            s.sendall(c.data_to_send())
+        if body:
+            pump(); s.sendall(c.data_to_send())
+        while not done:
+            d = s.recv(65536)
+            if not d:
+                break
+            for e in c.receive_data(d):
+                if isinstance(e, h2.events.ResponseReceived):
+                    for k, v in e.headers:
+                        if k == ":status": status = int(v)
+                        else: rh.append((k, v))
+                elif isinstance(e, h2.events.DataReceived):
+                    buf += e.data; c.acknowledge_received_data(e.flow_controlled_length, 1)
+                elif isinstance(e, (h2.events.StreamEnded, h2.events.StreamReset)):
+                    done = True
+                elif isinstance(e, h2.events.WindowUpdated) and sent < len(body):
+                    pump()
+            s.sendall(c.data_to_send())
+        if status == 0:
+            raise OSError("the stream ended without a response")
+        return status, rh, buf
+    finally:
+        s.close()
+
+# ---------------------------------------------------------------- gRPC
+
+class Protoset:
+    """記述子 (FileDescriptorSet) で JSON と protobuf を行き来させる (Python の protobuf)"""
+    def __init__(self, path):
+        from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+        fds = descriptor_pb2.FileDescriptorSet()
+        with open(path, "rb") as f:
+            fds.ParseFromString(f.read())
+        self.pool = descriptor_pool.DescriptorPool()
+        for fd in fds.file:
+            self.pool.Add(fd)
+        self.fac = message_factory.MessageFactory(self.pool)
+
+    def cls(self, name):
+        return self.fac.GetPrototype(self.pool.FindMessageTypeByName(name))
+
+    def encode(self, name, js):
+        from google.protobuf import json_format
+        m = self.cls(name)()
+        json_format.Parse(js, m, descriptor_pool=self.pool)
+        return m.SerializeToString()
+
+    def decode(self, name, data):
+        from google.protobuf import json_format
+        m = self.cls(name)()
+        m.ParseFromString(data)
+        return json.dumps(json_format.MessageToDict(m, preserving_proto_field_name=True, descriptor_pool=self.pool),
+                          ensure_ascii=False, sort_keys=True)
+
+
+def do_grpc(port, path, headers, msgs, timeout, body=None):
+    """h2c (prior knowledge) で gRPC の要求を 1 つ送る。msgs は送るメッセージのバイト列の列 (5 バイトの枠を付ける)。
+    body を渡せば、枠を付けずにそのバイト列を DATA で送る (空なら DATA を送らずに HEADERS で END_STREAM)。
+    戻り値 (status, [(名前, 値)], [(名前, 値)] の trailer, [受けたメッセージのバイト列], 余りのバイト列)"""
+    import h2.connection, h2.config, h2.events
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        c = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True, header_encoding="utf-8"))
+        c.initiate_connection(); s.sendall(c.data_to_send())
+        hs = [(":method", "POST"), (":scheme", "http"), (":path", path), (":authority", f"localhost:{port}"),
+              ("content-type", "application/grpc"), ("te", "trailers")] + [(k.lower(), v) for k, v in headers]
+        if body is None:
+            body = b"".join(b"\x00" + len(m).to_bytes(4, "big") + m for m in msgs)
+        if body:
+            c.send_headers(1, hs); c.send_data(1, body, end_stream=True)
+        else:
+            c.send_headers(1, hs, end_stream=True)
+        s.sendall(c.data_to_send())
+        status, rh, tr, buf, done = 0, [], [], b"", False
+        while not done:
+            d = s.recv(65536)
+            if not d:
+                break
+            for e in c.receive_data(d):
+                if isinstance(e, h2.events.ResponseReceived):
+                    for k, v in e.headers:
+                        if k == ":status": status = int(v)
+                        else: rh.append((k, v))
+                elif isinstance(e, h2.events.DataReceived):
+                    buf += e.data; c.acknowledge_received_data(e.flow_controlled_length, 1)
+                elif isinstance(e, h2.events.TrailersReceived):
+                    tr = list(e.headers)
+                elif isinstance(e, (h2.events.StreamEnded, h2.events.StreamReset)):
+                    done = True
+            s.sendall(c.data_to_send())
+        out, i = [], 0
+        while i + 5 <= len(buf):
+            n = int.from_bytes(buf[i + 1:i + 5], "big")
+            if i + 5 + n > len(buf): break
+            out.append(buf[i + 5:i + 5 + n]); i += 5 + n
+        return status, rh, tr, out, buf[i:]
+    finally:
+        s.close()
+
+
+def execute_grpc(sc, req, o, target, hs, body, masks, timeout):
+    if sc.protoset is None:
+        raise ValueError(f"{sc.path}: request GRPC needs '%%% protoset <file.desc>'")
+    if not hasattr(sc, "pset"):
+        sc.pset = Protoset(sc.protoset)
+    port = sc.port
+    if target.startswith(":"):
+        p, _, rest = target[1:].partition("/")
+        port, target = int(p), "/" + rest
+    tin, tout = o.get("in"), o.get("out")
+    text = body.decode("utf-8")
+    if isinstance(o.get("stream"), str):
+        st = GrpcStream(port, target, hs, grpc_msgs(sc, tin, text, o.get("raw")), o.get("end", "1") == "1", timeout)
+        st.tin, st.tout = tin, tout
+        sc.streams[o["stream"]] = st
+        sec_ = grpc_take_section(sc, st, masks, opening=True)
+        if st.status == 0 and st.error is not None:
+            raise socket.timeout()
+        return sec_
+    whole = None
+    if o.get("frame") == "0":
+        msgs, whole = [], base64.b64decode(text.strip())
+    elif o.get("raw"):
+        msgs = [base64.b64decode(x) for x in text.split("\n") if x.strip()]
+    else:
+        msgs = [sc.pset.encode(tin, x) for x in text.split("\n") if x.strip()] if text.strip() else [sc.pset.encode(tin, "{}")]
+    status, rh, tr, got, rest = do_grpc(port, target, hs, msgs, timeout, whole)
+    lines = [f"{k.lower()}: {v}" for k, v in rh if k.lower() not in VOLATILE_HEADERS]
+    lines += [f"{k.lower()} (trailer): {v}" for k, v in tr]
+    outs = []
+    for m in got:
+        try:
+            outs.append(sc.pset.decode(tout, m))
+        except Exception:
+            outs.append("base64 " + base64.b64encode(m).decode())
+    if rest:
+        outs.append("rest " + base64.b64encode(rest).decode())
+    text = apply_masks(masks, "\n".join(outs))
+    lines = [apply_masks(masks, x) for x in lines]
+    return Section(f"response {status}", ("\n".join(lines) + "\n" if lines else "") + "\n" + text)
+
+class GrpcStream:
+    """request GRPC .. stream=<名前> で開く gRPC の呼び出し (h2c)。背景のスレッドが応答の DATA と trailer を貯める。
+    send(msgs, end) で同じストリームにメッセージを足して送り、take() で前回から新しく届いた分を返す"""
+    def __init__(self, port, path, headers, msgs, end, timeout):
+        import h2.connection, h2.config
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        self.c = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True, header_encoding="utf-8"))
+        self.lock, self.head_ready = threading.Lock(), threading.Event()
+        self.status, self.headers, self.trailers, self.buf, self.pos = 0, [], [], b"", 0
+        self.trailers_taken, self.head_taken, self.done, self.last, self.error = False, False, False, time.time(), None
+        with self.lock:
+            self.c.initiate_connection()
+            hs = [(":method", "POST"), (":scheme", "http"), (":path", path), (":authority", f"localhost:{port}"),
+                  ("content-type", "application/grpc"), ("te", "trailers")] + [(k.lower(), v) for k, v in headers]
+            self.c.send_headers(1, hs, end_stream=(end and not msgs))
+            self._send_locked(msgs, end)
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def _send_locked(self, msgs, end):
+        body = b"".join(b"\x00" + len(m).to_bytes(4, "big") + m for m in msgs)
+        if body:
+            self.c.send_data(1, body, end_stream=end)
+        elif end:
+            self.c.end_stream(1)
+        self.sock.sendall(self.c.data_to_send())
+
+    def send(self, msgs, end):
+        with self.lock:
+            self._send_locked(msgs, end)
+
+    def loop(self):
+        import h2.events
+        try:
+            self.sock.settimeout(None)
+            while True:
+                d = self.sock.recv(65536)
+                if not d:
+                    break
+                with self.lock:
+                    for e in self.c.receive_data(d):
+                        if isinstance(e, h2.events.ResponseReceived):
+                            for k, v in e.headers:
+                                if k == ":status": self.status = int(v)
+                                else: self.headers.append((k, v))
+                            self.head_ready.set()
+                        elif isinstance(e, h2.events.DataReceived):
+                            self.buf += e.data; self.c.acknowledge_received_data(e.flow_controlled_length, 1)
+                        elif isinstance(e, h2.events.TrailersReceived):
+                            self.trailers = list(e.headers)
+                        elif isinstance(e, (h2.events.StreamEnded, h2.events.StreamReset)):
+                            self.done = True
+                    self.last = time.time()
+                    self.sock.sendall(self.c.data_to_send())
+                if self.done:
+                    break
+        except Exception as ex:   # noqa
+            self.error = ex
+        finally:
+            self.done = True; self.head_ready.set()
+
+    def take_head(self):
+        """届いていれば応答の :status とヘッダー (1 度だけ)。まだなら None"""
+        with self.lock:
+            if self.head_taken or not self.head_ready.is_set() or self.status == 0:
+                return None
+            self.head_taken = True
+            return self.status, list(self.headers)
+
+    def take(self, min_wait=0.3, quiet=0.3, max_wait=5.0):
+        """新しく届いたメッセージ (5 バイトの枠で切ったもの) と、届いていれば trailer (1 度だけ)"""
+        t0 = time.time(); time.sleep(min_wait)
+        while not self.done and time.time() - self.last < quiet and time.time() - t0 < max_wait:
+            time.sleep(0.03)
+        with self.lock:
+            out, i = [], self.pos
+            while i + 5 <= len(self.buf):
+                n = int.from_bytes(self.buf[i + 1:i + 5], "big")
+                if i + 5 + n > len(self.buf): break
+                out.append(self.buf[i + 5:i + 5 + n]); i += 5 + n
+            self.pos = i
+            tr = [] if self.trailers_taken else list(self.trailers)
+            if tr: self.trailers_taken = True
+            rest = self.buf[i:] if self.done else b""
+        return out, tr, rest
+
+    def close(self):
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def grpc_msgs(sc, tin, text, raw):
+    if raw:
+        return [base64.b64decode(x) for x in text.split("\n") if x.strip()]
+    return [sc.pset.encode(tin, x) for x in text.split("\n") if x.strip()]
+
+
+def grpc_lines(sc, tout, got, tr, rest):
+    outs = []
+    for m in got:
+        try:
+            outs.append(sc.pset.decode(tout, m))
+        except Exception:
+            outs.append("base64 " + base64.b64encode(m).decode())
+    if rest:
+        outs.append("rest " + base64.b64encode(rest).decode())
+    return outs, [f"{k.lower()} (trailer): {v}" for k, v in tr]
+
+
+def execute_grpc_send(sc, sec, masks):
+    """send <名前> [end=1] [raw=1]: stream=<名前> で開いた gRPC の呼び出しに、本文のメッセージ (1 行に 1 つの JSON) を送り、
+    新しく届いたメッセージを記録する"""
+    o = sec.opts()
+    st = sc.streams.get(sec.args[0]) if sec.args else None
+    if not isinstance(st, GrpcStream):
+        return Section("response none", "\nno such gRPC stream: " + (sec.args[0] if sec.args else ""))
+    hs, b = split_head_body(sec.body)
+    try:
+        st.send(grpc_msgs(sc, st.tin, b, o.get("raw")), o.get("end") == "1")
+    except OSError as e:
+        return Section("response none", f"\n{type(e).__name__}: {e}")
+    return grpc_take_section(sc, st, masks)
+
+
+def grpc_take_section(sc, st, masks, wait=0.3, opening=False):
+    """新しく届いたもの。応答の頭がこの間に届いたら response <status> とヘッダーの行も (開いた時にまだなら response pending)"""
+    got, tr, rest = st.take(min_wait=wait, max_wait=max(5.0, wait + 2))
+    outs, trl = grpc_lines(sc, st.tout, got, tr, rest)
+    hd = st.take_head()
+    lines = ([f"{k.lower()}: {v}" for k, v in hd[1] if k.lower() not in VOLATILE_HEADERS] if hd else []) + trl
+    lines = [apply_masks(masks, x) for x in lines]
+    status = f"response {hd[0]}" if hd else ("response pending" if opening else "response 200")
+    return Section(status, ("\n".join(lines) + "\n" if lines else "") + "\n" + apply_masks(masks, "\n".join(outs)))
+
+# ---------------------------------------------------------------- シナリオの実行
+
+def prepare_dirs(sc):
+    """startdir: アプリを起動する前に、そのディレクトリを消して空で作り直す (書いた順)"""
+    for s in sc.secs:
+        if s.kind == "startdir":
+            for d in s.args:
+                shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
+        elif s.kind == "sftpdir":
+            sftp_dirs(s.args[0], s.args[1:])
+        elif s.kind == "startsql":
+            r = subprocess.run(["psql", s.args[0], "-q", "-v", "ON_ERROR_STOP=1", "-f", "-"], input=s.body,
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                raise RuntimeError(f"startsql: psql failed: {r.stderr.strip()}")
+
+
+def wait_ssh(host, port, limit):
+    """SSH のサーバーが挨拶 (SSH-) を返すまで待つ。テスト用のサーバーは、使う時に立ち上がる転送 (kubectl port-forward) の
+    向こうにあり、冷えていると最初の接続が切られる"""
+    t0 = time.time()
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=5) as c:
+                c.settimeout(5)
+                if c.recv(64).startswith(b"SSH-"):
+                    return
+        except OSError:
+            pass
+        if time.time() - t0 > limit:
+            raise RuntimeError(f"sftpdir: no SSH server at {host}:{port} after {limit}s")
+        time.sleep(0.5)
+
+
+def sftp_dirs(url, dirs):
+    """sftpdir sftp://user:pass@host:port <path>...: SFTP サーバーの上でディレクトリを消して空で作り直す (lftp を使う)"""
+    m = re.match(r"sftp://([^:@]+):([^@]*)@([^/]+)$", url)
+    if not m:
+        raise ValueError(f"sftpdir: bad url {url!r}")
+    user, pw, hostport = m.groups()
+    host, _, port = hostport.rpartition(":")
+    wait_ssh(host, int(port), 30)
+    cmds = ["set sftp:auto-confirm yes", "set net:max-retries 1", "set cmd:fail-exit no"]
+    for d in dirs:
+        cmds += [f"rm -rf {d}", f"mkdir -p {d}"]
+    cmds += ["bye"]
+    r = subprocess.run(["lftp", "-u", f"{user},{pw}", "-e", "; ".join(cmds), f"sftp://{hostport}"],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(f"sftpdir: lftp failed: {r.stderr.strip()}")
+
+
+def run_scenario(sc, mode, out, logsrc):
+    """sc の request を順に送り、fill なら response/log を書き換え、check なら食い違いを数える。
+    logsrc はログの取り出し口 (OracleLog / ProcLog)。
+    戻り値: (件数, 食い違い数, [(request の通し番号, request の head, 差分の列)])"""
+    new, masks = [], []
+    sc.vars, sc.caps, sc.streams, sc.raws = {}, [], {}, []
+    try:
+        return run_sections(sc, mode, out, logsrc, new, masks)
+    finally:
+        for st in sc.streams.values():
+            st.close()
+        sc.streams = {}
+        for r in sc.raws:
+            r.close()
+        sc.raws = []
+
+
+def run_sections(sc, mode, out, logsrc, new, masks):
+    n, bad, results = 0, 0, []
+    secs = sc.secs
+    i = 0
+    while i < len(secs):
+        s = secs[i]
+        if s.kind in ("response", "log"):
+            i += 1; continue   # request の処理で作り直す (fill) / 読む (check)
+        new.append(s)
+        if s.kind == "mask":
+            for line in s.body.split("\n"):
+                if line.strip():
+                    masks.append(re.compile(line))
+        elif s.kind == "capture":
+            sc.caps.append((s.args[0], s.args[1]))
+        elif s.kind == "wait":
+            time.sleep(int(s.args[0]) / 1000.0)
+        elif s.kind == "emptydir":
+            for d in s.args:
+                shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
+        elif s.kind == "mkfifo":
+            for f in s.args:
+                if os.path.lexists(f): os.remove(f)
+                os.mkfifo(f)
+        elif s.kind == "symlink":
+            target, link = s.args[0], s.args[1]
+            if os.path.lexists(link): os.remove(link)
+            os.symlink(target, link)
+        elif s.kind == "rawserver":
+            sc.raws.append(RawServer(int(s.args[0]), s.args[1]))
+        elif s.kind == "grpcserver":
+            sc.raws.append(GrpcServer(int(s.args[0])))
+        elif s.kind in ("startdir", "sftpdir", "startsql", "requires"):
+            pass   # 起動の前に済ませてある (prepare_dirs、resolve_apps)
+        elif s.kind == "close":
+            for name in s.args:
+                st = sc.streams.pop(name, None)
+                if st is not None: st.close()
+        elif s.kind in ("request", "sfauth", "read", "send"):
+            exp_resp, exp_log = None, None
+            j = i + 1
+            while j < len(secs) and secs[j].kind in ("response", "log"):
+                if secs[j].kind == "response": exp_resp = secs[j]
+                else: exp_log = secs[j]
+                j += 1
+            n += 1
+            resp, logsec = ((execute_read(sc, s, masks), None) if s.kind == "read" else
+                            (execute_grpc_send(sc, s, masks), None) if s.kind == "send" else execute(sc, s, masks, logsrc))
+            label = f"{sc.name}: {s.head}"
+            if mode == "fill":
+                new.append(resp)
+                if logsec is not None:
+                    new.append(logsec)
+            else:
+                if exp_resp is None:
+                    out.append(f"MISSING  {label}: no expected response (run fill)"); bad += 1
+                    results.append((n, s.head, ["no expected response (run fill)"]))
+                else:
+                    d = diff_resp(exp_resp, resp)
+                    if exp_log is not None or logsec is not None:
+                        eb = exp_log.body if exp_log else "(none)"
+                        ab = logsec.body if logsec else "(none)"
+                        if norm_log(eb) != norm_log(ab):
+                            d.append(f"log:\n--- expected\n{eb}\n--- actual\n{ab}")
+                    results.append((n, s.head, d))
+                    if d:
+                        bad += 1
+                        out.append(f"DIFF     {label}\n  " + "\n  ".join(x.replace("\n", "\n  ") for x in d))
+                if exp_resp is not None:
+                    new.append(exp_resp)
+                if exp_log is not None:
+                    new.append(exp_log)
+            i = j; continue
+        i += 1
+    if mode == "fill":
+        sc.secs = new
+    return n, bad, results
+
+
+def do_sfauth(port, alias, path, timeout):
+    """sfauth: sf CLI の org (alias) のセッションで Salesforce にログインした状態 (frontdoor.jsp の cookie) を作り、
+    アプリの認可の口 (path) からリダイレクトをたどる (Salesforce の認可 → アプリのコールバック)。最後の応答を返す。
+    アクセストークンは表示しない"""
+    import http.cookiejar, urllib.request, urllib.parse, urllib.error
+    p = subprocess.run(["sf", "org", "display", "-o", alias, "--json"], capture_output=True, text=True)
+    d = json.loads(p.stdout)["result"]
+    jar = http.cookiejar.CookieJar()
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    op.open(d["instanceUrl"] + "/secur/frontdoor.jsp?sid=" + urllib.parse.quote(d["accessToken"]), timeout=timeout).read()
+    url = f"http://localhost:{port}{path}"
+    # Salesforce は https から http のコールバックへ戻すとき、302 ではなく window.location.replace('...') のページを返す。
+    # アプリのポートの localhost 宛てのものだけたどる
+    for _ in range(3):
+        try:
+            r = op.open(url, timeout=timeout)
+            st, hs, data = r.status, list(r.headers.items()), r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, list(e.headers.items()), e.read()
+        m = re.search(rb"window\.location\.replace\('(http://localhost:%d/[^']*)'\)" % port, data)
+        if st != 200 or not m:
+            return st, hs, data
+        url = m.group(1).decode()
+    return st, hs, data
+
+
+def subst_vars(sc, text):
+    """{{NAME}} を capture で取った値に置き換える"""
+    for k, v in sc.vars.items():
+        text = text.replace("{{" + k + "}}", v)
+    return text
+
+
+def take_captures(sc, rh, data):
+    """capture <NAME> header:<ヘッダ名> | regex:<正規表現> (最初のグループ)。直後の request の応答 (生の値) から取る"""
+    for name, how in sc.caps:
+        kind, _, arg = how.partition(":")
+        val = ""
+        if kind == "header":
+            for k, v in rh:
+                if k.lower() == arg.lower():
+                    val = v; break
+        else:
+            m = re.search(arg, data.decode("utf-8", "replace"))
+            val = (m.group(1) if m.groups() else m.group(0)) if m else ""
+        sc.vars[name] = val
+    sc.caps = []
+
+
+def execute(sc, req, masks, logsrc):
+    o = req.opts()
+    if len(req.args) < 2:
+        raise ValueError(f"{sc.path}: bad request head: {req.head}")
+    method, target = req.args[0], subst_vars(sc, req.args[1])
+    hs, b = split_head_body(subst_vars(sc, req.body))
+    body = decode_body(o, b) * int(o.get("repeat", 1))
+    want = ["content-type"]
+    if isinstance(o.get("headers"), str):
+        want += [h.lower() for h in o["headers"].split(",") if h and h.lower() != "content-type"]
+    mark = logsrc.mark() if o.get("log") else None
+    timeout = float(o.get("timeout", 30))
+    if method == "GRPC":
+        try:
+            resp = execute_grpc(sc, req, o, target, hs, body, masks, timeout)
+            return resp, collect_log(o, mark, masks, logsrc)
+        except (socket.timeout, TimeoutError):
+            return Section("response none", "\ntimeout"), None
+        except OSError as e:
+            return Section("response none", f"\n{type(e).__name__}: {e}"), None
+    try:
+        if req.kind == "sfauth":
+            status, rh, data = do_sfauth(sc.port, method, target, timeout)
+        elif isinstance(o.get("stream"), str):
+            st = StreamConn(sc.port, method, target, hs, body, timeout, sc.tls)
+            sc.streams[o["stream"]] = st
+            if not st.head_ready.wait(timeout) or st.status == 0:
+                raise socket.timeout()
+            status, rh, data = st.status, st.headers, st.take()
+        elif o.get("h2"):
+            status, rh, data = do_request_h2(sc.port, method, target, hs, body, timeout, sc.tls)
+        else:
+            status, rh, data = do_request(sc.port, method, target, hs, body, timeout, sc.tls)
+    except (socket.timeout, TimeoutError):
+        return Section("response none", "\ntimeout"), None
+    except OSError as e:
+        return Section("response none", f"\n{type(e).__name__}: {e}"), None
+    take_captures(sc, rh, data)
+    lines = []
+    if "*" in want:
+        # framing=1: 転送の形 (content-length / transfer-encoding) も残す (chunked かどうかを確かめる用)
+        skip = VOLATILE_HEADERS - ({"content-length", "transfer-encoding"} if o.get("framing") else set())
+        for k, v in rh:
+            if k.lower() not in skip:
+                lines.append(f"{k.lower()}: {v}")
+    else:
+        for w in want:
+            for k, v in rh:
+                if k.lower() == w:
+                    lines.append(f"{w}: {v}")
+    flag, text = encode_body(data)
+    text = apply_masks(masks, text) if flag != "base64" else text
+    lines = [apply_masks(masks, x) for x in lines]
+    head = f"response {status}" + (f" {flag}" if flag else "")
+    resp = Section(head, ("\n".join(lines) + "\n" if lines else "") + "\n" + text)
+    return resp, collect_log(o, mark, masks, logsrc)
+
+
+ENTRY_START = re.compile(r"^(TRACE|DEBUG|INFO|WARN|ERROR|FATAL) \S+: ?")
+RUST_HEAD = re.compile(r"^(error|warning)\[([^\]]+)\]: (.*)$")
+RUST_NOTE = re.compile(r"^\s*= note: (element|flow stack|DataWeave): (.*)$")
+MULAY_MODE = False   # mulay を回すとき、例外の枠は書式でなく事実 (メッセージ・要素・エラーの型・FlowStack) で比べる (ADR 096)
+
+
+def exc_facts(entry):
+    """例外の枠 (Mule の **** の枠か、mulay の Rust 風の枠) を事実の並びにする。枠でなければそのまま"""
+    head, _, body = entry.partition("\n")
+    lines = body.split("\n")
+    f = {}
+    if any(l.startswith("Message               : ") for l in lines):
+        key = None
+        for l in lines:
+            m = re.match(r"^(Message|Element|Error type|FlowStack)\s+: (.*)$", l)
+            if m:
+                key = m.group(1); f[key] = [m.group(2)]
+            elif key == "FlowStack" and l.strip().startswith("at "):
+                f[key].append(l.strip())
+            elif l.strip() == "" or l.startswith("  (set debug") or l.startswith("****"):
+                key = None if l.strip() == "" or l.startswith("****") else key
+        msg = f.get("Message", [""])[0]
+        return "\n".join([head.rstrip(), "message: " + (msg[1:] if msg.startswith('"') else msg),
+                          "element: " + f.get("Element", [""])[0], "type: " + f.get("Error type", [""])[0],
+                          "flowstack: " + " ".join(f.get("FlowStack", []))])
+    hm = next((RUST_HEAD.match(l) for l in lines if RUST_HEAD.match(l)), None)
+    if hm is None:
+        return entry
+    notes, key = {}, None
+    for l in lines:
+        m = RUST_NOTE.match(l)
+        if m:
+            key = m.group(1); notes[key] = [m.group(2)]
+        elif key and re.match(r"^\s{8,}\S", l):
+            notes[key].append(l.strip())
+        else:
+            key = None
+    msg = notes.get("DataWeave", [hm.group(3)])[0]
+    return "\n".join([head.rstrip(), "message: " + msg, "element: " + " ".join(notes.get("element", [""])),
+                      "type: " + hm.group(2), "flowstack: " + " ".join(notes.get("flow stack", []))])
+
+
+def norm_log(text):
+    if not MULAY_MODE or text is None:
+        return text
+    entries, cur = [], None
+    for l in text.split("\n"):
+        if ENTRY_START.match(l):
+            if cur is not None:
+                entries.append(cur)
+            cur = l
+        else:
+            cur = l if cur is None else cur + "\n" + l
+    if cur is not None:
+        entries.append(cur)
+    return "\n".join(exc_facts(e) for e in entries)
+
+
+def collect_log(o, mark, masks, logsrc):
+    """log (LoggerMessageProcessor だけ) か log=<カテゴリ,..> の要求で、要求の間に出たログの行"""
+    if mark is None:
+        return None
+    cats = o["log"].split(",") if isinstance(o["log"], str) else None
+    entries = []
+    for lvl, cat, msg in logsrc.entries(mark, float(o.get("logwait", "0"))):
+        if cats is None and cat != "org.mule.runtime.core.internal.processor.LoggerMessageProcessor":
+            continue
+        if cats is not None and "*" not in cats and cat not in cats:
+            continue
+        entries.append(apply_masks(masks, f"{lvl} {cat}: {msg}"))
+    return Section("log", "\n".join(entries))
+
+
+def execute_read(sc, sec, masks):
+    """read <名前>: stream=<名前> で開いた応答に、前回から新しく届いた本文 (届かなくなるまで待つ)。応答の status は 200 とする"""
+    st = sc.streams.get(sec.args[0]) if sec.args else None
+    if st is None:
+        return Section("response none", "\nno such stream: " + (sec.args[0] if sec.args else ""))
+    if isinstance(st, GrpcStream):
+        return grpc_take_section(sc, st, masks, wait=float(sec.opts().get("wait", "0.3")))
+    data = st.take()
+    flag, text = encode_body(data)
+    text = apply_masks(masks, text) if flag != "base64" else text
+    return Section("response 200" + (f" {flag}" if flag else ""), "\n" + text)
+
+
+def diff_resp(exp, act):
+    d = []
+    if exp.head != act.head:
+        d.append(f"status: expected '{exp.head}', got '{act.head}'")
+    eh, eb = split_head_body(exp.body)
+    ah, ab = split_head_body(act.body)
+    el = [(k.lower(), v) for k, v in eh]; al = [(k.lower(), v) for k, v in ah]
+    if el != al:
+        d.append(f"headers: expected {el}, got {al}")
+    if eb != ab:
+        d.append(f"body:\n--- expected\n{eb}\n--- actual\n{ab}")
+    return d
+
+# ---------------------------------------------------------------- ビルド
+
+def newest_mtime(d):
+    # symlink のディレクトリもたどる (テンプレを指す fixture: test/fixtures/apps/agent-harness-summary/src)
+    t = 0
+    for root, dirs, files in os.walk(d, followlinks=True):
+        dirs[:] = [x for x in dirs if x not in ("target", ".mule")]
+        for f in files:
+            if f != "scenario.scn":
+                t = max(t, os.path.getmtime(os.path.join(root, f)))
+    return t
+
+
+def build_app(app_dir, force):
+    name = os.path.basename(app_dir.rstrip("/"))
+    bdir = os.path.join(BUILD, name)
+    jar_out = os.path.join(BUILD, name + ".jar")
+    if not force and os.path.exists(jar_out) and os.path.getmtime(jar_out) >= newest_mtime(app_dir):
+        return name, jar_out, None
+    shutil.rmtree(bdir, ignore_errors=True)
+    shutil.copytree(app_dir, bdir, ignore=shutil.ignore_patterns("scenario.scn", "target", ".mule"))
+    retarget(bdir, MULE_VER, MULE_EE)
+    p = subprocess.run(["mvn", "-q", "-o", "package", "-DskipTests"], cwd=bdir,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    jars = [f for f in os.listdir(os.path.join(bdir, "target")) if f.endswith("-mule-application.jar")] \
+        if os.path.isdir(os.path.join(bdir, "target")) else []
+    if p.returncode != 0 or not jars:
+        return name, None, p.stdout[-4000:]
+    shutil.copy2(os.path.join(bdir, "target", jars[0]), jar_out)
+    return name, jar_out, None
+
+def ver_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def retarget(bdir, ver, ee):
+    """アプリが求める版 (minMuleVersion・app.runtime) が起動する Mule より新しければ、その版に下げる (CE の旧い版で動かすため)。
+    CE では requiredProduct を MULE にする (mule-maven-plugin の既定は MULE_EE で、CE は配置を断る)"""
+    if not ver:
+        return
+    art = os.path.join(bdir, "mule-artifact.json")
+    if os.path.exists(art):
+        with open(art, encoding="utf-8") as f:
+            desc = json.load(f)
+        if ver_tuple(desc.get("minMuleVersion", "0")) > ver_tuple(ver):
+            desc["minMuleVersion"] = ver
+        if not ee:
+            desc["requiredProduct"] = "MULE"
+        with open(art, "w", encoding="utf-8") as f:
+            json.dump(desc, f, indent=2)
+    pom = os.path.join(bdir, "pom.xml")
+    with open(pom, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r"<app\.runtime>([^<]+)</app\.runtime>", text)
+    if m and ver_tuple(m.group(1)) > ver_tuple(ver):
+        with open(pom, "w", encoding="utf-8") as f:
+            f.write(text[:m.start(1)] + ver + text[m.end(1):])
+
+# ---------------------------------------------------------------- 私的ランタイム
+
+WRAPPER_DROP = ("-javaagent", "oracle.batch.native.lib", "mule.verbose.exceptions")
+
+
+def prepare_runtime():
+    """ユーザーの Mule は読むだけ。lib/services/server-plugins はハードリンク、bin/conf は複製。"""
+    if not os.path.isdir(os.path.join(RT, "lib")):
+        os.makedirs(RT, exist_ok=True)
+        for d in ("lib", "services", "server-plugins"):
+            src = os.path.join(MULE_SRC, d)
+            if os.path.isdir(src):
+                if subprocess.run(["cp", "-al", src, os.path.join(RT, d)]).returncode != 0:
+                    shutil.copytree(src, os.path.join(RT, d), symlinks=True)
+        for d in ("bin", "conf"):
+            shutil.copytree(os.path.join(MULE_SRC, d), os.path.join(RT, d), symlinks=True)
+    write_wrapper_conf()   # JVM の引数 (%%% jvm) は実行ごとに違うので、毎回書く
+    for d in ("apps", "domains", "logs", ".mule"):
+        shutil.rmtree(os.path.join(RT, d), ignore_errors=True)
+    for d in ("apps", "domains", "logs", "policies"):
+        os.makedirs(os.path.join(RT, d), exist_ok=True)
+    src_domains = os.path.join(MULE_SRC, "domains")   # CE は空の domains/default を同梱し、無いとアプリを配置しない
+    for d in (os.listdir(src_domains) if os.path.isdir(src_domains) else []):
+        if os.path.isdir(os.path.join(src_domains, d)):
+            shutil.copytree(os.path.join(src_domains, d), os.path.join(RT, "domains", d), symlinks=True)
+    for f in os.listdir(RT):
+        if f.endswith((".status", ".pid", ".anchor", ".command")):
+            os.remove(os.path.join(RT, f))
+
+
+EXTRA_JVM = []   # %%% jvm で求められた JVM の引数 (main が決める)
+
+
+def write_wrapper_conf():
+    """ユーザー独自の追加 (javaagent、verbose exceptions 等) を除き、素の Mule に近い設定にする"""
+    src = os.path.join(MULE_SRC, "conf", "wrapper.conf")
+    out, n, dropped = [], 0, False
+    for line in open(src, encoding="utf-8", errors="replace"):
+        m = re.match(r"wrapper\.java\.additional\.(\d+)(\.stripquotes)?=(.*)", line.strip())
+        if m:   # 番号は詰めて振り直す。stripquotes は直前の本体に付く
+            if m.group(2):
+                if not dropped:
+                    out.append(f"wrapper.java.additional.{n}.stripquotes={m.group(3)}\n")
+            elif any(x in m.group(3) for x in WRAPPER_DROP):
+                dropped = True
+            else:
+                dropped = False; n += 1
+                v = m.group(3)
+                if v.startswith("-XX:MaxMetaspaceSize="):   # 全アプリを 1 つの JVM に載せる。既定の 256m では 30 本ほどで OutOfMemoryError: Metaspace
+                    v = "-XX:MaxMetaspaceSize=2048m"
+                out.append(f"wrapper.java.additional.{n}={v}\n")
+            continue
+        if line.startswith("wrapper.java.initmemory="):
+            line = "wrapper.java.initmemory=512\n"
+        elif line.startswith("wrapper.java.maxmemory="):
+            line = "wrapper.java.maxmemory=2048\n"
+        out.append(line)
+    for opt in EXTRA_JVM:
+        n += 1
+        out.append(f"wrapper.java.additional.{n}={opt}\n")
+    with open(os.path.join(RT, "conf", "wrapper.conf"), "w") as f:
+        f.writelines(out)
+
+
+class Mule:
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+
+    def start(self):
+        env = dict(os.environ, MULE_HOME=RT, MULE_BASE=RT)
+        env.pop("MULE_ENV", None)
+        self.console = open(os.path.join(RT, "logs", "console.out"), "wb")
+        self.proc = subprocess.Popen([os.path.join(RT, "bin", "mule"), "console"], cwd=RT, env=env,
+                                     stdin=subprocess.DEVNULL, stdout=self.console, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+        atexit.register(self.stop)
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self):
+        """SIGTERM で止め、5 秒で止まらなければ SIGKILL。java は wrapper と別のプロセスグループで
+        動くので、私的ランタイムから起動されたプロセスを名指しで待つ・殺す。
+        (オラクルの Mule は毎回 apps/.mule を作り直すので、graceful に止める必要は無い)"""
+        with self.lock:
+            if self.proc is None:
+                return
+            pgid = self.proc.pid
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            t0 = time.time()
+            while (self.proc.poll() is None or stray_pids()) and time.time() - t0 < 5:
+                time.sleep(0.2)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            for pid in stray_pids():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            t0 = time.time()   # SIGKILL した java が消えてポートが空くまで待つ
+            while stray_pids() and time.time() - t0 < 10:
+                time.sleep(0.1)
+            self.console.close()
+            self.proc = None
+
+
+def stray_pids():
+    """私的ランタイムから起動されたプロセス (wrapper と java)"""
+    p = subprocess.run(["pgrep", "-f", "--", RT + "/"], stdout=subprocess.PIPE, text=True)
+    out = []
+    for x in p.stdout.split():
+        try:
+            with open(f"/proc/{x}/cmdline", "rb") as f:
+                argv0 = f.read().split(b"\0")[0].decode(errors="replace")
+        except OSError:
+            continue
+        if int(x) != os.getpid() and ("java" in argv0 or "wrapper" in argv0):
+            out.append(int(x))
+    return out
+
+
+def listener_ports(app_dir):
+    """アプリの XML の http:listener-connection が開く (数で書いた) ポート。同じ JVM の別のアプリと重なると配備に失敗する"""
+    out = set()
+    mule_dir = os.path.join(app_dir, "src", "main", "mule")
+    for root, _, files in os.walk(mule_dir):
+        for fn in files:
+            if fn.endswith(".xml"):
+                with open(os.path.join(root, fn), encoding="utf-8") as f:
+                    out.update(int(m) for m in re.findall(r'<http:listener-connection\b[^>]*\bport="(\d+)"', f.read()))
+    return out
+
+
+def port_busy(port):
+    s = socket.socket()
+    try:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        s.close()
+
+
+def wait_deployed(mule, names, timeout):
+    """apps/<name>-anchor.txt ができたら成功。ログに Failed to deploy が出たら失敗"""
+    pending, failed = set(names), {}
+    t0 = time.time()
+    main_log = os.path.join(RT, "logs", "mule_ee.log" if MULE_EE else "mule.log")
+    fail_rx = re.compile(r"\+ Failed to deploy artifact: '([^']+)', (?:\S+Exception: )?(.*?)\n(?:ERROR|WARN|INFO) ", re.S)
+    box_rx = re.compile(r"\+ Failed to deploy artifact '([^']+)',([^\n]*)\n((?:\+ [^\n]*\n)*)\+*\n"
+                        r"(?:(?:ERROR|WARN) [^\n]*?\] [\w.$]+: ([^\n]*))?")
+    while pending and time.time() - t0 < timeout:
+        for n in list(pending):
+            if os.path.exists(os.path.join(RT, "apps", f"{n}-anchor.txt")):
+                pending.discard(n)
+        for path in (main_log, os.path.join(RT, "logs", "console.out")):
+            if os.path.exists(path):
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                    found = [(m.group(1), m.group(2)) for m in fail_rx.finditer(text)]
+                    for m in box_rx.finditer(text):   # CE: 理由は枠の中の行か、枠の後の ERROR の行
+                        box = " ".join(x.strip(" +") for x in (m.group(2) + "\n" + m.group(3)).split("\n")
+                                       if x.strip(" +") and x.strip(" +") != "see below")
+                        found.append((m.group(1), box or m.group(4) or ""))
+                    for name, reason in found:
+                        if name in pending:
+                            reason = re.sub(r"\[[^\]]*\]: Connection is not secure. Should use `HTTPS`\n?", "", reason)
+                            pending.discard(name); failed[name] = "deploy failed: " + reason.strip()[:3000]
+        if not mule.alive():
+            for n in pending:
+                failed[n] = "Mule exited"
+            return failed
+        time.sleep(0.5)
+    for n in pending:
+        failed[n] = "deploy timeout"
+    return failed
+
+# ---------------------------------------------------------------- mulay を同じシナリオで動かす
+
+MULAY = os.environ.get("MULAY_BIN", os.path.join(REPO, "target", "mulay"))
+
+
+def sources_newer(path):
+    t = os.path.getmtime(path)
+    for root, _, files in os.walk(os.path.join(REPO, "src")):
+        for f in files:
+            if f.endswith(".clay") and os.path.getmtime(os.path.join(root, f)) > t:
+                return True
+    return False
+
+
+def clay_version():
+    try:
+        return subprocess.run(["clay", "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.strip()
+    except OSError:
+        return ""
+
+
+def built_with(path):
+    """path を作った clay の版 (ensure_mulay が <path>.clay-version に書いたもの。無ければ "")"""
+    try:
+        with open(path + ".clay-version", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def ensure_mulay():
+    # MULAY_BIN を指定されたらそのまま使う。既定の target/mulay は、ソースより古いか、作った clay の版が今の clay と
+    # 違えば作り直す (古いバイナリで照合すると変更を試したことにならない。clay を上げた後も同じ)。
+    cv = clay_version()
+    if os.path.exists(MULAY) and ("MULAY_BIN" in os.environ or (not sources_newer(MULAY) and built_with(MULAY) == cv)):
+        return None
+    print(f"building {MULAY} ({cv}) ...", file=sys.stderr)
+    p = subprocess.run(["clay", "build", "src/mulay/cli/main.clay", "-o", MULAY], cwd=REPO,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if p.returncode != 0 or not os.path.exists(MULAY):
+        return p.stdout[-4000:] or "clay build failed"
+    with open(MULAY + ".clay-version", "w", encoding="utf-8") as f:
+        f.write(cv + "\n")
+    return None
+
+
+class MulayProc:
+    def __init__(self, app_dir, props=(), env=None):
+        self.log = ProcLog()
+        self.proc = subprocess.Popen([MULAY, "run", app_dir, *props], cwd=REPO, stdin=subprocess.DEVNULL, env=env,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        # stdout と stderr を 1 本にまとめて読む (別々のスレッドで読むと INFO と WARN/ERROR の順が入れ替わる)
+        self.log.attach(self.proc.stdout)
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def stop(self):
+        if self.proc is None:
+            return
+        for sig, wait in ((signal.SIGTERM, 3), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(self.proc.pid, sig)
+            except ProcessLookupError:
+                break
+            try:
+                self.proc.wait(timeout=wait); break
+            except subprocess.TimeoutExpired:
+                continue
+        self.proc = None
+
+
+def summarize(d):
+    """差分の 1 行要約"""
+    first = d[0]
+    if first.startswith("body:"):
+        return "body differs"
+    if first.startswith("log:"):
+        return "log differs"
+    return first.split("\n")[0]
+
+
+def run_mulay_app(sc, verbose, record, lazy, current, lock):
+    """1 つのアプリを mulay で回す。出力の行、通った要求の数、要求の数、全部通ったかを返す"""
+    lines = []
+    tag = sc.name + (" [lazy]" if lazy else "")
+    n_req = sum(1 for x in sc.secs if x.kind in ("request", "sfauth", "read", "send"))
+    t_app = time.time()
+    while port_busy(sc.port) and time.time() - t_app < 10:
+        time.sleep(0.2)
+    if port_busy(sc.port):
+        lines.append(f"FAIL {tag}: port {sc.port} already in use"); return lines, 0, n_req, False
+    prepare_dirs(sc)
+    env = dict(os.environ, MULAY_DW_LAZY_ALL="1") if lazy else None
+    mp = MulayProc(sc.app_dir, [x[2:] for x in sc.jvm if x.startswith("-D")], env)
+    with lock:
+        current.append(mp)
+    try:
+        t0 = time.time()
+        while not all(port_busy(p) for p in [sc.port] + sc.extra_ports) and mp.alive() and time.time() - t0 < 10:
+            time.sleep(0.05)
+        if not port_busy(sc.port):
+            why = "exited" if not mp.alive() else "port did not open in 10s"
+            lines.append(f"FAIL {tag}: mulay {why}")
+            lines.append("  " + "\n  ".join(mp.log.text().split("\n")[-40:]))
+            return lines, 0, n_req, False
+        try:
+            if record:
+                _n, _bad, results = run_scenario(sc, "fill", [], mp.log)
+                sc.save()
+                lines.append(f"RECORDED {sc.name} ({_n} request(s)) from mulay")
+                return lines, _n, n_req, True
+            _n, _bad, results = run_scenario(sc, "check", [], mp.log)
+        except Exception as e:  # noqa
+            lines.append(f"FAIL {tag}: scenario error: {type(e).__name__}: {e}"); return lines, 0, n_req, False
+        ok = sum(1 for _k, _h, d in results if not d)
+        if ok == len(results):
+            lines.append(f"PASS {tag} ({ok}/{len(results)}) {time.time() - t_app:.1f}s")
+            return lines, ok, n_req, True
+        for k, head, d in results:
+            if d:
+                lines.append(f"FAIL {tag} request #{k}: {head[len('request '):]}: {summarize(d)}")
+                if verbose:
+                    lines.append("  " + "\n  ".join(x.replace("\n", "\n  ") for x in d))
+        lines.append(f"     {tag} ({ok}/{len(results)}) {time.time() - t_app:.1f}s")
+        return lines, ok, n_req, False
+    finally:
+        mp.stop()
+        with lock:
+            current.remove(mp)
+
+
+SHARED_SERVICES = (("salesforce", r"<salesforce[a-z-]*:"), ("anypoint-mq", r"<anypoint-mq:"), ("db", r"<db:"), ("sftp", r"<sftp:"))
+
+
+def shared_service(sc):
+    """アプリが使う外のサービス (同じ org・キュー・表・ディレクトリを他のアプリと分け合うもの)。無ければ """""
+    d = os.path.join(sc.app_dir, "src", "main", "mule")
+    text = ""
+    for root, _, files in os.walk(d):
+        for f in files:
+            if f.endswith(".xml"):
+                with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
+                    text += fh.read()
+    for svc, pat in SHARED_SERVICES:
+        if re.search(pat, text):
+            return svc
+    return ""
+
+
+def mulay_main(apps, verbose, record=False, jobs=1, lazy=False, lazy_shared=True):
+    global MULAY_MODE
+    MULAY_MODE = True
+    err = ensure_mulay()
+    if err:
+        print("ERROR    mulay build failed:\n" + err, file=sys.stderr); return 1
+    scs = [Scenario(a) for a in apps]
+    if record:
+        others = [sc.name for sc in scs if sc.oracle != "mulay"]
+        if others:
+            print("--record is only for apps with '%%% oracle mulay': " + ", ".join(others), file=sys.stderr); return 2
+        lazy = False
+    current, lock = [], threading.Lock()
+
+    def on_signal(*_):
+        with lock:
+            for mp in list(current):
+                mp.stop()
+        os._exit(130)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+    modes = [False, True] if lazy else [False]
+    stats = {m: [0, 0, 0, 0] for m in modes}
+
+    def job(lane):
+        ms = modes if lazy_shared or not shared_service(lane[0]) else [False]
+        return [(m, *run_mulay_app(sc, verbose, record, m, current, lock)) for m in ms for sc in lane]
+    groups = {}
+    for sc in scs:
+        groups.setdefault(tuple(sc.jvm), []).append(sc)
+    t_start = time.time()
+    for _jvm, group in sorted(groups.items()):   # 実 Mule の照合と同じく、JVM の引数が同じアプリだけを同時に回す
+        if jobs <= 1:
+            lanes = [[sc] for sc in group]
+        else:   # 同じ外のサービスを使うアプリは 1 つの列で順に回す (通知やキューを取り合う)
+            shared = {}
+            for sc in group:
+                svc = shared_service(sc)
+                if svc:
+                    shared.setdefault(svc, []).append(sc)
+            lanes = list(shared.values()) + [[sc] for sc in group if not shared_service(sc)]
+        width = 1 if jobs <= 1 else jobs + len([ln for ln in lanes if len(ln) > 1])
+        with cf.ThreadPoolExecutor(width) as ex:
+            futs = [ex.submit(job, ln) for ln in lanes]
+            for f in (futs if jobs <= 1 else cf.as_completed(futs)):
+                for m, lines, ok, n, green in f.result():
+                    for line in lines:
+                        print(line, flush=True)
+                    stats[m][0] += ok
+                    stats[m][1] += n
+                    stats[m][2] += 0 if green else 1
+                    stats[m][3] += 1
+    rc = 0
+    for m in modes:
+        passed, total, failed_apps, ran = stats[m]
+        print(f"{'mulay lazy' if m else 'mulay'}: {passed}/{total} request(s) passed, "
+              f"{ran - failed_apps}/{ran} app(s) all green, {time.time() - t_start:.1f}s")
+        if passed != total or failed_apps:
+            rc = 1
+    return rc
+
+# ---------------------------------------------------------------- main
+
+def missing_requires(app_dir):
+    """requires <path>...: アプリのディレクトリからの相対パスで、無いもの (認証情報など、リポジトリに入れないファイル)"""
+    try:
+        text = open(os.path.join(app_dir, "scenario.scn"), encoding="utf-8").read()
+    except OSError:
+        return []
+    out = []
+    for line in text.split("\n"):
+        if line.startswith(MARK + "requires "):
+            for p in line[len(MARK + "requires "):].split():
+                if not os.path.exists(os.path.join(app_dir, p)):
+                    out.append(p)
+    return out
+
+
+def resolve_apps(args):
+    if not args:
+        apps = sorted(os.path.join(APPS_DIR, d) for d in os.listdir(APPS_DIR)
+                      if os.path.exists(os.path.join(APPS_DIR, d, "scenario.scn")))
+        keep = []
+        for a in apps:
+            miss = missing_requires(a)
+            if miss:
+                print(f"SKIP {os.path.basename(a)}: missing {', '.join(miss)}", file=sys.stderr)
+            else:
+                keep.append(a)
+        return keep
+    out = []
+    for a in args:
+        if a.endswith(".scn"):
+            a = os.path.dirname(os.path.abspath(a))
+        elif not os.path.isdir(a):
+            a = os.path.join(APPS_DIR, a)
+        out.append(os.path.abspath(a))
+    return out
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__); return 2
+    mode, rest = argv[0], argv[1:]
+    if mode == "clean":
+        shutil.rmtree(RT, ignore_errors=True); shutil.rmtree(BUILD, ignore_errors=True); return 0
+    if mode == "mulay":
+        verbose, record, lazy, lazy_shared, jobs, apps = False, False, False, True, 1, []
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "-v": verbose = True
+            elif a == "--record": record = True
+            elif a == "--lazy": lazy = True
+            elif a == "--lazy-local": lazy, lazy_shared = True, False
+            elif a == "-j": i += 1; jobs = int(rest[i])
+            else: apps.append(a)
+            i += 1
+        return mulay_main(resolve_apps(apps), verbose, record, jobs, lazy, lazy_shared)
+    if mode not in ("fill", "check", "run"):
+        print(__doc__); return 2
+    if mode == "fill" and not MULE_EE:
+        print(f"fill records expectations from Mule EE only ({MULE_SRC} is CE {MULE_VER})", file=sys.stderr); return 2
+    no_build, jobs, apps = False, 4, []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--no-build": no_build = True
+        elif a == "-j": i += 1; jobs = int(rest[i])
+        else: apps.append(a)
+        i += 1
+    apps = resolve_apps(apps)
+    scs = [Scenario(a) for a in apps]
+    groups = {}
+    for sc in scs:
+        groups.setdefault(sc.jvm, []).append(sc.app_dir)
+    if len(groups) > 1:   # JVM の引数が違うアプリは、別々の Mule で順に走らせる
+        rc = 0
+        flags = (["--no-build"] if no_build else []) + ["-j", str(jobs)]
+        for jvm, dirs in sorted(groups.items()):
+            print(f"== JVM {' '.join(jvm) if jvm else '(default)'}: {len(dirs)} app(s)", file=sys.stderr)
+            rc = max(rc, subprocess.call([sys.executable, os.path.abspath(__file__), mode] + flags + dirs))
+        return rc
+    global EXTRA_JVM
+    EXTRA_JVM = list(scs[0].jvm) if scs else []
+    ports = {}
+    for sc in scs:
+        for p in sorted({sc.port, *sc.extra_ports, *sc.raw_ports, *listener_ports(sc.app_dir)}):
+            if p in ports:
+                print(f"port {p} used by both {ports[p]} and {sc.name}", file=sys.stderr); return 2
+            ports[p] = sc.name
+    t0 = time.time()   # 直前の実行の Mule がまだポートを閉じ終えていないことがある
+    while [p for p in ports if port_busy(p)] and time.time() - t0 < 10:
+        time.sleep(0.2)
+    busy = [p for p in ports if port_busy(p)]
+    if busy:
+        print(f"ports already in use: {busy} (another Mule/mulay running?)", file=sys.stderr); return 2
+
+    t_start = time.time()
+    os.makedirs(BUILD, exist_ok=True)
+    jars, errors = {}, {}
+    with cf.ThreadPoolExecutor(jobs) as ex:
+        for name, jar, err in ex.map(lambda a: build_app(a, False) if not no_build else
+                                     (os.path.basename(a), os.path.join(BUILD, os.path.basename(a) + ".jar"), None), apps):
+            if err or not os.path.exists(jar):
+                errors[name] = "build failed:\n" + (err or "no jar")
+            else:
+                jars[name] = jar
+    t_built = time.time()
+    print(f"built {len(jars)} app(s) in {t_built - t_start:.1f}s", file=sys.stderr)
+    for sc in [x for x in scs if x.oracle == "mulay"]:   # ビルド (XSD の検査) だけ。期待は mulay で記録する
+        if sc.name in jars:
+            print(f"SKIP     {sc.name}: built only ('%%% oracle mulay': expectations come from mulay --record)", file=sys.stderr)
+            del jars[sc.name]
+    scs = [x for x in scs if x.oracle != "mulay"]
+
+    for pid in stray_pids():   # 前回の実行が残したもの
+        print(f"killing leftover Mule process {pid}", file=sys.stderr)
+        os.kill(pid, signal.SIGKILL)
+    prepare_runtime()
+    for name, jar in jars.items():
+        shutil.copy2(jar, os.path.join(RT, "apps", name + ".jar"))
+    for sc in scs:
+        prepare_dirs(sc)
+    mule = Mule()
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: (mule.stop(), sys.exit(130)))
+    total = bad = 0
+    out = []
+    try:
+        mule.start()
+        failed = wait_deployed(mule, list(jars), timeout=600)
+        errors.update(failed)
+        t_up = time.time()
+        print(f"Mule up, {len(jars) - len(failed)} app(s) deployed in {t_up - t_built:.1f}s", file=sys.stderr)
+        live = [sc for sc in scs if sc.name in jars and sc.name not in failed]
+        for sc in live:   # listener が開くまで待つ
+            t0 = time.time()
+            while not all(port_busy(p) for p in [sc.port] + sc.extra_ports) and time.time() - t0 < 120:
+                time.sleep(0.2)
+        if mode == "run":
+            print(f"running at {RT} — Ctrl-C to stop", file=sys.stderr)
+            for sc in live:
+                print(f"  {sc.name}: http://localhost:{sc.port}/", file=sys.stderr)
+            while mule.alive():
+                time.sleep(1)
+            return 0
+        results, outs = {}, {sc.name: [] for sc in live}
+        with cf.ThreadPoolExecutor(max(1, len(live))) as ex:
+            futs = {ex.submit(run_scenario, sc, mode, outs[sc.name], OracleLog(sc.name)): sc for sc in live}
+            for f, sc in futs.items():
+                try:
+                    results[sc.name] = f.result()
+                except Exception as e:  # noqa
+                    errors[sc.name] = f"scenario error: {type(e).__name__}: {e}"
+        for sc in live:   # 並行に走らせた結果を、アプリ名の順に出す
+            if sc.name in results:
+                n, b, _ = results[sc.name]; total += n; bad += b
+                for line in outs[sc.name]:
+                    print(line)
+                if mode == "fill":
+                    sc.save()
+        print(f"requests done in {time.time() - t_up:.1f}s", file=sys.stderr)
+    finally:
+        mule.stop()   # ログは次の起動まで target/mule-oracle-runtime/logs に残る
+    for name, e in sorted(errors.items()):
+        print(f"ERROR    {name}: {e}", file=sys.stderr)
+        log = app_log_path(name)
+        if os.path.exists(log):
+            print("  (log: " + log + ")", file=sys.stderr)
+    print(f"{mode}: {len(scs)} app(s), {total} request(s), {bad} diff(s), {len(errors)} error(s), "
+          f"total {time.time() - t_start:.1f}s", file=sys.stderr)
+    return 1 if (bad or errors) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

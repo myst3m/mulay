@@ -1,0 +1,114 @@
+(ns mulay.lib.youtline (:require [clay.string :as str]))
+
+(defrecord YKey [key: Str parent: Int ks: Int ke: Int bs: Int be: Int])
+
+(defrecord- Line [start: Int end: Int next: Int indent: Int])
+
+(defn- lines-of Vec(Line) [t: &Str]
+  (loop [i 0 acc: Vec(Line) []]
+    (if (>= i (count t)) acc
+      (let [nl (str/index-of-after t "\n" i)
+            e0 (if (< nl 0) (count t) nl)
+            e (if (and (> e0 i) (= (nth t (- e0 1)) 13)) (- e0 1) e0)
+            nx (if (< nl 0) (count t) (+ nl 1))
+            ind (loop [j i] (if (and (< j e) (= (nth t j) 32)) (recur (+ j 1)) (- j i)))]
+        (recur nx (conj acc (->Line i e nx ind)))))))
+
+(defn- blank? Bool [t: &Str l: &Line]
+  (let [p (+ (:start l) (:indent l))] (or (>= p (:end l)) (= (nth t p) 35))))
+
+(defn- quoted-end Int [t: &Str p: Int e: Int]
+  (let [q (nth t p)]
+    (loop [j (+ p 1)]
+      (cond (>= j e) -1
+            (and (= q 34) (= (nth t j) 92)) (recur (+ j 2))
+            (and (= q 39) (= (nth t j) 39) (< (+ j 1) e) (= (nth t (+ j 1)) 39)) (recur (+ j 2))
+            (= (nth t j) q) (+ j 1)
+            :else (recur (+ j 1))))))
+
+(defn- colon-at Int [t: &Str p: Int e: Int]
+  (let [j (loop [j p] (if (and (< j e) (= (nth t j) 32)) (recur (+ j 1)) j))]
+    (if (and (< j e) (= (nth t j) 58) (or (= (+ j 1) e) (= (nth t (+ j 1)) 32) (= (nth t (+ j 1)) 9))) j -1)))
+
+(defn- key-end Values(Int Int) [t: &Str p: Int e: Int]
+  (if (>= p e) (values -1 -1)
+    (let [c (nth t p)]
+      (cond
+        (or (= c 34) (= c 39)) (let [qe (quoted-end t p e)] (if (< qe 0) (values -1 -1) (values qe (colon-at t qe e))))
+        (or (= c 123) (= c 91) (= c 35) (= c 38) (= c 42) (= c 33) (= c 124) (= c 62)) (values -1 -1)
+        :else (loop [j p]
+                (cond (>= j e) (values -1 -1)
+                      (and (= (nth t j) 58) (or (= (+ j 1) e) (= (nth t (+ j 1)) 32) (= (nth t (+ j 1)) 9)))
+                      (let [k (loop [k j] (if (and (> k p) (= (nth t (- k 1)) 32)) (recur (- k 1)) k))] (values k j))
+                      (and (= (nth t j) 32) (< (+ j 1) e) (= (nth t (+ j 1)) 35)) (values -1 -1)
+                      :else (recur (+ j 1))))))))
+
+(defn- unquote Str [s: &Str]
+  (if (and (>= (count s) 2) (or (= (nth s 0) 34) (= (nth s 0) 39))) (subs s 1 (- (count s) 1)) (str s)))
+
+(defn- value-start Int [t: &Str c: Int e: Int] (loop [j (+ c 1)] (if (and (< j e) (or (= (nth t j) 32) (= (nth t j) 9))) (recur (+ j 1)) j)))
+
+(defn- bracket-depth Int [t: &Str p: Int e: Int d0: Int]
+  (loop [j p d d0 q 0]
+    (if (>= j e) d
+      (let [c (nth t j)]
+        (cond (and (> q 0) (= c q)) (recur (+ j 1) d 0)
+              (> q 0) (recur (+ j 1) d q)
+              (or (= c 34) (= c 39)) (recur (+ j 1) d c)
+              (and (= c 35) (> j p) (= (nth t (- j 1)) 32)) d
+              (or (= c 123) (= c 91)) (recur (+ j 1) (+ d 1) 0)
+              (or (= c 125) (= c 93)) (recur (+ j 1) (- d 1) 0)
+              :else (recur (+ j 1) d 0))))))
+
+(defn- pop-to Vec(Vec(Int)) [st: Vec(Vec(Int)) ind: Int seq: Bool ks: &Vec(YKey)]
+  (loop [s st]
+    (if (= (count s) 0) s
+      (let [top (nth s (- (count s) 1))
+            ti (nth top 0)
+            dash (= (:key (nth ks (nth top 1))) "-")]
+        (if (or (> ti ind) (and (= ti ind) (or (not seq) dash))) (recur (pop s)) s)))))
+
+(defn- parent-of Int [st: &Vec(Vec(Int))] (if (= (count st) 0) -1 (nth (nth st (- (count st) 1)) 1)))
+
+(defn- add-key Values(Vec(YKey) Vec(Vec(Int))) [ks: Vec(YKey) st: Vec(Vec(Int)) t: &Str l: &Line col: Int kb: Int ke: Int seq: Bool]
+  (let [st2 (pop-to st col seq ks)
+        k (if seq "-" (unquote (subs t kb ke)))
+        idx (count ks)]
+    (values (conj ks (->YKey k (parent-of st2) kb ke (:start l) (:next l))) (conj st2 [col idx]))))
+
+(defn- mark-end Vec(YKey) [ks: Vec(YKey) st: &Vec(Vec(Int)) e: Int]
+  (loop [i 0 a ks] (if (>= i (count st)) a (recur (+ i 1) (let [k (nth (nth st i) 1) y (nth a k)] (assoc a k (assoc y :be e)))))))
+
+(defn outline Vec(YKey) [t: &Str]
+  (let [ls (lines-of t)]
+    (loop [i 0 ks: Vec(YKey) [] st: Vec(Vec(Int)) [] scalar -1 flow 0]
+      (if (>= i (count ls)) ks
+        (let [l (nth ls i)]
+          (cond
+            (blank? t l) (recur (+ i 1) ks st scalar flow)
+            (and (>= scalar 0) (> (:indent l) scalar)) (recur (+ i 1) (mark-end ks st (:next l)) st scalar flow)
+            (> flow 0) (recur (+ i 1) (mark-end ks st (:next l)) st -1 (bracket-depth t (:start l) (:end l) flow))
+            :else
+            (let [p (+ (:start l) (:indent l)) e (:end l)
+                  doc (and (= (:indent l) 0) (or (str/starts-with? (subs t p e) "---") (str/starts-with? (subs t p e) "...")))
+                  dash (and (< p e) (= (nth t p) 45) (or (= (+ p 1) e) (= (nth t (+ p 1)) 32)))]
+              (if doc (recur (+ i 1) ks [] -1 0)
+                (let [[ks1 st1] (if dash (add-key ks st t l (:indent l) p (+ p 1) true) (values ks st))
+                      kp (if dash (loop [j (+ p 1)] (if (and (< j e) (= (nth t j) 32)) (recur (+ j 1)) j)) p)
+                      [kend col] (key-end t kp e)]
+                  (if (< col 0)
+                    (let [ks2 (mark-end ks1 st1 (:next l))] (recur (+ i 1) ks2 st1 -1 (bracket-depth t kp e 0)))
+                    (let [[ks2 st2] (add-key ks1 st1 t l (- kp (:start l)) kp kend false)
+                          ks3 (mark-end ks2 st2 (:next l))
+                          vs (value-start t col e)
+                          c (if (< vs e) (nth t vs) 0)]
+                      (recur (+ i 1) ks3 st2 (if (or (= c 124) (= c 62)) (- kp (:start l)) -1) (if (or (= c 123) (= c 91)) (bracket-depth t vs e 0) 0)))))))))))))
+
+(defn children Vec(Int) [ks: &Vec(YKey) parent: Int]
+  (loop [i 0 acc: Vec(Int) []] (if (>= i (count ks)) acc (recur (+ i 1) (if (= (:parent (nth ks i)) parent) (conj acc i) acc)))))
+
+(defn child Int [ks: &Vec(YKey) parent: Int key: &Str]
+  (loop [i 0] (cond (>= i (count ks)) -1 (and (= (:parent (nth ks i)) parent) (= (:key (nth ks i)) key)) i :else (recur (+ i 1)))))
+
+(defn find-path Int [ks: &Vec(YKey) path: &Vec(Str)]
+  (loop [i 0 p -1] (cond (>= i (count path)) p (< (child ks p (nth path i)) 0) -1 :else (recur (+ i 1) (child ks p (nth path i))))))

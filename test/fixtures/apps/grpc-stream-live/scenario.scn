@@ -1,0 +1,121 @@
+%%% note
+gRPC コネクタ (mule-grpc-connector 1.0.4) のサーバーのストリーミングを、開いたままのストリームで確かめる: server-streaming のメッセージは
+送るたびに届く、別の要求 (http:listener) からの send-stream-message と end-stream、閉じた後の send-stream-message、
+client-streaming をやりとりしながら送る、双方向の 1 つ送るたびの返事と途中の失敗。
+%%% port 18188
+%%% port 18187
+%%% protoset src/main/resources/stream.desc
+%%% request GRPC :18187/st.S/Ticks in=st.Req out=st.Rep stream=slow
+
+{"name": "a"}
+%%% response 200
+content-type: application/grpc
+grpc-encoding: identity
+grpc-accept-encoding: identity,deflate,gzip
+
+{"message": "early", "n": 1}
+%%% read slow wait=2.5
+%%% response 200
+grpc-status (trailer): 0
+
+{"message": "late", "n": 2}
+%%% close slow
+%%% request GRPC :18187/st.S/TicksLater in=st.Req out=st.Rep stream=later
+
+{"name": "b"}
+%%% response 200
+content-type: application/grpc
+grpc-encoding: identity
+grpc-accept-encoding: identity,deflate,gzip
+
+{"message": "first", "n": 1}
+%%% request GET /more
+%%% response 200
+
+sent
+%%% read later
+%%% response 200
+
+{"message": "more", "n": 2}
+%%% request GET /end
+%%% response 200
+
+ended
+%%% read later
+%%% response 200
+grpc-status (trailer): 0
+
+
+%%% close later
+%%% request GRPC :18187/st.S/TicksFail in=st.Req out=st.Rep log
+
+{"name": "c"}
+%%% response 200
+content-type: application/grpc
+grpc-encoding: identity
+grpc-accept-encoding: identity,deflate,gzip
+grpc-status (trailer): 0
+
+{"message": "one", "n": 1}
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"t": "MULE:UNKNOWN","d": "No active stream found for connection: ID"}
+%%% request GRPC :18187/st.S/Sum in=st.Req out=st.Rep stream=sum end=0
+
+{"name": "x", "count": 1}
+%%% response pending
+
+
+%%% send sum
+
+{"name": "y", "count": 2}
+%%% response 200
+
+
+%%% send sum end=1
+%%% response 200
+content-type: application/grpc
+grpc-encoding: identity
+grpc-accept-encoding: identity,deflate,gzip
+grpc-status (trailer): 0
+
+{"message": "sum", "n": 3}
+%%% close sum
+%%% request GRPC :18187/st.S/Chat in=st.Req out=st.Rep stream=chat end=0
+
+{"name": "p"}
+%%% response 200
+content-type: application/grpc
+grpc-encoding: identity
+grpc-accept-encoding: identity,deflate,gzip
+
+{"message": "echo p", "n": 1}
+%%% send chat
+
+{"name": "q"}
+%%% response 200
+
+{"message": "echo q", "n": 2}
+%%% send chat end=1
+%%% response 200
+grpc-status (trailer): 0
+
+{"message": "echo end"}
+%%% close chat
+%%% request GRPC :18187/st.S/Chat in=st.Req out=st.Rep stream=boom end=0
+
+{"name": "p"}
+%%% response 200
+content-type: application/grpc
+grpc-encoding: identity
+grpc-accept-encoding: identity,deflate,gzip
+
+{"message": "echo p", "n": 1}
+%%% send boom
+
+{"name": "boom"}
+%%% response 200
+grpc-status (trailer): 9
+grpc-message (trailer): boom at 2
+
+
+%%% close boom

@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A2A: このエージェントを公開する口と、他のエージェントに頼むツール (ask_agent)。
+  - サーバー: <a2a.path> で JSON-RPC (message/send) を受け、カードは <a2a.path>/.well-known/agent-card.json。
+    受けたメッセージの text を問いにして converse (agent.xml) を回し、答えを completed の Task (状態のメッセージと
+    artifact) で返す。失敗は failed の Task。タスクの記録は Object Store (A2aTasks) に置き、tasks/get で読める。
+    message/stream (SSE) なら、ツールを呼ぶたびに working の状態を送り、答えを artifact で送って completed で閉じる。
+    プッシュ通知 (message/send の configuration.pushNotificationConfig) なら、すぐ submitted の Task を返し、
+    答えの Task を通知の URL に POST する (コネクタが a2a-agent を別に流す)。
+    会話の履歴の鍵は A2A の contextId で、/chat の sessionId と同じもの (同じ鍵なら入口が違っても同じ会話)。
+  - クライアント (Peer): a2a.peerUrl のエージェント。既定はこのアプリ自身 (試すため)。
+    contextId には "peer-<自分の会話の鍵>" を付けて送るので、同じ会話からの依頼は相手でも同じ文脈になる
+    (相手が自分自身でも、呼んだ側の会話と混ざらない)。
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <!-- A2A のタスクの記録 (task-<taskId>、context-<contextId>) -->
+    <os:object-store name="A2aTasks" persistent="${store.persistent}" entryTtl="${store.ttlHours}" entryTtlUnit="HOURS"/>
+
+    <a2a:server-config name="AgentSrv">
+        <a2a:connection listenerConfig="Http" agentPath="${a2a.path}"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{
+  "name": "${a2a.name}",
+  "description": "${a2a.description}",
+  "url": "${a2a.publicUrl}",
+  "version": "1.0.0",
+  "protocolVersion": "0.3.0",
+  "capabilities": {"streaming": true, "pushNotifications": true, "stateTransitionHistory": false},
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [{"id": "chat", "name": "Chat", "description": "Answers questions, using its tools when needed", "tags": ["chat"]}]
+}]]></a2a:json>
+        </a2a:agent-card>
+        <a2a:history taskRepositoryObjectStore="A2aTasks"/>
+    </a2a:server-config>
+
+    <a2a:client-config name="Peer">
+        <a2a:client-connection serverUrl="${a2a.peerUrl}"/>
+    </a2a:client-config>
+
+    <flow name="a2a-agent">
+        <a2a:task-listener config-ref="AgentSrv"/>
+        <flow-ref name="a2a-request"/>
+        <try>
+            <flow-ref name="converse"/>
+            <set-payload value="#[output application/json --- {kind: 'task', id: vars.taskId, contextId: vars.contextId,
+                status: {state: 'completed', message: {kind: 'message', role: 'agent', messageId: uuid(), parts: [{kind: 'text', text: vars.answer}]}},
+                artifacts: [{artifactId: uuid(), name: 'answer', parts: [{kind: 'text', text: vars.answer}]}]}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {kind: 'task', id: vars.taskId, contextId: vars.contextId,
+                        status: {state: 'failed', message: {kind: 'message', role: 'agent', messageId: uuid(), parts: [{kind: 'text', text: error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ ': ' ++ (error.description default '')}]}}}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <!-- message/stream: 進み具合 (working) を送りながら答え、artifact と completed で閉じる -->
+    <flow name="a2a-agent-stream">
+        <a2a:task-stream-listener config-ref="AgentSrv"/>
+        <flow-ref name="a2a-request"/>
+        <set-variable variableName="streaming" value="#[true]"/>
+        <try>
+            <set-variable variableName="progress" value="#['received: ' ++ vars.question]"/>
+            <flow-ref name="a2a-progress"/>
+            <flow-ref name="converse"/>
+            <a2a:update-task-artifact config-ref="AgentSrv">
+                <a2a:artifact-content><![CDATA[#[output application/json --- {kind: 'artifact-update', taskId: vars.taskId, contextId: vars.contextId,
+                    artifact: {artifactId: uuid(), name: 'answer', parts: [{kind: 'text', text: vars.answer}]}, lastChunk: true}]]]></a2a:artifact-content>
+            </a2a:update-task-artifact>
+            <a2a:update-task-status config-ref="AgentSrv">
+                <a2a:status-content><![CDATA[#[output application/json --- {kind: 'status-update', taskId: vars.taskId, contextId: vars.contextId, final: true,
+                    status: {state: 'completed', message: {kind: 'message', role: 'agent', messageId: uuid(), parts: [{kind: 'text', text: vars.answer}]}}}]]]></a2a:status-content>
+            </a2a:update-task-status>
+            <error-handler>
+                <on-error-continue>
+                    <a2a:update-task-status config-ref="AgentSrv">
+                        <a2a:status-content><![CDATA[#[output application/json --- {kind: 'status-update', taskId: vars.taskId, contextId: vars.contextId, final: true,
+                            status: {state: 'failed', message: {kind: 'message', role: 'agent', messageId: uuid(), parts: [{kind: 'text', text: error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ ': ' ++ (error.description default '')}]}}}]]]></a2a:status-content>
+                    </a2a:update-task-status>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <!-- A2A の要求から会話の鍵 (sid = contextId)、問い、taskId、contextId を取る -->
+    <sub-flow name="a2a-request">
+        <set-variable variableName="sid" value="#[attributes.contextId default 'default']"/>
+        <set-variable variableName="question" value="#[((payload.message.parts default []) filter ($.kind == 'text') map $.text) joinBy '\n']"/>
+        <set-variable variableName="taskId" value="#[attributes.taskId]"/>
+        <set-variable variableName="contextId" value="#[attributes.contextId]"/>
+    </sub-flow>
+
+    <!-- ストリームなら working の状態を送る (vars.progress に文言。agent.xml の agent-loop もツールを呼ぶたびに使う) -->
+    <sub-flow name="a2a-progress">
+        <choice>
+            <when expression="#[vars.streaming default false]">
+                <a2a:update-task-status config-ref="AgentSrv">
+                    <a2a:status-content><![CDATA[#[output application/json --- {kind: 'status-update', taskId: vars.taskId, contextId: vars.contextId, final: false,
+                        status: {state: 'working', message: {kind: 'message', role: 'agent', messageId: uuid(), parts: [{kind: 'text', text: vars.progress default 'working'}]}}}]]]></a2a:status-content>
+                </a2a:update-task-status>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!--
+      プッシュ通知の設定を受けるか決める (失敗させれば断る)。テンプレは http / https の URL なら受ける
+      (コネクタも http / https 以外は断る)。公開するなら送り先を許す一覧と照らす。
+    -->
+    <flow name="a2a-push-config">
+        <a2a:push-notification-config-listener config-ref="AgentSrv">
+            <a2a:on-config-accepted/>
+        </a2a:push-notification-config-listener>
+        <logger level="DEBUG" message="#['a2a push config ' ++ (payload.pushNotificationConfig.url default '')]"/>
+    </flow>
+
+    <!--
+      認可: tasks/get、tasks/cancel など記録を読むメソッドの前に流れる。失敗させれば 403。
+      テンプレは誰にでも許す。公開するなら attributes.headers (Authorization など) を確かめる。
+    -->
+    <flow name="a2a-authorize">
+        <a2a:authorization-listener config-ref="AgentSrv"/>
+        <logger level="DEBUG" message="#['a2a authorize ' ++ (attributes.jsonRpcMethod default '')]"/>
+    </flow>
+
+    <!-- ツール ask_agent: Peer のエージェントに text を送り、返ってきた text を結果にする -->
+    <flow name="tool-ask_agent">
+        <a2a:send-message config-ref="Peer">
+            <a2a:message><![CDATA[#[output application/json --- {message: {kind: 'message', role: 'user', messageId: uuid(), contextId: 'peer-' ++ (vars.sid default 'default'), parts: [{kind: 'text', text: payload.text}]}}]]]></a2a:message>
+        </a2a:send-message>
+        <!-- Message ならその parts、Task なら状態のメッセージの parts -->
+        <set-payload value="#[((payload.parts default payload.status.message.parts default []) filter ($.kind == 'text') map $.text) joinBy '\n']"/>
+    </flow>
+</mule>

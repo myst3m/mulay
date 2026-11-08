@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="HTTP_Listener">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <vm:config name="VM_Config">
+        <vm:queues>
+            <vm:queue queueName="testQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="persistentQueue" queueType="PERSISTENT"/>
+            <vm:queue queueName="requestReplyQueue" queueType="TRANSIENT"/>
+        </vm:queues>
+    </vm:config>
+
+    <!-- Flow 1: POST /vm/publish - Publish message to transient queue -->
+    <flow name="vmPublishFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/publish" allowedMethods="POST"/>
+        <vm:publish queueName="testQueue" config-ref="VM_Config">
+            <vm:content><![CDATA[#[payload]]]></vm:content>
+        </vm:publish>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "published"
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 2: GET /vm/consume - Consume message from transient queue -->
+    <flow name="vmConsumeFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/consume" allowedMethods="GET"/>
+        <vm:consume queueName="testQueue" config-ref="VM_Config" timeoutUnit="MILLISECONDS" timeout="5000"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 3: POST /vm/publish/persistent - Publish to persistent queue -->
+    <flow name="vmPublishPersistentFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/publish/persistent" allowedMethods="POST"/>
+        <vm:publish queueName="persistentQueue" config-ref="VM_Config">
+            <vm:content><![CDATA[#[payload]]]></vm:content>
+        </vm:publish>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "published"
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 4: GET /vm/consume/persistent - Consume from persistent queue -->
+    <flow name="vmConsumePersistentFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/consume/persistent" allowedMethods="GET"/>
+        <vm:consume queueName="persistentQueue" config-ref="VM_Config" timeoutUnit="MILLISECONDS" timeout="5000"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 5: POST /vm/publish-consume - Publish and wait for reply (request-reply pattern) -->
+    <flow name="vmPublishConsumeFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/publish-consume" allowedMethods="POST"/>
+        <vm:publish-consume queueName="requestReplyQueue" config-ref="VM_Config" timeoutUnit="SECONDS" timeout="10">
+            <vm:content><![CDATA[#[payload]]]></vm:content>
+        </vm:publish-consume>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 6: VM Listener on requestReplyQueue - processes and returns response -->
+    <flow name="vmListenerFlow">
+        <vm:listener queueName="requestReplyQueue" config-ref="VM_Config"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  echo: payload,
+  processed: true,
+  timestamp: now()
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 7: POST /vm/roundtrip - Full roundtrip: publish then consume from testQueue -->
+    <flow name="vmRoundtripFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/roundtrip" allowedMethods="POST"/>
+        <vm:publish queueName="testQueue" config-ref="VM_Config">
+            <vm:content><![CDATA[#[payload]]]></vm:content>
+        </vm:publish>
+        <vm:consume queueName="testQueue" config-ref="VM_Config" timeoutUnit="MILLISECONDS" timeout="5000"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>

@@ -1,0 +1,45 @@
+(ns mulay.dw.fmt.ndjson
+  (:require [mulay.dw.fmt.out :as fo] [mulay.dw.err :as dwe] [mulay.dw.val :as v] [mulay.dw.fmt.props :as p] [mulay.dw.fmt.json :as json] [mulay.dw.fmt.csv :as csv]
+            [clay.string :as str]))
+
+(defn read Values(v/Val Str) [text: &Str props: &Vec(v/Field) mime: &Str]
+  (let [[ie e1] (p/pbool props "ignoreEmptyLine" true)
+        [si e2] (p/pbool props "skipInvalid" false)]
+    (if (not= (p/either-err e1 e2) "") (values (v/null-v) (p/either-err e1 e2))
+      (let [lines: Vec(Str) (str/split (str/replace (str text) "\r\n" "\n") "\n")
+            n (if (and (> (count lines) 0) (= (nth lines (- (count lines) 1)) "")) (- (count lines) 1) (count lines))]
+        (loop [i 0 acc: Vec(v/Val) []]
+          (if (>= i n) (values (v/->VMeta (v/->VArr acc) (p/reader-meta mime)) "")
+            (let [ln (nth lines i)]
+              (if (and ie (= (count (str/trim ln)) 0)) (recur (+ i 1) acc)
+                (let [[x e] (json/read ln)]
+                  (if (= e "") (recur (+ i 1) (conj acc x))
+                    (if si (recur (+ i 1) acc)
+                      (values (v/null-v)
+                              (str "Exception while reading line\n\n" (+ i 1) "| " ln "\n\nReason:\n\nException while reading '" ln "' as 'application/json' cause by:\n" e)))))))))))))
+
+(defn write-to Values(Str dwe/DwErr) [x0: &v/Val props: &Vec(v/Field) snk: &fo/Sink]
+  (let [[sk e1] (p/pstr props "skipNullOn" "")
+        [wa e2] (p/pbool props "writeAttributes" false)
+        o (json/opts-full false sk wa false)
+        x (v/unmeta x0)]
+    (if (not= (p/either-err e1 e2) "") (values "" (fo/writer-err (p/either-err e1 e2)))
+      (match x
+        (v/VArr xs) (let [k (atom 0) w xs]
+                      (lines "" (fn Values(v/Val Bool dwe/DwErr) [z: Int]
+                                  (let [i (deref k)]
+                                    (if (>= i (count w)) (values (v/null-v) true (dwe/ok))
+                                      (let [y (reset! k (+ i 1))] (values (nth w i) false (dwe/ok))))))
+                             o snk))
+        (v/VSeq q) (lines "" ((:open q) 0) o snk)
+        _ (values "" (fo/writer-err (str "Cannot coerce " (v/type-name x) " (" (csv/show x) ") to Array")))))))
+
+(defn- lines Values(Str dwe/DwErr) [out0: Str nx: &Fn(Int Values(v/Val Bool dwe/DwErr)) o: &json/Opts snk: &fo/Sink]
+  (loop [out out0]
+    (let [[y done e] (nx 0)]
+      (cond (not (dwe/ok? e)) (values out e)
+            done (values out (dwe/ok))
+            (and (:skip-arrays o) (v/null? y)) (recur out)
+            :else (let [[t we] (json/write-into out y o 0 snk)]
+                    (if (not (dwe/ok? we)) (values t we)
+                      (let [[t2 fe] (fo/flush (str t "\n") snk)] (if (dwe/ok? fe) (recur t2) (values t2 fe)))))))))

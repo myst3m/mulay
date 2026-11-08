@@ -1,0 +1,332 @@
+(ns mulay.lib.sftp (:require [clay.bytes :as bytes] [mulay.lib.ssh :as ssh] [mulay.lib.sshkey :as hk] [mulay.lib.sshwire :as w]))
+
+(def CANNOT-REACH 1)
+(def AUTH 2)
+(def HANDSHAKE 3)
+(def SFTP-INIT 4)
+(def HOSTKEY 5)
+
+(def EOF 1)
+(def NO-SUCH-FILE 2)
+(def PERMISSION-DENIED 3)
+(def FAILURE 4)
+(def CONNECTION-LOST 7)
+(def NO-SUCH-PATH 10)
+(def FILE-ALREADY-EXISTS 11)
+(def DIR-NOT-EMPTY 18)
+(def NOT-A-DIRECTORY 19)
+
+(def FXP-INIT 1)
+(def FXP-VERSION 2)
+(def FXP-OPEN 3)
+(def FXP-CLOSE 4)
+(def FXP-READ 5)
+(def FXP-WRITE 6)
+(def FXP-LSTAT 7)
+(def FXP-OPENDIR 11)
+(def FXP-READDIR 12)
+(def FXP-REMOVE 13)
+(def FXP-MKDIR 14)
+(def FXP-RMDIR 15)
+(def FXP-STAT 17)
+(def FXP-RENAME 18)
+(def FXP-EXTENDED 200)
+(def FXP-STATUS 101)
+(def FXP-HANDLE 102)
+(def FXP-DATA 103)
+(def FXP-NAME 104)
+(def FXP-ATTRS 105)
+(def FXP-EXTENDED-REPLY 201)
+
+(def MAX-MSG 1048576)
+(def DEFAULT-IO 32768)
+(def MAX-IO 261120)
+(def IN-FLIGHT 4194304)
+
+(defrecord Attrs [size: Int perms: Int mtime: Int dir: Bool reg: Bool link: Bool])
+(defrecord Entry [name: Str attrs: Attrs])
+
+(defrecord St [conn: ssh/Conn buf: Str pos: Int next-id: Int last: Int rsize: Int wsize: Int offs: Map(Str Int) up: Bool open: Bool])
+(defrecord Sess [st: Atom(Vec(St))])
+
+(defn- empty-attrs Attrs [] (->Attrs 0 0 0 false false false))
+
+(defn- no-sess Sess [] (let [v: Vec(St) []] (->Sess (atom v))))
+
+(defn- dead-st St [] (let [offs: Map(Str Int) {}] (->St (ssh/no-conn) "" 0 0 CONNECTION-LOST DEFAULT-IO DEFAULT-IO offs false false)))
+
+(defn- take-st St [s: &Sess]
+  (let [v (deref (:st s)) z (reset! (:st s) (let [e: Vec(St) []] e))] (if (= (count v) 0) (dead-st) (nth v 0))))
+(defn- put-st Int [s: &Sess st: St] (let [z (reset! (:st s) [st])] 0))
+
+(defn- send-msg Values(St Bool) [st: St msg: &Str]
+  (if (not (:up st)) (values st false)
+  (let [h (w/u32 (count msg))
+        c (:conn st)
+        st2 (assoc st :conn (ssh/no-conn))
+        [c2 e] (ssh/chan-send c (str h msg))]
+    (values (assoc st2 :conn c2 :up (and (:up st2) (= e ""))) (= e "")))))
+
+(defn- recv-msg Values(St Str Bool) [st0: St]
+  (loop [st st0]
+    (let [b (:buf st) pos (:pos st) have (- (count b) pos)
+          len (if (>= have 4) (bytes/unpack b pos 4 true) -1)]
+      (cond
+        (or (not (:up st)) (> len MAX-MSG)) (values (assoc st :up false) "" false)
+        (and (>= len 0) (>= have (+ 4 len))) (values (assoc st :pos (+ pos (+ 4 len))) (subs b (+ pos 4) (+ pos (+ 4 len))) true)
+        :else
+        (let [c (:conn st)
+              st2 (assoc st :conn (ssh/no-conn) :buf "" :pos 0)
+              [c2 d e] (ssh/chan-recv c)
+              nb (if (= pos 0) (str b d) (let [rest (subs b pos (count b))] (str rest d)))]
+          (if (not= e "") (values (assoc st2 :conn c2 :up false) "" false)
+            (recur (assoc st2 :conn c2 :buf nb))))))))
+
+(defn- new-id Values(St Int) [st: St] (let [id (:next-id st)] (values (assoc st :next-id (bit-and (+ id 1) 0xffffffff)) id)))
+
+(defn- reply Values(St Str) [st0: St id: Int]
+  (loop [st st0]
+    (let [[st2 m ok] (recv-msg st)
+          [rid p1 o1] (w/get-u32 m 1)]
+      (cond (not ok) (values st2 "")
+            (= rid id) (values st2 m)
+            :else (recur st2)))))
+
+(defn- call Values(St Str) [st0: St t: Int body: &Str]
+  (let [[st1 id] (new-id st0)
+        [st2 ok] (send-msg st1 (str (w/byte t) (w/u32 id) body))]
+    (if ok (reply st2 id) (values st2 ""))))
+
+(defn- msg-type Int [m: &Str] (if (= (count m) 0) -1 (nth m 0)))
+
+(defn- status-of Int [m: &Str]
+  (cond (= (count m) 0) CONNECTION-LOST
+        (= (msg-type m) FXP-STATUS) (let [[code p ok] (w/get-u32 m 5)] (if ok code FAILURE))
+        :else FAILURE))
+
+(defn- get-attrs Values(Attrs Int Bool) [m: &Str pos: Int]
+  (let [[flags p0 o0] (w/get-u32 m pos)
+        [size p1 o1] (if (= (bit-and flags 1) 0) (values 0 p0 o0) (w/get-u64 m p0))
+        p2 (if (= (bit-and flags 2) 0) p1 (+ p1 8))
+        [perms p3 o3] (if (= (bit-and flags 4) 0) (values 0 p2 o1) (w/get-u32 m p2))
+        [atime p4 o4] (if (= (bit-and flags 8) 0) (values 0 p3 o3) (w/get-u32 m p3))
+        [mtime p5 o5] (if (= (bit-and flags 8) 0) (values 0 p4 o4) (w/get-u32 m p4))
+        [p6 o6] (if (= (bit-and flags 0x80000000) 0) (values p5 o5) (skip-ext m p5))
+        kind (bit-and perms 61440)]
+    (values (->Attrs size perms mtime (= kind 16384) (= kind 32768) (= kind 40960)) p6 (and o6 (<= p6 (count m))))))
+
+(defn- skip-ext Values(Int Bool) [m: &Str pos: Int]
+  (let [[n p0 o0] (w/get-u32 m pos)]
+    (loop [i 0 p p0 ok o0]
+      (if (or (>= i n) (not ok)) (values p ok)
+        (let [[a p1 o1] (w/get-string m p) [b p2 o2] (w/get-string m p1)] (recur (+ i 1) p2 (and o1 o2)))))))
+
+(defn- perm-attrs Str [mode: Int] (str (w/u32 4) (w/u32 mode)))
+
+(defn- has-ext? Bool [m: &Str name: &Str]
+  (loop [p 5]
+    (let [[a p1 o1] (w/get-string m p) [b p2 o2] (w/get-string m p1)]
+      (cond (not (and o1 o2)) false (= a name) true :else (recur p2)))))
+
+(defn- limits Values(St Int Int) [st0: St]
+  (let [[st m] (call st0 FXP-EXTENDED (w/string "limits@openssh.com"))
+        [maxpkt p1 o1] (w/get-u64 m 5)
+        [rd p2 o2] (w/get-u64 m p1)
+        [wr p3 o3] (w/get-u64 m p2)
+        clamp (fn Int [x: Int] (cond (<= x 0) DEFAULT-IO (> x MAX-IO) MAX-IO :else x))]
+    (if (and (= (msg-type m) FXP-EXTENDED-REPLY) o1 o2 o3) (values st (clamp rd) (clamp wr))
+      (values st DEFAULT-IO DEFAULT-IO))))
+
+(defn connect Values(Sess Int Str) [host: &Str port: Int user: &Str password: &Str timeout-ms: Int known-hosts: &Vec(Str)]
+  (let [prefer (if (> (count known-hosts) 0) (hk/known-algorithms (nth known-hosts 0) host port) (let [e: Vec(Str) []] e))
+        [c kind e] (ssh/connect-with host port timeout-ms prefer "" "" "")]
+    (cond
+      (not= kind 0) (values (no-sess) (if (= kind ssh/CANNOT-REACH) CANNOT-REACH HANDSHAKE) e)
+      (and (> (count known-hosts) 0) (not (hk/known? (nth known-hosts 0) host port (ssh/host-key c))))
+      (let [z (ssh/close c)] (values (no-sess) HOSTKEY "Server key did not validate"))
+      :else
+      (let [[c2 ae] (ssh/auth-password c user password)]
+        (if (not= ae "") (let [z (ssh/close c2)] (values (no-sess) AUTH ae))
+          (let [[c3 oe] (ssh/open-subsystem c2 "sftp")]
+            (if (not= oe "") (let [z (ssh/close c3)] (values (no-sess) SFTP-INIT oe))
+              (let [offs: Map(Str Int) {}
+                    st0 (->St c3 "" 0 0 0 DEFAULT-IO DEFAULT-IO offs true true)
+                    [st1 ok] (send-msg st0 (str (w/byte FXP-INIT) (w/u32 3)))
+                    [st2 m ok2] (if ok (recv-msg st1) (values st1 "" false))]
+                (if (or (not ok2) (not= (msg-type m) FXP-VERSION))
+                  (let [z (ssh/close (:conn st2))] (values (no-sess) SFTP-INIT "the server did not answer SSH_FXP_INIT"))
+                  (let [[st3 rs ws] (if (has-ext? m "limits@openssh.com") (limits st2) (values st2 DEFAULT-IO DEFAULT-IO))
+                        st4 (assoc st3 :rsize rs :wsize ws)]
+                    (values (->Sess (atom [st4])) 0 "")))))))))))
+
+(defn close Int [s: &Sess]
+  (let [st (take-st s) z (put-st s (dead-st))]
+    (if (:open st) (ssh/close (:conn st)) 0)))
+
+(defn last-error Int [s: &Sess] (if (= (count (deref (:st s))) 0) CONNECTION-LOST (:last (nth (deref (:st s)) 0))))
+
+(defn- done Int [s: &Sess st: St code: Int] (let [z (put-st s (assoc st :last code))] code))
+
+(defn stat Values(Attrs Int) [s: &Sess path: &Str follow: Bool]
+  (let [[st m] (call (take-st s) (if follow FXP-STAT FXP-LSTAT) (w/string path))]
+    (if (= (msg-type m) FXP-ATTRS)
+      (let [[a p ok] (get-attrs m 5)] (values a (done s st (if ok 0 FAILURE))))
+      (values (empty-attrs) (done s st (status-of m))))))
+
+(defn- simple Int [s: &Sess t: Int body: &Str]
+  (let [[st m] (call (take-st s) t body)] (done s st (status-of m))))
+
+(defn mkdir Int [s: &Sess path: &Str] (simple s FXP-MKDIR (str (w/string path) (perm-attrs 493))))
+(defn rmdir Int [s: &Sess path: &Str] (simple s FXP-RMDIR (w/string path)))
+(defn unlink Int [s: &Sess path: &Str] (simple s FXP-REMOVE (w/string path)))
+(defn rename Int [s: &Sess from: &Str to: &Str overwrite: Bool] (simple s FXP-RENAME (str (w/string from) (w/string to))))
+
+(defn- open-handle Values(St Str Int) [st0: St t: Int body: &Str]
+  (let [[st m] (call st0 t body)]
+    (if (= (msg-type m) FXP-HANDLE)
+      (let [[h p ok] (w/get-string m 5)] (values st h (if ok 0 FAILURE)))
+      (values st "" (status-of m)))))
+
+(defn- close-st Values(St Int) [st0: St h: &Str]
+  (let [[st m] (call st0 FXP-CLOSE (w/string h))] (values st (status-of m))))
+
+(defn open-write Values(Str Int) [s: &Sess path: &Str mode: &Str]
+  (let [flags (cond (= mode "APPEND") (+ 2 4 8)
+                    (= mode "CREATE_NEW") (+ 2 8 32)
+                    :else (+ 2 8 16))
+        [st h code] (open-handle (take-st s) FXP-OPEN (str (w/string path) (w/u32 flags) (perm-attrs 420)))]
+    (if (not= code 0) (values "" (done s st code))
+      (let [offs (:offs st) st2 (assoc st :offs (let [m: Map(Str Int) {}] m))]
+        (values h (done s (assoc st2 :offs (assoc offs (str h) 0)) 0))))))
+
+(defn close-handle Int [s: &Sess h: &Str]
+  (let [st0 (take-st s)
+        offs (:offs st0)
+        st1 (assoc st0 :offs (let [m: Map(Str Int) {}] m))
+        st2 (assoc st1 :offs (dissoc offs h))
+        [st code] (close-st st2 h)]
+    (done s st code)))
+
+(defn- write-at Values(St Int) [st0: St h: &Str off0: Int data: &Str]
+  (let [ws (:wsize st0) depth (max 1 (quot IN-FLIGHT ws)) n (count data)]
+    (loop [st st0 sent 0 acked 0 code 0]
+      (cond
+        (and (>= sent n) (= acked sent)) (values st code)
+        (and (< sent n) (< (- sent acked) (* depth ws)) (= code 0))
+        (let [k (min ws (- n sent))
+              [st1 id] (new-id st)
+              part (subs data sent (+ sent k))
+              [st2 ok] (send-msg st1 (str (w/byte FXP-WRITE) (w/u32 id) (w/string h) (w/u64 (+ off0 sent)) (w/string part)))]
+          (if ok (recur st2 (+ sent k) acked code) (values st2 CONNECTION-LOST)))
+        (= acked sent) (values st code)
+        :else
+        (let [[st1 m ok] (recv-msg st)
+              k (min ws (- n acked))
+              c (status-of m)]
+          (if (not ok) (values st1 CONNECTION-LOST)
+            (recur st1 sent (+ acked k) (if (= code 0) c code))))))))
+
+(defn write-part Int [s: &Sess h: &Str data: &Str]
+  (let [st0 (take-st s)
+        off (if (contains? (:offs st0) h) (get! (:offs st0) h) 0)
+        [st code] (write-at st0 h off data)
+        offs (:offs st)
+        st2 (assoc st :offs (let [m: Map(Str Int) {}] m))]
+    (done s (assoc st2 :offs (assoc offs (str h) (+ off (count data)))) code)))
+
+(defn put-file Int [s: &Sess path: &Str data: &Str mode: &Str]
+  (let [[h oe] (open-write s path mode)]
+    (if (not= oe 0) oe
+      (let [code (write-part s h data)
+            c2 (close-handle s h)]
+        (if (not= code 0) (done s (take-st s) code) c2)))))
+
+(defn- read-all Values(St Str Int) [st0: St h: &Str]
+  (let [rs (:rsize st0) depth (max 1 (quot IN-FLIGHT rs))
+        q0: Vec(Int) []
+        stash0: Map(Str Str) {}]
+    (loop [st st0 next 0 q q0 qi 0 eof -1 out "" stash stash0 code 0]
+      (let [pending (quot (- (count q) qi) 3)]
+        (cond
+          (not= code 0) (values st out code)
+          (and (= pending 0) (>= eof 0)) (values st out 0)
+          (and (< pending depth) (< eof 0))
+          (let [[st1 id] (new-id st)
+                [st2 ok] (send-msg st1 (str (w/byte FXP-READ) (w/u32 id) (w/string h) (w/u64 next) (w/u32 rs)))]
+            (if ok (recur st2 (+ next rs) (conj (conj (conj q id) next) rs) qi eof out stash code) (values st2 out CONNECTION-LOST)))
+          :else
+          (let [[st1 m ok] (recv-msg st)
+                [rid p1 o1] (w/get-u32 m 1)
+                at (find-req q qi rid)]
+            (cond
+              (or (not ok) (< at 0)) (values st1 out (if ok FAILURE CONNECTION-LOST))
+              :else
+              (let [off (nth q (+ at 1)) len (nth q (+ at 2))
+                    [q2 qi2] (drop-req q qi at)]
+                (cond
+                  (= (msg-type m) FXP-DATA)
+                  (let [[d p2 o2] (w/get-string m 5) got (count d)]
+                    (cond
+                      (or (not o2) (= got 0) (> got len)) (values st1 out FAILURE)
+                      (< got len)
+                      (let [[st2 id] (new-id st1)
+                            [st3 ok3] (send-msg st2 (str (w/byte FXP-READ) (w/u32 id) (w/string h) (w/u64 (+ off got)) (w/u32 (- len got))))
+                            [out2 stash2] (place out stash off d)]
+                        (if ok3 (recur st3 next (conj (conj (conj q2 id) (+ off got)) (- len got)) qi2 eof out2 stash2 code)
+                          (values st3 out2 CONNECTION-LOST)))
+                      :else (let [[out2 stash2] (place out stash off d)] (recur st1 next q2 qi2 eof out2 stash2 code))))
+                  (= (status-of m) EOF)
+                  (recur st1 next q2 qi2 (if (or (< eof 0) (< off eof)) off eof) out stash code)
+                  :else (values st1 out (status-of m)))))))))))
+
+(defn- find-req Int [q: &Vec(Int) qi: Int id: Int]
+  (loop [i qi] (cond (>= i (count q)) -1 (= (nth q i) id) i :else (recur (+ i 3)))))
+
+(defn- drop-req Values(Vec(Int) Int) [q: Vec(Int) qi: Int at: Int]
+  (cond
+    (and (= at qi) (< qi 3000)) (values q (+ qi 3))
+    :else
+    (values (loop [i qi acc: Vec(Int) []]
+              (cond (>= i (count q)) acc
+                    (= i at) (recur (+ i 3) acc)
+                    :else (recur (+ i 3) (conj (conj (conj acc (nth q i)) (nth q (+ i 1))) (nth q (+ i 2))))))
+            0)))
+
+(defn- place Values(Str Map(Str Str)) [out0: Str stash0: Map(Str Str) off: Int d: &Str]
+  (if (not= off (count out0)) (values out0 (assoc stash0 (str off) (str d)))
+    (loop [out (str out0 d) stash stash0]
+      (let [k (str (count out))]
+        (if (contains? stash k) (let [x (get! stash k)] (recur (str out x) (dissoc stash k))) (values out stash))))))
+
+(defn get-file Values(Str Int) [s: &Sess path: &Str]
+  (let [[st h code] (open-handle (take-st s) FXP-OPEN (str (w/string path) (w/u32 1) (w/u32 0)))]
+    (if (not= code 0) (values "" (done s st code))
+      (let [[st2 out rc] (read-all st h)
+            [st3 cc] (close-st st2 h)]
+        (values out (done s st3 rc))))))
+
+(defn list-dir Values(Vec(Entry) Int) [s: &Sess path: &Str]
+  (let [[st h code] (open-handle (take-st s) FXP-OPENDIR (w/string path))
+        none: Vec(Entry) []]
+    (if (not= code 0) (values none (done s st code))
+      (let [[st2 es rc] (loop [st1 st acc none]
+                          (let [[st2 m] (call st1 FXP-READDIR (w/string h))]
+                            (cond
+                              (= (msg-type m) FXP-NAME)
+                              (let [[n p0 o0] (w/get-u32 m 5)
+                                    [acc2 ok] (names m p0 n acc)]
+                                (if ok (recur st2 acc2) (values st2 acc2 FAILURE)))
+                              (= (status-of m) EOF) (values st2 acc 0)
+                              :else (values st2 acc (status-of m)))))
+            [st3 cc] (close-st st2 h)]
+        (values es (done s st3 rc))))))
+
+(defn- names Values(Vec(Entry) Bool) [m: &Str pos: Int n: Int acc0: Vec(Entry)]
+  (loop [i 0 p pos acc acc0]
+    (if (>= i n) (values acc true)
+      (let [[name p1 o1] (w/get-string m p)
+            [long p2 o2] (w/get-string m p1)
+            [a p3 o3] (get-attrs m p2)]
+        (cond (not (and o1 o2 o3)) (values acc false)
+              (or (= name ".") (= name "..")) (recur (+ i 1) p3 acc)
+              :else (recur (+ i 1) p3 (conj acc (->Entry name a))))))))

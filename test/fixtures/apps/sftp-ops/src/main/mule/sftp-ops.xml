@@ -1,0 +1,229 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:sftp="http://www.mulesoft.org/schema/mule/sftp"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/sftp http://www.mulesoft.org/schema/mule/sftp/current/mule-sftp.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18192"/>
+    </http:listener-config>
+
+    <!-- 検査用の SFTP サーバー (docker の atmoz/sftp、127.0.0.1:2222、利用者 mulay、/upload だけ書ける) -->
+    <sftp:config name="S">
+        <sftp:connection host="localhost" port="2222" username="mulay" password="mulay" workingDir="/upload"/>
+    </sftp:config>
+
+    <sftp:config name="BadPass">
+        <sftp:connection host="localhost" port="2222" username="mulay" password="wrong" workingDir="/upload"/>
+    </sftp:config>
+
+    <sftp:config name="NoServer">
+        <sftp:connection host="localhost" port="2299" username="mulay" password="mulay" connectionTimeout="2" connectionTimeoutUnit="SECONDS"/>
+    </sftp:config>
+
+    <!-- knownHostsFile: クラスパスの資源 (無ければファイルのパス)。行の無いホストと鍵の違うホストは拒む -->
+    <sftp:config name="KhGood">
+        <sftp:connection host="localhost" port="2222" username="mulay" password="mulay" workingDir="/upload" knownHostsFile="known_hosts_good"/>
+    </sftp:config>
+
+    <sftp:config name="KhBad">
+        <sftp:connection host="localhost" port="2222" username="mulay" password="mulay" workingDir="/upload" knownHostsFile="known_hosts_bad"/>
+    </sftp:config>
+
+    <sftp:config name="KhRsa">
+        <sftp:connection host="localhost" port="2222" username="mulay" password="mulay" workingDir="/upload" knownHostsFile="known_hosts_rsa"/>
+    </sftp:config>
+
+    <sftp:config name="KhOther">
+        <sftp:connection host="localhost" port="2222" username="mulay" password="mulay" workingDir="/upload" knownHostsFile="known_hosts_other"/>
+    </sftp:config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 前の実行の残りを消してから作る -->
+    <flow name="reset">
+        <http:listener config-ref="HTTP" path="/reset"/>
+        <try>
+            <sftp:delete config-ref="S" path="t"/>
+            <error-handler><on-error-continue><logger level="DEBUG" message="no t"/></on-error-continue></error-handler>
+        </try>
+        <sftp:create-directory config-ref="S" directoryPath="t"/>
+        <sftp:write config-ref="S" path="t/a.json"><sftp:content>{"a": 1, "b": [true, null]}</sftp:content></sftp:write>
+        <sftp:write config-ref="S" path="t/b.csv"><sftp:content>h1,h2
+1,2</sftp:content></sftp:write>
+        <sftp:write config-ref="S" path="t/sub/c.txt"><sftp:content>plain</sftp:content></sftp:write>
+        <set-payload value="ok"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="read">
+        <http:listener config-ref="HTTP" path="/read"/>
+        <sftp:read config-ref="S" path="#[attributes.queryParams.path]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  text: write(payload, "application/json"),
+  mime: payload.^mimeType,
+  attrClass: attributes.^class,
+  keys: keysOf(attributes) map ($ as String),
+  fileName: attributes.fileName,
+  path: attributes.path,
+  size: attributes.size,
+  directory: attributes.directory,
+  regularFile: attributes.regularFile,
+  symbolicLink: attributes.symbolicLink,
+  permissions: attributes.permissions,
+  name: attributes.name,
+  tsType: typeOf(attributes.timestamp)
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="read-value">
+        <http:listener config-ref="HTTP" path="/read-value"/>
+        <sftp:read config-ref="S" path="t/a.json"/>
+        <set-payload value="#[output application/json --- {b: payload.b, a: payload.a + 1}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="list">
+        <http:listener config-ref="HTTP" path="/list"/>
+        <sftp:list config-ref="S" directoryPath="#[attributes.queryParams.dir default 't']" recursive="#[(attributes.queryParams.rec default 'false') == 'true']"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(payload map {path: $.attributes.path, size: $.attributes.size, dir: $.attributes.directory, payloadType: typeOf($.payload)}) orderBy $.path]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="write">
+        <http:listener config-ref="HTTP" path="/write"/>
+        <sftp:write config-ref="S" path="#[attributes.queryParams.path]" mode="#[attributes.queryParams.mode default 'OVERWRITE']" createParentDirectories="#[(attributes.queryParams.parents default 'true') == 'true']">
+            <sftp:content>#[attributes.queryParams.text default 'x']</sftp:content>
+        </sftp:write>
+        <set-variable variableName="after" value="#[payload]"/>
+        <sftp:read config-ref="S" path="#[attributes.queryParams.path]"/>
+        <set-payload value="#[output application/json --- {text: payload as String, after: vars.after}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="copy">
+        <http:listener config-ref="HTTP" path="/copy"/>
+        <sftp:copy config-ref="S" sourcePath="#[attributes.queryParams.src]" targetPath="#[attributes.queryParams.dst]" overwrite="#[(attributes.queryParams.over default 'false') == 'true']" createParentDirectories="true"/>
+        <sftp:list config-ref="S" directoryPath="t" recursive="true"/>
+        <set-payload value="#[output application/json --- (payload map $.attributes.path) orderBy $]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="move">
+        <http:listener config-ref="HTTP" path="/move"/>
+        <sftp:move config-ref="S" sourcePath="#[attributes.queryParams.src]" targetPath="#[attributes.queryParams.dst]" overwrite="#[(attributes.queryParams.over default 'false') == 'true']" createParentDirectories="true"/>
+        <sftp:list config-ref="S" directoryPath="t" recursive="true"/>
+        <set-payload value="#[output application/json --- (payload map $.attributes.path) orderBy $]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="rename">
+        <http:listener config-ref="HTTP" path="/rename"/>
+        <sftp:rename config-ref="S" path="#[attributes.queryParams.path]" to="#[attributes.queryParams.to]" overwrite="#[(attributes.queryParams.over default 'false') == 'true']"/>
+        <sftp:list config-ref="S" directoryPath="t" recursive="true"/>
+        <set-payload value="#[output application/json --- (payload map $.attributes.path) orderBy $]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="delete">
+        <http:listener config-ref="HTTP" path="/delete"/>
+        <sftp:delete config-ref="S" path="#[attributes.queryParams.path]"/>
+        <sftp:list config-ref="S" directoryPath="t" recursive="true"/>
+        <set-payload value="#[output application/json --- (payload map $.attributes.path) orderBy $]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="mkdir">
+        <http:listener config-ref="HTTP" path="/mkdir"/>
+        <sftp:create-directory config-ref="S" directoryPath="#[attributes.queryParams.path]"/>
+        <set-payload value="#[output application/json --- 'made']"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bad-pass">
+        <http:listener config-ref="HTTP" path="/bad-pass"/>
+        <sftp:read config-ref="BadPass" path="t/a.json"/>
+        <set-payload value="#[payload as String]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="no-server">
+        <http:listener config-ref="HTTP" path="/no-server"/>
+        <sftp:read config-ref="NoServer" path="/upload/t/a.json"/>
+        <set-payload value="#[payload as String]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="kh-good">
+        <http:listener config-ref="HTTP" path="/kh-good"/>
+        <sftp:read config-ref="KhGood" path="t/a.json" outputMimeType="text/plain"/>
+        <set-payload value="#[payload as String]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="kh-bad">
+        <http:listener config-ref="HTTP" path="/kh-bad"/>
+        <sftp:read config-ref="KhBad" path="t/a.json"/>
+        <set-payload value="#[payload as String]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- known_hosts にそのサーバーの RSA の行しか無いとき (サーバーの好む鍵は ed25519) -->
+    <flow name="kh-rsa">
+        <http:listener config-ref="HTTP" path="/kh-rsa"/>
+        <sftp:read config-ref="KhRsa" path="t/a.json" outputMimeType="text/plain"/>
+        <set-payload value="#[payload as String]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="kh-other">
+        <http:listener config-ref="HTTP" path="/kh-other"/>
+        <sftp:read config-ref="KhOther" path="t/a.json"/>
+        <set-payload value="#[payload as String]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- 拡張子から推定する mime (File コネクタと表が違う) -->
+    <flow name="mimes">
+        <http:listener config-ref="HTTP" path="/mimes"/>
+        <set-variable variableName="out" value="#[{}]"/>
+        <foreach collection="#[['a.json', 'b.xml', 'c.csv', 'd.txt', 'e.weird', 'noext', 'f.yaml', 'g.html', 'h.js', 'i.zip', 'j.pdf', 'k.png', 'l.dwl', 'm.properties', 'n.ndjson', 'o.jpg', 'p.gz', 'q.htm', 'r.md', 's.tsv']]">
+            <set-variable variableName="name" value="#[payload]"/>
+            <sftp:write config-ref="S" path="#['t/m/' ++ vars.name]"><sftp:content>#["x"]</sftp:content></sftp:write>
+            <sftp:read config-ref="S" path="#['t/m/' ++ vars.name]"/>
+            <set-variable variableName="out" value="#[output application/java --- vars.out ++ {(vars.name): payload.^mimeType}]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- vars.out]"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

@@ -1,0 +1,66 @@
+(ns mulay.dw.src
+  (:require [clay.core]
+            [clay.string :as str]
+            [mulay.dw.ast :as a]))
+
+(defn line-starts Vec(Int) [s: &Str]
+  (loop [i 0 acc: Vec(Int) [0]]
+    (if (>= i (count s)) acc
+      (recur (+ i 1) (if (= (nth s i) 10) (conj acc (+ i 1)) acc)))))
+
+(defn- clamp-off Int [s: &Str off: Int] (if (< off 0) 0 (if (> off (count s)) (count s) off)))
+
+(defn- line-start-of Int [s: &Str off: Int]
+  (loop [i off] (if (and (> i 0) (not (= (nth s (- i 1)) 10))) (recur (- i 1)) i)))
+
+(defn- line-end-of Int [s: &Str off: Int]
+  (loop [i off] (if (and (< i (count s)) (not (= (nth s i) 10))) (recur (+ i 1)) i)))
+
+(defn- cp-count Int [s: &Str a: Int b: Int]
+  (loop [i a n 0]
+    (if (>= i b) n
+      (recur (+ i 1) (if (= (bit-and (nth s i) 192) 128) n (+ n 1))))))
+
+(defn line-col Values(Int Int) [s: &Str off0: Int]
+  (let [off (clamp-off s off0)
+        ls (line-start-of s off)
+        line (loop [i 0 n 1] (if (>= i ls) n (recur (+ i 1) (if (= (nth s i) 10) (+ n 1) n))))]
+    (values line (+ (cp-count s ls off) 1))))
+
+(defn line-text Str [s: &Str off0: Int]
+  (let [off (clamp-off s off0)
+        ls (line-start-of s off)
+        le (line-end-of s off)
+        le2 (if (and (> le ls) (= (nth s (- le 1)) 13)) (- le 1) le)]
+    (subs s ls le2)))
+
+(defn- spaces Str [n: Int] (loop [i 0 acc ""] (if (>= i n) acc (recur (+ i 1) (str acc " ")))))
+
+(defn- carets Str [n: Int] (loop [i 0 acc ""] (if (>= i n) acc (recur (+ i 1) (str acc "^")))))
+
+(defn- pad-like Str [line: &Str upto: Int]
+  (loop [i 0 acc ""]
+    (if (or (>= i upto) (>= i (count line))) acc
+      (let [c (nth line i)]
+        (recur (+ i 1) (if (= (bit-and c 192) 128) acc (if (= c 9) (str acc "\t") (str acc " "))))))))
+
+(defn render-diag Str [s: &Str name: &Str d: &a/Diag]
+  (let [sp (:sp d)
+        st (clamp-off s (:start sp))
+        [line col] (line-col s st)
+        ls (line-start-of s st)
+        text (line-text s st)
+        le (+ ls (count text))
+        en (if (> (:end sp) le) le (if (< (:end sp) st) st (:end sp)))
+        width (let [w (cp-count s st en)] (if (< w 1) 1 w))
+        prefix (str line "| ")]
+    (str (:msg d) "\n\n"
+         prefix text "\n"
+         (spaces (count prefix)) (pad-like text (- st ls)) (carets width) "\n"
+         "Location:\n"
+         name " (line: " line ", column: " col ")")))
+
+(defn render-diags Str [s: &Str name: &Str ds: &Vec(a/Diag)]
+  (loop [i 0 acc ""]
+    (if (>= i (count ds)) acc
+      (recur (+ i 1) (str acc (if (= i 0) "" "\n\n") (render-diag s name (nth ds i)))))))

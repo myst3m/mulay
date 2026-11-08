@@ -1,0 +1,159 @@
+(ns mywire-test (:require [mulay.db.mywire :as w] [mulay.db.sql :as sql] [clay.string :as str]))
+
+(defn- hex Str [b: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count b)) out
+      (let [x (nth b i) d "0123456789abcdef"]
+        (recur (+ i 1) (str out (subs d (bit-shift-right x 4) (+ (bit-shift-right x 4) 1)) (subs d (bit-and x 15) (+ (bit-and x 15) 1))))))))
+
+(defn- col w/Col [t: Int flags: Int cs: Int len: Int] (w/->Col "c" t flags cs len 0))
+
+(defn- cell-str Str [c: &sql/Cell]
+  (match c
+    (sql/CNull) "null"
+    (sql/CInt n) (str "int:" n)
+    (sql/CLong n) (str "long:" n)
+    (sql/CBigInt s) (str "bigint:" s)
+    (sql/CDecimal s) (str "dec:" s)
+    (sql/CFloat s) (str "float:" s)
+    (sql/CDouble f) "double"
+    (sql/CBool b) (str "bool:" (if b "true" "false"))
+    (sql/CStr s) (str "str:" s)
+    (sql/CBytes b) (str "bytes:" (hex b))
+    (sql/CDate s) (str "date:" s)
+    (sql/CTimestamp s) (str "ts:" s)
+    (sql/CLdt s) (str "ldt:" s)
+    (sql/CTime s) (str "time:" s)
+    _ "other"))
+
+(deftest packets-round-trip
+  (let [[b seq] (w/packets 3 "hello")
+        [body s2 p] (w/take-packet b 0)
+        [b0 s0 p0] (w/take-packet (subs b 0 6) 0)]
+    (is (= (hex b) "0500000368656c6c6f"))
+    (is (= seq 4))
+    (is (= body "hello"))
+    (is (= s2 3))
+    (is (= p 9))
+    (is (= p0 w/SHORT))))
+
+(deftest lenenc
+  (let [b1 (w/wlenenc "" 250) b2 (w/wlenenc "" 251) b3 (w/wlenenc "" 70000) b4 (w/wlenenc "" 16777216)
+        [x1 p1] (w/rlenenc b1 0) [x2 p2] (w/rlenenc b2 0) [x3 p3] (w/rlenenc b3 0) [x4 p4] (w/rlenenc b4 0)
+        [xn pn] (w/rlenenc (str (chr 251)) 0)
+        [s ps null] (w/rlenstr (w/wlenstr "" "abc") 0)]
+    (is (= (hex b2) "fcfb00"))
+    (is (= [x1 x2 x3 x4] [250 251 70000 16777216]))
+    (is (= [p1 p2 p3 p4] [1 3 4 9]))
+    (is (= xn -1))
+    (is (= s "abc"))
+    (is (= ps 4))
+    (is (not null))))
+
+(deftest scrambles
+  (is (= (hex (w/scramble-sha2 "mulay" "abcdefghijklmnopqrst")) "a1ec95aa7ed6af94069fd3886f6fe04de4a302a871f94af8901fbf165ab3c20f"))
+  (is (= (hex (w/scramble-native "mulay" "abcdefghijklmnopqrst")) "11050d3323d8e7e288722d0025698abb4254f113"))
+  (is (= (w/scramble-sha2 "" "abcdefghijklmnopqrst") "")))
+
+(deftest hello
+  (let [b0 (str (chr 10) "8.4.11" (chr 0))
+        b1 (w/w32 b0 77)
+        b2 (str b1 "abcdefgh" (chr 0))
+        caps 4294967295
+        b3 (w/w16 b2 (bit-and caps 65535))
+        b4 (w/w8 b3 255)
+        b5 (w/w16 b4 2)
+        b6 (w/w16 b5 (bit-and (bit-shift-right caps 16) 65535))
+        b7 (w/w8 b6 21)
+        b8 (str b7 (subs "0000000000" 0 10) "ijklmnopqrst" (chr 0) "caching_sha2_password" (chr 0))
+        [h e] (w/parse-hello b8)]
+    (is (= e ""))
+    (is (= (:version h) "8.4.11"))
+    (is (= (:thread h) 77))
+    (is (= (:nonce h) "abcdefghijklmnopqrst"))
+    (is (= (:plugin h) "caching_sha2_password"))))
+
+(deftest err-and-ok
+  (let [[code msg st] (w/parse-err (str (chr 255) (chr 122) (chr 4) "#42S02Table 'mulay.x' doesn't exist"))
+        [aff id stat] (w/parse-ok (str (chr 0) (chr 2) (chr 7) (chr 8) (chr 0) (chr 0) (chr 0)))]
+    (is (= code 1146))
+    (is (= st "42S02"))
+    (is (= msg "Table 'mulay.x' doesn't exist"))
+    (is (= [aff id stat] [2 7 8]))))
+
+(deftest cells
+  (is (= (cell-str (w/cell-of (col w/T-TINY 0 63 1) "1")) "bool:true"))
+  (is (= (cell-str (w/cell-of (col w/T-TINY 0 63 4) "-5")) "int:-5"))
+  (is (= (cell-str (w/cell-of (col w/T-LONG 32 63 10) "4294967295")) "long:4294967295"))
+  (is (= (cell-str (w/cell-of (col w/T-LONG 0 63 11) "-2147483648")) "int:-2147483648"))
+  (is (= (cell-str (w/cell-of (col w/T-LONGLONG 32 63 20) "18446744073709551615")) "bigint:18446744073709551615"))
+  (is (= (cell-str (w/cell-of (col w/T-LONGLONG 0 63 1) "1")) "long:1"))
+  (is (= (cell-str (w/cell-of (col w/T-NEWDECIMAL 0 63 22) "12345.67891")) "dec:12345.67891"))
+  (is (= (cell-str (w/cell-of (col w/T-FLOAT 0 63 12) "1.5")) "float:1.5"))
+  (is (= (cell-str (w/cell-of (col w/T-DATETIME 0 63 26) "2026-10-10 12:34:56.123456")) "ldt:2026-10-10T12:34:56.123456"))
+  (is (= (cell-str (w/cell-of (col w/T-TIMESTAMP 0 63 19) "2026-10-10 12:34:56")) "ts:2026-10-10T12:34:56"))
+  (is (= (cell-str (w/cell-of (col w/T-YEAR 0 63 4) "2026")) "date:2026-01-01"))
+  (is (= (cell-str (w/cell-of (col w/T-TIME 0 63 10) "12:34:56")) "time:12:34:56"))
+  (is (= (cell-str (w/cell-of (col w/T-BIT 0 63 1) (str (chr 1)))) "bool:true"))
+  (is (= (cell-str (w/cell-of (col w/T-BIT 0 63 8) (str (chr 165)))) "bytes:a5"))
+  (is (= (cell-str (w/cell-of (col w/T-JSON 0 63 0) "{}")) "str:{}"))
+  (is (= (cell-str (w/cell-of (col 252 0 63 65535) "ab")) "bytes:6162"))
+  (is (= (cell-str (w/cell-of (col 252 0 255 65535) "ab")) "str:ab"))
+  (is (= (cell-str (w/cell-of (col w/T-NULL 0 63 0) "")) "null")))
+
+(deftest literals
+  (is (= (w/quote-str "it's") "_utf8mb4 X'69742773'"))
+  (is (= (w/quote-str "") "_utf8mb4 X''"))
+  (is (= (w/quote-str (str (chr 149) "\\' OR 1=1 -- ")) "_utf8mb4 X'955C27204F5220313D31202D2D20'"))
+  (is (= (w/quote-str (str "a" (chr 0) "\n" (chr 26))) "_utf8mb4 X'61000A1A'"))
+  (is (= (w/literal (sql/->CBool true)) "1"))
+  (is (= (w/literal (sql/->CNull)) "null"))
+  (is (= (w/literal (sql/->CBytes (str (chr 1) (chr 255)))) "X'01FF'"))
+  (is (= (w/literal (sql/->CTimestamp "2026-10-10T01:02:03.5")) "_utf8mb4 X'323032362D31302D31302030313A30323A30332E35'"))
+  (is (= (w/literal (sql/->CTimestamp "2026-10-10T01:02:03.500")) "_utf8mb4 X'323032362D31302D31302030313A30323A30332E35'"))
+  (is (= (w/literal (sql/->CLdt "2026-10-10T01:02:03.000")) "_utf8mb4 X'323032362D31302D31302030313A30323A3033'"))
+  (is (= (w/fill-params "SELECT ? AS a, '?' AS b, `?` AS c /* ? */ -- ?\n, ? AS d" ["1" "'x'"]) "SELECT 1 AS a, '?' AS b, `?` AS c /* ? */ -- ?\n, 'x' AS d"))
+  (is (= (w/fill-params "SELECT 'it''s ?', ?" ["2"]) "SELECT 'it''s ?', 2")))
+
+(deftest result-set-queries
+  (is (w/result-set-query? "  select 1"))
+  (is (w/result-set-query? "/* c */ SELECT 1"))
+  (is (w/result-set-query? "-- c\nSHOW TABLES"))
+  (is (w/result-set-query? "(SELECT 1)"))
+  (is (w/result-set-query? "WITH x AS (SELECT 1) SELECT * FROM x"))
+  (is (not (w/result-set-query? "CALL people()")))
+  (is (not (w/result-set-query? "UPDATE t SET a = 1")))
+  (is (not (w/result-set-query? "SET @a = 1"))))
+
+(deftest errors
+  (let [e1 (w/server-err 1146 "Table 'mulay.x' doesn't exist" "42S02")
+        e2 (w/server-err 1406 "Data too long for column 'v' at row 1" "22001")
+        e3 (w/server-err 1048 "Column 'name' cannot be null" "23000")
+        e4 (w/server-err 1366 "Incorrect integer value" "HY000")]
+    (is (= (:exc e1) "java.sql.SQLSyntaxErrorException"))
+    (is (= (:msg e2) "Data truncation: Data too long for column 'v' at row 1"))
+    (is (= (:exc e2) "com.mysql.cj.jdbc.exceptions.MysqlDataTruncation"))
+    (is (= (:exc e3) "java.sql.SQLIntegrityConstraintViolationException"))
+    (is (= (:exc e4) "java.sql.SQLException"))))
+
+(deftest urls
+  (let [[h p db kvs e] (w/parse-url "//localhost:13306/mulay?sslMode=REQUIRED&useSSL=true")
+        [h2 p2 db2 kvs2 e2] (w/parse-url "//db.example")
+        [h3 p3 db3 kvs3 e3] (w/parse-url "//a,b/x")]
+    (is (= [h db e] ["localhost" "mulay" ""]))
+    (is (= p 13306))
+    (is (= (w/prop kvs "sslmode" "PREFERRED") "REQUIRED"))
+    (is (= (w/prop kvs "allowPublicKeyRetrieval" "false") "false"))
+    (is (= [h2 db2] ["db.example" ""]))
+    (is (= p2 3306))
+    (is (str/starts-with? e3 "mulay does not support multiple MySQL hosts"))))
+
+(deftest hostile-server-packets
+  (let [[code msg st] (w/parse-err (str (chr 255) (chr 21) (chr 4) "#"))
+        [c2 m2 s2] (w/parse-err (str (chr 255) (chr 21) (chr 4) "#4200"))
+        huge (str (chr 254) (chr 255) (chr 255) (chr 255) (chr 255) (chr 255) (chr 255) (chr 255) (chr 127) "abc")
+        [s p null] (w/rlenstr huge 0)]
+    (is (= code 1045))
+    (is (= msg "malformed error packet"))
+    (is (= m2 "malformed error packet"))
+    (is (< p 0))))

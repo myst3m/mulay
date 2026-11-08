@@ -1,0 +1,154 @@
+(ns mulay.cli.dwtest
+  (:require [clay.string :as str] [clay.io :as io] [mulay.lib.fs :as fs] [mulay.lib.host :as host] [mulay.lib.diag :as diag] [mulay.dw.engine :as eng]
+            [mulay.dw.explain :as ex] [mulay.dw.val :as v] [mulay.dw.err :as dwe] [mulay.cli.dwpath :as dwpath] [mulay.dw.lib.testio :as l-testio]))
+
+(defrecord Row [depth: Int name: Str suite: Bool status: Str message: Str n: Int path: Str])
+
+(defrecord Outcome [file: Str rows: Vec(Row) error: Str reports: Vec(diag/Report)])
+
+(defn test-files Vec(Str) [path: &Str]
+  (cond
+    (fs/file? path) [(str path)]
+    (fs/dir? path)
+    (let [[names e] (io/list-dir path)]
+      (if (not= e "") []
+        (let [sorted (sort names)]
+          (loop [i 0 acc: Vec(Str) []]
+            (if (>= i (count sorted)) acc
+              (let [n (nth sorted i) p (fs/join path n)]
+                (cond
+                  (str/starts-with? n ".") (recur (+ i 1) acc)
+                  (fs/dir? p) (recur (+ i 1) (let [sub (test-files p)] (loop [k 0 a acc] (if (>= k (count sub)) a (recur (+ k 1) (conj a (nth sub k)))))))
+                  (str/ends-with? n ".dwl") (recur (+ i 1) (conj acc p))
+                  :else (recur (+ i 1) acc))))))))
+    :else []))
+
+(defn script? Bool [text: &Str]
+  (let [ls: Vec(Str) (str/split (str text) "\n")]
+    (loop [i 0] (if (>= i (count ls)) false (if (str/starts-with? (str/trim (nth ls i)) "---") true (recur (+ i 1)))))))
+
+(defn- text-of Str [fs0: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get fs0 k)]
+    (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) (str s) _ ""))))
+
+(defn- result? Bool [x: &v/Val]
+  (match (v/unmeta x) (v/VObj fs0) (and (> (count (v/obj-get fs0 "name")) 0) (not= (text-of fs0 "status") "")) _ false))
+
+(defn- cat-rows Vec(Row) [a: Vec(Row) b: &Vec(Row)] (loop [k 0 acc a] (if (>= k (count b)) acc (recur (+ k 1) (conj acc (nth b k))))))
+
+(defn rows-of Vec(Row) [x: &v/Val depth: Int prefix: &Str]
+  (match (v/unmeta x)
+    (v/VArr xs) (loop [i 0 acc: Vec(Row) []] (if (>= i (count xs)) acc (recur (+ i 1) (cat-rows acc (rows-of (nth xs i) depth prefix)))))
+    (v/VObj fs0)
+    (let [name (text-of fs0 "name")
+          status (text-of fs0 "status")
+          path (if (= prefix "") name (str prefix " › " name))
+          kids (v/obj-get fs0 "tests")]
+      (cond
+        (= (count kids) 0)
+        [(->Row depth name false status (if (= status "SKIP") (text-of fs0 "skipReason") (text-of fs0 "errorMessage")) 1 path)]
+        (= status "SKIP")
+        [(->Row depth name true status (text-of fs0 "skipReason") (match (v/unmeta (nth kids 0)) (v/VArr ks) (count ks) _ 0) path)]
+        :else (cat-rows [(->Row depth name true "" "" 0 path)] (rows-of (nth kids 0) (+ depth 1) path))))
+    _ []))
+
+(defn leaves Vec(Row) [o: &Outcome]
+  (let [rs (:rows o)] (loop [i 0 acc: Vec(Row) []] (if (>= i (count rs)) acc (recur (+ i 1) (if (:suite (nth rs i)) acc (conj acc (nth rs i))))))))
+
+(defn- failed-file Outcome [file: &Str r: diag/Report] (->Outcome (str file) [] (diag/render r false) [r]))
+
+(defn- source-id Str [file: &Str] (if (str/ends-with? file ".dwl") (subs file 0 (- (count file) 4)) (str file)))
+
+(defn run-file Outcome [file: &Str paths: &Vec(Str) cwd: &Str]
+  (let [[text re] (read-file file)]
+    (cond
+      (not= re "") (->Outcome (str file) [] (str "cannot read: " re) [])
+      (not (script? text)) (->Outcome (str file) [] "" [])
+      :else
+      (let [roots (dwpath/roots paths file cwd)
+            zr (l-testio/set-roots! roots)
+            ctx (ex/->Ctx [] true)
+            c (eng/with-source-id (eng/compile-with text [] (dwpath/loader roots)) (source-id file))]
+        (if (not (eng/ok? c)) (failed-file file (ex/compile-report (str file) (str text) c ctx))
+          (let [[x e] (eng/eval-compiled c [])
+                [w we] (if (dwe/ok? e) (v/whole-deep x) (values x e))]
+            (cond
+              (not (dwe/ok? e)) (failed-file file (ex/run-report (str file) (str text) c e ctx))
+              (not (dwe/ok? we)) (failed-file file (ex/run-report (str file) (str text) c we ctx))
+              (not (or (result? w) (match (v/unmeta w) (v/VArr xs) (and (> (count xs) 0) (result? (nth xs 0))) _ false)))
+              (->Outcome (str file) [] "the script's result is not a dw::test TestResult (use describedBy or in)" [])
+              :else (->Outcome (str file) (rows-of w 0 "") "" []))))))))
+
+(defn- esc Str [code: &Str] (str (chr 27) "[" code "m"))
+
+(defn- paint Str [s: &Str code: &Str color: Bool] (if color (str (esc code) s (esc "0")) (str s)))
+
+(defn- spaces Str [n: Int] (loop [i 0 o ""] (if (>= i n) o (recur (+ i 1) (str o " ")))))
+
+(defn- indent Str [text: &Str]
+  (let [ls: Vec(Str) (str/split (str text) "\n")]
+    (loop [i 0 out ""]
+      (if (>= i (count ls)) out
+        (recur (+ i 1) (str out (if (= (nth ls i) "") "" (str "  " (nth ls i))) "\n"))))))
+
+(defn- plural Str [n: Int word: &Str] (str n " " word (if (= n 1) "" "s")))
+
+(defn- fail? Bool [s: &Str] (or (= s "FAIL") (= s "ERROR")))
+
+(defn- row-line Str [r: &Row color: Bool]
+  (let [pad (spaces (* 2 (+ (:depth r) 1)))
+        s (:status r)
+        why (if (= (:message r) "") "" (str ": " (:message r)))]
+    (cond
+      (and (:suite r) (= s "SKIP")) (str pad (paint "○" "33" color) " " (:name r) " " (paint (str "(skipped" why ", " (plural (:n r) "test") ")") "33" color) "\n")
+      (:suite r) (str pad (:name r) "\n")
+      (= s "OK") (str pad (paint "✓" "32" color) " " (:name r) "\n")
+      (= s "SKIP") (str pad (paint "○" "33" color) " " (:name r) " " (paint (str "(skipped" why ")") "33" color) "\n")
+      (= s "ERROR") (str pad (paint "✗" "31" color) " " (:name r) " " (paint "(error)" "31" color) "\n")
+      :else (str pad (paint "✗" "31" color) " " (:name r) "\n"))))
+
+(defn- file-error Str [o: &Outcome color: Bool]
+  (if (> (count (:reports o)) 0) (diag/render (nth (:reports o) 0) color) (str (:error o))))
+
+(defn report Values(Str Bool) [os: &Vec(Outcome) ms: Int color: Bool]
+  (let [[tree fails ok bad err skip n]
+        (loop [i 0 out "" fl "" ok 0 bad 0 err 0 skip 0 n 0]
+          (if (>= i (count os)) (values out fl ok bad err skip n)
+            (let [o (nth os i)]
+              (if (not= (:error o) "")
+                (recur (+ i 1) (str out (paint (:file o) "1" color) "  " (paint "✗ error" "31" color) "\n")
+                       (str fl "\n" (paint (str "✗ " (:file o)) "1;31" color) "\n" (indent (file-error o color)))
+                       ok bad (+ err 1) skip n)
+                (let [rs (:rows o)
+                      [o2 f2 a b c d m]
+                      (loop [k 0 o1 (str out (paint (:file o) "1" color) "\n") f1 fl a ok b bad c err d skip m n]
+                        (if (>= k (count rs)) (values o1 f1 a b c d m)
+                          (let [r (nth rs k) s (:status r)]
+                            (cond
+                              (and (:suite r) (not= s "SKIP")) (recur (+ k 1) (str o1 (row-line r color)) f1 a b c d m)
+                              (:suite r) (recur (+ k 1) (str o1 (row-line r color)) f1 a b c (+ d (:n r)) (+ m (:n r)))
+                              :else
+                              (recur (+ k 1) (str o1 (row-line r color))
+                                     (if (fail? s) (str f1 "\n" (paint (str "✗ " (:path r)) "1;31" color) "  (" (:file o) ")" (if (= s "ERROR") " error" "") "\n" (indent (:message r))) f1)
+                                     (if (= s "OK") (+ a 1) a) (if (= s "FAIL") (+ b 1) b) (if (= s "ERROR") (+ c 1) c) (if (= s "SKIP") (+ d 1) d) (+ m 1))))))]
+                  (recur (+ i 1) o2 f2 a b c d m))))))
+        green (and (= bad 0) (= err 0))
+        fsec (if (= fails "") "" (str "\n" (paint "Failures" "1" color) "\n" fails))
+        secs (str (quot ms 1000) "." (let [r (rem ms 1000)] (str (if (< r 100) "0" "") (if (< r 10) "0" "") r)) "s")
+        tail (str "\n" (if green (paint "ok" "1;32" color) (paint "FAILED" "1;31" color)) "  "
+                  ok " passed, " bad " failed, " (plural err "error") ", " skip " skipped  ("
+                  (plural n "test") " in " (plural (count os) "file") ", " secs ")\n")]
+    (values (str tree fsec tail) green)))
+
+(defn run Int [targets: &Vec(Str) paths: &Vec(Str) cwd: &Str color: Bool]
+  (let [files (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count targets)) acc
+                  (let [fs1 (test-files (nth targets i))] (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count fs1)) a (recur (+ k 1) (conj a (nth fs1 k)))))))))
+        t0 (host/now-ms)
+        os (loop [i 0 acc: Vec(Outcome) []]
+             (if (>= i (count files)) acc
+               (let [o (run-file (nth files i) paths cwd)]
+                 (recur (+ i 1) (if (and (= (:error o) "") (= (count (:rows o)) 0)) acc (conj acc o))))))
+        [out green] (report os (- (host/now-ms) t0) color)
+        z (print out)]
+    (if green 0 1)))

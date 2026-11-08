@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  文書の検索 (RAG)。Vectors コネクタで、文書を分割して埋め込み、保存先 (ephemeral-file: docs.dir の docs.store) に置く。
+  文書の出し入れは管理用の MCP サーバー (admin.xml の /admin/mcp) から行い、ここの sub-flow を使う。
+  - docs-put: vars.doc {id, text, source} を入れる。同じ id の断片は先に消すので、入れ直しても重複しない。
+    断片のメタデータは source と docId。元の文と件数は DocsIndex (Object Store) に残す (一覧と作り直しに使う)。
+  - docs-remove: vars.docId の断片を消す。
+  - docs-search: vars.query に近い断片 (vars.maxResults 件、スコアが docs.minScore 以上) を Vectors の query の形で返す。
+  - ツール search_docs (エージェントが使う): 近い断片の本文を返す (無ければ "no matching documents")。
+  埋め込みは embed.url の Ollama の /api/embeddings。既定は stat.xml の統計的な埋め込み。保存先の名前 (docs.store) は
+  埋め込みのモデルごとに分かれる (モデルが違うベクトルは比べられない。替えたら reindex_documents で作り直す)。
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ms-vectors="http://www.mulesoft.org/schema/mule/ms-vectors"
+      xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ms-vectors http://www.mulesoft.org/schema/mule/ms-vectors/current/mule-ms-vectors.xsd
+        http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd">
+
+    <ms-vectors:embedding-config name="Embed">
+        <ms-vectors:ollama-connection baseUrl="${embed.url}"/>
+    </ms-vectors:embedding-config>
+
+    <!-- 相対の docs.dir を ephemeral-file と同じ基準 (プロセスのカレントディレクトリ) で解く。
+         config の無い file の操作は別の場所 (Mule では user.home) を基準にするので、ディレクトリを作る所がずれる -->
+    <file:config name="DocsDir">
+        <file:connection workingDir="."/>
+    </file:config>
+
+    <ms-vectors:store-config name="Docs">
+        <ms-vectors:ephemeral-file-connection workingDir="${docs.dir}"/>
+    </ms-vectors:store-config>
+
+    <!-- 入れた文書の一覧 (id → {id, source, chars, chunks, added, model, text})。期限なし -->
+    <os:object-store name="DocsIndex" persistent="${store.persistent}"/>
+
+    <sub-flow name="docs-put">
+        <validation:is-not-blank-string value="#[vars.doc.text]" message="text is required"/>
+        <validation:matches-regex value="#[vars.doc.id]" regex="[A-Za-z0-9_.:-]{1,128}"
+                                  message="id must be 1 to 128 letters, digits, '_', '.', ':' or '-'"/>
+        <!-- 保存先のディレクトリを用意する (ephemeral-file は無いディレクトリに書けない) -->
+        <try>
+            <file:create-directory config-ref="DocsDir" directoryPath="${docs.dir}"/>
+            <error-handler>
+                <on-error-continue type="FILE:FILE_ALREADY_EXISTS" logException="false">
+                    <logger level="DEBUG" message="docs.dir exists"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+        <os:contains key="#[vars.doc.id]" objectStore="DocsIndex" target="replaced"/>
+        <set-variable variableName="docId" value="#[vars.doc.id]"/>
+        <flow-ref name="docs-remove"/>
+        <!-- text/plain で渡す (JSON のままだと引用符ごと分ける) -->
+        <ms-vectors:transform-chunk-text maxSegmentSizeInChar="${docs.chunkSize}" maxOverlapSizeInChars="${docs.chunkOverlap}">
+            <ms-vectors:text>#[output text/plain --- vars.doc.text]</ms-vectors:text>
+        </ms-vectors:transform-chunk-text>
+        <ms-vectors:embedding-generate-from-text config-ref="Embed" embeddingModelName="${embed.model}">
+            <ms-vectors:inputs>#[payload]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:store-add config-ref="Docs" storeName="${docs.store}">
+            <ms-vectors:text-segments-and-embeddings>#[payload]</ms-vectors:text-segments-and-embeddings>
+            <ms-vectors:metadata-entries>
+                <ms-vectors:metadata-entry key="source" value="#[vars.doc.source]"/>
+                <ms-vectors:metadata-entry key="docId" value="#[vars.doc.id]"/>
+            </ms-vectors:metadata-entries>
+        </ms-vectors:store-add>
+        <set-variable variableName="entry" value="#[output application/java --- {id: vars.doc.id, source: vars.doc.source, chars: sizeOf(vars.doc.text), chunks: sizeOf(payload.embeddingIds), added: vars.doc.added default ((now() >> 'UTC') as String {format: &quot;yyyy-MM-dd'T'HH:mm:ss'Z'&quot;}), model: p('embed.model'), text: vars.doc.text}]"/>
+        <os:store key="#[vars.doc.id]" objectStore="DocsIndex">
+            <os:value>#[vars.entry]</os:value>
+        </os:store>
+        <set-payload value="#[output application/java --- {id: vars.entry.id, chunks: vars.entry.chunks, replaced: vars.replaced}]"/>
+    </sub-flow>
+
+    <sub-flow name="docs-remove">
+        <ms-vectors:store-remove config-ref="Docs" storeName="${docs.store}">
+            <!-- docId は docs-put と delete_document が形を確かめてある (引用符を含まない) -->
+            <ms-vectors:condition>#["docId = '" ++ vars.docId ++ "'"]</ms-vectors:condition>
+        </ms-vectors:store-remove>
+    </sub-flow>
+
+    <sub-flow name="docs-search">
+        <validation:is-not-blank-string value="#[vars.query]" message="query is required"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Embed" embeddingModelName="${embed.model}">
+            <ms-vectors:inputs>#[[vars.query]]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:query config-ref="Docs" storeName="${docs.store}" maxResults="#[vars.maxResults default p('docs.maxResults')]" minScore="${docs.minScore}">
+            <ms-vectors:text-segment-and-embedding>#[payload]</ms-vectors:text-segment-and-embedding>
+        </ms-vectors:query>
+    </sub-flow>
+
+    <!-- ツール search_docs: 近い断片の本文を返す (無ければ "no matching documents") -->
+    <flow name="tool-search_docs">
+        <set-variable variableName="query" value="#[payload.query]"/>
+        <flow-ref name="docs-search"/>
+        <set-payload value="#[if (isEmpty(payload.sources default [])) 'no matching documents' else payload.response]"/>
+    </flow>
+</mule>

@@ -1,0 +1,442 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- ============================================================ -->
+    <!-- 設定                                                          -->
+    <!-- ============================================================ -->
+
+    <configuration-properties file="config.yaml" doc:name="設定ファイル読込"/>
+
+    <http:listener-config name="HTTP_Listener" doc:name="HTTPリスナー設定">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="Salesforce_Config" doc:name="Salesforce接続設定">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials
+                clientId="${sf.clientId}"
+                clientSecret="${sf.clientSecret}"
+                tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <!-- ============================================================ -->
+    <!-- SOQL クエリ                                                   -->
+    <!-- ============================================================ -->
+
+    <flow name="queryFlow" doc:name="SOQL クエリ (Account 10件)">
+        <http:listener config-ref="HTTP_Listener" path="/sf/query" allowedMethods="GET" doc:name="GET /sf/query"/>
+        <salesforce:query config-ref="Salesforce_Config" doc:name="Account 10件取得">
+            <salesforce:salesforce-query>SELECT Id, Name FROM Account LIMIT 10</salesforce:salesforce-query>
+        </salesforce:query>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="queryAllFlow" doc:name="SOQL QueryAll (削除済み含む)">
+        <http:listener config-ref="HTTP_Listener" path="/sf/queryAll" allowedMethods="GET" doc:name="GET /sf/queryAll"/>
+        <salesforce:query-all config-ref="Salesforce_Config" doc:name="Account全件取得 (削除済含む)">
+            <salesforce:salesforce-query>SELECT Id, Name, IsDeleted FROM Account LIMIT 10</salesforce:salesforce-query>
+        </salesforce:query-all>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- CRUD操作: 作成 / 更新 / 削除 / Upsert / 取得                    -->
+    <!-- ============================================================ -->
+
+    <flow name="createFlow" doc:name="Account レコード作成">
+        <http:listener config-ref="HTTP_Listener" path="/sf/create" allowedMethods="POST" doc:name="POST /sf/create"/>
+        <salesforce:create config-ref="Salesforce_Config" type="Account" doc:name="Account 作成"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="updateFlow" doc:name="Account レコード更新">
+        <http:listener config-ref="HTTP_Listener" path="/sf/update" allowedMethods="POST" doc:name="POST /sf/update"/>
+        <salesforce:update config-ref="Salesforce_Config" type="Account" doc:name="Account 更新"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="deleteFlow" doc:name="レコード削除">
+        <http:listener config-ref="HTTP_Listener" path="/sf/delete" allowedMethods="POST" doc:name="POST /sf/delete"/>
+        <salesforce:delete config-ref="Salesforce_Config" doc:name="レコード削除"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="upsertFlow" doc:name="Account Upsert (外部ID)">
+        <http:listener config-ref="HTTP_Listener" path="/sf/upsert" allowedMethods="POST" doc:name="POST /sf/upsert"/>
+        <salesforce:upsert config-ref="Salesforce_Config" objectType="Account" externalIdFieldName="ExternalId__c" doc:name="Account Upsert"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="retrieveFlow" doc:name="Account ID指定取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/retrieve" allowedMethods="POST" doc:name="POST /sf/retrieve"/>
+        <salesforce:retrieve config-ref="Salesforce_Config" type="Account" fields="Id,Name,Industry" doc:name="Account取得 (Id,Name,Industry)"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- SOSL 検索                                                     -->
+    <!-- ============================================================ -->
+
+    <flow name="searchFlow" doc:name="SOSL 全文検索">
+        <http:listener config-ref="HTTP_Listener" path="/sf/search" allowedMethods="GET" doc:name="GET /sf/search"/>
+        <salesforce:search config-ref="Salesforce_Config" doc:name="Test で全文検索">
+            <salesforce:search-string>FIND {Test} IN ALL FIELDS RETURNING Account(Id, Name) LIMIT 5</salesforce:search-string>
+        </salesforce:search>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- オブジェクト定義参照                                             -->
+    <!-- ============================================================ -->
+
+    <flow name="describeSobjectFlow" doc:name="オブジェクト定義参照">
+        <http:listener config-ref="HTTP_Listener" path="/sf/describe/{sobject}" allowedMethods="GET" doc:name="GET /sf/describe/{sobject}"/>
+        <salesforce:describe-sobject config-ref="Salesforce_Config" type="#[attributes.uriParams.sobject]" doc:name="オブジェクト定義取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="describeGlobalFlow" doc:name="全オブジェクト一覧">
+        <http:listener config-ref="HTTP_Listener" path="/sf/describeGlobal" allowedMethods="GET" doc:name="GET /sf/describeGlobal"/>
+        <salesforce:describe-global config-ref="Salesforce_Config" doc:name="全オブジェクト一覧取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- ユーザー/サーバー情報                                           -->
+    <!-- ============================================================ -->
+
+    <flow name="getUserInfoFlow" doc:name="ユーザー情報取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/userInfo" allowedMethods="GET" doc:name="GET /sf/userInfo"/>
+        <salesforce:get-user-info config-ref="Salesforce_Config" doc:name="ユーザー情報取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="getServerTimestampFlow" doc:name="サーバー情報取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/serverTimestamp" allowedMethods="GET" doc:name="GET /sf/serverTimestamp"/>
+        <salesforce:get-server-timestamp config-ref="Salesforce_Config" doc:name="サーバータイムスタンプ取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- 削除済み/更新済みレコード取得                                     -->
+    <!-- ============================================================ -->
+
+    <flow name="getDeletedFlow" doc:name="削除済みレコード取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/deleted/{sobject}" allowedMethods="GET" doc:name="GET /sf/deleted/{sobject}"/>
+        <salesforce:get-deleted config-ref="Salesforce_Config" type="#[attributes.uriParams.sobject]" doc:name="削除済みレコード取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="getUpdatedFlow" doc:name="更新済みレコード取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/updated/{sobject}" allowedMethods="GET" doc:name="GET /sf/updated/{sobject}"/>
+        <salesforce:get-updated config-ref="Salesforce_Config" type="#[attributes.uriParams.sobject]" doc:name="更新済みレコード取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- Bulk API v2 - 一括取込ジョブ (Ingest)                           -->
+    <!-- ============================================================ -->
+
+    <flow name="bulkCreateJobFlow" doc:name="一括取込ジョブ作成 (CSV→Account INSERT)">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/ingest/create" allowedMethods="POST" doc:name="POST /sf/bulk/ingest/create">
+            <http:response>
+                <http:body><![CDATA[#[payload]]]></http:body>
+            </http:response>
+            <non-repeatable-streaming-strategy/>
+        </http:listener>
+        <salesforce:create-job-bulk-api-v2 config-ref="Salesforce_Config" object="Account" bulkOperation="insert" doc:name="Bulk Ingest ジョブ作成 + CSVアップロード"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkGetJobStateFlow" doc:name="一括取込ジョブ状態確認">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/ingest/{jobId}/state" allowedMethods="GET" doc:name="GET /sf/bulk/ingest/{jobId}/state"/>
+        <salesforce:get-job-state-bulk-api-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="ジョブ状態取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkAbortJobFlow" doc:name="一括取込ジョブ中止">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/ingest/{jobId}/abort" allowedMethods="POST" doc:name="POST /sf/bulk/ingest/{jobId}/abort"/>
+        <salesforce:abort-job-bulk-api-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="ジョブ中止"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkDeleteJobFlow" doc:name="一括取込ジョブ削除">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/ingest/{jobId}/delete" allowedMethods="POST" doc:name="POST /sf/bulk/ingest/{jobId}/delete"/>
+        <salesforce:delete-job-bulk-api-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="ジョブ削除"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkGetAllJobsFlow" doc:name="一括取込ジョブ一覧">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/ingest/jobs" allowedMethods="GET" doc:name="GET /sf/bulk/ingest/jobs"/>
+        <salesforce:get-all-jobs-bulk-api-v2 config-ref="Salesforce_Config" doc:name="全ジョブ一覧取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkGetSuccessResultsFlow" doc:name="一括取込 成功結果取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/ingest/{jobId}/success" allowedMethods="GET" doc:name="GET /sf/bulk/ingest/{jobId}/success"/>
+        <salesforce:retrieve-job-successful-results-bulk-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="成功レコード取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkGetFailedResultsFlow" doc:name="一括取込 失敗結果取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/ingest/{jobId}/failed" allowedMethods="GET" doc:name="GET /sf/bulk/ingest/{jobId}/failed"/>
+        <salesforce:retrieve-job-failed-results-bulk-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="失敗レコード取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkGetUnprocessedResultsFlow" doc:name="一括取込 未処理結果取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/ingest/{jobId}/unprocessed" allowedMethods="GET" doc:name="GET /sf/bulk/ingest/{jobId}/unprocessed"/>
+        <salesforce:retrieve-job-unprocessed-results-bulk-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="未処理レコード取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- Bulk API v2 - 一括クエリジョブ (Query)                          -->
+    <!-- ============================================================ -->
+
+    <flow name="bulkCreateQueryJobFlow" doc:name="一括クエリジョブ作成">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/query/create" allowedMethods="POST" doc:name="POST /sf/bulk/query/create"/>
+        <salesforce:create-query-job-bulk-api-v2 config-ref="Salesforce_Config" doc:name="Bulk Query ジョブ作成">
+            <salesforce:query>#[payload.query]</salesforce:query>
+        </salesforce:create-query-job-bulk-api-v2>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkGetQueryJobInfoFlow" doc:name="一括クエリジョブ情報取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/query/{jobId}/info" allowedMethods="GET" doc:name="GET /sf/bulk/query/{jobId}/info"/>
+        <salesforce:get-query-job-info-bulk-api-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="クエリジョブ情報取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkGetQueryJobResultsFlow" doc:name="一括クエリ結果取得">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/query/{jobId}/results" allowedMethods="GET" doc:name="GET /sf/bulk/query/{jobId}/results"/>
+        <salesforce:get-query-job-results-bulk-api-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="クエリ結果取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkAbortQueryJobFlow" doc:name="一括クエリジョブ中止">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/query/{jobId}/abort" allowedMethods="POST" doc:name="POST /sf/bulk/query/{jobId}/abort"/>
+        <salesforce:abort-query-job-bulk-api-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="クエリジョブ中止"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkDeleteQueryJobFlow" doc:name="一括クエリジョブ削除">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/query/{jobId}/delete" allowedMethods="POST" doc:name="POST /sf/bulk/query/{jobId}/delete"/>
+        <salesforce:delete-query-job-bulk-api-v2 config-ref="Salesforce_Config" jobId="#[attributes.uriParams.jobId]" doc:name="クエリジョブ削除"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="bulkGetAllQueryJobsFlow" doc:name="一括クエリジョブ一覧">
+        <http:listener config-ref="HTTP_Listener" path="/sf/bulk/query/jobs" allowedMethods="GET" doc:name="GET /sf/bulk/query/jobs"/>
+        <salesforce:get-all-query-jobs-bulk-api-v2 config-ref="Salesforce_Config" doc:name="全クエリジョブ一覧取得"/>
+        <ee:transform doc:name="JSON変換">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:tls="http://www.mulesoft.org/schema/mule/tls"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd">
+
+    <!-- テストの入口 (平文) -->
+    <http:listener-config name="Plain">
+        <http:listener-connection host="0.0.0.0" port="18168"/>
+    </http:listener-config>
+
+    <!-- エージェント (HTTPS) -->
+    <http:listener-config name="Secure">
+        <http:listener-connection host="0.0.0.0" port="18169" protocol="HTTPS">
+            <tls:context>
+                <tls:key-store type="pkcs12" path="server.p12" password="changeit" keyPassword="changeit"/>
+            </tls:context>
+        </http:listener-connection>
+    </http:listener-config>
+
+    <tls:context name="TrustCa">
+        <tls:trust-store type="pkcs12" path="truststore.p12" password="changeit"/>
+    </tls:context>
+
+    <a2a:server-config name="Srv">
+        <a2a:connection listenerConfig="Secure" agentPath="/agent"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{"name": "S", "description": "Secure agent", "url": "https://localhost:18169/agent", "version": "1.0.0",
+  "capabilities": {}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []}]]></a2a:json>
+        </a2a:agent-card>
+    </a2a:server-config>
+
+    <!-- その場の tls:context -->
+    <a2a:client-config name="ClInline">
+        <a2a:client-connection serverUrl="https://localhost:18169/agent">
+            <tls:context>
+                <tls:trust-store type="pkcs12" path="truststore.p12" password="changeit"/>
+            </tls:context>
+        </a2a:client-connection>
+    </a2a:client-config>
+
+    <!-- 大域の tls:context の参照 -->
+    <a2a:client-config name="ClRef">
+        <a2a:client-connection serverUrl="https://localhost:18169/agent" tlsContext="TrustCa"/>
+    </a2a:client-config>
+
+    <flow name="agent">
+        <a2a:task-listener config-ref="Srv"/>
+        <set-payload value='#[output application/json --- {kind: "message", role: "agent", messageId: "m-1", parts: [{kind: "text", text: "secure " ++ attributes.scheme}]}]'/>
+    </flow>
+
+    <flow name="send">
+        <http:listener config-ref="Plain" path="/t/send"/>
+        <choice>
+            <when expression="#[attributes.queryParams.cfg == 'ref']">
+                <a2a:send-message config-ref="ClRef">
+                    <a2a:message><![CDATA[#[output application/json --- {message: {kind: "message", role: "user", messageId: "u-1", parts: [{kind: "text", text: "hi"}]}}]]]></a2a:message>
+                </a2a:send-message>
+            </when>
+            <otherwise>
+                <a2a:send-message config-ref="ClInline">
+                    <a2a:message><![CDATA[#[output application/json --- {message: {kind: "message", role: "user", messageId: "u-1", parts: [{kind: "text", text: "hi"}]}}]]]></a2a:message>
+                </a2a:send-message>
+            </otherwise>
+        </choice>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <flow name="card">
+        <http:listener config-ref="Plain" path="/t/card"/>
+        <a2a:get-card config-ref="ClRef"/>
+        <set-payload value="#[output application/json --- payload.url]"/>
+    </flow>
+</mule>

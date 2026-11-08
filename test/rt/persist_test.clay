@@ -1,0 +1,69 @@
+(ns persist-test (:require [mulay.rt.persist :as ps] [mulay.rt.event :as ev] [mulay.dw.val :as v] [mulay.lib.fs :as fs] [clay.string :as str]))
+(defextern getpid getpid)
+(defextern c-symlink symlink)
+
+(c-include "<unistd.h>")
+
+(defn- round-trip ev/TV [t: ev/TV]
+  (let [f (str/split (ps/tv-fields t) " ")] (ps/tv-of (nth f 0) (nth f 1) (nth f 2))))
+
+(deftest raw
+  (let [t (round-trip (ev/tv-raw "{\"a\": 1}" "application/json; charset=UTF-8"))]
+    (is (= (:state t) ev/RAW))
+    (is (= (:raw t) "{\"a\": 1}"))
+    (is (= (:mime t) "application/json; charset=UTF-8"))))
+
+(deftest val
+  (let [x (v/->VObj [(v/field "n" (v/int-v 1)) (v/field "s" (v/->VStr "é\n\"q\"")) (v/field "xs" (v/->VArr [(v/bool-v true) (v/null-v)]))])
+        t (round-trip (ev/tv-val x "application/java"))]
+    (is (= (:state t) ev/VAL))
+    (is (= (:mime t) "application/java"))
+    (is (v/equal? (:val t) x))))
+
+(deftest empty
+  (let [t (round-trip (ev/tv-raw "" "text/plain"))]
+    (is (= (:raw t) ""))
+    (is (= (ps/b64d (ps/b64e "")) ""))))
+
+(deftest names
+  (is (= (ps/safe-name "my store/../x") "my_store_.._x"))
+  (is (= (ps/safe-name "") "_")))
+
+(deftest files
+  (let [p "/tmp/mulay-persist-test/a/b"
+        e (ps/save p ["x 1" "y 2"])]
+    (is (= e ""))
+    (is (= (ps/load p) ["x 1" "y 2"]))
+    (is (= (ps/load "/tmp/mulay-persist-test/none") []))))
+
+;; 一時ファイルは毎回別の名前で、O_EXCL で作る (以前は <path>.tmp に決まっていて、そこに置かれた symlink の先に
+;; 書き、同時に保存すると互いの一時ファイルを壊した)
+(deftest save-tmp-not-followed
+  (let [d (str "/tmp/mulay-persist-test-" (unsafe (getpid)))
+        z0 (fs/remove-tree d)
+        z1 (fs/mkdirs d)
+        p (str d "/store")
+        zl (unsafe (c-symlink (str d "/victim") (str p ".tmp")))
+        e (ps/save p ["a b c"])
+        [s se] (read-file p)
+        victim (fs/exists? (str d "/victim"))
+        st (fs/stat p)
+        z2 (fs/remove-tree d)]
+    (is (= e ""))
+    (is (= s "a b c\n"))
+    (is (not victim))
+    (is (not (:link st)))))
+
+(deftest saved-files-are-private
+  (let [root (str "/tmp/mulay-persist-private-" (unsafe (getpid)))
+        z0 (fs/remove-tree root)
+        p (fs/join root "store/os")
+        e (ps/save p ["x 1"])
+        fm (fs/perm p)
+        dm (fs/perm (fs/join root "store"))
+        rm (fs/perm root)
+        z (fs/remove-tree root)]
+    (is (= e ""))
+    (is (= fm 384))
+    (is (= dm 448))
+    (is (= rm 448))))

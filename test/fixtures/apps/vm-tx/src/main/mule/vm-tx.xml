@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18155"/>
+    </http:listener-config>
+
+    <vm:config name="V">
+        <vm:queues>
+            <vm:queue queueName="commitQ"/>
+            <vm:queue queueName="rollbackQ"/>
+            <vm:queue queueName="continueQ"/>
+            <vm:queue queueName="insideQ"/>
+            <vm:queue queueName="consumeBackQ"/>
+            <vm:queue queueName="notSupportedQ"/>
+            <vm:queue queueName="joinQ"/>
+        </vm:queues>
+    </vm:config>
+
+    <sub-flow name="report">
+        <set-payload value="#[output application/java --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+    </sub-flow>
+
+    <sub-flow name="drain">
+        <try>
+            <vm:consume config-ref="V" queueName="#[vars.q]" timeout="300" timeoutUnit="MILLISECONDS"/>
+            <set-payload value="#[output application/java --- {got: payload}]"/>
+            <error-handler><on-error-continue><flow-ref name="report"/></on-error-continue></error-handler>
+        </try>
+    </sub-flow>
+
+    <!-- 成功したトランザクションの publish は commit で見える -->
+    <flow name="commit">
+        <http:listener config-ref="L" path="/commit"/>
+        <try transactionalAction="ALWAYS_BEGIN">
+            <vm:publish config-ref="V" queueName="commitQ"><vm:content>#["c1"]</vm:content></vm:publish>
+        </try>
+        <set-variable variableName="q" value="commitQ"/>
+        <flow-ref name="drain"/>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <!-- on-error-propagate で抜けたトランザクションの publish は捨てる -->
+    <flow name="rollback">
+        <http:listener config-ref="L" path="/rollback"/>
+        <try>
+            <try transactionalAction="ALWAYS_BEGIN">
+                <vm:publish config-ref="V" queueName="rollbackQ"><vm:content>#["r1"]</vm:content></vm:publish>
+                <raise-error type="APP:BOOM" description="boom"/>
+                <error-handler><on-error-propagate/></error-handler>
+            </try>
+            <error-handler><on-error-continue/></error-handler>
+        </try>
+        <set-variable variableName="q" value="rollbackQ"/>
+        <flow-ref name="drain"/>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <!-- on-error-continue で抜けたトランザクションは commit -->
+    <flow name="continue">
+        <http:listener config-ref="L" path="/continue"/>
+        <try transactionalAction="ALWAYS_BEGIN">
+            <vm:publish config-ref="V" queueName="continueQ"><vm:content>#["k1"]</vm:content></vm:publish>
+            <raise-error type="APP:BOOM" description="boom"/>
+            <error-handler><on-error-continue/></error-handler>
+        </try>
+        <set-variable variableName="q" value="continueQ"/>
+        <flow-ref name="drain"/>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <!-- トランザクションの中で publish したものは、同じトランザクションの consume から見えるか -->
+    <flow name="inside">
+        <http:listener config-ref="L" path="/inside"/>
+        <try transactionalAction="ALWAYS_BEGIN">
+            <vm:publish config-ref="V" queueName="insideQ"><vm:content>#["i1"]</vm:content></vm:publish>
+            <set-variable variableName="q" value="insideQ"/>
+            <flow-ref name="drain"/>
+            <set-variable variableName="inner" value="#[payload]"/>
+        </try>
+        <set-variable variableName="q" value="insideQ"/>
+        <flow-ref name="drain"/>
+        <set-payload value="#[output application/json --- {inner: vars.inner, after: payload}]"/>
+    </flow>
+
+    <!-- トランザクションの中で consume したものは、rollback でキューに戻る -->
+    <flow name="consume-back">
+        <http:listener config-ref="L" path="/consume-back"/>
+        <vm:publish config-ref="V" queueName="consumeBackQ"><vm:content>#["b1"]</vm:content></vm:publish>
+        <try>
+            <try transactionalAction="ALWAYS_BEGIN">
+                <vm:consume config-ref="V" queueName="consumeBackQ" timeout="300" timeoutUnit="MILLISECONDS"/>
+                <set-variable variableName="inner" value="#[payload]"/>
+                <raise-error type="APP:BOOM" description="boom"/>
+            </try>
+            <error-handler><on-error-continue/></error-handler>
+        </try>
+        <set-variable variableName="q" value="consumeBackQ"/>
+        <flow-ref name="drain"/>
+        <set-payload value="#[output application/json --- {inner: vars.inner, after: payload}]"/>
+    </flow>
+
+    <!-- NOT_SUPPORTED の publish はトランザクションの外 (すぐ入る、rollback でも残る) -->
+    <flow name="not-supported">
+        <http:listener config-ref="L" path="/not-supported"/>
+        <try>
+            <try transactionalAction="ALWAYS_BEGIN">
+                <vm:publish config-ref="V" queueName="notSupportedQ" transactionalAction="NOT_SUPPORTED"><vm:content>#["n1"]</vm:content></vm:publish>
+                <raise-error type="APP:BOOM" description="boom"/>
+            </try>
+            <error-handler><on-error-continue/></error-handler>
+        </try>
+        <set-variable variableName="q" value="notSupportedQ"/>
+        <flow-ref name="drain"/>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <!-- ALWAYS_JOIN はトランザクションの外では失敗する -->
+    <flow name="always-join">
+        <http:listener config-ref="L" path="/always-join"/>
+        <try>
+            <vm:publish config-ref="V" queueName="joinQ" transactionalAction="ALWAYS_JOIN"><vm:content>#["j1"]</vm:content></vm:publish>
+            <set-payload value="#['published']"/>
+            <error-handler><on-error-continue><flow-ref name="report"/></on-error-continue></error-handler>
+        </try>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+</mule>

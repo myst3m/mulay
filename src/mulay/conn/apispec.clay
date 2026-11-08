@@ -1,0 +1,259 @@
+(ns mulay.conn.apispec
+  (:require [mulay.lib.yaml :as y] [mulay.lib.jsonschema :as js] [mulay.conn.amf31 :as am31] [clay.string :as str]))
+
+(defrecord Param [name: Str in: Str required: Bool schema: y/YVal root: y/YVal example: Vec(Str)])
+(defrecord Media [mime: Str schema: y/YVal has-schema: Bool root: y/YVal example: Vec(Str)])
+(defrecord Example [code: Str mime: Str json: Str])
+(defrecord Op [method: Str params: Vec(Param) body: Vec(Media) codes: Vec(Str) resp-media: Vec(Str) examples: Vec(Example)])
+(defrecord Res [path: Str segs: Vec(Str) ops: Vec(Op)])
+(defrecord Api [res: Vec(Res) root: y/YVal skema: Bool])
+
+(defn key y/YVal [m: &y/YVal k: &Str] (let [[x found] (y/get-key m k)] x))
+(defn has? Bool [m: &y/YVal k: &Str] (let [[x found] (y/get-key m k)] found))
+(defn text Str [x: &y/YVal] (y/scalar-text x))
+
+(defn scalar-ex Vec(Str) [x: &y/YVal]
+  (match x
+    (y/YNull) []
+    (y/YStr s) [(str s)]
+    (y/YTagged t v) (scalar-ex v)
+    (y/YMap ks vs) [(js/to-json x)]
+    (y/YSeq xs) [(js/to-json x)]
+    _ [(text x)]))
+
+(defn body-ex Vec(Str) [x: &y/YVal mime: &Str]
+  (match x
+    (y/YNull) []
+    (y/YStr s) (if (str/includes? mime "json") [(js/to-json x)] [(str s)])
+    _ [(js/to-json x)]))
+
+(defn- oas-pick y/YVal [m: &y/YVal root: &y/YVal]
+  (cond (has? m "example") (key m "example")
+        (has? m "examples") (key (js/resolve (first-val (key m "examples")) root) "value")
+        :else (let [sc (js/resolve (key m "schema") root)] (if (has? sc "example") (key sc "example") (y/->YNull)))))
+
+(defn map-keys Vec(Str) [m: &y/YVal]
+  (match m (y/YMap ks vs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (text (nth ks i)))))) _ []))
+
+(defn seq-items Vec(y/YVal) [x: &y/YVal] (match x (y/YSeq xs) xs _ []))
+
+(def METHODS ["get" "put" "post" "delete" "options" "head" "patch" "trace"])
+
+(defn- param-of Param [p0: &y/YVal root: &y/YVal]
+  (let [p (js/resolve p0 root)
+        rq (key p "required")]
+    (->Param (text (key p "name")) (text (key p "in")) (match rq (y/YBool b) b _ false) (key p "schema") (clone root) (scalar-ex (oas-pick p root)))))
+
+(defn clone y/YVal [x: &y/YVal] x)
+
+(defn- merge-params Vec(Param) [base: Vec(Param) own: Vec(Param)]
+  (loop [i 0 acc own]
+    (if (>= i (count base)) acc
+      (let [b (nth base i)
+            dup (loop [k 0] (if (>= k (count own)) false
+                              (if (and (= (:name (nth own k)) (:name b)) (= (:in (nth own k)) (:in b))) true (recur (+ k 1)))))]
+        (recur (+ i 1) (if dup acc (conj acc b)))))))
+
+(defn- params-of Vec(Param) [ps: &y/YVal root: &y/YVal]
+  (let [xs (seq-items ps)] (loop [i 0 acc: Vec(Param) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (param-of (nth xs i) root)))))))
+
+(defn- media-of Vec(Media) [content: &y/YVal root: &y/YVal]
+  (match content
+    (y/YMap ks vs) (loop [i 0 acc: Vec(Media) []]
+                     (if (>= i (count ks)) acc
+                       (let [mt (nth vs i)
+                             mime (str/lower-case (text (nth ks i)))]
+                         (recur (+ i 1) (conj acc (->Media mime (key mt "schema") (has? mt "schema") (clone root) (body-ex (oas-pick mt root) mime)))))))
+    _ []))
+
+(defn first-val y/YVal [m: &y/YVal] (match m (y/YMap ks vs) (if (= (count vs) 0) (y/->YNull) (nth vs 0)) _ (y/->YNull)))
+
+(defn- oas-examples Vec(Example) [rs: &y/YVal codes: &Vec(Str) root: &y/YVal]
+  (loop [i 0 acc: Vec(Example) []]
+    (if (>= i (count codes)) acc
+      (let [r (js/resolve (key rs (nth codes i)) root)
+            c (key r "content")
+            ms (map-keys c)
+            acc2 (loop [k 0 a acc]
+                   (if (>= k (count ms)) a
+                     (let [mime (str/lower-case (nth ms k))
+                           x (body-ex (oas-pick (key c (nth ms k)) root) mime)]
+                       (recur (+ k 1) (if (= (count x) 0) a (conj a (->Example (str (nth codes i)) mime (nth x 0))))))))]
+        (recur (+ i 1) acc2)))))
+
+(defn- op-of Op [method: &Str o: &y/YVal base: &Vec(Param) root: &y/YVal]
+  (let [ps (merge-params base (params-of (key o "parameters") root))
+        rb (js/resolve (key o "requestBody") root)
+        body (media-of (key rb "content") root)
+        rs (key o "responses")
+        codes (map-keys rs)
+        rmedia (loop [i 0 acc: Vec(Str) []]
+                 (if (>= i (count codes)) acc
+                   (let [r (js/resolve (key rs (nth codes i)) root)
+                         ms (map-keys (key r "content"))]
+                     (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count ms)) a (recur (+ k 1) (conj a (str/lower-case (nth ms k))))))))))]
+    (->Op (str method) ps body codes rmedia (oas-examples rs codes root))))
+
+(defn segs-of Vec(Str) [p: &Str]
+  (let [parts: Vec(Str) (str/split p "/")]
+    (loop [i 0 acc: Vec(Str) []] (if (>= i (count parts)) acc (recur (+ i 1) (if (= (nth parts i) "") acc (conj acc (nth parts i))))))))
+
+(defn- array-without-items Vec(Str) [acc: Vec(Str) x: &y/YVal where: &Str depth: Int]
+  (if (> depth 64) acc
+    (match x
+      (y/YMap ks vs)
+      (let [a1 (if (and (= (text (key x "type")) "array") (not (has? x "items"))) (conj acc where) acc)]
+        (loop [i 0 a a1] (if (>= i (count ks)) a (recur (+ i 1) (array-without-items a (nth vs i) (str where "/" (text (nth ks i))) (+ depth 1))))))
+      (y/YSeq xs) (loop [i 0 a acc] (if (>= i (count xs)) a (recur (+ i 1) (array-without-items a (nth xs i) (str where "/" i) (+ depth 1)))))
+      _ acc)))
+
+(defn- norm-path Str [p: &Str]
+  (let [segs: Vec(Str) (str/split (str p) "/")
+        out (loop [i 0 acc: Vec(Str) []]
+              (if (>= i (count segs)) acc
+                (let [s (nth segs i)]
+                  (cond (or (= s "") (= s ".")) (recur (+ i 1) acc)
+                        (= s "..") (recur (+ i 1) (if (= (count acc) 0) acc (pop acc)))
+                        :else (recur (+ i 1) (conj acc s))))))]
+    (str/join "/" out)))
+
+(defn- dir-of Str [p: &Str] (let [k (str/last-index-of p "/")] (if (< k 0) "" (subs p 0 k))))
+
+(defn- ext-ref Values(y/YVal Str) [ref: &Str dir: &Str res: &Fn(Str Values(Str Bool)) depth: Int]
+  (let [h (str/index-of ref "#")
+        file (if (< h 0) (str ref) (subs ref 0 h))
+        frag (if (< h 0) "" (subs ref h (count ref)))
+        path (norm-path (if (= dir "") file (str dir "/" file)))
+        [txt found] (res path)]
+    (if (not found) (values (y/->YNull) (str "File Not Found: " path " (Unresolved reference '" ref "')"))
+      (let [[doc pe] (y/parse txt)]
+        (if (not= pe "") (values (y/->YNull) (str "Errors while parsing '" path "': " pe))
+          (let [[node nf] (if (= frag "") (values doc true) (js/deref-ptr doc frag))]
+            (if (not nf) (values (y/->YNull) (str "Unresolved reference '" ref "'"))
+              (inline-refs (local-refs node doc 0) (dir-of path) res (+ depth 1)))))))))
+
+(defn- local-refs y/YVal [x: &y/YVal doc: &y/YVal depth: Int]
+  (if (> depth 32) x
+    (match x
+      (y/YMap ks vs)
+      (let [[r has] (y/get-key x "$ref")
+            rs (match r (y/YStr s) (str s) _ "")]
+        (if (and has (str/starts-with? rs "#"))
+          (let [[t found] (js/deref-ptr doc rs)] (if found (local-refs t doc (+ depth 1)) x))
+          (y/->YMap ks (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count vs)) acc (recur (+ i 1) (conj acc (local-refs (nth vs i) doc depth))))))))
+      (y/YSeq xs) (y/->YSeq (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (local-refs (nth xs i) doc depth))))))
+      _ x)))
+
+(defn- inline-refs Values(y/YVal Str) [x: &y/YVal dir: &Str res: &Fn(Str Values(Str Bool)) depth: Int]
+  (if (> depth 32) (values x "")
+    (match x
+      (y/YMap ks vs)
+      (let [[r has] (y/get-key x "$ref")
+            rs (match r (y/YStr s) (str s) _ "")]
+        (if (and has (not= rs "") (not (str/starts-with? rs "#")))
+          (ext-ref rs dir res depth)
+          (loop [i 0 acc: Vec(y/YVal) []]
+            (if (>= i (count vs)) (values (y/->YMap ks acc) "")
+              (let [[v e] (inline-refs (nth vs i) dir res depth)]
+                (if (not= e "") (values x e) (recur (+ i 1) (conj acc v))))))))
+      (y/YSeq xs)
+      (loop [i 0 acc: Vec(y/YVal) []]
+        (if (>= i (count xs)) (values (y/->YSeq acc) "")
+          (let [[v e] (inline-refs (nth xs i) dir res depth)]
+            (if (not= e "") (values x e) (recur (+ i 1) (conj acc v))))))
+      _ (values x ""))))
+
+(defn- const-at Vec(Str) [x: &y/YVal where: &Str props: Bool depth: Int]
+  (if (> depth 64) []
+    (match x
+      (y/YMap ks vs)
+      (loop [i 0]
+        (if (>= i (count ks)) []
+          (let [k (y/scalar-text (nth ks i))]
+            (if (and (not props) (= k "const")) [(str where "/const")]
+              (let [sub (const-at (nth vs i) (str where "/" k) (and (not props) (or (= k "properties") (= k "patternProperties"))) (+ depth 1))]
+                (if (> (count sub) 0) sub (recur (+ i 1))))))))
+      (y/YSeq xs) (loop [i 0] (if (>= i (count xs)) [] (let [sub (const-at (nth xs i) (str where "/" i) false (+ depth 1))] (if (> (count sub) 0) sub (recur (+ i 1))))))
+      _ [])))
+
+(defn version-at-least? Bool [v: &Str want: &Str]
+  (let [a: Vec(Str) (str/split (str v) ".") b: Vec(Str) (str/split (str want) ".")]
+    (loop [i 0]
+      (if (>= i (count b)) true
+        (let [x (if (< i (count a)) (let [[n e] (parse-long (digits-prefix (nth a i)))] (if (= e "") n 0)) 0)
+              [w we] (parse-long (nth b i))]
+          (cond (> x w) true (< x w) false :else (recur (+ i 1))))))))
+
+(defn- digits-prefix Str [s: &Str]
+  (let [k (loop [i 0] (if (and (< i (count s)) (>= (nth s i) 48) (<= (nth s i) 57)) (recur (+ i 1)) i))] (if (= k 0) "0" (subs s 0 k))))
+
+(def DATA-KEYS ["example" "examples" "default" "enum" "const" "x-amf-examples"])
+
+(defn- data-key? Bool [k: &Str] (loop [i 0] (if (>= i (count DATA-KEYS)) false (if (= (nth DATA-KEYS i) k) true (recur (+ i 1))))))
+
+(defn- loose-required? Bool [ks: &Vec(y/YVal) vs: &Vec(y/YVal)]
+  (let [[r hr] (y/get-key (y/->YMap (copy ks) (copy vs)) "required")
+        [t ht] (y/get-key (y/->YMap (copy ks) (copy vs)) "type")
+        [p hp] (y/get-key (y/->YMap (copy ks) (copy vs)) "properties")]
+    (and hr (not ht) (not hp) (match r (y/YSeq xs) true _ false))))
+
+(defn- amf-schema y/YVal [s: &y/YVal depth: Int]
+  (if (> depth 64) (copy s)
+    (match s
+      (y/YMap ks vs)
+      (let [drop (loose-required? ks vs)]
+        (loop [i 0 ko: Vec(y/YVal) [] vo: Vec(y/YVal) []]
+          (if (>= i (count ks)) (y/->YMap ko vo)
+            (let [k (y/scalar-text (nth ks i))]
+              (cond
+                (and drop (= k "required")) (recur (+ i 1) ko vo)
+                (data-key? k) (recur (+ i 1) (conj ko (nth ks i)) (conj vo (nth vs i)))
+                :else (recur (+ i 1) (conj ko (nth ks i)) (conj vo (amf-schema (nth vs i) (+ depth 1)))))))))
+      (y/YSeq xs) (y/->YSeq (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (amf-schema (nth xs i) (+ depth 1)))))))
+      _ (copy s))))
+
+(defn amf-doc y/YVal [d: &y/YVal depth: Int]
+  (if (> depth 64) (copy d)
+    (match d
+      (y/YMap ks vs)
+      (y/->YMap (copy ks) (loop [i 0 acc: Vec(y/YVal) []]
+                            (if (>= i (count ks)) acc
+                              (let [k (y/scalar-text (nth ks i)) v (nth vs i)]
+                                (recur (+ i 1) (conj acc (cond
+                                                           (= k "schema") (amf-schema v 0)
+                                                           (= k "schemas") (match v (y/YMap a b) (y/->YMap (copy a) (loop [j 0 o: Vec(y/YVal) []] (if (>= j (count b)) o (recur (+ j 1) (conj o (amf-schema (nth b j) 0)))))) _ (copy v))
+                                                           (data-key? k) (copy v)
+                                                           :else (amf-doc v (+ depth 1)))))))))
+      (y/YSeq xs) (y/->YSeq (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (amf-doc (nth xs i) (+ depth 1)))))))
+      _ (copy d))))
+
+(defn parse-oas Values(Api Str) [src: &Str name: &Str res: &Fn(Str Values(Str Bool)) apikit: &Str]
+  (let [[root1 e] (y/parse src)
+        [root0 re] (if (= e "") (inline-refs root1 (dir-of name) res 0) (values root1 ""))
+        v31 (str/starts-with? (y/scalar-text (key root0 "openapi")) "3.1")
+        skema (and v31 (version-at-least? apikit "1.13"))
+        root (if skema (am31/normalize-doc root0) (amf-doc root0 0))
+        cs (if (and (= e "") (= re "") v31 (not skema)) (const-at root "#" false 0) [])]
+    (cond
+      (not= e "") (values (->Api [] (y/->YNull) false) (str "Errors while parsing API definition '" name "': " e))
+      (not= re "") (values (->Api [] root false) (str "Errors while parsing API definition '" name "': " re))
+      (not (has? root "openapi"))
+      (values (->Api [] root false) (str "Unsupported API definition '" name "': only OpenAPI 3 (openapi: 3.x) is supported"))
+      (> (count cs) 0) (values (->Api [] root false) (str "Errors while parsing API definition '" name "': Property 'const' not supported in a OAS 3.1 schema node (at " (nth cs 0) ")"))
+      :else
+      (let [bad (array-without-items [] root "#" 0)]
+        (if (> (count bad) 0)
+          (values (->Api [] root false) (str "Errors while parsing API definition '" name "': 'items' field is required when schema type is array (at " (nth bad 0) ")"))
+          (let [paths (key root "paths")
+                pnames (map-keys paths)
+                rs (loop [i 0 acc: Vec(Res) []]
+                     (if (>= i (count pnames)) acc
+                       (let [p (nth pnames i)
+                             item (js/resolve (key paths p) root)
+                             base (params-of (key item "parameters") root)
+                             ops (loop [k 0 a: Vec(Op) []]
+                                   (if (>= k (count METHODS)) a
+                                     (let [mt (nth METHODS k)]
+                                       (recur (+ k 1) (if (has? item mt) (conj a (op-of mt (key item mt) base root)) a)))))]
+                         (recur (+ i 1) (conj acc (->Res p (segs-of p) ops))))))]
+            (values (->Api rs root skema) "")))))))

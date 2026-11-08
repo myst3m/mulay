@@ -1,0 +1,947 @@
+(ns mulay.conn.grpc
+  (:require [mulay.dw.val :as v] [mulay.dw.fmt.protobuf :as pbf] [mulay.mule.model :as m] [mulay.rt.event :as ev]
+            [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.lib.protobuf :as pb] [mulay.lib.xml :as xml]
+            [mulay.rt.stream :as stream] [mulay.rt.ops :as ops] [mulay.dw.lib.core_misc :as dmisc]
+            [mulay.rt.engine :as en] [mulay.lib.time.tz :as ttz] [mulay.lib.time.local :as tlocal]
+            [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/grpc")
+
+(def STATUS-NAMES ["OK" "CANCELLED" "UNKNOWN" "INVALID_ARGUMENT" "DEADLINE_EXCEEDED" "NOT_FOUND" "ALREADY_EXISTS"
+                   "PERMISSION_DENIED" "RESOURCE_EXHAUSTED" "FAILED_PRECONDITION" "ABORTED" "OUT_OF_RANGE" "UNIMPLEMENTED"
+                   "INTERNAL" "UNAVAILABLE" "DATA_LOSS" "UNAUTHENTICATED"])
+
+(defn status-name Str [n: Int] (if (and (>= n 0) (< n (count STATUS-NAMES))) (nth STATUS-NAMES n) "UNKNOWN"))
+
+(defn status-code Int [s: &Str]
+  (let [t (str/upper-case (str/trim s))
+        by-name (loop [i 0] (if (>= i (count STATUS-NAMES)) -1 (if (= (nth STATUS-NAMES i) t) i (recur (+ i 1)))))]
+    (cond (>= by-name 0) by-name
+          :else (let [[n e] (parse-long t)] (if (and (= e "") (>= n 0) (< n (count STATUS-NAMES))) n -1)))))
+
+(defn error-id Str [code: Int] (let [nm (status-name code)] (if (= nm "UNKNOWN") "GRPC_UNKNOWN" nm)))
+
+(defn frame Str [msg: &Str] (str (chr 0) (pb/put-fixed-be "" (count msg) 4) msg))
+
+(defn unframe Values(Vec(Str) Str) [b: &Str]
+  (loop [i 0 acc: Vec(Str) []]
+    (cond (= i (count b)) (values acc "")
+          (> (+ i 5) (count b)) (values acc (subs b i (count b)))
+          :else (let [n (pb/get-fixed-be b (+ i 1) 4)]
+                  (if (> (+ i 5 n) (count b)) (values acc (subs b i (count b)))
+                    (recur (+ i 5 n) (conj acc (subs b (+ i 5) (+ i 5 n)))))))))
+
+(defn- child-elem Vec(xml/XNode) [nodes: &Vec(xml/XNode) local: &Str] (conn/child-elem nodes local))
+
+(defn- attr-of Str [n: &xml/XNode name: &Str default: Str] (xml/attr n "" name default))
+
+(defn- first-elem Vec(xml/XNode) [nodes: &Vec(xml/XNode)]
+  (loop [i 0] (if (>= i (count nodes)) [] (if (xml/elem? (nth nodes i)) [(nth nodes i)] (recur (+ i 1))))))
+
+(defn descriptor-file Str [conn-node: &xml/XNode]
+  (let [idl (child-elem (xml/elem-children conn-node) "idl-definition")
+        sb (if (= (count idl) 0) [] (child-elem (xml/elem-children (nth idl 0)) "single-binary-protobuf"))]
+    (if (= (count sb) 0) "" (attr-of (nth sb 0) "protobufDescriptorFile" ""))))
+
+(defn method-parts Values(Str Str) [full: &Str]
+  (let [k (str/index-of full "/")]
+    (if (< k 0) (values (str full) "") (values (subs full 0 k) (subs full (+ k 1) (count full))))))
+
+(defn find-method Vec(pb/Method) [d: &pb/Desc full: &Str]
+  (let [[svc name] (method-parts full)] (pb/find-method d svc name)))
+
+(defrecord Client [host: Str port: Int desc: Str tls: Bool headers: Vec(hm/Header) connect-ms: Int])
+
+(defn- client-of Values(Client Str) [cfg: &Vec(m/Config)]
+  (if (= (count cfg) 0) (values (->Client "" 0 "" false [] 30000) "No <grpc:client-config> for the operation")
+    (let [ch (:children (nth cfg 0))
+          cn (first-elem ch)]
+      (if (= (count cn) 0) (values (->Client "" 0 "" false [] 30000) "No connection in <grpc:client-config>")
+        (let [node (nth cn 0)
+              [port pe] (parse-long (attr-of node "port" "443"))
+              mode (child-elem (xml/elem-children node) "connection-mode")
+              tls (if (= (count mode) 0) true (> (count (child-elem (xml/elem-children (nth mode 0)) "tls")) 0))
+              hn (child-elem (xml/elem-children node) "request-headers")
+              hs (if (= (count hn) 0) []
+                   (let [kids (xml/elem-children (nth hn 0))]
+                     (loop [i 0 acc: Vec(hm/Header) []]
+                       (if (>= i (count kids)) acc
+                         (let [k (nth kids i)]
+                           (recur (+ i 1) (if (xml/elem? k) (conj acc (hm/->Header (str/lower-case (attr-of k "key" "")) (attr-of k "value" ""))) acc)))))))]
+          (values (->Client (attr-of node "host" "") (if (= pe "") port 443) (descriptor-file node) tls hs 30000) ""))))))
+
+(defn- op-headers Vec(hm/Header) [c: &conn/OpCall]
+  (let [hn (child-elem (:children c) "request-headers")]
+    (if (= (count hn) 0) []
+      (let [kids (xml/elem-children (nth hn 0))]
+        (loop [i 0 acc: Vec(hm/Header) []]
+          (if (>= i (count kids)) acc
+            (let [k (nth kids i)]
+              (recur (+ i 1) (if (xml/elem? k) (conj acc (hm/->Header (str/lower-case (attr-of k "key" "")) (attr-of k "value" ""))) acc)))))))))
+
+(defn- sock-addr Str [host: &Str port: Int]
+  (str (if (= host "localhost") "localhost/127.0.0.1" (str "/" host)) ":" port))
+
+(defn- header-of Str [hs: &Vec(hm/Header) name: &Str]
+  (loop [i 0] (if (>= i (count hs)) "" (let [h (nth hs i)] (if (= (str/lower-case (:hd-name h)) name) (str (:hd-value h)) (recur (+ i 1)))))))
+
+(defn- has-header Bool [hs: &Vec(hm/Header) name: &Str]
+  (loop [i 0] (if (>= i (count hs)) false (if (= (str/lower-case (:hd-name (nth hs i))) name) true (recur (+ i 1))))))
+
+(defn- hex-digit Int [c: Int]
+  (cond (and (>= c 48) (<= c 57)) (- c 48) (and (>= c 65) (<= c 70)) (- c 55) (and (>= c 97) (<= c 102)) (- c 87) :else -1))
+
+(defn percent-decode Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)
+            hi (if (< (+ i 2) (count s)) (hex-digit (nth s (+ i 1))) -1)
+            lo (if (< (+ i 2) (count s)) (hex-digit (nth s (+ i 2))) -1)]
+        (if (and (= c 37) (>= hi 0) (>= lo 0)) (recur (+ i 3) (str out (chr (+ (* hi 16) lo))))
+          (recur (+ i 1) (str out (chr c))))))))
+
+(defn percent-encode Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (if (and (>= c 32) (<= c 126) (not= c 37)) (recur (+ i 1) (str out (chr c)))
+          (let [hx "0123456789ABCDEF"] (recur (+ i 1) (str out "%" (subs hx (quot c 16) (+ (quot c 16) 1)) (subs hx (mod c 16) (+ (mod c 16) 1))))))))))
+
+(defn- fail-status conn/OpResult [code: Int msg: &Str method: &Str]
+  (conn/fail-result (err/mk "GRPC" (error-id code)
+                            (str "gRPC operation 'UNARY' failed with status " (status-name code) ": " (if (= msg "") "No description" msg) "\nMethod: " method))))
+
+(def NPE "Cannot invoke \"com.mulesoft.connectors.grpc.api.MuleGrpcMethodDescriptor.getFullMethodName()\" because \"muleGrpcMethodDescriptor\" is null")
+
+(def TRANSFORM-ERR "The transformer \"_ObjectToInputStream\" does not support source type \"java.io.ByteArrayInputStream\".")
+
+(def USER-AGENT "Mule HTTP Client")
+
+(defn http-status-code Int [st: Int]
+  (cond (= st 400) 13 (= st 401) 16 (= st 403) 7 (= st 404) 12
+        (or (= st 429) (= st 502) (= st 503) (= st 504)) 14
+        :else 2))
+
+(defn read-reply Values(Int Str Str) [status: Int hs: &Vec(hm/Header) tr: &Vec(hm/Header) body: &Str]
+  (let [src (if (has-header tr "grpc-status") tr hs)
+        has (has-header src "grpc-status")
+        raw (str/trim (header-of src "grpc-status"))
+        [st se] (parse-long raw)
+        gm (percent-decode (header-of src "grpc-message"))]
+    (cond
+      (and (not has) (not= status 200)) (values (http-status-code status) (str "HTTP status code " status) "")
+      (and has (or (not= se "") (< st 0) (> st 16))) (values 2 (str "Unknown code " raw) "")
+      (and has (not= st 0)) (values st gm "")
+      :else
+      (let [[msgs rest] (unframe body)]
+        (cond (not= rest "") (values 13 "Received a truncated gRPC message" "")
+              (= (count msgs) 0) (values 13 "No value received for unary call" "")
+              (not= (nth body 0) 0) (values 13 "Compressed gRPC message, but the request did not offer a grpc-encoding" "")
+              :else (values 0 "" (nth msgs 0)))))))
+
+(defn- add-headers Vec(hm/Header) [acc: Vec(hm/Header) more: &Vec(hm/Header)]
+  (loop [i 0 a acc] (if (>= i (count more)) a (recur (+ i 1) (conj a (nth more i))))))
+
+(defn- call-headers Vec(hm/Header) [cl: &Client c: &conn/OpCall]
+  (let [hs0: Vec(hm/Header) [(hm/->Header "content-type" "application/grpc") (hm/->Header "te" "trailers")
+                             (hm/->Header "user-agent" USER-AGENT) (hm/->Header "accept" "*/*")]]
+    (add-headers (add-headers hs0 (:headers cl)) (op-headers c))))
+
+(def RESPONSE-TIMEOUT-MS 30000)
+
+(defn- timed-out? Bool [re: &Str] (str/includes? (str/lower-case re) "time"))
+
+(defn- refused Str [cl: &Client re: &Str]
+  (if (str/includes? (str/lower-case re) "refused") (str "Connection refused: Connection refused: " (sock-addr (:host cl) (:port cl))) (str re)))
+
+(defn- transport-fail Values(Int Str) [cl: &Client re: &Str]
+  (if (timed-out? re) (values 13 "Unexpected error: Timeout exceeded") (values 14 (refused cl re))))
+
+(defn stream-status Values(Int Str) [hs: &Vec(hm/Header) tr: &Vec(hm/Header)]
+  (let [src (if (has-header tr "grpc-status") tr hs)
+        raw (str/trim (header-of src "grpc-status"))
+        [n ne] (parse-long raw)
+        bad (and (= ne "") (or (< n 0) (> n 16)))
+        code (cond (not= ne "") 0 bad 2 :else n)
+        msrc (if (has-header tr "grpc-message") tr hs)
+        gm (if (has-header msrc "grpc-message") [(percent-decode (header-of msrc "grpc-message"))] [])]
+    (values code (cond (> (count gm) 0) (nth gm 0) bad (str "Unknown code " n) :else ""))))
+
+(defn status-text Str [code: Int msg: &Str] (str (status-name code) (if (= msg "") "" (str ": " msg))))
+
+(def ITER-PREFIX (str "Internal execution exception while executing the script, this is most probably a bug, file an issue with the script and the input data.\n"
+                      "NOTE: Enable dump option using `-Dcom.mulesoft.dw.dump_files=true` to log all required information.\n"
+                      "Caused by:\nio.grpc.StatusRuntimeException: "))
+
+(defn iterate-error Str [code: Int msg: &Str]
+  (let [t (status-text code msg)] (str ITER-PREFIX t "\nCaused by: io.grpc.StatusRuntimeException: " t)))
+
+(defn client-stream-error Str [code: Int msg: &Str method: &Str id: &Str]
+  (str "gRPC operation 'CLIENT_STREAMING' failed with status " (status-name code) ": " (if (= msg "") "No description" msg)
+       "\nAdditional Details:\n  Method: " method "\n  RequestId: " id))
+
+(def ATTR-PKG "com.mulesoft.connectors.grpc.api.attributes.")
+
+(defn client-attributes v/Val [id: &Str end: Bool sent: Bool]
+  (v/->VMeta (v/->VObj [(v/field "endOfStream" (v/bool-v end)) (v/field "messageSent" (v/bool-v sent)) (v/field "requestId" (v/str-v (str id)))])
+             [(v/field "class" (v/str-v (str ATTR-PKG "ClientStreamingAttributes")))]))
+
+(defn frame-attributes v/Val [routing: &Str id: &Str end: Bool er: Bool msg: &Str]
+  (v/->VMeta (v/->VObj [(v/field "routingId" (v/str-v (str routing))) (v/field "endOfStream" (v/bool-v end))
+                        (v/field "errorMessage" (if er (v/str-v (str msg)) (v/null-v))) (v/field "error" (v/bool-v er))
+                        (v/field "requestId" (v/str-v (str id)))])
+             [(v/field "class" (v/str-v (str ATTR-PKG "ServerStreamingAttributes")))]))
+
+(defrecord Frame [id: Str bytes: Str mime: Str end: Bool err: Bool msg: Str])
+
+(def FRAMES: Atom(Map(Str Vec(Frame))) (atom (let [m: Map(Str Vec(Frame)) {}] m)))
+
+(defn push-frame Int [key: &Str f: Frame]
+  (let [k (str key)
+        z (swap! FRAMES (fn Map(Str Vec(Frame)) [m: Map(Str Vec(Frame))] (assoc m k (if (contains? m k) (conj (get! m k) f) [f]))))]
+    0))
+
+(defn take-frame Values(Frame Bool) [key: &Str]
+  (let [k (str key)
+        got: Atom(Vec(Frame)) (atom [])
+        z (swap! FRAMES (fn Map(Str Vec(Frame)) [m: Map(Str Vec(Frame))]
+                          (if (and (contains? m k) (> (count (get! m k)) 0))
+                            (let [q (get! m k) z1 (reset! got [(nth q 0)])] (assoc m k (subvec q 1 (count q))))
+                            (let [z1 (reset! got [])] m))))
+        g (deref got)]
+    (if (= (count g) 0) (values (->Frame "" "" "" false false "") false) (values (nth g 0) true))))
+
+(defn- wait-frame Values(Frame Bool) [key: &Str ms: Int]
+  (let [deadline (+ (quot (mono-us) 1000) ms)]
+    (loop [pause 1]
+      (let [[f ok] (take-frame key)]
+        (cond ok (values f true)
+              (>= (quot (mono-us) 1000) deadline) (values f false)
+              :else (let [z (sleep-ms pause)] (recur (if (< pause 8) (* pause 2) 8))))))))
+
+(defn- out-mime Str [cl: &Client mt: &pb/Method]
+  (str "application/x-protobuf; descriptorUrl=\"" (:desc cl) "\"; messageType=\"" (:output mt) "\""))
+
+(defn- prep Values(Client pb/Method Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[cl ce] (client-of (:config c))
+        method (conn/param-lit (:params c) "method" "")
+        [dd de] (pbf/load-desc (:desc cl))
+        ms (if (= de "") (find-method dd method) [])
+        none (pb/->Method "" "" "" false false)]
+    (cond
+      (not= ce "") (values cl none [(err/mk "MULE" "UNKNOWN" ce)])
+      (not= de "") (values cl none [(err/mk "MULE" "UNKNOWN" de)])
+      (= (count ms) 0) (values cl none [(err/mk "MULE" "UNKNOWN" NPE)])
+      :else (values cl (nth ms 0) []))))
+
+(defn- content-bytes Values(Vec(Str) Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[ct cte] (conn/child-tv c "content")
+        body-tv (if (= (count ct) 0) (ev/settle (:payload (:event c))) (ev/settle (nth ct 0)))]
+    (cond
+      (> (count cte) 0) (values [] cte)
+      (= (:state body-tv) ev/TYPED) (values [] [(err/mk "MULE" "TRANSFORMATION" TRANSFORM-ERR)])
+      :else (let [[b be] (ev/wire-bytes body-tv)] (if (not= be "") (values [] [(err/mk "MULE" "UNKNOWN" be)]) (values [b] []))))))
+
+(defn- attr-content Values(Vec(Str) Vec(err/MErr)) [c: &conn/OpCall]
+  (let [p (conn/param (:params c) "content")]
+    (if (= (count p) 0) (values [] [])
+      (match (nth p 0)
+        (m/PLit s) (values [(str s)] [])
+        _ (let [[t e] ((:eval-tv c) (nth p 0) (:event c))]
+            (if (not= e "") (values [] [(err/mk "MULE" "EXPRESSION" e)])
+              (let [t2 (ev/settle t)]
+                (if (and (= (:state t2) ev/VAL) (v/null? (:val t2))) (values [] [])
+                  (let [[b be] (ev/wire-bytes t2)] (if (not= be "") (values [] [(err/mk "MULE" "UNKNOWN" be)]) (values [b] [])))))))))))
+
+(defn- cfg-name Str [c: &conn/OpCall] (if (= (count (:config c)) 0) "" (str (:name (nth (:config c) 0)))))
+
+(defn- id-or-new Str [s: &Str] (if (= (str/trim s) "") (dmisc/uuid4) (str s)))
+
+(defn- row-of Vec(v/Val) [msg: &Str props: &Vec(v/Field) mime: &Str]
+  (let [[x e] (pbf/read msg props)
+        ms [(v/field "mimeType" (v/str-v "application/x-protobuf")) (v/field "mediaType" (v/str-v (str mime)))]]
+    (if (not= e "") []
+      [(match x (v/VMeta y m0) (v/->VMeta y (loop [i 0 acc m0] (if (>= i (count ms)) acc (recur (+ i 1) (conj acc (nth ms i)))))) _ (v/->VMeta x ms))])))
+
+(defn- wait-ms Int [n: Int unit: &Str]
+  (let [u (str/upper-case (str/trim unit))]
+    (cond (= u "NANOSECONDS") (quot n 1000000) (= u "MICROSECONDS") (quot n 1000) (= u "SECONDS") (* n 1000)
+          (= u "MINUTES") (* n 60000) (= u "HOURS") (* n 3600000) (= u "DAYS") (* n 86400000) :else n)))
+
+(defn deadline-of Int [op-kids: &Vec(xml/XNode) cfg-kids: &Vec(xml/XNode)]
+  (let [d (child-elem op-kids "deadline")
+        n (if (> (count d) 0) d (child-elem cfg-kids "deadline"))]
+    (if (= (count n) 0) 0
+      (let [[dur de] (parse-long (str/trim (attr-of (nth n 0) "duration" "10")))]
+        (if (or (not= de "") (<= dur 0)) 0 (wait-ms dur (attr-of (nth n 0) "units" "SECONDS")))))))
+
+(defn- op-deadline Int [c: &conn/OpCall]
+  (deadline-of (:children c) (if (= (count (:config c)) 0) [] (:children (nth (:config c) 0)))))
+
+(defn timeout-header Str [ms: Int] (if (<= ms 99999999) (str ms "m") (str (quot (+ ms 999) 1000) "S")))
+
+(def DEADLINE-MSG "Deadline exceeded")
+
+(defn live-status Values(Int Str) [st: Int hs: &Vec(hm/Header) tr: &Vec(hm/Header)]
+  (if (or (has-header tr "grpc-status") (has-header hs "grpc-status")) (stream-status hs tr)
+    (if (not= st 200) (values (http-status-code st) (str "HTTP status code " st)) (values 2 "Missing grpc-status in the response"))))
+
+(defn grpc-op-error Str [kind: &Str code: Int msg: &Str method: &Str]
+  (str "gRPC operation '" kind "' failed with status " (status-name code) ": " (if (= msg "") "No description" msg) "\nMethod: " method))
+
+(defn- open-live Values(Vec(http/Call) Int Str) [cl: &Client c: &conn/OpCall method: &Str dl: Int]
+  (let [url (str (if (:tls cl) "https" "http") "://" (:host cl) ":" (:port cl) "/" method)
+        hs0 (call-headers cl c)
+        hs (if (> dl 0) (conj hs0 (hm/->Header "grpc-timeout" (timeout-header dl))) hs0)
+        o (assoc (http/request-opts url) :method "POST" :headers hs :h2c (not (:tls cl)) :timeout-ms dl)
+        [call e] (http/open-call o)]
+    (if (not= e "") (let [[fc fm] (transport-fail cl e)] (values [] fc fm)) (values [call] 0 ""))))
+
+(defn- read-live Int [call: http/Call cl: Client dl: Int t0: Int on-msg: Fn(Str Int) on-end: Fn(Int Str Int)]
+  (loop [head: Vec(hm/Header) [] st 200 buf ""]
+    (if (and (> dl 0) (> (- (quot (mono-us) 1000) t0) dl))
+      (let [z (http/call-cancel call)] (on-end 4 DEADLINE-MSG))
+      (let [[ev e] (http/call-next call)]
+        (if (not= e "")
+          (if (and (> dl 0) (>= (- (quot (mono-us) 1000) t0) (- dl 50))) (on-end 4 DEADLINE-MSG)
+            (let [[fc fm] (transport-fail cl e)] (on-end fc fm)))
+          (match ev
+            (http/CallHead r) (recur (:headers r) (:status r) buf)
+            (http/CallData b) (let [[msgs rest] (unframe (str buf b))
+                                    z (loop [i 0] (if (>= i (count msgs)) 0 (let [z1 (on-msg (nth msgs i))] (recur (+ i 1)))))]
+                                (recur head st rest))
+            (http/CallEnd tr) (let [[code msg] (live-status st head tr)] (on-end code msg))))))))
+
+(defn- start-reader Int [call: http/Call cl: &Client dl: Int on-msg: Fn(Str Int) on-end: Fn(Int Str Int)]
+  (let [cl1 cl t0 (quot (mono-us) 1000)]
+    (ops/spawn-bg (fn Int [k: Int] (read-live call cl1 dl t0 on-msg on-end)))))
+
+(defn- wait-frame-long Values(Frame Bool) [key: &Str]
+  (loop [] (let [[f ok] (wait-frame key 1000)] (if ok (values f true) (recur)))))
+
+(defn- next-rows Values(Vec(v/Val) Bool Str) [key: &Str pend: &Atom(Vec(Frame)) n: Int props: &Vec(v/Field) mime: &Str]
+  (let [p (deref pend)]
+    (if (> (count p) 0)
+      (let [f (nth p 0) z (reset! pend [])] (values [] true (if (:err f) (:msg f) "")))
+      (loop [k 0 acc: Vec(v/Val) []]
+        (if (>= k n) (values acc false "")
+          (let [[f ok] (wait-frame-long key)]
+            (cond
+              (or (:end f) (:err f)) (if (= (count acc) 0) (values [] true (if (:err f) (:msg f) ""))
+                                       (let [z (reset! pend [f])] (values acc false "")))
+              :else (let [r (row-of (:bytes f) props mime)] (recur (+ k 1) (if (= (count r) 0) acc (conj acc (nth r 0))))))))))))
+
+(defn drop-frames Int [key: &Str]
+  (let [k (str key) z (swap! FRAMES (fn Map(Str Vec(Frame)) [m: Map(Str Vec(Frame))] (dissoc m k)))] 0))
+
+(def ITERABLE-CLASS "com.mulesoft.connectors.grpc.api.StreamedResponseIterable")
+
+(defn- push-end Int [key: &Str id: &Str mime: &Str code: Int msg: &Str text: &Str]
+  (if (= code 0) (push-frame key (->Frame (str id) "" (str mime) true false ""))
+    (push-frame key (->Frame (str id) "" (str mime) false true (str text)))))
+
+(defn- run-iterate conn/OpResult [c: &conn/OpCall]
+  (let [[cl mt px] (prep c)
+        [bs bx] (if (> (count px) 0) (values [] []) (content-bytes c))]
+    (cond
+      (> (count px) 0) (conn/fail-result (nth px 0))
+      (> (count bx) 0) (conn/fail-result (nth bx 0))
+      :else
+      (let [method (conn/param-lit (:params c) "method" "")
+            key (str "i|" (dmisc/uuid4))
+            mime (out-mime cl mt)
+            props [(v/field "descriptorUrl" (v/->VStr (:desc cl))) (v/field "messageType" (v/->VStr (:output mt)))]
+            dl (op-deadline c)
+            [calls oc om] (open-live cl c method dl)
+            typed (fn Str [code: Int msg: Str] (str "GRPC:" (error-id code) "\n" (grpc-op-error "SERVER_STREAMING" code msg method)))
+            z (if (= (count calls) 0) (push-end key "" mime oc om (typed oc om))
+                (let [call (nth calls 0)
+                      z1 (http/call-send call (frame (nth bs 0)))
+                      z2 (http/call-close call)
+                      k1 key m1 mime ty typed]
+                  (start-reader call cl dl
+                                (fn Int [msg: Str] (push-frame k1 (->Frame "" msg m1 false false "")))
+                                (fn Int [code: Int msg: Str] (push-end k1 "" m1 code msg (ty code msg))))))
+            pend: Atom(Vec(Frame)) (atom [])
+            k2 key props1 props m2 mime calls1 calls
+            src (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (next-rows k2 pend n props1 m2))
+                                 (fn Int [broken: Bool] (let [z3 (if (> (count calls1) 0) (http/call-cancel (nth calls1 0)) 0)] (drop-frames k2))) false)
+            cid (stream/open (:rid (:event c)) src)]
+        (conn/ok-result (ev/tv-cursor-of cid ev/ANY ITERABLE-CLASS "GRPC" "*") (ev/tv-null))))))
+
+(defn- run-delegation conn/OpResult [c: &conn/OpCall]
+  (let [[cl mt px] (prep c)
+        [bs bx] (if (> (count px) 0) (values [] []) (content-bytes c))
+        [rid rx] (conn/attr-str c "routingId" "")]
+    (cond
+      (> (count px) 0) (conn/fail-result (nth px 0))
+      (> (count bx) 0) (conn/fail-result (nth bx 0))
+      (> (count rx) 0) (conn/fail-result (nth rx 0))
+      :else
+      (let [method (conn/param-lit (:params c) "method" "")
+            id (dmisc/uuid4)
+            key (str "s|" (cfg-name c) "|" rid)
+            mime (out-mime cl mt)
+            dl (op-deadline c)
+            [calls oc om] (open-live cl c method dl)
+            z (if (= (count calls) 0) (push-end key id mime oc om (status-text oc om))
+                (let [call (nth calls 0)
+                      z1 (http/call-send call (frame (nth bs 0)))
+                      z2 (http/call-close call)
+                      k1 key i1 id m1 mime]
+                  (start-reader call cl dl
+                                (fn Int [msg: Str] (push-frame k1 (->Frame i1 msg m1 false false "")))
+                                (fn Int [code: Int msg: Str] (push-end k1 i1 m1 code msg (status-text code msg))))))]
+        (conn/ok-result (ev/tv-val (v/str-v id) ev/ANY) (ev/tv-null))))))
+
+(def LIVE: Atom(Map(Str http/Call)) (atom (let [m: Map(Str http/Call) {}] m)))
+
+(defn- live-get Vec(http/Call) [key: &Str] (let [m (deref LIVE)] (if (contains? m key) [(get! m key)] [])))
+
+(defn- live-put Int [key: &Str call: http/Call]
+  (let [k (str key) z (swap! LIVE (fn Map(Str http/Call) [m: Map(Str http/Call)] (assoc m k call)))] 0))
+
+(defn- live-drop Int [key: &Str]
+  (let [k (str key) z (swap! LIVE (fn Map(Str http/Call) [m: Map(Str http/Call)] (dissoc m k)))] 0))
+
+(defrecord Outcome [done: Bool code: Int msg: Str body: Vec(Str)])
+
+(def OUTCOMES: Atom(Map(Str Outcome)) (atom (let [m: Map(Str Outcome) {}] m)))
+
+(defn- outcome Vec(Outcome) [key: &Str] (let [m (deref OUTCOMES)] (if (contains? m key) [(get! m key)] [])))
+
+(defn- outcome-set Int [key: &Str o: Outcome]
+  (let [k (str key) z (swap! OUTCOMES (fn Map(Str Outcome) [m: Map(Str Outcome)] (assoc m k o)))] 0))
+
+(defn- outcome-update Int [key: &Str f: Fn(Outcome Outcome)]
+  (let [k (str key)
+        z (swap! OUTCOMES (fn Map(Str Outcome) [m: Map(Str Outcome)] (assoc m k (f (if (contains? m k) (get! m k) (->Outcome false 0 "" []))))))]
+    0))
+
+(defn- outcome-drop Int [key: &Str]
+  (let [k (str key) z (swap! OUTCOMES (fn Map(Str Outcome) [m: Map(Str Outcome)] (dissoc m k)))] 0))
+
+(defn- done? Bool [key: &Str] (let [o (outcome key)] (and (> (count o) 0) (:done (nth o 0)))))
+
+(defn- wait-done Bool [key: &Str ms: Int]
+  (let [deadline (+ (quot (mono-us) 1000) ms)]
+    (loop [pause 1]
+      (cond (done? key) true
+            (and (> ms 0) (>= (quot (mono-us) 1000) deadline)) false
+            :else (let [z (sleep-ms pause)] (recur (if (< pause 8) (* pause 2) 8)))))))
+
+(def NO-VALUE "No value received for client streaming call")
+
+(defn- cs-resolve conn/OpResult [key: &Str id: &Str method: &Str mime: &Str sent: Bool]
+  (let [os (outcome key)
+        o (if (= (count os) 0) (->Outcome true 13 "" []) (nth os 0))
+        z1 (live-drop key)
+        z2 (outcome-drop key)]
+    (cond
+      (not= (:code o) 0) (conn/fail-result (err/mk "GRPC" (error-id (:code o)) (client-stream-error (:code o) (:msg o) method id)))
+      (= (count (:body o)) 0) (conn/fail-result (err/mk "GRPC" (error-id 13) (client-stream-error 13 NO-VALUE method id)))
+      :else (conn/ok-result (ev/tv-typed (nth (:body o) 0) mime) (ev/tv-val (client-attributes id true sent) ev/JAVA)))))
+
+(defn- run-client-stream conn/OpResult [c: &conn/OpCall]
+  (let [[cl mt px] (prep c)
+        [ids ix] (conn/attr-str c "requestId" "")
+        [bs bx] (attr-content c)
+        [end ex] (conn/attr-bool c "endClientStreaming" false)
+        [wt wx] (conn/attr-str c "responseWaitTime" "")
+        [wu ux] (conn/attr-str c "responseWaitTimeUnit" "SECONDS")
+        errs (loop [i 0 acc px] (let [all [ix bx ex wx ux]] (if (>= i (count all)) acc (recur (+ i 1) (let [xs (nth all i)] (if (> (count xs) 0) (conj acc (nth xs 0)) acc))))))]
+    (if (> (count errs) 0) (conn/fail-result (nth errs 0))
+      (let [method (conn/param-lit (:params c) "method" "")
+            id (id-or-new ids)
+            key (str "c|" (cfg-name c) "|" id)
+            mime (out-mime cl mt)
+            fresh (and (= (count (live-get key)) 0) (= (count (outcome key)) 0))
+            z0 (if (not fresh) 0
+                 (let [dl (op-deadline c)
+                       [calls oc om] (open-live cl c method dl)]
+                   (if (= (count calls) 0) (outcome-set key (->Outcome true oc om []))
+                     (let [call (nth calls 0)
+                           z1 (outcome-set key (->Outcome false 0 "" []))
+                           z2 (live-put key call)
+                           k1 key]
+                       (start-reader call cl dl
+                                     (fn Int [msg: Str] (outcome-update k1 (fn Outcome [o: Outcome] (if (> (count (:body o)) 0) o (assoc o :body [msg])))))
+                                     (fn Int [code: Int msg: Str] (outcome-update k1 (fn Outcome [o: Outcome] (assoc (assoc (assoc o :done true) :code code) :msg msg)))))))))]
+        (if (done? key) (cs-resolve key id method mime false)
+          (let [calls (live-get key)
+                sent (and (> (count bs) 0) (> (count calls) 0) (= (http/call-send (nth calls 0) (frame (nth bs 0))) ""))]
+            (cond
+              (done? key) (cs-resolve key id method mime sent)
+              end (let [z3 (if (> (count calls) 0) (http/call-close (nth calls 0)) "")
+                        w (wait-done key 0)]
+                    (cs-resolve key id method mime sent))
+              :else
+              (let [[w we] (parse-long (str/trim wt))
+                    waited (if (and (= we "") (> w 0)) (wait-done key (wait-ms w wu)) false)]
+                (if waited (cs-resolve key id method mime sent)
+                  (conn/ok-result (ev/tv-typed "" mime) (ev/tv-val (client-attributes id false sent) ev/JAVA)))))))))))
+
+(defn- run-bidi conn/OpResult [c: &conn/OpCall]
+  (let [[cl mt px] (prep c)
+        [rids rx] (conn/attr-str c "routingId" "")
+        [ids ix] (conn/attr-str c "requestId" "")
+        [bs bx] (attr-content c)
+        [end ex] (conn/attr-bool c "endClientStreaming" false)
+        errs (loop [i 0 acc px] (let [all [rx ix bx ex]] (if (>= i (count all)) acc (recur (+ i 1) (let [xs (nth all i)] (if (> (count xs) 0) (conj acc (nth xs 0)) acc))))))]
+    (if (> (count errs) 0) (conn/fail-result (nth errs 0))
+      (let [method (conn/param-lit (:params c) "method" "")
+            rid (id-or-new rids)
+            id (id-or-new ids)
+            ckey (str "b|" (cfg-name c) "|" rid "|" id)
+            fkey (str "b|" (cfg-name c) "|" rid)
+            mime (out-mime cl mt)
+            calls (if (> (count (live-get ckey)) 0) (live-get ckey)
+                    (let [dl (op-deadline c)
+                          [cs oc om] (open-live cl c method dl)]
+                      (if (= (count cs) 0) (let [z (push-end fkey id mime oc om (status-text oc om))] cs)
+                        (let [call (nth cs 0)
+                              z1 (live-put ckey call)
+                              k1 fkey i1 id m1 mime ck ckey]
+                          (let [z2 (start-reader call cl dl
+                                                 (fn Int [msg: Str] (push-frame k1 (->Frame i1 msg m1 false false "")))
+                                                 (fn Int [code: Int msg: Str] (let [z3 (live-drop ck)] (push-end k1 i1 m1 code msg (status-text code msg)))))]
+                            cs)))))
+            sent (and (> (count bs) 0) (> (count calls) 0) (= (http/call-send (nth calls 0) (frame (nth bs 0))) ""))
+            z4 (if (and end (> (count calls) 0)) (http/call-close (nth calls 0)) "")]
+        (conn/ok-result (ev/tv-val (v/str-v id) ev/ANY) (ev/tv-val (client-attributes id end sent) ev/JAVA))))))
+
+(def CLIENT-SOURCES ["bidi-streaming-listener" "server-streaming-delegated-listener"])
+
+(defn- poll Values(Int Str) [s: conn/SrcCall]
+  (let [rid (conn/param-lit (:params s) "routingId" "")
+        cfg (if (= (count (:config s)) 0) "" (str (:name (nth (:config s) 0))))
+        key (str (if (= (:name s) "bidi-streaming-listener") "b|" "s|") cfg "|" rid)
+        [f ok] (wait-frame key 200)]
+    (if (not ok) (values 0 "")
+      (let [[okd e] ((:dispatch s) (ev/tv-typed (:bytes f) (:mime f)) (ev/tv-val (frame-attributes rid (:id f) (:end f) (:err f) (:msg f)) ev/JAVA))]
+        (values 1 e)))))
+
+(defn- run-unary conn/OpResult [c: &conn/OpCall]
+  (let [[cl ce] (client-of (:config c))
+        method (conn/param-lit (:params c) "method" "")
+        [dd de] (pbf/load-desc (:desc cl))
+        ms (if (= de "") (find-method dd method) [])
+        [ct cte] (conn/child-tv c "content")
+        body-tv (if (= (count ct) 0) (ev/settle (:payload (:event c))) (ev/settle (nth ct 0)))
+        typed (= (:state body-tv) ev/TYPED)
+        [body be] (if typed (values "" "") (ev/wire-bytes body-tv))]
+    (cond
+      (not= ce "") (conn/fail-result (err/mk "MULE" "UNKNOWN" ce))
+      (> (count cte) 0) (conn/fail-result (nth cte 0))
+      (not= de "") (conn/fail-result (err/mk "MULE" "UNKNOWN" de))
+      (= (count ms) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" NPE))
+      typed (conn/fail-result (err/mk "MULE" "TRANSFORMATION" TRANSFORM-ERR))
+      (not= be "") (conn/fail-result (err/mk "MULE" "UNKNOWN" be))
+      :else
+      (let [mt (nth ms 0)
+            url (str (if (:tls cl) "https" "http") "://" (:host cl) ":" (:port cl) "/" method)
+            hs0: Vec(hm/Header) [(hm/->Header "content-type" "application/grpc") (hm/->Header "te" "trailers")
+                                 (hm/->Header "user-agent" USER-AGENT) (hm/->Header "accept" "*/*")]
+            hs (add-headers (add-headers hs0 (:headers cl)) (op-headers c))
+            dl (op-deadline c)
+            hs2 (if (> dl 0) (conj hs (hm/->Header "grpc-timeout" (timeout-header dl))) hs)
+            o (assoc (http/request-opts url) :method "POST" :headers hs2 :body (frame body) :max-redirects 0 :h2c (not (:tls cl)) :timeout-ms (if (> dl 0) dl RESPONSE-TIMEOUT-MS))
+            [r re] (http/request o)]
+        (if (not= re "")
+          (let [[fc fm] (if (and (> dl 0) (timed-out? re)) (values 4 DEADLINE-MSG) (transport-fail cl re))] (fail-status fc fm method))
+          (let [[code gm msg] (read-reply (:status r) (:headers r) (:trailers r) (:body r))]
+            (if (not= code 0) (fail-status code gm method)
+              (conn/ok-result (ev/tv-typed msg (str "application/x-protobuf; descriptorUrl=\"" (:desc cl) "\"; messageType=\"" (:output mt) "\""))
+                              (ev/tv-null)))))))))
+
+(defn- conn-id-of Values(Str Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[av ax] (conn/attr-val c "attributes")]
+    (cond (> (count ax) 0) (values "" ax)
+          (= (count av) 0) (values "" [])
+          :else (match (v/unmeta (nth av 0))
+                  (v/VObj fs) (let [r (v/obj-get fs "connectionId")] (values (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) (str s) _ "")) []))
+                  _ (values "" [])))))
+
+(defn- run-send conn/OpResult [c: &conn/OpCall]
+  (let [[id ix] (conn-id-of c)
+        [ct cte] (conn/child-tv c "stream-message")
+        body-tv (if (= (count ct) 0) (ev/settle (:payload (:event c))) (ev/settle (nth ct 0)))]
+    (cond
+      (> (count ix) 0) (conn/fail-result (nth ix 0))
+      (> (count cte) 0) (conn/fail-result (nth cte 0))
+      :else (let [[b be] (ev/wire-bytes body-tv)]
+              (if (not= be "") (conn/fail-result (err/mk "MULE" "UNKNOWN" be))
+                (let [e (push-message id b)] (if (not= e "") (conn/fail-result (err/mk "MULE" "UNKNOWN" e)) (conn/keep-result c))))))))
+
+(defn- run-end conn/OpResult [c: &conn/OpCall]
+  (let [[id ix] (conn-id-of c)]
+    (if (> (count ix) 0) (conn/fail-result (nth ix 0)) (let [z (end-stream id)] (conn/keep-result c)))))
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (cond
+    (= (:op c) "unary-call") (run-unary c)
+    (= (:op c) "server-streaming-call-with-response") (run-iterate c)
+    (= (:op c) "server-streaming-call-with-delegation") (run-delegation c)
+    (= (:op c) "client-streaming") (run-client-stream c)
+    (= (:op c) "bidirectional-streaming") (run-bidi c)
+    (= (:op c) "send-stream-message") (run-send c)
+    (= (:op c) "end-stream") (run-end c)
+    :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation grpc:" (:op c))))))
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "grpc" NS (fn conn/OpResult [c: conn/OpCall] (run-op c)))
+         :sources CLIENT-SOURCES :push CLIENT-SOURCES :poll (fn Values(Int Str) [s: conn/SrcCall] (poll s))
+         :mounts server-mounts :routed SOURCE-KINDS
+         :source-elems ["unary-method" "server-streaming-method" "client-streaming-method" "bidirectional-streaming-method"
+                        "bidi-streaming-listener" "server-streaming-delegated-listener" "server-streaming-subscriber-source"]))
+
+(def DEFAULT-MAX-INBOUND 4194304)
+
+(def K-UNARY 0)
+(def K-SERVER-STREAM 1)
+(def K-CLIENT-STREAM 2)
+(def K-BIDI 3)
+
+(def SOURCE-KINDS ["unary-method" "server-streaming-method" "client-streaming-method" "bidirectional-streaming-method"])
+
+(defrecord GMethod [full: Str kind: Int src-kind: Str flow: Int input: Str output: Str desc: Str cfg: Str listener: Str max-in: Int])
+
+(defn- method-kind Int [mt: &pb/Method]
+  (cond (and (:client-streaming mt) (:server-streaming mt)) K-BIDI
+        (:client-streaming mt) K-CLIENT-STREAM
+        (:server-streaming mt) K-SERVER-STREAM
+        :else K-UNARY))
+
+(defn http-source? Bool [nm: &Str] (loop [i 0] (if (>= i (count SOURCE-KINDS)) false (if (= (nth SOURCE-KINDS i) nm) true (recur (+ i 1))))))
+
+(defn- flow-for Values(Int Str) [app: &m/App cfg: &Str full: &Str]
+  (let [fs (:flows app)]
+    (loop [i 0]
+      (if (>= i (count fs)) (values -1 "")
+        (let [srcs (:source (nth fs i))]
+          (if (= (count srcs) 0) (recur (+ i 1))
+            (match (nth srcs 0)
+              (m/SrcConnector cn nm cref ps ch ex sch loc)
+              (if (and (= cn "grpc") (http-source? nm) (= cref cfg) (= (conn/param-lit ps "methodName" "") full)) (values i (str nm)) (recur (+ i 1)))
+              _ (recur (+ i 1)))))))))
+
+(defn server-methods Values(Vec(GMethod) Vec(Str)) [app: &m/App]
+  (let [cs (:configs app)]
+    (loop [i 0 acc: Vec(GMethod) [] errs: Vec(Str) []]
+      (if (>= i (count cs)) (values acc errs)
+        (let [cfg (nth cs i)]
+          (if (not= (:kind cfg) "grpc:server-config") (recur (+ i 1) acc errs)
+            (let [cn (child-elem (:children cfg) "grpc-server-connection")]
+              (if (= (count cn) 0) (recur (+ i 1) acc (conj errs (str "<grpc:server-config name=\"" (:name cfg) "\">: missing <grpc:grpc-server-connection>")))
+                (let [node (nth cn 0)
+                      lst (attr-of node "listenerConfig" "")
+                      [mx mxe] (parse-long (str/trim (conn/param-lit (:params cfg) "maxInboundMessageSize" (str DEFAULT-MAX-INBOUND))))
+                      max-in (if (= mxe "") mx DEFAULT-MAX-INBOUND)
+                      df (descriptor-file node)
+                      [dd de] (pbf/load-desc df)]
+                  (if (not= de "") (recur (+ i 1) acc (conj errs (str "<grpc:server-config name=\"" (:name cfg) "\">: " de)))
+                    (let [svcs (:services dd)
+                          acc2 (loop [s 0 a acc]
+                                 (if (>= s (count svcs)) a
+                                   (let [sv (nth svcs s)
+                                         a2 (loop [k 0 b a]
+                                              (if (>= k (count (:methods sv))) b
+                                                (let [mt (nth (:methods sv) k)
+                                                      full (str (:full sv) "/" (:name mt))
+                                                      [fi sk] (flow-for app (:name cfg) full)]
+                                                  (recur (+ k 1) (conj b (->GMethod full (method-kind mt) sk fi (:input mt) (:output mt) df (:name cfg) lst max-in))))))]
+                                     (recur (+ s 1) a2))))]
+                      (recur (+ i 1) acc2 errs))))))))))))
+
+(def SERVER-ATTR-CLASS "com.mulesoft.connectors.grpc.api.server.UnaryServerAttributes")
+
+(defn server-attributes v/Val [full: &Str hs: &Vec(hm/Header)]
+  (v/->VMeta (v/->VObj [(v/field "headers" (v/->VObj (header-fields hs))) (v/field "methodName" (v/str-v (str full))) (v/field "connectionId" (v/str-v ""))])
+             [(v/field "class" (v/str-v SERVER-ATTR-CLASS))]))
+
+(defn payload-mime Str [g: &GMethod]
+  (str "application/x-protobuf; charset=UTF-8; messagetype=\"" (:input g) "\"; descriptorurl=\"" (:desc g) "\""))
+
+(defn response-headers Vec(hm/Header) []
+  [(hm/->Header "content-type" "application/grpc") (hm/->Header "grpc-encoding" "identity") (hm/->Header "grpc-accept-encoding" "identity,deflate,gzip")])
+
+(defn read-request Values(Int Str Str) [body: &Str max: Int]
+  (if (= (count body) 0) (values 13 "Half-closed without a request" "")
+    (loop [i 0 got: Vec(Str) []]
+      (cond
+        (= i (count body)) (if (= (count got) 0) (values 13 "Half-closed without a request" "") (values 0 "" (nth got 0)))
+        (< (- (count body) i) 5) (values 13 "Encountered end-of-stream mid-frame" "")
+        :else
+        (let [fl (nth body i)
+              n (pb/get-fixed-be body (+ i 1) 4)]
+          (cond
+            (> (bit-and fl 254) 0) (values 13 "gRPC frame header malformed: reserved bits not zero" "")
+            (> n max) (values 8 (str "gRPC message exceeds maximum size " max ": " n) "")
+            (> (+ i 5 n) (count body)) (values 13 "Encountered end-of-stream mid-frame" "")
+            (= fl 1) (values 13 "Can't decode compressed gRPC message as compression not configured" "")
+            (> (count got) 0) (values 13 "Too many requests" "")
+            :else (recur (+ i 5 n) (conj got (subs body (+ i 5) (+ i 5 n))))))))))
+
+(defn status-trailers Vec(hm/Header) [code: Int msg: &Str]
+  (let [t: Vec(hm/Header) [(hm/->Header "grpc-status" (str code))]]
+    (if (= msg "") t (conj t (hm/->Header "grpc-message" (percent-encode msg))))))
+
+(defn error-status Int [s: &Str]
+  (let [c (status-code s)] (if (< c 1) 2 c)))
+
+(defn split-frames Values(Int Str Vec(Str) Str) [buf: &Str max: Int done: Bool]
+  (loop [i 0 got: Vec(Str) []]
+    (cond
+      (= i (count buf)) (values 0 "" got "")
+      (< (- (count buf) i) 5) (if done (values 13 "Encountered end-of-stream mid-frame" [] "") (values 0 "" got (subs buf i (count buf))))
+      :else
+      (let [fl (nth buf i)
+            n (pb/get-fixed-be buf (+ i 1) 4)]
+        (cond
+          (> (bit-and fl 254) 0) (values 13 "gRPC frame header malformed: reserved bits not zero" [] "")
+          (> n max) (values 8 (str "gRPC message exceeds maximum size " max ": " n) [] "")
+          (> (+ i 5 n) (count buf)) (if done (values 13 "Encountered end-of-stream mid-frame" [] "") (values 0 "" got (subs buf i (count buf))))
+          (= fl 1) (values 13 "Can't decode compressed gRPC message as compression not configured" [] "")
+          :else (recur (+ i 5 n) (conj got (subs buf (+ i 5) (+ i 5 n)))))))))
+
+(defn read-messages Values(Int Str Vec(Str)) [body: &Str max: Int]
+  (let [[c m ms rest] (split-frames body max true)] (values c m ms)))
+
+(defn dispatch Str [kind: Int src: &Str]
+  (cond
+    (= src "unary-method") (if (= kind K-UNARY) "unary" "unknown")
+    (and (= kind K-SERVER-STREAM) (= src "server-streaming-method")) "server-stream"
+    (and (= kind K-CLIENT-STREAM) (= src "client-streaming-method")) "client-stream"
+    (and (= kind K-BIDI) (= src "bidirectional-streaming-method")) "bidi"
+    :else "no-executor"))
+
+(defn header-fields Vec(v/Field) [hs: &Vec(hm/Header)]
+  (let [te (loop [i 0] (if (>= i (count hs)) [] (if (= (str/lower-case (:hd-name (nth hs i))) "te") [(v/field "te" (v/str-v (str (:hd-value (nth hs i)))))] (recur (+ i 1)))))]
+    (loop [i 0 acc: Vec(v/Field) te]
+      (if (>= i (count hs)) acc
+        (let [h (nth hs i) n (str/lower-case (:hd-name h))]
+          (recur (+ i 1) (if (or (str/starts-with? n ":") (= n "host") (= n "te")) acc (conj acc (v/field n (v/str-v (str (:hd-value h))))))))))))
+
+(defn- java-obj v/Val [fs: Vec(v/Field) cls: &Str] (v/->VMeta (v/->VObj fs) [(v/field "class" (v/str-v (str cls)))]))
+
+(def API-SERVER "com.mulesoft.connectors.grpc.api.server.")
+
+(defn server-stream-attributes v/Val [full: &Str hs: &Vec(hm/Header) id: &Str]
+  (java-obj [(v/field "headers" (v/->VObj (header-fields hs))) (v/field "methodName" (v/str-v (str full))) (v/field "connectionId" (v/str-v (str id)))]
+            (str API-SERVER "ServerStreamingServerAttributes")))
+
+(defn client-stream-attributes v/Val [hs: &Vec(hm/Header) n: Int state: &v/Val done: Bool]
+  (java-obj [(v/field "headers" (v/->VObj (header-fields hs))) (v/field "messageCount" (v/int-v n)) (v/field "streamState" state)
+             (v/field "streamCompleted" (v/bool-v done))]
+            (str API-SERVER "ClientStreamingServerAttributes")))
+
+(defn bidi-attributes v/Val [full: &Str hs: &Vec(hm/Header) n: Int done: Bool state: &v/Val index: Int id: &Str ts: &v/Val]
+  (java-obj [(v/field "headers" (v/->VObj (header-fields hs))) (v/field "messageCount" (v/int-v n)) (v/field "clientStreamCompleted" (v/bool-v done))
+             (v/field "streamState" state) (v/field "methodName" (v/str-v (str full))) (v/field "messageIndex" (v/int-v index))
+             (v/field "connectionId" (v/str-v (str id))) (v/field "timestamp" ts)]
+            (str API-SERVER "BidiStreamingServerAttributes")))
+
+(def EXHAUSTED "Server streaming capacity exhausted. Please retry later.")
+
+(defrecord Out [sink: hm/Sink sig: Chan(Int)])
+
+(def OUTS: Atom(Map(Str Out)) (atom (let [m: Map(Str Out) {}] m)))
+
+(defn open-out Values(hm/Response hm/Sink Chan(Int)) [id: &Str]
+  (let [[resp sk] (hm/stream-response 200 (response-headers))
+        sig: Chan(Int) (chan)
+        k (str id)
+        z (swap! OUTS (fn Map(Str Out) [m: Map(Str Out)] (assoc m k (->Out sk sig))))]
+    (values resp sk sig)))
+
+(defn push-message Str [id: &Str msg: &Str]
+  (let [m (deref OUTS)
+        gone (str "No active stream found for connection: " id)]
+    (if (not (contains? m id)) gone
+      (let [o (get! m id)
+            e (hm/sink-write (:sink o) (frame msg))
+            z (if (chan-done? (:sig o)) 0 (close! (:sig o)))]
+        (if (and (not= e "") (not (hm/sink-open? (:sink o)))) gone e)))))
+
+(defn- close-out Int [id: &Str trailers: Vec(hm/Header)]
+  (let [m (deref OUTS) k (str id)]
+    (if (not (contains? m k)) 0
+      (let [o (get! m k)
+            e (hm/sink-close (:sink o) trailers)
+            z (close! (:sig o))
+            z2 (swap! OUTS (fn Map(Str Out) [mm: Map(Str Out)] (dissoc mm k)))]
+        0))))
+
+(defn end-stream Int [id: &Str] (close-out id (status-trailers 0 "")))
+
+(defn fail-stream Int [id: &Str code: Int msg: &Str] (close-out id (status-trailers code msg)))
+
+(defn wait-out Int [sig: &Chan(Int)]
+  (loop [] (<! [v sig] (recur) 0 (recur))))
+
+(defrecord Served [g: GMethod flow-name: Str kids: Vec(xml/XNode) exprs: Vec(m/Param)])
+
+(defn- server-mounts Values(Vec(conn/Mount) Vec(Str)) [app: m/App]
+  (let [[gs ge] (server-methods app)]
+    (loop [i 0 acc: Vec(conn/Mount) []]
+      (if (>= i (count gs)) (values acc ge)
+        (let [g (nth gs i)
+              fl: Vec(m/Flow) (if (>= (:flow g) 0) [(nth (:flows app) (:flow g))] [])
+              src: Vec(m/Source) (if (> (count fl) 0) (:source (nth fl 0)) [])
+              kids: Vec(xml/XNode) (if (= (count src) 0) [] (match (nth src 0) (m/SrcConnector cn nm cref ps ch ex sch loc) ch _ []))
+              exs: Vec(m/Param) (if (= (count src) 0) [] (match (nth src 0) (m/SrcConnector cn nm cref ps ch ex sch loc) ex _ []))
+              d (dispatch (:kind g) (:src-kind g))
+              streamed (and (>= (:flow g) 0) (or (= d "server-stream") (= d "client-stream") (= d "bidi")))
+              sv (->Served g (if (> (count fl) 0) (:name (nth fl 0)) "") kids exs)]
+          (recur (+ i 1) (conj acc (conn/->Mount (:listener g) (str "/" (:full g)) ["POST"] false streamed
+                                                 (fn hm/Response [h: conn/Host at: conn/At q: hm/Request] (srv-respond h sv q))))))))))
+
+(defn- srv-reply hm/Response [code: Int msg: &Str body: &Str]
+  (srv-reply-frames code msg (if (= code 0) (frame body) "")))
+
+(defn- srv-reply-frames hm/Response [code: Int msg: &Str frames: &Str]
+  (assoc (hm/response 200 (response-headers) (str frames) false) :trailers (status-trailers code msg)))
+
+(defn- srv-respond hm/Response [h: &conn/Host sv: &Served req: &hm/Request]
+  (let [g (:g sv)
+        d (dispatch (:kind g) (:src-kind g))]
+    (cond
+      (or (< (:flow g) 0) (= d "no-executor")) (srv-reply 12 (str "No source executor registered for method: " (:full g)) "")
+      (= d "unknown") (srv-reply 2 "" "")
+      (= d "unary")
+      (let [[code msg m] (read-request (:body req) (:max-in g))]
+        (if (not= code 0) (srv-reply code msg "") (srv-run h sv g m req)))
+      (= d "server-stream")
+      (let [[b why] (srv-body req)
+            [code msg m] (read-request b (:max-in g))]
+        (cond (not= why "") (srv-reply 1 "" "")
+              (not= code 0) (srv-reply code msg "")
+              :else (srv-server-stream h sv g m req)))
+      (= d "client-stream") (srv-client-stream h sv g req)
+      :else (srv-bidi h sv g req))))
+
+(defn- srv-piece Values(Str Bool Str) [req: &hm/Request first: Bool]
+  (match (:body-in req)
+    (hm/Streaming sk) (loop [] (let [[p done why] (hm/body-next req)] (if (and (not done) (not= why "")) (recur) (values p done why))))
+    _ (if first (values (str (:body req)) true "") (values "" true ""))))
+
+(defn- srv-body Values(Str Str) [req: &hm/Request]
+  (loop [first true acc ""]
+    (let [[p done why] (srv-piece req first)]
+      (cond (not= why "") (values "" why)
+            done (values (str acc p) "")
+            :else (recur false (str acc p))))))
+
+(defn- srv-msg-tv ev/TV [g: &GMethod m: &Str]
+  (let [props [(v/field "descriptorUrl" (v/->VStr (:desc g))) (v/field "messageType" (v/->VStr (:input g)))]]
+    (ev/->TV (v/null-v) (payload-mime g) props (str m) ev/RAW false)))
+
+(defn- srv-flow Values(ev/Event Vec(err/MErr)) [h: &conn/Host sv: &Served g: &GMethod payload: ev/TV attrs: v/Val]
+  ((:run h) (:flow g) (ev/new-event payload (ev/tv-val attrs ev/JAVA) (conn/corr-id (:flow g)) (:flow-name sv))))
+
+(defn- srv-error-status Values(Int Str) [h: &conn/Host sv: &Served e: ev/Event x: &Vec(err/MErr)]
+  (let [er (conn/child-elem (:kids sv) "error-response")
+        code (if (= (count er) 0) 2 (error-status (xml/attr (nth er 0) "" "statusCode" "")))
+        dp (conn/param (:exprs sv) "error-response@description")
+        [dv e2 dx] (if (= (count dp) 0) (values [] e []) (conn/host-eval h dp (ev/with-error e x)))
+        d (cond (> (count dx) 0) ""
+                (> (count dv) 0) (en/java-str (nth dv 0))
+                (> (count er) 0) (xml/attr (nth er 0) "" "description" "")
+                :else "")]
+    (values code d)))
+
+(defn- srv-response-bytes Values(Str Bool Bool) [h: &conn/Host sv: &Served key: &Str e: ev/Event]
+  (let [bp (conn/param (:exprs sv) key)
+        [bt e2 bx] (if (= (count bp) 0) (values [(:payload e)] e []) (conn/host-eval-tv h bp e))]
+    (if (> (count bx) 0) (values "" false false)
+      (let [t (ev/settle (nth bt 0))
+            none (and (= (:state t) ev/VAL) (v/null? (:val t)))
+            [b be] (ev/wire-bytes t)]
+        (values b (= be "") none)))))
+
+(defn- srv-state v/Val [h: &conn/Host sv: &Served key: &Str e: ev/Event]
+  (let [sp (conn/param (:exprs sv) key)
+        [sv e2 sx] (if (= (count sp) 0) (values [] e []) (conn/host-eval h sp e))]
+    (if (or (= (count sv) 0) (> (count sx) 0)) (v/->VObj []) (v/unmeta (nth sv 0)))))
+
+(defn- srv-run hm/Response [h: &conn/Host sv: &Served g: &GMethod m: &Str req: &hm/Request]
+  (let [[e x] (srv-flow h sv g (srv-msg-tv g m) (server-attributes (:full g) (:headers req)))]
+    (if (> (count x) 0)
+      (let [[code d] (srv-error-status h sv e x)] (srv-reply code d ""))
+      (let [[b ok none] (srv-response-bytes h sv "response-unary" e)]
+        (if ok (srv-reply 0 "" b) (srv-reply 2 "" ""))))))
+
+(def MAX-SERVER-STREAMS 4096)
+(def SERVER-STREAMS (atom 0))
+
+(defn- srv-server-stream hm/Response [h: &conn/Host sv: &Served g: &GMethod m: &Str req: &hm/Request]
+  (let [id (dmisc/uuid4)
+        [resp sk sig] (open-out id)
+        h1 h sv1 sv g1 g m1 m hs (:headers req)
+        ok (ops/spawn-bg-try-in SERVER-STREAMS MAX-SERVER-STREAMS (fn Int [k: Int]
+                               (let [[e x] (srv-flow h1 sv1 g1 (srv-msg-tv g1 m1) (server-stream-attributes (:full g1) hs id))]
+                                 (if (> (count x) 0) (let [[code d] (srv-error-status h1 sv1 e x)] (fail-stream id code d)) 0))))
+        z (if ok 0 (fail-stream id 8 EXHAUSTED))
+        w (wait-out sig)]
+    resp))
+
+(defn- srv-client-run Values(v/Val Vec(hm/Response)) [h: &conn/Host sv: &Served g: &GMethod ms: &Vec(Str) hs: &Vec(hm/Header) n0: Int state0: v/Val]
+  (loop [i 0 state state0]
+    (if (>= i (count ms)) (let [none: Vec(hm/Response) []] (values state none))
+      (let [[e x] (srv-flow h sv g (srv-msg-tv g (nth ms i)) (client-stream-attributes hs (+ n0 i 1) state false))]
+        (if (> (count x) 0) (let [[code d] (srv-error-status h sv e x)] (values state [(srv-reply code d "")]))
+          (recur (+ i 1) (srv-state h sv "output@streamState" e)))))))
+
+(defn- srv-client-stream hm/Response [h: &conn/Host sv: &Served g: &GMethod req: &hm/Request]
+  (loop [first true buf "" n 0 state (v/->VObj [])]
+    (let [[p done why] (srv-piece req first)]
+      (if (not= why "") (srv-reply 1 "" "")
+        (let [[code msg ms rest] (split-frames (str buf p) (:max-in g) done)]
+          (if (not= code 0) (srv-reply code msg "")
+            (let [[st2 fail] (srv-client-run h sv g ms (:headers req) n state)]
+              (cond
+                (> (count fail) 0) (nth fail 0)
+                (not done) (recur false rest (+ n (count ms)) st2)
+                :else
+                (let [[e x] (srv-flow h sv g (ev/tv-null) (client-stream-attributes (:headers req) (+ n (count ms)) st2 true))]
+                  (if (> (count x) 0) (let [[code2 d] (srv-error-status h sv e x)] (srv-reply code2 d ""))
+                    (let [[b ok none] (srv-response-bytes h sv "output@response" e)]
+                      (cond (not ok) (srv-reply 2 "" "")
+                            none (srv-reply-frames 0 "" "")
+                            :else (srv-reply 0 "" b)))))))))))))
+
+(defn- srv-now v/Val []
+  (let [[s n] (ttz/now-instant)] (v/->VLocalDateTime (tlocal/ldt-of-epoch-second s n 0))))
+
+(defn- srv-bidi-one Values(v/Val Bool) [h: &conn/Host sv: &Served g: &GMethod id: &Str hs: &Vec(hm/Header) payload: ev/TV n: Int done: Bool index: Int state: v/Val]
+  (let [[e x] (srv-flow h sv g payload (bidi-attributes (:full g) hs n done state index id (srv-now)))]
+    (if (> (count x) 0) (let [[code d] (srv-error-status h sv e x) z (fail-stream id code d)] (values state false))
+      (let [[b ok none] (srv-response-bytes h sv "stream-output@response" e)
+            pe (if (and ok (not none)) (push-message id b) "")]
+        (values (srv-state h sv "stream-output@streamState" e) (= pe ""))))))
+
+(defn- srv-bidi-run Int [h: &conn/Host sv: &Served g: &GMethod req: &hm/Request id: &Str]
+  (let [hs (:headers req)]
+    (loop [first true buf "" n 0 state (v/->VObj [])]
+      (let [[p done why] (srv-piece req first)]
+        (if (not= why "") (fail-stream id 1 "")
+          (let [[code msg ms rest] (split-frames (str buf p) (:max-in g) done)]
+            (if (not= code 0) (fail-stream id code msg)
+              (let [[st2 ok n2] (loop [i 0 st state]
+                                  (if (>= i (count ms)) (values st true (+ n (count ms)))
+                                    (let [[st3 ok3] (srv-bidi-one h sv g id hs (srv-msg-tv g (nth ms i)) (+ n i 1) false (+ n i 1) st)]
+                                      (if ok3 (recur (+ i 1) st3) (values st3 false (+ n i 1))))))]
+                (cond
+                  (not ok) 0
+                  (not done) (recur false rest n2 st2)
+                  :else (let [[st4 ok4] (srv-bidi-one h sv g id hs (ev/tv-null) n2 true 0 st2)]
+                          (if ok4 (end-stream id) 0)))))))))))
+
+(defn- srv-bidi hm/Response [h: &conn/Host sv: &Served g: &GMethod req: &hm/Request]
+  (let [id (dmisc/uuid4)
+        [resp sk sig] (open-out id)
+        h1 h sv1 sv g1 g q req
+        ok (ops/spawn-bg-try-in SERVER-STREAMS MAX-SERVER-STREAMS (fn Int [k: Int] (srv-bidi-run h1 sv1 g1 q id)))
+        z (if ok 0 (fail-stream id 8 EXHAUSTED))
+        w (wait-out sig)]
+    resp))

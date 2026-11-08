@@ -1,0 +1,267 @@
+(ns mulay.app.munit
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.mule.model :as m] [mulay.mule.load :as ld]
+            [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.engine :as en] [mulay.rt.conn :as conn]
+            [mulay.app.run :as run] [mulay.conn.munit :as mu] [mulay.conn.http :as http] [mulay.dw.urls :as urls] [mulay.lib.diag :as d] [mulay.rt.explain :as rx] [clay.term :as term] [clay.net :as net] [clay.string :as str]))
+
+(defrecord Result [test: Str status: Str msg: Str ms: Int err: Vec(err/MErr)])
+
+(defn- result Result [test: Str status: Str msg: Str ms: Int] (let [z: Vec(err/MErr) []] (->Result test status msg ms z)))
+
+(defrecord Outcome [suite: Str results: Vec(Result) err: Str])
+
+(def SUCCESS "SUCCESS")
+(def FAILURE "FAILURE")
+(def ERROR "ERROR")
+(def SKIPPED "SKIPPED")
+
+(defn- fresh-event ev/Event [name: &Str]
+  (ev/new-event (ev/tv-val (v/->VStr "") ev/ANY) (ev/tv-null) (conn/corr-id 0) (str name)))
+
+(defn- run-chain Values(ev/Event Vec(err/MErr)) [c: &en/Ctx ps: &Vec(m/Proc) e: ev/Event]
+  (if (= (count ps) 0) (values e []) (en/run-procs c ps e)))
+
+(defn- elem-file-line Values(Str Str) [elem: &Str]
+  (let [at (str/last-index-of elem " @ ")
+        tail (if (< at 0) (str elem) (subs elem (+ at 3) (count elem)))
+        l (str/last-index-of tail ":")
+        head (if (< l 0) "" (subs tail 0 l))
+        f (str/index-of head ":")]
+    (values (if (< f 0) (str head) (subs head (+ f 1) (count head))) (if (< l 0) "" (subs tail (+ l 1) (count tail))))))
+
+(defn- assertion? Bool [x: &err/MErr] (= (:cause x) mu/ASSERTION))
+
+(defn- error-result Result [name: &Str x: &err/MErr ms: Int] (assoc (error-result0 name x ms) :err [(copy-err x)]))
+
+(defn- copy-err err/MErr [x: &err/MErr] x)
+
+(defn- error-result0 Result [name: &Str x: &err/MErr ms: Int]
+  (if (= (:cause x) mu/ASSERTION-PLAIN) (result (str name) FAILURE (str mu/ASSERTION ": " (:description x)) ms)
+  (if (assertion? x)
+    (let [[f l] (elem-file-line (:elem x))]
+      (result (str name) FAILURE (str mu/ASSERTION ": " (:detailed x) " at file: [" f "], line: [" l "]\n" (:description x)) ms))
+    (result (str name) ERROR (str "org.mule.munit.runner.model.TestExecutionException: Error [" (err/type-str x) "] while running test '" name "':" (:description x)) ms))))
+
+(defn- ignored? Bool [c: &en/Ctx t: &m/MTest]
+  (if (= (count (:ignore t)) 0) false
+    (match (nth (:ignore t) 0)
+      (m/PLit s) (= (str/lower-case (str/trim s)) "true")
+      _ (let [[x e2 errs] (en/eval-val c (nth (:ignore t) 0) (fresh-event (:name t)))]
+          (and (= (count errs) 0) (match (v/unmeta x) (v/VBool b) b (v/VStr s) (= s "true") _ false))))))
+
+(defn- known-type? Bool [t: &Str texts: &Vec(Str)]
+  (let [nt (err/norm-type t)]
+    (or (= nt "MULE:ANY") (err/known? nt)
+        (loop [i 0]
+          (if (>= i (count texts)) false
+            (let [x (nth texts i)]
+              (if (or (str/includes? x (str " type=\"" t "\"")) (str/includes? x (str "targetType=\"" t "\""))
+                      (str/includes? x (str " type=\"" nt "\"")) (str/includes? x (str "targetType=\"" nt "\"")))
+                true (recur (+ i 1)))))))))
+
+(def CONTEXT 20)
+
+(defn- compact Str [ex: &Str ac: &Str]
+  (if (= ex ac) (str "expected:<" ex "> but was:<" ac ">")
+    (let [end (min (count ex) (count ac))
+          pre (loop [i 0] (if (or (>= i end) (not= (nth ex i) (nth ac i))) i (recur (+ i 1))))
+          [es as] (loop [e (- (count ex) 1) a (- (count ac) 1)]
+                    (if (and (>= a pre) (>= e pre) (= (nth ex e) (nth ac a))) (recur (- e 1) (- a 1)) (values e a)))
+          suf (- (count ex) es)
+          one (fn Str [src: Str]
+                (let [mid (str "[" (subs src pre (+ (- (count src) suf) 1)) "]")
+                      p (if (> pre 0) (str (if (> pre CONTEXT) "..." "") (subs ex (max 0 (- pre CONTEXT)) pre)) "")
+                      sx (if (> suf 1)
+                           (let [from (+ (- (count ex) suf) 1)
+                                 to (min (+ from CONTEXT) (count ex))]
+                             (str (subs ex from to) (if (< from (- (count ex) CONTEXT)) "..." "")))
+                           "")]
+                  (str p mid sx)))]
+      (str "expected:<" (one (str ex)) "> but was:<" (one (str ac)) ">"))))
+
+(defn- expected-check Result [t: &m/MTest x: &Vec(err/MErr) texts: &Vec(Str) ms: Int]
+  (let [name (:name t)
+        et (str/trim (:expected-type t))
+        ed (:expected-desc t)]
+    (cond
+      (= (count x) 0)
+      (result (str name) FAILURE (str mu/ASSERTION ": The test: " name " was expecting a failure - Error ID: " et " but it didn't fail") ms)
+      (and (not= et "") (not (known-type? et texts)))
+      (result (str name) ERROR (str "org.mule.munit.common.exception.MunitError: The expected error type " et " was not found") ms)
+      (and (not= et "") (not (err/matches? (nth x 0) (err/norm-type et))))
+      (assoc (result (str name) FAILURE (str mu/ASSERTION ": The error ID thrown does not match the expected one.  " (compact et (err/type-str (nth x 0)))) ms) :err [(copy-err (nth x 0))])
+      (and (not= ed "") (not= ed (:description (nth x 0))))
+      (assoc (result (str name) FAILURE (str mu/ASSERTION ": The error description thrown does not match the expected one. " (compact ed (:description (nth x 0)))) ms) :err [(copy-err (nth x 0))])
+      :else (result (str name) SUCCESS "" ms))))
+
+(defn- run-test Result [gate: &Atom(Vec(Str)) c: &en/Ctx s: &m/MSuite t: &m/MTest texts: &Vec(Str)]
+  (if (ignored? c t) (result (str (:name t)) SKIPPED "" 0)
+    (let [z1 (reset! gate (:sources t))
+          r (run-test-body c s t texts)
+          z2 (reset! gate (let [e: Vec(Str) []] e))]
+      r)))
+
+(defn- run-test-body Result [c: &en/Ctx s: &m/MSuite t: &m/MTest texts: &Vec(Str)]
+    (let [t0 (quot (mono-us) 1000)
+          zr (mu/reset-test!)
+          [eb xb] (run-chain c (:before-test s) (fresh-event (:name t)))
+          expects (or (not= (str/trim (:expected-type t)) "") (not= (:expected-desc t) ""))
+          [e1 x1] (if (> (count xb) 0) (values eb xb) (run-chain c (:behavior t) (fresh-event (:name t))))
+          [e2 x2] (if (> (count x1) 0) (values e1 x1) (run-chain c (:execution t) e1))
+          r (cond
+              (> (count xb) 0) (error-result (:name t) (nth xb 0) 0)
+              (> (count x1) 0) (error-result (:name t) (nth x1 0) 0)
+              expects (expected-check t x2 texts 0)
+              (> (count x2) 0) (error-result (:name t) (nth x2 0) 0)
+              :else (let [[e3 x3] (run-chain c (:validation t) e2)]
+                      (if (> (count x3) 0) (error-result (:name t) (nth x3 0) 0) (result (str (:name t)) SUCCESS "" 0))))
+          [ea xa] (run-chain c (:after-test s) (fresh-event (:name t)))]
+      (assoc r :ms (- (quot (mono-us) 1000) t0))))
+
+(defn- suite-of Vec(m/MSuite) [app: &m/App file: &Str]
+  (let [ss (:suites app)] (loop [i 0] (if (>= i (count ss)) [] (if (= (:file (nth ss i)) file) [(nth ss i)] (recur (+ i 1)))))))
+
+(defn run-suite Outcome [dir: &Str file: &Str opts: &ld/LoadOpts cs: &Vec(conn/Connector) level: Int]
+  (let [l (ld/load-test dir file opts)
+        zc (urls/set-classpath! (:res l))
+        app (:app l)
+        z: Vec(Result) []]
+    (if (> (count (:diags app)) 0) (->Outcome (str file) z (str/join "\n" (m/diag-strs (:diags app))))
+      (let [ss (suite-of app file)]
+        (if (= (count ss) 0) (->Outcome (str file) z "")
+          (let [s (nth ss 0)
+                sv (run/prepare app level cs)
+                c (assoc (:ctx sv) :intercept
+                         [(fn Values(Int ev/Event Vec(err/MErr)) [l: m/Loc e: ev/Event] (mu/intercept l e))])
+                texts (:texts l)
+                gate (atom (let [e: Vec(Str) []] e))
+                live (run/start-flows sv c gate)
+                zl (if (= (:err live) "") 0 (let [w (eprintln (str "mulay test: " file ": " (:err live)))] 0))
+                [eb xb] (run-chain c (:before-suite s) (fresh-event "before-suite"))
+                rs (loop [i 0 acc z]
+                     (if (>= i (count (:tests s))) acc
+                       (let [t (nth (:tests s) i)
+                             r (if (:ignore s) (result (str (:name t)) SKIPPED "" 0)
+                                 (if (> (count xb) 0) (error-result (:name t) (nth xb 0) 0) (run-test gate c s t texts)))
+                             z1 (report-test app r (color?))]
+                         (recur (+ i 1) (conj acc r)))))
+                [ea xa] (run-chain c (:after-suite s) (fresh-event "after-suite"))
+                zs (run/stop-flows live)]
+            (->Outcome (str file) rs "")))))))
+
+(defn- strip-meta Str [s: &Str]
+  (let [t0 (str/trim s)
+        t1 (if (str/ends-with? t0 " at (root)") (subs t0 0 (- (count t0) 10)) t0)
+        k (str/index-of t1 " as ")
+        b (if (< k 0) -1 (str/index-of-after t1 " {" k))]
+    (if (and (>= k 0) (>= b 0) (str/ends-with? t1 "}")) (subs t1 0 k) t1)))
+
+(defn- line-after Str [msg: &Str key: &Str]
+  (let [ls: Vec(Str) (str/split msg "\n")]
+    (loop [i 0] (if (>= i (count ls)) "" (let [t (str/trim (nth ls i))] (if (str/starts-with? t key) (str/trim (subs t (count key) (count t))) (recur (+ i 1))))))))
+
+(defn- first-line Str [s: &Str] (let [k (str/index-of s "\n")] (if (< k 0) (str s) (subs s 0 k))))
+
+(defn failure-report d/Report [app: &m/App r: &Result]
+  (let [fail (= (:status r) FAILURE)
+        x (:err r)
+        msg (:msg r)
+        ex (line-after msg "Expected:")
+        bu (line-after msg "but:")
+        body (let [m (first-line msg) k (str/index-of m ": ")] (if (< k 0) m (subs m (+ k 2) (count m))))
+        exp-got (fn Vec(Str) [m: Str]
+                  (let [a (str/index-of m "expected:<") b (if (< a 0) -1 (str/index-of-after m ">" a))
+                        c (str/index-of m "but was:<") e (if (< c 0) -1 (str/index-of-after m ">" c))
+                        clean (fn Str [t: Str] (str/replace (str/replace t "[" "") "]" ""))]
+                    (if (or (< b 0) (< e 0)) ["" ""] [(clean (subs m (+ a 10) b)) (clean (subs m (+ c 9) e))])))
+        id-mismatch (str/includes? msg "The error ID thrown does not match")
+        desc-mismatch (str/includes? msg "The error description thrown does not match")
+        no-fail (str/includes? msg "was expecting a failure")
+        not-found (str/includes? msg "The expected error type ")
+        title (cond id-mismatch (let [eg (exp-got msg)] (str "expected the error " (nth eg 0) ", but " (nth eg 1) " was raised"))
+                    desc-mismatch (let [eg (exp-got msg)] (str "expected the error description \"" (nth eg 0) "\", but got \"" (nth eg 1) "\""))
+                    no-fail (let [k (str/index-of msg "Error ID: ") t (if (< k 0) "" (subs msg (+ k 10) (count msg))) j (str/index-of t " ")] (str "expected the error " (if (< j 0) t (subs t 0 j)) ", but the test did not fail"))
+                    not-found (let [k (str/index-of msg "error type ") t (subs msg (+ k 11) (count msg)) j (str/index-of t " ")] (str "the expected error type " (if (< j 0) t (subs t 0 j)) " does not exist in the application"))
+                    (and fail (not= ex "")) (str "expected " (strip-meta ex) ", but got " (strip-meta bu))
+                    fail (if (str/includes? body " at file: [") (subs body 0 (str/index-of body " at file: [")) body)
+                    (> (count x) 0) (first-line (:description (nth x 0)))
+                    :else body)
+        code (cond fail "MUNIT:ASSERTION" (> (count x) 0) (err/type-str (nth x 0)) :else "MUNIT:ERROR")
+        r0 (d/report "error" code (str/trim title))
+        r1a (if (> (count x) 0) (rx/located app r0 (:elem (nth x 0)) (cond (or id-mismatch desc-mismatch) "raised here" fail "assertion failed here" :else "failed here")) r0)
+        r1 (if not-found (d/help r1a "check the spelling: an error type exists when a raise-error, an error mapping or a connector of the application can raise it") r1a)
+        r2 (if (and fail (not= ex "")) (d/note (d/note r1 (str "Expected: " ex)) (str "     but: " bu)) r1)]
+    (d/note r2 (str "test: " (:test r)))))
+
+(defn- report-test Int [app: &m/App r: &Result color: Bool]
+  (let [z (println (str (:status r) " - test: " (:test r) " - Time elapsed: " (:ms r) " ms"))]
+    (if (= (:msg r) "") 0 (let [z2 (println (d/render (failure-report app r) color))] 0))))
+
+(defn- color? Bool [] (and (= (getenv "NO_COLOR" "") "") (= (term/term-isatty-c 1) 1)))
+
+(defn- str-cmp Int [a: &Str b: &Str]
+  (let [n (min (count a) (count b))]
+    (loop [i 0]
+      (cond (>= i n) (compare (count a) (count b))
+            (< (nth a i) (nth b i)) -1
+            (> (nth a i) (nth b i)) 1
+            :else (recur (+ i 1))))))
+
+(defn- order Vec(Int) [ks: &Vec(Str)]
+  (loop [i 0 acc: Vec(Int) []]
+    (if (>= i (count ks)) acc
+      (let [pos (loop [j 0] (if (or (>= j (count acc)) (> (str-cmp (nth ks (nth acc j)) (nth ks i)) 0)) j (recur (+ j 1))))
+            acc2 (loop [j 0 out: Vec(Int) []]
+                   (if (> j (count acc)) out
+                     (recur (+ j 1) (cond (= j pos) (let [o2 (conj out i)] (if (< j (count acc)) (conj o2 (nth acc j)) o2))
+                                          (< j (count acc)) (conj out (nth acc j))
+                                          :else out))))]
+        (recur (+ i 1) acc2)))))
+
+(defn- golden-lines Str [os: &Vec(Outcome)]
+  (let [oi (order (loop [i 0 acc: Vec(Str) []] (if (>= i (count os)) acc (recur (+ i 1) (conj acc (:suite (nth os i)))))))]
+    (loop [i 0 out ""]
+      (if (>= i (count oi)) out
+        (let [o (nth os (nth oi i))
+              rs (:results o)
+              ri (order (loop [k 0 acc: Vec(Str) []] (if (>= k (count rs)) acc (recur (+ k 1) (conj acc (:test (nth rs k)))))))
+              body (loop [k 0 b ""]
+                     (if (>= k (count ri)) b
+                       (let [r (nth rs (nth ri k))
+                             msg-lines: Vec(Str) (if (= (:msg r) "") [] (str/split (:msg r) "\n"))
+                             mls (loop [j 0 acc ""] (if (>= j (count msg-lines)) acc (recur (+ j 1) (str acc "| " (str/trimr (nth msg-lines j)) "\n"))))]
+                         (recur (+ k 1) (str b "test " (:test r) " " (:status r) "\n" mls)))))]
+          (recur (+ i 1) (str out "suite " (:suite o) "\n" body)))))))
+
+(defn- free-port Int []
+  (let [[sk e] (net/listen 0 1)]
+    (if (not= e "") 0 (let [p (net/local-port sk) z (net/close sk)] p))))
+
+(defn- with-dynamic-ports ld/LoadOpts [dir: &Str opts: &ld/LoadOpts]
+  (let [names (ld/munit-dynamic-ports dir)]
+    (loop [i 0 ps (:overrides opts)]
+      (if (>= i (count names)) (assoc opts :overrides ps)
+        (recur (+ i 1) (conj ps (m/->Param (nth names i) (m/->PLit (str (free-port))))))))))
+
+(defn run-dir Int [dir: &Str opts0: &ld/LoadOpts cs: &Vec(conn/Connector) level: Int golden: &Str]
+  (let [opts (with-dynamic-ports dir opts0)
+        files (ld/test-suites dir)
+        z6 (http/localhost-ipv6!)
+        t0 (quot (mono-us) 1000)
+        os (loop [i 0 acc: Vec(Outcome) []]
+             (if (>= i (count files)) acc
+               (let [f (nth files i)
+                     z (println (str "Running suite: " f))
+                     o (run-suite dir f opts cs level)
+                     z2 (if (= (:err o) "") 0 (let [w (eprintln (str "mulay test: " f ": " (:err o)))] 0))]
+                 (recur (+ i 1) (conj acc o)))))
+        [n nf ne ns se] (loop [i 0 n 0 nf 0 ne 0 ns 0 se 0]
+                          (if (>= i (count os)) (values n nf ne ns se)
+                            (let [rs (:results (nth os i))
+                                  [a b c d] (loop [k 0 a 0 b 0 c 0 d 0]
+                                              (if (>= k (count rs)) (values a b c d)
+                                                (let [st (:status (nth rs k))]
+                                                  (recur (+ k 1) (+ a 1) (if (= st FAILURE) (+ b 1) b) (if (= st ERROR) (+ c 1) c) (if (= st SKIPPED) (+ d 1) d)))))]
+                              (recur (+ i 1) (+ n a) (+ nf b) (+ ne c) (+ ns d) (if (= (:err (nth os i)) "") se (+ se 1))))))
+        z (println (str "Tests run: " n " - Failed: " nf " - Errors: " ne " - Skipped: " ns " - Time elapsed: " (- (quot (mono-us) 1000) t0) " ms"))
+        zg (if (= golden "") 0 (let [w (write-file golden (golden-lines os))] 0))]
+    (if (and (= nf 0) (= ne 0) (= se 0)) 0 1)))

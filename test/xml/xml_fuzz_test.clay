@@ -1,0 +1,25 @@
+(ns xml-fuzz-test (:require [mulay.lib.xml :as xml] [clay.string :as str]))
+;; malformed input must produce an error value, never an abort: every prefix of a
+;; document exercising most constructs, and pseudo-random byte mutations of it.
+(def DOC (str "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+              "<!DOCTYPE r [<!ENTITY e \"v&#65;\"><!ENTITY m \"<b a='1'>x</b>\"><!ATTLIST r a CDATA #IMPLIED><!-- c --><?p?>]>\n"
+              "<r xmlns=\"urn:a\" xmlns:p=\"urn:p\" p:at=\"&e;&amp;&#x42;\">text &e; &m;<![CDATA[<cd>]]><!--cm--><?pi data?>"
+              "<p:c k='v'/><é>ü</é>\n</r>\n<!-- tail -->"))
+(defn- lcg Int [x: Int] (bit-and (+ (* x 1103515245) 12345) 2147483647))
+(deftest prefixes
+  (is (loop [i 0 ok 0]
+        (if (> i (count DOC)) (> ok 0)
+          (let [[d err] (xml/parse (subs DOC 0 i))]
+            (recur (+ i 1) (if (= err "") (+ ok 1) ok)))))))
+(deftest mutations
+  (is (loop [k 0 seed 7 errs 0]
+        (if (>= k 3000) (> errs 100)
+          (let [s1 (lcg seed) s2 (lcg s1) s3 (lcg s2)
+                pos (mod s1 (count DOC))
+                b (mod s2 256)
+                mode (mod s3 3)
+                doc (cond (= mode 0) (str (subs DOC 0 pos) (chr b) (subs DOC (+ pos 1) (count DOC)))
+                          (= mode 1) (str (subs DOC 0 pos) (subs DOC (+ pos 1) (count DOC)))
+                          :else (str (subs DOC 0 pos) (chr b) (subs DOC pos (count DOC))))
+                [d err] (xml/parse doc)]
+            (recur (+ k 1) s3 (if (= err "") errs (+ errs 1))))))))

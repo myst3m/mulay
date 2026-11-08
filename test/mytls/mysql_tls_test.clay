@@ -1,0 +1,110 @@
+(ns mysql-tls-test (:require [mulay.db.mysql :as my] [mulay.db.mywire :as w] [mulay.db.sql :as sql]
+                             [clay.net :as net] [clay.tls :as tls] [clay.string :as str] [clay.io :as io]))
+
+;; 偽の MySQL サーバー (別スレッド) に sslMode を変えてつなぐ。caching_sha2_password の全部の認証はパスワードを
+;; そのまま送るので、確かめるモードで証明書が通らなければ、パスワードを送る前に止まることを見る。
+;; サーバーの証明書は test/fixtures/apps/https-test/certs (server.pem は mulay test CA の発行で localhost と
+;; 127.0.0.1 向け、rogue.pem は自己署名)
+(c-flags "-DCLAY_PARALLEL")
+
+(def CERTS "test/fixtures/apps/https-test/certs/")
+
+(defn- file Str [name: &Str] (let [[s e] (read-file (str CERTS name))] s))
+
+(defn- path-of Str [name: &Str] (let [[d e] (io/cwd)] (str d "/" CERTS name)))
+
+(defn- hello Str [tls: Bool]
+  (let [caps (bit-or (bit-or (bit-or w/PROTOCOL-41 w/SECURE-CONNECTION) (bit-or w/PLUGIN-AUTH w/DEPRECATE-EOF))
+                     (bit-or w/CONNECT-WITH-DB (if tls w/SSL 0)))
+        o1 (w/wnul (w/w8 "" 10) "8.4.0-fake")
+        o2 (w/w32 o1 7)
+        o3 (w/w8 (str o2 "abcdefgh") 0)
+        o4 (w/w16 o3 (bit-and caps 65535))
+        o5 (w/w16 (w/w8 o4 w/UTF8MB4) 2)
+        o6 (w/w8 (w/w16 o5 (bit-shift-right caps 16)) 21)
+        o7 (str o6 (str-from-bytes (repeat 10 0)) "ijklmnopqrst")]
+    (w/wnul (w/w8 o7 0) "caching_sha2_password")))
+
+(defn- pk Str [seq: Int body: &Str] (let [[b n] (w/packets seq body)] b))
+
+(defn- plain-until-closed Int [s: &net/Sock]
+  (loop [n 0] (let [[c e] (net/read s 65536)] (if (or (not= e "") (= (count c) 0)) n (recur (+ n (count c)))))))
+
+(defn- tls-packet Values(Str Str) [s: &tls/Sock buf: Str]
+  (let [[b seq np] (w/take-packet buf 0)]
+    (if (>= np 0) (values b (subs buf np (count buf)))
+      (let [[c e] (tls/read s 65536)]
+        (if (or (not= e "") (= (count c) 0)) (values "" "closed") (tls-packet s (str buf c)))))))
+
+(defn- serve Str [srv: net/Sock with-tls: Bool cert: Str key: Str]
+  (let [[s ae] (net/accept srv)
+        we (net/write s (pk 0 (hello with-tls)))]
+    (if (not with-tls) (let [n (plain-until-closed s) z (net/close s)] (str "plain " n))
+      (let [[req re] (loop [got ""] (if (>= (count got) 36) (values got "") (let [[c e] (net/read s (- 36 (count got)))] (if (or (not= e "") (= (count c) 0)) (values got "closed") (recur (str got c))))))]
+        (if (not= re "") (let [z (net/close s)] (str "no ssl request " (count req)))
+          (let [[sc sce] (tls/engine-server-config (assoc (assoc (tls/default-server-config) :cert cert) :key key))
+                [ts te] (tls/server-upgrade s sc)
+                [resp rest] (tls-packet ts "")]
+            (if (= resp "") (let [z (tls/close ts)] "tls failed")
+              (let [w1 (tls/write ts (pk 3 (str (chr 1) (chr 4))))
+                    [pw rest2] (tls-packet ts rest)
+                    w2 (tls/write ts (pk 5 (str (chr 0) (chr 0) (chr 0) (chr 2) (chr 0) (chr 0) (chr 0))))
+                    [quit rest3] (tls-packet ts rest2)
+                    z (tls/close ts)]
+                (str "password " (if (> (count pw) 0) (subs pw 0 (- (count pw) 1)) ""))))))))))
+
+(defn- run Values(Str Str) [host: Str with-tls: Bool cert: Str key: Str kvs: Vec(Str)]
+  (let [[srv le] (net/listen 0 4)
+        port (net/local-port srv)
+        f (future (fn Str [x: Int] (serve srv with-tls cert key)) 0)
+        [cs e] (my/open host port "db" "mulay" "s3cret" kvs)
+        z (if (> (count cs) 0) (my/close (nth cs 0)) 0)
+        seen (deref f)
+        z2 (net/close srv)]
+    (values seen (if (sql/ok? e) "ok" (str (:state e) " " (:msg e))))))
+
+(def TRUST-JKS (str "trustCertificateKeyStoreUrl=file:" (path-of "truststore.jks")))
+
+(deftest verify-identity-with-the-trusted-ca
+  (let [[seen r] (run "localhost" true (file "server.pem") (file "server-key.pem") ["sslMode=VERIFY_IDENTITY" TRUST-JKS "trustCertificateKeyStorePassword=changeit"])]
+    (is (= r "ok"))
+    (is (= seen "password s3cret"))))
+
+(deftest verify-ca-with-the-trusted-ca
+  (let [[seen r] (run "127.0.0.1" true (file "server.pem") (file "server-key.pem") ["sslMode=VERIFY_CA" TRUST-JKS])]
+    (is (= r "ok"))
+    (is (= seen "password s3cret"))))
+
+(deftest an-untrusted-certificate-gets-no-password
+  (let [[seen r] (run "localhost" true (file "rogue.pem") (file "rogue-key.pem") ["sslMode=VERIFY_IDENTITY" TRUST-JKS])
+        [seen2 r2] (run "localhost" true (file "rogue.pem") (file "rogue-key.pem") ["sslMode=VERIFY_CA" TRUST-JKS])]
+    (is (= seen "tls failed"))
+    (is (= r (str "08S01 " w/COMM-FAIL)))
+    (is (= seen2 "tls failed"))
+    (is (= r2 (str "08S01 " w/COMM-FAIL)))))
+
+(deftest a-certificate-for-another-host-fails-verify-identity
+  (let [[seen r] (run "127.0.0.2" true (file "server.pem") (file "server-key.pem") ["sslMode=VERIFY_IDENTITY" TRUST-JKS])]
+    (is (= seen "tls failed"))
+    (is (= r (str "08S01 " w/COMM-FAIL)))))
+
+(deftest verify-ca-checks-the-chain-but-not-the-name
+  (let [[seen r] (run "127.0.0.2" true (file "server.pem") (file "server-key.pem") ["sslMode=VERIFY_CA" TRUST-JKS])]
+    (is (= r "ok"))
+    (is (= seen "password s3cret"))))
+
+(deftest preferred-does-not-verify
+  (let [[seen r] (run "localhost" true (file "rogue.pem") (file "rogue-key.pem") [])]
+    (is (= r "ok"))
+    (is (= seen "password s3cret"))))
+
+(deftest a-server-without-ssl-fails-the-ssl-modes
+  (let [[s1 r1] (run "localhost" false "" "" ["sslMode=VERIFY_IDENTITY" TRUST-JKS])
+        [s2 r2] (run "localhost" false "" "" ["sslMode=VERIFY_CA" TRUST-JKS])
+        [s3 r3] (run "localhost" false "" "" ["sslMode=REQUIRED"])]
+    (is (= s1 "plain 0"))
+    (is (= r1 "08001 SSL Connection required, but not provided by server."))
+    (is (= s2 "plain 0"))
+    (is (= r2 "08001 SSL Connection required, but not provided by server."))
+    (is (= s3 "plain 0"))
+    (is (= r3 "08001 SSL Connection required, but not provided by server."))))

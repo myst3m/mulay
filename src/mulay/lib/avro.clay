@@ -1,0 +1,861 @@
+(ns mulay.lib.avro
+  (:require [clay.core] [clay.string :as str] [mulay.lib.yaml :as y] [mulay.lib.dec :as d] [mulay.lib.ieee :as ieee]))
+
+(def K-NULL 0)
+(def K-BOOLEAN 1)
+(def K-INT 2)
+(def K-LONG 3)
+(def K-FLOAT 4)
+(def K-DOUBLE 5)
+(def K-BYTES 6)
+(def K-STRING 7)
+(def K-RECORD 8)
+(def K-ENUM 9)
+(def K-ARRAY 10)
+(def K-MAP 11)
+(def K-UNION 12)
+(def K-FIXED 13)
+
+(def KIND-NAMES: Vec(Str) ["null" "boolean" "int" "long" "float" "double" "bytes" "string" "record" "enum" "array" "map" "union" "fixed"])
+
+(def MAX-DEPTH 1000)
+(def E-NONE 0)
+(def E-PATH 1)
+(def E-UNION 2)
+(def E-PLAIN 3)
+
+(def EOF-MSG "Unexpected end of Avro data")
+(def DEEP-MSG "Avro value is nested too deeply")
+(def MAX-ITEMS 2147483639)
+
+(defrecord SField [name: Str schema: Int doc: Vec(Str) default: Vec(Str) extra: Str])
+
+(defrecord SNode [kind: Int name: Str space: Str error: Bool doc: Vec(Str) fields: Vec(SField) symbols: Vec(Str) edefault: Vec(Str) items: Int branches: Vec(Int) size: Int extra: Str])
+
+(defrecord Schema [nodes: Vec(SNode) root: Int names: Map(Str Int)])
+
+(defvariant AVal
+  (ANull)
+  (ABool b: Bool)
+  (AInt i: Int)
+  (ALong l: Int)
+  (AFloat f: Float)
+  (ADouble x: Float)
+  (ABytes bytes: Str)
+  (AStr s: Str)
+  (ARec rname: Str keys: Vec(Str) vals: Vec(AVal))
+  (AEnum ename: Str symbol: Str)
+  (AArr items: Vec(AVal))
+  (AMap mkeys: Vec(Str) mvals: Vec(AVal))
+  (AFixed fname: Str fbytes: Str))
+
+(defrecord- PS [nodes: Vec(SNode) names: Map(Str Int)])
+
+(defn- no-names Map(Str Int) [] (let [m: Map(Str Int) {}] m))
+
+(defn- mk SNode [kind: Int] (->SNode kind "" "" false [] [] [] [] -1 [] 0 ""))
+
+(defn- fullname-of Str [n: &SNode]
+  (if (= (:space n) "") (str (:name n)) (str (:space n) "." (:name n))))
+
+(defn- named-kind? Bool [k: Int] (or (= k K-RECORD) (= k K-ENUM) (= k K-FIXED)))
+
+(defn root Int [s: &Schema] (:root s))
+(defn node-count Int [s: &Schema] (count (:nodes s)))
+(defn node-kind Int [s: &Schema i: Int] (:kind (nth (:nodes s) i)))
+(defn node-kind-name Str [s: &Schema i: Int] (str (nth KIND-NAMES (:kind (nth (:nodes s) i)))))
+(defn node-name Str [s: &Schema i: Int] (str (:name (nth (:nodes s) i))))
+(defn node-fullname Str [s: &Schema i: Int] (fullname-of (nth (:nodes s) i)))
+(defn node-fields Vec(SField) [s: &Schema i: Int] (:fields (nth (:nodes s) i)))
+(defn node-branches Vec(Int) [s: &Schema i: Int] (:branches (nth (:nodes s) i)))
+(defn node-items Int [s: &Schema i: Int] (:items (nth (:nodes s) i)))
+(defn node-symbols Vec(Str) [s: &Schema i: Int] (:symbols (nth (:nodes s) i)))
+(defn node-size Int [s: &Schema i: Int] (:size (nth (:nodes s) i)))
+(defn find-named Int [s: &Schema fullname: &Str]
+  (if (contains? (:names s) fullname) (get (:names s) fullname 0) -1))
+
+(defn- jq Str [s: &Str]
+  (loop [i 0 o "\""]
+    (if (>= i (count s)) (str o "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (cond (= c 34) (str o "\\\"") (= c 92) (str o "\\\\") (= c 10) (str o "\\n") (= c 13) (str o "\\r")
+                     (= c 9) (str o "\\t") (= c 8) (str o "\\b") (= c 12) (str o "\\f")
+                     (< c 32) (str o "\\u00" (subs "0123456789ABCDEF" (quot c 16) (+ (quot c 16) 1)) (subs "0123456789ABCDEF" (mod c 16) (+ (mod c 16) 1)))
+                     :else (str o (subs s i (+ i 1)))))))))
+
+(defn- jv-into Str [out: Str x: &y/YVal]
+  (match x
+    (y/YTagged t z) (jv-into out z)
+    (y/YNull) (str out "null")
+    (y/YBool b) (str out (if b "true" "false"))
+    (y/YInt t) (str out t)
+    (y/YFloat t) (let [[f ok] (y/float-value x)] (str out (if ok (d/float->shortest-str f) t)))
+    (y/YStr s) (let [q (jq s)] (str out q))
+    (y/YSeq xs) (let [o (loop [i 0 o (str out "[")] (if (>= i (count xs)) o (recur (+ i 1) (jv-into (if (= i 0) o (str o ",")) (nth xs i)))))] (str o "]"))
+    (y/YMap ks vs) (let [o (loop [i 0 o (str out "{")]
+                            (if (>= i (count ks)) o
+                              (let [kq (jq (y/scalar-text (nth ks i)))
+                                    o1 (str (if (= i 0) o (str o ",")) kq ":")]
+                                (recur (+ i 1) (jv-into o1 (nth vs i))))))]
+                     (str o "}"))))
+
+(defn- jv Str [x: &y/YVal] (jv-into "" x))
+
+(defn- text-of Vec(Str) [v: &y/YVal] (match v (y/YStr s) [(str s)] _ []))
+
+(defn- opt-str Vec(Str) [j: &y/YVal k: &Str]
+  (let [[v ok] (y/get-key j k)] (if ok (text-of v) [])))
+
+(defn- strs-with Bool [r: &Vec(Str) k: &Str]
+  (loop [i 0] (cond (>= i (count r)) false (= (nth r i) k) true :else (recur (+ i 1)))))
+
+(defn- props-of Str [j: &y/YVal reserved: &Vec(Str)]
+  (match j
+    (y/YMap ks vs)
+    (loop [i 0 o ""]
+      (if (>= i (count ks)) o
+        (let [k (y/scalar-text (nth ks i))]
+          (if (strs-with reserved k) (recur (+ i 1) o)
+            (let [kq (jq k) vj (jv (nth vs i))] (recur (+ i 1) (str o "," kq ":" vj)))))))
+    _ ""))
+
+(defn- aliases-of Str [j: &y/YVal]
+  (let [[v ok] (y/get-key j "aliases")]
+    (if ok (let [vj (jv v)] (str ",\"aliases\":" vj)) "")))
+
+(defn- prim-kind Int [s: &Str]
+  (loop [i 0] (cond (>= i 8) -1 (= (nth KIND-NAMES i) s) i :else (recur (+ i 1)))))
+
+(defn- name-char? Bool [c: Int first: Bool]
+  (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 95) (>= c 128)
+      (and (not first) (>= c 48) (<= c 57))))
+
+(defn- name-error Str [s: &Str]
+  (cond (= (count s) 0) "Empty name"
+        (not (name-char? (nth s 0) true)) (str "Illegal initial character: " s)
+        :else (loop [i 1]
+                (cond (>= i (count s)) ""
+                      (name-char? (nth s i) false) (recur (+ i 1))
+                      :else (str "Illegal character in: " s)))))
+
+(defn- add-node Values(Int PS) [ps: PS n: SNode]
+  (let [i (count (:nodes ps))]
+    (values i (assoc ps :nodes (conj (:nodes ps) n)))))
+
+(defn- set-node PS [ps: PS i: Int n: SNode]
+  (assoc ps :nodes (assoc (:nodes ps) i n)))
+
+(defn- find-name Int [ps: &PS s: &Str space: &Str]
+  (let [full (if (or (= space "") (str/includes? s ".")) (str s) (str space "." s))]
+    (cond (contains? (:names ps) full) (get (:names ps) full 0)
+          (contains? (:names ps) s) (get (:names ps) s 0)
+          :else -1)))
+
+(defn- w-name Str [n: &SNode cur: &Str]
+  (if (or (= (:space n) "") (= (:space n) cur)) (str (:name n)) (fullname-of n)))
+
+(defn- w-node Values(Str Map(Str Bool)) [nodes: &Vec(SNode) i: Int out: Str seen: Map(Str Bool) cur: &Str]
+  (let [n: SNode (nth nodes i)
+        k (:kind n)]
+    (cond
+      (< k K-RECORD)
+      (if (= (:extra n) "") (values (str out "\"" (nth KIND-NAMES k) "\"") seen)
+        (values (str out "{\"type\":\"" (nth KIND-NAMES k) "\"" (:extra n) "}") seen))
+      (named-kind? k)
+      (let [full (fullname-of n)]
+        (if (contains? seen full)
+          (let [nm (w-name n cur)] (values (str out "\"" nm "\"") seen))
+          (let [seen2 (assoc seen full true)
+                tn (if (= k K-RECORD) (if (:error n) "error" "record") (nth KIND-NAMES k))
+                o1 (str out "{\"type\":\"" tn "\",\"name\":\"" (:name n) "\"")
+                o2 (cond (not= (:space n) "") (if (= (:space n) cur) o1 (str o1 ",\"namespace\":\"" (:space n) "\""))
+                         (not= cur "") (str o1 ",\"namespace\":\"\"")
+                         :else o1)
+                o3 (if (> (count (:doc n)) 0) (let [q (jq (nth (:doc n) 0))] (str o2 ",\"doc\":" q)) o2)]
+            (cond
+              (= k K-FIXED) (values (str o3 ",\"size\":" (:size n) (:extra n) "}") seen2)
+              (= k K-ENUM)
+              (let [syms (loop [j 0 o ""] (if (>= j (count (:symbols n))) o (let [q (jq (nth (:symbols n) j))] (recur (+ j 1) (str o (if (= j 0) "" ",") q)))))
+                    o4 (str o3 ",\"symbols\":[" syms "]")
+                    o5 (if (> (count (:edefault n)) 0) (let [q (jq (nth (:edefault n) 0))] (str o4 ",\"default\":" q)) o4)]
+                (values (str o5 (:extra n) "}") seen2))
+              :else
+              (let [[o4 s4] (loop [j 0 o (str o3 ",\"fields\":[") sn seen2]
+                              (if (>= j (count (:fields n))) (values (str o "]") sn)
+                                (let [f: SField (nth (:fields n) j)
+                                      fq (jq (:name f))
+                                      [o5 s5] (w-node nodes (:schema f) (str o (if (= j 0) "" ",") "{\"name\":" fq ",\"type\":") sn (:space n))
+                                      o6 (if (> (count (:doc f)) 0) (let [q (jq (nth (:doc f) 0))] (str o5 ",\"doc\":" q)) o5)
+                                      o7 (if (> (count (:default f)) 0) (str o6 ",\"default\":" (nth (:default f) 0)) o6)]
+                                  (recur (+ j 1) (str o7 (:extra f) "}") s5))))]
+                (values (str o4 (:extra n) "}") s4))))))
+      (= k K-ARRAY)
+      (let [[o1 s1] (w-node nodes (:items n) (str out "{\"type\":\"array\",\"items\":") seen cur)]
+        (values (str o1 (:extra n) "}") s1))
+      (= k K-MAP)
+      (let [[o1 s1] (w-node nodes (:items n) (str out "{\"type\":\"map\",\"values\":") seen cur)]
+        (values (str o1 (:extra n) "}") s1))
+      :else
+      (loop [j 0 o (str out "[") sn seen]
+        (if (>= j (count (:branches n))) (values (str o "]") sn)
+          (let [[o2 s2] (w-node nodes (nth (:branches n) j) (if (= j 0) o (str o ",")) sn cur)]
+            (recur (+ j 1) o2 s2)))))))
+
+(defn- nodes-json Str [nodes: &Vec(SNode) i: Int]
+  (let [seen: Map(Str Bool) {}
+        [o s] (w-node nodes i "" seen "")]
+    o))
+
+(defn schema->json Str [s: &Schema] (nodes-json (:nodes s) (:root s)))
+(defn node->json Str [s: &Schema i: Int] (nodes-json (:nodes s) i))
+
+(defn- desc Str [nodes: &Vec(SNode) i: Int]
+  (let [n: SNode (nth nodes i) k (:kind n)]
+    (cond
+      (< k K-RECORD) (str (nth KIND-NAMES k))
+      (named-kind? k) (str (:name n))
+      (= k K-ARRAY) (let [e (desc nodes (:items n))] (str "List<" e ">"))
+      (= k K-MAP) (let [e (desc nodes (:items n))] (str "Map<String, " e ">"))
+      :else (let [parts (loop [j 0 acc: Vec(Str) []] (if (>= j (count (:branches n))) acc (recur (+ j 1) (conj acc (desc nodes (nth (:branches n) j))))))]
+              (str "[" (str/join ", " parts) "]")))))
+
+(defn- branch-seg Str [nodes: &Vec(SNode) i: Int]
+  (let [n: SNode (nth nodes i)] (if (named-kind? (:kind n)) (str (:name n)) (str (nth KIND-NAMES (:kind n))))))
+
+(defn- branch-key Str [nodes: &Vec(SNode) i: Int]
+  (let [n: SNode (nth nodes i)] (if (named-kind? (:kind n)) (fullname-of n) (str (nth KIND-NAMES (:kind n))))))
+
+(defn- valid-default? Bool [nodes: &Vec(SNode) i: Int v: &y/YVal depth: Int]
+  (if (> depth 100) true
+    (let [n: SNode (nth nodes i) k (:kind n)]
+      (match v
+        (y/YTagged t z) (valid-default? nodes i z depth)
+        _
+        (cond
+          (= k K-NULL) (match v (y/YNull) true _ false)
+          (= k K-BOOLEAN) (match v (y/YBool b) true _ false)
+          (= k K-INT) (match v (y/YInt t) (let [[x ok] (y/int-value v)] (and ok (>= x -2147483648) (<= x 2147483647))) _ false)
+          (= k K-LONG) (match v (y/YInt t) (let [[x ok] (y/int-value v)] ok) _ false)
+          (or (= k K-FLOAT) (= k K-DOUBLE)) (match v (y/YInt t) true (y/YFloat t) true _ false)
+          (or (= k K-STRING) (= k K-BYTES) (= k K-FIXED)) (match v (y/YStr s) true _ false)
+          (= k K-ENUM) (match v (y/YStr s) true _ false)
+          (= k K-ARRAY) (match v
+                          (y/YSeq xs) (loop [j 0] (if (>= j (count xs)) true (if (valid-default? nodes (:items n) (nth xs j) (+ depth 1)) (recur (+ j 1)) false)))
+                          _ false)
+          (= k K-MAP) (match v
+                        (y/YMap ks xs) (loop [j 0] (if (>= j (count xs)) true (if (valid-default? nodes (:items n) (nth xs j) (+ depth 1)) (recur (+ j 1)) false)))
+                        _ false)
+          (= k K-UNION) (if (= (count (:branches n)) 0) false (valid-default? nodes (nth (:branches n) 0) v (+ depth 1)))
+          :else (match v
+                  (y/YMap ks xs)
+                  (loop [j 0]
+                    (if (>= j (count (:fields n))) true
+                      (let [f: SField (nth (:fields n) j)
+                            [fv found] (y/get-key v (:name f))]
+                        (cond (and found (valid-default? nodes (:schema f) fv (+ depth 1))) (recur (+ j 1))
+                              (and (not found) (> (count (:default f)) 0)) (recur (+ j 1))
+                              :else false))))
+                  _ false))))))
+
+(defn- perr Values(Int PS Str) [ps: PS msg: Str] (values -1 ps msg))
+
+(defn- ok-node Values(Int PS Str) [ps: PS n: SNode]
+  (let [[i ps2] (add-node ps n)] (values i ps2 "")))
+
+(defn- split-name Values(Str Str) [nm: &Str space: &Str]
+  (let [dot (str/last-index-of nm ".")]
+    (if (< dot 0) (values (str nm) (str space))
+      (values (subs nm (+ dot 1) (count nm)) (subs nm 0 dot)))))
+
+(def RESERVED-RECORD: Vec(Str) ["type" "name" "namespace" "doc" "fields" "aliases"])
+(def RESERVED-ENUM: Vec(Str) ["type" "name" "namespace" "doc" "symbols" "default" "aliases"])
+(def RESERVED-FIXED: Vec(Str) ["type" "name" "namespace" "doc" "size" "aliases"])
+(def RESERVED-ARRAY: Vec(Str) ["type" "items"])
+(def RESERVED-MAP: Vec(Str) ["type" "values"])
+(def RESERVED-TYPE: Vec(Str) ["type"])
+(def RESERVED-FIELD: Vec(Str) ["name" "type" "doc" "default" "order" "aliases"])
+
+(defn- extra-of Str [j: &y/YVal reserved: &Vec(Str)]
+  (let [p (props-of j reserved) a (aliases-of j)] (str p a)))
+
+(defn- head Values(Str Str Str Str) [j: &y/YVal ps: &PS space: &Str]
+  (let [[nv nok] (y/get-key j "name")
+        nm (if nok (text-of nv) [])]
+    (if (= (count nm) 0) (values "" "" "" (str "No name in schema: " (jv j)))
+      (let [ns-opt (opt-str j "namespace")
+            sp (if (> (count ns-opt) 0) (nth ns-opt 0) (str space))
+            [short nsp] (split-name (nth nm 0) sp)
+            ne (name-error short)
+            full (if (= nsp "") (str short) (str nsp "." short))]
+        (cond (not= ne "") (values "" "" "" ne)
+              (>= (prim-kind full) 0) (values "" "" "" (str "Schemas may not be named after primitives: " full))
+              (contains? (:names ps) full) (values "" "" "" (str "Can't redefine: " full))
+              :else (values short nsp full ""))))))
+
+(defn- register PS [ps: PS full: &Str i: Int]
+  (assoc ps :names (assoc (:names ps) full i)))
+
+(defn- parse-ref Values(Int PS Str) [s: &Str ps: PS space: &Str]
+  (let [pk (prim-kind s)]
+    (if (>= pk 0) (ok-node ps (mk pk))
+      (let [hit (find-name ps s space)]
+        (if (>= hit 0) (values hit ps "")
+          (let [q (jq s)] (perr ps (str "Undefined name: " q))))))))
+
+(defn- branch-error Str [ps: &PS idx: Int]
+  (let [n: SNode (nth (:nodes ps) idx)
+        bs (:branches n)]
+    (loop [i 0 keys: Vec(Str) []]
+      (if (>= i (count bs)) ""
+        (let [b (nth bs i)
+              bn: SNode (nth (:nodes ps) b)]
+          (if (= (:kind bn) K-UNION) (let [js (nodes-json (:nodes ps) idx)] (str "Nested union: " js))
+            (let [k (branch-key (:nodes ps) b)]
+              (if (strs-with keys k) (str "Duplicate in union:" k)
+                (recur (+ i 1) (conj keys k))))))))))
+
+(defn- parse-union Values(Int PS Str) [items: &Vec(y/YVal) ps: PS space: &Str]
+  (let [[bs ps2 e] (loop [i 0 acc: Vec(Int) [] p ps]
+                     (if (>= i (count items)) (values acc p "")
+                       (let [[b p2 e] (parse-node (nth items i) p space)]
+                         (if (not= e "") (values acc p2 e) (recur (+ i 1) (conj acc b) p2)))))]
+    (if (not= e "") (perr ps2 e)
+      (let [n (assoc (mk K-UNION) :branches bs)
+            [idx ps3] (add-node ps2 n)
+            be (branch-error ps3 idx)]
+        (if (not= be "") (perr ps3 be) (values idx ps3 ""))))))
+
+(defn- map-json? Bool [x: &y/YVal] (match x (y/YMap a b) true _ false))
+
+(defn- parse-field Values(SField PS Str) [fj: &y/YVal ps: PS nspace: &Str]
+  (let [[nv nok] (y/get-key fj "name")
+        nm (if nok (text-of nv) [])
+        dummy (->SField "" -1 [] [] "")]
+    (if (or (not (map-json? fj)) (= (count nm) 0)) (values dummy ps (str "No field name: " (jv fj)))
+      (let [fname (nth nm 0)
+            [tv tok] (y/get-key fj "type")]
+        (if (not tok) (values dummy ps (str "No field type: " (jv fj)))
+          (let [bad-ref (match tv
+                          (y/YStr s) (and (< (prim-kind s) 0) (< (find-name ps s nspace) 0))
+                          _ false)]
+            (if bad-ref
+              (let [tj (jv tv)] (values dummy ps (str tj " is not a defined name. The type of the \"" fname "\" field must be a defined name or a {\"type\": ...} expression.")))
+              (let [[ti ps2 te] (parse-node tv ps nspace)]
+                (if (not= te "") (values dummy ps2 te)
+                  (let [[dv dok] (y/get-key fj "default")
+                        dflt (if dok [(jv dv)] [])
+                        derr (if (and dok (not (valid-default? (:nodes ps2) ti dv 0)))
+                               (let [sj (nodes-json (:nodes ps2) ti)] (str "Invalid default for field " fname ": " (nth dflt 0) " not a " sj))
+                               "")
+                        [ov ook] (y/get-key fj "order")
+                        order (if (and ook (match ov (y/YStr s) (not= s "ascending") _ true)) (let [oj (jv ov)] (str ",\"order\":" oj)) "")
+                        extra (str order (aliases-of fj) (props-of fj RESERVED-FIELD))]
+                    (cond (not= derr "") (values dummy ps2 derr)
+                          (not= (name-error fname) "") (values dummy ps2 (name-error fname))
+                          :else (values (->SField fname ti (opt-str fj "doc") dflt extra) ps2 ""))))))))))))
+
+(defn- dup-field Str [nodes: &Vec(SNode) fs: &Vec(SField) full: &Str]
+  (loop [i 1]
+    (if (>= i (count fs)) ""
+      (let [f: SField (nth fs i)
+            hit (loop [j 0] (cond (>= j i) -1 (= (:name (nth fs j)) (:name f)) j :else (recur (+ j 1))))]
+        (if (< hit 0) (recur (+ i 1))
+          (let [e: SField (nth fs hit)
+                tn (str/upper-case (nth KIND-NAMES (:kind (nth nodes (:schema f)))))
+                en (str/upper-case (nth KIND-NAMES (:kind (nth nodes (:schema e)))))]
+            (str "Duplicate field " (:name f) " in record " full ": " (:name f) " type:" tn " pos:" i " and " (:name e) " type:" en " pos:" hit ".")))))))
+
+(defn- parse-record Values(Int PS Str) [j: &y/YVal ps: PS space: &Str is-error: Bool]
+  (let [[short nsp full he] (head j ps space)]
+    (if (not= he "") (perr ps he)
+      (let [[fv fok] (y/get-key j "fields")]
+        (match fv
+          (y/YSeq xs)
+          (let [n0 (assoc (mk K-RECORD) :name short :space nsp :error is-error)
+                [idx ps1] (add-node ps n0)
+                ps2 (register ps1 full idx)
+                [fs ps3 fe] (loop [i 0 acc: Vec(SField) [] p ps2]
+                              (if (>= i (count xs)) (values acc p "")
+                                (let [[f p2 e] (parse-field (nth xs i) p nsp)]
+                                  (if (not= e "") (values acc p2 e) (recur (+ i 1) (conj acc f) p2)))))]
+            (if (not= fe "") (perr ps3 fe)
+              (let [de (dup-field (:nodes ps3) fs full)]
+                (if (not= de "") (perr ps3 de)
+                  (let [n1 (assoc n0 :fields fs :doc (opt-str j "doc") :extra (extra-of j RESERVED-RECORD))]
+                    (values idx (set-node ps3 idx n1) ""))))))
+          _ (perr ps (str "Record has no fields: " (jv j))))))))
+
+(defn- parse-enum Values(Int PS Str) [j: &y/YVal ps: PS space: &Str]
+  (let [[short nsp full he] (head j ps space)]
+    (if (not= he "") (perr ps he)
+      (let [[sv sok] (y/get-key j "symbols")]
+        (match sv
+          (y/YSeq xs)
+          (let [[syms se] (loop [i 0 acc: Vec(Str) []]
+                            (if (>= i (count xs)) (values acc "")
+                              (let [t (text-of (nth xs i))]
+                                (if (= (count t) 0) (values acc "Null name")
+                                  (let [sname (nth t 0) ne (name-error sname)]
+                                    (cond (not= ne "") (values acc ne)
+                                          (strs-with acc sname) (values acc (str "Duplicate enum symbol: " sname))
+                                          :else (recur (+ i 1) (conj acc sname))))))))]
+            (if (not= se "") (perr ps se)
+              (let [dflt (opt-str j "default")
+                    de (if (and (> (count dflt) 0) (not (strs-with syms (nth dflt 0))))
+                         (str "The Enum Default: " (nth dflt 0) " is not in the enum symbol set: [" (str/join ", " syms) "]")
+                         "")]
+                (if (not= de "") (perr ps de)
+                  (let [n (assoc (mk K-ENUM) :name short :space nsp :doc (opt-str j "doc") :symbols syms :edefault dflt :extra (extra-of j RESERVED-ENUM))
+                        [idx ps2] (add-node ps n)]
+                    (values idx (register ps2 full idx) ""))))))
+          _ (perr ps (str "Enum has no symbols: " (jv j))))))))
+
+(defn- parse-fixed Values(Int PS Str) [j: &y/YVal ps: PS space: &Str]
+  (let [[short nsp full he] (head j ps space)]
+    (if (not= he "") (perr ps he)
+      (let [[sv sok] (y/get-key j "size")
+            [sz zok] (match sv (y/YInt t) (y/int-value sv) _ (values 0 false))]
+        (cond (not (and sok zok (<= sz 2147483647) (>= sz -2147483648))) (perr ps (str "Invalid or no size: " (jv j)))
+              (< sz 0) (perr ps (str "Malformed data. Length is negative: " sz))
+              :else (let [n (assoc (mk K-FIXED) :name short :space nsp :doc (opt-str j "doc") :size sz :extra (extra-of j RESERVED-FIXED))
+                          [idx ps2] (add-node ps n)]
+                      (values idx (register ps2 full idx) "")))))))
+
+(defn- parse-coll Values(Int PS Str) [j: &y/YVal ps: PS space: &Str kind: Int]
+  (let [key (if (= kind K-ARRAY) "items" "values")
+        [cv cok] (y/get-key j key)]
+    (if (not cok) (perr ps (str (if (= kind K-ARRAY) "Array has no items type: " "Map has no values type: ") (jv j)))
+      (let [[ci ps2 ce] (parse-node cv ps space)]
+        (if (not= ce "") (perr ps2 ce)
+          (ok-node ps2 (assoc (mk kind) :items ci :extra (extra-of j (if (= kind K-ARRAY) RESERVED-ARRAY RESERVED-MAP)))))))))
+
+(defn- parse-object Values(Int PS Str) [j: &y/YVal ps: PS space: &Str]
+  (let [[tv tok] (y/get-key j "type")
+        tt (if tok (text-of tv) [])]
+    (if (= (count tt) 0) (perr ps (str "No type: " (jv j)))
+      (let [t (nth tt 0)
+            pk (prim-kind t)]
+        (cond
+          (>= pk 0) (ok-node ps (assoc (mk pk) :extra (extra-of j RESERVED-TYPE)))
+          (= t "record") (parse-record j ps space false)
+          (= t "error") (parse-record j ps space true)
+          (= t "enum") (parse-enum j ps space)
+          (= t "fixed") (parse-fixed j ps space)
+          (= t "array") (parse-coll j ps space K-ARRAY)
+          (= t "map") (parse-coll j ps space K-MAP)
+          :else (let [hit (find-name ps t space)]
+                  (if (>= hit 0) (values hit ps "") (perr ps (str "Type not supported: " t)))))))))
+
+(defn- parse-node Values(Int PS Str) [j: &y/YVal ps: PS space: &Str]
+  (match j
+    (y/YStr s) (parse-ref s ps space)
+    (y/YSeq items) (parse-union items ps space)
+    (y/YMap ks vs) (parse-object j ps space)
+    (y/YTagged t z) (parse-node z ps space)
+    _ (let [jj (jv j)] (perr ps (str "Schema not yet supported: " jj)))))
+
+(defn parse-schema Values(Schema Str) [text: &Str]
+  (let [empty (->Schema [] -1 (no-names))]
+    (if (str/blank? text) (values empty "Cannot parse <null> schema")
+      (let [[j je] (y/parse text)]
+        (if (not= je "") (values empty (str "Invalid JSON: " je))
+          (let [[i ps e] (parse-node j (->PS [] (no-names)) "")]
+            (if (not= e "") (values empty e)
+              (values (->Schema (:nodes ps) i (:names ps)) ""))))))))
+
+(defn- hex2 Str [c: Int]
+  (str (subs "0123456789abcdef" (quot c 16) (+ (quot c 16) 1)) (subs "0123456789abcdef" (mod c 16) (+ (mod c 16) 1))))
+
+(defn- u4 Str [cp: Int] (let [h (hex2 (quot cp 256)) l (hex2 (mod cp 256))] (str "\\u" h l)))
+
+(defn- esc-simple Str [c: Int]
+  (cond (= c 34) "\\\"" (= c 92) "\\\\" (= c 8) "\\b" (= c 12) "\\f" (= c 10) "\\n" (= c 13) "\\r" (= c 9) "\\t" :else ""))
+
+(defn- esc-string Str [out: Str s: &Str]
+  (let [n (count s)]
+    (loop [i 0 o out]
+      (if (>= i n) o
+        (let [c (nth s i)
+              c1 (if (< (+ i 1) n) (nth s (+ i 1)) 0)
+              c2 (if (< (+ i 2) n) (nth s (+ i 2)) 0)
+              sm (esc-simple c)]
+          (cond (not= sm "") (recur (+ i 1) (str o sm))
+                (or (< c 32) (= c 127)) (let [u (u4 c)] (recur (+ i 1) (str o u)))
+                (and (= c 194) (>= c1 128) (<= c1 159)) (let [u (u4 c1)] (recur (+ i 2) (str o u)))
+                (and (= c 226) (>= c1 128) (<= c1 131) (>= c2 128) (< c2 192))
+                (let [u (u4 (+ 8192 (+ (* 64 (- c1 128)) (- c2 128))))] (recur (+ i 3) (str o u)))
+                :else (recur (+ i 1) (str o (subs s i (+ i 1))))))))))
+
+(defn- esc-latin1 Str [out: Str s: &Str]
+  (loop [i 0 o out]
+    (if (>= i (count s)) o
+      (let [c (nth s i) sm (esc-simple c)]
+        (cond (not= sm "") (recur (+ i 1) (str o sm))
+              (or (< c 32) (and (>= c 127) (<= c 159))) (let [u (u4 c)] (recur (+ i 1) (str o u)))
+              (< c 127) (recur (+ i 1) (str o (subs s i (+ i 1))))
+              :else (recur (+ i 1) (str o (chr (+ 192 (quot c 64))) (chr (+ 128 (mod c 64))))))))))
+
+(defn- signed-bytes Str [out: Str s: &Str]
+  (loop [i 0 o (str out "[")]
+    (if (>= i (count s)) (str o "]")
+      (let [c (nth s i)]
+        (recur (+ i 1) (str o (if (= i 0) "" ", ") (if (>= c 128) (- c 256) c)))))))
+
+(defn- scalar-str Str [v: &AVal]
+  (match v
+    (AInt i) (str i)
+    (ALong l) (str l)
+    (AFloat f) (d/float32->shortest-str f)
+    (ADouble x) (d/float->shortest-str x)
+    (ABool b) (if b "true" "false")
+    _ ""))
+
+(defn- gstr-into Str [out: Str v: &AVal]
+  (match v
+    (ANull) (str out "null")
+    (AStr s) (let [o (esc-string (str out "\"") s)] (str o "\""))
+    (ABytes bs) (let [o (esc-latin1 (str out "\"") bs)] (str o "\""))
+    (AEnum en sy) (let [o (esc-string (str out "\"") sy)] (str o "\""))
+    (AFixed fnm fb) (signed-bytes out fb)
+    (AArr items) (let [o (loop [i 0 o (str out "[")] (if (>= i (count items)) o (recur (+ i 1) (gstr-into (if (= i 0) o (str o ", ")) (nth items i)))))] (str o "]"))
+    (ARec rn keys vals) (let [o (loop [i 0 o (str out "{")]
+                                  (if (>= i (count keys)) o
+                                    (let [o1 (esc-string (str (if (= i 0) o (str o ", ")) "\"") (nth keys i))]
+                                      (recur (+ i 1) (gstr-into (str o1 "\": ") (nth vals i))))))]
+                          (str o "}"))
+    (AMap keys vals) (let [o (loop [i 0 o (str out "{")]
+                               (if (>= i (count keys)) o
+                                 (let [o1 (esc-string (str (if (= i 0) o (str o ", ")) "\"") (nth keys i))]
+                                   (recur (+ i 1) (gstr-into (str o1 "\": ") (nth vals i))))))]
+                       (str o "}"))
+    _ (let [t (scalar-str v)] (str out t))))
+
+(defn- jstr-into Str [out: Str v: &AVal]
+  (match v
+    (ANull) (str out "null")
+    (AStr s) (str out s)
+    (ABytes bs) (str out "java.nio.HeapByteBuffer[pos=0 lim=" (count bs) " cap=" (count bs) "]")
+    (AEnum en sy) (str out sy)
+    (AFixed fnm fb) (signed-bytes out fb)
+    (AArr items) (let [o (loop [i 0 o (str out "[")] (if (>= i (count items)) o (recur (+ i 1) (jstr-into (if (= i 0) o (str o ", ")) (nth items i)))))] (str o "]"))
+    (ARec rn keys vals) (gstr-into out v)
+    (AMap keys vals) (let [o (loop [i 0 o (str out "{")]
+                               (if (>= i (count keys)) o
+                                 (let [o1 (str (if (= i 0) o (str o ", ")) (nth keys i) "=")]
+                                   (recur (+ i 1) (jstr-into o1 (nth vals i))))))]
+                       (str o "}"))
+    _ (let [t (scalar-str v)] (str out t))))
+
+(defn value->string Str [v: &AVal] (jstr-into "" v))
+(defn value->generic-string Str [v: &AVal] (gstr-into "" v))
+
+(defn- jclass Str [v: &AVal]
+  (match v
+    (ANull) "null"
+    (ABool b) "java.lang.Boolean"
+    (AInt i) "java.lang.Integer"
+    (ALong l) "java.lang.Long"
+    (AFloat f) "java.lang.Float"
+    (ADouble x) "java.lang.Double"
+    (ABytes bs) "java.nio.HeapByteBuffer"
+    (AStr s) "java.lang.String"
+    (ARec rn keys vals) "org.apache.avro.generic.GenericData$Record"
+    (AEnum en sy) "org.apache.avro.generic.GenericData$EnumSymbol"
+    (AArr items) "java.util.ArrayList"
+    (AMap keys vals) "java.util.LinkedHashMap"
+    (AFixed fnm fb) "org.apache.avro.generic.GenericData$Fixed"))
+
+(defn- val-key Str [v: &AVal]
+  (match v
+    (ANull) "null"
+    (ABool b) "boolean"
+    (AInt i) "int"
+    (ALong l) "long"
+    (AFloat f) "float"
+    (ADouble x) "double"
+    (ABytes bs) "bytes"
+    (AStr s) "string"
+    (ARec rn keys vals) (str rn)
+    (AEnum en sy) (str en)
+    (AArr items) "array"
+    (AMap keys vals) "map"
+    (AFixed fnm fb) (str fnm)))
+
+(defn- to-i32 Int [v: Int]
+  (let [x (bit-and v 4294967295)] (if (>= x 2147483648) (- x 4294967296) x)))
+
+(defn- sat-int Int [x: Float]
+  (cond (not= x x) 0 (>= x 2147483647.0) 2147483647 (<= x -2147483648.0) -2147483648 :else (int x)))
+
+(defn- sat-long Int [x: Float]
+  (cond (not= x x) 0 (>= x 9223372036854775807.0) 9223372036854775807
+        (<= x -9223372036854775808.0) (- -9223372036854775807 1) :else (int x)))
+
+(defn- num-int Values(Int Bool) [v: &AVal]
+  (match v (AInt i) (values i true) (ALong l) (values (to-i32 l) true) (AFloat f) (values (sat-int f) true)
+    (ADouble x) (values (sat-int x) true) _ (values 0 false)))
+
+(defn- num-long Values(Int Bool) [v: &AVal]
+  (match v (AInt i) (values i true) (ALong l) (values l true) (AFloat f) (values (sat-long f) true)
+    (ADouble x) (values (sat-long x) true) _ (values 0 false)))
+
+(defn- num-double Values(Float Bool) [v: &AVal]
+  (match v (AInt i) (values (float i) true) (ALong l) (values (float l) true) (AFloat f) (values f true)
+    (ADouble x) (values x true) _ (values 0.0 false)))
+
+(defn- put-long Str [out: Str n: Int]
+  (loop [v (bit-xor (bit-shift-left n 1) (bit-shift-right n 63)) o out]
+    (if (= (bit-and v -128) 0) (str o (chr v))
+      (recur (unsigned-bit-shift-right v 7) (str o (chr (bit-or 128 (bit-and v 127))))))))
+
+(defn- put-le Str [out: Str n: Int bytes: Int]
+  (loop [i 0 o out] (if (>= i bytes) o (recur (+ i 1) (str o (chr (bit-and (unsigned-bit-shift-right n (* 8 i)) 255)))))))
+
+(defn- put-bytes Str [out: Str s: &Str]
+  (let [o (put-long out (count s))] (str o s)))
+
+(defn- rd-long Values(Int Int Str) [b: &Str pos: Int]
+  (let [n (count b)]
+    (loop [i pos shift 0 acc 0]
+      (if (>= i n) (values 0 i EOF-MSG)
+        (let [c (nth b i)
+              acc2 (bit-or acc (bit-shift-left (bit-and c 127) shift))]
+          (cond (< c 128) (values (bit-xor (unsigned-bit-shift-right acc2 1) (- 0 (bit-and acc2 1))) (+ i 1) "")
+                (>= shift 63) (values 0 (+ i 1) "Invalid long encoding")
+                :else (recur (+ i 1) (+ shift 7) acc2)))))))
+
+(defn- rd-int Values(Int Int Str) [b: &Str pos: Int]
+  (let [n (count b)]
+    (loop [i pos shift 0 acc 0]
+      (if (>= i n) (values 0 i EOF-MSG)
+        (let [c (nth b i)
+              acc2 (bit-or acc (bit-and (bit-shift-left (bit-and c 127) shift) 4294967295))]
+          (cond (< c 128) (values (bit-xor (unsigned-bit-shift-right acc2 1) (- 0 (bit-and acc2 1))) (+ i 1) "")
+                (>= shift 28) (values 0 (+ i 1) "Invalid int encoding")
+                :else (recur (+ i 1) (+ shift 7) acc2)))))))
+
+(defn- rd-le Int [b: &Str pos: Int bytes: Int]
+  (loop [i 0 acc 0] (if (>= i bytes) acc (recur (+ i 1) (bit-or acc (bit-shift-left (nth b (+ pos i)) (* 8 i)))))))
+
+(defn- rd-len Values(Int Int Str) [b: &Str pos: Int]
+  (let [[len p e] (rd-int b pos)]
+    (cond (not= e "") (values 0 p e)
+          (< len 0) (values 0 p (str "Malformed data. Length is negative: " len))
+          (> len (- (count b) p)) (values 0 p EOF-MSG)
+          :else (values len p ""))))
+
+(defn- zero-width? Bool [nodes: &Vec(SNode) i: Int depth: Int]
+  (if (> depth 8) false
+    (let [n: SNode (nth nodes i) k (:kind n)]
+      (cond (= k K-NULL) true
+            (= k K-FIXED) (= (:size n) 0)
+            (= k K-RECORD) (loop [j 0] (cond (>= j (count (:fields n))) true
+                                             (zero-width? nodes (:schema (nth (:fields n) j)) (+ depth 1)) (recur (+ j 1))
+                                             :else false))
+            :else false))))
+
+(defn- dec-items Values(Vec(AVal) Int Str) [sch: &Schema idx: Int b: &Str pos: Int cnt: Int depth: Int acc0: Vec(AVal)]
+  (loop [i 0 p pos acc acc0]
+    (if (>= i cnt) (values acc p "")
+      (let [[v p2 e] (dec-node sch idx b p depth)]
+        (if (not= e "") (values acc p2 e) (recur (+ i 1) p2 (conj acc v)))))))
+
+(defn- dec-entries Values(Vec(Str) Vec(AVal) Map(Str Int) Int Str) [sch: &Schema idx: Int b: &Str pos: Int cnt: Int depth: Int ks0: Vec(Str) vs0: Vec(AVal) ix0: Map(Str Int)]
+  (loop [i 0 p pos ks ks0 vs vs0 ix ix0]
+    (if (>= i cnt) (values ks vs ix p "")
+      (let [[len p2 e] (rd-len b p)]
+        (if (not= e "") (values ks vs ix p2 e)
+          (let [key (subs b p2 (+ p2 len))
+                [v p3 e3] (dec-node sch idx b (+ p2 len) depth)]
+            (cond (not= e3 "") (values ks vs ix p3 e3)
+                  (contains? ix key) (let [at (get ix key 0)] (recur (+ i 1) p3 ks (assoc vs at v) ix))
+                  :else (let [n (count ks)] (recur (+ i 1) p3 (conj ks key) (conj vs v) (assoc ix key n))))))))))
+
+(defn- block-count Values(Int Int Str) [b: &Str pos: Int total: Int zw: Bool]
+  (let [[c p e] (rd-long b pos)]
+    (if (not= e "") (values 0 p e)
+      (if (= c 0) (values 0 p "")
+        (let [[cnt p2 e2] (if (< c 0) (let [[sz p3 e3] (rd-long b p)] (values (- 0 c) p3 e3)) (values c p ""))]
+          (cond (not= e2 "") (values 0 p2 e2)
+                (< cnt 0) (values 0 p2 (str "Malformed data. Length is negative: " cnt))
+                (> cnt MAX-ITEMS) (values 0 p2 "Cannot read collections larger than 2147483639 items in Java library")
+                (> (+ total cnt) MAX-ITEMS) (values 0 p2 "Cannot read collections larger than 2147483639 items in Java library")
+                (and (not zw) (> cnt (- (count b) p2))) (values 0 p2 EOF-MSG)
+                (and zw (> (+ total cnt) 1000000)) (values 0 p2 "Cannot read collections larger than 1000000 zero-width items")
+                :else (values cnt p2 "")))))))
+
+(defn- dec-array Values(AVal Int Str) [sch: &Schema n: &SNode b: &Str pos: Int depth: Int]
+  (let [zw (zero-width? (:nodes sch) (:items n) 0)]
+    (loop [p pos acc: Vec(AVal) []]
+      (let [[cnt p2 e] (block-count b p (count acc) zw)]
+        (cond (not= e "") (values (->ANull) p2 e)
+              (= cnt 0) (values (->AArr acc) p2 "")
+              :else (let [[acc2 p3 e3] (dec-items sch (:items n) b p2 cnt depth acc)]
+                      (if (not= e3 "") (values (->ANull) p3 e3) (recur p3 acc2))))))))
+
+(defn- dec-map Values(AVal Int Str) [sch: &Schema n: &SNode b: &Str pos: Int depth: Int]
+  (let [zw false]
+    (loop [p pos ks: Vec(Str) [] vs: Vec(AVal) [] ix (no-names)]
+      (let [[cnt p2 e] (block-count b p (count ks) zw)]
+        (cond (not= e "") (values (->ANull) p2 e)
+              (= cnt 0) (values (->AMap ks vs) p2 "")
+              :else (let [[ks2 vs2 ix2 p3 e3] (dec-entries sch (:items n) b p2 cnt depth ks vs ix)]
+                      (if (not= e3 "") (values (->ANull) p3 e3) (recur p3 ks2 vs2 ix2))))))))
+
+(defn- dec-record Values(AVal Int Str) [sch: &Schema n: &SNode b: &Str pos: Int depth: Int]
+  (let [fs (:fields n)]
+    (loop [i 0 p pos keys: Vec(Str) [] vals: Vec(AVal) []]
+      (if (>= i (count fs)) (values (->ARec (fullname-of n) keys vals) p "")
+        (let [f: SField (nth fs i)
+              [v p2 e] (dec-node sch (:schema f) b p depth)]
+          (if (not= e "") (values (->ANull) p2 e)
+            (recur (+ i 1) p2 (conj keys (:name f)) (conj vals v))))))))
+
+(defn- dec-node Values(AVal Int Str) [sch: &Schema idx: Int b: &Str pos: Int depth: Int]
+  (if (> depth MAX-DEPTH) (values (->ANull) pos DEEP-MSG)
+    (let [n: SNode (nth (:nodes sch) idx)
+          k (:kind n)
+          left (- (count b) pos)]
+      (cond
+        (= k K-NULL) (values (->ANull) pos "")
+        (= k K-BOOLEAN) (if (< left 1) (values (->ANull) pos EOF-MSG) (values (->ABool (= (nth b pos) 1)) (+ pos 1) ""))
+        (= k K-INT) (let [[v p e] (rd-int b pos)] (if (not= e "") (values (->ANull) p e) (values (->AInt v) p "")))
+        (= k K-LONG) (let [[v p e] (rd-long b pos)] (if (not= e "") (values (->ANull) p e) (values (->ALong v) p "")))
+        (= k K-FLOAT) (if (< left 4) (values (->ANull) pos EOF-MSG)
+                        (values (->AFloat (ieee/bits->float32 (rd-le b pos 4))) (+ pos 4) ""))
+        (= k K-DOUBLE) (if (< left 8) (values (->ANull) pos EOF-MSG)
+                         (values (->ADouble (bits->float (rd-le b pos 8))) (+ pos 8) ""))
+        (= k K-BYTES) (let [[len p e] (rd-len b pos)] (if (not= e "") (values (->ANull) p e) (values (->ABytes (subs b p (+ p len))) (+ p len) "")))
+        (= k K-STRING) (let [[len p e] (rd-len b pos)] (if (not= e "") (values (->ANull) p e) (values (->AStr (subs b p (+ p len))) (+ p len) "")))
+        (= k K-FIXED) (if (> (:size n) left) (values (->ANull) pos EOF-MSG)
+                        (values (->AFixed (fullname-of n) (subs b pos (+ pos (:size n)))) (+ pos (:size n)) ""))
+        (= k K-ENUM) (let [[i p e] (rd-int b pos)]
+                       (cond (not= e "") (values (->ANull) p e)
+                             (or (< i 0) (>= i (count (:symbols n)))) (values (->ANull) p (str "Index " i " out of bounds for length " (count (:symbols n))))
+                             :else (values (->AEnum (fullname-of n) (nth (:symbols n) i)) p "")))
+        (= k K-UNION) (let [[i p e] (rd-int b pos)]
+                        (cond (not= e "") (values (->ANull) p e)
+                              (or (< i 0) (>= i (count (:branches n)))) (values (->ANull) p (str "Index " i " out of bounds for length " (count (:branches n))))
+                              :else (dec-node sch (nth (:branches n) i) b p (+ depth 1))))
+        (= k K-ARRAY) (dec-array sch n b pos (+ depth 1))
+        (= k K-MAP) (dec-map sch n b pos (+ depth 1))
+        :else (dec-record sch n b pos (+ depth 1))))))
+
+(defn decode Values(AVal Int Str) [sch: &Schema b: &Str pos: Int]
+  (if (or (< pos 0) (> pos (count b))) (values (->ANull) pos EOF-MSG)
+    (dec-node sch (:root sch) b pos 0)))
+
+(defn- failure Values(Str Int Str Str) [kind: Int msg: Str path: Str] (values "" kind msg path))
+
+(defn- ok Values(Str Int Str Str) [out: Str] (values out 0 "" ""))
+
+(defn- npe Values(Str Int Str Str) [nodes: &Vec(SNode) idx: Int]
+  (let [ds (desc nodes idx)] (failure E-PATH (str "null value for (non-nullable) " ds) "")))
+
+(defn- cce Values(Str Int Str Str) [nodes: &Vec(SNode) idx: Int v: &AVal]
+  (let [ds (desc nodes idx) js (jstr-into "" v)]
+    (failure E-PATH (str "value " js " (a " (jclass v) ") cannot be cast to expected type " ds) "")))
+
+(defn- rec-value AVal [keys: &Vec(Str) vals: &Vec(AVal) i: Int fname: &Str]
+  (if (and (< i (count keys)) (= (nth keys i) fname)) (nth vals i)
+    (loop [j 0] (cond (>= j (count keys)) (->ANull) (= (nth keys j) fname) (nth vals j) :else (recur (+ j 1))))))
+
+(defn- enc-record Values(Str Int Str Str) [sch: &Schema n: &SNode keys: &Vec(Str) vals: &Vec(AVal) out0: Str depth: Int]
+  (let [fs (:fields n)]
+    (loop [i 0 out out0]
+      (if (>= i (count fs)) (ok out)
+        (let [f: SField (nth fs i)
+              fv: AVal (rec-value keys vals i (:name f))
+              [o k m p] (enc-node sch (:schema f) fv out (+ depth 1))]
+          (cond (= k E-NONE) (recur (+ i 1) o)
+                (= k E-PATH) (failure E-PATH m (str "." (:name f) p))
+                (= k E-UNION) (let [sj (nodes-json (:nodes sch) (:schema f)) js (jstr-into "" fv)]
+                                (failure E-UNION (str "Not in union " sj ": " js " (field=" (:name f) ")") ""))
+                :else (failure k m p)))))))
+
+(defn- enc-array Values(Str Int Str Str) [sch: &Schema n: &SNode items: &Vec(AVal) out0: Str depth: Int]
+  (if (= (count items) 0) (ok (str out0 (chr 0)))
+    (let [o1 (put-long out0 (count items))]
+      (loop [i 0 out o1]
+        (if (>= i (count items)) (ok (str out (chr 0)))
+          (let [[o k m p] (enc-node sch (:items n) (nth items i) out (+ depth 1))]
+            (cond (= k E-NONE) (recur (+ i 1) o)
+                  (= k E-PATH) (failure E-PATH m (str "[" i "]" p))
+                  :else (failure k m p))))))))
+
+(defn- enc-map Values(Str Int Str Str) [sch: &Schema n: &SNode keys: &Vec(Str) vals: &Vec(AVal) out0: Str depth: Int]
+  (if (= (count keys) 0) (ok (str out0 (chr 0)))
+    (let [o1 (put-long out0 (count keys))]
+      (loop [i 0 out o1]
+        (if (>= i (count keys)) (ok (str out (chr 0)))
+          (let [o2 (put-bytes out (nth keys i))
+                [o k m p] (enc-node sch (:items n) (nth vals i) o2 (+ depth 1))]
+            (cond (= k E-NONE) (recur (+ i 1) o)
+                  (= k E-PATH) (failure E-PATH m (str "[\"" (nth keys i) "\"]" p))
+                  :else (failure k m p))))))))
+
+(defn- enc-union Values(Str Int Str Str) [sch: &Schema idx: Int v: &AVal out: Str depth: Int]
+  (let [n: SNode (nth (:nodes sch) idx)
+        key (val-key v)
+        bs (:branches n)
+        hit (loop [i 0] (cond (>= i (count bs)) -1 (= (branch-key (:nodes sch) (nth bs i)) key) i :else (recur (+ i 1))))]
+    (if (< hit 0)
+      (let [uj (nodes-json (:nodes sch) idx) js (jstr-into "" v)]
+        (failure E-UNION (str "Not in union " uj ": " js) ""))
+      (let [o1 (put-long out hit)
+            br (nth bs hit)
+            [o k m p] (enc-node sch br v o1 (+ depth 1))]
+        (if (= k E-PATH) (failure E-PATH m (str "[" (branch-seg (:nodes sch) br) "]" p))
+          (values o k m p))))))
+
+(defn- enc-node Values(Str Int Str Str) [sch: &Schema idx: Int v: &AVal out: Str depth: Int]
+  (if (> depth MAX-DEPTH) (failure E-PLAIN DEEP-MSG "")
+    (let [n: SNode (nth (:nodes sch) idx)
+          k (:kind n)]
+      (cond
+        (= k K-UNION) (enc-union sch idx v out depth)
+        (= k K-NULL) (ok out)
+        (= k K-BOOLEAN)
+        (match v (ABool b) (ok (str out (chr (if b 1 0)))) (ANull) (npe (:nodes sch) idx) _ (cce (:nodes sch) idx v))
+        (= k K-INT)
+        (match v (ANull) (npe (:nodes sch) idx)
+          _ (let [[x good] (num-int v)] (if good (ok (put-long out x)) (cce (:nodes sch) idx v))))
+        (= k K-LONG)
+        (match v (ANull) (npe (:nodes sch) idx)
+          _ (let [[x good] (num-long v)] (if good (ok (put-long out x)) (cce (:nodes sch) idx v))))
+        (= k K-FLOAT)
+        (match v (ANull) (npe (:nodes sch) idx)
+          _ (let [[x good] (num-double v)] (if good (ok (put-le out (ieee/float32->bits x) 4)) (cce (:nodes sch) idx v))))
+        (= k K-DOUBLE)
+        (match v (ANull) (npe (:nodes sch) idx)
+          _ (let [[x good] (num-double v)] (if good (ok (put-le out (float->bits x) 8)) (cce (:nodes sch) idx v))))
+        (= k K-STRING)
+        (match v (AStr s) (ok (put-bytes out s)) (ANull) (npe (:nodes sch) idx) _ (cce (:nodes sch) idx v))
+        (= k K-BYTES)
+        (match v (ABytes bs) (ok (put-bytes out bs)) (ANull) (npe (:nodes sch) idx) _ (cce (:nodes sch) idx v))
+        (= k K-FIXED)
+        (match v
+          (AFixed fnm fb) (if (< (count fb) (:size n))
+                           (failure E-PLAIN (str "arraycopy: last source index " (:size n) " out of bounds for byte[" (count fb) "]") "")
+                           (ok (str out (subs fb 0 (:size n)))))
+          (ANull) (npe (:nodes sch) idx)
+          _ (cce (:nodes sch) idx v))
+        (= k K-ENUM)
+        (match v
+          (AEnum en sy) (let [ord (loop [i 0] (cond (>= i (count (:symbols n))) -1 (= (nth (:symbols n) i) sy) i :else (recur (+ i 1))))]
+                          (if (< ord 0) (npe (:nodes sch) idx) (ok (put-long out ord))))
+          (ANull) (failure E-PATH (str "value null is not a " (:name n)) "")
+          _ (let [js (jstr-into "" v)] (failure E-PATH (str "value " js " (a " (jclass v) ") is not a " (:name n)) "")))
+        (= k K-ARRAY)
+        (match v (AArr items) (enc-array sch n items out depth) (ANull) (npe (:nodes sch) idx) _ (cce (:nodes sch) idx v))
+        (= k K-MAP)
+        (match v (AMap keys vals) (enc-map sch n keys vals out depth) (ANull) (npe (:nodes sch) idx) _ (cce (:nodes sch) idx v))
+        :else
+        (match v (ARec rn keys vals) (enc-record sch n keys vals out depth) (ANull) (npe (:nodes sch) idx) _ (cce (:nodes sch) idx v))))))
+
+(defn encode Values(Str Str) [sch: &Schema v: &AVal]
+  (let [[out k m p] (enc-node sch (:root sch) v "" 0)]
+    (cond (= k E-NONE) (values out "")
+          (and (= k E-PATH) (not= p "")) (let [ds (desc (:nodes sch) (:root sch))] (values "" (str m " at " ds p)))
+          :else (values "" m))))

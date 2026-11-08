@@ -1,0 +1,22 @@
+(ns mysql-keys-test (:require [mulay.db.mysql :as my] [mulay.db.sql :as sql]))
+
+(defn- keys-of Str [insert-id: Int affected: Int]
+  (let [[r e] (my/gen-keys insert-id affected)] (if (= e "") (key-strs r) (str "ERR " e))))
+
+(defn- key-strs Str [r: &sql/Rows]
+  (loop [i 0 out ""]
+    (if (>= i (count (:rows r))) out
+      (recur (+ i 1) (str out (match (nth (nth (:rows r) i) 0) (sql/CBigInt s) s _ "?") ",")))))
+
+(deftest keys-count-from-the-affected-rows
+  (is (= (keys-of 4 1) "4,"))
+  (is (= (keys-of 7 3) "7,8,9,"))
+  (is (= (keys-of 7 0) "7,"))
+  (is (= (keys-of 0 5) "")))
+
+(deftest a-hostile-affected-count-is-an-error
+  (is (= (count (keys-of 1 1000000)) 6888896))
+  (is (= (keys-of 1 1000001) "ERR the server reported 1000001 affected rows, but mulay returns at most 1000000 generated keys"))
+  (is (= (keys-of 1 4611686018427387904) "ERR the server reported 4611686018427387904 affected rows, but mulay returns at most 1000000 generated keys"))
+  (is (= (keys-of 9223372036854775806 2) "9223372036854775806,9223372036854775807,"))
+  (is (= (keys-of 9223372036854775806 3) "ERR the server reported generated keys past 9223372036854775807")))

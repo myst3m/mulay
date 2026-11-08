@@ -1,0 +1,120 @@
+(ns server-test (:require [mulay.conn.mcp :as mcp] [clay.httpmsg :as hm] [clay.string :as str]))
+
+;; MCP サーバーのプロトコル (tools/call のフローは流さない部分)。期待値は実 Mule (mcp 1.5.0) の記録 (test/fixtures/apps/mcp-tools)。
+
+(def TOOLS [(mcp/->Tool "add" "Adds" "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"}},\"required\":[\"a\"]}" 0)])
+(def JSON-SRV (mcp/->Server "S" "L" "/mcp" false "Tools" "1.2.3" TOOLS [] [] [] 0 [] "" []))
+(def SSE-SRV (mcp/->Server "S2" "L" "/m" true "T" "0.1" TOOLS [] [] [] 0 [] "" []))
+
+(def ACCEPT [(hm/->Header "Accept" "application/json, text/event-stream")])
+(def INIT "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}")
+
+(defn- hv Str [a: &mcp/Answer name: &Str]
+  (match (hm/header-of (:headers a) name) (Some v) v (None) "<none>"))
+
+(defn- session Str [srv: &mcp/Server]
+  (let [st (mcp/begin srv "POST" ACCEPT INIT)] (hv (:answer st) "mcp-session-id")))
+
+(defn- with-session Vec(hm/Header) [sid: &Str] [(hm/->Header "Accept" "application/json, text/event-stream") (hm/->Header "Mcp-Session-Id" sid)])
+
+(deftest initialize-opens-a-session
+  (let [st (mcp/begin JSON-SRV "POST" ACCEPT INIT)
+        a (:answer st)]
+    (is (= (:status a) 200))
+    (is (= (count (hv a "mcp-session-id")) 36))
+    (is (= (hv a "mcp-protocol-version") "2025-06-18"))
+    (is (str/starts-with? (:body a) "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"experimental\":{},"))
+    (is (str/ends-with? (:body a) "\"serverInfo\":{\"name\":\"Tools\",\"version\":\"1.2.3\"}}}"))))
+
+(deftest unknown-protocol-version-falls-back-to-latest
+  (let [st (mcp/begin JSON-SRV "POST" ACCEPT "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1999-01-01\"}}")]
+    (is (= (hv (:answer st) "mcp-protocol-version") "2025-06-18"))))
+
+(deftest ping-needs-a-session
+  (let [st (mcp/begin JSON-SRV "POST" ACCEPT "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}")
+        a (:answer st)]
+    (is (= (:status a) 500))
+    (is (= (:body a) "{\"jsonrpc\":\"2.0\",\"id\":8,\"error\":{\"code\":-32000,\"message\":\"Cannot process message because this session hasn't been initialized yet\"}}"))))
+
+(deftest unknown-session-is-404
+  (let [st (mcp/begin JSON-SRV "POST" (with-session "zzz") "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}")
+        a (:answer st)]
+    (is (= (:status a) 404))
+    (is (= (hv a "mcp-session-id") "zzz"))
+    (is (= (:body a) "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Session not found\"}}"))))
+
+(deftest ping-answers-empty-result
+  (let [sid (session JSON-SRV)
+        st (mcp/begin JSON-SRV "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"ping\"}")]
+    (is (= (:body (:answer st)) "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{}}"))))
+
+(deftest notification-is-accepted
+  (let [sid (session JSON-SRV)
+        a (:answer (mcp/begin JSON-SRV "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"))]
+    (is (= (:status a) 202))
+    (is (= (:body a) ""))
+    (is (= (hv a "mcp-protocol-version") "2025-06-18"))))
+
+(deftest tools-list-reserialises-the-schema
+  (let [sid (session JSON-SRV)
+        a (:answer (mcp/begin JSON-SRV "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"))]
+    (is (= (:body a) "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"add\",\"description\":\"Adds\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"}},\"required\":[\"a\"]}}]}}"))))
+
+(deftest call-validates-the-arguments
+  (let [sid (session JSON-SRV)
+        a (:answer (mcp/begin JSON-SRV "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"add\",\"arguments\":{\"a\":\"x\"}}}"))]
+    (is (= (:body a) "{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32602,\"message\":\"Invalid tool parameters: /a: string found, number expected\"}}"))))
+
+(deftest call-of-a-valid-tool-goes-to-the-flow
+  (let [sid (session JSON-SRV)
+        st (mcp/begin JSON-SRV "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"id\":\"q\",\"method\":\"tools/call\",\"params\":{\"name\":\"add\",\"arguments\":{\"a\":1}}}")]
+    (is (= (:kind st) "call"))
+    (is (= (:tool st) 0))
+    (is (= (:id st) "\"q\""))
+    (is (= (:rid st) "q"))))
+
+(deftest unknown-tool
+  (let [sid (session JSON-SRV)
+        a (:answer (mcp/begin JSON-SRV "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\",\"arguments\":{}}}"))]
+    (is (= (:body a) "{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32602,\"message\":\"Unknown tool: invalid_tool_name\",\"data\":\"Tool not found: nope\"}}"))))
+
+(deftest accept-must-name-the-response-type
+  (let [a (:answer (mcp/begin JSON-SRV "POST" [(hm/->Header "Accept" "*/*")] INIT))]
+    (is (= (:status a) 400))
+    (is (= (:body a) "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"Client MUST accept either application/json, text/event-stream or both mediaTypes\"}}"))))
+
+(deftest broken-json-is-a-parse-error
+  (let [a (:answer (mcp/begin JSON-SRV "POST" ACCEPT "{bad"))]
+    (is (= (:status a) 400))
+    (is (str/starts-with? (:body a) "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700,\"message\":\"Unexpected character ('b' (code 98)): was expecting double-quote to start field name"))))
+
+(deftest sse-answers-one-message-event
+  (let [sid (session SSE-SRV)
+        a (:answer (mcp/begin SSE-SRV "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}"))]
+    (is (= (hv a "content-type") "text/event-stream"))
+    (is (= (hv a "mcp-session-id") sid))
+    (is (= (hv a "mcp-protocol-version") "<none>"))
+    (is (= (:body a) "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\n\n"))))
+
+(deftest get-is-not-allowed
+  (is (= (:status (:answer (mcp/begin JSON-SRV "GET" ACCEPT ""))) 405)))
+
+(deftest delete-closes-the-session
+  (let [sid (session JSON-SRV)
+        d (:answer (mcp/begin JSON-SRV "DELETE" (with-session sid) ""))
+        after (:answer (mcp/begin JSON-SRV "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}"))]
+    (is (= (:status d) 202))
+    (is (= (:status after) 404))))
+
+(deftest delete-without-a-session-id
+  (let [a (:answer (mcp/begin JSON-SRV "DELETE" [] ""))]
+    (is (= (:status a) 400))
+    (is (= (:body a) "Invalid SessionId"))))
+
+(deftest tool-result-json
+  (let [sid (session JSON-SRV)
+        st (mcp/begin JSON-SRV "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"add\",\"arguments\":{\"a\":1}}}")
+        items [(mcp/->Item "text" "hello" "" "" "" ["USER" "ASSISTANT"] "") (mcp/->Item "image" "" "image/png" "" "YWJj" [] "")
+               (mcp/->Item "res-text" "t" "text/plain" "file:///a" "" [] "") (mcp/->Item "res-blob" "" "application/octet-stream" "file:///b" "YWJj" [] "")]
+        a (mcp/finish JSON-SRV st items false)]
+    (is (= (:body a) "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"annotations\":{\"audience\":[\"user\",\"assistant\"]},\"text\":\"hello\"},{\"type\":\"image\",\"data\":\"YWJj\",\"mimeType\":\"image/png\"},{\"type\":\"resource\",\"resource\":{\"uri\":\"file:///a\",\"mimeType\":\"text/plain\",\"text\":\"t\"}},{\"type\":\"resource\",\"resource\":{\"uri\":\"file:///b\",\"mimeType\":\"application/octet-stream\",\"blob\":\"YWJj\"}}],\"isError\":false}}"))))

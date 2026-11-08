@@ -1,0 +1,316 @@
+%%% note
+mulet samples/file-test。File コネクタ: write (OVERWRITE / APPEND / CREATE_NEW、
+createParentDirectories)、read (text と outputMimeType=application/csv)、list (非再帰と再帰)、
+copy、move、rename、delete、create-directory と、それぞれの失敗 (FILE:ILLEGAL_PATH、
+FILE:FILE_ALREADY_EXISTS など) が既定のエラー応答にどう出るか。
+作業ディレクトリは /tmp/mulay-oracle-file-test (config.yaml)。シナリオの最初に空にする。
+list はフロー側で path 順に並べ、ディレクトリの size を出さないように変えてある。
+%%% port 18106
+%%% emptydir /tmp/mulay-oracle-file-test
+%%% request POST /file/setup
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "ready"
+}
+%%% request GET /file/read
+%%% response 200
+content-type: text/plain
+
+Hello World
+%%% request GET /file/read?path=sub/nested.txt
+%%% response 200
+content-type: text/plain
+
+Nested file
+%%% request GET /file/read?path=missing.txt
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Path '/tmp/mulay-oracle-file-test/missing.txt' doesn't exist
+%%% request GET /file/read/csv
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "Name": "Alice",
+    "Age": "30"
+  },
+  {
+    "Name": "Bob",
+    "Age": "25"
+  }
+]
+%%% request GET /file/list
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "fileName": "data.csv",
+    "size": 24,
+    "directory": false
+  },
+  {
+    "fileName": "sub",
+    "size": null,
+    "directory": true
+  },
+  {
+    "fileName": "test.txt",
+    "size": 11,
+    "directory": false
+  }
+]
+%%% request GET /file/list?dir=sub
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "fileName": "nested.txt",
+    "size": 11,
+    "directory": false
+  }
+]
+%%% request GET /file/list?dir=nope
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Path '/tmp/mulay-oracle-file-test/nope' doesn't exist
+%%% request GET /file/list/recursive
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "fileName": "data.csv",
+    "size": 24,
+    "directory": false
+  },
+  {
+    "fileName": "sub",
+    "size": null,
+    "directory": true
+  },
+  {
+    "fileName": "nested.txt",
+    "size": 11,
+    "directory": false
+  },
+  {
+    "fileName": "test.txt",
+    "size": 11,
+    "directory": false
+  }
+]
+%%% request POST /file/write?path=w.json
+Content-Type: application/json
+
+{"written": true}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "written",
+  "path": "w.json"
+}
+%%% request GET /file/read?path=w.json
+%%% response 200
+content-type: text/plain
+
+{"written": true}
+%%% request POST /file/write?path=w.json&mode=APPEND
+Content-Type: text/plain
+
++more
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "written",
+  "path": "w.json"
+}
+%%% request GET /file/read?path=w.json
+%%% response 200
+content-type: text/plain
+
+{"written": true}+more
+%%% request POST /file/write?path=w.json&mode=CREATE_NEW
+Content-Type: text/plain
+
+x
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Cannot write to path '/tmp/mulay-oracle-file-test/w.json' because it already exists and write mode 'CREATE_NEW' was selected. Use a different write mode or point to a path which doesn't exist
+%%% request POST /file/write?path=deep/er/x.txt
+Content-Type: text/plain
+
+x
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "written",
+  "path": "deep/er/x.txt"
+}
+%%% request POST /file/write/append
+Content-Type: text/plain
+
+line1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "appended",
+  "path": "append-test.txt"
+}
+%%% request POST /file/write/append
+Content-Type: text/plain
+
+line2
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "appended",
+  "path": "append-test.txt"
+}
+%%% request GET /file/read?path=append-test.txt
+%%% response 200
+content-type: text/plain
+
+line1line2
+%%% request POST /file/copy?source=test.txt&target=copies/test-copy.txt
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "copied",
+  "source": "test.txt",
+  "target": "copies/test-copy.txt"
+}
+%%% request GET /file/read?path=copies/test-copy.txt/test.txt
+%%% response 200
+content-type: text/plain
+
+Hello World
+%%% request GET /file/read?path=copies/test-copy.txt
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Cannot read path '/tmp/mulay-oracle-file-test/copies/test-copy.txt' since it's a directory
+%%% request POST /file/copy?source=missing.txt&target=x.txt
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Path '/tmp/mulay-oracle-file-test/missing.txt' doesn't exist
+%%% request POST /file/move?source=data.csv&target=moved
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "moved",
+  "source": "data.csv",
+  "target": "moved"
+}
+%%% request GET /file/list?dir=moved
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "fileName": "data.csv",
+    "size": 24,
+    "directory": false
+  }
+]
+%%% request POST /file/rename?path=test.txt&to=renamed.txt
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "renamed",
+  "path": "test.txt",
+  "newName": "renamed.txt"
+}
+%%% request GET /file/read?path=renamed.txt
+%%% response 200
+content-type: text/plain
+
+Hello World
+%%% request POST /file/rename?path=missing.txt&to=r.txt
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Path '/tmp/mulay-oracle-file-test/missing.txt' doesn't exist
+%%% request DELETE /file/delete?path=renamed.txt
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "deleted",
+  "path": "renamed.txt"
+}
+%%% request DELETE /file/delete?path=renamed.txt
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Path '/tmp/mulay-oracle-file-test/renamed.txt' doesn't exist
+%%% request POST /file/mkdir?dir=newdir
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "created",
+  "directory": "newdir"
+}
+%%% request POST /file/mkdir?dir=newdir
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Directory '/tmp/mulay-oracle-file-test/newdir' already exists
+%%% request GET /file/list
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "fileName": "append-test.txt",
+    "size": 10,
+    "directory": false
+  },
+  {
+    "fileName": "copies",
+    "size": null,
+    "directory": true
+  },
+  {
+    "fileName": "deep",
+    "size": null,
+    "directory": true
+  },
+  {
+    "fileName": "moved",
+    "size": null,
+    "directory": true
+  },
+  {
+    "fileName": "newdir",
+    "size": null,
+    "directory": true
+  },
+  {
+    "fileName": "sub",
+    "size": null,
+    "directory": true
+  },
+  {
+    "fileName": "w.json",
+    "size": 22,
+    "directory": false
+  }
+]

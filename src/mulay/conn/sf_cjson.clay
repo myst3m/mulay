@@ -1,0 +1,296 @@
+(ns mulay.conn.sf_cjson
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.lib.dec :as dec] [mulay.lib.jhash :as jh]
+            [clay.base64 :as b64] [clay.string :as str]))
+
+(def SRC "\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); ")
+
+(defn- class-meta Vec(v/Field) [cls: &Str] [(v/field "class" (v/->VStr (str cls)))])
+(def CM-LHM (class-meta "java.util.LinkedHashMap"))
+(def CM-HM (class-meta "java.util.HashMap"))
+(def CM-AL (class-meta "java.util.ArrayList"))
+(def CM-STR (class-meta "java.lang.String"))
+(def CM-INT (class-meta "java.lang.Integer"))
+(def CM-LONG (class-meta "java.lang.Long"))
+(def CM-BIGINT (class-meta "java.math.BigInteger"))
+(def CM-DOUBLE (class-meta "java.lang.Double"))
+(def CM-BOOL (class-meta "java.lang.Boolean"))
+
+(defn- line-col Str [s: &Str p: Int]
+  (let [[line last] (loop [i 0 ln 1 lastnl -1] (if (>= i p) (values ln lastnl) (if (= (nth s i) 10) (recur (+ i 1) (+ ln 1) i) (recur (+ i 1) ln lastnl))))]
+    (str "line: " line ", column: " (- p last))))
+
+(defn- loc Str [s: &Str p: Int] (str SRC (line-col s p) "]"))
+
+(defn- char-desc Str [s: &Str p: Int]
+  (let [c (nth s p)]
+    (cond (< c 32) (str "(CTRL-CHAR, code " c ")")
+          (< c 128) (str "'" (subs s p (+ p 1)) "' (code " c ")")
+          :else (let [n (cond (>= c 240) 4 (>= c 224) 3 :else 2)
+                      e (if (> (+ p n) (count s)) (count s) (+ p n))
+                      cp (loop [i (+ p 1) acc (bit-and c (cond (= n 4) 7 (= n 3) 15 :else 31))]
+                           (if (>= i e) acc (recur (+ i 1) (+ (* acc 64) (bit-and (nth s i) 63)))))]
+                  (str "'" (subs s p e) "' (code " cp ")")))))
+
+(defn- ws? Bool [c: Int] (or (= c 32) (= c 9) (= c 10) (= c 13)))
+
+(defn- skip-ws Int [s: &Str p: Int] (loop [i p] (if (and (< i (count s)) (ws? (nth s i))) (recur (+ i 1)) i)))
+
+(defn- ident? Bool [c: Int] (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57)) (= c 95) (= c 36) (>= c 128)))
+
+(defn- bad Values(v/Val Int Str) [msg: Str] (values (v/null-v) -1 msg))
+
+(defn- unrecognized Values(v/Val Int Str) [s: &Str p: Int]
+  (let [e (loop [i p] (if (and (< i (count s)) (< (- i p) 256) (ident? (nth s i))) (recur (+ i 1)) i))
+        e2 (if (= e p) (+ p 1) e)]
+    (bad (str "Unrecognized token '" (subs s p e2) "': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')" (loc s p)))))
+
+(defn- hexv Int [c: Int] (cond (and (>= c 48) (<= c 57)) (- c 48) (and (>= c 97) (<= c 102)) (- c 87) (and (>= c 65) (<= c 70)) (- c 55) :else -1))
+
+(defn- utf8 Str [out: Str cp: Int]
+  (cond (< cp 128) (str out (chr cp))
+        (< cp 2048) (str out (chr (bit-or 192 (bit-shift-right cp 6))) (chr (bit-or 128 (bit-and cp 63))))
+        (< cp 65536) (str out (chr (bit-or 224 (bit-shift-right cp 12))) (chr (bit-or 128 (bit-and (bit-shift-right cp 6) 63))) (chr (bit-or 128 (bit-and cp 63))))
+        :else (str out (chr (bit-or 240 (bit-shift-right cp 18))) (chr (bit-or 128 (bit-and (bit-shift-right cp 12) 63)))
+                   (chr (bit-or 128 (bit-and (bit-shift-right cp 6) 63))) (chr (bit-or 128 (bit-and cp 63))))))
+
+(defn- read-str Values(Str Int Str) [s: &Str p0: Int what: &Str]
+  (let [n (count s)]
+    (loop [p p0 out "" hi -1]
+      (if (>= p n) (values "" -1 (str "Unexpected end-of-input in " what (loc s n)))
+        (let [c (nth s p)]
+          (cond
+            (= c 34) (values out (+ p 1) "")
+            (< c 32) (values "" -1 (str "Illegal unquoted character (" (char-desc s p) "): has to be escaped using backslash to be included in string value" (loc s p)))
+            (= c 92)
+            (if (>= (+ p 1) n) (values "" -1 (str "Unexpected end-of-input in " what (loc s n)))
+              (let [e (nth s (+ p 1))]
+                (cond
+                  (= e 117)
+                  (let [[cp q err] (loop [k 0 acc 0]
+                                     (cond (= k 4) (values acc (+ p 6) "")
+                                           (>= (+ p 2 k) n) (values 0 -1 (str "Unexpected end-of-input in " what (loc s n)))
+                                           (< (hexv (nth s (+ p 2 k))) 0)
+                                           (values 0 -1 (str "Unexpected character (" (char-desc s (+ p 2 k)) "): expected a hex-digit for character escape sequence" (loc s (+ p 2 k))))
+                                           :else (recur (+ k 1) (+ (* acc 16) (hexv (nth s (+ p 2 k)))))))]
+                    (cond (not= err "") (values "" -1 err)
+                          (and (>= cp 55296) (<= cp 56319)) (recur q out cp)
+                          (and (>= cp 56320) (<= cp 57343) (>= hi 0)) (recur q (utf8 out (+ 65536 (* (- hi 55296) 1024) (- cp 56320))) -1)
+                          :else (recur q (utf8 out cp) -1)))
+                  :else
+                  (let [r (cond (= e 34) "\"" (= e 92) "\\" (= e 47) "/" (= e 98) (chr 8) (= e 102) (chr 12) (= e 110) "\n" (= e 114) "\r" (= e 116) "\t" :else "")]
+                    (if (= r "") (values "" -1 (str "Unrecognized character escape " (char-desc s (+ p 1)) (loc s (+ p 1))))
+                      (recur (+ p 2) (str out r) -1))))))
+            :else (recur (+ p 1) (w8 out c) -1)))))))
+
+(defn- w8 Str [out: Str c: Int] (str out (chr c)))
+
+(defn- digits-end Int [s: &Str p: Int] (loop [i p] (if (and (< i (count s)) (>= (nth s i) 48) (<= (nth s i) 57)) (recur (+ i 1)) i)))
+
+(defn- read-num Values(v/Val Int Str) [s: &Str p0: Int]
+  (let [n (count s)
+        neg (= (nth s p0) 45)
+        p1 (if neg (+ p0 1) p0)]
+    (cond
+      (and neg (>= p1 n)) (bad (str "Unexpected end-of-input in null" (loc s n)))
+      (not (and (>= (nth s p1) 48) (<= (nth s p1) 57)))
+      (bad (str "Unexpected character (" (char-desc s p1) ") in numeric value: expected digit (0-9) to follow minus sign, for valid numeric value" (loc s p1)))
+      (and (= (nth s p1) 48) (< (+ p1 1) n) (>= (nth s (+ p1 1)) 48) (<= (nth s (+ p1 1)) 57))
+      (bad (str "Invalid numeric value: Leading zeroes not allowed" (loc s (+ p1 1))))
+      :else
+      (let [ie (digits-end s p1)
+            frac (and (< ie n) (= (nth s ie) 46))
+            fe (if frac (digits-end s (+ ie 1)) ie)]
+        (if (and frac (= fe (+ ie 1)))
+          (bad (str "Unexpected character (" (char-desc s (if (< fe n) fe ie)) ") in numeric value: Decimal point not followed by a digit" (loc s ie)))
+          (let [expo (and (< fe n) (or (= (nth s fe) 101) (= (nth s fe) 69)))
+                es (if (and expo (< (+ fe 1) n) (or (= (nth s (+ fe 1)) 43) (= (nth s (+ fe 1)) 45))) (+ fe 2) (+ fe 1))
+                ee (if expo (digits-end s es) fe)]
+            (if (and expo (= ee es))
+              (bad (str "Unexpected character (" (char-desc s (if (< es n) es fe)) ") in numeric value: Exponent indicator not followed by a digit" (loc s (if (< es n) es fe))))
+              (let [t (subs s p0 ee)]
+                (if (or frac expo)
+                  (let [[f e] (parse-double t) [x xe] (num/from-float f)] (values (v/->VMeta (v/num-v x) CM-DOUBLE) ee ""))
+                  (let [[k e] (parse-long t)]
+                    (cond
+                      (not= e "") (let [[x xe] (num/parse-lit t)] (values (v/->VMeta (v/num-v x) CM-BIGINT) ee ""))
+                      (and (>= k -2147483648) (<= k 2147483647)) (values (v/->VMeta (v/int-v k) CM-INT) ee "")
+                      :else (values (v/->VMeta (v/int-v k) CM-LONG) ee ""))))))))))))
+
+(defn- put Vec(v/Field) [fs: Vec(v/Field) k: &Str x: v/Val]
+  (let [i (loop [j 0] (if (>= j (count fs)) -1 (if (= (:name (:key (nth fs j))) k) j (recur (+ j 1)))))]
+    (if (< i 0) (conj fs (v/field (str k) x)) (assoc fs i (v/field (str k) x)))))
+
+(defn- read-obj Values(v/Val Int Str) [s: &Str p0: Int hash: Bool]
+  (let [n (count s)
+        p1 (skip-ws s (+ p0 1))]
+    (if (and (< p1 n) (= (nth s p1) 125)) (values (v/->VMeta (v/->VObj []) (if hash CM-HM CM-LHM)) (+ p1 1) "")
+      (loop [p p1 fs: Vec(v/Field) []]
+        (cond
+          (>= p n) (bad (str "Unexpected end-of-input: expected close marker for Object (start marker at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); " (line-col s p0) "])" (loc s n)))
+          (not= (nth s p) 34) (bad (str "Unexpected character (" (char-desc s p) "): was expecting double-quote to start field name" (loc s p)))
+          :else
+          (let [[k q ke] (read-str s (+ p 1) "FIELD_NAME")]
+            (if (not= ke "") (bad ke)
+              (let [q1 (skip-ws s q)]
+                (cond
+                  (>= q1 n) (bad (str "Unexpected end-of-input: expected close marker for Object (start marker at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); " (line-col s p0) "])" (loc s n)))
+                  (not= (nth s q1) 58) (bad (str "Unexpected character (" (char-desc s q1) "): was expecting a colon to separate field name and value" (loc s q1)))
+                  :else
+                  (let [[x r xe] (read-value s (skip-ws s (+ q1 1)) p0 "Object")]
+                    (if (not= xe "") (bad xe)
+                      (let [r1 (skip-ws s r) fs2 (put fs k x)]
+                        (cond
+                          (>= r1 n) (bad (str "Unexpected end-of-input: expected close marker for Object (start marker at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); " (line-col s p0) "])" (loc s n)))
+                          (= (nth s r1) 44) (recur (skip-ws s (+ r1 1)) fs2)
+                          (= (nth s r1) 125) (values (if hash (hash-obj fs2) (v/->VMeta (v/->VObj fs2) CM-LHM)) (+ r1 1) "")
+                          (= (nth s r1) 93) (bad (str "Unexpected close marker ']': expected '}' (for Object starting at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); " (line-col s p0) "])" (loc s r1)))
+                          :else (bad (str "Unexpected character (" (char-desc s r1) "): was expecting comma to separate Object entries" (loc s r1))))))))))))))))
+
+(defn hash-obj v/Val [fs: &Vec(v/Field)]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (:name (:key (nth fs i)))))))
+        order (jh/hashmap-order names)]
+    (v/->VMeta (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                           (if (>= i (count order)) acc
+                             (let [k (loop [j 0] (if (= (nth names j) (nth order i)) j (recur (+ j 1))))]
+                               (recur (+ i 1) (conj acc (nth fs k)))))))
+               CM-HM)))
+
+(defn- read-arr Values(v/Val Int Str) [s: &Str p0: Int]
+  (let [n (count s)
+        p1 (skip-ws s (+ p0 1))]
+    (if (and (< p1 n) (= (nth s p1) 93)) (values (v/->VMeta (v/->VArr []) CM-AL) (+ p1 1) "")
+      (loop [p p1 xs: Vec(v/Val) []]
+        (let [[x r xe] (read-value s p p0 "Array")]
+          (if (not= xe "") (bad xe)
+            (let [r1 (skip-ws s r) xs2 (conj xs x)]
+              (cond
+                (>= r1 n) (bad (str "Unexpected end-of-input: expected close marker for Array (start marker at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); " (line-col s p0) "])" (loc s n)))
+                (= (nth s r1) 44) (recur (skip-ws s (+ r1 1)) xs2)
+                (= (nth s r1) 93) (values (v/->VMeta (v/->VArr xs2) CM-AL) (+ r1 1) "")
+                (= (nth s r1) 125) (bad (str "Unexpected close marker '}': expected ']' (for Array starting at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); " (line-col s p0) "])" (loc s r1)))
+                :else (bad (str "Unexpected character (" (char-desc s r1) "): was expecting comma to separate Array entries" (loc s r1)))))))))))
+
+(defn- read-value Values(v/Val Int Str) [s: &Str p: Int open: Int kind: &Str]
+  (let [n (count s)]
+    (if (>= p n)
+      (if (< open 0) (bad (str "No content to map due to end-of-input" SRC (let [lc (line-col s p)] (subs lc 0 (str/index-of lc ","))) "]"))
+        (bad (str "Unexpected end-of-input: expected close marker for " kind " (start marker at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); " (line-col s open) "])" (loc s n))))
+      (let [c (nth s p)]
+        (cond
+          (= c 123) (read-obj s p false)
+          (= c 91) (read-arr s p)
+          (= c 34) (let [[t q e] (read-str s (+ p 1) "VALUE_STRING")] (if (not= e "") (bad e) (values (v/->VMeta (v/->VStr t) CM-STR) q "")))
+          (or (= c 45) (and (>= c 48) (<= c 57))) (read-num s p)
+          (and (<= (+ p 4) n) (= (subs s p (+ p 4)) "true") (or (= (+ p 4) n) (not (ident? (nth s (+ p 4)))))) (values (v/->VMeta (v/bool-v true) CM-BOOL) (+ p 4) "")
+          (and (<= (+ p 5) n) (= (subs s p (+ p 5)) "false") (or (= (+ p 5) n) (not (ident? (nth s (+ p 5)))))) (values (v/->VMeta (v/bool-v false) CM-BOOL) (+ p 5) "")
+          (and (<= (+ p 4) n) (= (subs s p (+ p 4)) "null") (or (= (+ p 4) n) (not (ident? (nth s (+ p 4)))))) (values (v/null-v) (+ p 4) "")
+          (ident? c) (unrecognized s p)
+          :else (bad (str "Unexpected character (" (char-desc s p) "): expected a value" (loc s p))))))))
+
+(def MAP-TYPE "Cannot deserialize value of type `java.util.HashMap<java.lang.String,java.lang.Object>` from ")
+
+(defn read-java Values(v/Val Str) [s: &Str top-hash: Bool]
+  (let [p (skip-ws s 0)
+        n (count s)]
+    (if (and top-hash (< p n))
+      (let [c (nth s p)]
+        (cond
+          (= c 123) (let [[x q e] (read-obj s p true)] (values x e))
+          (= c 91) (values (v/null-v) (str MAP-TYPE "Array value (token `JsonToken.START_ARRAY`)" (loc s p)))
+          :else
+          (let [[x q e] (read-value s p -1 "")]
+            (cond
+              (not= e "") (values x e)
+              (v/null? x) (values x "")
+              :else
+              (match (v/unmeta x)
+                (v/VStr t) (values (v/null-v) (str "Cannot construct instance of `java.util.HashMap` (although at least one Creator exists): no String-argument constructor/factory method to deserialize from String value ('" t "')" (loc s p)))
+                (v/VBool b) (values (v/null-v) (str MAP-TYPE "Boolean value (token `JsonToken.VALUE_" (if b "TRUE" "FALSE") "`)" (loc s p)))
+                _ (let [cls (match x (v/VMeta a m) (let [r (v/obj-get m "class")] (match (nth r 0) (v/VStr k) (str k) _ "")) _ "")]
+                    (values (v/null-v) (str MAP-TYPE (if (= cls "java.lang.Double") "Floating-point value (token `JsonToken.VALUE_NUMBER_FLOAT`)" "Integer value (token `JsonToken.VALUE_NUMBER_INT`)") (loc s p)))))))))
+      (let [[x q e] (read-value s p -1 "")] (values x e)))))
+
+(def HEXU "0123456789ABCDEF")
+
+(defn- esc Str [out: Str s: &Str]
+  (let [n (count s)]
+    (loop [i 0 o (str out "\"")]
+      (if (>= i n) (str o "\"")
+        (let [c (nth s i)]
+          (recur (+ i 1)
+                 (cond (= c 34) (str o "\\\"")
+                       (= c 92) (str o "\\\\")
+                       (= c 8) (str o "\\b")
+                       (= c 9) (str o "\\t")
+                       (= c 10) (str o "\\n")
+                       (= c 12) (str o "\\f")
+                       (= c 13) (str o "\\r")
+                       (< c 32) (str o "\\u00" (subs HEXU (quot c 16) (+ (quot c 16) 1)) (subs HEXU (mod c 16) (+ (mod c 16) 1)))
+                       :else (w8 o c))))))))
+
+(defn- cls-of Str [m: &Vec(v/Field)]
+  (let [r (v/obj-get m "class")] (if (= (count r) 0) "" (match (nth r 0) (v/VStr k) (str k) _ ""))))
+
+(defn- time-class Str [x: &v/Val]
+  (match x
+    (v/VDateTime z) "java.time.ZonedDateTime"
+    (v/VLocalDateTime d) "java.time.LocalDateTime"
+    (v/VDate d) "java.time.LocalDate"
+    (v/VLocalTime t) "java.time.LocalTime"
+    (v/VTime t) "java.time.OffsetTime"
+    _ ""))
+
+(defn- num-text Str [n: &num/Num cls: &Str]
+  (cond
+    (or (= cls "java.lang.Double") (= cls "java.lang.Float")) (dec/float->shortest-str (num/to-float n))
+    (or (= cls "java.lang.Integer") (= cls "java.lang.Long") (= cls "java.math.BigInteger") (= cls "java.math.BigDecimal")) (num/to-plain-str n)
+    (num/integer? n) (num/to-plain-str n)
+    :else (dec/float->shortest-str (num/to-float n))))
+
+(defn- wv Values(Str Str) [out: Str x0: &v/Val chain: &Vec(Str)]
+  (let [[x m] (match x0 (v/VMeta a b) (values a b) _ (values x0 []))
+        cls (cls-of m)
+        tc (time-class x)]
+    (if (not= tc "")
+      (values out (str "Java 8 date/time type `" tc "` not supported by default: add Module \"com.fasterxml.jackson.datatype:jackson-datatype-jsr310\" to enable handling (or disable `MapperFeature.REQUIRE_HANDLERS_FOR_JAVA8_TIMES`) (through reference chain: " (str/join "->" chain) ")"))
+      (match x
+        (v/VNull) (values (str out "null") "")
+        (v/VStr s) (values (esc out s) "")
+        (v/VBool b) (values (str out (if b "true" "false")) "")
+        (v/VInt i) (values (str out (if (or (= cls "java.lang.Double") (= cls "java.lang.Float")) (str i ".0") (str i))) "")
+        (v/VNum n) (values (str out (num-text n cls)) "")
+        (v/VBin b) (values (str out "\"" (b64/encode b) "\"") "")
+        (v/VObj fs)
+        (let [c (if (= cls "") "java.util.LinkedHashMap" cls)
+              fs2 (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count fs)) acc (recur (+ i 1) (put acc (:name (:key (nth fs i))) (:value (nth fs i))))))]
+          (loop [i 0 o (str out "{")]
+            (if (>= i (count fs2)) (values (str o "}") "")
+              (let [f (nth fs2 i)
+                    k (:name (:key f))
+                    o1 (if (> i 0) (str o ",") o)
+                    o2 (str (esc o1 k) ":")
+                    [o3 e] (wv o2 (:value f) (conj chain (str c "[\"" k "\"]")))]
+                (if (not= e "") (values o3 e) (recur (+ i 1) o3))))))
+        (v/VArr xs)
+        (let [c (if (= cls "") "java.util.ArrayList" cls)]
+          (loop [i 0 o (str out "[")]
+            (if (>= i (count xs)) (values (str o "]") "")
+              (let [o1 (if (> i 0) (str o ",") o)
+                    [o2 e] (wv o1 (nth xs i) (conj chain (str c "[" i "]")))]
+                (if (not= e "") (values o2 e) (recur (+ i 1) o2))))))
+        (v/VRange a b) (wv out (v/->VArr (v/items x)) chain)
+        _ (values (esc out (v/type-name x)) "")))))
+
+(defn write-java Values(Str Str) [x: &v/Val] (wv "" x []))
+
+(defn hash-map v/Val [fs: Vec(v/Field)] (hash-obj fs))
+
+(defn hash-copy v/Val [fs: &Vec(v/Field) orig-size: Int]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (:name (:key (nth fs i)))))))
+        want (+ (quot (* orig-size 4) 3) 1)
+        order (if (= orig-size 0) (jh/hashmap-order names) (jh/hashmap-order-with names want))]
+    (v/->VMeta (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                           (if (>= i (count order)) acc
+                             (let [k (loop [j 0] (if (= (nth names j) (nth order i)) j (recur (+ j 1))))]
+                               (recur (+ i 1) (conj acc (nth fs k)))))))
+               CM-HM)))

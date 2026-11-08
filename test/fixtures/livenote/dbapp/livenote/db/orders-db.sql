@@ -1,0 +1,2 @@
+CREATE TABLE orders (id NUMBER(10) PRIMARY KEY, item VARCHAR2(40) NOT NULL, created DATE DEFAULT SYSDATE);
+INSERT INTO orders (id, item, created) VALUES (1, 'pen', '2024-01-02 03:04:05');

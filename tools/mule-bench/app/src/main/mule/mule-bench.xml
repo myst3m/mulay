@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
+  <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18590"/></http:listener-config>
+  <file:config name="F"/>
+  <flow name="ping">
+    <http:listener config-ref="L" path="/ping"/>
+    <set-payload value="pong"/>
+  </flow>
+  <flow name="copy">
+    <http:listener config-ref="L" path="/copy"/>
+    <set-variable variableName="q" value="#[attributes.queryParams]"/>
+    <file:read config-ref="F" path="#[vars.q.d ++ '/' ++ vars.q.f]"/>
+    <file:write config-ref="F" path="#[vars.q.o ++ '/copy-' ++ vars.q.f]"/>
+    <set-payload value="ok"/>
+  </flow>
+  <flow name="csv2json">
+    <http:listener config-ref="L" path="/csv2json"/>
+    <set-variable variableName="q" value="#[attributes.queryParams]"/>
+    <file:read config-ref="F" path="#[vars.q.d ++ '/orders.csv']" outputMimeType="application/csv"/>
+    <file:write config-ref="F" path="#[vars.q.o ++ '/csv2json.json']">
+      <file:content>#[output application/json --- payload map {id: $.id as Number, customer: $.customer, region: $.region, total: ($.amount as Number) * ($.qty as Number), date: $.date}]</file:content>
+    </file:write>
+    <set-payload value="ok"/>
+  </flow>
+  <flow name="json2xml">
+    <http:listener config-ref="L" path="/json2xml"/>
+    <set-variable variableName="q" value="#[attributes.queryParams]"/>
+    <file:read config-ref="F" path="#[vars.q.d ++ '/orders.json']"/>
+    <file:write config-ref="F" path="#[vars.q.o ++ '/json2xml.xml']">
+      <file:content>#[output application/xml --- {orders: {(payload map {order @(id: $.id): {customer: $.customer, region: $.region, amount: $.amount, qty: $.qty}})}}]</file:content>
+    </file:write>
+    <set-payload value="ok"/>
+  </flow>
+  <flow name="xml2json">
+    <http:listener config-ref="L" path="/xml2json"/>
+    <set-variable variableName="q" value="#[attributes.queryParams]"/>
+    <file:read config-ref="F" path="#[vars.q.d ++ '/orders.xml']"/>
+    <file:write config-ref="F" path="#[vars.q.o ++ '/xml2json.json']">
+      <file:content>#[output application/json --- payload.orders.*order map {id: $.@id as Number, customer: $.customer, amount: $.amount as Number}]</file:content>
+    </file:write>
+    <set-payload value="ok"/>
+  </flow>
+  <flow name="json-filter">
+    <http:listener config-ref="L" path="/json-filter"/>
+    <set-variable variableName="q" value="#[attributes.queryParams]"/>
+    <file:read config-ref="F" path="#[vars.q.d ++ '/orders.json']"/>
+    <file:write config-ref="F" path="#[vars.q.o ++ '/json-filter.json']">
+      <file:content>#[output application/json --- payload filter ($.amount &gt; 500) map {id: $.id, c: upper($.customer), q: $.qty * 2}]</file:content>
+    </file:write>
+    <set-payload value="ok"/>
+  </flow>
+  <flow name="json-agg">
+    <http:listener config-ref="L" path="/json-agg"/>
+    <set-variable variableName="q" value="#[attributes.queryParams]"/>
+    <file:read config-ref="F" path="#[vars.q.d ++ '/orders.json']"/>
+    <set-payload value="#[output application/json --- payload groupBy $.region mapObject ((v, k) -&gt; (k): {n: sizeOf(v), sum: v reduce ((x, a = 0) -&gt; a + x.amount), maxQty: max(v.qty)})]"/>
+    <file:write config-ref="F" path="#[vars.q.o ++ '/json-agg.json']"/>
+    <set-payload value="ok"/>
+  </flow>
+</mule>

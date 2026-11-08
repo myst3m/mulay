@@ -1,0 +1,81 @@
+(ns mulay.dw.sty (:require [clay.string :as str]))
+
+(defvariant STy
+  (SAny)
+  (SNull)
+  (SBool lit: Vec(Str))
+  (SNum lit: Vec(Str))
+  (SStr lit: Vec(Str))
+  (SArr e: Vec(STy))
+  (SObj keys: Vec(Str) vals: Vec(STy) known: Bool)
+  (SUnion xs: Vec(STy)))
+
+(defn any STy [] (->SAny))
+(defn null-t STy [] (->SNull))
+(defn num STy [lit: Vec(Str)] (->SNum lit))
+(defn str-t STy [lit: Vec(Str)] (->SStr lit))
+(defn bool-t STy [lit: Vec(Str)] (->SBool lit))
+(defn arr STy [e: STy] (->SArr [e]))
+(defn obj STy [] (let [k: Vec(Str) [] v: Vec(STy) []] (->SObj k v false)))
+(defn obj-of STy [keys: Vec(Str) vals: Vec(STy)] (->SObj keys vals true))
+
+(defn any? Bool [t: &STy] (match t (SAny) true _ false))
+
+(defn members Vec(STy) [t: &STy]
+  (match t (SUnion xs) xs _ [t]))
+
+(defn show Str [t: &STy]
+  (match t
+    (SAny) "Any"
+    (SNull) "Null"
+    (SBool l) (if (= (count l) 0) "Boolean" (nth l 0))
+    (SNum l) (if (= (count l) 0) "Number" (nth l 0))
+    (SStr l) (if (= (count l) 0) "String" (str "\"" (nth l 0) "\""))
+    (SArr e) (let [x (show (nth e 0))] (str "Array<" x ">"))
+    (SObj ks vs known)
+    (if (or (not known) (= (count ks) 0)) "Object"
+      (let [body (str/join ", " (loop [i 0 acc: Vec(Str) []]
+                                   (if (>= i (count ks)) acc
+                                     (recur (+ i 1) (conj acc (str (key-str (nth ks i)) ": " (show (nth vs i))))))))]
+        (if (single-chain? t) (str "{| " body " |}") (str "{|" body "|}"))))
+    (SUnion xs) (str/join " | " (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (show (nth xs i)))))))))
+
+(defn- single-chain? Bool [t: &STy]
+  (match t
+    (SObj ks vs known) (if (or (not known) (= (count ks) 0)) true (and (= (count ks) 1) (single-chain? (nth vs 0))))
+    _ true))
+
+(defn- key-str Str [k: &Str]
+  (let [ok (and (> (count k) 0)
+                (let [c (nth k 0)] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+                (loop [i 1] (if (>= i (count k)) true
+                              (let [c (nth k i)]
+                                (if (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 95))
+                                  (recur (+ i 1)) false)))))]
+    (if ok (str k) (str "\"" k "\""))))
+
+(defn union STy [a: &STy b: &STy]
+  (if (or (any? a) (any? b)) (any)
+    (let [xs (loop [i 0 acc (members a)]
+               (let [bs (members b)]
+                 (if (>= i (count bs)) acc
+                   (let [m (nth bs i)
+                         dup (loop [k 0] (if (>= k (count acc)) false (if (= (show (nth acc k)) (show m)) true (recur (+ k 1)))))]
+                     (recur (+ i 1) (if dup acc (conj acc m)))))))]
+      (if (= (count xs) 1) (nth xs 0) (->SUnion xs)))))
+
+(defn drop-null STy [t: &STy]
+  (let [ms (members t)
+        keep (loop [i 0 acc: Vec(STy) []] (if (>= i (count ms)) acc (recur (+ i 1) (match (nth ms i) (SNull) acc _ (conj acc (nth ms i))))))]
+    (cond (any? t) (any)
+          (= (count keep) 0) (any)
+          (= (count keep) 1) (nth keep 0)
+          :else (->SUnion keep))))
+
+(defn elem STy [t: &STy]
+  (match t
+    (SArr e) (nth e 0)
+    _ (any)))
+
+(defn tag Int [t: &STy]
+  (match t (SAny) 0 (SNull) 1 (SBool l) 2 (SNum l) 3 (SStr l) 4 (SArr e) 5 (SObj ks vs k) 6 _ 0))

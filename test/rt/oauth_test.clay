@@ -1,0 +1,120 @@
+(ns oauth-test (:require [mulay.app.run :as run] [mulay.rt.engine :as en] [mulay.mule.load :as ld] [mulay.lib.res :as res]
+                         [mulay.mule.model :as m] [mulay.conn.registry :as creg] [mulay.conn.sf_core :as sfc]
+                         [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]))
+
+;; トークンの口を別スレッドで立てる (既定のビルドでは future がその場で動く)
+(c-flags "-DCLAY_PARALLEL")
+
+;; Salesforce の OAuth の認可コード (config-with-oauth-connection): 認可の口のリダイレクト、コールバックでのトークンの
+;; 受け取り、refresh_token での取り直し、失敗。トークンの口は、テストの中で立てる偽物 (実 Salesforce は PKCE を
+;; 求めるので、実 Mule とはコールバックまで照合できない: test/fixtures/apps/salesforce-oauth)。
+
+(def TOKEN-PORT 19987)
+
+;; 偽のトークンの口が PKCE の要求で受けた code_verifier
+(def SEEN-VERIFIER (atom ""))
+
+;; 要求の本文 (form) の name の値
+(defn- form-field Str [b: &Str name: &Str]
+  (let [i (str/index-of b (str name "="))]
+    (if (< i 0) ""
+      (let [from (+ i (count name) 1) j (str/index-of-after b "&" from)] (subs b from (if (< j 0) (count b) j))))))
+
+;; 偽のトークンの口: code=C1 なら AT1 と RT1、refresh_token=RT1 なら AT2 (リフレッシュトークンは返さない)、
+;; code=C2 (PKCE) は code_verifier があれば AT3 (受けた code_verifier を覚える)、それ以外は 400
+(defn- token-endpoint hm/Response [req: hm/Request]
+  (let [b (:body req)]
+    (cond
+      (and (str/includes? b "grant_type=authorization_code") (str/includes? b "code=C2"))
+      (let [v (form-field b "code_verifier") z (swap! SEEN-VERIFIER (fn Str [o: Str] (str v)))]
+        (if (= v "") (hm/response 400 [(hm/->Header "Content-Type" "application/json")] "{\"error\":\"invalid_request\",\"error_description\":\"missing required code challenge\"}" false)
+          (hm/response 200 [(hm/->Header "Content-Type" "application/json")] "{\"access_token\":\"AT3\",\"instance_url\":\"https://inst.example\",\"refresh_token\":\"RT3\"}" false)))
+      (and (str/includes? b "grant_type=authorization_code") (str/includes? b "code=C1") (str/includes? b "client_secret=S"))
+      (hm/response 200 [(hm/->Header "Content-Type" "application/json")] "{\"access_token\":\"AT1\",\"instance_url\":\"https://inst.example\",\"refresh_token\":\"RT1\"}" false)
+      (and (str/includes? b "grant_type=refresh_token") (str/includes? b "refresh_token=RT1"))
+      (hm/response 200 [(hm/->Header "Content-Type" "application/json")] "{\"access_token\":\"AT2\",\"instance_url\":\"\"}" false)
+      :else (hm/response 400 [(hm/->Header "Content-Type" "application/json")] "{\"error\":\"invalid_grant\"}" false))))
+
+(def APP (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\" xmlns:salesforce=\"http://www.mulesoft.org/schema/mule/salesforce\">\n"
+              "<http:listener-config name=\"HTTP\"><http:listener-connection host=\"0.0.0.0\" port=\"9050\"/></http:listener-config>\n"
+              "<salesforce:sfdc-config name=\"SF\"><salesforce:config-with-oauth-connection>"
+              "<salesforce:oauth-authorization-code consumerKey=\"CK\" consumerSecret=\"S\" authorizationUrl=\"https://login.example/services/oauth2/authorize\" "
+              "accessTokenUrl=\"http://127.0.0.1:19987/token\" scopes=\"api refresh_token\"/>"
+              "<salesforce:oauth-callback-config listenerConfig=\"HTTP\" callbackPath=\"/callback\" authorizePath=\"/authorize\" externalCallbackUrl=\"http://localhost:9050/callback\"/>"
+              "</salesforce:config-with-oauth-connection></salesforce:sfdc-config>\n"
+              "<flow name=\"f\"><http:listener config-ref=\"HTTP\" path=\"/x\"/><set-payload value=\"x\"/></flow>\n</mule>"))
+
+;; PKCE を有効にしたアプリ (mulay だけの拡張)
+(def APP-PKCE (str/replace (str/replace APP "<flow name=\"f\">" "<global-property name=\"mulay.salesforce.pkce\" value=\"true\"/>\n<flow name=\"f\">")
+                           "name=\"SF\"" "name=\"SFP\""))
+
+(defn- req hm/Request [uri: Str]
+  (hm/->Request "GET" uri [(hm/->Header "Host" "localhost:9050")] "" "127.0.0.1:5000" 9050 "" "HTTP/1.1" (hm/->NoStream)))
+
+(defn- call Str [uri: Str] (call-app APP uri))
+
+(defn- call-app Str [text: Str uri: Str]
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [text] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        r (run/handle c rs (req uri))
+        loc: Str (match (hm/header-of (:headers r) "location") (Some x) x (None) "")]
+    (str (:status r) "|" loc "|" (:body r))))
+
+(defn- sf-cfg m/Config [] (sf-cfg-of APP))
+
+(defn- sf-cfg-of m/Config [text: Str]
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [text] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        cs (:configs a)]
+    (loop [i 0] (if (= (:kind (nth cs i)) "salesforce:sfdc-config") (nth cs i) (recur (+ i 1))))))
+
+(defn- tok Str [fresh: Bool] (tok-of APP fresh))
+
+(defn- tok-of Str [text: Str fresh: Bool]
+  (let [[s e] (sfc/session (atom (->dyn (let [m: Map(Str Dyn) {}] m))) (sf-cfg-of text) fresh)]
+    (if (not= e "") e (str (:token s) "@" (:instance s)))))
+
+(deftest authorization-code
+  (let [sv (http/new-server)
+        f (future (fn Int [k: Int] (let [[rc e] (http/run-server token-endpoint (assoc (assoc (http/default-server-opts) :port TOKEN-PORT) :server sv))] rc)) 0)
+        z0 (sleep-ms 300)
+        a1 (call "/authorize")
+        before (tok false)
+        bad (call "/callback?code=WRONG")
+        denied (call "/callback?error=access_denied")
+        good (call "/callback?code=C1")
+        after (tok false)
+        refreshed (tok true)
+        again (tok false)
+        ;; PKCE: 認可の口が code_challenge を付け、コールバックが code_verifier を送る
+        p1 (call-app APP-PKCE "/authorize")
+        ch (let [i (str/index-of p1 "code_challenge=")] (if (< i 0) "" (subs p1 (+ i 15) (+ i 15 43))))
+        pgood (call-app APP-PKCE "/callback?code=C2")
+        pver (deref SEEN-VERIFIER)
+        ptok (tok-of APP-PKCE false)
+        ;; 使った code_verifier は捨てる: もう一度のコールバックは code_verifier を送らない
+        pagain (call-app APP-PKCE "/callback?code=C2")
+        z1 (http/stop sv 1000)
+        z2 (deref f)]
+    (is (= a1 "302|https://login.example/services/oauth2/authorize?response_type=code&client_id=CK&scope=api+refresh_token&redirect_uri=http%3A%2F%2Flocalhost%3A9050%2Fcallback|"))
+    (is (= before "OAuth authorization dance not yet performed for resourceOwnerId null"))
+    (is (= bad "500||Failed to retrieve access token: Invalid status code: 400, response body: {\"error\":\"invalid_grant\"}"))
+    (is (= denied "500||Failed to retrieve access token: access_denied"))
+    (is (= good "200||Successfully retrieved access token!"))
+    (is (= after "AT1@https://inst.example"))
+    ;; 取り直しで新しいアクセストークン。インスタンスとリフレッシュトークンは前のもの
+    (is (= refreshed "AT2@https://inst.example"))
+    (is (= again "AT2@https://inst.example"))
+    (is (str/ends-with? p1 "&code_challenge_method=S256|"))
+    (is (= (count pver) 43))
+    (is (= ch (sfc/pkce-challenge pver)))
+    (is (= pgood "200||Successfully retrieved access token!"))
+    (is (= ptok "AT3@https://inst.example"))
+    (is (= pagain "500||Failed to retrieve access token: Invalid status code: 400, response body: {\"error\":\"invalid_request\",\"error_description\":\"missing required code challenge\"}"))))
+
+;; listener の設定が無いときの起動の誤りは、経路 2 つ (authorize と callback) でも 1 つ
+(deftest oauth-missing-listener
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [(str/replace APP "listenerConfig=\"HTTP\"" "listenerConfig=\"NOPE\"")] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))]
+    (is (= errs ["Listener config 'NOPE' not found"]))
+    (is (= (count rs) 1))))

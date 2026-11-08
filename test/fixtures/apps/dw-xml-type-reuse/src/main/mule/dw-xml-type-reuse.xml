@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18589"/>
+    </http:listener-config>
+
+    <error-handler name="eh">
+        <on-error-continue type="ANY">
+            <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="order">
+        <http:listener config-ref="L" path="/order"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import * from xmlschema!schemas::Order
+ns o http://example.com/order
+output application/json
+---
+{
+  root: payload is Root,
+  element: payload is orderElementDefinition,
+  items: (payload.o#order.*o#item default []) map ($ is ItemTypeDefinition.o#ItemType),
+  typed: {o#order @(status: payload.o#order.@status): {o#id: payload.o#order.o#id as Number default 0, o#item: {o#name: "a", o#qty: 2}}} is Root
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="eh"/>
+    </flow>
+
+    <flow name="person">
+        <http:listener config-ref="L" path="/person"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import * from xmlschema!schemas::Mix
+output application/json
+---
+{
+  root: payload is Root,
+  person: payload is personElementDefinition,
+  note: payload is noteElementDefinition
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="eh"/>
+    </flow>
+
+    <flow name="literal">
+        <http:listener config-ref="L" path="/literal"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import Root as Order, StatusTypeDefinition from xmlschema!schemas::Order
+ns o http://example.com/order
+output application/json
+---
+{
+  ok: {o#order @(status: "NEW"): {o#id: 1, o#item: {o#name: "a", o#qty: 2}}} is Order,
+  badStatus: {o#order @(status: "BAD"): {o#id: 1, o#item: {o#name: "a", o#qty: 2}}} is Order,
+  noNs: {order @(status: "NEW"): {id: 1, item: {name: "a", qty: 2}}} is Order,
+  status: {o#StatusType: "DONE"} is StatusTypeDefinition,
+  statusBad: {o#StatusType: "X"} is StatusTypeDefinition
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="eh"/>
+    </flow>
+    <flow name="invoice">
+        <http:listener config-ref="L" path="/invoice"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import * from xmlschema!schemas::Main
+ns m urn:main
+ns c urn:common
+output application/json
+---
+{
+  ok: {m#invoice: {m#total: {c#amount: 1, c#ccy: "JPY"}, c#header: "h", m#line: {m#sku: "a"}}} is Root,
+  badTotal: {m#invoice: {m#total: {c#amount: "x", c#ccy: "JPY"}, c#header: "h", m#line: {m#sku: "a"}}} is Root,
+  noHeader: {m#invoice: {m#total: {c#amount: 1, c#ccy: "JPY"}, m#line: {m#sku: "a"}}} is Root,
+  header: {c#header: "only"} is Root,
+  line: {m#Line: {m#sku: "s"}} is LineDefinition
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="eh"/>
+    </flow>
+</mule>

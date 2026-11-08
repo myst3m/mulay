@@ -1,0 +1,481 @@
+(ns mulay.conn.apikit
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.fmt.registry :as reg] [mulay.mule.model :as m]
+            [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.lib.xml :as xml]
+            [mulay.lib.yaml :as y] [mulay.lib.jsonschema :as js] [mulay.lib.jsonskema :as jsk] [mulay.conn.apispec :as sp] [mulay.conn.raml :as raml] [mulay.mule.amodel :as am] [mulay.lib.youtline :as yo]
+            [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/mule-apikit")
+
+(defn- aerr err/MErr [id: Str desc: Str] (err/mk "APIKIT" id desc))
+
+(defn parse-api Values(sp/Api Str) [src: &Str name: &Str res: &Fn(Str Values(Str Bool)) apikit: &Str]
+  (if (str/starts-with? (str/trim src) "#%RAML") (raml/parse-raml src name res) (sp/parse-oas src name res apikit)))
+
+(defn apikit-version Str [app: &m/App]
+  (let [ds (:deps app)]
+    (loop [i 0] (if (>= i (count ds)) "" (if (= (:artifact (nth ds i)) "mule-apikit-module") (str (:version (nth ds i))) (recur (+ i 1)))))))
+
+(defn api-path Str [api: &Str res: &Fn(Str Values(Str Bool))]
+  (let [[s1 f1] (res api)]
+    (if (or f1 (= api "") (str/includes? api "::")) (str api)
+      (let [p2 (str "api/" api) [s2 f2] (res p2)] (if f2 p2 (str api))))))
+
+(defn- cfg-param Str [cfg: &m/Config k: &Str default: Str] (conn/param-lit (:params cfg) k default))
+
+(defn- load-config Vec(Str) [cache: &Atom cfg: &m/Config res: &Fn(Str Values(Str Bool)) apikit: &Str]
+  (let [raw (cfg-param cfg "api" "")
+        api (api-path raw res)
+        [src found] (res api)]
+    (cond
+      (= api "") [(str "apikit:config '" (:name cfg) "': missing 'api'")]
+      (not found) [(str "apikit:config '" (:name cfg) "': API definition '" raw "' not found in the application resources")]
+      :else
+      (let [[a e] (parse-api src api res apikit)]
+        (if (not= e "") [e]
+          (let [nm (:name cfg)
+                z (swap! cache (fn Dyn [old: Dyn] (let [mm: Map (dyn->map old)] (->dyn (assoc mm nm (->dyn a))))))]
+            []))))))
+
+(def SERVED (atom (let [m: Map(Str Vec(Str)) {}] m)))
+
+(defn- init Vec(Str) [cache: &Atom app: &m/App]
+  (let [zs (reset! SERVED (let [m: Map(Str Vec(Str)) {}] m))
+        cs (:configs app)
+        ver (apikit-version app)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count cs)) acc
+        (let [c (nth cs i)]
+          (recur (+ i 1) (if (= (:kind c) "mule-apikit:config")
+                           (let [es (load-config cache c (:res app) ver)] (loop [k 0 a acc] (if (>= k (count es)) a (recur (+ k 1) (conj a (nth es k))))))
+                           acc)))))))
+
+(defn- api-of Values(sp/Api Str) [cache: &Atom cfg: &m/Config res: &Fn(Str Values(Str Bool))]
+  (let [nm (:name cfg)
+        mm: Map (dyn->map (deref cache))]
+    (if (contains? mm nm) (let [a: sp/Api (dyn->rec (get! mm nm))] (values a ""))
+      (let [es (load-config cache cfg res "")
+            m2: Map (dyn->map (deref cache))]
+        (if (> (count es) 0) (values (sp/->Api [] (y/->YNull) false) (nth es 0))
+          (let [a: sp/Api (dyn->rec (get! m2 nm))] (values a "")))))))
+
+(defn- field-str Str [fs: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get fs k)] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) (str s) _ ""))))
+
+(defn- field-obj Vec(v/Field) [fs: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get fs k)] (if (= (count r) 0) [] (match (v/unmeta (nth r 0)) (v/VObj gs) gs _ []))))
+
+(defn- values-of Vec(Str) [fs: &Vec(v/Field) name: &Str ci: Bool]
+  (let [ln (str/lower-case name)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count fs)) acc
+        (let [k (:name (:key (nth fs i)))
+              hit (if ci (= (str/lower-case k) ln) (= k name))]
+          (recur (+ i 1) (if hit (conj acc (match (v/unmeta (:value (nth fs i))) (v/VStr s) (str s) _ "")) acc)))))))
+
+(defn- pct-decode Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (if (and (= c 37) (< (+ i 2) (count s)))
+          (let [h (hexv (nth s (+ i 1))) l (hexv (nth s (+ i 2)))]
+            (if (and (>= h 0) (>= l 0)) (recur (+ i 3) (str out (chr (+ (* h 16) l)))) (recur (+ i 1) (str out "%"))))
+          (recur (+ i 1) (str out (subs s i (+ i 1)))))))))
+
+(defn- hexv Int [c: Int] (cond (and (>= c 48) (<= c 57)) (- c 48) (and (>= c 97) (<= c 102)) (- c 87) (and (>= c 65) (<= c 70)) (- c 55) :else -1))
+
+(defn- param-seg? Bool [s: &Str] (and (str/starts-with? s "{") (str/ends-with? s "}")))
+(defn- seg-name Str [s: &Str] (subs s 1 (- (count s) 1)))
+
+(defn- find-res Values(Int Vec(v/Field)) [rs: &Vec(sp/Res) rel: &Str]
+  (let [parts0: Vec(Str) (str/split rel "/")
+        parts (if (and (> (count parts0) 0) (= (nth parts0 0) "")) (drop-first parts0) parts0)
+        segs (if (and (= (count parts) 1) (= (nth parts 0) "")) [] parts)]
+    (loop [i 0 best -1 best-lit -1 bp: Vec(v/Field) []]
+      (if (>= i (count rs)) (values best bp)
+        (let [ts (:segs (nth rs i))]
+          (if (not= (count ts) (count segs)) (recur (+ i 1) best best-lit bp)
+            (let [[ok lit ps] (loop [k 0 lit 0 ps: Vec(v/Field) []]
+                                (if (>= k (count ts)) (values true lit ps)
+                                  (let [t (nth ts k) s (nth segs k)]
+                                    (cond (param-seg? t) (recur (+ k 1) lit (conj ps (v/field (seg-name t) (v/->VStr (str s)))))
+                                          (= t s) (recur (+ k 1) (+ lit 1) ps)
+                                          :else (values false lit ps)))))]
+              (if (and ok (> lit best-lit)) (recur (+ i 1) i lit ps) (recur (+ i 1) best best-lit bp)))))))))
+
+(defn- drop-first Vec(Str) [xs: &Vec(Str)] (loop [i 1 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (nth xs i))))))
+
+(defn- param-value y/YVal [schema: &y/YVal root: &y/YVal s: &Str]
+  (let [sc (js/resolve schema root)
+        t (sp/text (sp/key sc "type"))]
+    (if (= t "string") (y/->YStr (str s)) (y/resolve-plain s))))
+
+(defn- param-problem Str [schema: &y/YVal root: &y/YVal s: &Str skema: Bool]
+  (let [sc (js/resolve schema root)
+        t (sp/text (sp/key sc "type"))]
+    (cond
+      (and (= s "") (not= t "string") (not= t "")) "Unsupported chars in string value (probably a binary file)"
+      (not skema) (str/join "\n" (js/validate sc root (param-value sc root s)))
+      (and (= t "") (not (sp/has? sc "anyOf"))) ""
+      :else
+      (let [x (param-value sc root s)
+            te (if (= t "") [] (js/validate (y/->YMap [(y/->YStr "type")] [(y/->YStr (str t))]) root x))]
+        (if (> (count te) 0) (str/join "\n" te) (str/join "\n" (jsk/validate sc root x)))))))
+
+(defn- param-check Values(Vec(v/Field) Str) [p: &sp/Param root: &y/YVal vals: &Vec(Str) kind: &Str skema: Bool]
+  (let [sc (js/resolve (:schema p) root)
+        arr (= (sp/text (sp/key sc "type")) "array")
+        item (if arr (sp/key sc "items") sc)]
+    (cond
+      (= (count vals) 0)
+      (cond (:required p)
+            (values [] (if (= kind "header") (str "Required header '" (:name p) "' not specified")
+                         (str "Required " kind " parameter " (:name p) " not specified")))
+            (sp/has? sc "default") (values [(v/field (:name p) (v/->VStr (sp/text (sp/key sc "default"))))] "")
+            :else (values [] ""))
+      (and (> (count vals) 1) (not arr) (= kind "query")) (values [] (str "Query parameter " (:name p) " is not repeatable"))
+      :else
+      (loop [i 0]
+        (if (>= i (count vals)) (values [] "")
+          (let [pr (param-problem item root (nth vals i) skema)]
+            (if (= pr "") (recur (+ i 1))
+              (values [] (if (= kind "header") (str "Invalid value '" (nth vals i) "' for header '" (:name p) "'")
+                           (str "Invalid value '" (nth vals i) "' for " kind " parameter " (:name p) ". " pr))))))))))
+
+(defn- base-mime Str [ct: &Str] (let [k (str/index-of ct ";")] (str/lower-case (str/trim (if (< k 0) (str ct) (subs ct 0 k))))))
+
+(defn- mime-match? Bool [range: &Str mt: &Str]
+  (cond (or (= range "*/*") (= range "*")) true
+        (str/ends-with? range "/*") (str/starts-with? mt (subs range 0 (- (count range) 1)))
+        (str/ends-with? mt "/*") (str/starts-with? range (subs mt 0 (- (count mt) 1)))
+        :else (= range mt)))
+
+(defn- acceptable? Bool [accept: &Str media: &Vec(Str)]
+  (let [items: Vec(Str) (str/split accept ",")]
+    (loop [i 0]
+      (if (>= i (count items)) false
+        (let [it (nth items i)
+              r (base-mime it)
+              q0 (str/includes? (str/replace it " " "") ";q=0")
+              q-zero (and q0 (not (str/includes? (str/replace it " " "") ";q=0.")))
+              hit (and (not q-zero) (not= r "") (loop [k 0] (if (>= k (count media)) false (if (mime-match? r (nth media k)) true (recur (+ k 1))))))]
+          (if hit true (recur (+ i 1))))))))
+
+(defn- body-media Vec(sp/Media) [ms: &Vec(sp/Media) ct: &Str]
+  (let [b (base-mime ct)]
+    (if (= b "") []
+      (loop [i 0] (if (>= i (count ms)) [] (if (mime-match? (:mime (nth ms i)) b) [(nth ms i)] (recur (+ i 1))))))))
+
+(defn- json-mime? Bool [m: &Str] (or (= m "application/json") (str/ends-with? m "+json") (= m "text/json")))
+
+(defn- scalar? Bool [x: &y/YVal] (match x (y/YSeq xs) false (y/YMap ks vs) false (y/YNull) false _ true))
+
+(defn- validate-json Str [schema: &y/YVal root: &y/YVal raw: &Str]
+  (let [[dv de] (reg/read-fmt "application/json" [] raw)
+        [yv ye] (y/parse raw)]
+    (cond
+      (and (not= de "") (or (not= ye "") (not (or (scalar? yv) (match yv (y/YNull) true _ false)))))
+      "Unsupported chars in string value (probably a binary file)"
+      (not= ye "") ""
+      :else
+      (let [ms (js/validate schema root yv)
+            s (str/join "\n" ms)]
+        (if (and (scalar? yv) (= (count ms) 1) (str/starts-with? s "expected type:")) (str s "  Location:   Position: Line 1,  Column 0") s)))))
+
+(defn- validate-xml Str [raw: &Str]
+  (let [[doc e] (xml/parse raw)]
+    (if (not= e "") ""
+      (str "cvc-elt.1.a: Cannot find the declaration of element '" (xml/elem-local (xml/doc-root doc)) "'."))))
+
+(defn- form-fields Vec(Str) [raw: &Str]
+  (let [parts: Vec(Str) (str/split raw "&")]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count parts)) acc
+        (let [p (nth parts i) k (str/index-of p "=")]
+          (recur (+ i 1) (if (= p "") acc (conj acc (pct-decode (str/replace (if (< k 0) p (subs p 0 k)) "+" " "))))))))))
+
+(defn- form-values Vec(Str) [raw: &Str name: &Str]
+  (let [parts: Vec(Str) (str/split raw "&")]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count parts)) acc
+        (let [p (nth parts i) k (str/index-of p "=")
+              kn (pct-decode (str/replace (if (< k 0) p (subs p 0 k)) "+" " "))]
+          (recur (+ i 1) (if (= kn name) (conj acc (pct-decode (str/replace (if (< k 0) "" (subs p (+ k 1) (count p))) "+" " "))) acc)))))))
+
+(defn- validate-form Str [schema: &y/YVal root: &y/YVal raw: &Str]
+  (let [sc (js/resolve schema root)
+        names (form-fields raw)
+        rq (sp/seq-items (sp/key sc "required"))
+        props (sp/key sc "properties")
+        missing (loop [i 0]
+                  (if (>= i (count rq)) ""
+                    (let [k (sp/text (nth rq i))]
+                      (if (loop [j 0] (if (>= j (count names)) false (if (= (nth names j) k) true (recur (+ j 1))))) (recur (+ i 1))
+                        (str "Required parameter " k " not specified")))))]
+    (if (not= missing "") missing
+      (let [pn (sp/map-keys props)]
+        (loop [i 0]
+          (if (>= i (count pn)) ""
+            (let [k (nth pn i)
+                  vs (form-values raw k)
+                  bad (loop [j 0] (if (>= j (count vs)) -1 (if (= (param-problem (sp/key props k) root (nth vs j) false) "") (recur (+ j 1)) j)))]
+              (if (< bad 0) (recur (+ i 1)) (str "Invalid value '" (nth vs bad) "' for parameter" k)))))))))
+
+(defn- validate-json-skema Str [schema: &y/YVal root: &y/YVal raw: &Str]
+  (let [[dv de] (reg/read-fmt "application/json" [] raw)
+        [yv ye] (y/parse raw)]
+    (if (or (not= de "") (not= ye "")) "Invalid json value was provided"
+      (str/join "\n" (jsk/validate (js/resolve schema root) root yv)))))
+
+(defn- validate-body Str [md: &sp/Media root: &y/YVal raw: &Str skema: Bool]
+  (let [mt (:mime md)]
+    (cond (not (:has-schema md)) ""
+          (and skema (json-mime? mt)) (validate-json-skema (:schema md) root raw)
+          (json-mime? mt) (validate-json (:schema md) root raw)
+          (or (= mt "application/xml") (= mt "text/xml")) (validate-xml raw)
+          (= mt "application/x-www-form-urlencoded") (validate-form (:schema md) root raw)
+          :else "")))
+
+(defn- flow-path Str [p: &Str]
+  (let [segs (sp/segs-of p)]
+    (loop [i 0 out "\\"]
+      (if (>= i (count segs)) out
+        (let [s (nth segs i) t (if (param-seg? s) (str "(" (seg-name s) ")") s)]
+          (recur (+ i 1) (str out (if (= i 0) "" "\\") t)))))))
+
+(defn- default-status Int [codes: &Vec(Str)]
+  (loop [i 0] (if (>= i (count codes)) 200
+                (let [c (nth codes i)] (if (and (= (count c) 3) (= (nth c 0) 50)) (+ (* (- (nth c 0) 48) 100) (* (- (nth c 1) 48) 10) (- (nth c 2) 48)) (recur (+ i 1)))))))
+
+(defn- bad Values(Vec(v/Field) Str) [x: Str] (values [] x))
+
+(defn- check-params Values(Vec(v/Field) Str) [op: &sp/Op root: &y/YVal uparams: &Vec(v/Field) qfs: &Vec(v/Field) hfs: &Vec(v/Field) skema: Bool]
+  (let [ps (:params op)
+        pe (loop [i 0] (if (>= i (count ps)) ""
+                         (let [p (nth ps i)]
+                           (if (not= (:in p) "path") (recur (+ i 1))
+                             (let [vs (values-of uparams (:name p) false)]
+                               (cond (or (= (count vs) 0) (= (nth vs 0) "")) "Unable to resolve valid URI parameter values for the requested URL"
+                                     :else (let [pr (param-problem (:schema p) (:root p) (nth vs 0) skema)]
+                                             (if (= pr "") (recur (+ i 1)) (str "Invalid value '" (nth vs 0) "' for uri parameter " (:name p) ". " pr)))))))))]
+    (if (not= pe "") (bad pe)
+      (let [[defs qe] (loop [i 0 acc: Vec(v/Field) []]
+                        (if (>= i (count ps)) (values acc "")
+                          (let [p (nth ps i)]
+                            (if (not= (:in p) "query") (recur (+ i 1) acc)
+                              (let [[d e] (param-check p (:root p) (values-of qfs (:name p) false) "query" skema)]
+                                (if (not= e "") (values acc e) (recur (+ i 1) (cat-fields acc d))))))))]
+        (if (not= qe "") (bad qe)
+          (let [he (loop [i 0] (if (>= i (count ps)) ""
+                                 (let [p (nth ps i)]
+                                   (if (not= (:in p) "header") (recur (+ i 1))
+                                     (let [[d e] (param-check p (:root p) (values-of hfs (:name p) true) "header" skema)]
+                                       (if (not= e "") e (recur (+ i 1))))))))]
+            (if (not= he "") (bad he) (values defs ""))))))))
+
+(defn- cat-fields Vec(v/Field) [a: Vec(v/Field) b: Vec(v/Field)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- with-params v/Val [attrs: &v/Val ups: &Vec(v/Field) qdefs: &Vec(v/Field)]
+  (let [[inner meta] (match attrs (v/VMeta x ms) (values x ms) _ (values attrs []))]
+    (match inner
+      (v/VObj fs)
+      (let [fs2 (loop [i 0 acc: Vec(v/Field) []]
+                  (if (>= i (count fs)) acc
+                    (let [f (nth fs i) k (:name (:key f))]
+                      (recur (+ i 1)
+                             (conj acc (cond (= k "uriParams") (v/field "uriParams" (v/->VObj ups))
+                                             (and (= k "queryParams") (> (count qdefs) 0))
+                                             (v/field "queryParams" (v/->VObj (cat-fields (field-obj fs "queryParams") qdefs)))
+                                             :else f))))))
+            o (v/->VObj fs2)]
+        (if (= (count meta) 0) o (v/->VMeta o meta)))
+      _ attrs)))
+
+(defn- route conn/OpResult [c: &conn/OpCall api: &sp/Api cfg: &m/Config]
+  (let [e (:event c)
+        [av atv ae] (ev/value (:attributes e))
+        fs (match (v/unmeta av) (v/VObj xs) xs _ [])
+        method (str/lower-case (field-str fs "method"))
+        req-path (field-str fs "requestPath")
+        lp (field-str fs "listenerPath")
+        base (cond (str/ends-with? lp "/*") (subs lp 0 (- (count lp) 2)) (str/ends-with? lp "*") (subs lp 0 (- (count lp) 1)) :else (str lp))
+        rel0 (if (and (> (count base) 0) (str/starts-with? req-path base)) (subs req-path (count base) (count req-path)) (str req-path))
+        rel (if (= rel0 "") "/" rel0)
+        root (:root api)
+        rs (:res api)
+        [ri ups] (find-res rs rel)]
+    (if (< ri 0) (conn/fail-result (aerr "NOT_FOUND" rel))
+      (let [r (nth rs ri)
+            oi (loop [k 0] (if (>= k (count (:ops r))) -1 (if (= (:method (nth (:ops r) k)) method) k (recur (+ k 1)))))]
+        (if (< oi 0) (conn/fail-result (aerr "METHOD_NOT_ALLOWED" (str "HTTP Method " method " not allowed for : " (:path r))))
+          (let [op (nth (:ops r) oi)
+                novalid (= (str/lower-case (cfg-param cfg "disableValidations" "false")) "true")
+                hfs (field-obj fs "headers")
+                [qdefs pe] (if novalid (values [] "") (check-params op root ups (field-obj fs "queryParams") hfs (:skema api)))
+                accept (str/join "," (values-of hfs "accept" true))
+                ct (let [xs (values-of hfs "content-type" true)] (if (= (count xs) 0) "" (nth xs 0)))
+                bm (body-media (:body op) ct)]
+            (cond
+              (not= pe "") (conn/fail-result (aerr "BAD_REQUEST" pe))
+              (and (not= accept "") (> (count (:resp-media op)) 0) (not (acceptable? accept (:resp-media op))))
+              (conn/fail-result (aerr "NOT_ACCEPTABLE" "Not Acceptable"))
+              (and (> (count (:body op)) 0) (= (count bm) 0))
+              (conn/fail-result (aerr "UNSUPPORTED_MEDIA_TYPE" "Unsupported mediaType"))
+              :else
+              (let [[raw re] (ev/bytes (:payload e))
+                    be (if (or novalid (= (count bm) 0)) "" (validate-body (nth bm 0) (:root (nth bm 0)) raw (:skema api)))]
+                (if (not= be "") (conn/fail-result (aerr "BAD_REQUEST" be))
+                  (call-impl c e op r cfg atv (with-params av ups qdefs) (if (= (count bm) 0) "" (:mime (nth bm 0)))))))))))))
+
+(defn- call-impl conn/OpResult [c: &conn/OpCall e: &ev/Event op: &sp/Op r: &sp/Res cfg: &m/Config atv: &ev/TV attrs: v/Val mime: &Str]
+  (let [cname (:name cfg)
+        hv (cfg-param cfg "outboundHeadersMapName" "outboundHeaders")
+        sv (cfg-param cfg "httpStatusVarName" "httpStatus")
+        e1 (ev/with-attributes e (ev/tv-val attrs (:mime atv)))
+        e2 (if (= (count (ev/get-var e1 hv)) 0) (ev/set-var e1 hv (ev/tv-val (v/->VObj []) ev/JAVA)) e1)
+        p (flow-path (:path r))
+        n1 (str (:method op) ":" p ":" (str/replace mime "/" "\\") ":" cname)
+        n2 (str (:method op) ":" p ":" cname)
+        [e3 x found] (if (= mime "") (values e2 [] false) ((:flow c) n1 e2))
+        [e4 x4 found2] (if found (values e3 x found) ((:flow c) n2 e2))]
+    (cond
+      (not found2) (conn/fail-result (aerr "NOT_IMPLEMENTED" "Not implemented"))
+      (> (count x4) 0) (conn/event-result e4 x4)
+      (> (count (ev/get-var e4 sv)) 0) (conn/event-result e4 [])
+      :else (conn/event-result (ev/set-var e4 sv (ev/tv-val (v/int-v (default-status (:codes op))) ev/JAVA)) []))))
+
+(defn- run conn/OpResult [cache: &Atom c: &conn/OpCall]
+  (let [op (:op c)]
+    (cond
+      (and (not= op "router") (not= op "console")) (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation apikit:" op)))
+      (= (count (:config c)) 0) (conn/fail-result (err/mk "MULE" "CONFIG" (str "apikit:" op " needs config-ref")))
+      (= op "console") (console c (nth (:config c) 0))
+      :else
+      (let [cfg (nth (:config c) 0)
+            [api e] (api-of cache cfg (:res c))]
+        (if (not= e "") (conn/fail-result (err/mk "MULE" "CONFIG" e))
+          (route c api cfg))))))
+
+(def CONSOLE-HTML (str "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>APIkit Console</title>\n"
+                       "<style>body{margin:0;padding:16px;font:14px/1.5 sans-serif;color:#424242}pre{background:#f5f5f5;padding:12px;overflow:auto}</style>\n"
+                       "</head>\n<body>\n<h1>APIkit Console</h1>\n<p>mulay serves the API definition only: <a href=\"api/\">api/</a></p>\n<pre id=\"spec\"></pre>\n"
+                       "<script>fetch('api/').then(function(r){return r.text()}).then(function(t){document.getElementById('spec').textContent=t})</script>\n"
+                       "</body>\n</html>\n"))
+
+(defn- recording-res Fn(Str Values(Str Bool)) [res: &Fn(Str Values(Str Bool)) seen: &Atom(Vec(Str))]
+  (let [r res s seen]
+    (fn Values(Str Bool) [p: Str]
+      (let [[src found] (r p)
+            z (if found (swap! s (fn Vec(Str) [o: Vec(Str)] (conj o (str p)))) [])]
+        (values src found)))))
+
+(defn- served-files Vec(Str) [api: &Str res: &Fn(Str Values(Str Bool))]
+  (let [m (deref SERVED)]
+    (if (contains? m api) (get! m api)
+      (let [fs (served-files0 api res)
+            z (swap! SERVED (fn Map(Str Vec(Str)) [o: Map(Str Vec(Str))] (assoc o (str api) fs)))]
+        fs))))
+
+(defn- served-files0 Vec(Str) [api: &Str res: &Fn(Str Values(Str Bool))]
+  (let [seen (atom (let [z: Vec(Str) []] z))
+        rr (recording-res res seen)
+        [src found] (rr api)
+        z (if (and found (str/starts-with? (str/trim src) "#%RAML")) (let [[a e] (raml/parse-raml src api rr)] 0) 0)]
+    (deref seen)))
+
+(defn- dir-of Str [p: &Str] (let [k (str/last-index-of p "/")] (if (< k 0) "" (subs p 0 (+ k 1)))))
+
+(defn- console conn/OpResult [c: &conn/OpCall cfg: &m/Config]
+  (let [e (:event c)
+        [av atv ae] (ev/value (:attributes e))
+        fs (match (v/unmeta av) (v/VObj xs) xs _ [])
+        req-path (field-str fs "requestPath")
+        lp (field-str fs "listenerPath")
+        base (cond (str/ends-with? lp "/*") (subs lp 0 (- (count lp) 2)) (str/ends-with? lp "*") (subs lp 0 (- (count lp) 1)) :else (str lp))
+        rel (if (and (> (count base) 0) (str/starts-with? req-path base)) (subs req-path (count base) (count req-path)) (str req-path))
+        hv (cfg-param cfg "outboundHeadersMapName" "outboundHeaders")
+        sv (cfg-param cfg "httpStatusVarName" "httpStatus")
+        api (api-path (cfg-param cfg "api" "") (:res c))
+        dir (dir-of api)
+        hfs (field-obj fs "headers")
+        hosts (values-of hfs "host" true)
+        scheme (let [x (field-str fs "scheme")] (if (= x "") "http" x))
+        file (if (str/starts-with? rel "/api/") (str dir (subs rel 5 (count rel))) "")]
+    (cond
+      (= rel "")
+      (let [loc (str scheme "://" (if (= (count hosts) 0) "localhost" (nth hosts 0)) req-path "/")
+            e1 (ev/set-var (ev/set-var e sv (ev/tv-val (v/int-v 301) ev/JAVA)) hv (ev/tv-val (v/->VObj [(v/field "location" (v/->VStr loc))]) ev/JAVA))]
+        (conn/event-result (ev/with-payload e1 (ev/tv-raw "" ev/ANY)) []))
+      (or (= rel "/") (= rel "/index.html"))
+      (let [e1 (ev/set-var e hv (ev/tv-val (v/->VObj [(v/field "expires" (v/->VStr "-1"))]) ev/JAVA))]
+        (conn/event-result (ev/with-payload e1 (ev/tv-raw CONSOLE-HTML "text/html")) []))
+      (and (not= file "") (has-name? (served-files api (:res c)) file))
+      (let [[src found] ((:res c) file)]
+        (conn/event-result (ev/with-payload e (ev/tv-raw src "application/raml+yaml")) []))
+      :else (conn/fail-result (aerr "NOT_FOUND" rel)))))
+
+(defn connector conn/Connector []
+  (let [z: Map {}
+        cache (atom (->dyn z))]
+    (assoc (conn/connector "mule-apikit" NS (fn conn/OpResult [c: conn/OpCall] (run cache c)))
+           :init (fn Vec(Str) [a: m/App] (init cache a)))))
+
+(defn- flow-names Vec(Str) [app: &m/App] (mapv (fn Str [f: m/Flow] (str (:name f))) (:flows app)))
+
+(defn- has-name? Bool [ns: &Vec(Str) n: &Str] (loop [i 0] (if (>= i (count ns)) false (if (= (nth ns i) n) true (recur (+ i 1))))))
+
+(defn- raml-key Int [ks: &Vec(yo/YKey) parent: Int rest: &Str method: &Str]
+  (if (= rest "") (yo/child ks parent method)
+    (let [cs (yo/children ks parent)]
+      (loop [i 0]
+        (if (>= i (count cs)) -1
+          (let [k (:key (nth ks (nth cs i)))
+                hit (and (str/starts-with? k "/") (str/starts-with? rest k)
+                         (or (= (count rest) (count k)) (= (nth rest (count k)) 47)))
+                r (if hit (raml-key ks (nth cs i) (subs rest (count k) (count rest)) method) -1)]
+            (if (>= r 0) r (recur (+ i 1)))))))))
+
+(defn- param-type Str [p: &sp/Param]
+  (let [sc (js/resolve (:schema p) (:root p))] (sp/text (sp/key sc "type"))))
+
+(defn- op-model am/AOp [o: &sp/Op r: &sp/Res cname: &Str names: &Vec(Str) ks: &Vec(yo/YKey) raml: Bool src: &Str]
+  (let [p (flow-path (:path r))
+        media (mapv (fn Str [x: sp/Media] (str (:mime x))) (:body o))
+        n2 (str (:method o) ":" p ":" cname)
+        cands (loop [i 0 a: Vec(Str) []] (if (>= i (count media)) (conj a n2) (recur (+ i 1) (conj a (str (:method o) ":" p ":" (str/replace (nth media i) "/" "\\") ":" cname)))))
+        hit (loop [i 0] (if (>= i (count cands)) "" (if (has-name? names (nth cands i)) (str (nth cands i)) (recur (+ i 1)))))
+        ki (if raml (raml-key ks -1 (:path r) (:method o)) (yo/find-path ks ["paths" (str (:path r)) (str (:method o))]))
+        [kr br] (if (< ki 0) (let [z: Vec(Int) []] (values z z))
+                  (let [y (nth ks ki)] (values [(:ks y) (:ke y)] [(:bs y) (:be y)])))
+        ps (mapv (fn am/AParam [x: sp/Param] (am/->AParam (str (:name x)) (str (:in x)) (:required x) (param-type x) (copy-strs (:example x)))) (:params o))
+        rx (mapv (fn am/AEx [x: sp/Example] (am/->AEx (str (:code x)) (str (:mime x)) (str (:json x)))) (:examples o))
+        bs (:body o)
+        qx (loop [i 0] (cond (>= i (count bs)) [] (> (count (:example (nth bs i))) 0) [(am/->AEx "" (str (:mime (nth bs i))) (str (nth (:example (nth bs i)) 0)))] :else (recur (+ i 1))))
+        jm (loop [i 0] (cond (>= i (count bs)) [] (and (:has-schema (nth bs i)) (json-mime? (:mime (nth bs i)))) [(nth bs i)] :else (recur (+ i 1))))
+        [smp sok] (if (= (count jm) 0) (values "" false) (js/sample (:schema (nth jm 0)) (:root (nth jm 0))))
+        sx (if sok [(am/->AEx "" (str (:mime (nth jm 0))) smp)] [])
+        rqn (if (= (count jm) 0) [] (js/required-names (:schema (nth jm 0)) (:root (nth jm 0))))]
+    (am/->AOp (str/upper-case (:method o)) (str (:path r)) kr br ps media (copy-strs (:codes o)) (if (= hit "") (nth cands 0) hit) (not= hit "") rx qx sx rqn)))
+
+(defn- copy-strs Vec(Str) [xs: &Vec(Str)] (mapv (fn Str [x: Str] (str x)) xs))
+
+(defn api-models Vec(am/AApi) [app: &m/App rpre: &Str]
+  (let [cs (:configs app) names (flow-names app)]
+    (loop [i 0 acc: Vec(am/AApi) []]
+      (if (>= i (count cs)) acc
+        (let [c (nth cs i)]
+          (if (not= (:kind c) "mule-apikit:config") (recur (+ i 1) acc)
+            (let [raw (cfg-param c "api" "")
+                  api (api-path raw (:res app))
+                  [src found] ((:res app) api)
+                  file (if (or (not found) (str/includes? api "::")) "" (str rpre api))
+                  raml (str/starts-with? (str/trim src) "#%RAML")
+                  fmt (if raml "raml" "oas3")
+                  [a e] (cond (= api "") (values (sp/->Api [] (y/->YNull) false) (str "apikit:config '" (:name c) "': missing 'api'"))
+                              (not found) (values (sp/->Api [] (y/->YNull) false) (str "apikit:config '" (:name c) "': API definition '" raw "' not found in the application resources"))
+                              :else (parse-api src api (:res app) (apikit-version app)))
+                  ks (if found (yo/outline src) [])
+                  ops (loop [k 0 out: Vec(am/AOp) []]
+                        (if (>= k (count (:res a))) out
+                          (let [r (nth (:res a) k)]
+                            (recur (+ k 1) (loop [q 0 o2 out] (if (>= q (count (:ops r))) o2 (recur (+ q 1) (conj o2 (op-model (nth (:ops r) q) r (:name c) names ks raml src)))))))))]
+              (recur (+ i 1) (conj acc (am/->AApi (str (:name c)) file fmt e ops))))))))))

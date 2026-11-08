@@ -1,0 +1,33 @@
+(ns munitout-test (:require [mulay.app.munit :as mu] [mulay.rt.error :as err] [mulay.mule.load :as ld] [mulay.conn.registry :as creg]
+                            [mulay.lib.res :as res] [mulay.lib.diag :as d] [clay.string :as str]))
+
+(def XML (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\">\n<flow name=\"f\">\n"
+              "  <set-payload value=\"#[payload * 2]\"/>\n</flow>\n</mule>"))
+
+(defn- app-of ld/Loaded [] (ld/load-texts "t" ["a.xml"] [XML] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+
+(deftest assertion-failure-is-short-and-points-at-the-element
+  (let [l (app-of)
+        x (assoc (err/mk "MUNIT-TOOLS" "ASSERTION" "x") :elem "f/processors/0 @ t:a.xml:3")
+        r (mu/->Result "t1" mu/FAILURE (str "java.lang.AssertionError:  at file: [a.xml], line: [3]\nExpected: 5\n     but: 4 as Number {class: \"java.lang.Integer\"} at (root)") 0 [x])]
+    (is (= (d/render (mu/failure-report (:app l) r) false)
+           (str/join "\n" ["error[MUNIT:ASSERTION]: expected 5, but got 4"
+                           " --> a.xml:3:3"
+                           "  |"
+                           "3 |   <set-payload value=\"#[payload * 2]\"/>"
+                           "  |   ^^^^^^^^^^^^ assertion failed here"
+                           "  |"
+                           "  = note: Expected: 5"
+                           "  = note:      but: 4 as Number {class: \"java.lang.Integer\"} at (root)"
+                           "  = note: test: t1"])))))
+
+(deftest expected-error-mismatches
+  (let [l (app-of)
+        x (assoc (err/mk "MULE" "EXPRESSION" "bad") :elem "f/processors/0 @ t:a.xml:3")
+        a (mu/->Result "t2" mu/FAILURE "java.lang.AssertionError: The error ID thrown does not match the expected one.  expected:<[APP:BOOM]> but was:<[MULE:EXPRESSION]>" 0 [x])
+        z: Vec(err/MErr) []
+        b (mu/->Result "t3" mu/FAILURE "java.lang.AssertionError: The test: t3 was expecting a failure - Error ID: APP:BOOM but it didn't fail" 0 z)
+        ra (d/render (mu/failure-report (:app l) a) false)]
+    (is (str/starts-with? ra "error[MUNIT:ASSERTION]: expected the error APP:BOOM, but MULE:EXPRESSION was raised\n"))
+    (is (str/includes? ra "^^^^^^^^^^^^ raised here"))
+    (is (= (d/render (mu/failure-report (:app l) b) false) "error[MUNIT:ASSERTION]: expected the error APP:BOOM, but the test did not fail\n  = note: test: t3"))))

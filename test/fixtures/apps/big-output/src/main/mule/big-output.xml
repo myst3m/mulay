@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm" xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+  <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18579"/></http:listener-config>
+  <file:config name="F"><file:connection workingDir="/tmp/mulay-oracle-big-output"/></file:config>
+  <vm:config name="VM"><vm:queues><vm:queue queueName="big" queueType="TRANSIENT"/></vm:queues></vm:config>
+  <ee:object-store-caching-strategy name="C" keyGenerationExpression="#[attributes.queryParams.k]"/>
+
+  <sub-flow name="make">
+    <set-payload value="#[output application/json --- (1 to 60000) map {i: $, s: 'abcdefgh'}]"/>
+  </sub-flow>
+
+  <flow name="pub">
+    <http:listener config-ref="L" path="/pub"/>
+    <flow-ref name="make"/>
+    <vm:publish config-ref="VM" queueName="big"/>
+    <set-payload value="published"/>
+  </flow>
+  <flow name="consume">
+    <vm:listener config-ref="VM" queueName="big"/>
+    <file:write config-ref="F" path="vm.json"/>
+  </flow>
+
+  <flow name="async">
+    <http:listener config-ref="L" path="/async"/>
+    <flow-ref name="make"/>
+    <async>
+      <file:write config-ref="F" path="async.json"/>
+    </async>
+    <set-payload value="started"/>
+  </flow>
+
+  <flow name="check">
+    <http:listener config-ref="L" path="/check"/>
+    <until-successful maxRetries="50" millisBetweenRetries="100">
+      <file:read config-ref="F" path="#[attributes.queryParams.f]" outputMimeType="text/plain"/>
+      <choice>
+        <when expression="#[not ((payload as String) endsWith ']')]"><raise-error type="APP:NOT_YET" description="not written yet"/></when>
+      </choice>
+    </until-successful>
+    <set-payload value="#[output application/json --- do { var s = payload as String --- {size: sizeOf(s), head: s[0 to 20], tail: s[-20 to -1], items: sizeOf(read(s, 'application/json'))} }]"/>
+  </flow>
+
+  <flow name="cached">
+    <http:listener config-ref="L" path="/cached"/>
+    <ee:cache cachingStrategy-ref="C">
+      <flow-ref name="make"/>
+    </ee:cache>
+    <set-payload value="#[output application/json --- do { var n = 0 --- {items: sizeOf(payload), last: payload[-1], mime: payload.^mimeType} }]"/>
+  </flow>
+</mule>

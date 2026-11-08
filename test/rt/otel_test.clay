@@ -1,0 +1,271 @@
+(ns otel-test (:require [mulay.conn.registry :as creg] [mulay.app.otel :as ot] [mulay.rt.meter :as mt] [mulay.lib.otlp :as o] [mulay.mule.load :as ld]
+                        [mulay.mule.model :as m] [mulay.lib.res :as res] [clay.httpmsg :as hm] [clay.string :as str]))
+
+;; app/otel: mule.openTelemetry.meter.exporter.* の設定と、送るメトリクスの中身 (実 Mule 4.12.0 と同じ名前と説明)
+
+(defn- aval Str [v: &o/AVal] (match v (o/AStr s) (str s) (o/ABool b) (if b "true" "false")))
+(defn- nval Str [v: &o/NVal] (match v (o/NInt n) (str n) (o/NDouble x) (str "d" (int (* x 1000.0)))))
+
+(def HEAD "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\" xmlns:apikit=\"http://www.mulesoft.org/schema/mule/mule-apikit\">\n<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"9001\"/></http:listener-config>\n")
+
+(def FLOWS (str "<sub-flow name=\"sub\"><set-payload value=\"sub\"/></sub-flow>\n"
+                "<flow name=\"private\"><flow-ref name=\"sub\"/></flow>\n"
+                "<flow name=\"get:\\things:api-config\"><set-payload value=\"things\"/></flow>\n"
+                "<flow name=\"stopped\" initialState=\"stopped\"><http:listener config-ref=\"L\" path=\"/stopped\"/><set-payload value=\"s\"/></flow>\n"
+                "<flow name=\"ok\"><http:listener config-ref=\"L\" path=\"/ok\"/><flow-ref name=\"private\"/></flow>\n"))
+
+(defn- params Vec(m/Param) [props: &Vec(Str)]
+  (loop [i 0 acc: Vec(m/Param) []]
+    (if (>= i (count props)) acc
+      (let [p (nth props i) k (str/index-of p "=")]
+        (recur (+ i 1) (conj acc (m/->Param (subs p 0 k) (m/->PLit (subs p (+ k 1) (count p))))))))))
+
+(defn- app m/App [props: Vec(Str) extra: Str]
+  (:app (ld/load-texts "t" ["a.xml"] [(str HEAD FLOWS extra "</mule>")] (res/res-none) (ld/->LoadOpts (params props) false (creg/hints)))))
+
+(defn- cfg-err Str [props: Vec(Str)] (let [[x err] (ot/configure (app props ""))] err))
+
+(deftest disabled-by-default
+  (let [[x err] (ot/configure (app [] ""))]
+    (is (= err ""))
+    (is (not (:on x)))))
+
+(deftest http-settings
+  (let [[x err] (ot/configure (app ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.type=HTTP"
+                                    "mule.openTelemetry.meter.exporter.endpoint=http://collector:4318/v1/metrics"
+                                    "mule.openTelemetry.meter.exporter.headers=Authorization=Bearer x, X-Org = o1"
+                                    "mule.openTelemetry.meter.exporter.interval=15" "mule.openTelemetry.meter.exporter.timeout=2500"
+                                    "mule.openTelemetry.meter.exporter.compression=gzip" "mule.enable.statistics=true"] ""))]
+    (is (= err ""))
+    (is (:on x))
+    (is (:stats x))
+    (is (= (:endpoint x) "http://collector:4318/v1/metrics"))
+    (is (= (count (:headers x)) 2))
+    (is (= (:hd-name (nth (:headers x) 0)) "Authorization"))
+    (is (= (:hd-value (nth (:headers x) 0)) "Bearer x"))
+    (is (= (:hd-name (nth (:headers x) 1)) "X-Org"))
+    (is (= (:hd-value (nth (:headers x) 1)) "o1"))
+    (is (= (:interval-ms x) 15000))
+    (is (= (:timeout-ms x) 2500))
+    (is (:gzip x))))
+
+;; HTTP の既定の宛先は実 Mule と同じ http://localhost:4318/v1/metrics。統計は mule.enable.statistics が無ければ数えない
+(deftest http-defaults
+  (let [[x err] (ot/configure (app ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.type=http"] ""))]
+    (is (= err ""))
+    (is (= (:endpoint x) "http://localhost:4318/v1/metrics"))
+    (is (not (:stats x)))
+    (is (= (:interval-ms x) 60000))
+    (is (= (:timeout-ms x) 10000))
+    (is (not (:gzip x)))))
+
+;; 既定の type は GRPC (実 Mule と同じ)。宛先の既定は OTel の SDK と同じ http://localhost:4317
+(deftest grpc-defaults
+  (let [[x err] (ot/configure (app ["mule.openTelemetry.meter.exporter.enabled=true"] ""))]
+    (is (= err ""))
+    (is (:on x))
+    (is (:grpc x))
+    (is (= (:endpoint x) "http://localhost:4317"))))
+
+(deftest settings-errors
+  (is (str/includes? (cfg-err ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.type=UDP"]) "GRPC or HTTP"))
+  (is (str/includes? (cfg-err ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.type=HTTP"
+                               "mule.openTelemetry.meter.exporter.interval=0"]) "interval"))
+  (is (str/includes? (cfg-err ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.type=HTTP"
+                               "mule.openTelemetry.meter.exporter.compression=zstd"]) "none or gzip"))
+  (is (str/includes? (cfg-err ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.endpoint=collector:4317"]) "http://"))
+  (is (= (cfg-err ["mule.openTelemetry.meter.exporter.enabled=false"]) "")))
+
+;; gRPC の宛先のパスは無視して Export のパスにする (SDK は endpoint.resolve の絶対パス)
+(deftest grpc-url
+  (is (= (ot/grpc-url "http://localhost:4317" ot/GRPC-PATH) "http://localhost:4317/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"))
+  (is (= (ot/grpc-url "https://c.example:443/" ot/GRPC-PATH) "https://c.example:443/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"))
+  (is (= (ot/grpc-url "http://c:4317/v1/metrics" ot/GRPC-PATH) "http://c:4317/opentelemetry.proto.collector.metrics.v1.MetricsService/Export")))
+
+;; gRPC の要求のヘッダ: te: trailers と application/grpc、gzip なら grpc-encoding、設定の headers
+(deftest grpc-headers
+  (let [[x err] (ot/configure (app ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.compression=gzip"
+                                    "mule.openTelemetry.meter.exporter.headers=x-k=v1"] ""))
+        hs (ot/grpc-headers x)
+        te: Str (match (hm/header-of hs "te") (Some x) x (None) "")
+        ct: Str (match (hm/header-of hs "content-type") (Some x) x (None) "")
+        ge: Str (match (hm/header-of hs "grpc-encoding") (Some x) x (None) "")
+        xk: Str (match (hm/header-of hs "x-k") (Some x) x (None) "")]
+    (is (= err ""))
+    (is (= (count hs) 4))
+    (is (= te "trailers"))
+    (is (= ct "application/grpc"))
+    (is (= ge "gzip"))
+    (is (= xk "v1"))))
+
+;; gRPC の枠: 圧縮の印 1 バイトと長さ 4 バイト (ビッグエンディアン)
+(deftest grpc-frame
+  (let [f (ot/grpc-frame "abc" false)
+        g (ot/grpc-frame (str (chr 1) (chr 2)) true)
+        big (ot/grpc-frame (loop [i 0 s ""] (if (>= i 70000) s (recur (+ i 1) (str s "x")))) false)]
+    (is (= (count f) 8))
+    (is (= (nth f 0) 0))
+    (is (= (nth f 4) 3))
+    (is (= (subs f 5 8) "abc"))
+    (is (= (nth g 0) 1))
+    (is (= (nth g 4) 2))
+    (is (= (nth big 2) 1))
+    (is (= (nth big 3) 17))
+    (is (= (nth big 4) 112))))
+
+;; grpc-status は trailer、無ければヘッダ (Trailers-Only)、どちらにも無ければ UNKNOWN (2)。grpc-message はパーセント符号を戻す
+(deftest grpc-status-of
+  (let [none: Vec(hm/Header) []
+        [c1 m1] (ot/grpc-status-of (hm/->Resp 200 [(hm/->Header "content-type" "application/grpc")] "" "" [(hm/->Header "grpc-status" "0")]))
+        [c2 m2] (ot/grpc-status-of (hm/->Resp 200 [(hm/->Header "grpc-status" "3") (hm/->Header "grpc-message" "bad%20thing%E3%81%82")] "" "" none))
+        [c3 m3] (ot/grpc-status-of (hm/->Resp 200 none "" "" none))
+        [c4 m4] (ot/grpc-status-of (hm/->Resp 200 none "" "" [(hm/->Header "grpc-status" "x")]))]
+    (is (= c1 0))
+    (is (= m1 ""))
+    (is (= c2 3))
+    (is (= m2 "bad thingあ"))
+    (is (= c3 2))
+    (is (= c4 2))))
+
+;; 試し直すのは OTel の SDK の RetryUtil と同じ状態 (CANCELLED、DEADLINE_EXCEEDED、RESOURCE_EXHAUSTED、ABORTED、OUT_OF_RANGE、UNAVAILABLE、DATA_LOSS)
+(deftest grpc-retryable
+  (is (= (filterv (fn Bool [c: Int] (ot/grpc-retryable? c)) [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]) [1 4 8 10 11 14 15])))
+
+;; 諦めたときのログ (実 Mule 4.12.0 の GrpcExporter で確かめた段と文言)
+(deftest grpc-failure-log
+  (let [[l3 t3] (ot/grpc-failure "metrics" 3 "bad thing")
+        [l14 t14] (ot/grpc-failure "metrics" 14 "down")
+        [l12 t12] (ot/grpc-failure "metrics" 12 "nope")]
+    (is (= l3 3))
+    (is (= t3 "Failed to export metrics. Server responded with gRPC status code 3. Error message: bad thing"))
+    (is (= l14 4))
+    (is (= t14 "Failed to export metrics. Server is UNAVAILABLE. Make sure your collector is running and reachable from this network. Full error message:down"))
+    (is (= l12 4))
+    (is (= t12 "Failed to export metrics. Server responded with UNIMPLEMENTED. This usually means that your collector is not configured with an otlp receiver in the \"pipelines\" section of the configuration. If export is not desired and you are using OpenTelemetry autoconfiguration or the javaagent, disable export by setting OTEL_METRICS_EXPORTER=none. Full error message: nope"))))
+
+;; service.name と service.namespace (既定はアプリの名前と mule)、resource.attributes
+(deftest resource
+  (let [[x err] (ot/configure (app ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.type=HTTP"
+                                    "mule.openTelemetry.exporter.resource.service.namespace=shop"
+                                    "mule.openTelemetry.meter.exporter.resource.attributes=deployment.environment=dev,team=core"] ""))
+        rs (:resource x)
+        keys (loop [i 0 out ""] (if (>= i (count rs)) out (recur (+ i 1) (str out (:key (nth rs i)) "=" (if (= (:key (nth rs i)) "service.instance.id") "*" (aval (:val (nth rs i)))) ";"))))]
+    (is (= err ""))
+    (is (= keys "deployment.environment=dev;service.instance.id=*;service.name=t;service.namespace=shop;team=core;telemetry.sdk.language=clay;telemetry.sdk.name=mulay;"))))
+
+;; フローの数: trigger (source がある)、apikit (名前が method:\resource:config で config が apikit の設定)、private (それ以外)。
+;; sub-flow は数えない。initialState="stopped" は declared だけ
+(deftest inventory
+  (let [i1 (ot/inventory (app [] ""))
+        i2 (ot/inventory (app [] "<apikit:config name=\"api-config\" api=\"x.raml\"/>\n"))]
+    (is (= (str (:declared-trigger i1) (:active-trigger i1) (:declared-private i1) (:active-private i1) (:declared-apikit i1) (:active-apikit i1)) "212200"))
+    (is (= (str (:declared-trigger i2) (:active-trigger i2) (:declared-private i2) (:active-private i2) (:declared-apikit i2) (:active-apikit i2)) "211111"))))
+
+(defn- sum-line Str [s: &o/Metric]
+  (let [ps (:points s)]
+    (loop [i 0 out (str (:name s) "|" (:desc s))]
+      (if (>= i (count ps)) out
+        (let [p (nth ps i) as (:attrs p)
+              a (loop [j 0 o2 ""] (if (>= j (count as)) o2 (recur (+ j 1) (str o2 " " (:key (nth as j)) "=" (aval (:val (nth as j)))))))]
+          (recur (+ i 1) (str out " [" (str/trim a) " " (nval (:value p)) "]")))))))
+
+(defn- lines Str [scs: &Vec(o/Scope)]
+  (loop [i 0 out ""]
+    (if (>= i (count scs)) out
+      (let [sc (nth scs i)
+            ss (:metrics sc)
+            b (loop [j 0 o2 ""] (if (>= j (count ss)) o2 (recur (+ j 1) (str o2 (sum-line (nth ss j)) "\n"))))]
+        (recur (+ i 1) (str out "# " (:name sc) "\n" b))))))
+
+(deftest scopes
+  (let [a (app [] "")
+        z0 (mt/clear!)
+        z1 (mt/enable! true true)
+        z2 (mt/flow-received "ok")
+        z3 (mt/flow-dispatched "ok")
+        z4 (mt/flow-received "private")
+        z5 (mt/error-raised "APP:X")
+        z6 (mt/error-raised "APP:X")
+        z7 (mt/error-raised "HTTP:NOT_FOUND")
+        out (lines (ot/scopes a (ot/inventory a)))
+        z8 (mt/clear!)
+        empty (lines (ot/scopes a (ot/inventory a)))
+        z9 (mt/enable! false false)]
+    (is (= out (str "# org.mule.runtime.errors\n"
+                    "error-count|Mule runtime error count [mule.artifact.id=t mule.error.type=APP:X 2] [mule.artifact.id=t mule.error.type=HTTP:NOT_FOUND 1]\n"
+                    "# org.mule.runtime.flow.statistics\n"
+                    "declared-private-flows|Declared Private Flows [mule.artifact.id=t 2]\n"
+                    "active-private-flows|Activate Private Flows [mule.artifact.id=t 2]\n"
+                    "declared-trigger-flows|Declared Trigger Flows [mule.artifact.id=t 2]\n"
+                    "active-trigger-flows|Active Trigger Flows [mule.artifact.id=t 1]\n"
+                    "declared-apikit-flows|Declared ApiKit Flows [mule.artifact.id=t 0]\n"
+                    "active-apikit-flows|Active Apikit Flows [mule.artifact.id=t 0]\n"
+                    "declared-private-flows-v2|Declared Private Flows [mule.artifact.id=t 2]\n"
+                    "active-private-flows-v2|Activate Private Flows [mule.artifact.id=t 2]\n"
+                    "declared-trigger-flows-v2|Declared Trigger Flows [mule.artifact.id=t 2]\n"
+                    "active-trigger-flows-v2|Active Trigger Flows [mule.artifact.id=t 1]\n"
+                    "declared-apikit-flows-v2|Declared ApiKit Flows [mule.artifact.id=t 0]\n"
+                    "active-apikit-flows-v2|Active Apikit Flows [mule.artifact.id=t 0]\n"
+                    "received.events|Received Events [mule.artifact.id=t mule.flow.name=private 1] [mule.artifact.id=t mule.flow.name=get:\\things:api-config 0] [mule.artifact.id=t mule.flow.name=stopped 0] [mule.artifact.id=t mule.flow.name=ok 1]\n"
+                    "dispatched.messages|Dispatched Messages [mule.artifact.id=t mule.flow.name=private 0] [mule.artifact.id=t mule.flow.name=get:\\things:api-config 0] [mule.artifact.id=t mule.flow.name=stopped 0] [mule.artifact.id=t mule.flow.name=ok 1]\n"
+                    "dispatched.primary.messages|Dispatched Primary Messages [mule.artifact.id=t mule.flow.name=private 0] [mule.artifact.id=t mule.flow.name=get:\\things:api-config 0] [mule.artifact.id=t mule.flow.name=stopped 0] [mule.artifact.id=t mule.flow.name=ok 1]\n"
+                    "execution.errors|Execution Errors [mule.artifact.id=t mule.flow.name=private 0] [mule.artifact.id=t mule.flow.name=get:\\things:api-config 0] [mule.artifact.id=t mule.flow.name=stopped 0] [mule.artifact.id=t mule.flow.name=ok 0]\n"
+                    "fatal.errors|Fatal Errors [mule.artifact.id=t mule.flow.name=private 0] [mule.artifact.id=t mule.flow.name=get:\\things:api-config 0] [mule.artifact.id=t mule.flow.name=stopped 0] [mule.artifact.id=t mule.flow.name=ok 0]\n")))
+    ;; エラーがまだ無ければ org.mule.runtime.errors の scope は出さない (実 Mule と同じ)
+    (is (not (str/includes? empty "org.mule.runtime.errors")))))
+
+;; jvmMetrics.enabled: JVM のメトリクスのうち mulay のプロセスの値に付け替えられるものを、service.name=mule-container の
+;; resource で送る (実 Mule 4.12.0 と同じ名前、説明、単位、種類。test/fixtures/otel/jvm-metrics.mule-4.12.0.json)
+(deftest jvm-settings
+  (let [[x err] (ot/configure (app ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.type=HTTP"
+                                    "mule.openTelemetry.meter.exporter.jvmMetrics.enabled=true"] ""))
+        [y err2] (ot/configure (app ["mule.openTelemetry.meter.exporter.enabled=true" "mule.openTelemetry.meter.exporter.type=HTTP"] ""))
+        rs (:container x)
+        keys (loop [i 0 out ""] (if (>= i (count rs)) out (recur (+ i 1) (str out (:key (nth rs i)) "=" (if (= (:key (nth rs i)) "service.instance.id") "*" (aval (:val (nth rs i)))) ";"))))]
+    (is (= err ""))
+    (is (:jvm x))
+    (is (not (:jvm y)))
+    (is (= keys "service.instance.id=*;service.name=mule-container;telemetry.sdk.language=clay;telemetry.sdk.name=mulay;"))))
+
+(defn- kinds Str [ms: &Vec(o/Metric)]
+  (loop [i 0 out ""]
+    (if (>= i (count ms)) out
+      (let [m (nth ms i)] (recur (+ i 1) (str out (:name m) "|" (:desc m) "|" (:unit m) "|" (:kind m) "|" (count (:points m)) "\n"))))))
+
+(defn- point-of Values(Int Float) [ms: &Vec(o/Metric) name: Str k: Int]
+  (let [i (loop [j 0] (if (= (:name (nth ms j)) name) j (recur (+ j 1))))
+        p (nth (:points (nth ms i)) k)]
+    (match (:value p) (o/NInt n) (values n 0.0) (o/NDouble x) (values 0 x))))
+
+(deftest jvm-metrics
+  (let [sc (ot/jvm-scope)
+        ms (:metrics sc)
+        [ncpu f0] (point-of ms "jvm.cpu.count" 0)
+        [i1 cpu] (point-of ms "jvm.cpu.time" 0)
+        [i2 util] (point-of ms "jvm.cpu.recent_utilization" 0)
+        [used f3] (point-of ms "jvm.memory.used" 0)]
+    (is (= (:name sc) "io.opentelemetry.runtime-telemetry"))
+    (is (= (kinds ms) (str "jvm.cpu.count|Number of processors available to the Java virtual machine.|{cpu}|1|1\n"
+                           "jvm.cpu.time|CPU time used by the process as reported by the JVM.|s|0|1\n"
+                           "jvm.cpu.recent_utilization|Recent CPU utilization for the process as reported by the JVM.|1|2|1\n"
+                           "jvm.memory.used|Measure of memory used.|By|1|2\n"
+                           "jvm.memory.committed|Measure of memory committed.|By|1|2\n"
+                           ;; cgroup のメモリの上限が無い所 (この機械) では jvm.memory.limit を出さない
+                           (if (= (count ms) 7) "jvm.memory.limit|Measure of max obtainable memory.|By|1|1\n" "")
+                           "jvm.thread.count|Number of executing platform threads.|{thread}|1|" (count (:points (nth ms (- (count ms) 1)))) "\n")))
+    (is (> ncpu 0))
+    (is (>= cpu 0.0))
+    (is (and (>= util 0.0) (<= util 1.0)))
+    (is (> used 0))
+    (is (> (count (:points (nth ms (- (count ms) 1)))) 0))))
+
+;; HTTP の状態で失敗したときのログ: 段は WARN、本文は google.rpc.Status の message (読めなければ HTTP の理由句。実 Mule 4.12.0 で確かめた)
+(deftest http-failure-log
+  (let [[l1 t1] (ot/http-failure "metrics" 400 "bad request body" "Bad Request")
+        [l2 t2] (ot/http-failure "metrics" 503 (str (chr 8) (chr 14) (chr 18) (chr 4) "busy") "Service Unavailable")
+        [l3 t3] (ot/http-failure "metrics" 500 "" "Internal Server Error")]
+    (is (= l1 3))
+    (is (= t1 "Failed to export metrics. Server responded with HTTP status code 400. Error message: Unable to parse response body, HTTP status message: Bad Request"))
+    (is (= l2 3))
+    (is (= t2 "Failed to export metrics. Server responded with HTTP status code 503. Error message: busy"))
+    (is (= t3 "Failed to export metrics. Server responded with HTTP status code 500. Error message: "))))

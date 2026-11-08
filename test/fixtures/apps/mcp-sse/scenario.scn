@@ -1,0 +1,568 @@
+%%% note
+MCP の SSE トランスポート (旧式の HTTP + SSE)。mcp:sse-server-connection (sseEndpointPath と messagesPath、default-sse-response-headers と default-message-response-headers) と
+mcp:sse-client-connection。GET /sse で開く閉じない応答 (stream) の最初のイベント endpoint がメッセージの送り先 (sessionId 付き) を知らせ、
+メッセージは POST で送って 202 Accepted、応答は SSE のストリームに event: message で流れる。
+セッション ID は揺れるので capture で次の request へ渡し、応答の記録からは mask で伏せる。
+複数の tool の tools/list の並びは実 Mule でも起動のたびに変わるので、一覧は 1 つだけの設定 (/c) で確かめる。
+%%% jvm -Dmule.http.service.implementation=NETTY
+%%% port 18215
+%%% port 18216
+%%% mask
+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
+%%% request GET :18216/call-add
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payload": {
+    "error": false,
+    "contents": [
+      {
+        "audience": [
+          
+        ],
+        "data": null,
+        "resource": null,
+        "mimeType": null,
+        "priority": null,
+        "type": "text",
+        "text": "3"
+      }
+    ]
+  },
+  "kind": "Object"
+}
+%%% request GET :18216/call-invalid
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "MCP:INVALID_PARAMS",
+  "desc": "Invalid tool parameters: /a: string found, number expected; : required property 'b' not found"
+}
+%%% request GET :18216/call-unknown
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "MCP:INVALID_PARAMS",
+  "desc": "Unknown tool: invalid_tool_name"
+}
+%%% request GET :18216/hdrs
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+"{\n  \"contentType\": \"application/json\",\n  \"accept\": \"*/*\",\n  \"version\": \"2025-06-18\",\n  \"agent\": \"Mule HTTP Client\",\n  \"trace\": null,\n  \"hasSid\": true\n}"
+%%% request GET :18216/hdrs-b
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+"{\n  \"contentType\": \"application/json\",\n  \"accept\": \"*/*\",\n  \"version\": \"2025-06-18\",\n  \"agent\": \"Mule HTTP Client\",\n  \"trace\": \"abc\",\n  \"hasSid\": true\n}"
+%%% request GET :18216/call-add-b
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payload": {
+    "error": false,
+    "contents": [
+      {
+        "audience": [
+          
+        ],
+        "data": null,
+        "resource": null,
+        "mimeType": null,
+        "priority": null,
+        "type": "text",
+        "text": "9"
+      }
+    ]
+  },
+  "kind": "Object"
+}
+%%% request GET :18216/list-tools
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payload": [
+    {
+      "inputSchema": "{\"type\":\"object\"}",
+      "description": "The only tool",
+      "name": "only"
+    }
+  ],
+  "kind": "Array"
+}
+%%% request GET :18216/ping
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payload": "",
+  "kind": "Binary",
+  "method": "GET"
+}
+%%% request GET :18216/ping-down
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "MCP:CONNECTIVITY",
+  "desc": "Message endpoint not received"
+}
+%%% capture SID regex:sessionId=([0-9a-f-]+)
+%%% request GET /sse stream=a headers=*
+Accept: text/event-stream
+
+%%% response 200
+content-type: text/event-stream
+cache-control: no-cache, no-store, max-age=0, must-revalidate
+pragma: no-cache
+access-control-allow-origin: *
+
+event: endpoint
+data: /message?sessionId=***
+
+
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% read a
+%%% response 200
+
+event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"experimental":{},"logging":{},"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"serverInfo":{"name":"Sse","version":"1.0.0"}}}
+
+
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":1,"b":2}}}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"add","arguments":{"a":"x"}}}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nope","arguments":{}}}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":6,"method":"ping"}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":7,"method":"zzz"}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":8,"method":"resources/list"}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% read a
+%%% response 200
+
+event: message
+data: {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"3"}],"isError":false}}
+
+event: message
+data: {"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"Invalid tool parameters: /a: string found, number expected; : required property 'b' not found"}}
+
+event: message
+data: {"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"Unknown tool: invalid_tool_name","data":"Tool not found: nope"}}
+
+event: message
+data: {"jsonrpc":"2.0","id":6,"result":{}}
+
+event: message
+data: {"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"Method not found: zzz"}}
+
+event: message
+data: {"jsonrpc":"2.0","id":8,"result":{"resources":[]}}
+
+
+%%% capture SID regex:sessionId=([0-9a-f-]+)
+%%% request GET /c/sse stream=c headers=*
+Accept: text/event-stream
+
+%%% response 200
+content-type: text/event-stream
+cache-control: no-cache, no-store, max-age=0, must-revalidate
+pragma: no-cache
+access-control-allow-origin: *
+
+event: endpoint
+data: /c/message?sessionId=***
+
+
+%%% request POST /c/message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /c/message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /c/message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% read c
+%%% response 200
+
+event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"experimental":{},"logging":{},"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"serverInfo":{"name":"SseC","version":"3.0.0"}}}
+
+event: message
+data: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"only","description":"The only tool","inputSchema":{"type":"object"}}]}}
+
+
+%%% close c
+%%% request POST /message headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"ping"}
+%%% response 400
+
+Missing session id
+%%% request POST /message?sessionId= headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"ping"}
+%%% response 400
+
+Missing session id
+%%% request POST /message?sessionId=zzz headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"ping"}
+%%% response 503
+
+No active SSE connection for sessionId: zzz
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: text/plain
+
+{"jsonrpc":"2.0","id":1,"method":"ping"}
+%%% response 400
+
+Unsupported content type: text/plain
+%%% request POST /message?sessionId={{SID}} headers=*
+Accept: */*
+
+{"jsonrpc":"2.0","id":1,"method":"ping"}
+%%% response 400
+
+Unsupported content type: null
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+
+%%% response 503
+
+No active SSE connection for sessionId: ***
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+[{"jsonrpc":"2.0","id":3,"method":"ping"}]
+%%% response 503
+
+No active SSE connection for sessionId: ***
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{bad
+%%% response 503
+
+No active SSE connection for sessionId: ***
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":9}
+%%% response 503
+
+No active SSE connection for sessionId: ***
+%%% request GET /message headers=*
+Accept: */*
+
+%%% response 405
+content-type: text/plain
+
+Method not allowed for endpoint: /message
+%%% read a
+%%% response 200
+
+
+%%% capture SID regex:sessionId=([0-9a-f-]+)
+%%% request POST /sse stream=a2 headers=*
+Accept: text/event-stream
+Content-Type: application/json
+
+%%% response 200
+content-type: text/event-stream
+cache-control: no-cache, no-store, max-age=0, must-revalidate
+pragma: no-cache
+access-control-allow-origin: *
+
+event: endpoint
+data: /message?sessionId=***
+
+
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 202
+mcp-protocol-version: 2024-11-05
+
+Accepted
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+%%% response 202
+mcp-protocol-version: 2024-11-05
+
+Accepted
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}
+%%% response 202
+mcp-protocol-version: 2024-11-05
+
+Accepted
+%%% read a2
+%%% response 200
+
+event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"experimental":{},"logging":{},"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"serverInfo":{"name":"Sse","version":"1.0.0"}}}
+
+event: message
+data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"5"}],"isError":false}}
+
+
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":9,"b":9}}}
+%%% response 202
+mcp-protocol-version: 2024-11-05
+
+Accepted
+%%% read a
+%%% response 200
+
+
+%%% close a
+%%% close a2
+%%% capture SID regex:sessionId=([0-9a-f-]+)
+%%% request GET /b/events stream=b headers=*
+Accept: text/event-stream
+
+%%% response 200
+content-type: text/event-stream
+cache-control: no-cache, no-store, max-age=0, must-revalidate
+pragma: no-cache
+access-control-allow-origin: *
+x-s: 1
+
+event: endpoint
+data: /b/msg?sessionId=***
+
+
+%%% request POST /b/msg?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 202
+x-m: 2
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /b/msg?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+%%% response 202
+x-m: 2
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /b/msg?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"a":1,"b":1}}}
+%%% response 202
+x-m: 2
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /b/msg?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":3,"method":"ping"}
+%%% response 202
+x-m: 2
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% request POST /b/msg?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{bad
+%%% response 400
+
+Invalid message format
+%%% request POST /b/msg?sessionId=zzz headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"ping"}
+%%% response 503
+
+No active SSE connection for sessionId: zzz
+%%% read b
+%%% response 200
+
+event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"experimental":{},"logging":{},"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"serverInfo":{"name":"SseB","version":"2.0.0"}}}
+
+event: message
+data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"2"}],"isError":false}}
+
+event: message
+data: {"jsonrpc":"2.0","id":3,"result":{}}
+
+
+%%% close b
+%%% request GET /sse stream=none headers=*
+Accept: text/event-stream
+
+%%% response 200
+content-type: text/event-stream
+cache-control: no-cache, no-store, max-age=0, must-revalidate
+pragma: no-cache
+access-control-allow-origin: *
+
+event: endpoint
+data: /message?sessionId=***
+
+
+%%% close none
+%%% capture SID regex:sessionId=([0-9a-f-]+)
+%%% request GET /b/events stream=b2 headers=*
+Accept: text/event-stream
+
+%%% response 200
+content-type: text/event-stream
+cache-control: no-cache, no-store, max-age=0, must-revalidate
+pragma: no-cache
+access-control-allow-origin: *
+x-s: 1
+
+event: endpoint
+data: /b/msg?sessionId=***
+
+
+%%% request POST /message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 503
+
+No active SSE connection for sessionId: ***
+%%% close b2
+%%% request GET /d/sse headers=* timeout=5
+Accept: text/event-stream
+X-Deny: yes
+
+%%% response 403
+
+
+%%% request GET /d/sse headers=* timeout=5
+Accept: text/event-stream
+X-Err: yes
+
+%%% response 500
+
+
+%%% capture SID regex:sessionId=([0-9a-f-]+)
+%%% request GET /d/sse stream=d headers=*
+Accept: text/event-stream
+X-Deny: no
+
+%%% response 200
+content-type: text/event-stream
+cache-control: no-cache, no-store, max-age=0, must-revalidate
+pragma: no-cache
+access-control-allow-origin: *
+
+event: endpoint
+data: /d/message?sessionId=***
+
+
+%%% request POST /d/message?sessionId={{SID}} headers=*
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 202
+mcp-protocol-version: 2025-06-18
+
+Accepted
+%%% read d
+%%% response 200
+
+event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"experimental":{},"logging":{},"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"serverInfo":{"name":"SseD","version":"4.0.0"}}}
+
+
+%%% close d

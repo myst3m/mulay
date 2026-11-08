@@ -1,0 +1,129 @@
+(ns mulay.cli.opts
+  (:require [mulay.mule.model :as m] [mulay.rt.log :as log] [clay.string :as str]))
+
+(defn wants-help? Bool [as: &Vec(Str) from: Int]
+  (loop [i from] (if (>= i (count as)) false (if (or (= (nth as i) "--help") (= (nth as i) "-h")) true (recur (+ i 1))))))
+
+(defn serves-app? Bool [as: &Vec(Str) embedded: Bool]
+  (if embedded
+    (not (or (and (> (count as) 0) (or (= (nth as 0) "version") (= (nth as 0) "help"))) (wants-help? as 0)))
+    (and (>= (count as) 2) (= (nth as 0) "run") (not (wants-help? as 1)))))
+
+(defn parse Values(Vec(m/Param) Int Vec(Str)) [as: &Vec(Str) from: Int]
+  (loop [i from ps: Vec(m/Param) [] lvl log/INFO rest: Vec(Str) []]
+    (if (>= i (count as)) (values ps lvl rest)
+      (let [a (nth as i)
+            has-next (< (+ i 1) (count as))]
+        (cond
+          (and (= a "-l") has-next) (recur (+ i 2) ps (log/level-of (nth as (+ i 1))) rest)
+          (and (= a "-p") has-next (> (str/index-of (nth as (+ i 1)) "=") 0))
+          (let [kv (nth as (+ i 1)) eq (str/index-of kv "=")]
+            (recur (+ i 2) (conj ps (m/->Param (subs kv 0 eq) (m/->PLit (subs kv (+ eq 1) (count kv))))) lvl rest))
+          :else
+          (let [eq (str/index-of a "=")]
+            (if (and (> eq 0) (not (str/starts-with? a "-"))) (recur (+ i 1) (conj ps (m/->Param (subs a 0 eq) (m/->PLit (subs a (+ eq 1) (count a))))) lvl rest)
+              (recur (+ i 1) ps lvl (conj rest a)))))))))
+
+(def UNRESOLVED "Couldn't find configuration property value for key ${")
+
+(defn- has? Bool [xs: &Vec(Str) s: &Str]
+  (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn unresolved-keys Vec(Str) [diags: &Vec(Str)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count diags)) acc
+      (let [d (nth diags i)
+            k (str/index-of d UNRESOLVED)]
+        (if (< k 0) (recur (+ i 1) acc)
+          (let [from (+ k (count UNRESOLVED))
+                e (str/index-of-after d "}" from)
+                key (if (< e 0) "" (subs d from e))]
+            (recur (+ i 1) (if (or (= key "") (has? acc key)) acc (conj acc key)))))))))
+
+(defn missing-hint Str [cmd: &Str keys: &Vec(Str)]
+  (let [n (count keys)
+        list (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (if (= i 0) (str (nth keys i)) (str out ", " (nth keys i))))))
+        args (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out " " (nth keys i) "=<value>"))))]
+    (str n (if (= n 1) " configuration property is not set: " " configuration properties are not set: ") list "\n"
+         "  Pass " (if (= n 1) "it as an option" "them as options") ":  " cmd args "\n"
+         "  (-p key=value works too. validate, build and an executable made with `mulay build` take the same options.)")))
+
+(defn take-key Values(Str Vec(Str)) [as: &Vec(Str)]
+  (loop [i 0 key "" rest: Vec(Str) []]
+    (if (>= i (count as)) (values key rest)
+      (let [a (nth as i)]
+        (if (and (or (= a "-k") (= a "--key")) (< (+ i 1) (count as)))
+          (recur (+ i 2) (str (nth as (+ i 1))) rest)
+          (recur (+ i 1) key (conj rest a)))))))
+
+(defn take-flag Values(Bool Vec(Str)) [as: &Vec(Str) name: &Str]
+  (loop [i 0 on false rest: Vec(Str) []]
+    (if (>= i (count as)) (values on rest)
+      (if (= (nth as i) name) (recur (+ i 1) true rest) (recur (+ i 1) on (conj rest (nth as i)))))))
+
+(defn encode-props Str [ps: &Vec(m/Param)]
+  (loop [i 0 out ""]
+    (if (>= i (count ps)) out
+      (let [p (nth ps i)
+            v (match (:v p) (m/PLit s) (str s) _ "")]
+        (recur (+ i 1) (str out (count (:name p)) ":" (:name p) (count v) ":" v))))))
+
+(defn- field Values(Str Int Str) [s: &Str at: Int]
+  (let [c (str/index-of-after s ":" at)]
+    (if (< c 0) (values "" at "bad embedded properties")
+      (let [[n err] (parse-long (subs s at c))]
+        (if (or (not= err "") (< n 0) (> (+ c 1 n) (count s))) (values "" at "bad embedded properties")
+          (values (subs s (+ c 1) (+ c 1 n)) (+ c 1 n) ""))))))
+
+(defn decode-props Values(Vec(m/Param) Str) [s: &Str]
+  (loop [at 0 acc: Vec(m/Param) []]
+    (if (>= at (count s)) (values acc "")
+      (let [[k at1 e1] (field s at)]
+        (if (not= e1 "") (values acc e1)
+          (let [[v at2 e2] (field s at1)]
+            (if (not= e2 "") (values acc e2)
+              (recur at2 (conj acc (m/->Param k (m/->PLit v)))))))))))
+
+(defn merge-props Vec(m/Param) [emb: &Vec(m/Param) run: &Vec(m/Param)]
+  (loop [i 0 acc: Vec(m/Param) []]
+    (if (>= i (count emb)) (loop [j 0 out acc] (if (>= j (count run)) out (recur (+ j 1) (conj out (nth run j)))))
+      (let [p (nth emb i)
+            hit (loop [j 0] (if (>= j (count run)) false (if (= (:name (nth run j)) (:name p)) true (recur (+ j 1)))))]
+        (recur (+ i 1) (if hit acc (conj acc p)))))))
+
+(defn need-key-hint Str [exe: &Str]
+  (str "the properties embedded in this executable are encrypted\n"
+       "  Pass the key as an option:  " exe " -k <key>\n"
+       "  (or set the environment variable MULAY_KEY)"))
+
+(defn with-default-app Vec(Str) [as: &Vec(Str)]
+  (if (or (= (count as) 0) (not (or (= (nth as 0) "run") (= (nth as 0) "validate") (= (nth as 0) "inspect") (= (nth as 0) "build")))) (copy-of as)
+    (let [optlike (or (< (count as) 2) (str/starts-with? (nth as 1) "-") (> (str/index-of (nth as 1) "=") 0))]
+      (if (not optlike) (copy-of as)
+        (if (< (count as) 2) (conj (copy-of as) ".")
+          (loop [i 0 acc: Vec(Str) []]
+            (if (>= i (count as)) acc (recur (+ i 1) (if (= i 1) (conj (conj acc ".") (nth as i)) (conj acc (nth as i)))))))))))
+
+(defn- copy-of Vec(Str) [as: &Vec(Str)] (loop [i 0 acc: Vec(Str) []] (if (>= i (count as)) acc (recur (+ i 1) (conj acc (nth as i))))))
+
+(defn- file-entries Values(Vec(Str) Str) [path: &Str]
+  (let [[data re] (read-file path)]
+    (if (not= re "") (values [] (str "-P " path ": " re))
+      (loop [at 0 n 1 acc: Vec(Str) []]
+        (if (>= at (count data)) (values acc "")
+          (let [z (str/index-of-after data (chr 0) at)
+                e (if (< z 0) (count data) z)
+                kv (subs data at e)]
+            (cond
+              (= (count kv) 0) (recur (+ e 1) n acc)
+              (> (str/index-of kv "=") 0) (recur (+ e 1) (+ n 1) (conj (conj acc "-p") kv))
+              :else (values [] (str "-P " path ": entry " n " is not key=value")))))))))
+
+(defn expand-props-files Values(Vec(Str) Str) [as: &Vec(Str)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count as)) (values acc "")
+      (if (not= (nth as i) "-P") (recur (+ i 1) (conj acc (nth as i)))
+        (if (>= (+ i 1) (count as)) (values [] "-P needs a file")
+          (let [[kvs err] (file-entries (nth as (+ i 1)))]
+            (if (not= err "") (values [] err)
+              (recur (+ i 2) (loop [k 0 a acc] (if (>= k (count kvs)) a (recur (+ k 1) (conj a (nth kvs k)))))))))))))

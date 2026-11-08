@@ -1,0 +1,159 @@
+(ns mulay.rt.stream (:require [mulay.dw.val :as v]))
+
+(defrecord Source [next: Fn(Int Values(Vec(v/Val) Bool Str)) close: Fn(Bool Int) drain: Bool])
+
+(def FRESH 0)
+(def STREAM 1)
+(def DONE 2)
+(def SPENT 3)
+
+(defrecord Cur [owner: Str src: Source state: Int rows: Vec(v/Val) err: Str])
+
+(def BLOCK 1000)
+
+(defn- empty-curs Map(Str Cur) [] (let [m: Map(Str Cur) {}] m))
+(defn- empty-owners Map(Str Int) [] (let [m: Map(Str Int) {}] m))
+
+(def CURS (atom (empty-curs)))
+(def FORKS (atom (let [m: Map(Str Fn(Bool Source)) {}] m)))
+(def OWNERS (atom (empty-owners)))
+(def SEQ (atom 0))
+
+(defn- with-state Cur [c: &Cur state: Int rows: Vec(v/Val) err: Str]
+  (->Cur (:owner c) (if (>= state DONE) (dead-src) (:src c)) state rows err))
+
+(defn- dead-next Values(Vec(v/Val) Bool Str) [n: Int] (values [] true "The stream is closed"))
+(defn- dead-close Int [broken: Bool] 0)
+(defn- dead-src Source [] (->Source dead-next dead-close false))
+
+(defn- put Int [id: &Str c: Cur]
+  (let [z (swap! CURS (fn Map(Str Cur) [m: Map(Str Cur)] (assoc m (str id) c)))] 0))
+
+(defn- lookup Vec(Cur) [id: &Str]
+  (let [m (deref CURS)] (if (contains? m id) [(get! m id)] [])))
+
+(defn- forget Int [id: &Str]
+  (let [z (swap! CURS (fn Map(Str Cur) [m: Map(Str Cur)] (dissoc m id)))
+        z2 (if (contains? (deref FORKS) id) (swap! FORKS (fn Map(Str Fn(Bool Source)) [m: Map(Str Fn(Bool Source))] (dissoc m id))) (deref FORKS))]
+    0))
+
+(defn open Str [owner: &Str src: Source]
+  (let [id (str "cur-" (swap! SEQ (fn Int [n: Int] (+ n 1))))
+        z (put id (->Cur (str owner) src FRESH [] ""))]
+    id))
+
+(defn fresh? Bool [id: &Str]
+  (let [cs (lookup id)] (and (> (count cs) 0) (= (:state (nth cs 0)) FRESH))))
+
+(defn take-vals Values(Vec(v/Val) Bool Str) [id: &Str n: Int]
+  (let [cs (lookup id)]
+    (if (= (count cs) 0) (values [] true "The stream is closed")
+      (let [c (nth cs 0)
+            st (:state c)]
+        (cond
+          (= st SPENT) (values [] true (:err c))
+          (= st DONE) (values [] true "The stream was already read")
+          :else
+          (let [[rows done err] ((:next (:src c)) n)]
+            (if (or done (not= err ""))
+              (let [z ((:close (:src c)) (not= err ""))
+                    z2 (put id (with-state c SPENT [] err))]
+                (values rows true err))
+              (let [z3 (if (= st FRESH) (put id (with-state c STREAM [] "")) 0)]
+                (values rows false "")))))))))
+
+(defn all Values(Vec(v/Val) Str) [id: &Str]
+  (let [cs (lookup id)]
+    (if (= (count cs) 0) (values [] "The stream is closed")
+      (let [c (nth cs 0)
+            st (:state c)]
+        (cond
+          (= st DONE) (values (:rows c) (:err c))
+          (not= st FRESH) (values [] "The stream was already consumed by a foreach or a batch job")
+          :else
+          (let [[rows err] (loop [acc: Vec(v/Val) []]
+                             (let [[rs done e] ((:next (:src c)) BLOCK)
+                                   acc2 (loop [i 0 a acc] (if (>= i (count rs)) a (recur (+ i 1) (conj a (nth rs i)))))]
+                               (if (or done (not= e "")) (values acc2 e) (recur acc2))))
+                z ((:close (:src c)) (not= err ""))
+                z2 (put id (with-state c DONE rows err))]
+            (values rows err)))))))
+
+(defn enter Int [owner: &Str]
+  (let [z (swap! OWNERS (fn Map(Str Int) [m: Map(Str Int)]
+                          (assoc m (str owner) (+ (if (contains? m owner) (get! m owner) 0) 1))))]
+    0))
+
+(defn leave Int [owner: &Str]
+  (let [m (swap! OWNERS (fn Map(Str Int) [m: Map(Str Int)]
+                          (let [n (- (if (contains? m owner) (get! m owner) 1) 1)]
+                            (if (<= n 0) (dissoc m owner) (assoc m (str owner) n)))))]
+    (if (contains? m owner) 0
+      (let [cm (deref CURS)
+            ks (keys cm)]
+        (loop [i 0]
+          (if (>= i (count ks)) 0
+            (let [id (nth ks i)
+                  c (get! cm id)]
+              (if (not= (:owner c) owner) (recur (+ i 1))
+                (let [st (:state c)
+                      z (cond
+                          (and (= st FRESH) (:drain (:src c))) (let [[rows err] (all id)] 0)
+                          (or (= st FRESH) (= st STREAM)) ((:close (:src c)) false)
+                          :else 0)
+                      z2 (forget id)]
+                  (recur (+ i 1)))))))))))
+
+(defn owned a [owner: &Str f: Fn(a)]
+  (let [o (str owner) z (enter o)] (with-cleanup f (fn Int [] (leave o)))))
+
+(defn open-repeatable Str [owner: &Str f: Fn(Bool Source)]
+  (let [id (open owner (f true))
+        g f
+        z (swap! FORKS (fn Map(Str Fn(Bool Source)) [m: Map(Str Fn(Bool Source))] (assoc m (str id) g)))]
+    id))
+
+(defn repeatable? Bool [id: &Str] (contains? (deref FORKS) id))
+
+(defn fork Str [id: &Str]
+  (let [fs (deref FORKS) cs (lookup id)]
+    (if (or (not (contains? fs id)) (= (count cs) 0)) (str id)
+      (let [f (get! fs id)] (open (:owner (nth cs 0)) (f false))))))
+
+(defn discard Int [id: &Str]
+  (let [cs (lookup id)]
+    (if (= (count cs) 0) 0
+      (let [c (nth cs 0)
+            z (if (or (= (:state c) FRESH) (= (:state c) STREAM)) ((:close (:src c)) false) 0)]
+        (forget id)))))
+
+(defn adopt Int [id: &Str owner: &Str]
+  (let [cs (lookup id)]
+    (if (= (count cs) 0) 0
+      (let [c (nth cs 0)] (put id (->Cur (str owner) (:src c) (:state c) (:rows c) (:err c)))))))
+
+(defn live Int [] (count (keys (deref CURS))))
+
+(defn- paged-next Values(Vec(v/Val) Bool Str) [buf: &Atom(Vec(v/Val)) pos: &Atom(Int) loc: &Atom(Str) fetch: &Fn(Str Values(Vec(v/Val) Str Str)) n: Int]
+  (loop [acc: Vec(v/Val) []]
+    (let [b (deref buf)
+          p (deref pos)]
+      (cond
+        (>= (count acc) n) (values acc (and (>= p (count b)) (= (deref loc) "")) "")
+        (< p (count b))
+        (let [want (- n (count acc))
+              to (if (> (+ p want) (count b)) (count b) (+ p want))
+              acc2 (loop [i p a acc] (if (>= i to) a (recur (+ i 1) (conj a (nth b i)))))
+              z (reset! pos to)]
+          (recur acc2))
+        (= (deref loc) "") (values acc true "")
+        :else
+        (let [[rows nx e] (fetch (deref loc))]
+          (if (not= e "") (values acc true e)
+            (let [z1 (reset! buf rows) z2 (reset! pos 0) z3 (reset! loc nx)] (recur acc))))))))
+
+(defn paged Source [first: Vec(v/Val) next-loc: Str fetch: Fn(Str Values(Vec(v/Val) Str Str)) close: Fn(Bool Int)]
+  (let [buf: Atom(Vec(v/Val)) (atom first)
+        pos: Atom(Int) (atom 0)
+        loc: Atom(Str) (atom next-loc)]
+    (->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (paged-next buf pos loc fetch n)) close false)))

@@ -1,0 +1,44 @@
+(ns grpc-test (:require [mulay.conn.grpc :as g] [clay.httpmsg :as hm]))
+
+(defn- H hm/Header [k: Str v: Str] (hm/->Header k v))
+
+(def G [(hm/->Header "content-type" "application/grpc")])
+
+(defn- msg Str [s: Str] (g/frame s))
+
+(defn- rr Str [status: Int hs: Vec(hm/Header) tr: Vec(hm/Header) body: Str]
+  (let [[c m b] (g/read-reply status hs tr body)] (str c "|" m "|" b)))
+
+;; 応答の読み方。成功・失敗の status・Trailers-Only・trailer 無し・番号の範囲外・メッセージ 2 つは実 Mule 4.11.3 で記録した
+;; (test/fixtures/apps/grpc-client、相手は mule-oracle の gRPC のスタブ)。枠の壊れた本文・メッセージ無しの成功・HTTP の失敗は
+;; 実 Mule が応答を返さずに止まるので、mulay が決めた結果 (docs/compat/deviations.md)
+(deftest reply-success-takes-the-first-message
+  (is (= (rr 200 G [(H "grpc-status" "0")] (msg "abc")) "0||abc"))
+  (is (= (rr 200 G [(H "grpc-status" "0")] (str (msg "one") (msg "two"))) "0||one"))
+  (is (= (rr 200 G [] (msg "abc")) "0||abc")))
+
+(deftest reply-status-from-trailers-or-headers
+  (is (= (rr 200 G [(H "grpc-status" "5") (H "grpc-message" "nicht gefunden: %C3%BC 100%25")] "") "5|nicht gefunden: ü 100%|"))
+  (is (= (rr 200 [(H "content-type" "application/grpc") (H "grpc-status" "7") (H "grpc-message" "denied")] [] "") "7|denied|"))
+  (is (= (rr 200 G [(H "grpc-status" "13")] "") "13||"))
+  (is (= (rr 200 G [(H "grpc-status" "99")] "") "2|Unknown code 99|")))
+
+(deftest reply-shapes-real-mule-hangs-on
+  (is (= (rr 200 G [(H "grpc-status" "0")] (str (chr 0) (chr 0) (chr 0) (chr 0) (chr 9) "abc")) "13|Received a truncated gRPC message|"))
+  (is (= (rr 200 G [(H "grpc-status" "0")] "") "13|No value received for unary call|"))
+  (is (= (rr 503 [(H "content-type" "text/plain")] [] "busy") "14|HTTP status code 503|"))
+  (is (= (rr 404 [(H "content-type" "text/plain")] [] "") "12|HTTP status code 404|"))
+  (is (= (rr 200 G [(H "grpc-status" "0")] (str (chr 1) (chr 0) (chr 0) (chr 0) (chr 3) "abc")) "13|Compressed gRPC message, but the request did not offer a grpc-encoding|")))
+
+(deftest status-names
+  (is (= (g/status-name 5) "NOT_FOUND"))
+  (is (= (g/error-id 2) "GRPC_UNKNOWN"))
+  (is (= (g/error-id 14) "UNAVAILABLE"))
+  (is (= (g/status-code "not_found") 5))
+  (is (= (g/status-code "5") 5))
+  (is (= (g/status-code "BOGUS") -1)))
+
+(deftest percent-coding
+  (is (= (g/percent-encode "no such ü 100%") "no such %C3%BC 100%25"))
+  (is (= (g/percent-decode "a%2") "a%2"))
+  (is (= (g/percent-decode "%zz") "%zz")))

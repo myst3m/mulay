@@ -1,0 +1,169 @@
+(ns mulay.mule.model (:require [mulay.dw.engine :as eng] [mulay.lib.xml :as xml] [mulay.lib.diag :as d] [mulay.lib.res :as res]))
+
+(defrecord Loc
+  [file: Str
+   line: Int
+   path: Str
+   dsl: Str
+   elem: Str
+   attrs: Vec(Str)])
+
+(defrecord ExprSrc
+  [expr: Str
+   script: Str
+   off: Int
+   where: Str
+   plain: Bool
+   uses: Vec(Str)
+   file: Str
+   base: Int])
+
+(defvariant PVal
+  (PLit s: Str)
+  (PExpr text: Str c: eng/Compiled src: ExprSrc))
+
+(defrecord Param [name: Str v: PVal])
+
+(defrecord Script [c: eng/Compiled src: ExprSrc])
+
+(defrecord TVar [name: Str script: Script])
+
+(defrecord When [cond: PVal procs: Vec(Proc)])
+
+(defrecord Handler
+  [propagate: Bool
+   types: Vec(Str)
+   when: Vec(PVal)
+   log-exception: Bool
+   procs: Vec(Proc)
+   loc: Loc])
+
+(defvariant Proc
+  (PrSetPayload value: PVal mime: Str encoding: Str loc: Loc)
+  (PrSetVar name: Str value: PVal mime: Str loc: Loc)
+  (PrRemoveVar name: Str loc: Loc)
+  (PrLogger message: Vec(PVal) level: Str category: Str loc: Loc)
+  (PrTransform payload: Vec(Script) attributes: Vec(Script) vars: Vec(TVar) loc: Loc)
+  (PrFlowRef name: PVal target: Str target-value: Vec(PVal) loc: Loc)
+  (PrRaise type: Str description: PVal loc: Loc)
+  (PrParseTemplate content: Str parts: Vec(PVal) target: Str loc: Loc)
+  (PrChoice whens: Vec(When) otherwise: Vec(Proc) loc: Loc)
+  (PrForEach collection: Vec(PVal) counter: Str root: Str batch: Int procs: Vec(Proc) loc: Loc)
+  (PrParallelForEach collection: Vec(PVal) max-concurrency: Int timeout: Int target: Str procs: Vec(Proc) loc: Loc)
+  (PrScatterGather routes: Vec(Route) timeout: Int max-concurrency: Int target: Str loc: Loc)
+  (PrTry procs: Vec(Proc) handlers: Vec(Handler) handler-ref: Str tx-action: Str loc: Loc)
+  (PrUntilSuccessful max-retries: Int millis-between: Int procs: Vec(Proc) loc: Loc)
+  (PrAsync procs: Vec(Proc) max-concurrency: Int loc: Loc)
+  (PrIdempotent id: PVal value: PVal store: Str private: Vec(Vec(Param)) loc: Loc)
+  (PrCache strategy: Str filter: Vec(PVal) procs: Vec(Proc) loc: Loc)
+  (PrInvalidateKey strategy: Str key: Vec(PVal) loc: Loc)
+  (PrInvalidateCache strategy: Str loc: Loc)
+  (PrFirstSuccessful routes: Vec(Route) loc: Loc)
+  (PrRoundRobin routes: Vec(Route) id: Int loc: Loc)
+  (PrBatchJob name: Str block-size: Int max-failed: Int max-concurrency: Int steps: Vec(BatchStep) on-complete: Vec(Proc) loc: Loc)
+  (PrConnectorOp connector: Str op: Str config-ref: Str params: Vec(Param) children: Vec(xml/XNode)
+                 exprs: Vec(Param) chains: Vec(Chain) target: Str target-value: Vec(PVal) loc: Loc)
+  (PrUnknown name: Str loc: Loc))
+
+(defrecord Route [procs: Vec(Proc)])
+
+(defn proc-loc Loc [p: &Proc]
+  (match p
+    (PrSetPayload a b d l) l (PrSetVar a b d l) l (PrRemoveVar a l) l (PrLogger a b d l) l
+    (PrTransform a b d l) l (PrFlowRef a b d l) l (PrRaise a b l) l (PrParseTemplate a b d l) l
+    (PrChoice a b l) l (PrForEach a b d f g l) l (PrParallelForEach a b d f g l) l
+    (PrScatterGather a b d f l) l (PrTry a b d f l) l (PrUntilSuccessful a b d l) l
+    (PrAsync a b l) l (PrIdempotent a b d f l) l (PrCache a b d l) l (PrInvalidateKey a b l) l (PrInvalidateCache a l) l (PrFirstSuccessful a l) l (PrRoundRobin a b l) l (PrBatchJob a b d f g h l) l
+    (PrConnectorOp a b d f g h k i j l) l (PrUnknown a l) l))
+
+(defrecord Chain [name: Str procs: Vec(Proc)])
+
+(defrecord BatchStep [name: Str accept-expr: Vec(PVal) accept-policy: Str procs: Vec(Proc) aggregator: Vec(BatchAggregator) loc: Loc])
+
+(defrecord BatchAggregator [size: Int preserve: Bool procs: Vec(Proc) loc: Loc])
+
+(defvariant Source
+  (SrcHttpListener config-ref: Str path: Str methods: Vec(Str)
+                   resp-status: Vec(PVal) resp-headers: Vec(PVal) resp-body: Vec(PVal)
+                   err-status: Vec(PVal) err-headers: Vec(PVal) err-body: Vec(PVal)
+                   resp-reason: Vec(PVal) err-reason: Vec(PVal) stream-mode: Str
+                   out-mime: Str out-enc: Str
+                   loc: Loc)
+  (SrcScheduler frequency-ms: Int start-delay-ms: Int cron: Str tz: Str disallow-concurrent: Bool loc: Loc)
+  (SrcConnector connector: Str name: Str config-ref: Str params: Vec(Param) children: Vec(xml/XNode)
+                exprs: Vec(Param) sched: Vec(Sched) loc: Loc))
+
+(defrecord Sched [frequency-ms: Int start-delay-ms: Int cron: Str tz: Str])
+
+(defrecord Flow
+  [name: Str
+   sub: Bool
+   source: Vec(Source)
+   procs: Vec(Proc)
+   handlers: Vec(Handler)
+   handler-ref: Str
+   max-concurrency: Int
+   initial-state: Str
+   loc: Loc])
+
+(defrecord MTest
+  [name: Str
+   description: Str
+   ignore: Vec(PVal)
+   expected-type: Str
+   expected-desc: Str
+   behavior: Vec(Proc)
+   execution: Vec(Proc)
+   validation: Vec(Proc)
+   sources: Vec(Str)
+   loc: Loc])
+
+(defrecord MSuite
+  [file: Str
+   name: Str
+   ignore: Bool
+   before-suite: Vec(Proc)
+   after-suite: Vec(Proc)
+   before-test: Vec(Proc)
+   after-test: Vec(Proc)
+   tests: Vec(MTest)])
+
+(defrecord OpChains [op: Str names: Vec(Str)])
+
+(defrecord Hints [source-uris: Vec(Str) sources: Vec(Str) chains: Vec(OpChains) each: Vec(Str) raw-sources: Vec(Str) modules: Vec(Str)])
+
+(defn no-hints Hints [] (let [s: Vec(Str) [] c: Vec(OpChains) []] (->Hints s s c s s s)))
+
+(defrecord Config [kind: Str name: Str params: Vec(Param) children: Vec(xml/XNode) exprs: Vec(Param) loc: Loc])
+
+(defrecord GlobalHandler [name: Str handlers: Vec(Handler) loc: Loc])
+
+(defrecord Diag [file: Str line: Int msg: Str path: Str rep: Vec(d/Report)])
+
+(defn diag-str Str [d: &Diag]
+  (cond (> (:line d) 0) (str (:file d) ":" (:line d) ": " (:msg d))
+        (not= (:file d) "") (str (:file d) ": " (:msg d))
+        :else (str (:msg d))))
+
+(defn diag-strs Vec(Str) [ds: &Vec(Diag)]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i (count ds)) acc (recur (+ i 1) (conj acc (diag-str (nth ds i)))))))
+
+(defrecord Dep [group: Str artifact: Str version: Str])
+
+(defrecord App
+  [name: Str
+   flows: Vec(Flow)
+   configs: Vec(Config)
+   global-handlers: Vec(GlobalHandler)
+   default-handler: Str
+   properties: Vec(Param)
+   prop-origins: Vec(Str)
+   diags: Vec(Diag)
+   res: Fn(Str Values(Str Bool))
+   res-url: Fn(Str Str)
+   suites: Vec(MSuite)
+   texts: Map(Str Str)
+   deps: Vec(Dep)
+   rset: res/ResSet])
+
+(def BINDINGS ["payload" "attributes" "vars" "error" "message" "flow" "app" "mule" "server" "correlationId" "authentication" "dataType"])

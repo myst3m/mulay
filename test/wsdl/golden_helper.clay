@@ -1,0 +1,49 @@
+(ns wsdl-golden-helper (:require [mulay.lib.wsdl :as w] [clay.io :as io] [clay.string :as str]))
+
+;; tools/gen-wsdl-golden.java と同じ形の文字列 (service、port、操作は名前の順)
+
+(defn- read-loc Values(Str Str) [url: Str]
+  (if (str/starts-with? url "file:")
+    (let [p (subs url 5 (count url))
+          [t e] (read-file p)]
+      (values t (if (= e "") "" (str p " (No such file or directory)"))))
+    (values "" "unknown scheme")))
+
+(defn- sort-names Vec(Int) [names: &Vec(Str)]
+  (loop [i 0 acc: Vec(Int) []]
+    (if (>= i (count names)) acc
+      (let [pos (loop [k 0] (if (or (>= k (count acc)) (< (str-cmp (nth names i) (nth names (nth acc k))) 0)) k (recur (+ k 1))))
+            acc2 (loop [k 0 a: Vec(Int) []] (if (>= k (count acc)) (if (= pos (count acc)) (conj a i) a)
+                                              (recur (+ k 1) (if (= k pos) (conj (conj a i) (nth acc k)) (conj a (nth acc k))))))]
+        (recur (+ i 1) acc2)))))
+
+(defn- str-cmp Int [a: &Str b: &Str]
+  (let [n (if (< (count a) (count b)) (count a) (count b))]
+    (loop [i 0] (if (>= i n) (- (count a) (count b)) (if (not= (nth a i) (nth b i)) (- (nth a i) (nth b i)) (recur (+ i 1)))))))
+
+(defn- show-op Str [o: &w/Op]
+  (str "  op " (:name o) " type=" (if (:one-way o) "ONE_WAY" "REQUEST_RESPONSE")
+       " action=" (if (:has-action o) (str "[" (:action o) "]") "null") "\n"))
+
+(defn- show-port Str [p: &w/Port]
+  (let [os (:ops p)
+        idx (sort-names (loop [i 0 acc: Vec(Str) []] (if (>= i (count os)) acc (recur (+ i 1) (conj acc (:name (nth os i)))))))
+        head (str " port " (:name p) " address=" (if (= (count (:address p)) 0) "null" (nth (:address p) 0))
+                  " binding=" (:version p) "/" (:style p) "\n")]
+    (loop [i 0 out head] (if (>= i (count idx)) out (let [s (show-op (nth os (nth idx i)))] (recur (+ i 1) (str out s)))))))
+
+(defn- show-service Str [s: &w/Service]
+  (let [ps (:ports s)
+        idx (sort-names (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (:name (nth ps i)))))))
+        head (str "service " (:name s) "\n")]
+    (loop [i 0 out head] (if (>= i (count idx)) out (let [x (show-port (nth ps (nth idx i)))] (recur (+ i 1) (str out x)))))))
+
+(defn show Str [file: Str]
+  (let [[cwd ce] (io/cwd)
+        dir (str cwd "/test/wsdl/data")
+        [m e] (w/parse (str "file:" dir "/" file) read-loc)]
+    (if (not= e "") (str "!" (str/replace (str/replace e dir "<DIR>") cwd "<CWD>"))
+      (let [ss (:services m)
+            idx (sort-names (loop [i 0 acc: Vec(Str) []] (if (>= i (count ss)) acc (recur (+ i 1) (conj acc (:name (nth ss i)))))))
+            head (str "style=" (:style m) "\n")]
+        (loop [i 0 out head] (if (>= i (count idx)) out (let [x (show-service (nth ss (nth idx i)))] (recur (+ i 1) (str out x)))))))))

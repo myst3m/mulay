@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18146"/>
+    </http:listener-config>
+
+    <!-- import * from で関数と var -->
+    <flow name="star">
+        <http:listener config-ref="L" path="/star"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import * from modules::Utils
+output application/json
+---
+{greet: greet("mule"), g: greeting, twice: twice(21)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- import M as 別名、修飾名、名前を選んだ import -->
+    <flow name="alias">
+        <http:listener config-ref="L" path="/alias"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import modules::Utils as U
+import double, factor from modules::sub::Helpers
+import modules::sub::Helpers
+output application/json
+---
+{a: U::greet("x"), b: double(4) + factor, c: Helpers::factor}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- インラインの式からモジュール -->
+    <flow name="inline">
+        <http:listener config-ref="L" path="/inline"/>
+        <set-payload value="#[import greet from modules::Utils --- greet('inline')]" mimeType="text/plain"/>
+    </flow>
+
+    <!-- モジュールの関数の中の失敗 -->
+    <flow name="boom">
+        <http:listener config-ref="L" path="/boom"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import boom from modules::Utils
+output application/json
+---
+boom({})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[error.description]" mimeType="text/plain"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- try の stack (モジュールの関数の枠) -->
+    <flow name="try">
+        <http:listener config-ref="L" path="/try"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import boom from modules::Utils
+import try from dw::Runtime
+output application/json
+---
+try(() -> boom({})).error - "location"]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+</mule>

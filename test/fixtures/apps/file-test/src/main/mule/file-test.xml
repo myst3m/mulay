@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="HTTP_Listener">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <file:config name="File_Config" doc:name="File Config">
+        <file:connection workingDir="${file.workingDir}"/>
+    </file:config>
+
+    <!-- Flow 1: POST /file/setup - Create test directory and seed files -->
+    <flow name="file-setup-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/setup" allowedMethods="POST" doc:name="POST /file/setup"/>
+        <file:write config-ref="File_Config" path="test.txt" doc:name="Write test.txt">
+            <file:content>Hello World</file:content>
+        </file:write>
+        <file:write config-ref="File_Config" path="data.csv" doc:name="Write data.csv">
+            <file:content>Name,Age
+Alice,30
+Bob,25</file:content>
+        </file:write>
+        <file:write config-ref="File_Config" path="sub/nested.txt" createParentDirectories="true" doc:name="Write sub/nested.txt">
+            <file:content>Nested file</file:content>
+        </file:write>
+        <ee:transform doc:name="Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "ready"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 2: GET /file/read - Read a file -->
+    <flow name="file-read-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/read" allowedMethods="GET" doc:name="GET /file/read"/>
+        <set-variable variableName="filePath" value="#[attributes.queryParams.path default 'test.txt']" doc:name="Set filePath"/>
+        <file:read config-ref="File_Config" path="#[vars.filePath]" doc:name="Read file"/>
+        <set-payload value="#[payload]" mimeType="text/plain" doc:name="Set mime type"/>
+    </flow>
+
+    <!-- Flow 3: GET /file/read/csv - Read CSV file -->
+    <flow name="file-read-csv-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/read/csv" allowedMethods="GET" doc:name="GET /file/read/csv"/>
+        <file:read config-ref="File_Config" path="data.csv" outputMimeType="application/csv" doc:name="Read CSV"/>
+        <ee:transform doc:name="CSV to JSON">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 4: POST /file/write - Write content to file -->
+    <flow name="file-write-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/write" allowedMethods="POST" doc:name="POST /file/write"/>
+        <set-variable variableName="path" value="#[attributes.queryParams.path]" doc:name="Set path"/>
+        <set-variable variableName="mode" value="#[attributes.queryParams.mode default 'OVERWRITE']" doc:name="Set mode"/>
+        <file:write config-ref="File_Config" path="#[vars.path]" mode="#[vars.mode]" doc:name="Write file"/>
+        <ee:transform doc:name="Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "written", path: vars.path}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 5: POST /file/write/append - Append to file -->
+    <flow name="file-write-append-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/write/append" allowedMethods="POST" doc:name="POST /file/write/append"/>
+        <file:write config-ref="File_Config" path="append-test.txt" mode="APPEND" createParentDirectories="true" doc:name="Append to file"/>
+        <ee:transform doc:name="Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "appended", path: "append-test.txt"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 6: GET /file/list - List directory -->
+    <flow name="file-list-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/list" allowedMethods="GET" doc:name="GET /file/list"/>
+        <set-variable variableName="dir" value="#[attributes.queryParams.dir default '.']" doc:name="Set dir"/>
+        <file:list config-ref="File_Config" directoryPath="#[vars.dir]" doc:name="List directory"/>
+        <ee:transform doc:name="To JSON">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+// mulay: 並びとディレクトリのサイズはファイルシステム依存なので、path で並べ、ディレクトリの size は出さない
+payload orderBy ((item) -> item.attributes.path) map ((item) -> {
+    fileName: item.attributes.fileName,
+    size: if (item.attributes.directory) null else item.attributes.size,
+    directory: item.attributes.directory
+})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 7: GET /file/list/recursive - List recursively -->
+    <flow name="file-list-recursive-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/list/recursive" allowedMethods="GET" doc:name="GET /file/list/recursive"/>
+        <file:list config-ref="File_Config" directoryPath="." recursive="true" doc:name="List recursive"/>
+        <ee:transform doc:name="To JSON">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+// mulay: 並びとディレクトリのサイズはファイルシステム依存なので、path で並べ、ディレクトリの size は出さない
+payload orderBy ((item) -> item.attributes.path) map ((item) -> {
+    fileName: item.attributes.fileName,
+    size: if (item.attributes.directory) null else item.attributes.size,
+    directory: item.attributes.directory
+})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 8: POST /file/copy - Copy a file -->
+    <flow name="file-copy-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/copy" allowedMethods="POST" doc:name="POST /file/copy"/>
+        <set-variable variableName="source" value="#[attributes.queryParams.source]" doc:name="Set source"/>
+        <set-variable variableName="target" value="#[attributes.queryParams.target]" doc:name="Set target"/>
+        <file:copy config-ref="File_Config" sourcePath="#[vars.source]" targetPath="#[vars.target]" overwrite="true" createParentDirectories="true" doc:name="Copy file"/>
+        <ee:transform doc:name="Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "copied", source: vars.source, target: vars.target}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 9: POST /file/move - Move a file -->
+    <flow name="file-move-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/move" allowedMethods="POST" doc:name="POST /file/move"/>
+        <set-variable variableName="source" value="#[attributes.queryParams.source]" doc:name="Set source"/>
+        <set-variable variableName="target" value="#[attributes.queryParams.target]" doc:name="Set target"/>
+        <file:move config-ref="File_Config" sourcePath="#[vars.source]" targetPath="#[vars.target]" overwrite="true" createParentDirectories="true" doc:name="Move file"/>
+        <ee:transform doc:name="Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "moved", source: vars.source, target: vars.target}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 10: POST /file/rename - Rename a file -->
+    <flow name="file-rename-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/rename" allowedMethods="POST" doc:name="POST /file/rename"/>
+        <set-variable variableName="path" value="#[attributes.queryParams.path]" doc:name="Set path"/>
+        <set-variable variableName="newName" value="#[attributes.queryParams['to']]" doc:name="Set newName"/>
+        <file:rename config-ref="File_Config" path="#[vars.path]" to="#[vars.newName]" overwrite="true" doc:name="Rename file"/>
+        <ee:transform doc:name="Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "renamed", path: vars.path, newName: vars.newName}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 11: DELETE /file/delete - Delete a file -->
+    <flow name="file-delete-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/delete" allowedMethods="DELETE" doc:name="DELETE /file/delete"/>
+        <set-variable variableName="path" value="#[attributes.queryParams.path]" doc:name="Set path"/>
+        <file:delete config-ref="File_Config" path="#[vars.path]" doc:name="Delete file"/>
+        <ee:transform doc:name="Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "deleted", path: vars.path}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 12: POST /file/mkdir - Create directory -->
+    <flow name="file-mkdir-flow">
+        <http:listener config-ref="HTTP_Listener" path="/file/mkdir" allowedMethods="POST" doc:name="POST /file/mkdir"/>
+        <set-variable variableName="dir" value="#[attributes.queryParams.dir]" doc:name="Set dir"/>
+        <file:create-directory config-ref="File_Config" directoryPath="#[vars.dir]" doc:name="Create directory"/>
+        <ee:transform doc:name="Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "created", directory: vars.dir}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>

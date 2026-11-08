@@ -1,0 +1,1880 @@
+(ns mulay.rt.engine
+  (:require [clay.utf8 :as u8] [mulay.lib.host :as host] [mulay.rt.stream :as stream] [mulay.rt.outspool :as osp] [mulay.rt.persist :as ps] [mulay.lib.spool :as spool] [mulay.rt.ops :as ops] [mulay.rt.meter :as mt] [mulay.rt.trace :as tr] [mulay.lib.otlp :as otlp] [mulay.rt.deferred :as dfr] [mulay.dw.javaobj :as jo] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as drt] [mulay.dw.err :as dwe] [mulay.dw.engine :as eng] [mulay.dw.eval :as dev]
+            [mulay.dw.ast :as ast] [mulay.dw.rir :as r] [mulay.lib.numparse :as npz] [mulay.dw.fmt.registry :as reg] [mulay.dw.fmt.json :as json] [mulay.mule.model :as m] [mulay.rt.event :as ev]
+            [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.rt.log :as log] [mulay.rt.ostore :as ost] [mulay.lib.hash :as hash] [mulay.dw.lib.binaries :as bin] [mulay.lib.xml :as xml]
+            [mulay.dw.lib.core_misc :as dmisc] [mulay.lib.time.zoned :as zt] [mulay.lib.jhash :as jh] [mulay.dw.coerce_time :as ctm] [mulay.lib.uni :as uni] [mulay.rt.explain :as rx] [mulay.lib.diag :as diag] [clay.string :as str]))
+
+
+
+(defrecord Hook [before: Fn(m/Loc ev/Event Int) after: Fn(m/Loc ev/Event Vec(err/MErr) Int) route: Fn(m/Loc Int Int) handled: Fn(m/Loc Int)])
+
+(defrecord Ctx
+  [app: m/App
+   conns: Vec(conn/Connector)
+   log-level: Int
+   rr: Atom
+   infer: Atom
+   intercept: Vec(Fn(m/Loc ev/Event Values(Int ev/Event Vec(err/MErr))))
+   hook: Vec(Hook)
+   inline-batch: Bool])
+
+(defn new-ctx Ctx [app: m/App conns: Vec(conn/Connector) log-level: Int]
+  (let [z: Map {} z2: Map {} zp (err/set-conn-parents! (conn/error-parents conns)) zc (err/set-conn-classes! (conn/error-classes conns))] (->Ctx app conns log-level (atom (->dyn z)) (atom (->dyn z2)) (no-intercept) (let [h: Vec(Hook) []] h) false)))
+
+(defn- no-intercept Vec(Fn(m/Loc ev/Event Values(Int ev/Event Vec(err/MErr)))) []
+  (let [z: Vec(Fn(m/Loc ev/Event Values(Int ev/Event Vec(err/MErr)))) []] z))
+
+(def DEFAULT-LISTENER "org.mule.runtime.core.privileged.exception.DefaultExceptionListener")
+(def LOGGER-CATEGORY "org.mule.runtime.core.internal.processor.LoggerMessageProcessor")
+
+(defn- ok Values(ev/Event Vec(err/MErr)) [e: ev/Event] (values e []))
+(defn- failure Values(ev/Event Vec(err/MErr)) [e: ev/Event x: err/MErr] (values e [x]))
+
+(defn plain-desc Str [msg: &Str expr: &Str] (str "\"" msg "\" evaluating expression: \"" expr "\"."))
+
+(defn- cps Int [s: &Str a: Int b: Int]
+  (loop [i a n 0] (if (>= i b) n (recur (+ i 1) (if (= (bit-and (nth s i) 192) 128) n (+ n 1))))))
+
+(defn- rep-str Str [c: &Str n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out c)))))
+
+(defn dw-desc Str [msg: &Str start0: Int end0: Int src: &m/ExprSrc]
+  (let [[start end] (drt/strip-parens (:script src) start0 end0)
+        script (:script src)
+        off (:off src)
+        n (count script)]
+    (if (or (:plain src) (< start off) (>= start n)) (plain-desc msg (:expr src))
+      (let [ls (loop [j start] (if (and (> j off) (not= (nth script (- j 1)) 10)) (recur (- j 1)) j))
+            le (loop [j start] (if (and (< j n) (not= (nth script j) 10) (not= (nth script j) 13)) (recur (+ j 1)) j))
+            ln (loop [j off k 1] (if (>= j start) k (recur (+ j 1) (if (= (nth script j) 10) (+ k 1) k))))
+            col (+ 1 (cps script ls start))
+            ce (if (or (> end le) (<= end start)) le end)
+            ncar (let [x (cps script start ce)] (if (< x 1) 1 x))
+            lnum (str ln)]
+        (str "\"" msg "\n\n" lnum "| " (subs script ls le) "\n" (rep-str " " (+ (count lnum) 1 col)) (rep-str "^" ncar)
+             "\nTrace:\n  at " (:where src) " (line: " ln ", column: " col ")\" evaluating expression: \""
+             (:expr src) "\".")))))
+
+(defn dw-err-desc Str [de: &dwe/DwErr src: &m/ExprSrc srcs: &drt/Srcs]
+  (let [frames (:frames de)
+        sp (:sp de)
+        main-len (count (:script src))]
+    (if (or (:plain src) (and (= (count frames) 0) (< (:start sp) main-len)))
+      (dw-desc (:msg de) (:start sp) (:end sp) src)
+      (let [ex (cond (not= (:origin de) "") (:origin de)
+                     (>= (:start sp) main-len) (let [[l c x id] (drt/excerpt-in srcs sp)] x)
+                     :else (main-excerpt src sp))
+            fs (dwe/stack-of de)
+            trace (loop [i 0 out ""]
+                    (if (>= i (count fs)) out
+                      (let [f (nth fs i)
+                            w (:where f)
+                            fsp (:sp f)
+                            line (cond
+                                   (not= w "") (let [p2 (str/last-index-of w ":") p1 (str/last-index-of (subs w 0 p2) ":")]
+                                                 (str (subs w 0 p1) "::" (:name f) " (line: " (subs w (+ p1 1) p2) ", column: " (subs w (+ p2 1) (count w)) ")"))
+                                   (>= (:start fsp) main-len)
+                                   (let [[ln col x id] (drt/excerpt-in srcs fsp)] (str id "::" (drt/short-name (:name f)) " (line: " ln ", column: " col ")"))
+                                   :else
+                                   (let [[ln col] (main-line-col src fsp)]
+                                     (str (if (= (:name f) "main") (:where src) (str "anonymous::" (:name f)))
+                                          " (line: " ln ", column: " col ")")))]
+                        (recur (+ i 1) (str out "\n  at " line)))))]
+        (str "\"" (:msg de) "\n" ex "\nTrace:" trace "\" evaluating expression: \"" (:expr src) "\".")))))
+
+(defn- main-line-col Values(Int Int) [src: &m/ExprSrc sp: &ast/Span]
+  (let [script (:script src)
+        off (:off src)
+        [start end] (drt/strip-parens script (:start sp) (:end sp))]
+    (if (or (< start off) (>= start (count script))) (values 0 0)
+      (let [ls (loop [j start] (if (and (> j off) (not= (nth script (- j 1)) 10)) (recur (- j 1)) j))
+            ln (loop [j off k 1] (if (>= j start) k (recur (+ j 1) (if (= (nth script j) 10) (+ k 1) k))))]
+        (values ln (+ 1 (cps script ls start)))))))
+
+(defn- main-excerpt Str [src: &m/ExprSrc sp: &ast/Span]
+  (let [script (:script src)
+        off (:off src)
+        [start end] (drt/strip-parens script (:start sp) (:end sp))
+        n (count script)]
+    (if (or (< start off) (>= start n)) ""
+      (let [ls (loop [j start] (if (and (> j off) (not= (nth script (- j 1)) 10)) (recur (- j 1)) j))
+            le (loop [j start] (if (and (< j n) (not= (nth script j) 10) (not= (nth script j) 13)) (recur (+ j 1)) j))
+            [ln col] (main-line-col src sp)
+            ce (if (or (> end le) (<= end start)) le end)
+            ncar (let [x (cps script start ce)] (if (< x 1) 1 x))
+            lnum (str ln)]
+        (str "\n" lnum "| " (subs script ls le) "\n" (rep-str " " (+ (count lnum) 1 col)) (rep-str "^" ncar))))))
+
+(defn expr-err err/MErr [desc: Str] (err/mk "MULE" "EXPRESSION" desc))
+
+(def STREAM-CLASS "org.mule.runtime.core.internal.streaming.bytes.ManagedCursorStreamProvider")
+
+(def TYPED-CLASS "org.mule.runtime.api.metadata.TypedValue")
+
+(defn- typed-meta v/Val [x: v/Val t: &ev/TV]
+  (let [[r re] (ev/typed-read t "" "raw")
+        ms [(v/field "encoding" (v/->VStr "UTF-8")) (v/field "mediaType" (v/->VStr (:mime t)))
+            (v/field "mimeType" (v/->VStr (reg/norm-mime (:mime t)))) (v/field "class" (v/->VStr TYPED-CLASS))
+            (v/field "raw" (if (= re "") r (v/null-v)))]]
+    (match x
+      (v/VMeta y m0) (v/->VMeta y (add-missing m0 ms))
+      _ (v/->VMeta x ms))))
+
+(defn with-mime-meta v/Val [x: v/Val t: &ev/TV]
+  (if (= (:state t) ev/TYPED) (typed-meta x t)
+  (if (let [n (reg/norm-mime (:mime t))] (or (and (= n "application/java") (not (wire-bytes? t))) (= n "")))
+    (java-root-meta x t)
+    (if (and (= (reg/norm-mime (:mime t)) "*/*") (match x (v/VStr s) true _ false))
+      (java-root-meta (v/->VMeta x CM-STR) t)
+      (with-format-meta x t)))))
+
+(defn- wire-bytes? Bool [t: &ev/TV] (and (not= (:state t) ev/VAL) (not= (:state t) ev/DEFER)))
+
+(defn- with-format-meta v/Val [x: v/Val t: &ev/TV]
+  (let [mt (v/field "mimeType" (v/->VStr (reg/norm-mime (:mime t))))
+        id (reg/format-id (reg/norm-mime (:mime t)))
+        extra0: Vec(v/Field) (if (not (wire-bytes? t)) []
+                               [(v/field "encoding" (v/->VStr (ev/charset-of (:mime t)))) (v/field "raw" (v/->VBin (:raw t)))
+                                (v/field "mediaType" (v/->VStr (:mime t)))])
+        extra (if (and (> (count extra0) 0) (or (= id "") (= id "binary") (= id "java"))) (conj extra0 (v/field "class" (v/->VStr STREAM-CLASS))) extra0)]
+    (match x
+      (v/VMeta y ms) (if (> (count (v/obj-get ms "mimeType")) 0) x (v/->VMeta y (add-missing (conj ms mt) extra)))
+      _ (v/->VMeta x (add-missing [mt] extra)))))
+
+(defn- add-missing Vec(v/Field) [ms: Vec(v/Field) extra: &Vec(v/Field)]
+  (loop [i 0 acc ms]
+    (if (>= i (count extra)) acc
+      (let [k (:name (:key (nth extra i)))]
+        (recur (+ i 1) (if (> (count (v/obj-get acc k)) 0) acc (conj acc (nth extra i))))))))
+
+(defn- java-root-meta v/Val [x: v/Val t: &ev/TV]
+  (match x
+    (v/VMeta y ms)
+    (if (or (= (count (v/obj-get ms "class")) 0) (> (count (v/obj-get ms "mediaType")) 0)) x
+      (let [head [(v/field "encoding" (v/->VStr (ev/charset-of (:mime t))))
+                  (v/field "mediaType" (v/->VStr (:mime t)))
+                  (v/field "mimeType" (v/->VStr (let [n (reg/norm-mime (:mime t))] (if (= n "") "application/java" n))))
+                  (v/field "raw" y)]
+            tail (match y (v/VStr s) [(v/field "contentLength" (v/int-v (count s)))] _ [])
+            all (loop [i 0 acc: Vec(v/Field) head] (if (>= i (count ms)) acc (recur (+ i 1) (conj acc (nth ms i)))))]
+        (v/->VMeta y (loop [i 0 acc all] (if (>= i (count tail)) acc (recur (+ i 1) (conj acc (nth tail i))))))))
+    _ x))
+
+(defn- vars-val Values(v/Val Vec(ev/Var) Str) [e: &ev/Event src: &m/ExprSrc]
+  (let [vs (:vars e)
+        text (:expr src)]
+    (loop [i 0 acc: Vec(v/Field) [] nv: Vec(ev/Var) [] err ""]
+      (if (>= i (count vs)) (values (v/->VObj acc) nv err)
+        (let [x (nth vs i)
+              [val t2 pe] (if (and (= (:state (:tv x)) ev/DEFER) (not (str/includes? text (str "vars." (:name x)))))
+                            (values (v/null-v) (:tv x) "")
+                            (ev/value-named (:tv x) (:name x)))
+              err2 (if (and (= err "") (not= pe "") (str/includes? text (str "vars." (:name x)))) pe err)]
+          (recur (+ i 1) (conj acc (v/field (:name x) (with-mime-meta val t2))) (conj nv (ev/->Var (:name x) t2)) err2))))))
+
+(defn- uses? Bool [src: &m/ExprSrc name: &Str]
+  (let [us (:uses src)] (loop [i 0] (if (>= i (count us)) false (if (= (nth us i) name) true (recur (+ i 1)))))))
+
+(defn inputs Values(Vec(v/Val) ev/Event Str) [c: &Ctx e: ev/Event src: &m/ExprSrc]
+  (let [need-p (or (uses? src "payload") (uses? src "message"))
+        meta-only (and (not need-p) (uses? src "payload^"))
+        [ps lazy-p] (if need-p (ev/pipe-seq (:payload e) "payload") (values (v/null-v) false))
+        [pv0 ptv pe] (cond lazy-p (values ps (:payload e) "")
+                           need-p (ev/value (:payload e))
+                           (and meta-only (or (= (:state (:payload e)) ev/RAW) (= (:state (:payload e)) ev/DEFER)))
+                           (values (v/->VMeta (v/null-v) [(v/field "encoding" (v/->VStr (ev/charset-of (:mime (:payload e)))))])
+                                   (:payload e) "")
+                           meta-only (ev/value (:payload e))
+                           :else (values (v/null-v) (:payload e) ""))
+        pv (v/lazy-input (with-mime-meta pv0 ptv))
+        e1 (ev/with-payload e ptv)
+        [vv0 nvars ve] (if (uses? src "vars") (vars-val e1 src) (values (v/->VObj []) (:vars e1) ""))
+        vv (v/lazy-input vv0)
+        e2 (ev/with-vars e1 nvars)
+        [av0 atv ae] (ev/value (:attributes e2))
+        av (java-root-meta av0 (ev/tv-val (v/null-v) ev/ANY))
+        errv (if (= (count (:error e2)) 0) (v/null-v) (err/to-val (nth (:error e2) 0)))
+        msg (v/->VObj [(v/field "payload" pv) (v/field "attributes" av)])
+        flow (v/->VObj [(v/field "name" (v/->VStr (:flow e2)))])
+        app (v/->VObj [(v/field "name" (v/->VStr (:name (:app c))))])
+        mule (v/->VObj [(v/field "version" (v/->VStr "4.11.3")) (v/field "clusterId" (v/->VStr ""))])
+        server (v/->VObj [(v/field "host" (v/->VStr "localhost"))])]
+    (values [pv av vv errv msg flow app mule server (v/->VStr (:corr e2)) (v/null-v) (v/null-v)]
+            e2
+            (cond (not= pe "") pe (not= ve "") ve :else ae))))
+
+(def PROTOBUF-SETTINGS ["descriptorurl" "messagetype"])
+
+(defn- in-strs? Bool [xs: &Vec(Str) k: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) k) true (recur (+ i 1))))))
+
+(defn- declared-order Vec(Str) [first: &Vec(Str) names: &Vec(Str)]
+  (let [front (loop [i 0 acc: Vec(Str) []] (if (>= i (count first)) acc (recur (+ i 1) (if (in-strs? names (nth first i)) (conj acc (nth first i)) acc))))
+        rest (loop [i 0 acc: Vec(Str) []] (if (>= i (count names)) acc (recur (+ i 1) (if (in-strs? first (nth names i)) acc (conj acc (nth names i))))))
+        tail (jh/hashmap-order rest)]
+    (loop [i 0 acc front] (if (>= i (count tail)) acc (recur (+ i 1) (conj acc (nth tail i)))))))
+
+(defn- out-media Str [mime: &Str props: &Vec(v/Field)]
+  (let [enc (loop [i 0] (if (>= i (count props)) "UTF-8"
+                          (if (= (:name (:key (nth props i))) "encoding")
+                            (let [[s e] (drt/to-text (:value (nth props i)))] s)
+                            (recur (+ i 1)))))
+        names (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count props)) acc
+                  (let [k (str/lower-case (:name (:key (nth props i))))]
+                    (recur (+ i 1) (if (or (= k "encoding") (= k "skipnullon") (= k "buffersize") (= k "deferred")) acc (conj acc k))))))
+        order (if (= (reg/format-id (reg/norm-mime mime)) "protobuf") (declared-order PROTOBUF-SETTINGS names) (jh/hashmap-order names))]
+    (loop [i 0 out (str mime "; charset=" enc)]
+      (if (>= i (count order)) out
+        (let [k (nth order i)
+              [s e] (drt/to-text (prop-ci props k))]
+          (recur (+ i 1) (str out "; " k "=\"" s "\"")))))))
+
+(defn- prop-ci v/Val [props: &Vec(v/Field) k: &Str]
+  (loop [i (- (count props) 1)]
+    (cond (< i 0) (v/null-v)
+          (= (str/lower-case (:name (:key (nth props i)))) k) (:value (nth props i))
+          :else (recur (- i 1)))))
+
+(defn- written Values(ev/TV dwe/DwErr) [c: &Ctx owner: &Str x: v/Val mime: &Str props: &Vec(v/Field)]
+  (written-ns c owner x mime props []))
+
+(defn- written-ns Values(ev/TV dwe/DwErr) [c: &Ctx owner: &Str x0: v/Val mime: &Str props: &Vec(v/Field) nss: &Vec(v/Ns)]
+  (if (and (not= owner "") (reg/streams? mime nss) (= (eng/out-charset mime props) ""))
+    (spooled c owner x0 mime props nss)
+    (written-whole x0 mime props nss)))
+
+(defn- spooled Values(ev/TV dwe/DwErr) [c: &Ctx owner: &Str x0: v/Val mime: &Str props: &Vec(v/Field) nss: &Vec(v/Ns)]
+  (let [[sp we] (osp/write (ps/spool-dir (:app c)) mime props nss x0)
+        media (out-media mime props)]
+    (cond (not (dwe/ok? we)) (values (ev/tv-null) we)
+          (not (spool/in-memory? sp)) (values (ev/->TV (v/null-v) media [] (osp/open owner sp) ev/PIPE true) (dwe/ok))
+          (v/has-seq? x0) (values (reread media (:mem sp) (reg/json-like? (reg/norm-mime mime))) (dwe/ok))
+          :else (values (ev/->TV x0 media [] (:mem sp) (if (reg/json-like? (reg/norm-mime mime)) ev/BOTH ev/RAW) true) (dwe/ok)))))
+
+(defn- reread ev/TV [media: &Str text: Str json-like: Bool]
+  (if (not json-like) (ev/->TV (v/null-v) media [] text ev/RAW true)
+    (let [[y e] (json/read text)]
+      (if (= e "") (ev/->TV y media [] text ev/BOTH true) (ev/->TV (v/null-v) media [] text ev/RAW true)))))
+
+(defn- written-whole Values(ev/TV dwe/DwErr) [x0: v/Val mime: &Str props: &Vec(v/Field) nss: &Vec(v/Ns)]
+  (let [[x de] (v/whole-deep x0)]
+    (if (not (dwe/ok? de)) (values (ev/tv-null) de)
+      (let [[text we] (reg/write-script-output mime props nss x)
+            raw (eng/encode-output text mime props)]
+        (if (not (dwe/ok? we)) (values (ev/tv-null) we)
+          (values (ev/->TV x (out-media mime props) [] raw (if (reg/json-like? (reg/norm-mime mime)) ev/BOTH ev/RAW) true) (dwe/ok)))))))
+
+(defn- writer-msg Str [e: &dwe/DwErr] (if (dwe/ok? e) "" (str (:msg e))))
+
+(defn- dw-fail Values(ev/TV ev/Event Vec(err/MErr)) [de: &dwe/DwErr src: &m/ExprSrc cmp: &eng/Compiled e2: ev/Event]
+  (if (dwe/input? de) (values (ev/tv-null) e2 [(expr-err (payload-err-desc (:msg de) (:payload e2) cmp src))])
+    (values (ev/tv-null) e2 [(assoc (expr-err (dw-err-desc de src (eng/srcs-of cmp))) :dx [(rx/dw-x de src)])])))
+
+(defn- java-out Values(ev/TV ev/Event Vec(err/MErr)) [x0: &v/Val meta: Bool src: &m/ExprSrc cmp: &eng/Compiled e2: ev/Event dc: &dev/Ctx]
+  (let [[x de] (v/whole-deep x0)
+        exp (let [c dc] (fn v/Val [g: v/FnV] (dev/export-fn c g)))]
+    (if (dwe/ok? de) (values (ev/tv-val (if meta (java-meta x exp) (dev/export-val exp x)) ev/JAVA) e2 []) (dw-fail de src cmp e2))))
+
+(def ARRAY-T (v/->TypeV "name" "Array" [] [] [] []))
+
+(defn mule-wrap Fn(Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) v/FnV v/Val) [src: &m/ExprSrc cmp: &eng/Compiled]
+  (let [s src k cmp]
+    (fn v/Val [inv: Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) f: v/FnV] (fn-wrapper inv f s k))))
+
+(defn- fn-wrapper v/Val [inv: Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) f: v/FnV src: m/ExprSrc cmp: eng/Compiled]
+  (match (:host f)
+    (Some h) (v/->VFn f)
+    (None)
+    (v/->VFn (v/->FnV -1 [] (->Some (v/->Host "AnonymousFunction" ["rhs"] [ARRAY-T]
+                                              (fn Values(v/Val dwe/DwErr) [caller: v/Caller args: Vec(v/Val) depth: Int]
+                                                (call-wrapped inv f src cmp (:wrap caller) args depth))))
+                      1))))
+
+(defn- call-wrapped Values(v/Val dwe/DwErr) [inv: &Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) f: &v/FnV src: &m/ExprSrc cmp: &eng/Compiled
+                                             exp: &Fn(v/FnV v/Val) args: &Vec(v/Val) depth: Int]
+  (let [[xs we] (v/whole-deep (nth args 0))]
+    (if (not (dwe/ok? we)) (values (v/null-v) we)
+      (let [elems (v/items xs)
+            jargs (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count elems)) acc (recur (+ i 1) (conj acc (java-nested (nth elems i) exp)))))
+            [y e] (inv f jargs depth)]
+        (if (not (dwe/ok? e)) (values (v/null-v) (rehome e f src cmp))
+          (let [[y2 ye] (v/whole-deep y)]
+            (if (not (dwe/ok? ye)) (values (v/null-v) (rehome ye f src cmp))
+              (let [i2 inv s2 src k2 cmp]
+                (values (java-nested y2 (fn v/Val [g: v/FnV] (fn-wrapper i2 g s2 k2))) (dwe/ok))))))))))
+
+(defn- fn-display Str [cmp: &eng/Compiled f: &v/FnV]
+  (let [d (:def f)]
+    (if (< d 0)
+      (let [id (- -1 d) bs (:builtins cmp)] (if (< id (count bs)) (str (:name (nth bs id))) "AnonymousFunction"))
+      (let [n (:name (nth (:fns (:prog cmp)) d))] (if (str/starts-with? n "<") "AnonymousFunction" (drt/short-name n))))))
+
+(defn- def-span ast/Span [cmp: &eng/Compiled f: &v/FnV]
+  (let [d (:def f)] (if (< d 0) (dwe/no-span) (:sp (nth (:fns (:prog cmp)) d)))))
+
+(defn- where-module Str [src: &m/ExprSrc]
+  (let [w (:where src) k (str/index-of w "::")] (if (< k 0) (str w) (subs w 0 k))))
+
+(defn- home-where Str [src: &m/ExprSrc srcs: &drt/Srcs sp: &ast/Span]
+  (if (>= (:start sp) (count (:script src)))
+    (let [[ln col x id] (drt/excerpt-in srcs sp)] (str id ":" ln ":" col))
+    (let [[ln col] (main-line-col src sp)] (str (where-module src) ":" ln ":" col))))
+
+(defn- home-excerpt Str [src: &m/ExprSrc srcs: &drt/Srcs sp: &ast/Span]
+  (if (>= (:start sp) (count (:script src))) (let [[l c x id] (drt/excerpt-in srcs sp)] x) (main-excerpt src sp)))
+
+(defn- rehome dwe/DwErr [e: &dwe/DwErr f: &v/FnV src: &m/ExprSrc cmp: &eng/Compiled]
+  (let [srcs (eng/srcs-of cmp)
+        dsp (def-span cmp f)
+        name (fn-display cmp f)
+        fs1 (if (dwe/unset? (:pend e)) (:frames e) (conj (:frames e) (dwe/->StackF name (:pend e) "")))
+        fs (if (= (count fs1) 0) [(dwe/->StackF name dsp "")] fs1)
+        esp (if (dwe/unset? (:sp e)) dsp (:sp e))
+        shown (loop [i 0 acc: Vec(dwe/StackF) []]
+                (if (>= i (count fs)) acc
+                  (let [fr (nth fs i)]
+                    (recur (+ i 1) (conj acc (if (not= (:where fr) "") fr (dwe/->StackF (:name fr) (:sp fr) (home-where src srcs (:sp fr)))))))))
+        origin (if (not= (:origin e) "") (str (:origin e)) (home-excerpt src srcs esp))]
+    (dwe/->DwErr (:kind e) (:msg e) esp shown (dwe/no-span) origin)))
+
+(defn- var-ref? Bool [x: &Str]
+  (and (str/starts-with? x "vars.") (> (count x) 5)
+       (loop [i 5] (if (>= i (count x)) true
+                     (let [c (nth x i)] (if (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 95)) (recur (+ i 1)) false))))))
+
+(defn identity-expr? Bool [src: &m/ExprSrc]
+  (let [x (str/trim (:expr src))] (or (= x "payload") (var-ref? x))))
+
+(defn- identity-input Vec(ev/TV) [e: &ev/Event src: &m/ExprSrc]
+  (let [x (str/trim (:expr src))]
+    (cond
+      (= x "payload") [(:payload e)]
+      (var-ref? x) (ev/get-var e (subs x 5 (count x)))
+      :else [])))
+
+(defn- var-mime Str [e: &ev/Event name: &Str]
+  (let [vs (ev/get-var e name)]
+    (if (= (count vs) 0) "application/java"
+      (let [m (reg/norm-mime (:mime (nth vs 0)))]
+        (if (or (= m "") (= m "*/*")) "application/java" m)))))
+
+(defn- infer-mime Values(Str Str) [e: &ev/Event src: &m/ExprSrc]
+  (let [us (:uses src)
+        pm0 (reg/norm-mime (:mime (:payload e)))
+        pm (if (or (= pm0 "") (= pm0 "*/*")) "application/java" pm0)
+        named (loop [i 0] (if (>= i (count us)) false (if (str/starts-with? (nth us i) "vars.") true (recur (+ i 1)))))
+        ms (loop [i 0 acc: Vec(Str) []]
+             (if (>= i (count us)) acc
+               (let [u (nth us i)
+                     mm (cond (or (= u "payload") (= u "payload^")) pm
+                              (str/starts-with? u "vars.") (var-mime e (subs u 5 (count u)))
+                              (and (= u "vars") named) ""
+                              :else "application/java")
+                     dup (or (= mm "") (loop [k 0] (if (>= k (count acc)) false (if (= (nth acc k) mm) true (recur (+ k 1))))))]
+                 (recur (+ i 1) (if dup acc (conj acc mm))))))]
+    (cond (= (count ms) 0) (values "application/java" "")
+          (= (count ms) 1) (values (nth ms 0) "")
+          :else (values "" (str "Unable to infer a output media type as more than one is being used: "
+                                (str/join "," (sort-strs ms)) " please specify using: 'output <your mime-type> --- <expr>'")))))
+
+(defn- infer-cached Values(Str Str) [c: &Ctx e: &ev/Event src: &m/ExprSrc]
+  (let [key (:expr src)
+        m0: Map (dyn->map (deref (:infer c)))]
+    (if (contains? m0 key) (values (dyn->str (get! m0 key)) "")
+      (let [[im ime] (infer-mime e src)]
+        (if (not= ime "") (values im ime)
+          (let [d (swap! (:infer c) (fn Dyn [old: Dyn]
+                                         (let [mm: Map (dyn->map old)]
+                                           (if (contains? mm key) old (->dyn (assoc mm key (->dyn im)))))))
+                m2: Map (dyn->map d)]
+            (values (dyn->str (get! m2 key)) "")))))))
+
+(defn- msg-type Str [msg: &Str]
+  (let [a (str/index-of msg "Cannot coerce ")
+        b (str/index-of msg "`")]
+    (cond (>= a 0) (let [s0 (+ a 14) e0 (str/index-of-after msg " " s0)] (if (< e0 0) "" (subs msg s0 e0)))
+          (>= b 0) (let [e0 (str/index-of-after msg "`" (+ b 1))] (if (< e0 0) "" (subs msg (+ b 1) e0)))
+          :else "")))
+
+(defn- bad-path Values(Vec(Str) Bool) [x: &v/Val t: &Str]
+  (match (v/unmeta x)
+    (v/VObj fs) (loop [i 0]
+                  (if (>= i (count fs)) (values [] false)
+                    (let [f (nth fs i) y (:value f) k (str "k:" (:name (:key f)))]
+                      (if (= (v/type-name (v/unmeta y)) t) (values [k] true)
+                        (let [[p ok] (bad-path y t)]
+                          (if ok (values (loop [j 0 acc: Vec(Str) [k]] (if (>= j (count p)) acc (recur (+ j 1) (conj acc (nth p j))))) true)
+                            (recur (+ i 1))))))))
+    (v/VArr xs) (loop [i 0]
+                  (if (>= i (count xs)) (values [] false)
+                    (let [y (nth xs i) k (str "i:" i)]
+                      (if (= (v/type-name (v/unmeta y)) t) (values [k] true)
+                        (let [[p ok] (bad-path y t)]
+                          (if ok (values (loop [j 0 acc: Vec(Str) [k]] (if (>= j (count p)) acc (recur (+ j 1) (conj acc (nth p j))))) true)
+                            (recur (+ i 1))))))))
+    _ (values [] false)))
+
+(defn- ir-key-name Str [k: &r/RKey]
+  (match k
+    (r/RKName ns kn) (str kn)
+    (r/RKExpr ns e) (match (:x e) (r/RConst c) (match (v/unmeta c) (v/VStr x) (str x) _ "") (r/RInterp ps) (ir-interp-const ps) _ "")))
+
+(defn- ir-interp-const Str [ps: &Vec(r/R)]
+  (loop [i 0 out ""]
+    (if (>= i (count ps)) out
+      (match (:x (nth ps i)) (r/RConst c) (match (v/unmeta c) (v/VStr x) (recur (+ i 1) (str out x)) _ "") _ ""))))
+
+(defn- ir-at Vec(r/R) [n: &r/R path: &Vec(Str) i: Int t: &Str]
+  (match (:x n)
+    (r/RLet slot x body) (ir-at body path i t)
+    (r/RIf c th el) (let [a (ir-at th path i t)] (if (> (count a) 0) a (ir-at el path i t)))
+    _ (if (>= i (count path))
+        (if (match (:x n) (r/RObj es) (= t "Object") (r/RArr els) (= t "Array") _ false) [n] [])
+        (let [seg (nth path i)]
+          (match (:x n)
+            (r/RObj es) (if (not (str/starts-with? seg "k:")) []
+                          (let [nm (subs seg 2 (count seg))]
+                            (loop [k 0]
+                              (if (>= k (count es)) []
+                                (match (nth es k)
+                                  (r/REKV key attrs val cnd)
+                                  (if (and (= (count cnd) 0) (= (ir-key-name key) nm)) (ir-at val path (+ i 1) t) (recur (+ k 1)))
+                                  _ [])))))
+            (r/RArr els) (if (not (str/starts-with? seg "i:")) []
+                           (let [ix (npz/int-or (subs seg 2 (count seg)) -1)]
+                             (if (or (< ix 0) (>= ix (count els))
+                                     (loop [k 0] (if (> k ix) false (if (> (count (:cond (nth els k))) 0) true (recur (+ k 1))))))
+                               []
+                               (ir-at (:value (nth els ix)) path (+ i 1) t))))
+            _ [])))))
+
+(defn value-desc Str [msg: &Str x: &v/Val cmp: &eng/Compiled src: &m/ExprSrc]
+  (let [t (msg-type msg)
+        [p ok] (if (= t "") (values [] false) (bad-path x t))
+        hit (if ok (ir-at (:body (:prog cmp)) p 0 t) [])]
+    (if (= (count hit) 0) (plain-desc msg (:expr src))
+      (let [sp (:sp (nth hit 0))] (dw-desc msg (:start sp) (:end sp) src)))))
+
+(defn pval-value-desc Str [msg: &Str x: &v/Val pv: &m/PVal]
+  (match pv
+    (m/PExpr t c src) (value-desc msg x c src)
+    (m/PLit s0) (plain-desc msg s0)))
+
+(defn- input-origin Str [cmp: &eng/Compiled]
+  (let [p (:prog cmp)]
+    (loop [n (:body p) first-key ""]
+      (match (:x n)
+        (r/RInput i) (let [nm (nth (:inputs p) i)] (if (and (= nm "vars") (not= first-key "")) first-key (str nm)))
+        (r/RSel t sel) (recur t (match sel (r/SKey ns k) (str k) _ ""))
+        _ ""))))
+
+(defn- input-user Values(Vec(r/R) Bool) [n: &r/R i: Int]
+  (match (:x n)
+    (r/RInput k) (values [] (= k i))
+    (r/RSel t sel) (match (:x t) (r/RInput k) (values [] (= k i)) _ (input-user t i))
+    (r/RCallB id args) (if (loop [k 0] (if (>= k (count args)) false (if (match (:x (nth args k)) (r/RInput q) (= q i) _ false) true (recur (+ k 1)))))
+                         (values [n] true) (input-user-all args i))
+    (r/RNumOp op id l rr) (input-user-all [l rr] i)
+    (r/RCall f args) (input-user-all (let [v: Vec(r/R) [f]] (loop [k 0 acc v] (if (>= k (count args)) acc (recur (+ k 1) (conj acc (nth args k)))))) i)
+    (r/RCallG d args) (input-user-all args i)
+    (r/RArr els) (input-user-all (loop [k 0 acc: Vec(r/R) []] (if (>= k (count els)) acc (recur (+ k 1) (conj acc (:value (nth els k)))))) i)
+    (r/RObj es) (input-user-all (loop [k 0 acc: Vec(r/R) []]
+                                  (if (>= k (count es)) acc
+                                    (recur (+ k 1) (conj acc (match (nth es k) (r/REKV key attrs val cnd) val (r/RESpread e cnd) e))))) i)
+    (r/RIf c th el) (input-user-all [c th el] i)
+    (r/RLet slot x body) (input-user-all [x body] i)
+    (r/RAs e ty) (input-user e i)
+    (r/RIs e ty) (input-user e i)
+    (r/RDefault e fb) (input-user-all [e fb] i)
+    (r/RAnd l rr) (input-user-all [l rr] i)
+    (r/ROr l rr) (input-user-all [l rr] i)
+    (r/RNot e) (input-user e i)
+    (r/RExists t) (input-user t i)
+    (r/RAssert t) (input-user t i)
+    (r/RInterp ps) (input-user-all ps i)
+    _ (values [] false)))
+
+(defn- input-user-all Values(Vec(r/R) Bool) [ns: &Vec(r/R) i: Int]
+  (loop [k 0] (if (>= k (count ns)) (values [] false) (let [[a stop] (input-user (nth ns k) i)] (if stop (values a true) (recur (+ k 1)))))))
+
+(defn- payload-err-desc Str [ie: &Str p: &ev/TV cmp: &eng/Compiled src: &m/ExprSrc]
+  (if (= (reg/format-id (:mime p)) "json") (plain-desc ie (:expr src)) (input-err-desc ie "payload" cmp src)))
+
+(defn- input-err-desc Str [ie: &Str name: &Str cmp: &eng/Compiled src: &m/ExprSrc]
+  (let [p (:prog cmp)
+        i (loop [k 0] (if (>= k (count (:inputs p))) -1 (if (= (nth (:inputs p) k) name) k (recur (+ k 1)))))
+        [u stop] (if (or (< i 0) (:plain src)) (values [] true) (input-user (:body p) i))]
+    (if (= (count u) 0) (plain-desc ie (:expr src))
+      (let [[ln col] (main-line-col src (:sp (nth u 0)))]
+        (if (= ln 0) (plain-desc ie (:expr src))
+          (str "\"" ie "\nTrace:\n  at " (:where src) " (line: " ln ", column: " col ")\" evaluating expression: \"" (:expr src) "\"."))))))
+
+(defn- writer-at-desc Str [we: &Str cmp: &eng/Compiled src: &m/ExprSrc]
+  (let [o (input-origin cmp)]
+    (if (= o "") (writer-desc we (:expr src)) (plain-desc (str we o ".") (:expr src)))))
+
+(defn- writer-desc Str [we: &Str expr: &Str]
+  (let [n (count we)]
+    (plain-desc (if (and (>= n 4) (= (subs we (- n 4) n) " at "))
+                  (str (subs we 0 (- n 4)) ".\nTrace:\n  at main (Unknown)")
+                  we)
+                expr)))
+
+(defn- str-lt? Bool [a: &Str b: &Str]
+  (loop [i 0]
+    (cond (>= i (count a)) (< i (count b))
+          (>= i (count b)) false
+          (< (nth a i) (nth b i)) true
+          (> (nth a i) (nth b i)) false
+          :else (recur (+ i 1)))))
+
+(defn- sort-strs Vec(Str) [xs: Vec(Str)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count xs)) acc
+      (let [x (nth xs i)
+            k (loop [j 0] (if (>= j (count acc)) j (if (str-lt? x (nth acc j)) j (recur (+ j 1)))))
+            acc2 (loop [j 0 out: Vec(Str) []] (if (>= j (count acc)) (if (= k (count acc)) (conj out x) out)
+                                               (recur (+ j 1) (if (= j k) (conj (conj out x) (nth acc j)) (conj out (nth acc j))))))]
+        (recur (+ i 1) acc2)))))
+
+(defn- class-meta Vec(v/Field) [c: &Str] [(v/field "class" (v/->VStr c))])
+
+(def CM-MAP (class-meta "java.util.LinkedHashMap"))
+(def CM-LIST (class-meta "java.util.ArrayList"))
+(def CM-STR (class-meta "java.lang.String"))
+(def CM-BOOL (class-meta "java.lang.Boolean"))
+(def CM-INT (class-meta "java.lang.Integer"))
+(def CM-LONG (class-meta "java.lang.Long"))
+(def CM-BIGINT (class-meta "java.math.BigInteger"))
+(def CM-DOUBLE (class-meta "java.lang.Double"))
+(def CM-DATE (class-meta "java.time.LocalDate"))
+(def CM-ZDT (class-meta "java.time.ZonedDateTime"))
+(def CM-LDT (class-meta "java.time.LocalDateTime"))
+(def CM-LTIME (class-meta "java.time.LocalTime"))
+(def CM-TIME (class-meta "java.time.OffsetTime"))
+(def CM-FN (class-meta "org.mule.weave.v2.module.pojo.function.WeaveFunctionWrapper"))
+
+(defn- java-class-of Vec(v/Field) [x: &v/Val]
+  (match x
+    (v/VObj fs) CM-MAP
+    (v/VArr xs) CM-LIST
+    (v/VRange a b) CM-LIST
+    (v/VStr s) CM-STR
+    (v/VBool b) CM-BOOL
+    (v/VInt i) (if (and (>= i -2147483648) (<= i 2147483647)) CM-INT CM-LONG)
+    (v/VNum n) (if (num/integer? n)
+                 (let [[k e] (num/to-int n)]
+                   (cond (not= e "") CM-BIGINT
+                         (and (>= k -2147483648) (<= k 2147483647)) CM-INT
+                         :else CM-LONG))
+                 CM-DOUBLE)
+    (v/VDate d) CM-DATE
+    (v/VDateTime d) CM-ZDT
+    (v/VLocalDateTime d) CM-LDT
+    (v/VLocalTime d) CM-LTIME
+    (v/VTime d) CM-TIME
+    (v/VFn f) CM-FN
+    _ []))
+
+(defn- java-inner v/Val [y: &v/Val exp: &Fn(v/FnV v/Val)]
+  (match y
+    (v/VObj fs) (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                            (if (>= i (count fs)) acc
+                              (recur (+ i 1) (conj acc (v/->Field (:key (nth fs i)) (java-nested (:value (nth fs i)) exp)))))))
+    (v/VArr xs) (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (java-nested (nth xs i) exp))))))
+    (v/VRange a b) (let [its (v/items y)] (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count its)) acc (recur (+ i 1) (conj acc (java-nested (nth its i) exp)))))))
+    (v/VFn f) (exp f)
+    _ y))
+
+(defn- java-nested v/Val [x0: &v/Val exp: &Fn(v/FnV v/Val)]
+  (let [[y m] (match x0 (v/VMeta a b) (values a b) _ (values x0 []))
+        given (v/obj-get m "class")
+        cm (if (> (count given) 0) [(v/field "class" (nth given 0))] (java-class-of y))
+        inner (java-inner y exp)]
+    (if (= (count cm) 0) inner (v/->VMeta inner cm))))
+
+(defn- java-meta v/Val [x0: v/Val exp: &Fn(v/FnV v/Val)]
+  (let [[y m] (match x0 (v/VMeta a b) (values a b) _ (values x0 []))
+        cm (java-class-of y)
+        inner (java-inner y exp)]
+    (cond (= (count cm) 0) x0
+          (= (count m) 0) (v/->VMeta inner cm)
+          (> (count (v/obj-get m "class")) 0) (v/->VMeta inner m)
+          :else (v/->VMeta inner (conj m (nth cm 0))))))
+
+(defn run-script Values(ev/TV ev/Event Vec(err/MErr)) [c: &Ctx cmp: &eng/Compiled src: &m/ExprSrc e: ev/Event infer: Bool]
+  (let [mime (eng/output-mime cmp)]
+    (cond
+      (not (eng/ok? cmp)) (values (ev/tv-null) e [(expr-err (str "DataWeave compile error: " (eng/render-first-error (:script src) cmp (:where src))))])
+      (and (not= mime "") (not= mime "application/java") (= (prop-text (eng/output-props cmp) "deferred") "true"))
+      (run-deferred c cmp src e)
+      :else (run-script-now c cmp src e (if infer INFER-YES INFER-NO)))))
+
+(defn- prop-text Str [props: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get props k)] (if (= (count r) 0) "" (let [[s e] (drt/to-text (nth r 0))] (str/lower-case s)))))
+
+(defn- lazy-text Str [st: &Vec(eng/Staged) src: &m/ExprSrc p: &ev/TV]
+  (if (not (and (> (count st) 0) (streaming-json? p) (eng/stage-src-input? (nth st 0) "payload")
+                (= (count-of (:script src) "payload") 1)))
+    ""
+    (let [text (if (= (str/lower-case (ev/charset-of (:mime p))) "utf-8") (:raw p) (ev/decode-text (:raw p) (:mime p)))
+          [i arr] (json/array-start text)]
+      (if arr text ""))))
+
+(defn- run-streamed Vec(ev/TV) [c: &Ctx cmp: &eng/Compiled src: &m/ExprSrc e: ev/Event]
+  (let [mime (eng/output-mime cmp)]
+    (if (or (not (reg/json-like? mime)) (= (lazy-text (staged-of cmp src) src (:payload e)) "")) []
+      (let [[t e2 x] (run-deferred c cmp src e)]
+        (if (> (count x) 0) []
+          (let [[text ge ok] (ev/drain t)]
+            (if (or (not ok) (not= ge "")) [] [(ev/tv-raw text (:mime t))])))))))
+
+(def STAGED (atom (let [m: Map(Str Vec(eng/Staged)) {}] m)))
+
+(defn- staged-of Vec(eng/Staged) [cmp: &eng/Compiled src: &m/ExprSrc]
+  (let [k (:script src)
+        m (deref STAGED)]
+    (if (contains? m k) (get! m k)
+      (let [st (eng/stage-map cmp)
+            z (swap! STAGED (fn Map(Str Vec(eng/Staged)) [old: Map(Str Vec(eng/Staged))] (assoc old (str k) st)))]
+        st))))
+
+(defn- count-of Int [s: &Str w: &Str]
+  (loop [i 0 n 0] (let [k (str/index-of-after s w i)] (if (< k 0) n (recur (+ k (count w)) (+ n 1))))))
+
+(defn- run-deferred Values(ev/TV ev/Event Vec(err/MErr)) [c: &Ctx cmp: &eng/Compiled src: &m/ExprSrc e: ev/Event]
+  (let [st (staged-of cmp src)
+        p (:payload e)
+        text (lazy-text st src p)
+        lazy (not= text "")
+        [ins e2 ie] (inputs c (if lazy (ev/with-payload e (ev/tv-null)) e) src)]
+    (if (not= ie "") (values (ev/tv-null) e2 [(expr-err (payload-err-desc ie (:payload e) cmp src))])
+      (let [mime (eng/output-mime cmp)
+            props (eng/output-props cmp)
+            id (dfr/open (:corr e) (dfr/->Gen cmp st ins (if lazy [text] []) mime props (eng/output-nss cmp) (->Some (mule-wrap src cmp))))]
+        (values (ev/tv-defer id (out-media mime props)) (if lazy (ev/with-payload e2 p) e2) [])))))
+
+(defn- run-script-now Values(ev/TV ev/Event Vec(err/MErr)) [c: &Ctx cmp: &eng/Compiled src: &m/ExprSrc e: ev/Event infer: Int]
+  (let [fast (run-streamed c cmp src e)]
+    (if (> (count fast) 0) (values (nth fast 0) e []) (run-script-whole c cmp src e infer))))
+
+(defn- run-script-whole Values(ev/TV ev/Event Vec(err/MErr)) [c: &Ctx cmp: &eng/Compiled src: &m/ExprSrc e: ev/Event infer: Int]
+  (let [[ins e2 ie] (inputs c e src)]
+    (if (not= ie "") (values (ev/tv-null) e2 [(expr-err (payload-err-desc ie (:payload e) cmp src))])
+      (let [[x de dc] (eng/eval-compiled-w cmp ins (->Some (mule-wrap src cmp)))]
+        (if (not (dwe/ok? de)) (dw-fail de src cmp e2)
+          (let [mime (eng/output-mime cmp)]
+            (cond
+              (= mime "application/java") (java-out x true src cmp e2 dc)
+              (not= mime "")
+              (let [[t wd] (written-ns c (:rid e2) x mime (eng/output-props cmp) (eng/output-nss cmp))
+                    we (writer-msg wd)]
+                (cond (dwe/ok? wd) (values t e2 [])
+                      (not= (:kind wd) "WriterException") (dw-fail wd src cmp e2)
+                      :else (values t e2 [(expr-err (if (str/ends-with? we " at ") (writer-at-desc we cmp src) (value-desc we x cmp src)))])))
+              (= infer INFER-NO) (java-out x false src cmp e2 dc)
+              :else
+              (let [[im ime] (infer-cached c e2 src)
+                    same (identity-input e2 src)]
+                (cond
+                  (not= ime "")
+                  (let [off (:off src) n (count (:script src)) b (:base src)]
+                    (values (ev/tv-null) e2 [(assoc (expr-err (dw-desc ime off n (assoc src :where "anonymous::main")))
+                                                    :dx [(err/->DwX (str ime) (str (:file src)) (if (>= b 0) b -1) (if (>= b 0) (+ b (- n off)) -1) (str (:script src)))])]))
+                  (> (count same) 0) (values (nth same 0) e2 [])
+                  (and (= im "application/java") (> (count (typed-raw x)) 0)) (values (nth (typed-raw x) 0) e2 [])
+                  (= im "application/java") (java-out x true src cmp e2 dc)
+                  :else
+                  (let [[t0 wd0] (written c (:rid e2) x im [])
+                        [t wd] (if (and (= (:kind wd0) "WriterException") (= infer INFER-LOG)) (written c (:rid e2) x "application/json" []) (values t0 wd0))
+                        we (writer-msg wd)
+                        we2 (if (and (= (reg/format-id im) "protobuf") (not= we "") (not (str/ends-with? we " at "))) (str we "\nTrace:\n  at main (Unknown)") we)]
+                    (cond (dwe/ok? wd) (values t e2 [])
+                          (not= (:kind wd) "WriterException") (dw-fail wd src cmp e2)
+                          :else (values t e2 [(expr-err (writer-desc we2 (:expr src)))]))))))))))))
+
+(defn- typed-raw Vec(ev/TV) [x: &v/Val]
+  (match x
+    (v/VMeta y ms) (let [r (v/obj-get ms "raw") mt (v/obj-get ms "mimeType")]
+                     (if (or (= (count r) 0) (= (count mt) 0)) []
+                       (match (nth r 0)
+                         (v/VBin b) (match (nth mt 0)
+                                      (v/VStr m) (if (= (reg/norm-mime m) "application/java") [] [(ev/tv-raw (str b) (str m))])
+                                      _ [])
+                         _ [])))
+    _ []))
+
+(defn eval-pval Values(ev/TV ev/Event Vec(err/MErr)) [c: &Ctx p: &m/PVal e: ev/Event]
+  (match p
+    (m/PLit s) (values (ev/tv-val (v/->VStr s) ev/ANY) e [])
+    (m/PExpr text cmp src)
+    (let [same (identity-input e src)]
+      (if (> (count same) 0) (values (nth same 0) e [])
+        (run-script c cmp src e true)))))
+
+(def INFER-NO 0)
+(def INFER-YES 1)
+(def INFER-LOG 2)
+
+(defn- eval-log-pval Values(ev/TV ev/Event Vec(err/MErr)) [c: &Ctx p: &m/PVal e: ev/Event]
+  (match p
+    (m/PLit s) (values (ev/tv-val (v/->VStr s) ev/ANY) e [])
+    (m/PExpr text cmp src)
+    (if (= (str/trim (:expr src)) "payload") (values (:payload e) e [])
+      (let [mime (eng/output-mime cmp)]
+        (if (and (not= mime "") (not= mime "application/java") (= (prop-text (eng/output-props cmp) "deferred") "true"))
+          (run-deferred c cmp src e)
+          (run-script-now c cmp src e INFER-LOG))))))
+
+(defn eval-string-pval Values(ev/TV ev/Event Vec(err/MErr)) [c: &Ctx p: &m/PVal e: ev/Event]
+  (match p
+    (m/PLit s) (values (ev/tv-val (v/->VStr s) ev/ANY) e [])
+    (m/PExpr text cmp src)
+    (if (= (str/trim (:expr src)) "payload") (values (:payload e) e [])
+      (let [[t e2 x] (run-script c cmp src e false)
+            t2 (ev/settle t)
+            str? (and (= (count x) 0) (= (:state t2) ev/VAL) (match (v/unmeta (:val t2)) (v/VStr s) true _ false))]
+        (if (or (> (count x) 0) str?) (values t e2 x) (run-script c cmp src e true))))))
+
+(defn eval-val Values(v/Val ev/Event Vec(err/MErr)) [c: &Ctx p: &m/PVal e: ev/Event]
+  (match p
+    (m/PLit s) (values (v/->VStr s) e [])
+    (m/PExpr text cmp src)
+    (let [[t e2 x] (run-script c cmp src e false)]
+      (if (> (count x) 0) (values (v/null-v) e2 x)
+        (let [[val t2 pe] (ev/value t)]
+          (if (not= pe "") (values (v/null-v) e2 [(expr-err (plain-desc pe text))]) (values val e2 [])))))))
+
+(defn expr-text Str [p: &m/PVal] (match p (m/PLit s) (str s) (m/PExpr t c src) (str (:expr src))))
+
+(defn- java-path Str [expr: &Str]
+  (let [x (str/trim expr)
+        simple (and (> (count x) 0)
+                    (loop [i 0] (if (>= i (count x)) true
+                                  (let [c (nth x i)] (if (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 95) (= c 46)) (recur (+ i 1)) false)))))
+        d (str/index-of x ".")]
+    (if (and simple (> d 0)) (subs x (+ d 1) (count x)) "")))
+
+(defn- java-class Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VStr s) "java.lang.String"
+    (v/VNum n) (if (num/integer? n) "java.lang.Integer" "java.lang.Double")
+    (v/VInt n-i) (let [n (num/from-int n-i)] (if (num/integer? n) "java.lang.Integer" "java.lang.Double"))
+    (v/VBool b) "java.lang.Boolean"
+    (v/VObj fs) "java.util.LinkedHashMap"
+    (v/VArr xs) "java.util.ArrayList"
+    _ "java.lang.Object"))
+
+(defn convert-err err/MErr [x: &v/Val target: &Str expr: &Str]
+  (let [[s e] (drt/to-text x)
+        p (java-path expr)]
+    (expr-err (plain-desc (str "Unable to convert '" s "' with class '" (java-class x) "' to class '" target "'"
+                               (if (= p "") "" (str ", while writing Java at " p)) ".")
+                          expr))))
+
+(defn coerce-param-err err/MErr [x: &v/Val t: &ev/TV target: &Str expr: &Str]
+  (let [y (v/unmeta x)
+        tn (v/type-name y)
+        base (match y (v/VStr s) (str "\"" s "\"") _ (ctm/show-val y))
+        full (str base " as " tn " {encoding: \"" (ev/charset-of (:mime t)) "\", mediaType: \"" (ev/with-charset (:mime t))
+                  "\", mimeType: \"" (reg/norm-mime (:mime t)) "\"}")
+        shown (if (<= (u8/codepoint-count full) 77) full (str (uni/sub-cp full 0 77) "..."))]
+    (expr-err (plain-desc (str "Cannot coerce " tn " (" shown ") to " target) expr))))
+
+(defn- truthy Values(Bool Vec(err/MErr)) [x: &v/Val expr: &Str]
+  (match (v/unmeta x)
+    (v/VBool b) (values b [])
+    (v/VNull) (values false [])
+    (v/VStr s) (let [u (str/lower-case s)]
+                 (cond (= u "true") (values true []) (= u "false") (values false [])
+                       :else (values false [(convert-err x "Boolean" expr)])))
+    _ (values false [(convert-err x "Boolean" expr)])))
+
+(defn tv-text Str [t0: &ev/TV]
+  (let [t (ev/settle t0)]
+    (if (not= (:state t) ev/VAL) (str (:raw t))
+      (let [x (:val t)] (java-str x)))))
+
+(defn java-str Str [x0: &v/Val]
+  (let [x (v/unmeta x0)
+        [jt known] (jo/to-string x0)]
+    (if known jt
+    (match x
+      (v/VNull) "null"
+      (v/VStr s) (str s)
+      (v/VBin b) (str b)
+      (v/VArr xs) (loop [i 0 out "["] (if (>= i (count xs)) (str out "]") (let [s (java-str (nth xs i))] (recur (+ i 1) (str out (if (> i 0) ", " "") s)))))
+      (v/VRange a b) (java-str (v/->VArr (v/items x)))
+      (v/VObj fs) (loop [i 0 out "{"] (if (>= i (count fs)) (str out "}")
+                                         (let [s (java-str (:value (nth fs i)))]
+                                           (recur (+ i 1) (str out (if (> i 0) ", " "") (:name (:key (nth fs i))) "=" s)))))
+      _ (let [[s e] (drt/to-text x)] s)))))
+
+(defn- find-flow Vec(m/Flow) [c: &Ctx name: &Str]
+  (let [fs (:flows (:app c))]
+    (loop [i 0] (if (>= i (count fs)) [] (if (= (:name (nth fs i)) name) [(nth fs i)] (recur (+ i 1)))))))
+
+(defn- key-text Values(Str Bool ev/Event Vec(err/MErr)) [c: &Ctx p: &m/PVal e: ev/Event]
+  (let [[x e2 errs] (eval-val c p e)]
+    (if (> (count errs) 0) (values "" false e2 errs)
+      (if (v/null? x) (values "" false e2 [])
+        (let [s (match (v/unmeta x) (v/VStr t) (str t) _ (java-str x))]
+          (values s (not= (str/trim s) "") e2 []))))))
+
+(defn- private-store Str [kind: &Str loc: &m/Loc priv: &Vec(Vec(m/Param)) dflt: ost/Cfg]
+  (let [name (str kind ":" (:file loc) ":" (:path loc))
+        z (ost/define! name (if (= (count priv) 0) dflt (ost/cfg-of (nth priv 0))))]
+    name))
+
+(defn- run-idempotent Values(ev/Event Vec(err/MErr)) [c: &Ctx idx: &m/PVal valx: &m/PVal store0: &Str priv: &Vec(Vec(m/Param)) loc: &m/Loc e: ev/Event]
+  (let [[id good e2 x] (key-text c idx e)]
+    (cond
+      (> (count x) 0) (values e2 x)
+      (not good) (failure e2 (err/mk "MULE" "UNKNOWN" "key cannot be null or blank"))
+      :else
+      (let [[vv e3 x3] (eval-val c valx e2)]
+        (if (> (count x3) 0) (values e3 x3)
+          (let [store (if (not= store0 "") (str store0) (private-store "idempotent" loc priv (ost/->Cfg 300000 0 360000 false)))
+                val (if (v/null? vv) vv (match (v/unmeta vv) (v/VStr t) vv _ (v/->VStr (java-str vv))))]
+            (if (ost/put-new! store id (ev/tv-val val ev/JAVA)) (ok e3)
+              (failure e3 (assoc (err/mk "MULE" "DUPLICATE_MESSAGE" "unknown description") :cause "org.mule.runtime.core.internal.routing.split.DuplicateMessageException")))))))))
+
+(defn- param-lit Str [ps: &Vec(m/Param) name: &Str dflt: Str]
+  (loop [i 0] (if (>= i (count ps)) dflt (if (= (:name (nth ps i)) name) (match (:v (nth ps i)) (m/PLit s) (str s) _ dflt) (recur (+ i 1))))))
+
+(defn- param-ms Int [ps: &Vec(m/Param) name: &Str dflt: Int]
+  (let [[n pe] (parse-long (str/trim (param-lit ps name "")))] (if (= pe "") n dflt)))
+
+(defn- xml-params Vec(m/Param) [n: &xml/XNode]
+  (let [as (xml/elem-attrs n)]
+    (loop [i 0 acc: Vec(m/Param) []] (if (>= i (count as)) acc (recur (+ i 1) (conj acc (m/->Param (:local (:name (nth as i))) (m/->PLit (:value (nth as i))))))))))
+
+(defn- cache-strategy Values(Str Vec(m/PVal) Str) [c: &Ctx sref: &Str loc: &m/Loc]
+  (let [none: Vec(m/PVal) []]
+    (if (= sref "")
+      (let [name (str "cache:" (:file loc) ":" (:path loc))
+            z (ost/define! name (ost/->Cfg 300000 4000 30000 false))]
+        (values name none ""))
+      (let [cf (conn/find-config (:configs (:app c)) "ee:object-store-caching-strategy" sref)]
+        (if (= (count cf) 0) (values "" none (str "No caching strategy named '" sref "'"))
+          (let [cfg (nth cf 0)
+                ps (:params cfg)
+                kx (conn/param ps "keyGenerationExpression")
+                os (param-lit ps "objectStore" "")
+                kids (:children cfg)
+                pk (loop [i 0] (if (>= i (count kids)) -1 (if (and (xml/elem? (nth kids i)) (= (xml/elem-local (nth kids i)) "private-object-store")) i (recur (+ i 1)))))
+                store (if (not= os "") os (str "cache-strategy:" sref))
+                z (if (not= os "") 0
+                    (ost/define! store (if (>= pk 0) (ost/cfg-of (xml-params (nth kids pk)))
+                                         (ost/->Cfg (param-ms ps "entryTTL" 300000) (param-ms ps "maxEntries" 4000) (param-ms ps "expirationInterval" 30000)
+                                                    (= (str/lower-case (param-lit ps "persistent" "false")) "true")))))]
+            (values store kx "")))))))
+
+(defn- cache-key Values(Str Bool ev/Event Vec(err/MErr)) [c: &Ctx kx: &Vec(m/PVal) e: ev/Event]
+  (if (> (count kx) 0) (key-text c (nth kx 0) e)
+    (let [[b be] (ev/bytes (:payload e))]
+      (if (not= be "") (values "" false e [(err/mk "MULE" "UNKNOWN" be)])
+        (values (bin/hex-lower (hash/sha256 b)) true e [])))))
+
+(defn- run-cache Values(ev/Event Vec(err/MErr)) [c: &Ctx sref: &Str filter: &Vec(m/PVal) procs: &Vec(m/Proc) loc: &m/Loc e0: ev/Event]
+  (let [[use e1 fx] (if (= (count filter) 0) (values true e0 [])
+                      (let [[fv e2 x2] (eval-val c (nth filter 0) e0)]
+                        (if (> (count x2) 0) (values false e2 x2)
+                          (let [[b bx] (truthy fv (expr-text (nth filter 0)))] (values b e2 bx)))))]
+    (cond
+      (> (count fx) 0) (values e1 fx)
+      (not use) (run-procs c procs e1)
+      :else
+      (let [[store kx se] (cache-strategy c sref loc)]
+        (if (not= se "") (failure e1 (err/mk "MULE" "UNKNOWN" se))
+          (let [e2 (ev/with-payload e1 (ev/settle (:payload e1)))
+                [key good e3 x] (cache-key c kx e2)]
+            (cond
+              (> (count x) 0) (values e3 x)
+              (not good) (failure e3 (err/mk "MULE" "UNKNOWN" "key cannot be null or blank"))
+              :else
+              (let [lk (str store "\n" key)
+                    z (ost/lock! lk)
+                    es (ost/entries store)]
+                (if (contains? es key)
+                  (let [en (get! es key)
+                        z1 (ost/unlock! lk)
+                        e4 (ev/with-payload e3 (:value en))]
+                    (ok (if (= (count (:attrs en)) 0) e4 (ev/with-attributes e4 (nth (:attrs en) 0)))))
+                  (let [[e5 x5] (run-procs c procs e3)]
+                    (if (> (count x5) 0) (let [z2 (ost/unlock! lk)] (values e5 x5))
+                      (let [pt (ev/settle (:payload e5))
+                            at (ev/settle (:attributes e5))
+                            z3 (ost/put-with! store key pt at)
+                            z4 (ost/unlock! lk)]
+                        (ok (ev/with-attributes (ev/with-payload e5 pt) at))))))))))))))
+
+(defn- elem-str Str [c: &Ctx l: &m/Loc]
+  (str (:path l) " @ " (:name (:app c)) ":" (:file l) ":" (:line l)))
+
+(defn run-procs Values(ev/Event Vec(err/MErr)) [c: &Ctx ps: &Vec(m/Proc) e0: ev/Event]
+  (loop [i 0 e e0]
+    (if (>= i (count ps)) (ok e)
+      (let [p (nth ps i)
+            [e2 x] (if (:sampled (:span e)) (run-traced c p e) (run-at c p e))]
+        (if (= (count x) 0) (recur (+ i 1) e2) (values e2 x))))))
+
+(defn- run-at Values(ev/Event Vec(err/MErr)) [c: &Ctx p: &m/Proc e: ev/Event]
+  (let [[e2 x] (if (= (count (:hook c)) 0) (run-one c p e) (run-hooked c p e))]
+    (if (= (count x) 0) (values e2 x)
+      (let [l (m/proc-loc p)
+            el (elem-str c l)]
+        (values e2 [(err/at-elem (nth x 0) el (:dsl l) (flow-stack e2 el))])))))
+
+(defn- run-traced Values(ev/Event Vec(err/MErr)) [c: &Ctx p: &m/Proc e: ev/Event]
+  (let [l (m/proc-loc p)
+        sc (:span e)
+        op? (match p (m/PrConnectorOp a b d f g h k q j z) true _ false)
+        [o e1] (cond (>= (tr/level) tr/MONITORING) (tr/start e (:elem l) (:path l))
+                     op? (tr/start-provisional e (:elem l) (:path l))
+                     :else (values tr/DEAD e))
+        [e2 x] (run-at c p e1)
+        z (tr/finish o e2 x)]
+    (values (tr/restore e2 sc) x)))
+
+(defn- in-span Values(ev/Event Vec(err/MErr)) [name: &Str location: &Str always: Bool e: ev/Event f: Fn(ev/Event Values(ev/Event Vec(err/MErr)))]
+  (if (or (not (:sampled (:span e))) (and (not always) (< (tr/level) tr/MONITORING))) (f e)
+    (let [sc (:span e)
+          [o e1] (tr/start e name location)
+          [e2 x] (f e1)
+          z (tr/finish o e2 x)]
+      (values (tr/restore e2 sc) x))))
+
+(defn- route-span Values(ev/Event Vec(err/MErr)) [c: &Ctx name: &Str l: &m/Loc ps: &Vec(m/Proc) e: ev/Event]
+  (if (not (:sampled (:span e))) (run-procs c ps e)
+    (let [cc c pp ps] (in-span name (:path l) false e (fn Values(ev/Event Vec(err/MErr)) [e1: ev/Event] (run-procs cc pp e1))))))
+
+(defn- flow-span Values(ev/Event Vec(err/MErr)) [c: &Ctx f: &m/Flow e: ev/Event]
+  (if (not (:sampled (:span e))) (run-flow-body c f e)
+    (let [cc c ff f] (in-span (if (:sub f) "mule:subflow" "mule:flow") (:name f) true e
+                              (fn Values(ev/Event Vec(err/MErr)) [e1: ev/Event] (run-flow-body cc ff e1))))))
+
+(defn- run-one Values(ev/Event Vec(err/MErr)) [c: &Ctx p: &m/Proc e: ev/Event]
+  (if (= (count (:intercept c)) 0) (run-proc c p e)
+    (let [[code e3 x3] ((nth (:intercept c) 0) (m/proc-loc p) e)]
+      (if (= code 0) (run-proc c p e) (values e3 x3)))))
+
+(defn- run-hooked Values(ev/Event Vec(err/MErr)) [c: &Ctx p: &m/Proc e: ev/Event]
+  (let [h (nth (:hook c) 0)
+        l (m/proc-loc p)
+        z ((:before h) l e)
+        [e2 x] (run-one c p e)
+        z2 ((:after h) l e2 x)]
+    (values e2 x)))
+
+(defn- chose Int [c: &Ctx l: &m/Loc i: Int] (if (= (count (:hook c)) 0) 0 ((:route (nth (:hook c) 0)) l i)))
+
+(defn- flow-stack Str [e: &ev/Event el: &Str]
+  (let [cs (:callers e)
+        top (str "at " (:frame e) "(" el ")")]
+    (loop [i (- (count cs) 1) out top] (if (< i 0) out (recur (- i 1) (str out "\nat " (nth cs i)))))))
+
+(defn- set-value Values(ev/TV ev/Event Vec(err/MErr)) [c: &Ctx value: &m/PVal mime: &Str enc: &Str e: ev/Event]
+  (match value
+    (m/PLit s)
+    (if (and (= mime "") (= enc "")) (values (ev/tv-val (v/->VStr s) ev/ANY) e [])
+      (let [m0 (if (= mime "") "text/plain" (str mime))
+            m1 (if (= enc "") m0 (str m0 "; charset=" enc))]
+        (values (ev/tv-val (v/->VStr s) m1) e [])))
+    _ (let [[t e2 x] (eval-pval c value e)]
+        (if (or (> (count x) 0) (and (= mime "") (= enc ""))) (values t e2 x)
+          (let [m0 (if (= mime "") (reg/norm-mime (:mime t)) (str mime))
+                java (= (reg/norm-mime (:mime t)) "application/java")
+                bare (or (= (str/trim (expr-text value)) "payload") java)
+                m1 (cond (not= enc "") (str m0 "; charset=" enc) bare m0 :else (str m0 "; charset=UTF-8"))]
+            (values (ev/->TV (:val t) m1 (if (= (:state t) ev/TYPED) (:props t) []) (:raw t) (:state t) (:stream t)) e2 []))))))
+
+(defn run-proc Values(ev/Event Vec(err/MErr)) [c: &Ctx p: &m/Proc e: ev/Event]
+  (match p
+    (m/PrSetPayload value mime enc loc)
+    (let [[t e2 x] (set-value c value mime enc e)]
+      (if (> (count x) 0) (values e2 x) (ok (ev/with-payload e2 t))))
+    (m/PrSetVar name value mime loc)
+    (let [[t0 e2 x] (set-value c value mime "" e)
+          t (match value
+              (m/PLit s) (if (= mime "") (ev/->TV (:val t0) "*/*; charset=UTF-8" [] (:raw t0) (:state t0) (:stream t0)) t0)
+              _ t0)]
+      (if (> (count x) 0) (values e2 x) (ok (ev/set-var e2 name t))))
+    (m/PrRemoveVar name loc) (ok (ev/remove-var e name))
+    (m/PrLogger msgs level category loc) (run-logger c msgs level category e)
+    (m/PrTransform pay attrs tvars loc) (run-transform c pay attrs tvars e)
+    (m/PrFlowRef name target tvalue loc) (run-flow-ref c name target tvalue e (elem-str c loc))
+    (m/PrRaise type desc loc)
+    (let [[d e2 x] (match desc
+                     (m/PLit s) (values (str s) e [])
+                     _ (let [[v e3 x3] (eval-val c desc e)] (values (if (> (count x3) 0) "" (java-str v)) e3 x3)))
+          nt (err/norm-type type)
+          i (str/index-of nt ":")]
+      (if (> (count x) 0) (values e2 x)
+        (failure e2 (err/mk (subs nt 0 i) (subs nt (+ i 1) (count nt)) (if (= d "") "An error occurred." d)))))
+    (m/PrParseTemplate content parts target loc) (run-template c parts target e)
+    (m/PrChoice whens other loc)
+    (loop [i 0]
+      (if (>= i (count whens)) (let [z (chose c loc i)] (if (= (count other) 0) (values e []) (route-span c "mule:choice:route" loc other e)))
+        (let [w (nth whens i)
+              [val e2 x] (eval-val c (:cond w) e)]
+          (if (> (count x) 0) (values e2 x)
+            (let [[b be] (truthy val (expr-text (:cond w)))]
+              (if (> (count be) 0) (values e2 be)
+                (if b (let [z (chose c loc i)] (route-span c "mule:choice:route" loc (:procs w) e2)) (recur (+ i 1)))))))))
+    (m/PrForEach coll counter root batch procs loc) (run-foreach c coll counter root batch procs loc e)
+    (m/PrParallelForEach coll maxc timeout target procs loc) (run-par-foreach c coll target procs maxc timeout loc e)
+    (m/PrScatterGather routes timeout maxc target loc) (run-scatter c routes target maxc timeout loc e)
+    (m/PrTry procs handlers href tx loc)
+    (let [outer (:tx e)
+          begin (or (= tx "ALWAYS_BEGIN") (and (= tx "BEGIN_OR_JOIN") (= outer "")))
+          id (if begin (str "tx-" (swap! TX-SEQ (fn Int [n: Int] (+ n 1)))) outer)
+          [e3 x3] (ops/on-fail (fn Values(ev/Event Vec(err/MErr)) []
+                                 (let [[e2 x] (run-procs c procs (if begin (ev/with-tx e id) e))]
+                                   (if (= (count x) 0) (values e2 x) (handle-error c handlers href e2 (nth x 0) false))))
+                               (fn Int [] (if begin (let [z (end-tx c id false)] 0) 0)))]
+      (if (not begin) (values e3 x3)
+        (let [te (end-tx c id (= (count x3) 0))
+              e4 (ev/with-tx e3 outer)]
+          (if (or (> (count x3) 0) (= te "")) (values e4 x3)
+            (values e4 [(err/mk "MULE" "UNKNOWN" te)])))))
+    (m/PrUntilSuccessful maxr millis procs loc) (run-until c maxr millis procs loc e)
+    (m/PrAsync procs maxc loc)
+    (let [c1 c ps procs e1 e
+          key (str "async:" (:path loc))
+          zh (stream/enter (:rid e))
+          z (ops/spawn-bg (fn Int [k: Int]
+                            (with-cleanup
+                              (fn Int []
+                                (let [[e2 x] (with-sem key maxc (fn Values(ev/Event Vec(err/MErr)) [] (run-procs c1 ps e1)))]
+                                  (if (> (count x) 0) (log-error c1 e2 (nth x 0) DEFAULT-LISTENER) 0)))
+                              (fn Int [] (stream/leave (:rid e1))))))]
+      (ok e))
+    (m/PrBatchJob job bs mf maxc steps oc loc) (run-batch c job bs mf maxc steps oc e)
+    (m/PrIdempotent idx valx store priv loc) (run-idempotent c idx valx store priv loc e)
+    (m/PrCache sref filter procs loc) (run-cache c sref filter procs loc e)
+    (m/PrInvalidateKey sref kx loc)
+    (let [[store kx0 se] (cache-strategy c sref loc)]
+      (if (not= se "") (failure e (err/mk "MULE" "UNKNOWN" se))
+        (let [[key good e2 x] (cache-key c (if (> (count kx) 0) kx kx0) e)]
+          (cond (> (count x) 0) (values e2 x)
+                (not good) (failure e2 (err/mk "MULE" "UNKNOWN" "key cannot be null or blank"))
+                :else (let [z (ost/lock! (str store "\n" key)) z1 (ost/remove! store key) z2 (ost/unlock! (str store "\n" key))] (ok e2))))))
+    (m/PrInvalidateCache sref loc)
+    (let [[store kx0 se] (cache-strategy c sref loc)]
+      (if (not= se "") (failure e (err/mk "MULE" "UNKNOWN" se)) (let [z (ost/clear! store)] (ok e))))
+    (m/PrFirstSuccessful routes loc)
+    (loop [i 0 last: Vec(err/MErr) []]
+      (if (>= i (count routes)) (values e (if (> (count last) 0) last [(err/mk "MULE" "ROUTING" "All routes failed")]))
+        (let [[e2 x] (run-procs c (:procs (nth routes i)) e)]
+          (if (= (count x) 0) (ok e2) (recur (+ i 1) x)))))
+    (m/PrRoundRobin routes id loc)
+    (if (= (count routes) 0) (ok e)
+      (let [k (next-rr c id)] (run-procs c (:procs (nth routes (mod k (count routes)))) e)))
+    (m/PrConnectorOp connector op cref params children exprs chains target tvalue loc)
+    (run-op c connector op cref params children exprs chains target tvalue loc e)
+    (m/PrUnknown name loc) (failure e (err/mk "MULE" "UNKNOWN" (str "Unsupported element <" name ">")))))
+
+(defrecord BatchRec [payload: ev/TV vars: Vec(ev/Var) failed: Bool])
+
+(defrecord BatchStats [received: Vec(Int) failed: Vec(Int) etypes: Vec(Vec(Str)) ecounts: Vec(Vec(Int))])
+
+(defn- stats-new BatchStats [n: Int]
+  (loop [i 0 r: Vec(Int) [] f: Vec(Int) [] t: Vec(Vec(Str)) [] k: Vec(Vec(Int)) []]
+    (if (>= i n) (->BatchStats r f t k)
+      (recur (+ i 1) (conj r 0) (conj f 0) (conj t (let [z: Vec(Str) []] z)) (conj k (let [z: Vec(Int) []] z))))))
+
+(defn- stats-add BatchStats [s: BatchStats si: Int etype: &Str]
+  (let [rv (:received s) r (assoc rv si (+ (nth rv si) 1))]
+    (if (= etype "") (->BatchStats r (:failed s) (:etypes s) (:ecounts s))
+      (let [fv (:failed s) f (assoc fv si (+ (nth fv si) 1))
+            ts (nth (:etypes s) si) ks (nth (:ecounts s) si)
+            k (loop [j 0] (if (>= j (count ts)) -1 (if (= (nth ts j) etype) j (recur (+ j 1)))))
+            [ts2 ks2] (if (< k 0) (values (conj ts (str etype)) (conj ks 1)) (values ts (assoc ks k (+ (nth ks k) 1))))]
+        (->BatchStats r f (assoc (:etypes s) si ts2) (assoc (:ecounts s) si ks2))))))
+
+(defn- step-results v/Val [steps: &Vec(m/BatchStep) s: &BatchStats]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count steps)) acc (recur (+ i 1) (conj acc (:name (nth steps i))))))
+        order (jh/hashmap-order names)]
+    (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                (if (>= i (count order)) acc
+                  (let [nm (nth order i)
+                        si (loop [j 0] (if (>= j (count names)) 0 (if (= (nth names j) nm) j (recur (+ j 1)))))
+                        rcv (nth (:received s) si) fl (nth (:failed s) si)
+                        ts (nth (:etypes s) si) ks (nth (:ecounts s) si)
+                        eorder (jh/hashmap-order ts)
+                        ecount (loop [j 0 acc2: Vec(v/Field) []]
+                                 (if (>= j (count eorder)) acc2
+                                   (let [t (nth eorder j)
+                                         k (loop [q 0] (if (>= q (count ts)) 0 (if (= (nth ts q) t) q (recur (+ q 1)))))]
+                                     (recur (+ j 1) (conj acc2 (v/field t (v/int-v (nth ks k))))))))]
+                    (recur (+ i 1)
+                           (conj acc (v/field nm (java-obj [(v/field "failedRecords" (v/int-v fl))
+                                                            (v/field "errorSummary" (v/->VObj [(v/field "errorsCount" (v/->VObj ecount))]))
+                                                            (v/field "successfulRecords" (v/int-v (- rcv fl)))
+                                                            (v/field "exceptionSummary" (v/->VObj [(v/field "exceptionsCount" (v/->VObj []))]))
+                                                            (v/field "receivedRecords" (v/int-v rcv))]
+                                                           BATCH-STEP-RESULT-CLASS))))))))))
+
+(def BATCH-INSTANCE-CLASS "com.mulesoft.mule.runtime.module.batch.privileged.ImmutableBatchJobInstance")
+(def BATCH-RESULT-CLASS "com.mulesoft.mule.runtime.module.batch.privileged.ImmutableBatchJobResult")
+(def BATCH-STEP-RESULT-CLASS "com.mulesoft.mule.runtime.module.batch.privileged.ImmutableBatchStepResult")
+
+(defn- java-obj v/Val [fs: Vec(v/Field) cls: &Str] (v/->VMeta (v/->VObj fs) [(v/field "class" (v/->VStr cls))]))
+
+(defn- run-batch Values(ev/Event Vec(err/MErr)) [c: &Ctx job: &Str bs: Int mf: Int maxc: Int steps: &Vec(m/BatchStep) oc: &Vec(m/Proc) e: ev/Event]
+  (let [p (:payload e)]
+    (if (and (not (:inline-batch c)) (or (> maxc 1) (and (= (:state p) ev/CURSOR) (stream/fresh? (:raw p))) (streaming-json? p)))
+      (run-batch-par c job (if (> bs 0) bs 100) mf (if (> maxc 1) maxc 1) steps oc e)
+      (run-batch-seq c job bs mf steps oc e))))
+
+(defn- run-batch-seq Values(ev/Event Vec(err/MErr)) [c: &Ctx job: &Str bs: Int mf: Int steps: &Vec(m/BatchStep) oc: &Vec(m/Proc) e: ev/Event]
+  (let [[x t2 pe] (ev/value (:payload e))]
+    (if (not= pe "") (failure e (err/mk "MULE" "EXPRESSION" pe))
+      (let [items: Vec(v/Val) (match (v/unmeta x) (v/VArr xs) xs (v/VNull) [] _ [x])
+            id (dmisc/uuid4)
+            name (if (= job "") (str "batch-job-" id) (str job))
+            inst (java-obj [(v/field "creationTime" (v/->VDateTime (zt/now-zdt))) (v/field "recordCount" (v/int-v (count items)))
+                            (v/field "result" (v/null-v)) (v/field "id" (v/->VStr id))
+                            (v/field "ownerJobName" (v/->VStr name)) (v/field "status" (v/->VStr "EXECUTING"))]
+                           BATCH-INSTANCE-CLASS)
+            c1 c st steps oc1 oc e1 e
+            pm (data-mime-of (:payload e))
+            zh (stream/enter (:rid e))
+            z (if (:inline-batch c) (with-cleanup (fn Int [] (batch-body c id items pm (if (> bs 0) bs 100) mf steps oc e)) (fn Int [] (stream/leave (:rid e))))
+                (ops/spawn-bg (fn Int [k: Int] (with-cleanup (fn Int [] (batch-body c1 id items pm (if (> bs 0) bs 100) mf st oc1 e1))
+                                                             (fn Int [] (stream/leave (:rid e1)))))))]
+        (ok (ev/with-payload e (ev/tv-val inst ev/JAVA)))))))
+
+(defrecord BatchPar [stop: Atom(Bool) stats: Atom(BatchStats) bufs: Atom(Vec(Vec(v/Val)))
+                     loaded: Atom(Int) processed: Atom(Int) failed: Atom(Int)])
+
+(defn- run-batch-par Values(ev/Event Vec(err/MErr)) [c: &Ctx job: &Str bs: Int mf: Int maxc: Int steps: &Vec(m/BatchStep) oc: &Vec(m/Proc) e: ev/Event]
+  (let [p (:payload e)
+        id (dmisc/uuid4)
+        z0 (stream/enter id)
+        [cid n0 perr] (cond
+                        (= (:state p) ev/CURSOR) (values (:raw p) -1 "")
+                        (streaming-json? p) (let [[j ok] (json-stream id p)] (if ok (values j -1 "") (items-stream id p)))
+                        :else (items-stream id p))]
+    (if (not= perr "") (let [z (stream/leave id)] (failure e (err/mk "MULE" "EXPRESSION" perr)))
+      (let [z1 (stream/adopt cid id)
+            name (if (= job "") (str "batch-job-" id) (str job))
+            inst (java-obj [(v/field "creationTime" (v/->VDateTime (zt/now-zdt))) (v/field "recordCount" (v/int-v (if (< n0 0) 0 n0)))
+                            (v/field "result" (v/null-v)) (v/field "id" (v/->VStr id))
+                            (v/field "ownerJobName" (v/->VStr name)) (v/field "status" (v/->VStr "EXECUTING"))]
+                           BATCH-INSTANCE-CLASS)
+            c1 c st steps oc1 oc e1 e id1 id cid1 cid
+            pm (if (= (:state p) ev/CURSOR) "" (data-mime-of p))
+            zh (stream/enter (:rid e))
+            z (ops/spawn-bg (fn Int [k: Int] (let [r (batch-par-body c1 id1 cid1 pm bs mf maxc st oc1 e1)] (stream/leave (:rid e1)))))]
+        (ok (ev/with-payload e (ev/tv-val inst ev/JAVA)))))))
+
+(defn- items-stream Values(Str Int Str) [owner: &Str p: &ev/TV]
+  (let [[x t2 pe] (ev/value p)]
+    (if (not= pe "") (values "" 0 pe)
+      (let [items: Vec(v/Val) (match (v/unmeta x) (v/VArr xs) xs (v/VNull) [] _ [x])
+            pos (atom 0)
+            n (count items)
+            src (stream/->Source (fn Values(Vec(v/Val) Bool Str) [k: Int] (slice-vals items pos k)) (fn Int [broken: Bool] 0) false)]
+        (values (stream/open owner src) n "")))))
+
+(defn- slice-vals Values(Vec(v/Val) Bool Str) [xs: &Vec(v/Val) pos: &Atom(Int) n: Int]
+  (let [from (deref pos)
+        to (if (> (+ from n) (count xs)) (count xs) (+ from n))
+        out (loop [i from acc: Vec(v/Val) []] (if (>= i to) acc (recur (+ i 1) (conj acc (nth xs i)))))
+        z (reset! pos to)]
+    (values out (>= to (count xs)) "")))
+
+(defn- batch-par-body Int [c: &Ctx id: &Str cid: &Str pm: &Str bs: Int mf: Int maxc: Int steps: &Vec(m/BatchStep) oc: &Vec(m/Proc) e0: &ev/Event]
+  (let [t0 (quot (mono-us) 1000)
+        bufs0 (loop [i 0 acc: Vec(Vec(v/Val)) []] (if (>= i (count steps)) acc (recur (+ i 1) (conj acc (let [z: Vec(v/Val) []] z)))))
+        bp (->BatchPar (atom false) (atom (stats-new (count steps))) (atom bufs0) (atom 0) (atom 0) (atom 0))
+        fs (loop [k 0 acc: Vec(Future(Int)) []]
+             (if (>= k maxc) acc
+               (let [c1 c id1 id cid1 cid st steps e1 e0 bp1 bp pm1 pm]
+                 (recur (+ k 1) (conj acc (future (fn Int [x: Int] (batch-worker c1 id1 cid1 pm1 bs mf st e1 bp1)) k))))))
+        z1 (loop [k 0 r 0] (if (>= k (count fs)) r (recur (+ k 1) (+ r (deref (nth fs k))))))
+        stopped (and (>= mf 0) (> (deref (:failed bp)) mf))
+        z2 (if stopped 0 (batch-flush c (deref (:bufs bp)) steps e0))
+        z3 (stream/leave id)
+        n (deref (:loaded bp))
+        processed (deref (:processed bp))
+        failed (deref (:failed bp))
+        res (java-obj [(v/field "onCompletePhaseException" (v/null-v))
+                       (v/field "loadingPhaseException" (v/null-v))
+                       (v/field "totalRecords" (v/int-v n))
+                       (v/field "onCompletePhaseError" (v/null-v))
+                       (v/field "elapsedTimeInMillis" (v/int-v (- (quot (mono-us) 1000) t0)))
+                       (v/field "failedOnCompletePhase" (v/bool-v false))
+                       (v/field "failedRecords" (v/int-v failed))
+                       (v/field "loadedRecords" (v/int-v n))
+                       (v/field "failedOnInputPhase" (v/bool-v false))
+                       (v/field "successfulRecords" (v/int-v (- processed failed)))
+                       (v/field "batchStepResults" (step-results steps (deref (:stats bp))))
+                       (v/field "inputPhaseException" (v/null-v))
+                       (v/field "processedRecords" (v/int-v processed))
+                       (v/field "loadingPhaseError" (v/null-v))
+                       (v/field "failedOnLoadingPhase" (v/bool-v false))
+                       (v/field "batchJobInstanceId" (v/->VStr (str id)))
+                       (v/field "inputPhaseError" (v/null-v))]
+                      BATCH-RESULT-CLASS)
+        [e2 x] (run-procs c oc (ev/with-payload (clone-event e0) (ev/tv-val res ev/JAVA)))]
+    (if (> (count x) 0) (log-error c e2 (nth x 0) DEFAULT-LISTENER) 0)))
+
+(defn- batch-worker Int [c: &Ctx id: &Str cid: &Str pm: &Str bs: Int mf: Int steps: &Vec(m/BatchStep) e0: &ev/Event bp: &BatchPar]
+  (let [key (str "batch-pull-" id)]
+    (loop [n 0]
+      (let [[rows err] (with-sem key 1 (fn Values(Vec(v/Val) Str) []
+                                         (let [[rows done err] (if (deref (:stop bp)) (values [] true "") (stream/take-vals cid bs))
+                                               z1 (if (or done (not= err "")) (reset! (:stop bp) true) false)]
+                                           (values rows err))))
+            z3 (if (not= err "") (log-error c e0 (err/mk "MULE" "UNKNOWN" err) DEFAULT-LISTENER) 0)]
+        (if (= (count rows) 0) n
+          (let [k (count rows)
+                z4 (swap! (:loaded bp) (fn Int [v: Int] (+ v k)))
+                recs (loop [i 0 acc: Vec(BatchRec) []]
+                       (if (>= i k) acc (recur (+ i 1) (conj acc (->BatchRec (elem-tv (nth rows i) pm ev/ANY) (:vars e0) false)))))
+                nf (batch-block-par c id recs steps e0 bp)
+                z5 (swap! (:processed bp) (fn Int [v: Int] (+ v k)))
+                f2 (swap! (:failed bp) (fn Int [v: Int] (+ v nf)))
+                z6 (if (and (>= mf 0) (> f2 mf)) (reset! (:stop bp) true) false)]
+            (recur (+ n k))))))))
+
+(defn- batch-block-par Int [c: &Ctx id: &Str recs0: Vec(BatchRec) steps: &Vec(m/BatchStep) e0: &ev/Event bp: &BatchPar]
+  (let [recs (loop [si 0 recs recs0]
+               (if (>= si (count steps)) recs
+                 (let [stp (nth steps si)
+                       [r2 passed st] (loop [i 0 rs recs pv: Vec(v/Val) [] st: Vec(Str) []]
+                                        (if (>= i (count rs)) (values rs pv st)
+                                          (let [[r3 ok et] (batch-step c stp (nth rs i) e0)
+                                                pv2 (if ok (conj pv (agg-elem (:payload r3) (agg-preserve stp))) pv)]
+                                            (recur (+ i 1) (assoc rs i r3) pv2 (conj st (str et))))))
+                       z (swap! (:stats bp) (fn BatchStats [s: BatchStats]
+                                                      (loop [j 0 a s] (if (>= j (count st)) a (recur (+ j 1) (stats-add a si (nth st j)))))))
+                       z2 (batch-agg-par c id si stp passed e0 bp)]
+                   (recur (+ si 1) r2))))]
+    (loop [i 0 k 0] (if (>= i (count recs)) k (recur (+ i 1) (if (:failed (nth recs i)) (+ k 1) k))))))
+
+(defn- batch-agg-par Int [c: &Ctx id: &Str si: Int stp: &m/BatchStep passed: Vec(v/Val) e0: &ev/Event bp: &BatchPar]
+  (let [ags (:aggregator stp)]
+    (if (or (= (count ags) 0) (= (count passed) 0)) 0
+      (let [ag (nth ags 0)
+            sz (:size ag)
+            key (str "batch-agg-" id)
+            chunks (with-sem key 1
+                     (fn Vec(Vec(v/Val)) []
+                       (let [cur (let [b (deref (:bufs bp)) x (nth b si)] (loop [i 0 a x] (if (>= i (count passed)) a (recur (+ i 1) (conj a (nth passed i))))))
+                             [chunks rest] (if (<= sz 0) (values (let [z: Vec(Vec(v/Val)) []] z) cur)
+                                             (loop [from 0 acc: Vec(Vec(v/Val)) []]
+                                               (if (> (+ from sz) (count cur))
+                                                 (values acc (loop [i from r: Vec(v/Val) []] (if (>= i (count cur)) r (recur (+ i 1) (conj r (nth cur i))))))
+                                                 (recur (+ from sz) (conj acc (loop [i from r: Vec(v/Val) []] (if (>= i (+ from sz)) r (recur (+ i 1) (conj r (nth cur i))))))))))
+                             z1 (swap! (:bufs bp) (fn Vec(Vec(v/Val)) [b: Vec(Vec(v/Val))] (assoc b si rest)))]
+                         chunks)))]
+        (loop [i 0] (if (>= i (count chunks)) 0 (let [z3 (batch-aggregate c ag (nth chunks i) e0)] (recur (+ i 1)))))))))
+
+(defn- batch-body Int [c: &Ctx id: &Str items: &Vec(v/Val) pm: &Str bs: Int mf: Int steps: &Vec(m/BatchStep) oc: &Vec(m/Proc) e0: &ev/Event]
+  (let [t0 (quot (mono-us) 1000)
+        n (count items)
+        recs0 (loop [i 0 acc: Vec(BatchRec) []]
+                (if (>= i n) acc (recur (+ i 1) (conj acc (->BatchRec (elem-tv (nth items i) pm ev/ANY) (:vars e0) false)))))
+        bufs0 (loop [i 0 acc: Vec(Vec(v/Val)) []] (if (>= i (count steps)) acc (recur (+ i 1) (conj acc (let [z: Vec(v/Val) []] z)))))
+        [recs bufs processed failed stopped stats]
+        (loop [b 0 recs recs0 bufs bufs0 processed 0 failed 0 stats (stats-new (count steps))]
+          (if (>= b n) (values recs bufs processed failed false stats)
+            (let [hi (min n (+ b bs))
+                  [r2 g2 s2] (batch-block c recs bufs stats b hi steps e0)
+                  nf (loop [i b k failed] (if (>= i hi) k (recur (+ i 1) (if (:failed (nth r2 i)) (+ k 1) k))))
+                  np (+ processed (- hi b))]
+              (if (and (>= mf 0) (> nf mf))
+                (let [[r3 g3 s3] (if (< hi n) (batch-block c r2 g2 s2 hi (min n (+ hi bs)) steps e0) (values r2 g2 s2))]
+                  (values r3 g3 np nf true s2))
+                (recur hi r2 g2 np nf s2)))))
+        z1 (if stopped 0 (batch-flush c bufs steps e0))
+        res (java-obj [(v/field "onCompletePhaseException" (v/null-v))
+                       (v/field "loadingPhaseException" (v/null-v))
+                       (v/field "totalRecords" (v/int-v n))
+                       (v/field "onCompletePhaseError" (v/null-v))
+                       (v/field "elapsedTimeInMillis" (v/int-v (- (quot (mono-us) 1000) t0)))
+                       (v/field "failedOnCompletePhase" (v/bool-v false))
+                       (v/field "failedRecords" (v/int-v failed))
+                       (v/field "loadedRecords" (v/int-v n))
+                       (v/field "failedOnInputPhase" (v/bool-v false))
+                       (v/field "successfulRecords" (v/int-v (- processed failed)))
+                       (v/field "batchStepResults" (step-results steps stats))
+                       (v/field "inputPhaseException" (v/null-v))
+                       (v/field "processedRecords" (v/int-v processed))
+                       (v/field "loadingPhaseError" (v/null-v))
+                       (v/field "failedOnLoadingPhase" (v/bool-v false))
+                       (v/field "batchJobInstanceId" (v/->VStr (str id)))
+                       (v/field "inputPhaseError" (v/null-v))]
+                      BATCH-RESULT-CLASS)
+        [e2 x] (run-procs c oc (ev/with-payload (clone-event e0) (ev/tv-val res ev/JAVA)))]
+    (if (> (count x) 0) (log-error c e2 (nth x 0) DEFAULT-LISTENER) 0)))
+
+(defn- clone-event ev/Event [e: &ev/Event] (ev/with-rid (ev/with-vars (ev/with-payload (ev/new-event (:payload e) (:attributes e) (:corr e) (:flow e)) (:payload e)) (:vars e)) (str (:rid e))))
+
+(defn- batch-block Values(Vec(BatchRec) Vec(Vec(v/Val)) BatchStats) [c: &Ctx recs0: Vec(BatchRec) bufs0: Vec(Vec(v/Val)) stats0: BatchStats b: Int hi: Int steps: &Vec(m/BatchStep) e0: &ev/Event]
+  (loop [si 0 recs recs0 bufs bufs0 stats stats0]
+    (if (>= si (count steps)) (values recs bufs stats)
+      (let [stp (nth steps si)
+            [r2 buf st2] (loop [i b rs recs buf (nth bufs si) st stats]
+                           (if (>= i hi) (values rs buf st)
+                             (let [r (nth rs i)
+                                   [r3 passed et] (batch-step c stp r e0)
+                                   buf2 (if passed (conj buf (agg-elem (:payload r3) (agg-preserve stp))) buf)
+                                   buf3 (batch-maybe-aggregate c stp buf2 e0)]
+                               (recur (+ i 1) (assoc rs i r3) buf3 (stats-add st si et)))))]
+        (recur (+ si 1) r2 (assoc bufs si buf) st2)))))
+
+(defn- batch-step Values(BatchRec Bool Str) [c: &Ctx stp: &m/BatchStep r: BatchRec e0: &ev/Event]
+  (let [pol (:accept-policy stp)
+        failed (:failed r)
+        by-policy (cond (= pol "ALL") true (= pol "ONLY_FAILURES") failed :else (not failed))]
+    (if (not by-policy) (values r false "")
+      (let [ev (ev/with-vars (ev/with-payload (clone-event e0) (:payload r)) (:vars r))
+            ae (:accept-expr stp)
+            [acc ax] (if (= (count ae) 0) (values true [])
+                       (let [[val e2 x] (eval-val c (nth ae 0) ev)]
+                         (if (> (count x) 0) (values false x) (truthy val (expr-text (nth ae 0))))))]
+        (cond
+          (> (count ax) 0) (let [z (log-error c ev (nth ax 0) DEFAULT-LISTENER)] (values (->BatchRec (:payload r) (:vars r) true) false (err-type-str (nth ax 0))))
+          (not acc) (values r false "")
+          :else
+          (let [[e2 x] (run-procs c (:procs stp) ev)]
+            (if (> (count x) 0)
+              (let [z (log-error c e2 (nth x 0) DEFAULT-LISTENER)] (values (->BatchRec (:payload r) (:vars r) true) false (err-type-str (nth x 0))))
+              (values (->BatchRec (:payload e2) (:vars e2) failed) true ""))))))))
+
+(defn- err-type-str Str [x: &err/MErr] (str (:ns x) ":" (:id x)))
+
+(defn- batch-maybe-aggregate Vec(v/Val) [c: &Ctx stp: &m/BatchStep buf: Vec(v/Val) e0: &ev/Event]
+  (let [ags (:aggregator stp)]
+    (if (= (count ags) 0) (let [z: Vec(v/Val) []] z)
+      (let [ag (nth ags 0) sz (:size ag)]
+        (if (or (<= sz 0) (< (count buf) sz)) buf
+          (let [z (batch-aggregate c ag buf e0)] (let [y: Vec(v/Val) []] y)))))))
+
+(defn- batch-aggregate Int [c: &Ctx ag: &m/BatchAggregator buf: Vec(v/Val) e0: &ev/Event]
+  (let [[e2 x] (run-procs c (:procs ag) (ev/with-payload (clone-event e0) (ev/tv-val (v/->VArr buf) ev/JAVA)))]
+    (if (> (count x) 0) (log-error c e2 (nth x 0) DEFAULT-LISTENER) 0)))
+
+(defn- batch-flush Int [c: &Ctx bufs: &Vec(Vec(v/Val)) steps: &Vec(m/BatchStep) e0: &ev/Event]
+  (loop [i 0]
+    (if (>= i (count steps)) 0
+      (let [ags (:aggregator (nth steps i))
+            z (if (or (= (count ags) 0) (= (count (nth bufs i)) 0)) 0 (batch-aggregate c (nth ags 0) (nth bufs i) e0))]
+        (recur (+ i 1))))))
+
+(def TX-SEQ (atom 0))
+
+(defn- empty-counts Map(Str Int) [] (let [m: Map(Str Int) {}] m))
+(def RUNNING (atom (empty-counts)))
+
+(defn- sem-acquire Int [key: &Str limit: Int]
+  (let [tok (str key "#" (swap! TX-SEQ (fn Int [n: Int] (+ n 1))))]
+    (loop [pause 1]
+      (let [m (swap! RUNNING (fn Map(Str Int) [o: Map(Str Int)]
+                               (let [n (if (contains? o key) (get! o key) 0)]
+                                 (if (< n limit) (assoc (assoc o key (+ n 1)) tok 1) o))))]
+        (if (contains? m tok)
+          (let [z (swap! RUNNING (fn Map(Str Int) [o: Map(Str Int)] (dissoc o tok)))] 0)
+          (let [z (host/pause-ms pause)] (recur (if (< pause 8) (* pause 2) 8))))))))
+
+(defn- sem-release Int [key: &Str]
+  (let [z (swap! RUNNING (fn Map(Str Int) [o: Map(Str Int)] (let [n (if (contains? o key) (get! o key) 0)] (assoc o key (if (> n 0) (- n 1) 0)))))] 0))
+
+(defn with-sem a [key: &Str limit: Int f: Fn(a)]
+  (if (<= limit 0) (f)
+    (let [k (str key) z (sem-acquire k limit)] (with-cleanup f (fn Int [] (sem-release k))))))
+
+(defn end-tx Str [c: &Ctx id: &Str commit: Bool]
+  (let [cs (:conns c)]
+    (loop [i 0 err ""]
+      (if (>= i (count cs)) err
+        (let [e ((:tx-end (nth cs i)) (str id) commit)]
+          (recur (+ i 1) (if (and (= err "") (not= e "")) e err)))))))
+
+(defn- next-rr Int [c: &Ctx id: Int]
+  (let [key (str id)
+        d (swap! (:rr c) (fn Dyn [old: Dyn]
+                              (let [mm: Map (dyn->map old)
+                                    n (if (contains? mm key) (dyn->int (get! mm key)) -1)]
+                                (->dyn (assoc mm key (->dyn (+ n 1)))))))
+        m2: Map (dyn->map d)]
+    (dyn->int (get! m2 key))))
+
+(defn- run-logger Values(ev/Event Vec(err/MErr)) [c: &Ctx msgs: &Vec(m/PVal) level: &Str category: &Str e: ev/Event]
+  (let [lv (log/level-of level)
+        cat (if (= category "") LOGGER-CATEGORY (str category))
+        on (log/enabled? lv (:log-level c) cat)
+        cap (log/capturing?)]
+    (if (and (not on) (not cap)) (ok e)
+      (let [[text e2 x] (if (= (count msgs) 0) (values (describe-event e) e [])
+                          (loop [i 0 out "" ee e]
+                            (if (>= i (count msgs)) (values out ee [])
+                              (match (nth msgs i)
+                                (m/PLit s) (recur (+ i 1) (str out s) ee)
+                                _ (let [[t e3 x3] (eval-log-pval c (nth msgs i) ee)]
+                                    (if (> (count x3) 0) (values "" e3 x3)
+                                      (let [s (tv-text t)] (recur (+ i 1) (str out s) e3))))))))]
+        (cond
+          (and (not on) (> (count x) 0)) (let [z (log/capture lv cat "(not evaluated by Mule at this level)" false)] (ok e))
+          (> (count x) 0) (values e2 x)
+          (not on) (let [z (log/capture lv cat text false)] (ok e))
+          :else (let [z (log/emit lv (:log-level c) (where-str c e2) cat text)] (ok e2)))))))
+
+(defn- where-str Str [c: &Ctx e: &ev/Event] (str "[" (:name (:app c)) "]." (:flow e)))
+
+(defn describe-event Str [e: &ev/Event]
+  (let [p (ev/settle (:payload e))
+        pr (if (not= (:state p) ev/VAL) "org.mule.runtime.core.internal.streaming.bytes.ManagedCursorStreamProvider@0"
+             (java-str (:val p)))
+        pm (if (= (:mime p) "") "*/*" (str (:mime p)))
+        [av at ae] (ev/value (:attributes e))
+        ar (attributes-str av)]
+    (str "\norg.mule.runtime.core.internal.message.DefaultMessageBuilder$MessageImplementation\n{\n  payload=" pr
+         "\n  mediaType=" pm "\n  attributes=" ar "\n  attributesMediaType=*/*\n}")))
+
+(defn- attributes-str Str [a: &v/Val]
+  (match (v/unmeta a)
+    (v/VObj fs)
+    (if (= (count (v/obj-get fs "listenerPath")) 0) (java-str a)
+      (let [[t known] (jo/to-string (v/->VMeta (v/unmeta a) [(v/field "class" (v/->VStr "org.mule.extension.http.api.HttpRequestAttributes"))]))] t))
+    (v/VNull) "null"
+    _ (java-str a)))
+
+(defn- run-transform Values(ev/Event Vec(err/MErr)) [c: &Ctx pay: &Vec(m/Script) attrs: &Vec(m/Script) tvars: &Vec(m/TVar) e0: ev/Event]
+  (let [[e1 x1] (loop [i 0 e e0 out e0]
+                  (if (>= i (count tvars)) (values out [])
+                    (let [tv (nth tvars i)
+                          sc (:script tv)
+                          [t e2 x] (run-script c (:c sc) (:src sc) e true)]
+                      (if (> (count x) 0) (values e2 x) (recur (+ i 1) e2 (ev/set-var out (:name tv) t))))))]
+    (if (> (count x1) 0) (values e1 x1)
+      (let [[e2 x2] (if (= (count pay) 0) (values e1 [])
+                      (let [sc (nth pay 0)
+                            [t e3 x] (run-script c (:c sc) (:src sc) e0 true)]
+                        (if (> (count x) 0) (values e3 x) (values (ev/with-payload e1 t) []))))]
+        (if (> (count x2) 0) (values e2 x2)
+          (if (= (count attrs) 0) (ok e2)
+            (let [sc (nth attrs 0)
+                  [t e3 x] (run-script c (:c sc) (:src sc) e0 true)]
+              (if (> (count x) 0) (values e3 x) (ok (ev/with-attributes e2 t))))))))))
+
+(defn- run-template Values(ev/Event Vec(err/MErr)) [c: &Ctx parts: &Vec(m/PVal) target: &Str e0: ev/Event]
+  (loop [i 0 out "" e e0]
+    (if (>= i (count parts))
+      (let [t (ev/tv-val (v/->VStr out) ev/ANY)]
+        (ok (if (= target "") (ev/with-payload e t) (ev/set-var e target t))))
+      (match (nth parts i)
+        (m/PLit s) (recur (+ i 1) (str out s) e)
+        _ (let [[t e2 x] (eval-pval c (nth parts i) e)]
+            (if (> (count x) 0) (values e2 x)
+              (let [s (tv-text t)] (recur (+ i 1) (str out s) e2))))))))
+
+(defn- run-flow-ref Values(ev/Event Vec(err/MErr)) [c: &Ctx name: &m/PVal target: &Str tvalue: &Vec(m/PVal) e: ev/Event el: Str]
+  (let [[nv e2 x] (eval-val c name e)]
+    (if (> (count x) 0) (values e2 x)
+      (let [[fname fe] (drt/to-text nv)
+            fl (find-flow c fname)]
+        (cond
+          (= (count fl) 0)
+          (failure e2 (err/mk "MULE" "ROUTING" (str "No flow/sub-flow with name '" fname "' found. Failed to route event via endpoint: "
+                                                 "org.mule.runtime.config.internal.factories.FlowRefFactoryBean$DynamicFlowRefMessageProcessor@0")))
+          (= (:initial-state (nth fl 0)) "stopped")
+          (failure e2 (err/mk "MULE" "UNKNOWN" (str "Cannot process event as \"" fname "\" is stopped")))
+          :else
+          (let [saved (:flow e2)
+                frame (:frame e2)
+                callers (:callers e2)
+                [e3 x3] (flow-span c (nth fl 0) (ev/with-frame e2 frame (conj callers (str frame "(" el ")"))))
+                e4 (ev/with-frame (ev/with-flow e3 saved) frame callers)]
+            (cond
+              (> (count x3) 0) (values e4 x3)
+              (= target "") (ok e4)
+              (= (count tvalue) 0) (ok (ev/set-var e2 target (:payload e4)))
+              :else (let [[t e5 x5] (eval-pval c (nth tvalue 0) e4)]
+                      (if (> (count x5) 0) (values e2 x5) (ok (ev/set-var e2 target t)))))))))))
+
+(defn- collection Values(Vec(v/Val) ev/Event Vec(err/MErr)) [c: &Ctx coll: &Vec(m/PVal) e: ev/Event]
+  (let [[val e2 x] (if (= (count coll) 0)
+                     (let [[pv t pe] (ev/value (:payload e))] (values pv (ev/with-payload e t) (if (= pe "") [] [(expr-err (plain-desc pe "payload"))])))
+                     (eval-val c (nth coll 0) e))
+        expr (if (= (count coll) 0) "payload" (expr-text (nth coll 0)))]
+    (if (> (count x) 0) (values [] e2 x)
+      (match (v/unmeta val)
+        (v/VArr xs) (values xs e2 [])
+        (v/VRange a b) (values (v/items (v/unmeta val)) e2 [])
+        (v/VObj fs) (values (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (v/->VObj [(nth fs i)]))))) e2 [])
+        (v/VNull) (values [] e2 [])
+        _ (values [] e2 [(expr-err (plain-desc (str "Expecting Array or Object but got " (v/type-name (v/unmeta val)) ".") expr))])))))
+
+(defn- data-mime-of Str [t: &ev/TV]
+  (let [m (reg/norm-mime (:mime t))]
+    (if (or (= m "") (= m "*/*") (= m "application/java") (= m "text/plain") (= m "application/octet-stream")) "" m)))
+
+(defn- elem-val v/Val [x: v/Val pm: &Str] (if (= pm "application/csv") (v/->VArr [x]) x))
+
+(defn- elem-tv ev/TV [x: v/Val pm: &Str java-mime: &Str]
+  (cond (= pm "application/csv") (ev/tv-val (v/->VArr [x]) "application/csv")
+        (and (not= pm "") (not (scalar-text? x))) (ev/tv-val x (str pm))
+        :else (ev/tv-val x (str java-mime))))
+
+(defn- scalar-text? Bool [x: &v/Val] (match (v/unmeta x) (v/VStr s) true (v/VBin b) true _ false))
+
+(defn- agg-elem v/Val [t: &ev/TV preserve: Bool]
+  (let [[x t2 pe] (ev/value t)
+        m (data-mime-of t)]
+    (cond
+      (= m "") x
+      preserve (match x (v/VMeta y ms) (v/->VMeta y (conj ms (v/field "mimeType" (v/->VStr m)))) _ (v/->VMeta x [(v/field "mimeType" (v/->VStr m))]))
+      :else (let [[b be] (ev/bytes t)] (v/->VBin b)))))
+
+(defn- agg-preserve Bool [stp: &m/BatchStep]
+  (let [ags (:aggregator stp)] (and (> (count ags) 0) (:preserve (nth ags 0)))))
+
+(defn- batch-val v/Val [xs: Vec(v/Val)] (v/->VMeta (v/->VArr xs) [(v/field "class" (v/->VStr "java.util.ArrayList"))]))
+
+(defn- batches Vec(v/Val) [xs: &Vec(v/Val) n: Int]
+  (if (<= n 1) (str-vec xs)
+    (loop [i 0 acc: Vec(v/Val) [] cur: Vec(v/Val) []]
+      (if (>= i (count xs)) (if (> (count cur) 0) (conj acc (batch-val cur)) acc)
+        (let [cur2 (conj cur (nth xs i))]
+          (if (= (count cur2) n) (recur (+ i 1) (conj acc (batch-val cur2)) []) (recur (+ i 1) acc cur2)))))))
+
+(defn- str-vec Vec(v/Val) [xs: &Vec(v/Val)] (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (nth xs i))))))
+
+(defn- run-foreach Values(ev/Event Vec(err/MErr)) [c: &Ctx coll: &Vec(m/PVal) counter: &Str root: &Str batch: Int procs: &Vec(m/Proc) loc: &m/Loc e: ev/Event]
+  (let [p (:payload e)]
+    (cond
+      (and (= (count coll) 0) (= (:state p) ev/CURSOR) (stream/fresh? (:raw p)))
+      (let [[ens eid] (ev/cursor-error-type p)] (run-foreach-stream c (:raw p) ens eid counter root batch procs loc e))
+      (and (= (count coll) 0) (streaming-json? p))
+      (let [[id ok] (json-stream (:rid e) p)]
+        (if ok (run-foreach-stream c id "MULE" "EXPRESSION" counter root batch procs loc e) (run-foreach-items c coll counter root batch procs loc e)))
+      :else (run-foreach-items c coll counter root batch procs loc e))))
+
+(defn- streaming-json? Bool [t: &ev/TV]
+  (and (= (:state t) ev/RAW)
+       (reg/json-like? (reg/norm-mime (:mime t)))
+       (let [ps (reg/mime-params (:mime t)) f (v/obj-get ps "streaming")]
+         (and (> (count f) 0) (match (v/unmeta (nth f 0)) (v/VStr x) (= (str/lower-case x) "true") _ false)))))
+
+(defn- json-stream Values(Str Bool) [owner: &Str t: &ev/TV]
+  (let [text (if (= (str/lower-case (ev/charset-of (:mime t))) "utf-8") (:raw t) (ev/decode-text (:raw t) (:mime t)))
+        [start arr] (json/array-start text)]
+    (if (not arr) (values "" false)
+      (let [pos (atom start)
+            src (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (json-take text pos n))
+                                 (fn Int [broken: Bool] 0) false)]
+        (values (stream/open owner src) true)))))
+
+(defn- json-take Values(Vec(v/Val) Bool Str) [text: &Str pos: &Atom(Int) n: Int]
+  (loop [k 0 acc: Vec(v/Val) []]
+    (if (>= k n) (values acc false "")
+      (let [[x j done e] (json/array-next text (deref pos) "payload")
+            z (reset! pos j)]
+        (cond (not= e "") (values acc true e)
+              done (values acc true "")
+              :else (recur (+ k 1) (conj acc x)))))))
+
+(defn- run-foreach-stream Values(ev/Event Vec(err/MErr)) [c: &Ctx id: &Str ens: &Str eid: &Str counter: &Str root: &Str batch: Int procs: &Vec(m/Proc) loc: &m/Loc e: ev/Event]
+  (let [cname (if (= counter "") "counter" (str counter))
+        rname (if (= root "") "rootMessage" (str root))
+        root-msg (ev/tv-val (message-val (ev/with-payload e (ev/tv-null))) ev/JAVA)
+        n (if (> batch 1) batch 1)]
+    (loop [i 0 cur (ev/set-var e rname root-msg)]
+      (let [[rows done err] (stream/take-vals id n)]
+        (cond
+          (not= err "") (values cur [(let [[n2 i2 d2] (ev/typed-error ens eid err)] (err/mk n2 i2 d2))])
+          (= (count rows) 0)
+          (ok (ev/remove-var (ev/remove-var (ev/with-attributes (ev/with-payload cur (:payload e)) (:attributes e)) cname) rname))
+          :else
+          (let [item (if (> batch 1) (batch-val rows) (nth rows 0))
+                it (ev/set-var (ev/with-payload cur (ev/tv-val item (if (> batch 1) ev/ANY ev/JAVA))) cname (ev/tv-val (v/int-v (+ i 1)) ev/JAVA))
+                [e3 x3] (route-span c "mule:foreach:iteration" loc procs it)]
+            (cond
+              (> (count x3) 0) (values e3 x3)
+              done (ok (ev/remove-var (ev/remove-var (ev/with-attributes (ev/with-payload e3 (:payload e)) (:attributes e)) cname) rname))
+              :else (recur (+ i 1) e3))))))))
+
+(defn- run-foreach-items Values(ev/Event Vec(err/MErr)) [c: &Ctx coll: &Vec(m/PVal) counter: &Str root: &Str batch: Int procs: &Vec(m/Proc) loc: &m/Loc e: ev/Event]
+  (let [[items1 e2 x] (collection c coll e)
+        pm (if (= (count coll) 0) (data-mime-of (:payload e)) "")
+        items0 (if (= pm "application/csv") (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count items1)) acc (recur (+ i 1) (conj acc (elem-val (nth items1 i) pm))))) items1)
+        items (batches items0 batch)
+        cname (if (= counter "") "counter" (str counter))
+        rname (if (= root "") "rootMessage" (str root))]
+    (if (> (count x) 0) (values e2 x)
+      (let [root-msg (ev/tv-val (message-val e2) ev/JAVA)]
+        (loop [i 0 cur (ev/set-var e2 rname root-msg)]
+          (if (>= i (count items))
+            (ok (ev/remove-var (ev/remove-var (ev/with-attributes (ev/with-payload cur (:payload e2)) (:attributes e2)) cname) rname))
+            (let [it (ev/set-var (ev/with-payload cur (if (> batch 1) (ev/tv-val (nth items i) ev/ANY) (elem-tv (nth items i) (if (= pm "application/csv") "" pm) ev/JAVA)))
+                                 cname (ev/tv-val (v/int-v (+ i 1)) ev/JAVA))
+                  [e3 x3] (route-span c "mule:foreach:iteration" loc procs it)]
+              (if (> (count x3) 0) (values e3 x3) (recur (+ i 1) e3)))))))))
+
+(defrecord Done [e: ev/Event x: Vec(err/MErr)])
+
+(defn- par-worker Int [c: Ctx jobs: Vec(Vec(m/Proc)) evs: Vec(ev/Event) next: Atom(Int) out: Atom(Map(Str Done)) span: Str loc: m/Loc]
+  (loop []
+    (let [i (- (swap! next (fn Int [n: Int] (+ n 1))) 1)]
+      (if (>= i (count jobs)) 0
+        (let [[e2 x] (if (= span "") (run-procs c (nth jobs i) (nth evs i)) (route-span c span loc (nth jobs i) (nth evs i)))
+              z (swap! out (fn Map(Str Done) [m: Map(Str Done)] (assoc m (str i) (->Done e2 x))))]
+          (recur))))))
+
+(defn- timeout-err err/MErr [i: Int]
+  (let [d (str "Timeout while processing route/part: '" i "'")]
+    (err/->MErr "MULE" "TIMEOUT" d d [] [] "java.util.concurrent.TimeoutException" [] "" "" "" true [] [])))
+
+(def MAX-PAR-WORKERS 256)
+
+(defn par-workers Int [n: Int maxc: Int]
+  (min n (if (> maxc 0) maxc MAX-PAR-WORKERS)))
+
+(defn run-parallel Vec(Done) [c: &Ctx jobs: Vec(Vec(m/Proc)) evs: Vec(ev/Event) maxc: Int timeout: Int span: &Str loc: &m/Loc]
+  (let [n (count jobs)
+        workers (par-workers n maxc)
+        z0: Map(Str Done) {}
+        out (atom z0)
+        next (atom 0)
+        owner (if (and (> timeout 0) (> n 0)) (:corr (nth evs 0)) "")
+        fs (loop [k 0 acc: Vec(Future(Int)) []]
+             (if (>= k workers) acc
+               (let [c1 c js jobs es evs nx next o1 out ow owner sp (str span) l1 loc
+                     zh (if (= owner "") 0 (stream/enter owner))]
+                 (recur (+ k 1) (conj acc (future (fn Int [x: Int] (let [r (par-worker c1 js es nx o1 sp l1)] (if (= ow "") r (stream/leave ow)))) k))))))
+        z1 (if (<= timeout 0)
+             (loop [k 0 r 0] (if (>= k (count fs)) r (recur (+ k 1) (+ r (deref (nth fs k))))))
+             (let [deadline (+ (quot (mono-us) 1000) timeout)
+                   zz (loop [k 0] (if (>= k (count fs)) 0 (let [d (future-detach (nth fs k))] (recur (+ k 1)))))]
+               (loop [] (if (or (>= (count (deref out)) n) (>= (quot (mono-us) 1000) deadline)) 0 (let [z (host/pause-ms 1)] (recur))))))
+        mm (deref out)]
+    (loop [i 0 acc: Vec(Done) []]
+      (if (>= i n) acc
+        (recur (+ i 1) (conj acc (if (contains? mm (str i)) (get! mm (str i)) (->Done (nth evs i) [(timeout-err i)]))))))))
+
+(defn- run-par-foreach Values(ev/Event Vec(err/MErr)) [c: &Ctx coll: &Vec(m/PVal) target: &Str procs: &Vec(m/Proc) maxc: Int timeout: Int loc: &m/Loc e: ev/Event]
+  (let [[items e2 x] (collection c coll e)]
+    (if (> (count x) 0) (values e2 x)
+      (let [[jobs evs] (loop [i 0 js: Vec(Vec(m/Proc)) [] es: Vec(ev/Event) []]
+                         (if (>= i (count items)) (values js es)
+                           (recur (+ i 1) (conj js procs) (conj es (ev/with-payload e2 (ev/tv-val (nth items i) ev/JAVA))))))
+            ds (run-parallel c jobs evs maxc timeout "" loc)
+            nfail (loop [i 0 k 0] (if (>= i (count ds)) k (recur (+ i 1) (if (> (count (:x (nth ds i))) 0) (+ k 1) k))))]
+        (if (> nfail 0) (gather ds target e2)
+          (loop [i 0 acc: Vec(v/Val) []]
+            (if (>= i (count ds))
+              (let [t (ev/tv-val (v/->VArr acc) ev/JAVA)]
+                (ok (if (= target "") (ev/with-payload e2 t) (ev/set-var e2 target t))))
+              (recur (+ i 1) (conj acc (message-val (:e (nth ds i))))))))))))
+
+(defn message-val v/Val [e: &ev/Event]
+  (let [[pv t pe] (ev/value (:payload e))
+        [av t2 ae] (ev/value (:attributes e))]
+    (v/->VObj [(v/field "payload" pv) (v/field "attributes" av)])))
+
+(defn- run-scatter Values(ev/Event Vec(err/MErr)) [c: &Ctx routes: &Vec(m/Route) target: &Str maxc: Int timeout: Int loc: &m/Loc e: ev/Event]
+  (let [[jobs evs] (loop [i 0 js: Vec(Vec(m/Proc)) [] es: Vec(ev/Event) []]
+                     (if (>= i (count routes)) (values js es)
+                       (recur (+ i 1) (conj js (:procs (nth routes i))) (conj es e))))
+        ds (run-parallel c jobs evs maxc timeout "mule:scatter-gather:route" loc)]
+    (gather ds target e)))
+
+(defn- gather Values(ev/Event Vec(err/MErr)) [ds: &Vec(Done) target: &Str e: ev/Event]
+  (loop [i 0 acc: Vec(v/Field) [] vars e fails: Vec(v/Field) [] desc ""]
+    (if (>= i (count ds))
+      (if (> (count fails) 0)
+        (failure e (err/with-payload (err/mk "MULE" "COMPOSITE_ROUTING" (str "Error(s) were found for route(s):" desc))
+                                  (v/->VObj [(v/field "results" (v/->VObj acc)) (v/field "failures" (v/->VObj fails))])))
+        (let [t (ev/tv-val (v/->VObj acc) ev/JAVA)]
+          (ok (if (= target "") (ev/with-payload vars t) (ev/set-var vars target t)))))
+      (let [d (nth ds i) e2 (:e d) x (:x d)]
+        (if (> (count x) 0)
+          (let [er (nth x 0)]
+            (recur (+ i 1) acc vars (conj fails (v/field (str i) (err/to-val er)))
+                   (str desc "\n\tRoute " i ": " (err/exception-class er) ": " (:description er))))
+          (recur (+ i 1) (conj acc (v/field (str i) (message-val e2))) (merge-vars vars e2) fails desc))))))
+
+(defn- merge-vars ev/Event [into: ev/Event from: &ev/Event]
+  (let [vs (:vars from)]
+    (loop [i 0 acc into] (if (>= i (count vs)) acc (recur (+ i 1) (ev/set-var acc (:name (nth vs i)) (:tv (nth vs i))))))))
+
+(defn- run-until Values(ev/Event Vec(err/MErr)) [c: &Ctx maxr: Int millis: Int procs: &Vec(m/Proc) loc: &m/Loc e: ev/Event]
+  (loop [k 0]
+    (let [[e2 x] (route-span c "mule:until-successful:attempt" loc procs e)]
+      (if (= (count x) 0) (ok e2)
+        (if (or (>= k maxr) (err/halt? (nth x 0)))
+          (failure e2 (if (err/halt? (nth x 0)) (->err-retry (nth x 0)) (assoc (->err-retry (nth x 0)) :stack (flow-stack e2 (elem-str c loc)))))
+          (let [z (if (> millis 0) (host/pause-ms millis) 0)] (recur (+ k 1))))))))
+
+(defn- ->err-retry err/MErr [cause: &err/MErr]
+  (err/->MErr "MULE" "RETRY_EXHAUSTED" (:description cause) (:detailed cause)
+              (:payload cause) (:attrs cause) ""
+              (conj (:also cause) (err/type-str cause)) (:elem cause) (:dsl cause)
+              (:stack cause) (:logged cause) (:kids cause) (:dx cause)))
+
+(defn- find-global-handlers Vec(m/Handler) [c: &Ctx name: &Str]
+  (let [gs (:global-handlers (:app c))]
+    (loop [i 0] (if (>= i (count gs)) [] (if (= (:name (nth gs i)) name) (:handlers (nth gs i)) (recur (+ i 1)))))))
+
+(defn- handler-matches? Values(Bool Vec(err/MErr)) [c: &Ctx h: &m/Handler x: &err/MErr e: ev/Event]
+  (let [ts (:types h)
+        type-ok (if (= (count ts) 0) (err/matches? x "MULE:ANY")
+                  (loop [i 0] (if (>= i (count ts)) false (if (err/matches? x (err/norm-type (nth ts i))) true (recur (+ i 1))))))]
+    (if (not type-ok) (values false [])
+      (if (= (count (:when h)) 0) (values true [])
+        (let [w (nth (:when h) 0)
+              [val e2 x2] (eval-val c w (ev/with-error e [x]))]
+          (if (> (count x2) 0) (values false x2)
+            (let [[b be] (truthy val (expr-text w))] (values b be))))))))
+
+(defn handle-error Values(ev/Event Vec(err/MErr)) [c: &Ctx handlers0: &Vec(m/Handler) href: &Str e: ev/Event x: err/MErr flow: Bool]
+  (if (err/halt? x) (values (ev/with-error e [x]) [x]) (handle-error-in c handlers0 href e x flow)))
+
+(defn- handle-error-in Values(ev/Event Vec(err/MErr)) [c: &Ctx handlers0: &Vec(m/Handler) href: &Str e: ev/Event x: err/MErr flow: Bool]
+  (let [handlers (if (> (count handlers0) 0) handlers0
+                   (if (not= href "") (find-global-handlers c href)
+                     (let [d (:default-handler (:app c))] (if (= d "") [] (find-global-handlers c d)))))
+        ee (ev/with-error e [x])
+        z0 (if (:logged x) 0 (mt/error-raised (err/type-str x)))]
+    (loop [i 0]
+      (if (>= i (count handlers))
+        (let [z (if (:logged x) 0 (log-error c ee x DEFAULT-LISTENER))
+              zs (implicit-handler-span ee)]
+          (values ee [(err/mark-logged x)]))
+        (let [h (nth handlers i)
+              [ok2 wx] (handler-matches? c h x ee)]
+          (if (> (count wx) 0) (values ee wx)
+            (if (not ok2) (recur (+ i 1))
+              (let [zh (if (= (count (:hook c)) 0) 0 ((:handled (nth (:hook c) 0)) (:loc h)))
+                    z (if (and (:log-exception h) (not (:logged x))) (log-error c ee x DEFAULT-LISTENER) 0)
+                    cc c hp (:procs h)
+                    [e2 x2] (in-span (if (:propagate h) "mule:on-error-propagate" "mule:on-error-continue") (:path (:loc h)) false ee
+                                     (fn Values(ev/Event Vec(err/MErr)) [e1: ev/Event] (run-procs cc hp e1)))]
+                (if (> (count x2) 0) (values e2 (handler-failed c e2 h (nth x2 0)))
+                  (if (:propagate h) (values e2 [(err/mark-logged (restack c e2 h x))])
+                    (ok (ev/with-error e2 []))))))))))))
+
+(defn- implicit-handler-span Int [e: &ev/Event]
+  (if (or (not (:sampled (:span e))) (< (tr/level) tr/MONITORING)) 0
+    (let [[o e1] (tr/start (ev/with-span e (:span e)) "mule:on-error-propagate" "unknown")] (tr/finish o e1 []))))
+
+(defn- restack err/MErr [c: &Ctx e: &ev/Event h: &m/Handler x: err/MErr]
+  (let [ps (:procs h)]
+    (if (= (count ps) 0) x
+      (assoc x :stack (flow-stack e (elem-str c (m/proc-loc (nth ps (- (count ps) 1)))))))))
+
+(def PROPAGATE-HANDLER "org.mule.runtime.core.internal.exception.OnErrorPropagateHandler")
+(def CONTINUE-HANDLER "org.mule.runtime.core.internal.exception.OnErrorContinueHandler")
+
+(defn- handler-failed Vec(err/MErr) [c: &Ctx e: &ev/Event h: &m/Handler x: err/MErr]
+  (if (:logged x) [x]
+    (let [cat (if (:propagate h) PROPAGATE-HANDLER CONTINUE-HANDLER)
+          z1 (if (log/enabled? log/ERROR (:log-level c) cat)
+               (log/emit log/ERROR (:log-level c) (where-str c e) cat "Exception during exception strategy execution") 0)
+          z2 (mt/error-raised (err/type-str x))
+          z3 (log-error c e x DEFAULT-LISTENER)]
+      [(err/mark-logged x)])))
+
+(defn- log-error Int [c: &Ctx e: &ev/Event x: &err/MErr category: &Str]
+  (if (not (log/enabled? log/ERROR (:log-level c) category)) 0
+    (let [el (:elem x)
+          flow (:flow e)
+          stack (if (not= (:stack x) "") (str (:stack x)) (str "at " flow (if (= el "") "" (str "(" el ")"))))]
+      (log/emit log/ERROR (:log-level c) (where-str c e) category (str "\n" (diag/render (rx/exc-report (:app c) x stack) false))))))
+
+(defn run-flow-top Values(ev/Event Vec(err/MErr)) [c: &Ctx f: &m/Flow e0: ev/Event]
+  (let [owner (:corr e0)
+        zm (mt/flow-dispatched (:name f))
+        z0 (stream/enter owner)
+        [e x] (run-root c f e0)
+        e2 (ev/with-payload e (ev/settle (:payload e)))
+        z1 (stream/leave owner)]
+    (values e2 x)))
+
+(defn run-flow-done Vec(err/MErr) [c: &Ctx f: &m/Flow e0: ev/Event]
+  (let [owner (:corr e0)
+        zm (mt/flow-dispatched (:name f))]
+    (stream/owned owner (fn Vec(err/MErr) [] (let [[e x] (run-root c f e0)] x)))))
+
+(defn- run-root Values(ev/Event Vec(err/MErr)) [c: &Ctx f: &m/Flow e0: ev/Event]
+  (if (or (not (tr/on?)) (ev/traced? (:span e0))) (run-flow-body c f e0)
+    (let [sc (:span e0)
+          [o e1] (tr/start-root e0 "mule:flow" otlp/INTERNAL (:name f) "" "" [])
+          [e2 x] (run-flow-body c f e1)
+          z (tr/finish o e2 x)]
+      (values (tr/restore e2 sc) x))))
+
+(defn run-flow-body Values(ev/Event Vec(err/MErr)) [c: &Ctx f: &m/Flow e0: ev/Event]
+  (let [e1 (if (:sub f) e0 (ev/with-flow e0 (:name f)))
+        e (ev/with-frame e1 (:name f) (:callers e1))
+        mc (if (:sub f) -1 (:max-concurrency f))
+        key (str "flow:" (:name f))
+        [e2 x] (with-sem key mc (fn Values(ev/Event Vec(err/MErr)) [] (let [zm (if (:sub f) 0 (mt/flow-received (:name f)))]
+                                                                        (run-procs c (:procs f) e))))]
+    (if (or (= (count x) 0) (:sub f)) (values e2 x)
+      (let [z2 (mt/flow-error (:name f))]
+        (handle-error c (:handlers f) (:handler-ref f) e2 (nth x 0) true)))))
+
+(defn find-config Vec(m/Config) [c: &Ctx name: &Str]
+  (let [cs (:configs (:app c))]
+    (loop [i 0] (if (>= i (count cs)) [] (if (= (:name (nth cs i)) name) [(nth cs i)] (recur (+ i 1)))))))
+
+(defn- map-error err/MErr [children: &Vec(xml/XNode) x: err/MErr]
+  (loop [i 0]
+    (if (>= i (count children)) x
+      (let [n (nth children i)]
+        (if (and (xml/elem? n) (= (xml/elem-local n) "error-mapping"))
+          (let [src (xml/attr n "" "sourceType" "")
+                dst (err/norm-type (xml/attr n "" "targetType" ""))]
+            (if (or (= src "") (err/matches? x (err/norm-type src))) (err/retype x dst) (recur (+ i 1))))
+          (recur (+ i 1)))))))
+
+(defn- run-op Values(ev/Event Vec(err/MErr)) [c: &Ctx connector: &Str op: &Str cref: &Str params: &Vec(m/Param) children: &Vec(xml/XNode) exprs: &Vec(m/Param) chains: &Vec(m/Chain) target: &Str tvalue: &Vec(m/PVal) loc: &m/Loc e: ev/Event]
+  (let [cs (:conns c)
+        i (loop [k 0] (if (>= k (count cs)) -1 (if (= (:name (nth cs k)) connector) k (recur (+ k 1)))))]
+    (if (< i 0) (failure e (err/mk "MULE" "UNKNOWN" (str "Unsupported connector operation " connector ":" op)))
+      (let [cc c chs chains
+            call (conn/->OpCall op (find-config c cref) params children exprs e
+                                (fn Values(v/Val Str) [p: m/PVal ev0: ev/Event]
+                                  (let [[val e2 x] (eval-val cc p ev0)]
+                                    (values val (if (> (count x) 0) (:description (nth x 0)) ""))))
+                                (fn Values(ev/TV Str) [p: m/PVal ev0: ev/Event]
+                                  (let [[t e2 x] (eval-pval cc p ev0)]
+                                    (values t (if (> (count x) 0) (:description (nth x 0)) ""))))
+                                (:configs (:app c))
+                                (fn Values(ev/Event Vec(err/MErr) Bool) [name: Str ev0: ev/Event] (call-flow cc name ev0))
+                                (:res (:app c))
+                                (:res-url (:app c))
+                                (fn Values(ev/Event Vec(err/MErr) Bool) [name: Str ev0: ev/Event] (run-chain cc chs name ev0))
+                                (str-loc loc)
+                                (:rset (:app c)))
+            r ((:run (nth cs i)) call)]
+        (if (> (count (:event r)) 0)
+          (let [e2 (nth (:event r) 0) x (:err r)]
+            (if (> (count x) 0) (values e2 [(map-error children (nth x 0))]) (ok e2)))
+          (if (> (count (:err r)) 0) (values e [(map-error children (nth (:err r) 0))])
+            (if (= target "")
+              (ok (ev/with-attributes (ev/with-payload e (:payload r)) (:attributes r)))
+              (if (= (count tvalue) 0) (ok (ev/set-var e target (:payload r)))
+                (let [tmp (ev/with-attributes (ev/with-payload e (:payload r)) (:attributes r))
+                      [t e2 x] (eval-pval c (nth tvalue 0) tmp)]
+                  (if (> (count x) 0) (values e x) (ok (ev/set-var e target t))))))))))))
+
+(defn- str-loc m/Loc [l: &m/Loc] (m/->Loc (str (:file l)) (:line l) (str (:path l)) (str (:dsl l)) (str (:elem l)) (:attrs l)))
+
+(defn- run-chain Values(ev/Event Vec(err/MErr) Bool) [c: &Ctx chs: &Vec(m/Chain) name: &Str e: ev/Event]
+  (let [k (loop [i 0] (if (>= i (count chs)) -1 (if (= (:name (nth chs i)) name) i (recur (+ i 1)))))]
+    (if (< k 0) (values e [] false)
+      (let [[e2 x] (run-procs c (:procs (nth chs k)) e)] (values e2 x true)))))
+
+(defn- call-flow Values(ev/Event Vec(err/MErr) Bool) [c: &Ctx name: &Str e: ev/Event]
+  (let [fl (find-flow c name)]
+    (if (= (count fl) 0) (values e [] false)
+      (let [saved (:flow e)
+            [e2 x] (flow-span c (nth fl 0) e)]
+        (values (ev/with-flow e2 saved) x true)))))

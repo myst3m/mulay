@@ -1,0 +1,174 @@
+(ns fmt-test (:require [mulay.dw.err :as dwe] [mulay.dw.fmt.registry :as reg] [mulay.dw.val :as v] [clay.string :as str]))
+
+;; 期待値は実 DW 2.11.2 の出力 (tools/dw-oracle で確認した形)。
+
+(defn- conv Str [in-mime: Str text: Str out-mime: Str props: Vec(v/Field)]
+  (let [[x e] (reg/read-fmt in-mime [] text)]
+    (if (not= e "") (str "READ-ERR:" e)
+      (let [[out we] (reg/write-fmt out-mime props x)]
+        (if (dwe/ok? we) out (str "WRITE-ERR:" (:msg we)))))))
+
+(defn- sp v/Field [k: Str s: Str] (v/field k (v/->VStr s)))
+(defn- bp v/Field [k: Str b: Bool] (v/field k (v/->VBool b)))
+
+(deftest xml-read-to-dw
+  (is (= (conv "application/xml" "<users><company>MuleSoft</company><user name=\"L\"/></users>" "application/dw" [])
+         "{\n  users: {\n    company: \"MuleSoft\",\n    user @(name: \"L\"): null\n  }\n} as Object {encoding: \"UTF-8\", mediaType: \"application/xml\"}"))
+  (is (= (conv "application/xml" "<r><m>t1<c>1</c>t2</m></r>" "application/json" [])
+         "{\n  \"r\": {\n    \"m\": {\n      \"__text\": \"t1\",\n      \"c\": \"1\",\n      \"__text\": \"t2\"\n    }\n  }\n}"))
+  (is (= (conv "application/xml" "<a:r xmlns:a=\"http://a\"><a:z>3</a:z></a:r>" "application/dw" [])
+         "do {\n  ns a http://a\n  ---\n  {\n    a#r: {\n      a#z: \"3\"\n    }\n  }\n} as Object {encoding: \"UTF-8\", mediaType: \"application/xml\"}")))
+
+(deftest xml-write
+  (is (= (conv "application/xml" "<r><m>t1<c>1</c>t2</m></r>" "application/xml" [])
+         "<?xml version='1.0' encoding='UTF-8'?>\n<r>\n  <m>t1\n    <c>1</c>t2</m>\n</r>"))
+  (is (= (conv "application/json" "{\"r\": {\"a\": null, \"b\": {}, \"e\": [1,2]}}" "application/xml" [])
+         "<?xml version='1.0' encoding='UTF-8'?>\n<r>\n  <a/>\n  <b/>\n  <e>1</e>\n  <e>2</e>\n</r>"))
+  (is (= (conv "application/json" "{\"r\": {\"a\": {\"b\": 1}}}" "application/xml" [(bp "indent" false)])
+         "<?xml version='1.0' encoding='UTF-8'?><r><a><b>1</b></a></r>"))
+  (is (= (conv "application/json" "{\"a\": 1, \"b\": 2}" "application/xml" [])
+         "WRITE-ERR:Trying to output second root, <b>, while writing Xml at .")))
+
+(deftest csv
+  (is (= (conv "application/csv" "a,b\n1,\"x,y\"\n2" "application/json" [(bp "indent" false)])
+         "[{\"a\": \"1\",\"b\": \"x,y\"},{\"a\": \"2\"}]"))
+  (is (= (conv "application/json" "[{\"a\": 1, \"b\": \"x,y\", \"c\": \"q\\\"r\"}, {\"a\": 2}]" "application/csv" [])
+         "a,b,c\n1,x\\,y,q\\\"r\n2\n"))
+  (is (= (conv "application/json" "[{\"a\": 1}]" "application/csv" [(bp "quoteValues" true) (bp "quoteHeader" true)])
+         "\"a\"\n\"1\"\n")))
+
+(deftest dw-writer
+  (is (= (conv "application/json" "{\"a\": [1, {}], \"if\": \"q\\\"$\"}" "application/dw" [])
+         "{\n  a: [\n    1, \n    {}\n  ],\n  \"if\": \"q\\\"\\$\"\n} as Object {encoding: \"UTF-8\", mediaType: \"application/json\"}")))
+
+(deftest misc-0
+  (is (= (conv "application/x-www-form-urlencoded" "a=1&b=x+y%21&c" "application/x-www-form-urlencoded" [])
+         "a=1&b=x+y%21&c")))
+
+(deftest misc-1
+  (is (= (conv "application/json" "[{\"a\": 1, \"b\": [1,2]}, \"x\"]" "application/x-ndjson" [])
+         "{\"a\": 1,\"b\": [1,2]}\n\"x\"\n")))
+
+(deftest misc-2
+  (is (= (conv "text/x-java-properties" "host=localhost\nport=1234" "application/json" [(bp "indent" false)])
+         "{\"port\": \"1234\",\"host\": \"localhost\"}")))
+
+(deftest misc-3
+  (is (= (conv "application/json" "{\"a\": 1, \"f\": [1, \"x\", {\"g\": 2}], \"j\": \"multi\\nline\", \"l\": \"1\"}" "application/yaml" [])
+         "%YAML 1.2\n---\na: 1\nf:\n  - 1\n  - x\n  -\n    g: 2\nj: |-\n  multi\n  line\nl: \"1\"")))
+
+(deftest misc-4
+  (is (= (conv "application/json" "{\"a\": 1, \"b\": [1, \"x\"]}" "application/java" []) "{a=1, b=[1, x]}")))
+
+(deftest multipart
+  (is (= (conv "multipart/form-data; boundary=B" "--B\r\nContent-Disposition: form-data; name=\"t\"\r\nContent-Type: text/plain\r\n\r\nhi\r\n--B--\r\n" "multipart/form-data" [(sp "boundary" "X")])
+         "--X\r\nContent-Type: text/plain\r\nContent-Disposition: form-data; name=\"t\"\r\n\r\nhi\r\n--X--\r\n")))
+
+(deftest options
+  (is (= (conv "application/json" "1" "application/json" [(sp "foo" "1")])
+         "WRITE-ERR:Option `foo` is not valid. Valid options are: `writeAttributes`, `indent`, `encoding`, `bufferSize`, `skipNullOn`, `deferred`, `duplicateKeyAsArray`"))
+  (is (= (conv "application/json" "1" "text/plain" [(sp "foo" "1")])
+         "WRITE-ERR:Option `foo` is not valid. Valid options are: `encoding`, `bufferSize`, `deferred`")))
+
+(deftest xml-doctype
+  (is (= (conv "application/xml" "<!DOCTYPE r PUBLIC \"-//X\" \"http://x.dtd\"><r/>" "application/xml" [])
+         "<?xml version='1.0' encoding='UTF-8'?>\n<!DOCTYPE r PUBLIC \"-//X\" \"http://x.dtd\">\n<r/>")))
+
+(deftest dw-read-roundtrip
+  (is (= (conv "application/dw" "{a: 1, d @(x: \"y\"): \"YQ==\" as Binary {base: \"64\"}}" "application/dw" [])
+         "{\n  a: 1,\n  d @(x: \"y\"): \"YQ==\" as Binary {base: \"64\"}\n}")))
+
+(defn- as-chain Str [n: Int unit: Str]
+  (loop [i 0 out "1"] (if (>= i n) out (recur (+ i 1) (str out unit)))))
+
+;; 連鎖した as も構文解析の深さに数える (ADR 017、2026-11-03)。前は数えず、500KB の本文でもプロセスは落ちなかったが、
+;; 同じ形のスクリプトは名前解決が鎖の長さだけ再帰して落ちた。実 DW は 600 段で StackOverflowError (要求 1 件の失敗)。
+;; mulay は 400 段を超えると失敗する (deviations)。
+(deftest dw-read-long-as-chain
+  (is (= (conv "application/dw" (as-chain 300 " as String") "application/json" []) "\"1\""))
+  (is (= (conv "application/dw" (as-chain 100000 " as String") "application/json" []) "READ-ERR:The expression is nested too deeply (the limit is 400 levels)"))
+  (is (= (conv "application/dw" "1 as String as String" "application/json" []) "\"1\"")))
+
+;; text/x-java-properties の読み取りはキーの数に対して O(n log n)。以前は重複の検査、ConcurrentHashMap の順、
+;; Scala の HashMap の順のそれぞれが O(n^2)〜O(n^3) で、2 万行 (約 170KB の本文) に 199 秒かかった。
+;; 順そのものは test/fixtures/dw/props_test (実 DW で記録) で確かめる。
+(defn- many-props Str [n: Int]
+  (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out "k" i "=v" i "\n")))))
+
+(deftest properties-many-keys
+  (is (str/starts-with? (conv "text/x-java-properties" (many-props 20000) "application/json" [(bp "indent" false)]) "{\"k")))
+
+;; XML の writer は出力の大きさに対して線形。以前は要素ごとに出力全体を複製し (W レコードの中の文字列に追記)、
+;; 1MB の JSON (50 万要素) を XML で書くのに 223 秒かかった。
+(defn- many-zeros Str [n: Int]
+  (loop [i 0 out "{\"root\": {\"a\": ["] (if (>= i n) (str out "0]}}") (recur (+ i 1) (str out "0,")))))
+
+(deftest xml-write-many
+  (is (str/ends-with? (conv "application/json" (many-zeros 200000) "application/xml" []) "<a>0</a>\n</root>")))
+
+;; multipart の読み取りは本文の大きさに対して線形 (以前は部分ごとに残りの本文を複製し、1MB・14 万部分で 8.3 秒)。
+(defn- many-parts Str [n: Int]
+  (loop [i 0 out ""] (if (>= i n) (str out "--B--\r\n")
+                       (recur (+ i 1) (str out "--B\r\nContent-Disposition: form-data; name=\"p" i "\"\r\n\r\nx\r\n")))))
+
+(deftest multipart-many-parts
+  (is (str/starts-with? (conv "multipart/form-data; boundary=B" (many-parts 20000) "application/json" [(bp "indent" false)]) "{\"parts\": {\"p0\": ")))
+
+;; 部分の頭の終わり (空行) は次の境界までで探す。以前は部分ごとに本文の終わりまで探し、4.5MB・8 万部分で 12.6 秒かかった。
+(deftest multipart-many-parts-header-search-is-bounded
+  (let [out (conv "multipart/form-data; boundary=B" (many-parts 200000) "application/json" [(bp "indent" false)])]
+    (is (>= (str/index-of out "\"p199999\": {") 0))))
+
+;; 入れ子の multipart は 100 段まで読む (段ごとに中身を複製するので、1MB の 1 万 6 千段で 5.5GB を使った)。
+;; 実 DW は 3000 段も読む (docs/compat/deviations.md)。
+(defn- nested-mp Str [d: Int]
+  (loop [k (- d 1) inner (str "--b" (+ 1000 d) "\r\nContent-Disposition: form-data; name=\"p\"\r\n\r\nx\r\n--b" (+ 1000 d) "--\r\n")]
+    (if (< k 1) inner
+      (recur (- k 1) (str "--b" (+ 1000 k) "\r\nContent-Disposition: form-data; name=\"p\"\r\nContent-Type: multipart/mixed; boundary=b" (+ 1001 k) "\r\n\r\n" inner "\r\n--b" (+ 1000 k) "--\r\n")))))
+
+;; "parts" の数 (読んだ段の数)
+(defn- parts-count Int [s: &Str]
+  (loop [i 0 n 0] (let [j (str/index-of-after s "\"parts\"" i)] (if (< j 0) n (recur (+ j 1) (+ n 1))))))
+
+;; 101 段目からは読まずに Binary のまま (部分が読めないときと同じ)
+(deftest multipart-nesting-limit
+  (is (= (parts-count (conv "multipart/form-data; boundary=b1001" (nested-mp 50) "application/json" [(bp "indent" false)])) 50))
+  (is (= (parts-count (conv "multipart/form-data; boundary=b1001" (nested-mp 150) "application/json" [(bp "indent" false)])) 101)))
+
+(deftest protobuf-named-read-error-carries-the-reader-trace
+  (let [props [(v/field "descriptorUrl" (v/str-v "test/fixtures/dw/protobuf_test/types.desc")) (v/field "messageType" (v/str-v "t.Inner"))]
+        [x e] (reg/read-named "application/x-protobuf" props (str (chr 255) (chr 255) (chr 255)) "payload")
+        [y e2] (reg/read-named "application/x-protobuf" props (str (chr 255) (chr 255) (chr 255)) "root")]
+    (is (= e "While parsing a protocol message, the input ended unexpectedly in the middle of a field.  This could mean either that the input has been truncated or that an embedded message misreported its own length.\nTrace:\n  at main (Unknown), while reading `payload` as ProtoBuf.\nTrace:\n  at main (Unknown)"))
+    (is (= e2 "While parsing a protocol message, the input ended unexpectedly in the middle of a field.  This could mean either that the input has been truncated or that an embedded message misreported its own length."))))
+
+(defn- part-with Str [ctype: Str body: Str]
+  (str "--b1\r\nContent-Disposition: form-data; name=\"x\"\r\nContent-Type: " ctype "\r\n\r\n" body "\r\n--b1--\r\n"))
+
+(deftest multipart-part-params-cannot-enable-dtd-or-files
+  (let [xxe "<!DOCTYPE r [<!ENTITY e SYSTEM \"file:///dev/null\">]><r>&e;</r>"
+        out (conv "multipart/form-data; boundary=b1" (part-with "application/xml; supportDtd=true; externalEntities=true" xxe) "application/json" [(bp "indent" false)])
+        dtd (conv "multipart/form-data; boundary=b1" (part-with "application/xml; supportDtd=true" "<!DOCTYPE r [<!ENTITY e \"hi\">]><r>&e;</r>") "application/json" [(bp "indent" false)])
+        pb (conv "multipart/form-data; boundary=b1" (part-with "application/protobuf; descriptorUrl=\"test/fixtures/dw/protobuf_test/types.desc\"; messageType=t.Inner" "x") "application/json" [(bp "indent" false)])
+        csv (conv "multipart/form-data; boundary=b1" (part-with "application/csv; separator=|" "a|b\r\n1|2") "application/json" [(bp "indent" false)])]
+    (is (>= (str/index-of out "DOCTYPE") 0))
+    (is (= (str/index-of dtd "\"hi\"") -1))
+    (is (= (str/index-of pb "READ-ERR") -1))
+    (is (>= (str/index-of csv "\"b\": \"2\"") 0))))
+
+;; 実 DW は value の無い map の項目、fields の無い google.protobuf.Struct で NullPointerException になる。mulay は止まらずに失敗にする (docs/compat/deviations.md)
+(defn- pb-props Vec(v/Field) [desc: Str]
+  [(v/field "descriptorUrl" (v/str-v (str "test/fixtures/dw/protobuf_test/broken/" desc ".desc"))) (v/field "messageType" (v/str-v "t.A"))])
+
+(defn- pb-read-err Str [desc: Str bytes: Str]
+  (let [[x e] (reg/read-named "application/x-protobuf" (pb-props desc) bytes "root")] e))
+
+(defn- pb-write-err Str [desc: Str x: v/Val]
+  (let [[out e] (reg/write-fmt "application/x-protobuf" (pb-props desc) x)] (:msg e)))
+
+(deftest protobuf-broken-map-entry-and-well-known-types-fail-without-abort
+  (is (= (pb-read-err "map-novalue" (str (chr 10) (chr 3) (chr 10) (chr 1) "k")) "Message t.A.MEntry has no field `value`."))
+  (is (= (pb-read-err "struct-nofields" (str (chr 10) (chr 3) (chr 10) (chr 1) "k")) "Message google.protobuf.Struct has no field `fields`."))
+  (is (= (pb-write-err "map-novalue" (v/->VObj [(v/field "m" (v/->VObj [(sp "k" "v")]))])) "Message t.A.MEntry has no field `value`."))
+  (is (= (pb-write-err "struct-nofields" (v/->VObj [(v/field "m" (v/->VObj [(sp "k" "v")]))])) "Message google.protobuf.Struct has no field `fields`."))
+  (is (= (pb-write-err "struct-nofields" (v/->VObj [(v/field "l" (v/->VArr [(v/str-v "v")]))])) "Message google.protobuf.ListValue has no field `values`.")))

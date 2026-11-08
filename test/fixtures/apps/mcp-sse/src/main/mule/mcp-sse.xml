@@ -1,0 +1,251 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18215"/>
+    </http:listener-config>
+    <http:listener-config name="L2">
+        <http:listener-connection host="0.0.0.0" port="18216"/>
+    </http:listener-config>
+
+    <mcp:server-config name="SrvA" serverName="Sse" serverVersion="1.0.0">
+        <mcp:sse-server-connection listenerConfig="L"/>
+    </mcp:server-config>
+    <mcp:server-config name="SrvB" serverName="SseB" serverVersion="2.0.0">
+        <mcp:sse-server-connection listenerConfig="L" sseEndpointPath="/b/events" messagesPath="/b/msg">
+            <mcp:default-sse-response-headers>
+                <mcp:default-sse-response-header key="X-S" value="1"/>
+            </mcp:default-sse-response-headers>
+            <mcp:default-message-response-headers>
+                <mcp:default-message-response-header key="X-M" value="2"/>
+            </mcp:default-message-response-headers>
+        </mcp:sse-server-connection>
+    </mcp:server-config>
+
+    <mcp:server-config name="SrvC" serverName="SseC" serverVersion="3.0.0">
+        <mcp:sse-server-connection listenerConfig="L" sseEndpointPath="/c/sse" messagesPath="/c/message"/>
+    </mcp:server-config>
+    <mcp:server-config name="SrvD" serverName="SseD" serverVersion="4.0.0">
+        <mcp:sse-server-connection listenerConfig="L" sseEndpointPath="/d/sse" messagesPath="/d/message"/>
+    </mcp:server-config>
+    <flow name="new-session-d">
+        <mcp:on-new-session-listener config-ref="SrvD">
+            <mcp:rejection rejectWithStatusCode="#[vars.code]" rejectWithMessage="#[vars.msg]">
+                <mcp:reject-with-headers>
+                    <mcp:reject-with-header key="X-Code" value="#[vars.code default 200]"/>
+                </mcp:reject-with-headers>
+            </mcp:rejection>
+        </mcp:on-new-session-listener>
+        <choice>
+            <when expression="#[payload.additionalProperties.'x-deny' == 'yes']">
+                <set-variable variableName="code" value="#[403]"/>
+                <set-variable variableName="msg" value="no entry"/>
+            </when>
+            <when expression="#[payload.additionalProperties.'x-err' == 'yes']">
+                <raise-error type="APP:DENIED" description="not welcome"/>
+            </when>
+        </choice>
+        <logger level="INFO" message="session D"/>
+    </flow>
+    <flow name="tool-only-d">
+        <mcp:tool-listener config-ref="SrvD" name="hello">
+            <mcp:description>Hello</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="hi"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="hello"/>
+    </flow>
+    <flow name="tool-only-c">
+        <mcp:tool-listener config-ref="SrvC" name="only">
+            <mcp:description>The only tool</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="only"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="only"/>
+    </flow>
+    <mcp:client-config name="CliC" clientName="mulay-test" clientVersion="9.9">
+        <mcp:sse-client-connection serverUrl="http://localhost:18215" sseEndpointPath="/c/sse"/>
+    </mcp:client-config>
+    <mcp:client-config name="Cli" clientName="mulay-test" clientVersion="9.9">
+        <mcp:sse-client-connection serverUrl="http://localhost:18215"/>
+    </mcp:client-config>
+    <mcp:client-config name="CliB" clientName="mulay-test" clientVersion="9.9">
+        <mcp:sse-client-connection serverUrl="http://localhost:18215" sseEndpointPath="/b/events">
+            <mcp:default-request-headers>
+                <mcp:default-request-header key="X-Trace" value="abc"/>
+            </mcp:default-request-headers>
+        </mcp:sse-client-connection>
+    </mcp:client-config>
+    <mcp:client-config name="CliDown" clientName="mulay-test" clientVersion="9.9">
+        <mcp:sse-client-connection serverUrl="http://localhost:18299"/>
+    </mcp:client-config>
+
+    <flow name="tool-add-a">
+        <mcp:tool-listener config-ref="SrvA" name="add">
+            <mcp:description>Adds two numbers</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="#[(payload.a + payload.b) as String]"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="add"/>
+    </flow>
+    <flow name="tool-hdrs-a">
+        <mcp:tool-listener config-ref="SrvA" name="hdrs">
+            <mcp:description>Request headers</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="#[write({contentType: attributes.additionalProperties.'content-type', accept: attributes.additionalProperties.accept, version: attributes.additionalProperties.'mcp-protocol-version', agent: attributes.additionalProperties.'user-agent', trace: attributes.additionalProperties.'x-trace', hasSid: sizeOf(attributes.sessionId default '') > 0}, 'application/json')]"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="hdrs"/>
+    </flow>
+    <flow name="tool-add-b">
+        <mcp:tool-listener config-ref="SrvB" name="add">
+            <mcp:description>Adds two numbers</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="#[(payload.a + payload.b) as String]"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="add b"/>
+    </flow>
+    <flow name="tool-hdrs-b">
+        <mcp:tool-listener config-ref="SrvB" name="hdrs">
+            <mcp:description>Request headers</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="#[write({contentType: attributes.additionalProperties.'content-type', accept: attributes.additionalProperties.accept, version: attributes.additionalProperties.'mcp-protocol-version', agent: attributes.additionalProperties.'user-agent', trace: attributes.additionalProperties.'x-trace', hasSid: sizeOf(attributes.sessionId default '') > 0}, 'application/json')]"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="hdrs b"/>
+    </flow>
+
+    <flow name="call-add">
+        <http:listener config-ref="L2" path="/call-add"/>
+        <try>
+            <mcp:call-tool config-ref="Cli" toolName="add"><mcp:arguments>#[{a: 1, b: 2}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-invalid">
+        <http:listener config-ref="L2" path="/call-invalid"/>
+        <try>
+            <mcp:call-tool config-ref="Cli" toolName="add"><mcp:arguments>#[{a: "x"}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-unknown">
+        <http:listener config-ref="L2" path="/call-unknown"/>
+        <try>
+            <mcp:call-tool config-ref="Cli" toolName="nope"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="hdrs">
+        <http:listener config-ref="L2" path="/hdrs"/>
+        <try>
+            <mcp:call-tool config-ref="Cli" toolName="hdrs" extractStructuredContent="false"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- payload.contents[0].text]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="hdrs-b">
+        <http:listener config-ref="L2" path="/hdrs-b"/>
+        <try>
+            <mcp:call-tool config-ref="CliB" toolName="hdrs" extractStructuredContent="false"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- payload.contents[0].text]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-add-b">
+        <http:listener config-ref="L2" path="/call-add-b"/>
+        <try>
+            <mcp:call-tool config-ref="CliB" toolName="add"><mcp:arguments>#[{a: 4, b: 5}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="list-tools">
+        <http:listener config-ref="L2" path="/list-tools"/>
+        <try>
+            <mcp:list-tools config-ref="CliC"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="ping">
+        <http:listener config-ref="L2" path="/ping"/>
+        <try>
+            <mcp:ping config-ref="Cli"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, method: attributes.method}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="ping-down">
+        <http:listener config-ref="L2" path="/ping-down"/>
+        <try>
+            <mcp:ping config-ref="CliDown"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+</mule>

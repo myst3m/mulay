@@ -1,0 +1,39 @@
+(ns dwcorpus-test
+  (:require [clay.core] [clay.string :as str] [clay.io :as io]
+            [mulay.dw.parse :as p] [mulay.dw.ast :as a] [mulay.dw.src :as src]))
+
+;; コーパス (tools/extract-dw-corpus.py が作る。1 ファイル 1 スクリプト、実 DW 2.11.2 で読めるもの)
+;; をすべて診断 0 で読めること。dw-corpus-invalid (実 DW が拒否するもの) はすべて診断を出すこと。
+;; .mod.dwl はモジュールとして読む。戻り値: [読んだファイル数 期待と違ったものの報告]
+
+(defn- check-dir Values(Int Str) [dir: Str want-ok: Bool]
+  (let [[names err] (io/list-dir dir)]
+    (loop [i 0 n 0 out ""]
+      (if (>= i (count names)) (values n (if (= (count err) 0) out (str "list-dir: " err)))
+        (let [f: Str (nth names i)]
+          (if (not (str/ends-with? f ".dwl")) (recur (+ i 1) n out)
+            (let [path (str dir "/" f)
+                  [txt e2] (read-file path)
+                  [sc ds] (if (str/ends-with? f ".mod.dwl") (p/parse-module txt) (p/parse txt))
+                  bad (if want-ok (> (count ds) 0) (= (count ds) 0))
+                  msg (if (not bad) ""
+                        (if want-ok
+                          (let [[ln col] (src/line-col txt (:start (:sp (nth ds 0))))]
+                            (str f ": " (:msg (nth ds 0)) " @" ln ":" col "\n"))
+                          (str f ": no diagnostic\n")))]
+              (recur (+ i 1) (+ n 1) (str out msg)))))))))
+
+(deftest mulet-corpus
+  (let [[n out] (check-dir "test/fixtures/dw-corpus" true)]
+    (is (> n 500))
+    (is (= out ""))))
+
+(deftest docs-corpus
+  (let [[n out] (check-dir "test/fixtures/dw-docs-corpus" true)]
+    (is (> n 600))
+    (is (= out ""))))
+
+(deftest invalid-corpus
+  (let [[n out] (check-dir "test/fixtures/dw-corpus-invalid" false)]
+    (is (> n 10))
+    (is (= out ""))))

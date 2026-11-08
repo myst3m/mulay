@@ -1,0 +1,69 @@
+(ns http-static-test (:require [mulay.conn.http_static :as hs] [mulay.lib.res :as res]))
+
+(deftest mime-by-extension-case-sensitive
+  (is (= (hs/mime-of "index.html") "text/html"))
+  (is (= (hs/mime-of "UPPER.HTML") "text/html"))
+  (is (= (hs/mime-of "X.CSS") "application/octet-stream"))
+  (is (= (hs/mime-of "app.css") "text/css"))
+  (is (= (hs/mime-of "app.js") "text/javascript"))
+  (is (= (hs/mime-of "data.json") "text/json"))
+  (is (= (hs/mime-of "logo.png") "image/png"))
+  (is (= (hs/mime-of "W.Png") "application/octet-stream"))
+  (is (= (hs/mime-of "z.zip") "application/zip"))
+  (is (= (hs/mime-of "k.java") "application/java"))
+  (is (= (hs/mime-of "s.mpeg") "video/mpeg"))
+  (is (= (hs/mime-of "icon.svg") "application/octet-stream"))
+  (is (= (hs/mime-of "noext") "application/octet-stream"))
+  (is (= (hs/mime-of "d.") "application/octet-stream"))
+  (is (= (hs/mime-of ".hidden") "application/octet-stream"))
+  (is (= (hs/mime-of "a.tar.gz") "application/octet-stream"))
+  (is (= (hs/mime-of "a.gz.tar") "application/x-tar")))
+
+(deftest escape-html4-like-commons-lang
+  (is (= (hs/escape-html4 "/<b>&\"x'.txt") "/&lt;b&gt;&amp;&quot;x'.txt"))
+  (is (= (hs/escape-html4 "café ©") "caf&eacute; &copy;"))
+  (is (= (hs/escape-html4 "日本 α €") "日本 &alpha; &euro;")))
+
+(deftest normalize-like-java-path
+  (is (= (hs/normalize "/a/web/../secret.txt") "/a/secret.txt"))
+  (is (= (hs/normalize "/a//web/./x/") "/a/web/x"))
+  (is (= (hs/normalize "/..") "/"))
+  (is (= (hs/normalize "/a/web/sub/../../..") "/"))
+  (is (= (hs/normalize "a/../../b") "../b"))
+  (is (hs/under? "/a/web/x" "/a/web/"))
+  (is (hs/under? "/a/web" "/a/web"))
+  (is (not (hs/under? "/a/webx" "/a/web")))
+  (is (not (hs/under? "/a" "/a/web")))
+  (is (not (hs/under? "a/web/x" "/a/web"))))
+
+(deftest strip-listener-path
+  (is (= (hs/strip-listener "/static/a.css" "/static/*") "/a.css"))
+  (is (= (hs/strip-listener "/static" "/static/*") ""))
+  (is (= (hs/strip-listener "/a.css" "/*") "/a.css"))
+  (is (= (hs/strip-listener "/exact/" "/exact") "/"))
+  (is (= (hs/strip-listener "/x" "/") "/x")))
+
+(defn- store hs/Store []
+  (hs/->Store "/h" (res/res-mem ["web/index.html" "web/sub/index.html" "web/sub/other.html" "web/deep/er/f.txt" "secret.txt" "web/logo.png"]
+                                ["top" "sub" "other" "deep" "s" "PNG"])))
+
+(defn- got Str [base: Str req: Str lp: Str dflt: Str]
+  (let [l (hs/load (store) base req lp dflt)]
+    (if (= (:missing l) "") (str (:mime l) " " (:bytes l)) (str "missing " (:missing l)))))
+
+(deftest load-from-resources
+  (is (= (got "/h/web" "/static/" "/static/*" "index.html") "text/html top"))
+  (is (= (got "/h/web" "/static" "/static/*" "index.html") "text/html top"))
+  (is (= (got "/h/web" "/static/sub" "/static/*" "index.html") "text/html sub"))
+  (is (= (got "/h/web" "/static/sub/" "/static/*" "other.html") "text/html other"))
+  (is (= (got "/h/web" "/static/" "/static/*" "other.html") "missing /"))
+  (is (= (got "/h/web" "/static/logo.png" "/static/*" "index.html") "image/png PNG"))
+  (is (= (got "/h/web" "/static/deep" "/static/*" "index.html") "missing /deep/"))
+  (is (= (got "/h/web" "/static/missing.html" "/static/*" "index.html") "missing /missing.html"))
+  (is (= (got "/h/web" "/static/../secret.txt" "/static/*" "index.html") "missing /../secret.txt"))
+  (is (= (got "/h/web" "/static/sub/../index.html" "/static/*" "index.html") "text/html top"))
+  (is (= (got "/h/web" "/static/sub/../" "/static/*" "index.html") "text/html top"))
+  (is (= (got "/h/web" "/static/missing/../" "/static/*" "index.html") "missing /missing/../"))
+  (is (= (got "/h/web/" "/slash/index.html" "/slash/*" "index.html") "text/html top"))
+  (is (= (got "/h/web/sub" "/a/b/../index.html" "/a/b/*" "index.html") "missing /../index.html"))
+  (is (= (got "/h/web" "/" "/*" "index.html") "text/html top")))

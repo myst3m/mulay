@@ -1,0 +1,191 @@
+%%% note
+foreach と parallel-foreach: 要素ごとの payload、counter (1 始まり、counterVariableName)、
+rootMessage、終了後に payload が元に戻ること、foreach 内の変数変更が外に残ること、counter が
+外に残るか、batchSize、collection 省略時 (payload を回す。Object・文字列・null のとき)、
+本体のエラーで止まること、入れ子、parallel-foreach の結果の形と順序。
+/infer-error: output の無い式で application/java と application/json の値を混ぜると、
+出力形式を推論できずに MULE:EXPRESSION になる (foreach とは別件の発見)。
+%%% port 18112
+%%% request POST /basic
+Content-Type: application/json
+
+{"items": ["a", {"b": 2}, 3], "other": true}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payloadAfter": {
+    "items": [
+      "a",
+      {
+        "b": 2
+      },
+      3
+    ],
+    "other": true
+  },
+  "acc": [
+    {
+      "item": "a",
+      "counter": 1,
+      "rootIsObject": true
+    },
+    {
+      "item": {
+        "b": 2
+      },
+      "counter": 2,
+      "rootIsObject": true
+    },
+    {
+      "item": 3,
+      "counter": 3,
+      "rootIsObject": true
+    }
+  ],
+  "counterAfter": "absent"
+}
+%%% request POST /basic
+Content-Type: application/json
+
+{"items": []}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payloadAfter": {
+    "items": [
+      
+    ]
+  },
+  "acc": [
+    
+  ],
+  "counterAfter": "absent"
+}
+%%% request POST /batch
+Content-Type: application/json
+
+[1, 2, 3, 4, 5]
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "batch": [
+      1,
+      2
+    ],
+    "i": 1
+  },
+  {
+    "batch": [
+      3,
+      4
+    ],
+    "i": 2
+  },
+  {
+    "batch": [
+      5
+    ],
+    "i": 3
+  }
+]
+%%% request POST /shapes
+Content-Type: application/json
+
+[1, "two", {"three": 3}]
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "count": 3,
+  "acc": [
+    1,
+    "two",
+    {
+      "three": 3
+    }
+  ]
+}
+%%% request POST /shapes
+Content-Type: application/json
+
+{"a": 1, "b": 2}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "count": 2,
+  "acc": [
+    {
+      "a": 1
+    },
+    {
+      "b": 2
+    }
+  ]
+}
+%%% request POST /shapes
+Content-Type: text/plain
+
+just text
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+"Expecting Array or Object but got String." evaluating expression: "payload".
+%%% request GET /shapes
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+"Expecting Array or Object but got Binary." evaluating expression: "payload".
+%%% request GET /error
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "seen": [
+    1,
+    2,
+    0
+  ],
+  "counter": 3,
+  "payloadIsElement": 0,
+  "errorType": "MULE:EXPRESSION",
+  "description": "\"Division by zero\n\n1| 10 / payload\n   ^^^^^^^^^^^^\nTrace:\n  at anonymous::main (line: 1, column: 1)\" evaluating expression: \"10 / payload\"."
+}
+%%% request POST /infer-error
+Content-Type: application/json
+
+[1]
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+"Unable to infer a output media type as more than one is being used: application/java,application/json please specify using: 'output <your mime-type> --- <expr>'
+
+1| vars.acc + payload
+   ^^^^^^^^^^^^^^^^^^
+Trace:
+  at anonymous::main (line: 1, column: 1)" evaluating expression: "vars.acc + payload".
+%%% request GET /nested
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  "1.1=1",
+  "1.2=2",
+  "2.1=3"
+]
+%%% request GET /parallel
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "isArray": true,
+  "values": [
+    30,
+    10,
+    20
+  ]
+}

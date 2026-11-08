@@ -1,0 +1,197 @@
+(ns mulay.lib.host (:require [clay.string :as str] [clay.io :as io] [clay.crypto :as crypto]))
+
+(def FILES (atom (let [m: Map(Str Str) {}] m)))
+
+(defn- files Map(Str Str) [] (let [m: Map(Str Str) (deref FILES)] m))
+
+(defn norm-path Str [p: &Str]
+  (let [segs: Vec(Str) (str/split (str p) "/")
+        out (loop [i 0 acc: Vec(Str) []]
+              (if (>= i (count segs)) acc
+                (let [s (nth segs i)]
+                  (cond (or (= s "") (= s ".")) (recur (+ i 1) acc)
+                        (= s "..") (recur (+ i 1) (if (= (count acc) 0) acc (subvec acc 0 (- (count acc) 1))))
+                        :else (recur (+ i 1) (conj acc s))))))]
+    (str "/" (str/join "/" out))))
+
+(defn mount! Int [paths: &Vec(Str) bodies: &Vec(Str)]
+  (let [m (loop [i 0 m: Map(Str Str) {}]
+            (if (>= i (count paths)) m (recur (+ i 1) (assoc m (norm-path (nth paths i)) (str (nth bodies i))))))
+        z (reset! FILES m)]
+    (count paths)))
+
+(defn mem-read Values(Str Str) [p: &Str]
+  (let [m (files) k (norm-path p)]
+    (if (contains? m k) (values (get m k "") "") (values "" (str p ": No such file or directory")))))
+
+(defn- prefix-of Str [p: &Str] (let [k (norm-path p)] (if (= k "/") "/" (str k "/"))))
+
+(defn mem-dir? Bool [p: &Str]
+  (let [pre (prefix-of p) ks (keys (files))]
+    (loop [i 0] (if (>= i (count ks)) false (if (str/starts-with? (nth ks i) pre) true (recur (+ i 1)))))))
+
+(defn mem-exists? Bool [p: &Str] (or (contains? (files) (norm-path p)) (mem-dir? p)))
+
+(defn mem-list Values(Vec(Str) Str) [p: &Str]
+  (let [pre (prefix-of p) ks (sort (keys (files)))
+        out (loop [i 0 acc: Vec(Str) []]
+              (if (>= i (count ks)) acc
+                (let [x (nth ks i)]
+                  (if (not (str/starts-with? x pre)) (recur (+ i 1) acc)
+                    (let [rest (subs x (count pre) (count x))
+                          j (str/index-of rest "/")
+                          nm (if (< j 0) rest (subs rest 0 j))
+                          dup (and (> (count acc) 0) (= (nth acc (- (count acc) 1)) nm))]
+                      (recur (+ i 1) (if dup acc (conj acc nm))))))))]
+    (if (and (= (count out) 0) (not (mem-dir? p))) (values out (str p ": No such file or directory")) (values out ""))))
+
+(defn mem-delete Str [p: &Str]
+  (let [k (norm-path p)
+        z (swap! FILES (fn Map(Str Str) [m: Map(Str Str)] (dissoc m k)))]
+    ""))
+
+(defn mem-write Str [p: &Str body: &Str]
+  (let [k (norm-path p) b (str body)
+        z (swap! FILES (fn Map(Str Str) [m: Map(Str Str)] (assoc m k b)))]
+    ""))
+
+(def CLOCK (atom (let [v: Vec(Int) []] v)))
+
+(def RNG (atom (let [v: Vec(Int) []] v)))
+
+(defn set-clock! Int [ms: Int] (let [z (reset! CLOCK [ms])] ms))
+
+(defn clear-clock! Int [] (let [z (reset! CLOCK (let [v: Vec(Int) []] v))] 0))
+
+(defn- frozen Vec(Int) [] (let [v: Vec(Int) (deref CLOCK)] v))
+
+(defn now-ns Values(Int Int) []
+  (let [f (frozen)]
+    (if (= (count f) 0) (real-now-ns)
+      (let [ms (nth f 0)
+            q (quot ms 1000)
+            s (if (and (< ms 0) (not= (* q 1000) ms)) (- q 1) q)]
+        (values s (* (- ms (* s 1000)) 1000000))))))
+
+(defn now-ms Int [] (let [[s ns] (now-ns)] (+ (* s 1000) (quot ns 1000000))))
+
+(defn set-seed! Int [seed: Int] (let [z (reset! RNG [seed])] seed))
+
+(defn clear-seed! Int [] (let [z (reset! RNG (let [v: Vec(Int) []] v))] 0))
+
+(defn- mix Int [x: Int]
+  (let [z1 (* (bit-xor x (unsigned-bit-shift-right x 30)) -4658895280553007687)
+        z2 (* (bit-xor z1 (unsigned-bit-shift-right z1 27)) -7723592293110705685)]
+    (bit-xor z2 (unsigned-bit-shift-right z2 31))))
+
+(defn- seeded-bytes Values(Str Int) [st0: Int n: Int]
+  (loop [st st0 out "" left n]
+    (if (<= left 0) (values out st)
+      (let [st2 (+ st -7046029254386353131)
+            v (mix st2)
+            k (min left 8)
+            o2 (loop [j 0 o out] (if (>= j k) o (recur (+ j 1) (str o (chr (bit-and (unsigned-bit-shift-right v (- 56 (* 8 j))) 255))))))]
+        (recur st2 o2 (- left k))))))
+
+(defn real-random-bytes Values(Str Bool) [n: Int]
+  (if (< n 0) (values "" false)
+    (loop [out "" left n]
+      (if (= left 0) (values out true)
+        (let [k (min left 1048576)
+              [b e] (crypto/random-bytes k)]
+          (if (not= e "") (fail (str "random-bytes: " e)) (recur (str out b) (- left k))))))))
+
+(defn random-bytes Values(Str Bool) [n: Int]
+  (let [sd: Vec(Int) (deref RNG)]
+    (cond (< n 0) (values "" false)
+          (= (count sd) 0) (real-random-bytes n)
+          :else (let [[b st] (seeded-bytes (nth sd 0) n)
+                      z (reset! RNG [st])]
+                  (values b true)))))
+
+(defn rand-below Int [n: Int]
+  (if (<= n 0) 0
+    (let [[b ok] (random-bytes 7)
+          u (loop [i 0 acc 0] (if (>= i 7) acc (recur (+ i 1) (+ (* acc 256) (nth b i)))))]
+      (mod u n))))
+
+(def BRIDGE (atom (let [v: Vec(Fn(Str Str)) []] v)))
+
+(defn set-http-bridge! Int [f: Fn(Str Str)] (let [z (reset! BRIDGE [f])] 0))
+
+(defn clear-http-bridge! Int [] (let [z (reset! BRIDGE (let [v: Vec(Fn(Str Str)) []] v))] 0))
+
+(defn- bridge-call Str [req: &Str] (let [v: Vec(Fn(Str Str)) (deref BRIDGE)] (if (= (count v) 0) "" ((nth v 0) (str req)))))
+
+(target-when "wasm"
+(do
+(defextern host-http Str "mulay_http" [req: Str] :wasm-import "env")
+(defn http-call Str [req: &Str] (let [v: Vec(Fn(Str Str)) (deref BRIDGE)] (if (> (count v) 0) (bridge-call req) (host-http (str req)))))
+(defn file-read Values(Str Str) [p: &Str] (mem-read p))
+(defn file-read-or Str [p: &Str d: Str] (let [[t e] (mem-read p)] (if (= e "") t d)))
+(defn file-exists? Bool [p: &Str] (mem-exists? p))
+(defn file-dir? Bool [p: &Str] (mem-dir? p))
+(defn file-list Values(Vec(Str) Str) [p: &Str] (mem-list p))
+(defn work-dir Values(Str Str) [] (values "/" ""))
+(defn file-write Str [p: &Str body: &Str] (mem-write p body))
+(defn file-append Str [p: &Str body: &Str] (let [[t e] (mem-read p)] (mem-write p (str t body))))
+(defn make-dir Str [p: &Str] "")
+(defn env Option(Str) [k: &Str] (->None))
+(defn pid Int [] 1)
+(defn thread-id Int [] 1)
+(defn flush-stdout Int [] 0)
+(defn read-link Str [p: &Str] "")
+(defn pause-ms Int [ms: Int] 0)
+(defn environ Vec(Str) [] [])
+(defn real-now-ns Values(Int Int) [] (let [ms (epoch-ms)] (values (quot ms 1000) (* (mod ms 1000) 1000000)))))
+(do
+(defn http-call Str [req: &Str] (bridge-call req))
+(defn file-read Values(Str Str) [p: &Str] (clay.core/read-file p))
+(defn file-read-or Str [p: &Str d: Str] (clay.core/read-file-or p d))
+(defn file-exists? Bool [p: &Str] (io/exists? (str p)))
+(defn file-dir? Bool [p: &Str] (io/dir? p))
+(defn file-list Values(Vec(Str) Str) [p: &Str] (io/list-dir p))
+(defn work-dir Values(Str Str) [] (io/cwd))
+(defn file-write Str [p: &Str body: &Str] (clay.core/write-file p body))
+(defn file-append Str [p: &Str body: &Str] (clay.core/append-file p body))
+(defn make-dir Str [p: &Str] (io/mkdir (str p)))
+(defn env Option(Str) [k: &Str] (clay.core/getenv k))
+(defextern c-getpid getpid)
+(defextern c-pthread-self pthread_self)
+(defextern c-fflush fflush)
+(defextern c-stdout stdout)
+(defextern c-readlink readlink)
+(defextern c-environ __environ)
+(c-include "<unistd.h>")
+(c-include "<pthread.h>")
+(defn pid Int [] (unsafe (c-getpid)))
+(defn thread-id Int [] (unsafe (c-pthread-self)))
+(defn flush-stdout Int [] (unsafe (c-fflush (c-stdout))))
+(defn read-link Str [p: &Str]
+  (let [buf: Str (new-bytes 4096)
+        k (unsafe (c-readlink p buf 4095))]
+    (if (< k 0) "" (subs buf 0 k))))
+(defn pause-ms Int [ms: Int] (let [z (sleep-ms ms)] 0))
+(defn- ^:unsafe cstr Str [p: Int]
+  (let [n (loop [k 0] (if (= (prim/mem-read8 (prim/int->addr (+ p k))) 0) k (recur (+ k 1))))] (prim/mem-str (prim/int->addr p) n)))
+(defn environ Vec(Str) []
+  (unsafe
+    (match (c-environ)
+      (Some e) (let [base (prim/addr->int e)]
+                 (loop [i 0 acc: Vec(Str) []]
+                   (let [p (prim/mem-read64 (prim/int->addr (+ base (* i 8))))]
+                     (if (= p 0) acc (recur (+ i 1) (conj acc (cstr p)))))))
+      (None) [])))
+(defextern c-clock-gettime clock_gettime)
+(defextern c-clock-realtime CLOCK_REALTIME)
+(defextern c-time-t-bytes (c/sizeof "time_t"))
+(defextern c-long-bytes (c/sizeof "long"))
+(defextern c-timespec-tv-sec-at (c/offsetof "struct timespec" "tv_sec"))
+(defextern c-timespec-tv-nsec-at (c/offsetof "struct timespec" "tv_nsec"))
+(defn real-now-ns Values(Int Int) []
+  (unsafe (let [ts (prim/addr->int (prim/frame-bytes 16)) r (c-clock-gettime (c-clock-realtime) (prim/int->addr ts))
+                sz (c-time-t-bytes) nz (c-long-bytes)
+                s (if (= sz 8) (prim/mem-read64 (prim/int->addr (+ ts (c-timespec-tv-sec-at)))) (prim/mem-read32 (prim/int->addr (+ ts (c-timespec-tv-sec-at)))))
+                ns (if (= nz 8) (prim/mem-read64 (prim/int->addr (+ ts (c-timespec-tv-nsec-at)))) (prim/mem-read32 (prim/int->addr (+ ts (c-timespec-tv-nsec-at)))))]
+            (values s ns))))
+))

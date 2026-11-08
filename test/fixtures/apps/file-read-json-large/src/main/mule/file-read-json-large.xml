@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
+  <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18577"/></http:listener-config>
+  <file:config name="F"><file:connection workingDir="/tmp/mulay-oracle-file-read-json-large"/></file:config>
+  <flow name="seed">
+    <http:listener config-ref="L" path="/seed"/>
+    <file:write config-ref="F" path="big.json"><file:content>#[output application/json --- (1 to 20000) map {id: $, name: "name-" ++ $, v: $ mod 10, tags: ["t" ++ ($ mod 3)]}]</file:content></file:write>
+    <file:write config-ref="F" path="bad.json"><file:content>#[output text/plain --- "[" ++ ((1 to 30000) map ("{\"id\": " ++ $ ++ "}") joinBy ",") ++ ",{\"id\": tru"]</file:content></file:write>
+    <file:write config-ref="F" path="bad-big.json"><file:content>#[output text/plain --- "[" ++ ((1 to 60000) map ("{\"id\": " ++ $ ++ "}") joinBy ",") ++ ",{\"id\": tru"]</file:content></file:write>
+    <set-payload value="seeded"/>
+  </flow>
+  <flow name="map">
+    <http:listener config-ref="L" path="/map"/>
+    <file:read config-ref="F" path="big.json"/>
+    <set-payload value="#[output application/json --- payload filter (($.id mod 5000) == 0) map {id: $.id, n: $.name, t: $.tags[0]}]"/>
+  </flow>
+  <flow name="agg">
+    <http:listener config-ref="L" path="/agg"/>
+    <file:read config-ref="F" path="big.json"/>
+    <set-payload value="#[output application/json --- {n: sizeOf(payload), first: payload[0].id, last: payload[-1].id, sum: payload reduce ((x, acc = 0) -> acc + x.v), ids: (payload[0 to 2] map $.id) joinBy ',', big: sizeOf(payload filter ($.v > 7)), empty: isEmpty(payload), flat: sizeOf(payload flatMap $.tags), eq: payload[1] == {id: 2, name: 'name-2', v: 2, tags: ['t2']}, mime: payload.^mimeType}]"/>
+  </flow>
+  <flow name="ndjson">
+    <http:listener config-ref="L" path="/ndjson"/>
+    <file:read config-ref="F" path="big.json"/>
+    <set-payload value="#[output application/x-ndjson --- (payload filter ($.id &lt;= 3)) map {id: $.id}]"/>
+  </flow>
+  <flow name="bad">
+    <http:listener config-ref="L" path="/bad"/>
+    <file:read config-ref="F" path="bad.json"/>
+    <set-payload value="#[output application/json --- sizeOf(payload map $.id)]"/>
+  </flow>
+  <flow name="bad-big">
+    <http:listener config-ref="L" path="/bad-big"/>
+    <file:read config-ref="F" path="bad-big.json"/>
+    <set-payload value="#[output application/json --- sizeOf(payload map $.id)]"/>
+  </flow>
+  <flow name="try-read">
+    <http:listener config-ref="L" path="/try-read"/>
+    <file:read config-ref="F" path="big.json"/>
+    <set-payload value="#[output application/json --- {ok: dw::Runtime::try(() -> read('{bad', 'application/json')).success, n: sizeOf(payload)}]"/>
+  </flow>
+</mule>

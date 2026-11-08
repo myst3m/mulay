@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation">
+  <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="8081"/></http:listener-config>
+  <db:config name="orders-db"><db:oracle-connection host="db.example.com" port="1521" serviceName="ORCL" user="shop" password="x"/></db:config>
+  <db:config name="other-db"><db:my-sql-connection host="db2.example.com" port="3306" database="other" user="u" password="x"/></db:config>
+  <flow name="get-order">
+    <http:listener config-ref="L" path="/orders/{id}"/>
+    <db:select config-ref="orders-db" doc:id="sel1">
+      <db:sql>SELECT id, item, created FROM orders WHERE id = :id</db:sql>
+      <db:input-parameters>#[{id: attributes.uriParams.id as Number}]</db:input-parameters>
+    </db:select>
+    <set-payload value="#[output application/json --- {item: payload[0].ITEM, id: payload[0].ID, t: typeOf(payload[0].CREATED)}]"/>
+  </flow>
+  <flow name="add-order">
+    <http:listener config-ref="L" path="/orders" allowedMethods="POST"/>
+    <db:insert config-ref="orders-db" doc:id="ins1">
+      <db:sql>INSERT INTO orders (id, item) VALUES (:id, :item)</db:sql>
+      <db:input-parameters>#[{id: payload.id, item: payload.item}]</db:input-parameters>
+    </db:insert>
+    <db:select config-ref="orders-db" doc:id="sel2"><db:sql>SELECT count(*) AS n FROM orders</db:sql></db:select>
+    <set-payload value="#[output application/json --- payload[0].N]"/>
+    <error-handler>
+      <on-error-continue type="DB:QUERY_EXECUTION"><set-payload value="#[error.description]"/></on-error-continue>
+    </error-handler>
+  </flow>
+  <flow name="proc">
+    <http:listener config-ref="L" path="/proc"/>
+    <db:stored-procedure config-ref="orders-db" doc:id="sp1"><db:sql>{call do_it()}</db:sql></db:stored-procedure>
+  </flow>
+  <flow name="other">
+    <http:listener config-ref="L" path="/other"/>
+    <db:select config-ref="other-db" doc:id="sel3"><db:sql>SELECT 1</db:sql></db:select>
+  </flow>
+</mule>

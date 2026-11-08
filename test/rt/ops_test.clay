@@ -1,0 +1,64 @@
+(ns ops-test (:require [mulay.rt.ops :as ops] [clay.string :as str]))
+
+;; spawn-bg の試験は実際のスレッドで動かす (既定のビルドでは future がその場で動く)
+(c-flags "-DCLAY_PARALLEL")
+
+(deftest secs
+  (is (= (ops/secs 0) "0"))
+  (is (= (ops/secs 1500000) "1.5"))
+  (is (= (ops/secs 104139) "0.104139"))
+  (is (= (ops/secs 12500) "0.0125")))
+
+(deftest states
+  (is (= (ops/set-state ops/STARTING) 0))
+  (is (not (ops/ready?)))
+  (is (= (ops/set-state ops/READY) 1))
+  (is (ops/ready?)))
+
+(deftest health-starting
+  (let [z (ops/set-state ops/STARTING) [st body] (ops/health-body)]
+    (is (= st 503))
+    (is (= body "{\"status\":\"unhealthy\",\"reason\":\"starting\",\"uptime\":0}"))))
+
+(deftest health-ready
+  (let [z (ops/set-state ops/READY) [st body] (ops/health-body)]
+    (is (= st 200))
+    (is (str/starts-with? body "{\"status\":\"healthy\",\"uptime\":"))))
+
+(deftest inflight
+  (let [a (ops/enter) b (ops/enter) c (ops/leave)]
+    (is (= (ops/in-flight) 1))))
+
+(deftest metrics
+  (let [z1 (ops/record "f1" 3000 "")
+        z2 (ops/record "f1" 200000 "HTTP:NOT_FOUND")
+        t (ops/metrics-text)]
+    (is (str/includes? t "mulay_flow_requests_total{flow=\"f1\"} 2\n"))
+    (is (str/includes? t "mulay_flow_errors_total{flow=\"f1\",type=\"HTTP:NOT_FOUND\"} 1\n"))
+    (is (str/includes? t "mulay_flow_duration_seconds_bucket{flow=\"f1\",le=\"0.005\"} 1\n"))
+    (is (str/includes? t "mulay_flow_duration_seconds_bucket{flow=\"f1\",le=\"0.25\"} 2\n"))
+    (is (str/includes? t "mulay_flow_duration_seconds_sum{flow=\"f1\"} 0.203\n"))
+    (is (str/includes? t "process_resident_memory_bytes "))
+    (is (str/includes? (ops/metrics-json) "\"f1\":{\"requests\":2,\"errors\":1,\"errorTypes\":{\"HTTP:NOT_FOUND\":1},\"durationSeconds\":0.203}"))))
+
+;; spawn-bg: 別スレッドの仕事は同時に mx 個まで。超えた分は呼び出し側で動かす (以前は async や batch:job の
+;; 要求ごとにスレッドを作り続け、作れなくなるとプロセスごと落ちた)
+;; 別スレッドで同時に動いた数の最大
+(defn- spawn-peak Int [n: Int mx: Int]
+  (let [cnt (atom 0) peak (atom 0) done (atom 0) bg (atom 0)
+        z (loop [i 0] (if (>= i n) 0
+                        (let [p1 peak d1 done b1 bg
+                              z (ops/spawn-bg-in cnt mx (fn Int [k: Int]
+                                                          (let [v (swap! b1 (fn Int [x: Int] (+ x k)))
+                                                                z (swap! p1 (fn Int [x: Int] (if (> v x) v x)))
+                                                                z2 (sleep-ms 20)
+                                                                z3 (swap! b1 (fn Int [x: Int] (- x k)))]
+                                                            (swap! d1 (fn Int [x: Int] (+ x 1))))))]
+                          (recur (+ i 1)))))
+        w (loop [] (if (< (deref done) n) (let [z (sleep-ms 5)] (recur)) 0))
+        w2 (loop [] (if (> (deref cnt) 0) (let [z (sleep-ms 5)] (recur)) 0))]
+    (deref peak)))
+
+(deftest spawn-bg-cap
+  (is (= (spawn-peak 20 3) 3))
+  (is (= (spawn-peak 5 8) 5)))

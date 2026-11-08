@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:tls="http://www.mulesoft.org/schema/mule/tls"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- 大域の tls:context (JKS、鍵のパスワードはストアと別) -->
+    <tls:context name="serverJks">
+        <tls:key-store type="jks" path="server.jks" password="changeit" keyPassword="keypass1" alias="server"/>
+    </tls:context>
+
+    <tls:context name="trustCa">
+        <tls:trust-store type="jks" path="truststore.jks" password="changeit"/>
+    </tls:context>
+
+    <!-- HTTPS の listener: 大域の tls:context を参照 -->
+    <http:listener-config name="HttpsJks">
+        <http:listener-connection host="0.0.0.0" port="18140" protocol="HTTPS" tlsContext="serverJks"/>
+    </http:listener-config>
+
+    <!-- HTTPS の listener: その場の tls:context (PKCS12) -->
+    <http:listener-config name="HttpsP12">
+        <http:listener-connection host="0.0.0.0" port="18141" protocol="HTTPS">
+            <tls:context>
+                <tls:key-store type="pkcs12" path="server.p12" password="changeit" keyPassword="changeit"/>
+            </tls:context>
+        </http:listener-connection>
+    </http:listener-config>
+
+    <!-- クライアント証明書を求める listener (mTLS) -->
+    <http:listener-config name="HttpsMtls">
+        <http:listener-connection host="0.0.0.0" port="18142" protocol="HTTPS">
+            <tls:context>
+                <tls:trust-store type="pkcs12" path="truststore.p12" password="changeit"/>
+                <tls:key-store type="pkcs12" path="server.p12" password="changeit" keyPassword="changeit"/>
+            </tls:context>
+        </http:listener-connection>
+    </http:listener-config>
+
+    <!-- 信頼されない (自己署名の) 証明書の listener -->
+    <http:listener-config name="HttpsRogue">
+        <http:listener-connection host="0.0.0.0" port="18144" protocol="HTTPS">
+            <tls:context>
+                <tls:key-store type="pkcs12" path="rogue.p12" password="changeit" keyPassword="changeit"/>
+            </tls:context>
+        </http:listener-connection>
+    </http:listener-config>
+
+    <!-- PKCS12 のストアと鍵のパスワードが別 (ストアは changeit、鍵は keypass2) -->
+    <http:listener-config name="HttpsSplit">
+        <http:listener-connection host="0.0.0.0" port="18147" protocol="HTTPS">
+            <tls:context>
+                <tls:key-store type="pkcs12" path="server-split.p12" password="changeit" keyPassword="keypass2"/>
+            </tls:context>
+        </http:listener-connection>
+    </http:listener-config>
+
+    <!-- 版と暗号スイートを絞った listener (enabledProtocols / enabledCipherSuites) -->
+    <http:listener-config name="HttpsTls13">
+        <http:listener-connection host="0.0.0.0" port="18148" protocol="HTTPS">
+            <tls:context enabledProtocols="TLSv1.3">
+                <tls:key-store type="pkcs12" path="server.p12" password="changeit" keyPassword="changeit"/>
+            </tls:context>
+        </http:listener-connection>
+    </http:listener-config>
+    <http:listener-config name="HttpsAes128">
+        <http:listener-connection host="0.0.0.0" port="18149" protocol="HTTPS">
+            <tls:context enabledProtocols="TLSv1.2" enabledCipherSuites="TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256">
+                <tls:key-store type="pkcs12" path="server.p12" password="changeit" keyPassword="changeit"/>
+            </tls:context>
+        </http:listener-connection>
+    </http:listener-config>
+
+    <http:listener-config name="Plain">
+        <http:listener-connection host="0.0.0.0" port="18143"/>
+    </http:listener-config>
+
+    <!-- http:request の接続 -->
+    <http:request-config name="ToJksTrusted">
+        <http:request-connection host="localhost" port="18140" protocol="HTTPS" tlsContext="trustCa"/>
+    </http:request-config>
+    <http:request-config name="ToJksInsecure">
+        <http:request-connection host="localhost" port="18140" protocol="HTTPS">
+            <tls:context>
+                <tls:trust-store insecure="true"/>
+            </tls:context>
+        </http:request-connection>
+    </http:request-config>
+    <http:request-config name="ToJksDefault">
+        <http:request-connection host="localhost" port="18140" protocol="HTTPS"/>
+    </http:request-config>
+    <http:request-config name="ToRogue">
+        <http:request-connection host="localhost" port="18144" protocol="HTTPS" tlsContext="trustCa"/>
+    </http:request-config>
+    <http:request-config name="ToMtls">
+        <http:request-connection host="localhost" port="18142" protocol="HTTPS">
+            <tls:context>
+                <tls:trust-store type="jks" path="truststore.jks" password="changeit"/>
+                <tls:key-store type="pkcs12" path="client.p12" password="changeit" keyPassword="changeit"/>
+            </tls:context>
+        </http:request-connection>
+    </http:request-config>
+    <http:request-config name="ToMtlsNoCert">
+        <http:request-connection host="localhost" port="18142" protocol="HTTPS" tlsContext="trustCa"/>
+    </http:request-config>
+    <http:request-config name="ToSplit">
+        <http:request-connection host="localhost" port="18147" protocol="HTTPS" tlsContext="trustCa"/>
+    </http:request-config>
+    <http:request-config name="Tls12ToTls13">
+        <http:request-connection host="localhost" port="18148" protocol="HTTPS">
+            <tls:context enabledProtocols="TLSv1.2">
+                <tls:trust-store type="jks" path="truststore.jks" password="changeit"/>
+            </tls:context>
+        </http:request-connection>
+    </http:request-config>
+    <http:request-config name="Tls13ToTls13">
+        <http:request-connection host="localhost" port="18148" protocol="HTTPS">
+            <tls:context enabledProtocols="TLSv1.2,TLSv1.3">
+                <tls:trust-store type="jks" path="truststore.jks" password="changeit"/>
+            </tls:context>
+        </http:request-connection>
+    </http:request-config>
+    <http:request-config name="Aes256ToAes128">
+        <http:request-connection host="localhost" port="18149" protocol="HTTPS">
+            <tls:context enabledCipherSuites="TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384">
+                <tls:trust-store type="jks" path="truststore.jks" password="changeit"/>
+            </tls:context>
+        </http:request-connection>
+    </http:request-config>
+    <http:request-config name="Aes128ToAes128">
+        <http:request-connection host="localhost" port="18149" protocol="HTTPS">
+            <tls:context enabledCipherSuites="TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256">
+                <tls:trust-store type="jks" path="truststore.jks" password="changeit"/>
+            </tls:context>
+        </http:request-connection>
+    </http:request-config>
+    <http:request-config name="PlainToHttps">
+        <http:request-connection host="localhost" port="18140"/>
+    </http:request-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <sub-flow name="describe">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  scheme: attributes.scheme,
+  path: attributes.requestPath,
+  hasClientCert: attributes.clientCertificate != null,
+  certType: typeOf(attributes.clientCertificate)
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <flow name="jks"><http:listener config-ref="HttpsJks" path="/hello"/><flow-ref name="describe"/></flow>
+    <flow name="p12"><http:listener config-ref="HttpsP12" path="/hello"/><flow-ref name="describe"/></flow>
+    <flow name="mtls"><http:listener config-ref="HttpsMtls" path="/hello"/><flow-ref name="describe"/></flow>
+    <!-- クライアント証明書の値 (java.security.cert.X509Certificate を DW から見たもの) -->
+    <flow name="mtls-cert">
+        <http:listener config-ref="HttpsMtls" path="/cert"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var c = attributes.clientCertificate
+---
+{
+  keys: keysOf(c) orderBy $,
+  subject: c.subjectDN.name,
+  issuer: c.issuerDN.name,
+  serial: typeOf(c.serialNumber),
+  notAfter: c.notAfter,
+  certKind: c."type",
+  version: c.version,
+  sigAlg: c.sigAlgName,
+  subjectX500: c.subjectX500Principal.name
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="rogue"><http:listener config-ref="HttpsRogue" path="/hello"/><set-payload value="rogue" mimeType="text/plain"/></flow>
+
+    <flow name="call-trusted">
+        <http:listener config-ref="Plain" path="/call/trusted"/>
+        <http:request config-ref="ToJksTrusted" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="call-insecure">
+        <http:listener config-ref="Plain" path="/call/insecure"/>
+        <http:request config-ref="ToJksInsecure" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="call-default">
+        <http:listener config-ref="Plain" path="/call/default"/>
+        <http:request config-ref="ToJksDefault" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="call-rogue">
+        <http:listener config-ref="Plain" path="/call/rogue"/>
+        <http:request config-ref="ToRogue" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="call-mtls">
+        <http:listener config-ref="Plain" path="/call/mtls"/>
+        <http:request config-ref="ToMtls" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="call-mtls-nocert">
+        <http:listener config-ref="Plain" path="/call/mtls-nocert"/>
+        <http:request config-ref="ToMtlsNoCert" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="split"><http:listener config-ref="HttpsSplit" path="/hello"/><flow-ref name="describe"/></flow>
+    <flow name="call-split">
+        <http:listener config-ref="Plain" path="/call/split"/>
+        <http:request config-ref="ToSplit" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="call-plain-to-https">
+        <http:listener config-ref="Plain" path="/call/plain-to-https"/>
+        <http:request config-ref="PlainToHttps" method="GET" path="/hello" responseTimeout="3000"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="tls13"><http:listener config-ref="HttpsTls13" path="/hello"/><flow-ref name="describe"/></flow>
+    <flow name="aes128"><http:listener config-ref="HttpsAes128" path="/hello"/><flow-ref name="describe"/></flow>
+    <flow name="call-tls12-to-tls13">
+        <http:listener config-ref="Plain" path="/call/tls12-to-tls13"/>
+        <http:request config-ref="Tls12ToTls13" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="call-tls13-to-tls13">
+        <http:listener config-ref="Plain" path="/call/tls13-to-tls13"/>
+        <http:request config-ref="Tls13ToTls13" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="call-aes256-to-aes128">
+        <http:listener config-ref="Plain" path="/call/aes256-to-aes128"/>
+        <http:request config-ref="Aes256ToAes128" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="call-aes128-to-aes128">
+        <http:listener config-ref="Plain" path="/call/aes128-to-aes128"/>
+        <http:request config-ref="Aes128ToAes128" method="GET" path="/hello"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

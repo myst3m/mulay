@@ -1,0 +1,106 @@
+(ns mulay.conn.os
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.rt.ostore :as st] [mulay.rt.persist :as ps] [mulay.lib.xml :as xml] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/os")
+
+(defn- init Vec(Str) [app: &m/App]
+  (let [cs (:configs app)
+        cfgs (loop [i 0 acc: Map(Str st/Cfg) {}]
+               (if (>= i (count cs)) acc
+                 (let [c (nth cs i)]
+                   (recur (+ i 1) (if (= (:kind c) "os:object-store") (assoc acc (:name c) (st/cfg-of (:params c))) acc)))))
+        z (st/init! (ps/dir app "objectstore") cfgs)]
+    []))
+
+(defn- attr-val Values(Vec(v/Val) Str) [c: &conn/OpCall name: &Str]
+  (let [p (conn/param (:params c) name)]
+    (if (= (count p) 0) (values [] "")
+      (let [[x e] ((:eval c) (nth p 0) (:event c))] (values [x] e)))))
+
+(defn- attr-text Str [c: &conn/OpCall name: &Str]
+  (let [p (conn/param (:params c) name)]
+    (if (= (count p) 0) "" (match (nth p 0) (m/PLit s) (str s) (m/PExpr t cmp src) (str t)))))
+
+(defn- child-tv Values(Vec(ev/TV) Str) [c: &conn/OpCall local: &Str]
+  (let [p (conn/param (:exprs c) local)]
+    (if (> (count p) 0)
+      (let [[t e] ((:eval-tv c) (nth p 0) (:event c))] (values [t] e))
+      (let [ch (:children c)
+            k (loop [i 0] (if (>= i (count ch)) -1 (if (and (xml/elem? (nth ch i)) (= (xml/elem-local (nth ch i)) local)) i (recur (+ i 1)))))]
+        (if (< k 0) (values [] "")
+          (values [(ev/tv-val (v/->VStr (xml/text-content (nth ch k))) ev/ANY)] ""))))))
+
+(defn- flag Bool [c: &conn/OpCall name: &Str dflt: Bool]
+  (let [[xs e] (attr-val c name)]
+    (if (or (not= e "") (= (count xs) 0)) dflt
+      (match (v/unmeta (nth xs 0)) (v/VBool b) b (v/VStr s) (= (str/lower-case s) "true") _ dflt))))
+
+(defn- os-err conn/OpResult [id: Str msg: Str] (conn/fail-result (err/mk "OS" id msg)))
+
+(defn- java conn/OpResult [x: v/Val] (conn/ok-result (ev/tv-val x ev/JAVA) (ev/tv-null)))
+
+(defn- keep-result conn/OpResult [c: &conn/OpCall] (conn/ok-result (:payload (:event c)) (:attributes (:event c))))
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (let [op (:op c)
+        store (attr-text c "objectStore")
+        [kv ke] (attr-val c "key")
+        key-needed (or (= op "store") (= op "retrieve") (= op "contains") (= op "remove"))]
+    (cond
+      (not= ke "") (conn/fail-result (err/mk "MULE" "EXPRESSION" ke))
+      (and key-needed (or (= (count kv) 0) (v/null? (nth kv 0))))
+      (conn/fail-result (err/mk "MULE" "VALIDATION" (str "Required parameter 'key' was assigned with value '" (attr-text c "key") "' which resolved to null. Required parameters need to be assigned with non null values")))
+      :else
+      (let [key (if (= (count kv) 0) "" (let [x (v/unmeta (nth kv 0))] (match x (v/VStr s) (str s) _ (let [[t e] (drt/to-text x)] t))))]
+        (cond
+          (= op "store")
+          (let [[vt ve] (child-tv c "value")
+                t (ev/settle (if (= (count vt) 0) (:payload (:event c)) (nth vt 0)))]
+            (cond
+              (not= ve "") (conn/fail-result (err/mk "MULE" "EXPRESSION" ve))
+              (and (= (:state t) ev/VAL) (v/null? (:val t)))
+              (if (flag c "failOnNullValue" true)
+                (os-err "NULL_VALUE" "A null value was provided. Please provide a non-null value or set the 'failOnNullValue' parameter to 'false'")
+                (keep-result c))
+              (and (flag c "failIfPresent" false) (contains? (st/entries store) key))
+              (os-err "KEY_ALREADY_EXISTS" (str "ObjectStore already contains an object for key '" key "'"))
+              :else
+              (let [z (st/put! store key t)]
+                (keep-result c))))
+          (= op "retrieve")
+          (let [es (st/entries store)]
+            (if (contains? es key) (conn/ok-result (:value (get! es key)) (ev/tv-null))
+              (let [[dt de] (child-tv c "default-value")]
+                (cond (not= de "") (conn/fail-result (err/mk "MULE" "EXPRESSION" de))
+                      (and (> (count dt) 0) (not (v/null? (:val (nth dt 0))))) (conn/ok-result (nth dt 0) (ev/tv-null))
+                      :else (os-err "KEY_NOT_FOUND" (str "ObjectStore '" (store-desc store) "' doesn't contain any value for key '" key "' and default value was not provided or resolved to a null value."))))))
+          (= op "contains")
+          (java (v/bool-v (contains? (st/entries store) key)))
+          (= op "remove")
+          (let [es (st/entries store)]
+            (if (not (contains? es key)) (os-err "KEY_NOT_FOUND" (str "ObjectStore doesn't contain any value for key '" key "'"))
+              (let [z (st/remove! store key)]
+                (keep-result c))))
+          (= op "clear")
+          (let [z (st/clear! store)]
+            (keep-result c))
+          (or (= op "retrieve-all") (= op "retrieve-all-keys"))
+          (let [es (st/entries store)
+                ks (keys es)
+                [fs names] (loop [i 0 fs: Vec(v/Field) [] ns: Vec(v/Val) []]
+                             (if (>= i (count ks)) (values fs ns)
+                               (let [name (nth ks i)
+                                     t (:value (get! es name))
+                                     x (if (= (:state t) ev/VAL) (:val t) (v/->VStr (:raw t)))]
+                                 (recur (+ i 1) (conj fs (v/field name x)) (conj ns (v/->VStr name))))))]
+            (java (if (= op "retrieve-all") (v/->VObj fs) (v/->VArr names))))
+          :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation os:" op))))))))
+
+(defn- store-desc Str [store: &Str]
+  (if (= store "") "_defaultPersistentObjectStore"
+    (str "org.mule.extension.objectstore.api.TopLevelObjectStore$ByteBuddy$withAnnotations@0; location: " store)))
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "os" NS (fn conn/OpResult [c: conn/OpCall] (run-op c)))
+         :init (fn Vec(Str) [a: m/App] (init a))))

@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""MUnit のテストの結果を、実 MUnit (munit-maven-plugin、MULE_EE 4.11.3) と mulay test で比べる。
+
+  tools/munit-oracle/munit-oracle fill  [name...]   実 MUnit (mvn test) で回し、結果を expected.txt に書く
+  tools/munit-oracle/munit-oracle mulay [-v] [name...]  mulay test で回し、expected.txt と比べる (違えば終了コード 1)
+
+  name は test/fixtures/munit/<name>。省略時は全部。
+  fixture は Mule のアプリ (pom.xml、src/main/mule、src/test/munit)。実 MUnit はコピー (target/munit-oracle/<name>) で回す。
+  結果の形は docs/fixtures.md の「MUnit のテスト」。mulay は MULAY_BIN (既定 <repo>/target/mulay) を使う。
+"""
+import os, re, shutil, subprocess, sys, tempfile
+import xml.etree.ElementTree as ET
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+FIX = os.path.join(ROOT, "test/fixtures/munit")
+WORK = os.path.join(ROOT, "target/munit-oracle")
+MULAY = os.environ.get("MULAY_BIN", os.path.join(ROOT, "target/mulay"))
+
+
+def message_lines(text):
+    out = []
+    text = (text or "").replace("&#10;", "\n").replace("&#9;", "\t").replace("&#13;", "")
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if line.startswith("\tat ") or line.startswith("Caused by:"):
+            break
+        out.append(line.rstrip())
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
+def suite_name(xml_name):
+    m = re.match(r"TEST-munit\.[A-Z_]+\.[0-9.]+\.(.+)\.xml$", xml_name)
+    return (m.group(1) if m else xml_name) + ".xml"
+
+
+def golden_from_surefire(rep_dir):
+    suites = []
+    for f in sorted(os.listdir(rep_dir)):
+        if not (f.startswith("TEST-") and f.endswith(".xml")):
+            continue
+        t = ET.parse(os.path.join(rep_dir, f)).getroot()
+        tests = []
+        for tc in t.iter("testcase"):
+            status, msg = "SUCCESS", []
+            for kind, label in (("failure", "FAILURE"), ("error", "ERROR"), ("skipped", "SKIPPED")):
+                el = tc.find(kind)
+                if el is not None:
+                    status = label
+                    msg = message_lines(el.text if el.text else el.get("message", ""))
+                    break
+            tests.append((tc.get("name"), status, msg))
+        suites.append((suite_name(f), tests))
+    return render(suites)
+
+
+def render(suites):
+    lines = []
+    for name, tests in sorted(suites):
+        lines.append("suite " + name)
+        for tname, status, msg in sorted(tests):
+            lines.append("test " + tname + " " + status)
+            lines.extend("| " + m for m in msg)
+    return "\n".join(lines) + "\n"
+
+
+def names(args):
+    if args:
+        return [os.path.basename(a.rstrip("/")) for a in args]
+    return sorted(d for d in os.listdir(FIX) if os.path.isdir(os.path.join(FIX, d)))
+
+
+def fill(name):
+    src = os.path.join(FIX, name)
+    dst = os.path.join(WORK, name)
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("expected.txt", "target"))
+    r = subprocess.run(["mvn", "-q", "-B", "test"], cwd=dst, capture_output=True, text=True, timeout=1800)
+    rep = os.path.join(dst, "target/surefire-reports")
+    if not os.path.isdir(rep):
+        print(r.stdout[-3000:] + r.stderr[-3000:])
+        raise SystemExit(f"{name}: no surefire reports (mvn exit {r.returncode})")
+    g = golden_from_surefire(rep)
+    open(os.path.join(src, "expected.txt"), "w").write(g)
+    shutil.rmtree(dst, ignore_errors=True)
+    n = sum(1 for l in g.split("\n") if l.startswith("test "))
+    print(f"fill {name}: {n} test(s)")
+
+
+def run_mulay(name, verbose):
+    src = os.path.join(FIX, name)
+    exp = open(os.path.join(src, "expected.txt")).read()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "got.txt")
+        r = subprocess.run([MULAY, "test", src, "--golden", out], capture_output=True, text=True, timeout=600)
+        got = open(out).read() if os.path.exists(out) else ""
+    if got == exp:
+        print(f"PASS {name}")
+        return True
+    print(f"FAIL {name}")
+    if verbose or not got:
+        print(r.stdout[-4000:] + r.stderr[-4000:])
+    import difflib
+    for l in difflib.unified_diff(exp.split("\n"), got.split("\n"), "expected", "mulay", lineterm="", n=2):
+        print("  " + l)
+    return False
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd, rest = a[0], a[1:]
+    verbose = "-v" in rest
+    rest = [x for x in rest if x != "-v"]
+    if cmd == "fill":
+        for n in names(rest):
+            fill(n)
+        return 0
+    if cmd == "mulay":
+        ok = [run_mulay(n, verbose) for n in names(rest)]
+        print(f"munit: {sum(ok)}/{len(ok)} fixture(s) green")
+        return 0 if all(ok) else 1
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1 @@
+vars.items ++ [payload * 2]

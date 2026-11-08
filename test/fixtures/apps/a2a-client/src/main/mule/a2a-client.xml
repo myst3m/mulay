@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18167"/>
+    </http:listener-config>
+
+    <os:object-store name="Snap" persistent="false"/>
+
+    <a2a:server-config name="Srv">
+        <a2a:connection listenerConfig="L" agentPath="/agent"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{"name": "C", "description": "Client test", "url": "http://localhost:18167/agent", "version": "1.0.0",
+  "capabilities": {}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []}]]></a2a:json>
+        </a2a:agent-card>
+    </a2a:server-config>
+
+    <!-- 認証あり、既定のヘッダあり -->
+    <a2a:client-config name="ClBasic">
+        <a2a:client-connection serverUrl="http://localhost:18167/agent">
+            <a2a:authentication>
+                <http:basic-authentication username="agent" password="s3cret"/>
+            </a2a:authentication>
+            <a2a:default-headers>
+                <a2a:default-header key="X-Default" value="d1"/>
+            </a2a:default-headers>
+        </a2a:client-connection>
+    </a2a:client-config>
+
+    <a2a:client-config name="ClNone">
+        <a2a:client-connection serverUrl="http://localhost:18167/agent"/>
+    </a2a:client-config>
+
+    <!-- 認可: Basic で来たものだけ通す -->
+    <flow name="auth">
+        <a2a:authorization-listener config-ref="Srv"/>
+        <choice>
+            <when expression="#[not ((attributes.headers.authorization default '') startsWith 'Basic ')]">
+                <raise-error type="APP:DENIED" description="no basic"/>
+            </when>
+        </choice>
+    </flow>
+
+    <flow name="agent">
+        <a2a:task-listener config-ref="Srv"/>
+        <os:store key="hdrs" objectStore="Snap">
+            <os:value><![CDATA[#[output application/json --- {
+  authorization: attributes.headers.authorization,
+  xDefault: attributes.headers."x-default",
+  xExtra: attributes.headers."x-extra",
+  ctype: attributes.headers."content-type"
+}]]]></os:value>
+        </os:store>
+        <set-payload value='#[output application/json --- {kind: "message", role: "agent", messageId: "m-1", parts: [{kind: "text", text: "ok"}]}]'/>
+    </flow>
+
+    <flow name="send">
+        <http:listener config-ref="L" path="/t/send"/>
+        <choice>
+            <when expression="#[attributes.queryParams.cfg == 'basic']">
+                <a2a:send-message config-ref="ClBasic">
+                    <a2a:message><![CDATA[#[output application/json --- {message: {kind: "message", role: "user", messageId: "u-1", parts: [{kind: "text", text: "hi"}]}}]]]></a2a:message>
+                    <a2a:additional-properties><![CDATA[#[{"X-Extra": "e1"}]]]></a2a:additional-properties>
+                </a2a:send-message>
+            </when>
+            <otherwise>
+                <a2a:send-message config-ref="ClNone">
+                    <a2a:message><![CDATA[#[output application/json --- {message: {kind: "message", role: "user", messageId: "u-1", parts: [{kind: "text", text: "hi"}]}}]]]></a2a:message>
+                </a2a:send-message>
+            </otherwise>
+        </choice>
+        <os:retrieve key="hdrs" objectStore="Snap" target="hdrs"/>
+        <set-payload value='#[output application/json --- {result: payload, hdrs: vars.hdrs}]'/>
+    </flow>
+
+    <flow name="get">
+        <http:listener config-ref="L" path="/t/get"/>
+        <choice>
+            <when expression="#[attributes.queryParams.cfg == 'basic']">
+                <a2a:get-task config-ref="ClBasic">
+                    <a2a:task-query><![CDATA[#[output application/json --- {id: "nope"}]]]></a2a:task-query>
+                </a2a:get-task>
+            </when>
+            <otherwise>
+                <a2a:get-task config-ref="ClNone">
+                    <a2a:task-query><![CDATA[#[output application/json --- {id: "nope"}]]]></a2a:task-query>
+                </a2a:get-task>
+            </otherwise>
+        </choice>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value='#[output application/json --- {error: error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]'/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>

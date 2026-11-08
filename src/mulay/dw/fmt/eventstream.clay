@@ -1,0 +1,72 @@
+(ns mulay.dw.fmt.eventstream
+  (:require [mulay.dw.val :as v] [mulay.dw.fmt.dw :as dwf] [mulay.dw.fmt.text :as text] [mulay.dw.lib.binaries :as bin]
+            [mulay.lib.uni :as uni] [clay.string :as str]))
+
+(defn- colon-at Values(Int Int) [line: &Str]
+  (let [i (str/index-of line ":")]
+    (if (< i 0) (values -1 -1)
+      (values i (loop [k 0 n 0] (if (>= k i) n (recur (+ k 1) (if (= (bit-and (nth line k) 192) 128) n (+ n 1)))))))))
+
+(defn- blank? Bool [s: &Str] (= (count (uni/java-trim s)) 0))
+
+(defn- classify Values(Int Str Str) [line: &Str]
+  (if (str/starts-with? line ":") (values 0 "" "")
+    (let [[ci cn] (colon-at line)]
+      (cond
+        (> cn 1) (if (>= (+ ci 1) (count line)) (values 3 (subs line 0 ci) "") (values 1 (subs line 0 ci) (uni/java-trim (subs line (+ ci 1) (count line)))))
+        (not (blank? line)) (values 1 (str line) "")
+        :else (values 2 "" "")))))
+
+(defn read Values(v/Val Str) [text: &Str mime: &Str]
+  (let [lines (bin/split-lines text)]
+    (loop [i 0 cur: Vec(v/Field) [] acc: Vec(v/Val) []]
+      (if (>= i (count lines))
+        (values (v/->VMeta (v/->VArr acc) [(v/field "encoding" (v/->VStr "UTF-8")) (v/field "mediaType" (v/->VStr (str mime)))]) "")
+        (let [ln (match (nth lines i) (v/VStr s) s _ "")
+              [kind k val] (classify ln)]
+          (cond
+            (= kind 0) (recur (+ i 1) cur acc)
+            (= kind 1) (recur (+ i 1) (conj cur (v/field k (v/->VStr val))) acc)
+            (= kind 3) (recur (+ i 1) (conj cur (v/field k (v/null-v))) acc)
+            :else (if (= (count cur) 0) (recur (+ i 1) cur acc)
+                    (recur (+ i 1) (let [z: Vec(v/Field) []] z) (conj acc (v/->VObj cur))))))))))
+
+(defn- show Str [x: &v/Val]
+  (let [nss: Vec(v/Ns) []
+        [o e] (dwf/write-into "" x (dwf/->Ctx "" false -1) 0 nss)]
+    (if (not= e "") "" (str " (" o ")"))))
+
+(defn- map-object-err Str [x: &v/Val]
+  (str "You called the function 'mapObject' with these arguments: \n  1: " (v/type-name x) (show x)
+       "\n  2: Function ((value:Any, key:Any, index:Any) -> ???)\n\nBut it expects arguments of these types:\n  1: Object\n  2: Function\n"))
+
+(def PLUS-ERR (str "You called the function '++' with these arguments: \n  1: Null (null)\n  2: String (\"\\n\")\n\n"
+                   "But it expects one of these combinations:\n  (Array, Array)\n  (Date, Time)\n  (Date, LocalTime)\n  (Date, TimeZone)\n"
+                   "  (LocalDateTime, TimeZone)\n  (LocalTime, Date)\n  (LocalTime, TimeZone)\n  (Object, Object)\n  (String, String)\n"
+                   "  (Time, Date)\n  (TimeZone, LocalDateTime)\n  (TimeZone, Date)\n  (TimeZone, LocalTime)\n"))
+
+(defn- event-text Values(Str Str) [fs: &Vec(v/Field)]
+  (loop [i 0 out ""]
+    (if (>= i (count fs)) (values out "")
+      (let [f (nth fs i)
+            y (v/unmeta (:value f))
+            [t e] (cond (v/null? y) (values "" "x")
+                        (match y (v/VRegex rs rf) true _ false) (match y (v/VRegex rs rf) (values (str rs) "") _ (values "" "x"))
+                        :else (text/scalar y))]
+        (if (not= e "")
+          (values "" (str "Expecting type: `String` but got: `" (v/type-name y) "` on key: `" (:name (:key f)) "` at index: `" i "`."))
+          (recur (+ i 1) (str out (if (> i 0) "\n" "") (:name (:key f)) ": " (str/replace (str t) "\n" " "))))))))
+
+(defn write Values(Str Str) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VArr xs)
+      (loop [i 0 out ""]
+        (if (>= i (count xs)) (values out "")
+          (let [it (v/unmeta (nth xs i))]
+            (match it
+              (v/VObj fs) (let [[t e] (event-text fs)]
+                            (if (not= e "") (values "" e) (recur (+ i 1) (str out t "\n\n"))))
+              (v/VNull) (values "" PLUS-ERR)
+              _ (values "" (map-object-err it))))))
+      _ (values "" (str "Expecting input to be of type: `Array<{_: String}>` but got: `" (v/type-name x) "`")))))

@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
+
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18563"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="SF">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 前の実行の残りを消す -->
+    <flow name="reset">
+        <http:listener config-ref="HTTP" path="/reset" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>SELECT Id FROM SyncItem__c WHERE Name LIKE 'mulay type%' OR Status__c = 'name-number'</salesforce:salesforce-query>
+        </salesforce:query>
+        <choice>
+            <when expression="#[sizeOf(vars.found) > 0]">
+                <salesforce:delete config-ref="SF"><salesforce:ids>#[vars.found map $.Id]</salesforce:ids></salesforce:delete>
+            </when>
+        </choice>
+        <set-payload value="#[output application/json --- {ok: true}]"/>
+    </flow>
+
+    <!-- 値の型ごとに 1 件ずつ作る (SyncItem__c: Amount__c は数、Due__c は日付、Sync_Deleting__c はチェックボックス、Name は文字列) -->
+    <flow name="create">
+        <http:listener config-ref="HTTP" path="/create" allowedMethods="POST"/>
+        <salesforce:create config-ref="SF" type="SyncItem__c">
+            <salesforce:records>#[[
+  {Name: "mulay type typed", Amount__c: 5.5, Due__c: |2026-12-24|, Sync_Deleting__c: true, Sync_Version__c: 42},
+  {Name: "mulay type amount-string", Amount__c: "5.5"},
+  {Name: "mulay type amount-int", Amount__c: 7},
+  {Name: "mulay type due-string", Due__c: "2026-12-24"},
+  {Name: "mulay type due-datetime", Due__c: |2026-12-24T10:00:00Z|},
+  {Name: "mulay type flag-string", Sync_Deleting__c: "true"},
+  {Name: "mulay type flag-number", Sync_Deleting__c: 1},
+  {Name: 123, Status__c: "name-number"},
+  {Name: "mulay type status-number", Status__c: 456},
+  {Name: "mulay type status-bool", Status__c: false},
+  {Name: "mulay type version-string", Sync_Version__c: "99"}
+]]</salesforce:records>
+        </salesforce:create>
+        <set-payload value="#[output application/json --- payload.items map ((it, i) -> {i: i, successful: it.successful, statusCode: it.statusCode, message: it.message})]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 読んだ値の型 -->
+    <flow name="query">
+        <http:listener config-ref="HTTP" path="/query" allowedMethods="GET"/>
+        <salesforce:query config-ref="SF">
+            <salesforce:salesforce-query>SELECT Name, Amount__c, Due__c, Sync_Deleting__c, Sync_Version__c, Status__c, CreatedDate FROM SyncItem__c WHERE Name LIKE 'mulay type%' OR Status__c = 'name-number' ORDER BY Name</salesforce:salesforce-query>
+        </salesforce:query>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun t(x) = {"type": typeOf(x) as String, "class": x.^class default null}
+---
+payload map (r) -> {
+  Name: r.Name, Amount__c: r.Amount__c, Due__c: r.Due__c, Sync_Deleting__c: r.Sync_Deleting__c,
+  Sync_Version__c: r.Sync_Version__c, Status__c: r.Status__c,
+  types: {Name: t(r.Name), Amount__c: t(r.Amount__c), Due__c: t(r.Due__c), Sync_Deleting__c: t(r.Sync_Deleting__c),
+          Sync_Version__c: t(r.Sync_Version__c), CreatedDate: t(r.CreatedDate)}
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

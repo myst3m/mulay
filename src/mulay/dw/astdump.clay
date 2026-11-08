@@ -1,0 +1,219 @@
+(ns mulay.dw.astdump
+  (:require [clay.core]
+            [clay.string :as str]
+            [mulay.dw.ast :as a]
+            [mulay.dw.lex :as l]))
+
+(defn- hex1 Str [v: Int] (subs "0123456789abcdef" v (+ v 1)))
+
+(defn quote-str Str [x: &Str]
+  (loop [i 0 run 0 acc "\""]
+    (if (>= i (count x)) (str acc (subs x run i) "\"")
+      (let [c (nth x i)
+            esc (cond
+                  (= c 34) "\\\""
+                  (= c 92) "\\\\"
+                  (= c 10) "\\n"
+                  (= c 9) "\\t"
+                  (= c 13) "\\r"
+                  (< c 32) (str "\\u00" (hex1 (bit-shift-right c 4)) (hex1 (bit-and c 15)))
+                  :else "")]
+        (if (= (count esc) 0) (recur (+ i 1) run acc)
+          (recur (+ i 1) (+ i 1) (str acc (subs x run i) esc)))))))
+
+(defn- name-ok? Bool [x: &Str]
+  (and (> (count x) 0) (l/ident-start? (nth x 0))
+       (loop [i 1] (if (>= i (count x)) true (if (l/ident-char? (nth x i)) (recur (+ i 1)) false)))))
+
+(defn- qname Str [ns: &Str nm: &Str]
+  (let [n (if (name-ok? nm) (str nm) (quote-str nm))]
+    (if (= (count ns) 0) n (str ns "#" n))))
+
+(defn- join-with Str [sep: &Str xs: &Vec(Str)]
+  (loop [i 0 acc ""]
+    (if (>= i (count xs)) acc (recur (+ i 1) (str acc (if (= i 0) "" sep) (nth xs i))))))
+
+(defn- nodes Str [ns: &Vec(a/Node)]
+  (join-with " " (mapv (fn Str [n: a/Node] (dump-node n)) ns)))
+
+(defn- parts Str [ps: &Vec(a/StrPart)]
+  (if (= (count ps) 0) "\"\""
+    (let [single (and (= (count ps) 1) (match (nth ps 0) (a/SPText x) true (a/SPExpr e) false))]
+      (if single
+        (match (nth ps 0) (a/SPText x) (quote-str x) (a/SPExpr e) "")
+        (str "(str "
+             (join-with " " (mapv (fn Str [p: a/StrPart] (match p (a/SPText x) (quote-str x) (a/SPExpr e) (dump-node e))) ps))
+             ")")))))
+
+(defn- dkey Str [k: &a/Key]
+  (match k
+    (a/KName ns nm) (qname ns nm)
+    (a/KStr ps) (parts ps)
+    (a/KExpr ns e) (if (= (count ns) 0) (str "(dyn " (dump-node e) ")") (str "(dyn " ns "# " (dump-node e) ")"))))
+
+(defn- dconds Str [cs: &Vec(a/Node)]
+  (if (= (count cs) 0) "" (str " :if " (nodes cs))))
+
+(defn- dattr Str [at: &a/Attr]
+  (if (:spread at) (str "(spread " (dump-node (:value at)) (dconds (:cond at)) ")")
+    (str "(" (qname (:ns at) (:name at)) " " (dump-node (:value at)) (dconds (:cond at)) ")")))
+
+(defn- dentry Str [en: &a/Entry]
+  (match en
+    (a/EKV k ats v cs)
+    (str "(" (dkey k)
+         (if (= (count ats) 0) "" (str " :attrs (" (join-with " " (mapv (fn Str [x: a/Attr] (dattr x)) ats)) ")"))
+         " " (dump-node v) (dconds cs) ")")
+    (a/ESpread e cs) (str "(spread " (dump-node e) (dconds cs) ")")))
+
+(defn- delem Str [el: &a/Elem]
+  (if (= (count (:cond el)) 0) (dump-node (:value el))
+    (str "(when " (dump-node (:value el)) " " (nodes (:cond el)) ")")))
+
+(defn- dsel Str [s: &a/Sel]
+  (match s
+    (a/SelKey ns nm) (str "." (qname ns nm))
+    (a/SelMulti ns nm) (str ".*" (qname ns nm))
+    (a/SelDesc ns nm) (if (and (= (count ns) 0) (= (count nm) 0)) ".." (str ".." (qname ns nm)))
+    (a/SelDescMulti ns nm) (str "..*" (qname ns nm))
+    (a/SelAttr nm) (str ".@" (qname "" nm))
+    (a/SelAllAttrs) ".@"
+    (a/SelKV nm) (str ".&" (qname "" nm))
+    (a/SelDescKV nm) (str "..&" (qname "" nm))
+    (a/SelAllKV) ".&"
+    (a/SelNs) ".#"
+    (a/SelMeta nm) (if (= (count nm) 0) ".^" (str ".^" (qname "" nm)))
+    (a/SelDyn e) (str "[" (dump-node e) "]")
+    (a/SelQDyn ns e) (str "." ns "#" (dump-node e))
+    (a/SelMultiDyn e) (str "*[" (dump-node e) "]")
+    (a/SelRange x y) (str "[" (dump-node x) " to " (dump-node y) "]")
+    (a/SelFilter e) (str "[?" (dump-node e) "]")
+    (a/SelAttrDyn e) (str ".@(" (dump-node e) ")")
+    (a/SelAttrQ ns nm multi) (str (if multi ".*@" ".@") (qname ns nm))))
+
+(defn- dparam Str [p: &a/Param]
+  (if (and (= (count (:ty p)) 0) (= (count (:default p)) 0)) (str (:name p))
+    (str "(" (:name p)
+         (if (= (count (:ty p)) 0) "" (str " :type " (dump-ty (nth (:ty p) 0))))
+         (if (= (count (:default p)) 0) "" (str " :default " (dump-node (nth (:default p) 0))))
+         ")")))
+
+(defn- dparams Str [ps: &Vec(a/Param)]
+  (str "(" (join-with " " (mapv (fn Str [p: a/Param] (dparam p)) ps)) ")"))
+
+(defn- dpat Str [p: &a/Pat]
+  (match p
+    (a/PLit v) (str "(lit " (dump-node v) ")")
+    (a/PGuard c) (str "(guard " (dump-node c) ")")
+    (a/PType t) (str "(is " (dump-ty t) ")")
+    (a/PRegex r) (str "(matches " (dump-node r) ")")
+    (a/PArrDestr h t) (str "(arr " h " " t ")")
+    (a/PObjDestr k v t) (str "(obj " k " " v " " t ")")
+    (a/PElse) "else"))
+
+(defn- bind-str Str [b: &Str] (if (= (count b) 0) "_" (str b)))
+
+(defn- dcase Str [c: &a/Case]
+  (str "(case " (bind-str (:bind c)) " " (dpat (:pat c)) " " (dump-node (:body c)) ")"))
+
+(defn- dupd Str [c: &a/UpdCase]
+  (str "(case " (bind-str (:bind c)) " " (bind-str (:index c))
+       " (" (join-with " " (mapv (fn Str [x: a/Sel] (dsel x)) (:path c))) ")"
+       (if (:upsert c) " !" "")
+       (dconds (:cond c))
+       " " (dump-node (:body c)) ")"))
+
+(defn- decls Str [ds: &Vec(a/DeclAt)]
+  (join-with " " (mapv (fn Str [d: a/DeclAt] (dump-decl d)) ds)))
+
+(defn dump-node Str [n: &a/Node]
+  (match (:e n)
+    (a/ENull) "null"
+    (a/EBool b) (if b "true" "false")
+    (a/ENum t) (str t)
+    (a/EStr ps) (parts ps)
+    (a/ERegex p f) (if (= (count f) 0) (str "(regex " (quote-str p) ")") (str "(regex " (quote-str p) " " (quote-str f) ")"))
+    (a/ETemporal k t) (str "(" k " " (quote-str t) ")")
+    (a/ERef nm) (str nm)
+    (a/EArr els) (if (= (count els) 0) "(arr)" (str "(arr " (join-with " " (mapv (fn Str [x: a/Elem] (delem x)) els)) ")"))
+    (a/EObj es) (if (= (count es) 0) "(obj)" (str "(obj " (join-with " " (mapv (fn Str [x: a/Entry] (dentry x)) es)) ")"))
+    (a/EUnary op e) (str "(" op " " (dump-node e) ")")
+    (a/EBin op x y osp) (str "(" op " " (dump-node x) " " (dump-node y) ")")
+    (a/ECall f args) (if (= (count args) 0) (str "(call " (dump-node f) ")") (str "(call " (dump-node f) " " (nodes args) ")"))
+    (a/ELambda ps ret body)
+    (str "(fn " (dparams ps) (if (= (count ret) 0) "" (str " :ret " (dump-ty (nth ret 0)))) " " (dump-node body) ")")
+    (a/ESelect t s) (str "(sel " (dump-node t) " " (dsel s) ")")
+    (a/EExists t) (str "(exists " (dump-node t) ")")
+    (a/EAssert t) (str "(assert " (dump-node t) ")")
+    (a/EIf c x y) (str "(if " (dump-node c) " " (dump-node x) " " (dump-node y) ")")
+    (a/EMatch t cs) (str "(match " (dump-node t) (loop [i 0 acc ""] (if (>= i (count cs)) acc (recur (+ i 1) (str acc " " (dcase (nth cs i)))))) ")")
+    (a/EAs e t) (str "(as " (dump-node e) " " (dump-ty t) ")")
+    (a/EIs e t) (str "(is " (dump-node e) " " (dump-ty t) ")")
+    (a/EMetaSet e m) (str "(<~ " (dump-node e) " " (dump-node m) ")")
+    (a/EDo ds b) (str "(do (" (decls ds) ") " (dump-node b) ")")
+    (a/EUsing ds b) (str "(using (" (decls ds) ") " (dump-node b) ")")
+    (a/EUpdate t cs) (str "(update " (dump-node t) (loop [i 0 acc ""] (if (>= i (count cs)) acc (recur (+ i 1) (str acc " " (dupd (nth cs i)))))) ")")
+    (a/ETypeRef t) (str "(type " (dump-ty t) ")")
+    (a/EErr m) (str "(err " (quote-str m) ")")))
+
+(defn- dfield Str [f: &a/TField]
+  (str "(" (if (= (count (:key f)) 0) "_" (qname (:ns f) (:key f)))
+       (if (:optional f) "?" "") (if (:repeated f) "*" "")
+       " " (dump-ty (:ty f)) ")"))
+
+(defn- tys Str [ts: &Vec(a/Ty)] (join-with " " (mapv (fn Str [t: a/Ty] (dump-ty t)) ts)))
+
+(defn dump-ty Str [t: &a/Ty]
+  (match (:t t)
+    (a/TName nm args) (if (= (count args) 0) (str nm) (str "(" nm " " (tys args) ")"))
+    (a/TObj fs closed ordered)
+    (str "(tobj" (if closed " :closed" "") (if ordered " :ordered" "")
+         (loop [i 0 acc ""] (if (>= i (count fs)) acc (recur (+ i 1) (str acc " " (dfield (nth fs i))))))
+         ")")
+    (a/TUnion alts) (str "(| " (tys alts) ")")
+    (a/TInter ps) (str "(& " (tys ps) ")")
+    (a/TLit v) (str "(tlit " (dump-node v) ")")
+    (a/TFn ps r) (str "(-> (" (tys ps) ") " (dump-ty r) ")")
+    (a/TMeta b sc) (str "(tmeta " (dump-ty b) " " (dump-node sc) ")")
+    (a/TSel b ns nm) (str "(tsel " (dump-ty b) " " (qname ns nm) ")")))
+
+(defn- dannot Str [an: &a/Annotation]
+  (if (= (count (:args an)) 0) (str "@" (:name an)) (str "(@" (:name an) " " (nodes (:args an)) ")")))
+
+(defn dump-decl Str [da: &a/DeclAt]
+  (match (:d da)
+    (a/DVar nm ty v) (str "(var " nm (if (= (count ty) 0) "" (str " :type " (dump-ty (nth ty 0)))) " " (dump-node v) ")")
+    (a/DFun nm ps ret body ans gens)
+    (str "(fun " nm
+         (if (= (count gens) 0) "" (str " :generics (" (join-with " " gens) ")"))
+         (if (= (count ans) 0) "" (str " :annots (" (join-with " " (mapv (fn Str [x: a/Annotation] (dannot x)) ans)) ")"))
+         " " (dparams ps)
+         (if (= (count ret) 0) "" (str " :ret " (dump-ty (nth ret 0))))
+         " " (dump-node body) ")")
+    (a/DType nm gens t)
+    (str "(type " nm (if (= (count gens) 0) "" (str " :generics (" (join-with " " gens) ")")) " " (dump-ty t) ")")
+    (a/DNs p u) (str "(ns " p " " (quote-str u) ")")
+    (a/DImport m names star alias)
+    (str "(import " m
+         (if star " :star" "")
+         (if (= (count names) 0) ""
+           (str " :names (" (join-with " " (mapv (fn Str [x: a/ImportName] (if (= (count (:alias x)) 0) (str (:name x)) (str "(" (:name x) " :as " (:alias x) ")"))) names)) ")"))
+         (if (= (count alias) 0) "" (str " :as " alias))
+         ")")
+    (a/DAnnotationDef nm ps) (str "(annotation " nm " " (dparams ps) ")")))
+
+(defn- ddir Str [d: &a/Directive]
+  (str "(" (:kind d)
+       (if (= (count (:name d)) 0) "" (str " " (:name d)))
+       (if (= (count (:ty d)) 0) "" (str " :type " (dump-ty (nth (:ty d) 0))))
+       " " (quote-str (:mime d))
+       (if (= (count (:fmt d)) 0) "" (str " :with " (:fmt d)))
+       (match (:e (:props d)) (a/ENull) "" _ (str " " (dump-node (:props d))))
+       ")"))
+
+(defn dump-script Str [sc: &a/Script]
+  (str "(script"
+       (if (= (count (:version sc)) 0) "" (str " :version " (quote-str (:version sc))))
+       (if (= (count (:directives sc)) 0) "" (str " (dirs " (join-with " " (mapv (fn Str [d: a/Directive] (ddir d)) (:directives sc))) ")"))
+       (if (= (count (:decls sc)) 0) "" (str " (decls " (decls (:decls sc)) ")"))
+       " " (dump-node (:body sc)) ")"))

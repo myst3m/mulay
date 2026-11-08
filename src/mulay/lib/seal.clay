@@ -1,0 +1,50 @@
+(ns mulay.lib.seal
+  (:require [mulay.lib.crypto :as cr] [clay.string :as str]))
+
+(def BAD-KEY "wrong key, or the data is corrupted")
+
+(def MAGIC "MS1")
+(def ITERS 100000)
+
+(defn- pad Str [s: &Str]
+  (let [p (- 16 (mod (count s) 16))]
+    (loop [i 0 out (str s)] (if (>= i p) out (recur (+ i 1) (str out (chr p)))))))
+
+(defn- unpad Values(Str Bool) [s: &Str]
+  (let [n (count s)]
+    (if (= n 0) (values "" false)
+      (let [p (nth s (- n 1))]
+        (if (or (< p 1) (> p 16) (> p n)) (values "" false)
+          (values (subs s 0 (- n p)) true))))))
+
+(defn- derive Values(Str Bool) [pass: &Str salt: &Str]
+  (cr/pbkdf2 "SHA256" pass salt ITERS 64))
+
+(defn seal Values(Str Str) [pass: &Str plain: &Str]
+  (if (= (count pass) 0) (values "" "the key is empty")
+    (let [[salt s1] (cr/random-bytes 16)
+          [iv s2] (cr/random-bytes 16)]
+      (if (not (and s1 s2)) (values "" "no random bytes available")
+        (let [[dk ok] (derive pass salt)]
+          (if (not ok) (values "" "key derivation failed")
+            (let [[ct ok2] (cr/aes-cbc true (subs dk 0 32) iv (pad plain))]
+              (if (not ok2) (values "" "encryption failed")
+                (let [body (str MAGIC salt iv ct)
+                      [mac ok3] (cr/hmac "SHA256" (subs dk 32 64) body)]
+                  (if ok3 (values (str body mac) "") (values "" "authentication failed")))))))))))
+
+(defn unseal Values(Str Str) [pass: &Str sealed: &Str]
+  (let [n (count sealed)]
+    (if (or (< n (+ 3 16 16 16 32)) (not= (subs sealed 0 3) MAGIC) (not= (mod (- n 3 16 16 32) 16) 0)) (values "" BAD-KEY)
+      (let [salt (subs sealed 3 19)
+            iv (subs sealed 19 35)
+            ct (subs sealed 35 (- n 32))
+            body (subs sealed 0 (- n 32))
+            mac (subs sealed (- n 32) n)
+            [dk ok] (derive pass salt)]
+        (if (not ok) (values "" BAD-KEY)
+          (let [[want ok2] (cr/hmac "SHA256" (subs dk 32 64) body)]
+            (if (or (not ok2) (not= want mac)) (values "" BAD-KEY)
+              (let [[pt ok3] (cr/aes-cbc false (subs dk 0 32) iv ct)
+                    [plain ok4] (unpad pt)]
+                (if (and ok3 ok4) (values plain "") (values "" BAD-KEY))))))))))

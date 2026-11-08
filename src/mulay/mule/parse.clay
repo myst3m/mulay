@@ -1,0 +1,1288 @@
+(ns mulay.mule.parse
+  (:require [mulay.mule.errtypes :as et] [clay.core] [clay.string :as str]
+            [mulay.mule.model :as m] [mulay.dw.explain :as ex] [mulay.mule.props :as pr] [mulay.lib.res :as res]
+            [mulay.dw.engine :as eng] [mulay.lib.xml :as xml]))
+
+(def NS-CORE "http://www.mulesoft.org/schema/mule/core")
+(def NS-EE "http://www.mulesoft.org/schema/mule/ee/core")
+(def NS-BATCH "http://www.mulesoft.org/schema/mule/batch")
+(def NS-HTTP "http://www.mulesoft.org/schema/mule/http")
+(def NS-DOC "http://www.mulesoft.org/schema/mule/documentation")
+(def NS-OS "http://www.mulesoft.org/schema/mule/os")
+(def NS-MUNIT "http://www.mulesoft.org/schema/mule/munit")
+
+(defrecord SrcDoc [file: Str root: xml/XNode lines: xml/XLines text: Str])
+
+(defrecord St [file: Str diags: Vec(m/Diag) rr: Int res: res/ResSet imports: Vec(Str) path: Str dsl: Str elem: Str attrs: Vec(Str) hints: m/Hints raw: Str])
+
+(defn- diag St [st: St line: Int msg: &Str]
+  (assoc st :diags (conj (:diags st) (m/->Diag (str (:file st)) line (str msg) (str (:path st)) []))))
+
+(defn- loc m/Loc [st: &St line: Int] (m/->Loc (str (:file st)) line (str (:path st)) (str (:dsl st)) (str (:elem st)) (:attrs st)))
+
+(defn ns-name Str [uri: &Str]
+  (let [u (if (str/ends-with? uri "/") (subs uri 0 (- (count uri) 1)) (str uri))
+        segs: Vec(Str) (str/split u "/")
+        n (count segs)]
+    (cond (= n 0) ""
+          (and (= (nth segs (- n 1)) "core") (> n 1)) (nth segs (- n 2))
+          :else (nth segs (- n 1)))))
+
+(defn- kid-lines xml/XLines [ln: &xml/XLines i: Int]
+  (if (< i (count (:kids ln))) (nth (:kids ln) i)
+    (let [z: Vec(xml/XLines) []] (xml/->XLines (:line ln) z xml/NO-SPAN))))
+
+(defn- core? Bool [n: &xml/XNode l: &Str] (and (= (xml/elem-uri n) NS-CORE) (= (xml/elem-local n) l)))
+(defn- is? Bool [n: &xml/XNode u: &Str l: &Str] (and (= (xml/elem-uri n) u) (= (xml/elem-local n) l)))
+
+(defn- a Str [n: &xml/XNode name: &Str] (xml/attr n "" name ""))
+(defn- has? Bool [n: &xml/XNode name: &Str] (xml/has-attr? n "" name))
+
+(defn- own-text Str [n: &xml/XNode]
+  (let [cs (xml/elem-children n)]
+    (loop [i 0 out ""]
+      (if (>= i (count cs)) out
+        (match (nth cs i)
+          (xml/XnText t) (recur (+ i 1) (str out t))
+          (xml/XnCData t) (recur (+ i 1) (str out t))
+          _ (recur (+ i 1) out))))))
+
+(defn- ws-byte? Bool [c: Int] (or (= c 32) (= c 9) (= c 10) (= c 13)))
+
+(defn- xtrim Str [s: &Str]
+  (let [n (count s)
+        b (loop [i 0] (if (and (< i n) (ws-byte? (nth s i))) (recur (+ i 1)) i))
+        e (loop [j n] (if (and (> j b) (ws-byte? (nth s (- j 1)))) (recur (- j 1)) j))]
+    (subs s b e)))
+
+(defn- parse-int Values(Int Bool) [s0: &Str]
+  (let [s (xtrim s0) n (count s)
+        neg (and (> n 0) (= (nth s 0) 45))
+        st (if neg 1 0)]
+    (if (or (<= n st) (> (- n st) 18)) (values 0 false)
+      (loop [i st acc 0]
+        (if (>= i n) (values (if neg (- 0 acc) acc) true)
+          (let [c (nth s i)]
+            (if (and (>= c 48) (<= c 57)) (recur (+ i 1) (+ (* acc 10) (- c 48))) (values 0 false))))))))
+
+(defn- int-attr Values(Int St) [n: &xml/XNode name: &Str default: Int st: St line: Int]
+  (if (not (has? n name)) (values default st)
+    (let [v (a n name) [x ok] (parse-int v)]
+      (if ok (values x st)
+        (values default (diag st line (str "<" (xml/elem-local n) "> " name ": not an integer: \"" v "\"")))))))
+
+(defn- bool-attr Bool [n: &xml/XNode name: &Str default: Bool]
+  (if (not (has? n name)) default
+    (let [v (str/upper-case (xtrim (a n name)))] (if default (not= v "FALSE") (= v "TRUE")))))
+
+(defn- elem-label Str [n: &xml/XNode] (xml/qname-str (xml/elem-name n)))
+
+(defn- subst-str Values(Str St) [s: &Str p: &pr/Props st: St line: Int]
+  (if (not (str/includes? s "${")) (values (str s) st)
+    (let [[v errs] (pr/resolve-str p s)]
+      (values v (loop [i 0 t st] (if (>= i (count errs)) t (recur (+ i 1) (diag t line (nth errs i)))))))))
+
+(defn- subst-node Values(xml/XNode St) [n: &xml/XNode ln: &xml/XLines p: &pr/Props st0: St]
+  (match n
+    (xml/XnElem q as ns cs)
+    (let [line (:line ln)
+          [as2 st1] (loop [i 0 acc: Vec(xml/XAttr) [] st st0]
+                      (if (>= i (count as)) (values acc st)
+                        (let [x (nth as i) [v st2] (subst-str (:value x) p st line)]
+                          (recur (+ i 1) (conj acc (xml/->XAttr (:name x) v)) st2))))
+          [cs2 st3] (loop [i 0 k 0 acc: Vec(xml/XNode) [] st st1]
+                      (if (>= i (count cs)) (values acc st)
+                        (let [c (nth cs i)]
+                          (match c
+                            (xml/XnElem q2 a2 n2 c2)
+                            (let [[c3 st4] (subst-node c (kid-lines ln k) p st)] (recur (+ i 1) (+ k 1) (conj acc c3) st4))
+                            (xml/XnText t)
+                            (if (= (count (xtrim t)) 0) (recur (+ i 1) k acc st)
+                              (let [[t2 st4] (subst-str t p st line)] (recur (+ i 1) k (conj acc (xml/->XnText t2)) st4)))
+                            (xml/XnCData t)
+                            (let [[t2 st4] (subst-str t p st line)] (recur (+ i 1) k (conj acc (xml/->XnCData t2)) st4))
+                            _ (recur (+ i 1) k acc st)))))]
+      (values (xml/->XnElem q as2 ns cs2) st3))
+    _ (values n st0)))
+
+(defn- expr-text? Bool [s: &Str]
+  (and (str/starts-with? s "#[") (str/ends-with? s "]") (>= (count s) 3)))
+
+(defn- module-loader Fn(Str Values(Str Bool)) [rs: &res/ResSet mods: &Vec(Str)]
+  (let [r rs ms mods]
+    (fn Values(Str Bool) [m: Str]
+      (let [k (loop [i 0] (if (>= (+ i 1) (count ms)) -1 (if (= (nth ms i) m) i (recur (+ i 2)))))]
+        (if (>= k 0) (values (nth ms (+ k 1)) true) (res/res-read r (eng/module-path m)))))))
+
+(defn- compile-script Values(eng/Compiled St) [script: &Str st: St line: Int what: &Str]
+  (compile-script-at script st line what (:file st) (:raw st) -1 0))
+
+(defn- compile-script-at Values(eng/Compiled St) [script: &Str st: St line: Int what: &Str file: &Str raw: &Str base: Int off: Int]
+  (let [c (eng/compile-with script m/BINDINGS (module-loader (:res st) (:modules (:hints st))))]
+    (if (eng/ok? c) (values c st)
+      (let [rep (ex/script-report (str file) (str raw) base off script c (ex/->Ctx m/BINDINGS false) (str what) line)]
+        (values c (assoc st :diags (conj (:diags st) (m/->Diag (str (:file st)) line (str what ": DataWeave compile error: " (eng/render-first-error script c what)) (str (:path st)) [rep]))))))))
+
+(def DIRECTIVES ["output" "import" "var" "fun" "ns" "type" "input"])
+
+(defn- has-header? Bool [b: &Str]
+  (or (str/starts-with? b "%dw")
+      (and (str/includes? b "---")
+           (loop [i 0]
+             (if (>= i (count DIRECTIVES)) false
+               (let [d (nth DIRECTIVES i) n (count d)]
+                 (if (and (str/starts-with? b d) (> (count b) n) (ws-byte? (nth b n))) true (recur (+ i 1)))))))))
+
+(def WRAP "%dw 2.0\n---\n")
+
+(defn- ident-start? Bool [c: Int] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 95)))
+(defn- ident-char? Bool [c: Int] (or (ident-start? c) (and (>= c 48) (<= c 57))))
+
+(defn- close-paren Int [s: &Str from: Int]
+  (loop [j from d 1 q 0]
+    (if (>= j (count s)) j
+      (let [c (nth s j)]
+        (cond
+          (> q 0) (cond (= c 92) (recur (+ j 2) d q) (= c q) (recur (+ j 1) d 0) :else (recur (+ j 1) d q))
+          (or (= c 34) (= c 39) (= c 96)) (recur (+ j 1) d c)
+          (= c 40) (recur (+ j 1) (+ d 1) q)
+          (= c 41) (if (= d 1) j (recur (+ j 1) (- d 1) q))
+          :else (recur (+ j 1) d q))))))
+
+(defn- meta-only-ref? Bool [s: &Str e: Int]
+  (let [n (loop [j e] (if (and (< j (count s)) (or (= (nth s j) 32) (= (nth s j) 9))) (recur (+ j 1)) j))]
+    (and (< (+ n 1) (count s)) (= (nth s n) 46) (= (nth s (+ n 1)) 94)
+         (let [b (+ n 2)
+               x (loop [k b] (if (and (< k (count s)) (ident-char? (nth s k))) (recur (+ k 1)) k))
+               nm (subs s b x)]
+           (or (= nm "mimeType") (= nm "encoding"))))))
+
+(defn- add-raw Vec(Str) [acc: Vec(Str) name: &Str]
+  (if (loop [k 0] (if (>= k (count acc)) false (if (= (nth acc k) name) true (recur (+ k 1))))) acc (conj acc (str name))))
+
+(defn- add-var-ref Vec(Str) [acc: Vec(Str) s: &Str e: Int]
+  (if (and (< (+ e 1) (count s)) (= (nth s e) 46) (ident-start? (nth s (+ e 1))))
+    (let [x (loop [k (+ e 1)] (if (and (< k (count s)) (ident-char? (nth s k))) (recur (+ k 1)) k))]
+      (add-raw acc (str "vars." (subs s (+ e 1) x))))
+    acc))
+
+(defn- call-ahead? Bool [s: &Str e: Int]
+  (let [n (loop [j e] (if (and (< j (count s)) (or (= (nth s j) 32) (= (nth s j) 9))) (recur (+ j 1)) j))]
+    (and (< n (count s)) (= (nth s n) 40))))
+
+(defn- add-ref Vec(Str) [acc: Vec(Str) name: &Str]
+  (let [known (or (= name "payload^") (loop [k 0] (if (>= k (count m/BINDINGS)) false (if (= (nth m/BINDINGS k) name) true (recur (+ k 1))))))
+        dup (loop [k 0] (if (>= k (count acc)) false (if (= (nth acc k) name) true (recur (+ k 1)))))]
+    (if (and known (not dup)) (conj acc (str name)) acc)))
+
+(defn- value-ref? Bool [s: &Str b: Int e: Int]
+  (let [p (loop [j (- b 1)] (if (and (>= j 0) (or (= (nth s j) 32) (= (nth s j) 9) (= (nth s j) 10) (= (nth s j) 13))) (recur (- j 1)) j))
+        pc (if (>= p 0) (nth s p) 0)
+        ppc (if (>= p 1) (nth s (- p 1)) 0)
+        n (loop [j e] (if (and (< j (count s)) (or (= (nth s j) 32) (= (nth s j) 9))) (recur (+ j 1)) j))
+        nc (if (< n (count s)) (nth s n) 0)
+        nnc (if (< (+ n 1) (count s)) (nth s (+ n 1)) 0)]
+    (not (or (= pc 46) (= pc 94) (= pc 64) (= pc 35)
+             (and (or (= pc 63) (= pc 42)) (= ppc 46))
+             (and (= nc 58) (not= nnc 58))))))
+
+(defn- input-refs Vec(Str) [s: &Str acc0: Vec(Str)]
+  (loop [i 0 acc acc0]
+    (if (>= i (count s)) acc
+      (let [c (nth s i)]
+        (cond
+          (and (= c 47) (< (+ i 1) (count s)) (= (nth s (+ i 1)) 47))
+          (recur (loop [j i] (if (and (< j (count s)) (not= (nth s j) 10)) (recur (+ j 1)) j)) acc)
+          (and (= c 47) (< (+ i 1) (count s)) (= (nth s (+ i 1)) 42))
+          (let [k (str/index-of-after s "*/" (+ i 2))] (recur (if (< k 0) (count s) (+ k 2)) acc))
+          (or (= c 34) (= c 39) (= c 96))
+          (let [[j acc2] (loop [j (+ i 1) a acc]
+                           (if (>= j (count s)) (values j a)
+                             (let [d (nth s j)]
+                               (cond (= d 92) (recur (+ j 2) a)
+                                     (= d c) (values (+ j 1) a)
+                                     (and (= d 36) (< (+ j 1) (count s)) (= (nth s (+ j 1)) 40))
+                                     (let [e (close-paren s (+ j 2))] (recur (+ e 1) (input-refs (subs s (+ j 2) (if (> e (count s)) (count s) e)) a)))
+                                     (and (= d 36) (< (+ j 1) (count s)) (ident-start? (nth s (+ j 1))))
+                                     (let [e (loop [k (+ j 1)] (if (and (< k (count s)) (ident-char? (nth s k))) (recur (+ k 1)) k))]
+                                       (recur e (add-ref a (subs s (+ j 1) e))))
+                                     :else (recur (+ j 1) a)))))]
+            (recur j acc2))
+          (ident-start? c)
+          (let [e (loop [k i] (if (and (< k (count s)) (ident-char? (nth s k))) (recur (+ k 1)) k))]
+            (recur e (if (value-ref? s i e)
+                       (let [nm (subs s i e)
+                             a2 (add-ref acc (if (and (= nm "payload") (meta-only-ref? s e)) "payload^" nm))]
+                         (cond (= nm "vars") (add-var-ref a2 s e)
+                               (and (= nm "p") (call-ahead? s e)) (add-raw a2 "p()")
+                               :else a2))
+                       acc)))
+          (and (>= c 48) (<= c 57))
+          (recur (loop [k i] (if (and (< k (count s)) (ident-char? (nth s k))) (recur (+ k 1)) k)) acc)
+          :else (recur (+ i 1) acc))))))
+
+(defn refs Vec(Str) [s: &Str] (let [z: Vec(Str) []] (input-refs s z)))
+(def WHERE "anonymous::main")
+
+(defn- line-off Int [raw: &Str line: Int]
+  (if (< line 1) -1
+    (loop [i 0 k 1] (cond (= k line) i (>= i (count raw)) -1 (= (nth raw i) 10) (recur (+ i 1) (+ k 1)) :else (recur (+ i 1) k)))))
+
+(defn- attr-at Int [raw: &Str from: Int name: &Str]
+  (loop [i from]
+    (let [j (str/index-of-after raw (str name "=") i)]
+      (cond (< j 0) -1
+            (and (> j 0) (let [c (nth raw (- j 1))] (or (= c 32) (= c 9) (= c 10) (= c 13)))) (+ j (count name) 1)
+            :else (recur (+ j 1))))))
+
+(defn- locate Int [st: &St line: Int what: &Str body: &Str]
+  (let [raw (:raw st)
+        ls (line-off raw line)
+        gt (str/last-index-of what "> ")
+        attr (if (< gt 0) "" (subs what (+ gt 2) (count what)))]
+    (cond (or (< ls 0) (= body "")) -1
+          (= attr "")
+          (str/index-of-after raw body ls)
+          :else
+          (let [q (attr-at raw ls attr)]
+            (if (or (< q 0) (>= q (count raw)) (not (or (= (nth raw q) 34) (= (nth raw q) 39)))) -1
+              (let [e (str/index-of-after raw (subs raw q (+ q 1)) (+ q 1))
+                    k (str/index-of-after raw body (+ q 1))]
+                (if (and (>= k 0) (>= e 0) (<= (+ k (count body)) e)) k -1)))))))
+
+(defn- compile-body Values(m/PVal St) [orig: &Str body: &Str st: St line: Int what: &Str]
+  (let [b (xtrim body)
+        hdr (has-header? b)
+        script (if hdr (str b) (str WRAP b))
+        base (locate st line what b)
+        [c st2] (compile-script-at script st line what (:file st) (:raw st) base (if hdr 0 (count WRAP)))]
+    (values (m/->PExpr (str orig) c (m/->ExprSrc (str b) script (if hdr 0 (count WRAP)) WHERE false (refs b) (str (:file st)) base)) st2)))
+
+(defn- with-where m/PVal [p: m/PVal w: &Str]
+  (match p
+    (m/PExpr t c s) (m/->PExpr t c (m/->ExprSrc (:expr s) (:script s) (:off s) (str w) (:plain s) (:uses s) (:file s) (:base s)))
+    _ p))
+
+(defn- close-bracket Int [s: &Str from: Int]
+  (loop [j from d 1 q 0]
+    (if (>= j (count s)) -1
+      (let [c (nth s j)]
+        (cond
+          (> q 0) (cond (= c 92) (recur (+ j 2) d q) (= c q) (recur (+ j 1) d 0) :else (recur (+ j 1) d q))
+          (or (= c 34) (= c 39) (= c 96)) (recur (+ j 1) d c)
+          (= c 91) (recur (+ j 1) (+ d 1) q)
+          (= c 93) (if (= d 1) j (recur (+ j 1) (- d 1) q))
+          :else (recur (+ j 1) d q))))))
+
+(defn- dw-str-esc Str [out: Str s: &Str]
+  (loop [i 0 o out]
+    (if (>= i (count s)) o
+      (let [c (nth s i)]
+        (cond (= c 34) (recur (+ i 1) (str o "\\\""))
+              (= c 92) (recur (+ i 1) (str o "\\\\"))
+              (= c 36) (recur (+ i 1) (str o "\\$"))
+              :else (recur (+ i 1) (str o (chr c))))))))
+
+(defn- pval Values(m/PVal St) [s0: &Str st: St line: Int what: &Str]
+  (let [s (xtrim s0)]
+    (cond
+      (expr-text? s) (compile-body s0 (subs s 2 (- (count s) 1)) st line what)
+      (str/includes? s "#[")
+      (let [col (+ (str/index-of s "#[") 2)
+            msg (str "Script '" s "' has errors: \n\tInvalid input '[', expected ??? (line 1, column " col "):\n at 1 : " col)
+            script (str WRAP "dw::Runtime::fail(\"" (dw-str-esc "" msg) "\")")
+            [c st2] (compile-script script st line what)]
+        (values (m/->PExpr (str s0) c (m/->ExprSrc (str s) script (count WRAP) WHERE true [] "" -1)) st2))
+      :else (values (m/->PLit (str s0)) st))))
+
+(defn- pval-expr Values(m/PVal St) [s0: &Str st: St line: Int what: &Str]
+  (let [s (xtrim s0)]
+    (if (expr-text? s) (compile-body s0 (subs s 2 (- (count s) 1)) st line what)
+      (compile-body s0 s st line what))))
+
+(defn- opt-pval Values(Vec(m/PVal) St) [n: &xml/XNode name: &Str st: St line: Int]
+  (if (not (has? n name)) (let [z: Vec(m/PVal) []] (values z st))
+    (let [[v st2] (pval (a n name) st line (str "<" (elem-label n) "> " name))] (values [v] st2))))
+
+(defn- opt-pval-expr Values(Vec(m/PVal) St) [n: &xml/XNode name: &Str st: St line: Int]
+  (if (or (not (has? n name)) (= (xtrim (a n name)) "")) (let [z: Vec(m/PVal) []] (values z st))
+    (let [[v st2] (pval-expr (a n name) st line (str "<" (elem-label n) "> " name))] (values [v] st2))))
+
+(defn- attr-params Values(Vec(m/Param) St) [n: &xml/XNode st0: St line: Int]
+  (let [as (xml/elem-attrs n)]
+    (loop [i 0 acc: Vec(m/Param) [] st st0]
+      (if (>= i (count as)) (values acc st)
+        (let [x (nth as i) q (:name x)]
+          (if (= (:uri q) NS-DOC) (recur (+ i 1) acc st)
+            (let [nm (xml/qname-str q)
+                  [v st2] (pval (:value x) st line (str "<" (elem-label n) "> " nm))]
+              (recur (+ i 1) (conj acc (m/->Param nm v)) st2))))))))
+
+(defn- lit-params Vec(m/Param) [n: &xml/XNode]
+  (let [as (xml/elem-attrs n)]
+    (loop [i 0 acc: Vec(m/Param) []]
+      (if (>= i (count as)) acc
+        (let [x (nth as i) q (:name x)]
+          (recur (+ i 1) (if (= (:uri q) NS-DOC) acc (conj acc (m/->Param (xml/qname-str q) (m/->PLit (str (:value x))))))))))))
+
+(defn- collect-exprs Values(Vec(m/Param) St) [n: &xml/XNode ln: &xml/XLines prefix: &Str acc0: Vec(m/Param) st0: St]
+  (collect-exprs-skip n ln prefix acc0 st0 []))
+
+(defn- collect-exprs-skip Values(Vec(m/Param) St) [n: &xml/XNode ln: &xml/XLines prefix: &Str acc0: Vec(m/Param) st0: St skip: Vec(Str)]
+  (let [kids (xml/child-elems n)]
+    (loop [i 0 acc acc0 st st0]
+      (if (>= i (count kids)) (values acc st)
+        (let [c (nth kids i)
+              cl (kid-lines ln i)
+              line (:line cl)
+              local (xml/elem-local c)
+              dup (loop [j 0 cnt 0] (if (>= j (count kids)) (> cnt 1) (recur (+ j 1) (if (= (xml/elem-local (nth kids j)) local) (+ cnt 1) cnt))))
+              idx (loop [j 0 cnt 0] (if (>= j i) cnt (recur (+ j 1) (if (= (xml/elem-local (nth kids j)) local) (+ cnt 1) cnt))))
+              name (if dup (str local "[" idx "]") (str local))
+              path (if (= prefix "") name (str prefix "/" name))]
+          (if (or (= (xml/elem-uri c) NS-DOC) (has-name? skip local)) (recur (+ i 1) acc st)
+            (let [t (own-text c)
+                  [acc1 st1] (if (str/includes? t "#[")
+                               (let [[v st2] (pval t st line (str "<" (elem-label c) ">"))] (values (conj acc (m/->Param path v)) st2))
+                               (values acc st))
+                  as (xml/elem-attrs c)
+                  [acc2 st3] (loop [k 0 ac acc1 s st1]
+                               (if (>= k (count as)) (values ac s)
+                                 (let [x (nth as k)]
+                                   (if (and (not= (:uri (:name x)) NS-DOC) (str/includes? (:value x) "#["))
+                                     (let [nm (xml/qname-str (:name x))
+                                           [v s2] (pval (:value x) s line (str "<" (elem-label c) "> " nm))]
+                                       (recur (+ k 1) (conj ac (m/->Param (str path "@" nm) v)) s2))
+                                     (recur (+ k 1) ac s)))))
+                  [acc3 st4] (collect-exprs c cl path acc2 st3)]
+              (recur (+ i 1) acc3 st4))))))))
+
+(defn- content-nodes Vec(xml/XNode) [n: &xml/XNode]
+  (let [cs (xml/elem-children n)]
+    (loop [i 0 acc: Vec(xml/XNode) []]
+      (if (>= i (count cs)) acc
+        (let [c (nth cs i)]
+          (recur (+ i 1) (if (and (xml/elem? c) (= (xml/elem-uri c) NS-DOC)) acc (conj acc c))))))))
+
+(defn- xesc Str [out: Str s: &Str]
+  (loop [i 0 o out]
+    (if (>= i (count s)) o
+      (let [c (nth s i)]
+        (recur (+ i 1) (cond (= c 38) (str o "&amp;") (= c 60) (str o "&lt;") (= c 62) (str o "&gt;") (= c 34) (str o "&quot;")
+                             :else (str o (chr c))))))))
+
+(defn- enter St [st: St c: &xml/XNode path: Str]
+  (assoc (assoc (assoc (assoc st :path path) :dsl (dsl-of c)) :elem (elem-name c)) :attrs (raw-attrs c)))
+
+(defn- leave St [st: St outer: &St base: Str]
+  (assoc (assoc (assoc (assoc st :path base) :dsl (str (:dsl outer))) :elem (str (:elem outer))) :attrs (:attrs outer)))
+
+(defn- elem-name Str [n: &xml/XNode]
+  (let [u (xml/elem-uri n)] (str (if (= u NS-CORE) "mule" (ns-name u)) ":" (xml/elem-local n))))
+
+(defn- raw-attrs Vec(Str) [n: &xml/XNode]
+  (let [as (xml/elem-attrs n)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count as)) acc
+        (let [x (nth as i) q (:name x)
+              nm (if (= (:uri q) NS-DOC) (str "doc:" (:local q)) (xml/qname-str q))]
+          (recur (+ i 1) (conj (conj acc nm) (str (:value x)))))))))
+
+(defn- dsl-of Str [n: &xml/XNode]
+  (match n
+    (xml/XnElem q as nss cs)
+    (let [tag (xml/qname-str q)
+          o1 (loop [i 0 o (str "<" tag)]
+               (if (>= i (count as)) (str o ">")
+                 (let [x (nth as i)]
+                   (if (= (:uri (:name x)) NS-DOC) (recur (+ i 1) o)
+                     (recur (+ i 1) (str (xesc (str o " " (xml/qname-str (:name x)) "=\"") (:value x)) "\""))))))
+          o2 (loop [i 0 o o1]
+               (if (>= i (count cs)) o
+                 (let [c (nth cs i)]
+                   (match c
+                     (xml/XnElem q2 a2 n2 c2) (recur (+ i 1) (if (= (xml/elem-uri c) NS-DOC) o (let [d (dsl-of c)] (str o d))))
+                     (xml/XnText t) (recur (+ i 1) (xesc o t))
+                     (xml/XnCData t) (recur (+ i 1) (xesc o t))
+                     _ (recur (+ i 1) o)))))]
+      (str o2 "</" tag ">"))
+    _ ""))
+
+(defn- parse-procs Values(Vec(m/Proc) St) [n: &xml/XNode ln: &xml/XLines from: Int st0: St]
+  (let [kids (xml/child-elems n)
+        base (str (:path st0))]
+    (loop [i from k 0 acc: Vec(m/Proc) [] st st0]
+      (if (>= i (count kids)) (values acc (leave (if (= (count acc) 0) (empty-check n ln (at-path st base)) st) st0 base))
+        (let [c (nth kids i)]
+          (if (or (core? c "error-handler") (= (xml/elem-uri c) NS-DOC) (is? c NS-BATCH "aggregator")) (recur (+ i 1) k acc st)
+            (let [st1 (enter st c (str base "/processors/" k))
+                  [p st2] (parse-proc c (kid-lines ln i) st1)]
+              (recur (+ i 1) (+ k 1) (conj acc p) (assoc st2 :path base)))))))))
+
+(defn- at-path St [st: St p: Str] (assoc st :path p))
+
+(defn- kids-named Values(Vec(xml/XNode) Vec(xml/XLines)) [n: &xml/XNode ln: &xml/XLines u: &Str local: &Str]
+  (let [kids (xml/child-elems n)]
+    (loop [i 0 ns: Vec(xml/XNode) [] ls: Vec(xml/XLines) []]
+      (if (>= i (count kids)) (values ns ls)
+        (let [c (nth kids i)]
+          (if (is? c u local) (recur (+ i 1) (conj ns c) (conj ls (kid-lines ln i)))
+            (recur (+ i 1) ns ls)))))))
+
+(defn- check-kids St [n: &xml/XNode ln: &xml/XLines allowed: Vec(Str) st0: St]
+  (let [kids (xml/child-elems n)]
+    (loop [i 0 st st0]
+      (if (>= i (count kids)) st
+        (let [c (nth kids i)
+              ok (or (= (xml/elem-uri c) NS-DOC)
+                     (loop [k 0] (if (>= k (count allowed)) false (if (= (nth allowed k) (xml/elem-local c)) true (recur (+ k 1))))))]
+          (recur (+ i 1) (if ok st (diag st (:line (kid-lines ln i)) (str "<" (elem-label n) ">: unexpected child <" (elem-label c) ">")))))))))
+
+(defn- parse-routes Values(Vec(m/Route) St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [[rs rls] (kids-named n ln NS-CORE "route")
+        st1 (check-kids n ln ["route"] st0)]
+    (loop [i 0 acc: Vec(m/Route) [] st st1]
+      (if (>= i (count rs)) (values acc (at-path st (str (:path st1))))
+        (let [[ps st2] (parse-procs (nth rs i) (nth rls i) 0 (at-path st (str (:path st1) "/route/" i)))] (recur (+ i 1) (conj acc (m/->Route ps)) st2))))))
+
+(defn- error-types Vec(Str) [s: &Str]
+  (let [parts: Vec(Str) (str/split (str s) ",")]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count parts)) acc
+        (let [t (xtrim (nth parts i))]
+          (recur (+ i 1) (cond (= t "") acc
+                               (str/includes? t ":") (conj acc t)
+                               :else (conj acc (str "MULE:" t)))))))))
+
+(defrecord TypeRef [raw: Str file: Str line: Int path: Str])
+
+(def TYPE-REFS (atom (let [z: Vec(TypeRef) []] z)))
+
+(defn- note-type-refs! Int [s: &Str st: &St line: Int]
+  (let [parts: Vec(Str) (str/split (str s) ",")]
+    (loop [i 0]
+      (if (>= i (count parts)) 0
+        (let [t (xtrim (nth parts i))
+              z (if (= t "") [] (swap! TYPE-REFS (fn Vec(TypeRef) [o: Vec(TypeRef)] (conj o (->TypeRef (str t) (str (:file st)) line (str (:path st)))))))]
+          (recur (+ i 1)))))))
+
+(defn- parse-handler Values(m/Handler St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [line (:line ln)
+        zt (if (has? n "type") (note-type-refs! (a n "type") st0 line) 0)
+        [w st1] (opt-pval-expr n "when" st0 line)
+        [ps st2] (parse-procs n ln 0 st1)
+        st3 (if (has? n "ref") (diag st2 line (str "<" (elem-label n) " ref=..> is not supported")) st2)]
+    (values (m/->Handler (= (xml/elem-local n) "on-error-propagate") (error-types (a n "type")) w
+                         (bool-attr n "logException" true) ps (loc st3 line))
+            st3)))
+
+(defn- parse-error-handler Values(Vec(m/Handler) Str St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [kids (xml/child-elems n)
+        base (str (:path st0))]
+    (loop [i 0 acc: Vec(m/Handler) [] st st0]
+      (if (>= i (count kids)) (values acc (a n "ref") (at-path st base))
+        (let [c (nth kids i) cl (kid-lines ln i)]
+          (cond
+            (or (core? c "on-error-continue") (core? c "on-error-propagate"))
+            (let [[h st2] (parse-handler c cl (at-path st (str base "/errorHandler/" (count acc))))] (recur (+ i 1) (conj acc h) st2))
+            (= (xml/elem-uri c) NS-DOC) (recur (+ i 1) acc st)
+            :else (recur (+ i 1) acc (diag st (:line cl) (str "<error-handler>: unsupported child <" (elem-label c) ">")))))))))
+
+(defn- child-error-handler Values(Vec(m/Handler) Str St) [n: &xml/XNode ln: &xml/XLines st: St]
+  (let [[ehs els] (kids-named n ln NS-CORE "error-handler")]
+    (cond (= (count ehs) 0) (let [z: Vec(m/Handler) []] (values z "" st))
+          :else (let [st2 (if (> (count ehs) 1) (diag st (:line (nth els 1)) "more than one <error-handler>") st)]
+                  (parse-error-handler (nth ehs 0) (nth els 0) st2)))))
+
+(defn- script-of m/Script [c: eng/Compiled text: &Str file: &Str base: Int]
+  (m/->Script c (m/->ExprSrc (str text) (str text) 0 WHERE false (refs text) (str file) base)))
+
+(defn- transform-script Values(Vec(m/Script) St) [n: &xml/XNode ln: &xml/XLines st: St]
+  (let [line (:line ln)
+        what (str "<" (elem-label n) ">")]
+    (if (has? n "resource")
+      (let [r (a n "resource") [text found] (res/res-read (:res st) r)]
+        (if (not found)
+          (let [z: Vec(m/Script) []] (values z (diag st line (str what ": resource not found: " r))))
+          (let [[c st2] (compile-script-at text st line (str what " " r) r text 0 0)] (values [(script-of c text r 0)] st2))))
+      (let [t (own-text n)]
+        (if (= (count (xtrim t)) 0)
+          (let [z: Vec(m/Script) []] (values z (diag st line (str what ": empty script"))))
+          (let [base (locate st line "" t) [c st2] (compile-script-at t st line what (:file st) (:raw st) base 0)] (values [(script-of c t (:file st) base)] st2)))))))
+
+(defn- parse-transform Values(m/Proc St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [line (:line ln)
+        kids (xml/child-elems n)
+        z: Vec(m/Script) []
+        zv: Vec(m/TVar) []]
+    (loop [i 0 pay z att z vars zv st st0]
+      (if (>= i (count kids)) (values (m/->PrTransform pay att vars (loc st line)) st)
+        (let [c (nth kids i) cl (kid-lines ln i)]
+          (cond
+            (is? c NS-EE "message")
+            (let [mk (xml/child-elems c)
+                  [p2 a2 st2]
+                  (loop [k 0 p pay at att s st]
+                    (if (>= k (count mk)) (values p at s)
+                      (let [e (nth mk k) el (kid-lines cl k)]
+                        (cond (is? e NS-EE "set-payload") (let [[x s2] (transform-script e el s)] (recur (+ k 1) x at s2))
+                              (is? e NS-EE "set-attributes") (let [[x s2] (transform-script e el s)] (recur (+ k 1) p x s2))
+                              (= (xml/elem-uri e) NS-DOC) (recur (+ k 1) p at s)
+                              :else (recur (+ k 1) p at (diag s (:line el) (str "<ee:message>: unexpected child <" (elem-label e) ">")))))))]
+              (recur (+ i 1) p2 a2 vars st2))
+            (or (is? c NS-EE "variables") (is? c NS-EE "set-variable"))
+            (let [vk (if (is? c NS-EE "variables") (xml/child-elems c) [c])
+                  vl (if (is? c NS-EE "variables") (:kids cl) [cl])
+                  [v2 st2]
+                  (loop [k 0 vs vars s st]
+                    (if (>= k (count vk)) (values vs s)
+                      (let [e (nth vk k) el (if (< k (count vl)) (nth vl k) cl)]
+                        (if (is? e NS-EE "set-variable")
+                          (let [nm (a e "variableName")
+                                [x s2] (transform-script e el s)
+                                s3 (if (= nm "") (diag s2 (:line el) "<ee:set-variable>: missing variableName") s2)]
+                            (recur (+ k 1) (if (> (count x) 0) (conj vs (m/->TVar nm (nth x 0))) vs) s3))
+                          (recur (+ k 1) vs (if (= (xml/elem-uri e) NS-DOC) s (diag s (:line el) (str "<ee:variables>: unexpected child <" (elem-label e) ">"))))))))]
+              (recur (+ i 1) pay att v2 st2))
+            (= (xml/elem-uri c) NS-DOC) (recur (+ i 1) pay att vars st)
+            :else (recur (+ i 1) pay att vars (diag st (:line cl) (str "<ee:transform>: unexpected child <" (elem-label c) ">")))))))))
+
+(defn- template-parts Values(Vec(m/PVal) St) [s: &Str st0: St line: Int what: &Str where: &Str]
+  (loop [i 0 acc: Vec(m/PVal) [] st st0]
+    (let [k (str/index-of-after s "#[" i)]
+      (if (< k 0) (values (if (< i (count s)) (conj acc (m/->PLit (subs s i (count s)))) acc) st)
+        (let [e (close-bracket s (+ k 2))]
+          (if (< e 0) (values (conj acc (m/->PLit (subs s i (count s)))) st)
+            (let [acc1 (if (> k i) (conj acc (m/->PLit (subs s i k))) acc)
+                  [v st2] (compile-body (subs s k (+ e 1)) (subs s (+ k 2) e) st line what)]
+              (recur (+ e 1) (conj acc1 (with-where v where)) st2))))))))
+
+(defn- parse-template Values(m/Proc St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [line (:line ln)
+        [cs cls] (kids-named n ln NS-CORE "content")
+        [content st1]
+        (cond
+          (has? n "location")
+          (let [[t found] (res/res-read (:res st0) (a n "location"))]
+            (if found (values t st0) (values "" (diag st0 line (str "<parse-template>: file not found: " (a n "location"))))))
+          (> (count cs) 0) (values (own-text (nth cs 0)) st0)
+          :else (values "" (diag st0 line "<parse-template>: needs 'location' or <content>")))
+        [parts st2] (template-parts content st1 line "<parse-template>" WHERE)]
+    (values (m/->PrParseTemplate content parts (a n "target") (loc st2 line)) st2)))
+
+(defn op-chain-names Vec(Str) [h: &m/Hints key: &Str]
+  (let [cs (:chains h)]
+    (loop [i 0] (if (>= i (count cs)) [] (if (= (:op (nth cs i)) key) (:names (nth cs i)) (recur (+ i 1)))))))
+
+(defn- has-name? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn op-each-child? Bool [h: &m/Hints key: &Str] (has-name? (:each h) key))
+
+(defn- child-locals Vec(Str) [n: &xml/XNode]
+  (let [kids (xml/child-elems n)]
+    (loop [i 0 acc: Vec(Str) []] (if (>= i (count kids)) acc (recur (+ i 1) (conj acc (str (xml/elem-local (nth kids i)))))))))
+
+(defn- parse-connector-op Values(m/Proc St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [line (:line ln)
+        cn (ns-name (xml/elem-uri n))
+        key (str (xml/elem-uri n) " " (xml/elem-local n))
+        each (op-each-child? (:hints st0) key)
+        names (op-chain-names (:hints st0) key)
+        [ps st1] (attr-params n st0 line)
+        z: Vec(m/Param) []
+        [ex st2] (collect-exprs-skip n ln "" z st1 (if each (child-locals n) names))
+        [chs st3] (if each (parse-child-chains n ln st2) (parse-chains n ln names st2))
+        [tv st4] (opt-pval-expr n "targetValue" st3 line)]
+    (values (m/->PrConnectorOp cn (xml/elem-local n) (a n "config-ref") ps (content-nodes n)
+                               ex chs (a n "target") tv (loc st4 line))
+            st4)))
+
+(defn- parse-chains Values(Vec(m/Chain) St) [n: &xml/XNode ln: &xml/XLines names: &Vec(Str) st0: St]
+  (let [kids (xml/child-elems n)]
+    (loop [i 0 acc: Vec(m/Chain) [] st st0]
+      (if (>= i (count kids)) (values acc st)
+        (let [c (nth kids i) local (xml/elem-local c)]
+          (if (not (has-name? names local)) (recur (+ i 1) acc st)
+            (let [[ps st2] (parse-procs c (kid-lines ln i) 0 st)]
+              (recur (+ i 1) (conj acc (m/->Chain (str local) ps)) st2))))))))
+
+(defn- parse-child-chains Values(Vec(m/Chain) St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [kids (xml/child-elems n)
+        base (str (:path st0))]
+    (loop [i 0 k 0 acc: Vec(m/Chain) [] st st0]
+      (if (>= i (count kids)) (values acc (leave st st0 base))
+        (let [c (nth kids i)]
+          (if (= (xml/elem-uri c) NS-DOC) (recur (+ i 1) k acc st)
+            (let [st1 (enter st c (str base "/processors/" k))
+                  [p st2] (parse-proc c (kid-lines ln i) st1)]
+              (recur (+ i 1) (+ k 1) (conj acc (m/->Chain (str k) [p])) (assoc st2 :path base)))))))))
+
+(defn- parse-core-proc Values(m/Proc St) [n: &xml/XNode ln: &xml/XLines st: St]
+  (let [l (xml/elem-local n)
+        line (:line ln)
+        lc (loc st line)
+        what (str "<" l ">")]
+    (cond
+      (= l "set-payload")
+      (let [[v st2] (pval (a n "value") st line (str what " value"))]
+        (values (m/->PrSetPayload v (a n "mimeType") (a n "encoding") lc) st2))
+      (= l "set-variable")
+      (let [st1 (if (= (a n "variableName") "") (diag st line "<set-variable>: missing variableName") st)
+            [v st2] (pval (a n "value") st1 line (str what " value"))]
+        (values (m/->PrSetVar (a n "variableName") v (a n "mimeType") lc) st2))
+      (= l "remove-variable")
+      (values (m/->PrRemoveVar (a n "variableName") lc) (if (= (a n "variableName") "") (diag st line "<remove-variable>: missing variableName") st))
+      (= l "logger")
+      (let [[msg0 st2] (if (has? n "message") (template-parts (a n "message") st line "<logger> message" "main") (values [] st))
+            msg (if (and (has? n "message") (= (count msg0) 0)) [(m/->PLit "")] msg0)
+            lv (if (has? n "level") (str/upper-case (xtrim (a n "level"))) "INFO")
+            st3 (enum-check n "level" LOG-LEVELS st2 line)]
+        (values (m/->PrLogger msg lv (a n "category") lc) st3))
+      (= l "flow-ref")
+      (let [st1 (if (= (a n "name") "") (diag st line "<flow-ref>: missing name") st)
+            [v st2] (pval (a n "name") st1 line (str what " name"))
+            [tv st3] (opt-pval-expr n "targetValue" st2 line)]
+        (values (m/->PrFlowRef v (a n "target") tv lc) st3))
+      (= l "raise-error")
+      (let [st1 (if (= (a n "type") "") (diag st line "<raise-error>: missing type") st)
+            [v st2] (pval (a n "description") st1 line (str what " description"))
+            t (xtrim (a n "type"))]
+        (values (m/->PrRaise (if (or (= t "") (str/includes? t ":")) t (str "MULE:" t)) v lc) st2))
+      (= l "parse-template") (parse-template n ln st)
+      (= l "choice")
+      (let [kids (xml/child-elems n)
+            [ws ow st2]
+            (loop [i 0 ws: Vec(m/When) [] ow: Vec(m/Proc) [] s st]
+              (if (>= i (count kids)) (values ws ow s)
+                (let [c (nth kids i) cl (kid-lines ln i)]
+                  (cond
+                    (core? c "when")
+                    (let [[cv0 s2] (pval-expr (a c "expression") s (:line cl) "<when> expression")
+                          cv (with-where cv0 "main")
+                          [ps s3] (parse-procs c cl 0 (at-path s2 (str (:path st) "/route/" (count ws))))]
+                      (recur (+ i 1) (conj ws (m/->When cv ps)) ow s3))
+                    (core? c "otherwise") (let [[ps s2] (parse-procs c cl 0 (at-path s (str (:path st) "/route/" (count ws))))] (recur (+ i 1) ws ps s2))
+                    (= (xml/elem-uri c) NS-DOC) (recur (+ i 1) ws ow s)
+                    :else (recur (+ i 1) ws ow (diag s (:line cl) (str "<choice>: unexpected child <" (elem-label c) ">")))))))
+            st3 (if (= (count ws) 0) (diag st2 line "<choice>: needs at least one <when>") st2)]
+        (values (m/->PrChoice ws ow lc) st3))
+      (= l "foreach")
+      (let [[col st1] (opt-pval-expr n "collection" st line)
+            [b st2] (int-attr n "batchSize" 1 st1 line)
+            [ps st3] (parse-procs n ln 0 st2)
+            cn (if (has? n "counterVariableName") (a n "counterVariableName") "counter")
+            rn (if (has? n "rootMessageVariableName") (a n "rootMessageVariableName") "rootMessage")]
+        (values (m/->PrForEach col cn rn b ps lc) st3))
+      (= l "parallel-foreach")
+      (let [[col st1] (opt-pval-expr n "collection" st line)
+            [mc st2] (int-attr n "maxConcurrency" -1 st1 line)
+            [to st3] (int-attr n "timeout" -1 st2 line)
+            [ps st4] (parse-procs n ln 0 st3)]
+        (values (m/->PrParallelForEach col mc to (a n "target") ps lc) st4))
+      (= l "scatter-gather")
+      (let [[to st1] (int-attr n "timeout" -1 st line)
+            [mc st2] (int-attr n "maxConcurrency" -1 st1 line)
+            [rs st3] (parse-routes n ln st2)
+            st4 (if (< (count rs) 2) (diag st3 line "<scatter-gather>: needs at least two <route>") st3)]
+        (values (m/->PrScatterGather rs to mc (a n "target") lc) st4))
+      (= l "try")
+      (let [[ps st1] (parse-procs n ln 0 st)
+            [hs ref st2] (child-error-handler n ln st1)
+            ta (if (has? n "transactionalAction") (a n "transactionalAction") "INDEPENDENT")]
+        (values (m/->PrTry ps hs ref ta lc) st2))
+      (= l "until-successful")
+      (let [[mr st1] (int-attr n "maxRetries" 5 st line)
+            [mb st2] (int-attr n "millisBetweenRetries" 60000 st1 line)
+            [ps st3] (parse-procs n ln 0 st2)]
+        (values (m/->PrUntilSuccessful mr mb ps lc) st3))
+      (= l "async")
+      (let [[mc st1] (int-attr n "maxConcurrency" -1 st line)
+            [ps st2] (parse-procs n ln 0 st1)]
+        (values (m/->PrAsync ps mc lc) st2))
+      (= l "first-successful")
+      (let [[rs st2] (parse-routes n ln st)] (values (m/->PrFirstSuccessful rs lc) st2))
+      (= l "idempotent-message-validator")
+      (let [[id st1] (pval-expr (if (has? n "idExpression") (a n "idExpression") "#[correlationId]") st line "<idempotent-message-validator> idExpression")
+            [vl st2] (pval-expr (if (has? n "valueExpression") (a n "valueExpression") "#[correlationId]") st1 line "<idempotent-message-validator> valueExpression")
+            [pns pls] (kids-named n ln NS-OS "private-object-store")
+            [pr st3] (if (= (count pns) 0) (let [z: Vec(Vec(m/Param)) []] (values z st2))
+                       (let [[ps st4] (attr-params (nth pns 0) st2 (:line (nth pls 0)))] (values [ps] st4)))
+            st5 (if (and (has? n "objectStore") (> (count pns) 0)) (diag st3 line "<idempotent-message-validator>: Ambiguous definition of object store, both reference and private were configured") st3)]
+        (values (m/->PrIdempotent id vl (a n "objectStore") pr lc) st5))
+      (= l "round-robin")
+      (let [[rs st2] (parse-routes n ln st)
+            id (:rr st2)]
+        (values (m/->PrRoundRobin rs id lc) (assoc st2 :rr (+ id 1))))
+      :else
+      (values (m/->PrUnknown (elem-label n) lc) (diag st line (str "unsupported core element <" l ">"))))))
+
+(defn- parse-proc Values(m/Proc St) [n: &xml/XNode ln: &xml/XLines st: St]
+  (let [u (xml/elem-uri n)]
+    (cond
+      (= u NS-CORE) (parse-core-proc n ln st)
+      (is? n NS-EE "transform") (parse-transform n ln st)
+      (is? n NS-EE "cache")
+      (let [line (:line ln) lc (loc st line)
+            [fl st1] (opt-pval-expr n "filterExpression" st line)
+            [ps st2] (parse-procs n ln 0 st1)]
+        (values (m/->PrCache (a n "cachingStrategy-ref") fl ps lc) st2))
+      (is? n NS-EE "invalidate-key")
+      (let [line (:line ln) lc (loc st line)
+            [kx st1] (opt-pval-expr n "keyGenerationExpression" st line)
+            st2 (if (has? n "keyGenerator-ref") (diag st1 line "<ee:invalidate-key>: keyGenerator-ref is not supported (a Java key generator); use keyGenerationExpression") st1)]
+        (values (m/->PrInvalidateKey (a n "cachingStrategy-ref") kx lc) st2))
+      (is? n NS-EE "invalidate-cache")
+      (let [line (:line ln)] (values (m/->PrInvalidateCache (a n "cachingStrategy-ref") (loc st line)) st))
+      (is? n NS-BATCH "job") (parse-batch-job n ln st)
+      (= u "")
+      (values (m/->PrUnknown (elem-label n) (loc st (:line ln))) (diag st (:line ln) (str "element <" (elem-label n) "> has no namespace")))
+      :else (parse-connector-op n ln st))))
+
+(def LOG-LEVELS ["ERROR" "WARN" "INFO" "DEBUG" "TRACE"])
+(def TIME-UNITS ["NANOSECONDS" "MICROSECONDS" "MILLISECONDS" "SECONDS" "MINUTES" "HOURS" "DAYS"])
+
+(defn- enum-check St [n: &xml/XNode k: &Str allowed: &Vec(Str) st: St line: Int]
+  (let [v (a n k)]
+    (if (or (not (has? n k)) (str/includes? v "${") (loop [i 0] (if (>= i (count allowed)) false (if (= (nth allowed i) v) true (recur (+ i 1)))))) st
+      (diag st line (str "cvc-enumeration-valid: Value '" v "' is not facet-valid with respect to enumeration '[" (str/join ", " allowed) "]'. It must be a value from the enumeration.")))))
+
+(defn- parse-batch-job Values(m/Proc St) [n: &xml/XNode ln: &xml/XLines st: St]
+  (let [line (:line ln)
+        lc (loc st line)
+        base (str (:path st))
+        [bs st1] (int-attr n "blockSize" 100 st line)
+        [mf st2] (int-attr n "maxFailedRecords" 0 st1 line)
+        [mc st3] (int-attr n "maxConcurrency" -1 st2 line)
+        [prs prl] (kids-named n ln NS-BATCH "process-records")
+        [ocs ocl] (kids-named n ln NS-BATCH "on-complete")
+        st4 (if (= (count prs) 0) (diag st3 line "<batch:job>: missing <batch:process-records>") st3)
+        [steps st5] (if (= (count prs) 0) (let [z: Vec(m/BatchStep) []] (values z st4))
+                      (parse-batch-steps (nth prs 0) (nth prl 0) (at-path st4 (str base "/process-records"))))
+        [oc st6] (if (= (count ocs) 0) (let [z: Vec(m/Proc) []] (values z st5))
+                   (parse-procs (nth ocs 0) (nth ocl 0) 0 (at-path st5 (str base "/on-complete"))))]
+    (values (m/->PrBatchJob (a n "jobName") bs mf mc steps oc lc) (at-path st6 base))))
+
+(defn- parse-batch-steps Values(Vec(m/BatchStep) St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [[ss sls] (kids-named n ln NS-BATCH "step")
+        base (str (:path st0))]
+    (loop [i 0 acc: Vec(m/BatchStep) [] st st0]
+      (if (>= i (count ss)) (values acc (at-path st base))
+        (let [s (nth ss i) sl (nth sls i) line (:line sl)
+              stp (at-path st (str base "/" i))
+              [ae st1] (opt-pval-expr s "acceptExpression" stp line)
+              pol0 (str/upper-case (a s "acceptPolicy"))
+              pol (if (= pol0 "") "NO_FAILURES" pol0)
+              st2 (if (or (= pol "NO_FAILURES") (= pol "ONLY_FAILURES") (= pol "ALL")) st1
+                    (diag st1 line (str "<batch:step>: invalid acceptPolicy '" (a s "acceptPolicy") "'")))
+              [ps st3] (parse-procs s sl 0 st2)
+              [ags agl] (kids-named s sl NS-BATCH "aggregator")
+              [agg st4] (if (= (count ags) 0) (let [z: Vec(m/BatchAggregator) []] (values z st3))
+                          (let [g (nth ags 0) gl (nth agl 0)
+                                [sz s1] (int-attr g "size" 0 st3 (:line gl))
+                                [gp s2] (parse-procs g gl 0 (at-path s1 (str base "/" i "/aggregator")))]
+                            (values [(m/->BatchAggregator sz (= (a g "preserveMimeTypes") "true") gp (loc s2 (:line gl)))] s2)))]
+          (recur (+ i 1) (conj acc (m/->BatchStep (a s "name") ae pol ps agg (loc stp line))) st4))))))
+
+(defn source-elem? Bool [n: &xml/XNode h: &m/Hints]
+  (let [u (xml/elem-uri n) l (xml/elem-local n)]
+    (cond
+      (= u NS-CORE) (= l "scheduler")
+      (or (= u NS-DOC) (= u NS-EE) (= u "")) false
+      (has-name? (:source-uris h) u) (has-name? (:sources h) (str u " " l))
+      :else (or (str/includes? l "listener") (str/ends-with? l "subscriber") (= l "polling-source")
+                (str/ends-with? l "-trigger") (= l "scheduler")))))
+
+(defn- unit-ms Values(Int Bool) [unit: &Str]
+  (let [u (str/upper-case (xtrim unit))]
+    (cond (or (= u "") (= u "MILLISECONDS")) (values 1 true)
+          (= u "SECONDS") (values 1000 true)
+          (= u "MINUTES") (values 60000 true)
+          (= u "HOURS") (values 3600000 true)
+          (= u "DAYS") (values 86400000 true)
+          (or (= u "MICROSECONDS") (= u "NANOSECONDS")) (values 0 true)
+          :else (values 1 false))))
+
+(defn- to-ms Int [x: Int unit: &Str]
+  (let [u (str/upper-case (xtrim unit)) [k ok] (unit-ms u)]
+    (cond (= u "MICROSECONDS") (/ x 1000) (= u "NANOSECONDS") (/ x 1000000) :else (* x k))))
+
+(defn- parse-scheduler Values(m/Source St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [line (:line ln)
+        dis (bool-attr n "disallowConcurrentExecution" false)
+        [ss st1] (parse-strategy n ln "<scheduler>" st0)
+        s (if (= (count ss) 0) (m/->Sched 60000 0 "" "") (nth ss 0))]
+    (values (m/->SrcScheduler (:frequency-ms s) (:start-delay-ms s) (:cron s) (:tz s) dis (loc st1 line)) st1)))
+
+(defn- parse-strategy Values(Vec(m/Sched) St) [n: &xml/XNode ln: &xml/XLines what: &Str st0: St]
+  (let [line (:line ln)
+        [ss ssl] (kids-named n ln NS-CORE "scheduling-strategy")]
+    (if (= (count ss) 0)
+      (values [] (diag st0 line (str what ": missing <scheduling-strategy>")))
+      (let [s (nth ss 0) sl (nth ssl 0)
+            [ff ffl] (kids-named s sl NS-CORE "fixed-frequency")
+            [cr crl] (kids-named s sl NS-CORE "cron")]
+        (cond
+          (> (count ff) 0)
+          (let [f (nth ff 0) fl (:line (nth ffl 0))
+                [fr st1] (int-attr f "frequency" 60000 st0 fl)
+                [sd st2] (int-attr f "startDelay" 0 st1 fl)
+                unit (a f "timeUnit")
+                st3 (if (= unit "") st2 (enum-check f "timeUnit" TIME-UNITS st2 fl))
+                st4 (if (<= fr 0) (diag st3 fl "<fixed-frequency>: frequency must be positive") st3)]
+            (values [(m/->Sched (to-ms fr unit) (to-ms sd unit) "" "")] st4))
+          (> (count cr) 0)
+          (let [c (nth cr 0) cl (:line (nth crl 0))
+                ex (xtrim (a c "expression"))
+                st1 (if (= ex "") (diag st0 cl "<cron>: missing expression") st0)]
+            (values [(m/->Sched 0 0 ex (a c "timeZone"))] st1))
+          :else
+          (values [] (diag st0 (:line sl) "<scheduling-strategy>: needs <fixed-frequency> or <cron>")))))))
+
+(defn- headers-pval Values(Vec(m/PVal) St) [h: &xml/XNode hl: &xml/XLines st: St]
+  (let [line (:line hl)
+        hs (xml/child-elems h)]
+    (if (= (count hs) 0)
+      (let [t (xtrim (own-text h))]
+        (if (= t "") (let [z: Vec(m/PVal) []] (values z st))
+          (let [[v st2] (pval t st line "<http:headers>")] (values [v] st2))))
+      (let [body (loop [i 0 out "{"]
+                   (if (>= i (count hs)) (str out "}")
+                     (let [e (nth hs i)
+                           k (if (has? e "key") (a e "key") (a e "headerName"))
+                           v (xtrim (a e "value"))
+                           o1 (str (dw-str-esc (if (= i 0) (str out "\"") (str out ", \"")) k) "\": ")
+                           o2 (if (expr-text? v) (str o1 "(" (subs v 2 (- (count v) 1)) ")")
+                                (str (dw-str-esc (str o1 "\"") v) "\""))]
+                       (recur (+ i 1) o2))))
+            [v st2] (compile-body body body st line "<http:headers>")]
+        (values [v] st2)))))
+
+(defn- parse-http-response Values(Vec(m/PVal) Vec(m/PVal) Vec(m/PVal) Vec(m/PVal) St) [n: &xml/XNode ln: &xml/XLines local: &Str st0: St]
+  (let [[rs rls] (kids-named n ln NS-HTTP local)
+        z: Vec(m/PVal) []]
+    (if (= (count rs) 0) (values z z z z st0)
+      (let [r (nth rs 0) rl (nth rls 0)
+            [status st1] (opt-pval r "statusCode" st0 (:line rl))
+            [hs hls] (kids-named r rl NS-HTTP "headers")
+            [hv st2] (if (> (count hs) 0) (headers-pval (nth hs 0) (nth hls 0) st1) (values z st1))
+            [bs bls] (kids-named r rl NS-HTTP "body")
+            [bv st3] (if (> (count bs) 0)
+                       (let [t (own-text (nth bs 0))]
+                         (if (= (count (xtrim t)) 0) (values z st2)
+                           (let [[v s] (pval t st2 (:line (nth bls 0)) "<http:body>")] (values [v] s))))
+                       (values z st2))
+            [reason st4] (opt-pval r "reasonPhrase" st3 (:line rl))]
+        (values status hv bv reason st4)))))
+
+(defn- parse-http-listener Values(m/Source St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [line (:line ln)
+        ms0 (xtrim (a n "allowedMethods"))
+        parts: Vec(Str) (if (= ms0 "") [] (str/split ms0 ","))
+        methods (loop [i 0 acc: Vec(Str) []] (if (>= i (count parts)) acc
+                                               (let [x (str/upper-case (xtrim (nth parts i)))] (recur (+ i 1) (if (= x "") acc (conj acc x))))))
+        st1 (if (= (a n "config-ref") "") (diag st0 line "<http:listener>: missing config-ref") st0)
+        st1b (if (= (xtrim (a n "path")) "") (diag st1 line "<http:listener>: missing path") st1)
+        [s1 h1 b1 r1 st2] (parse-http-response n ln "response" st1b)
+        [s2 h2 b2 r2 st3] (parse-http-response n ln "error-response" st2)
+        sm (str/upper-case (xtrim (a n "responseStreamingMode")))
+        st4 (if (or (= sm "") (= sm "AUTO") (= sm "ALWAYS") (= sm "NEVER")) st3
+              (diag st3 line (str "<http:listener>: invalid responseStreamingMode '" (a n "responseStreamingMode") "' (AUTO, ALWAYS or NEVER)")))]
+    (values (m/->SrcHttpListener (a n "config-ref") (a n "path") methods s1 h1 b1 s2 h2 b2 r1 r2 (if (= sm "") "AUTO" sm)
+                                 (xtrim (a n "outputMimeType")) (xtrim (a n "outputEncoding")) (loc st4 line)) st4)))
+
+(defn- parse-source Values(m/Source St) [n: &xml/XNode ln: &xml/XLines st: St]
+  (cond
+    (core? n "scheduler") (parse-scheduler n ln st)
+    (is? n NS-HTTP "listener") (parse-http-listener n ln st)
+    :else
+    (let [line (:line ln)
+          raw (has-name? (:raw-sources (:hints st)) (str (xml/elem-uri n) " " (xml/elem-local n)))
+          [ps st1] (if raw (values (lit-params n) st) (attr-params n st line))
+          [kn kl] (kids-named n ln NS-CORE "scheduling-strategy")
+          [sch st2] (if (> (count kn) 0) (parse-strategy n ln (str "<" (elem-label n) ">") st1) (values [] st1))
+          z: Vec(m/Param) []
+          [ex st3] (if raw (values z st2) (collect-exprs n ln "" z st2))]
+      (values (m/->SrcConnector (ns-name (xml/elem-uri n)) (xml/elem-local n) (a n "config-ref") ps (content-nodes n) ex sch (loc st3 line)) st3))))
+
+(defn- first-elem-index Int [kids: &Vec(xml/XNode)]
+  (loop [i 0] (if (>= i (count kids)) -1 (if (= (xml/elem-uri (nth kids i)) NS-DOC) (recur (+ i 1)) i))))
+
+(defn- parse-flow Values(m/Flow St) [n: &xml/XNode ln: &xml/XLines sub: Bool st0: St]
+  (let [line (:line ln)
+        name (a n "name")
+        st1 (at-path (if (= name "") (diag st0 line (str "<" (xml/elem-local n) ">: missing name")) st0) (str name))
+        kids (xml/child-elems n)
+        fi (first-elem-index kids)
+        has-src (and (>= fi 0) (source-elem? (nth kids fi) (:hints st1)))
+        [src st2] (if has-src
+                    (let [[s st] (parse-source (nth kids fi) (kid-lines ln fi) st1)] (values [s] st))
+                    (let [z: Vec(m/Source) []] (values z st1)))
+        st3 (if (and sub has-src) (diag st2 line "<sub-flow> cannot have a message source") st2)
+        [ps st4] (parse-procs n ln (if has-src (+ fi 1) 0) st3)
+        [hs ref st5] (child-error-handler n ln st4)
+        st6 (if (and sub (or (> (count hs) 0) (not= ref ""))) (diag st5 line "<sub-flow> cannot have an error-handler") st5)
+        [mc st7] (int-attr n "maxConcurrency" -1 st6 line)
+        is (if (has? n "initialState") (xtrim (a n "initialState")) "started")
+        st8 (if (or (= is "started") (= is "stopped")) st7 (diag st7 line (str "<flow>: invalid initialState \"" is "\"")))]
+    (values (m/->Flow name sub src ps hs ref mc is (loc st8 line)) st8)))
+
+(defrecord Part [flows: Vec(m/Flow) configs: Vec(m/Config) globals: Vec(m/GlobalHandler) default-handler: Str suite: Vec(m/MSuite)])
+
+(defn- no-suite m/MSuite [file: &Str]
+  (let [z: Vec(m/Proc) [] t: Vec(m/MTest) []] (m/->MSuite (str file) "" false z z z z t)))
+
+(defn- part-suite m/MSuite [part: &Part file: &Str] (if (= (count (:suite part)) 0) (no-suite file) (nth (:suite part) 0)))
+
+(defn- munit-chain Values(Vec(m/Proc) St) [c: &xml/XNode cl: &xml/XLines st: St what: Str]
+  (let [base (str (:path st))
+        [ps st2] (parse-procs c cl 0 (at-path st (str "munit/" what)))]
+    (values ps (at-path st2 base))))
+
+(defn- parse-munit-test Values(m/MTest St) [n: &xml/XNode ln: &xml/XLines st0: St]
+  (let [line (:line ln)
+        name (a n "name")
+        lc (loc st0 line)
+        [ig st1] (opt-pval n "ignore" st0 line)
+        chain (fn Values(Vec(m/Proc) St) [local: Str st: St]
+                (let [[kn kl] (kids-named n ln NS-MUNIT local)]
+                  (if (= (count kn) 0) (let [z: Vec(m/Proc) []] (values z st))
+                    (munit-chain (nth kn 0) (nth kl 0) st (str name "/" local)))))
+        [bh st2] (chain "behavior" st1)
+        [ex st3] (chain "execution" st2)
+        [va st4] (chain "validation" st3)
+        [en el] (kids-named n ln NS-MUNIT "enable-flow-sources")
+        srcs (if (= (count en) 0) []
+               (let [ks (xml/child-elems (nth en 0))]
+                 (loop [i 0 acc: Vec(Str) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (xml/attr (nth ks i) "" "value" "")))))))
+        srcs2 (if (has? n "enableFlowSources") (conj srcs (a n "enableFlowSources")) srcs)
+        st5 (if (= name "") (diag st4 line "<munit:test>: missing name") st4)]
+    (values (m/->MTest name (a n "description") ig (a n "expectedErrorType") (a n "expectedErrorDescription") bh ex va srcs2 lc) st5)))
+
+(defn- parse-munit Values(Part St) [c: &xml/XNode cl: &xml/XLines part: Part st: St]
+  (let [l (xml/elem-local c)
+        line (:line cl)
+        s0 (part-suite part (:file st))]
+    (cond
+      (= l "config")
+      (values (assoc part :suite [(assoc (assoc s0 :name (a c "name")) :ignore (= (xtrim (a c "ignore")) "true"))]) st)
+      (= l "test")
+      (let [[t st2] (parse-munit-test c cl st)] (values (assoc part :suite [(assoc s0 :tests (conj (:tests s0) t))]) st2))
+      (or (= l "before-suite") (= l "after-suite") (= l "before-test") (= l "after-test"))
+      (let [[ps st2] (munit-chain c cl st l)
+            s1 (cond (= l "before-suite") (assoc s0 :before-suite ps) (= l "after-suite") (assoc s0 :after-suite ps)
+                     (= l "before-test") (assoc s0 :before-test ps) :else (assoc s0 :after-test ps))]
+        (values (assoc part :suite [s1]) st2))
+      :else (values part (diag st line (str "unsupported MUnit element <munit:" l ">"))))))
+
+(def CORE-IGNORED ["configuration-properties" "global-property" "description" "notifications"])
+
+(defn- parse-root Values(Part St) [root: &xml/XNode ln: &xml/XLines st0: St]
+  (let [kids (xml/child-elems root)
+        zf: Vec(m/Flow) [] zc: Vec(m/Config) [] zg: Vec(m/GlobalHandler) []]
+    (loop [i 0 part (->Part zf zc zg "" []) st st0]
+      (if (>= i (count kids)) (values part st)
+        (let [c (nth kids i) cl (kid-lines ln i) line (:line cl) u (xml/elem-uri c) l (xml/elem-local c)]
+          (cond
+            (= u NS-DOC) (recur (+ i 1) part st)
+            (= u NS-CORE)
+            (cond
+              (or (= l "flow") (= l "sub-flow"))
+              (let [[f st2] (parse-flow c cl (= l "sub-flow") st)] (recur (+ i 1) (assoc part :flows (conj (:flows part) f)) st2))
+              (= l "error-handler")
+              (let [[hs ref st2] (parse-error-handler c cl st)
+                    st3 (if (= (a c "name") "") (diag st2 line "global <error-handler>: missing name") st2)]
+                (recur (+ i 1) (assoc part :globals (conj (:globals part) (m/->GlobalHandler (a c "name") hs (loc st3 line)))) st3))
+              (= l "configuration")
+              (let [[ps st2] (attr-params c st line)
+                    z: Vec(m/Param) []
+                    p1 (if (has? c "defaultErrorHandler-ref") (assoc part :default-handler (a c "defaultErrorHandler-ref")) part)]
+                (recur (+ i 1) (assoc p1 :configs (conj (:configs p1) (m/->Config "mule:configuration" "" ps [] z (loc st2 line)))) st2))
+              (= l "import")
+              (recur (+ i 1) part (if (= (a c "file") "") (diag st line "<import>: missing file") (assoc st :imports (conj (:imports st) (a c "file")))))
+              (loop [k 0] (if (>= k (count CORE-IGNORED)) false (if (= (nth CORE-IGNORED k) l) true (recur (+ k 1)))))
+              (recur (+ i 1) part st)
+              (= l "object")
+              (let [[ps st2] (attr-params c st line)
+                    z: Vec(m/Param) []
+                    [ex st3] (collect-exprs c cl "" z st2)]
+                (recur (+ i 1) (assoc part :configs (conj (:configs part) (m/->Config "mule:object" (a c "name") ps (content-nodes c) ex (loc st3 line)))) st3))
+              :else (recur (+ i 1) part (diag st line (str "unsupported core element <" l ">"))))
+            (= u "") (recur (+ i 1) part (diag st line (str "element <" l "> has no namespace")))
+            (= u NS-MUNIT) (let [[p2 st2] (parse-munit c cl part st)] (recur (+ i 1) p2 st2))
+            :else
+            (let [[ps st2] (attr-params c st line)
+                  kind (str (ns-name u) ":" l)
+                  z: Vec(m/Param) []
+                  [ex st3] (collect-exprs c cl "" z st2)]
+              (recur (+ i 1) (assoc part :configs (conj (:configs part) (m/->Config kind (a c "name") ps (content-nodes c) ex (loc st3 line))))
+                     (cond (= kind "ee:object-store-caching-strategy") (check-caching-strategy c line st3)
+                           (= kind "db:config") (check-db-connection c cl st3)
+                           (= kind "mule-apikit:config") (check-required c line ["outboundHeadersMapName" "httpStatusVarName"] st3)
+                           :else st3)))))))))
+
+(defn- check-required St [c: &xml/XNode line: Int names: Vec(Str) st0: St]
+  (loop [i 0 st st0]
+    (if (>= i (count names)) st
+      (let [nm (nth names i)]
+        (recur (+ i 1) (if (has? c nm) st (diag st line (str "cvc-complex-type.4: Attribute '" nm "' must appear on element '" (elem-label c) "'."))))))))
+
+(def DB-CONNECTIONS ["generic-connection" "derby-connection" "oracle-connection" "my-sql-connection" "mssql-connection" "data-source-connection"])
+
+(defn- check-db-connection St [c: &xml/XNode cl: &xml/XLines st0: St]
+  (let [ks (xml/child-elems c) u (xml/elem-uri c)]
+    (loop [i 0 st st0]
+      (if (>= i (count ks)) st
+        (let [k (nth ks i) l (xml/elem-local k)]
+          (recur (+ i 1)
+                 (if (and (= (xml/elem-uri k) u) (str/ends-with? l "-connection") (not (has-name? DB-CONNECTIONS l)))
+                   (diag st (:line (kid-lines cl i))
+                         (str "cvc-complex-type.2.4.a: Invalid content was found starting with element '{\"" u "\":" l "}'. "
+                              (one-of ["annotations" "abstractConnectionProvider" "expiration-policy"])))
+                   st)))))))
+
+(defn- check-caching-strategy St [c: &xml/XNode line: Int st0: St]
+  (let [st1 (if (has? c "keyGenerator-ref") (diag st0 line "<ee:object-store-caching-strategy>: keyGenerator-ref is not supported (a Java key generator); use keyGenerationExpression") st0)
+        st2 (if (has? c "responseGenerator-ref") (diag st1 line "<ee:object-store-caching-strategy>: responseGenerator-ref is not supported (a Java response generator)") st1)
+        kids (xml/child-elems c)
+        priv (loop [i 0] (if (>= i (count kids)) false (if (is? (nth kids i) NS-OS "private-object-store") true (recur (+ i 1)))))
+        copy (loop [i 0] (if (>= i (count kids)) false (if (str/ends-with? (xml/elem-local (nth kids i)) "event-copy-strategy") true (recur (+ i 1)))))
+        st3 (if (and priv (has? c "objectStore")) (diag st2 line "<ee:object-store-caching-strategy>: Ambiguous definition of object store, both reference and private were configured") st2)]
+    (if copy (diag st3 line "<ee:object-store-caching-strategy>: event copy strategies are not supported") st3)))
+
+(def CORE-NS-Q "\"http://www.mulesoft.org/schema/mule/core\"")
+(def EMPTY-A ["when" "otherwise" "try" "foreach" "until-successful" "async" "parallel-foreach"])
+(def EMPTY-B ["route" "sub-flow"])
+
+(defn- one-of Str [names: Vec(Str)]
+  (str "One of '{" (str/join ", " (mapv (fn Str [n: Str] (str CORE-NS-Q ":" n)) names)) "}' is expected."))
+
+(defn- content-count Int [n: &xml/XNode]
+  (let [ks (xml/child-elems n)]
+    (loop [i 0 k 0]
+      (if (>= i (count ks)) k
+        (let [c (nth ks i) u (xml/elem-uri c) l (xml/elem-local c)]
+          (recur (+ i 1) (if (or (= u NS-DOC) (and (= u NS-CORE) (or (= l "error-handler") (= l "description") (= l "annotations")))) k (+ k 1))))))))
+
+(defn- eh-index Int [n: &xml/XNode]
+  (let [ks (xml/child-elems n)]
+    (loop [i 0] (if (>= i (count ks)) -1 (if (and (= (xml/elem-uri (nth ks i)) NS-CORE) (= (xml/elem-local (nth ks i)) "error-handler")) i (recur (+ i 1)))))))
+
+(defn- empty-check St [c: &xml/XNode cl: &xml/XLines st: St]
+  (let [l (xml/elem-local c)
+        core (= (xml/elem-uri c) NS-CORE)
+        set (cond (not core) ""
+                  (has-name? EMPTY-A l) (one-of ["annotations" "abstract-message-processor" "abstract-mixed-content-message-processor"])
+                  (has-name? EMPTY-B l) (one-of ["annotations" "description" "abstract-message-processor" "abstract-mixed-content-message-processor"])
+                  (= l "flow") (one-of ["annotations" "description" "abstract-message-source" "abstract-message-processor" "abstract-mixed-content-message-processor"])
+                  :else "")
+        eh (eh-index c)]
+    (cond (or (= set "") (> (content-count c) 0)) st
+          (and (>= eh 0) (= l "try"))
+          (diag st (:line (kid-lines cl eh)) (str "cvc-complex-type.2.4.a: Invalid content was found starting with element '{" CORE-NS-Q ":error-handler}'. " set))
+          (>= eh 0) st
+          :else (diag st (:line cl) (str "cvc-complex-type.2.4.b: The content of element '" l "' is not complete. " set)))))
+
+(defn- defined-types Vec(Str) [n: &xml/XNode acc0: Vec(Str)]
+  (let [l (xml/elem-local n)
+        acc1 (cond (and (= l "raise-error") (has? n "type")) (conj acc0 (str/upper-case (xtrim (a n "type"))))
+                   (and (= l "error-mapping") (has? n "targetType")) (conj acc0 (str/upper-case (xtrim (a n "targetType"))))
+                   :else acc0)
+        ks (xml/child-elems n)]
+    (loop [i 0 acc acc1] (if (>= i (count ks)) acc (recur (+ i 1) (defined-types (nth ks i) acc))))))
+
+(defn- ext-nss Vec(Str) [n: &xml/XNode acc0: Vec(Str)]
+  (match n
+    (xml/XnElem q as nss cs)
+    (let [acc1 (loop [i 0 acc acc0]
+                 (if (>= i (count nss)) acc
+                   (let [x (nth nss i)
+                         u (:uri x)
+                         seg (let [k (str/last-index-of u "/")] (if (< k 0) (str u) (subs u (+ k 1) (count u))))
+                         seg2 (if (str/starts-with? seg "mule-") (subs seg 5 (count seg)) seg)]
+                     (recur (+ i 1) (conj (conj acc (str/upper-case (:prefix x))) (str/upper-case seg2))))))
+          ks (xml/child-elems n)]
+      (loop [i 0 acc acc1] (if (>= i (count ks)) acc (recur (+ i 1) (ext-nss (nth ks i) acc)))))
+    _ acc0))
+
+(defn- core-type? Bool [t: &Str]
+  (let [ps et/CORE-PARENTS] (loop [i 0] (if (>= i (count ps)) false (if (= (nth ps i) t) true (recur (+ i 2)))))))
+
+(defn- type-diags Vec(m/Diag) [docs: &Vec(SrcDoc)]
+  (let [defs (loop [i 0 acc: Vec(Str) []] (if (>= i (count docs)) acc (recur (+ i 1) (defined-types (:root (nth docs i)) acc))))
+        nss (loop [i 0 acc: Vec(Str) et/EXTENSION-NSS] (if (>= i (count docs)) acc (recur (+ i 1) (ext-nss (:root (nth docs i)) acc))))
+        refs (deref TYPE-REFS)]
+    (loop [i 0 out: Vec(m/Diag) []]
+      (if (>= i (count refs)) out
+        (let [r (nth refs i)
+              raw (:raw r)
+              k (str/index-of raw ":")
+              ns (if (< k 0) "MULE" (str/upper-case (subs raw 0 k)))
+              full (if (< k 0) (str "MULE:" (str/upper-case raw)) (str/upper-case raw))
+              ok (cond (= full "MULE:ANY") true
+                       (= ns "MULE") (core-type? full)
+                       (has-name? nss ns) true
+                       :else (has-name? defs full))]
+          (recur (+ i 1) (if ok out (conj out (m/->Diag (str (:file r)) (:line r) (str "Could not find error '" raw "'") (str (:path r)) [])))))))))
+
+(defn parse-app Values(m/App Vec(Str)) [name: &Str docs: &Vec(SrcDoc) props: &pr/Props rs: &res/ResSet diags0: &Vec(m/Diag) hints: &m/Hints]
+  (let [zf: Vec(m/Flow) [] zc: Vec(m/Config) [] zg: Vec(m/GlobalHandler) [] zi: Vec(Str) [] zs: Vec(m/MSuite) []
+        zr (reset! TYPE-REFS (let [z: Vec(TypeRef) []] z))
+        [flows configs globals dh diags imports rr suites]
+        (loop [i 0 fs zf cs zc gs zg dh "" ds diags0 im zi rr 0 ss zs]
+          (if (>= i (count docs)) (values fs cs gs dh ds im rr ss)
+            (let [d (nth docs i)
+                  st0 (->St (:file d) ds rr rs im "" "" "" [] hints (:text d))
+                  root (:root d)
+                  st1 (if (not (core? root "mule")) (diag st0 (:line (:lines d)) (str "not a Mule configuration: root element <" (elem-label root) ">")) st0)
+                  [root2 st2] (subst-node root (:lines d) props st1)
+                  [part st3] (parse-root root2 (:lines d) st2)
+                  fs2 (loop [k 0 a fs] (if (>= k (count (:flows part))) a (recur (+ k 1) (conj a (nth (:flows part) k)))))
+                  cs2 (loop [k 0 a cs] (if (>= k (count (:configs part))) a (recur (+ k 1) (conj a (nth (:configs part) k)))))
+                  gs2 (loop [k 0 a gs] (if (>= k (count (:globals part))) a (recur (+ k 1) (conj a (nth (:globals part) k)))))
+                  ds2 (if (and (not= dh "") (not= (:default-handler part) "") (not= dh (:default-handler part)))
+                        (conj (:diags st3) (m/->Diag (str (:file d)) 0 "<configuration defaultErrorHandler-ref> is set in more than one file" "" []))
+                        (:diags st3))
+                  dh2 (if (= (:default-handler part) "") dh (:default-handler part))]
+              (recur (+ i 1) fs2 cs2 gs2 dh2 ds2 (:imports st3) (:rr st3) (if (= (count (:suite part)) 0) ss (conj ss (nth (:suite part) 0)))))))
+        d2 (check-config-refs flows configs (check-flow-refs flows globals (check-dups flows configs globals (loop [k 0 ds diags td (type-diags docs)] (if (>= k (count td)) ds (recur (+ k 1) (conj ds (nth td k) ) td))))))]
+    (values (m/->App (str name) flows configs globals dh (pr/resolved-params props) (pr/resolved-origins props) d2 (res-fn rs) (res-url-fn rs) suites (doc-texts docs) [] rs) imports)))
+
+(defn- doc-texts Map(Str Str) [docs: &Vec(SrcDoc)]
+  (loop [i 0 m: Map(Str Str) {}] (if (>= i (count docs)) m (recur (+ i 1) (assoc m (str (:file (nth docs i))) (str (:text (nth docs i))))))))
+
+(defn- res-fn Fn(Str Values(Str Bool)) [rs: &res/ResSet]
+  (let [r rs] (fn Values(Str Bool) [p: Str] (res/res-read r p))))
+
+(defn- res-url-fn Fn(Str Str) [rs: &res/ResSet]
+  (let [r rs] (fn Str [p: Str] (res/res-url r p))))
+
+(defn- stereo-ns Str [conn: &Str] (if (= conn "mule-apikit") "APIKIT" (str/upper-case conn)))
+
+(defn- stereo Str [kind: &Str]
+  (let [k (str/index-of kind ":")]
+    (if (< k 0) (str/upper-case kind)
+      (str (stereo-ns (subs kind 0 k)) ":" (str/upper-case (str/replace (subs kind (+ k 1) (count kind)) "-" "_"))))))
+
+(defn- expected-kind Values(Str Bool) [conn: &Str op: &Str]
+  (cond (and (= conn "http") (= op "listener")) (values "http:listener-config" true)
+        (and (= conn "http") (= op "request")) (values "http:request-config" true)
+        (= conn "salesforce") (values "salesforce:sfdc-config" false)
+        :else (values (str conn ":config") false)))
+
+(defn- ref-diag Vec(m/Diag) [configs: &Vec(m/Config) conn: &Str op: &Str cref: &Str lc: &m/Loc ds: Vec(m/Diag)]
+  (if (or (= cref "") (str/includes? cref "${") (str/includes? cref "#[")) ds
+    (let [[want sure] (expected-kind conn op)
+          same (loop [i 0] (if (>= i (count configs)) -1 (if (= (:name (nth configs i)) cref) i (recur (+ i 1)))))
+          sibling (loop [i 0] (if (>= i (count configs)) "" (if (str/starts-with? (:kind (nth configs i)) (str conn ":")) (str (:kind (nth configs i))) (recur (+ i 1)))))
+          kind (if (or sure (= sibling "")) want sibling)
+          bad (or (< same 0) (and sure (not= (:kind (nth configs same)) want)))]
+      (if (not bad) ds
+        (conj ds (m/->Diag (str (:file lc)) (:line lc) (str "Referenced component '" cref "' must be one of stereotypes [" (stereo kind) "].") (str (:path lc)) []))))))
+
+(defn- cfg-refs-in Vec(m/Diag) [configs: &Vec(m/Config) ps: &Vec(m/Proc) ds0: Vec(m/Diag)]
+  (loop [i 0 ds ds0]
+    (if (>= i (count ps)) ds
+      (recur (+ i 1)
+             (match (nth ps i)
+               (m/PrConnectorOp cn op cr ps2 cs ex chs t tv lc)
+               (let [d1 (ref-diag configs cn op cr lc ds)]
+                 (loop [k 0 d d1] (if (>= k (count chs)) d (recur (+ k 1) (cfg-refs-in configs (:procs (nth chs k)) d)))))
+               (m/PrChoice ws ow lc) (cfg-refs-in configs ow (loop [k 0 d ds] (if (>= k (count ws)) d (recur (+ k 1) (cfg-refs-in configs (:procs (nth ws k)) d)))))
+               (m/PrForEach c ct r b ps2 lc) (cfg-refs-in configs ps2 ds)
+               (m/PrParallelForEach c mc to tg ps2 lc) (cfg-refs-in configs ps2 ds)
+               (m/PrScatterGather rs to mc tg lc) (loop [k 0 d ds] (if (>= k (count rs)) d (recur (+ k 1) (cfg-refs-in configs (:procs (nth rs k)) d))))
+               (m/PrTry ps2 hs hr ta lc) (loop [k 0 d (cfg-refs-in configs ps2 ds)] (if (>= k (count hs)) d (recur (+ k 1) (cfg-refs-in configs (:procs (nth hs k)) d))))
+               (m/PrUntilSuccessful mr mb ps2 lc) (cfg-refs-in configs ps2 ds)
+               (m/PrAsync ps2 mc lc) (cfg-refs-in configs ps2 ds)
+               (m/PrCache sr fl ps2 lc) (cfg-refs-in configs ps2 ds)
+               (m/PrFirstSuccessful rs lc) (loop [k 0 d ds] (if (>= k (count rs)) d (recur (+ k 1) (cfg-refs-in configs (:procs (nth rs k)) d))))
+               (m/PrRoundRobin rs id lc) (loop [k 0 d ds] (if (>= k (count rs)) d (recur (+ k 1) (cfg-refs-in configs (:procs (nth rs k)) d))))
+               (m/PrBatchJob nm bs mf mc steps oc lc)
+               (cfg-refs-in configs oc (loop [k 0 d ds]
+                                         (if (>= k (count steps)) d
+                                           (let [stp (nth steps k) ags (:aggregator stp) d2 (cfg-refs-in configs (:procs stp) d)]
+                                             (recur (+ k 1) (if (= (count ags) 0) d2 (cfg-refs-in configs (:procs (nth ags 0)) d2)))))))
+               _ ds)))))
+
+(defn- check-config-refs Vec(m/Diag) [flows: &Vec(m/Flow) configs: &Vec(m/Config) ds0: Vec(m/Diag)]
+  (loop [i 0 ds ds0]
+    (if (>= i (count flows)) ds
+      (let [f (nth flows i)
+            d1 (if (= (count (:source f)) 0) ds
+                 (match (nth (:source f) 0)
+                   (m/SrcHttpListener cref p ms a b c d e g h k o q w lc) (ref-diag configs "http" "listener" cref lc ds)
+                   (m/SrcConnector cn nm cref ps ch ex sc lc) (ref-diag configs cn nm cref lc ds)
+                   _ ds))
+            d2 (cfg-refs-in configs (:procs f) d1)
+            d3 (loop [k 0 d d2] (if (>= k (count (:handlers f))) d (recur (+ k 1) (cfg-refs-in configs (:procs (nth (:handlers f) k)) d))))]
+        (recur (+ i 1) d3)))))
+
+(defn- check-flow-refs Vec(m/Diag) [flows: &Vec(m/Flow) globals: &Vec(m/GlobalHandler) ds0: Vec(m/Diag)]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count flows)) acc (recur (+ i 1) (conj acc (:name (nth flows i))))))
+        ds1 (loop [i 0 ds ds0]
+              (if (>= i (count flows)) ds
+                (let [f (nth flows i)]
+                  (recur (+ i 1) (refs-in-handlers (:handlers f) names (refs-in (:procs f) names ds))))))]
+    (loop [i 0 ds ds1] (if (>= i (count globals)) ds (recur (+ i 1) (refs-in-handlers (:handlers (nth globals i)) names ds))))))
+
+(defn- refs-in-handlers Vec(m/Diag) [hs: &Vec(m/Handler) names: &Vec(Str) ds0: Vec(m/Diag)]
+  (loop [i 0 ds ds0] (if (>= i (count hs)) ds (recur (+ i 1) (refs-in (:procs (nth hs i)) names ds)))))
+
+(defn- refs-in-routes Vec(m/Diag) [rs: &Vec(m/Route) names: &Vec(Str) ds0: Vec(m/Diag)]
+  (loop [i 0 ds ds0] (if (>= i (count rs)) ds (recur (+ i 1) (refs-in (:procs (nth rs i)) names ds)))))
+
+(defn- refs-in Vec(m/Diag) [ps: &Vec(m/Proc) names: &Vec(Str) ds0: Vec(m/Diag)]
+  (loop [i 0 ds ds0]
+    (if (>= i (count ps)) ds
+      (recur (+ i 1)
+             (match (nth ps i)
+               (m/PrFlowRef v t tv lc)
+               (match v
+                 (m/PLit nm) (if (or (= nm "") (loop [k 0] (if (>= k (count names)) false (if (= (nth names k) nm) true (recur (+ k 1)))))) ds
+                               (conj ds (m/->Diag (str (:file lc)) (:line lc) (str "'flow-ref' is pointing to '" nm "' which does not exist") (str (:path lc)) [])))
+                 _ ds)
+               (m/PrChoice ws ow lc) (refs-in ow names (loop [k 0 d ds] (if (>= k (count ws)) d (recur (+ k 1) (refs-in (:procs (nth ws k)) names d)))))
+               (m/PrForEach c ct r b ps2 lc) (refs-in ps2 names ds)
+               (m/PrParallelForEach c mc to tg ps2 lc) (refs-in ps2 names ds)
+               (m/PrScatterGather rs to mc tg lc) (refs-in-routes rs names ds)
+               (m/PrTry ps2 hs hr ta lc) (refs-in-handlers hs names (refs-in ps2 names ds))
+               (m/PrUntilSuccessful mr mb ps2 lc) (refs-in ps2 names ds)
+               (m/PrAsync ps2 mc lc) (refs-in ps2 names ds)
+               (m/PrCache sr fl ps2 lc) (refs-in ps2 names ds)
+               (m/PrBatchJob nm bs mf mc steps oc lc)
+               (refs-in oc names (loop [k 0 d ds]
+                                   (if (>= k (count steps)) d
+                                     (let [stp (nth steps k)
+                                           ags (:aggregator stp)
+                                           d2 (refs-in (:procs stp) names d)]
+                                       (recur (+ k 1) (if (= (count ags) 0) d2 (refs-in (:procs (nth ags 0)) names d2)))))))
+               (m/PrFirstSuccessful rs lc) (refs-in-routes rs names ds)
+               (m/PrRoundRobin rs id lc) (refs-in-routes rs names ds)
+               (m/PrConnectorOp cn op cr ps2 cs ex chs t tv lc)
+               (loop [k 0 d ds] (if (>= k (count chs)) d (recur (+ k 1) (refs-in (:procs (nth chs k)) names d))))
+               _ ds)))))
+
+(defn- check-dups Vec(m/Diag) [flows: &Vec(m/Flow) configs: &Vec(m/Config) globals: &Vec(m/GlobalHandler) ds0: Vec(m/Diag)]
+  (let [[seen ds1]
+        (loop [i 0 seen: Map(Str Str) {} ds ds0]
+          (if (>= i (count flows)) (values seen ds)
+            (let [f (nth flows i) nm (:name f) lc (:loc f)
+                  here (str (:file lc) ":" (:line lc))]
+              (cond (= nm "") (recur (+ i 1) seen ds)
+                    (contains? seen nm) (recur (+ i 1) seen (conj ds (m/->Diag (str (:file lc)) (:line lc) (str "duplicate flow name \"" nm "\" (first defined at " (get seen nm "") ")") (str (:path lc)) [])))
+                    :else (recur (+ i 1) (assoc seen nm here) ds)))))
+        [seen2 ds2]
+        (loop [i 0 sn seen ds ds1]
+          (if (>= i (count configs)) (values sn ds)
+            (let [c (nth configs i) nm (:name c) lc (:loc c)
+                  here (str (:file lc) ":" (:line lc))]
+              (cond (= nm "") (recur (+ i 1) sn ds)
+                    (contains? sn nm) (recur (+ i 1) sn (conj ds (m/->Diag (str (:file lc)) (:line lc) (str "duplicate global element name \"" nm "\" (first defined at " (get sn nm "") ")") (str (:path lc)) [])))
+                    :else (recur (+ i 1) (assoc sn nm here) ds)))))]
+    (loop [i 0 sn seen2 ds ds2]
+      (if (>= i (count globals)) ds
+        (let [g (nth globals i) nm (:name g) lc (:loc g)
+              here (str (:file lc) ":" (:line lc))]
+          (cond (= nm "") (recur (+ i 1) sn ds)
+                (contains? sn nm) (recur (+ i 1) sn (conj ds (m/->Diag (str (:file lc)) (:line lc) (str "duplicate global element name \"" nm "\" (first defined at " (get sn nm "") ")") (str (:path lc)) [])))
+                :else (recur (+ i 1) (assoc sn nm here) ds)))))))

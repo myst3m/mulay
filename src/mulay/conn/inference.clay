@@ -1,0 +1,196 @@
+(ns mulay.conn.inference
+  (:require [mulay.conn.http :as h] [mulay.dw.val :as v] [mulay.dw.fmt.registry :as reg] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.conn.mcp :as mcp] [mulay.lib.xml :as xml] [mulay.lib.numparse :as npz] [clay.http :as http] [clay.httpmsg :as hm]
+            [clay.tls :as ctls] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/ms-inference")
+
+(defn- failure conn/OpResult [id: &Str msg: &Str] (conn/fail-result (err/mk "MS-INFERENCE" id msg)))
+
+(defn- attr-of Str [n: &xml/XNode name: &Str default: Str] (xml/attr n "" name default))
+
+(defn- jfield v/Field [name: Str x: v/Val] (v/field name x))
+
+(defn- obj-first v/Val [x: &v/Val name: &Str]
+  (match (v/unmeta x)
+    (v/VObj fs) (let [r (v/obj-get fs name)] (if (> (count r) 0) (nth r 0) (v/null-v)))
+    _ (v/null-v)))
+
+(defn- compact Str [x: &v/Val] (mcp/compact x))
+
+(defrecord Conn [url: Str model: Str key: Str max-tokens: Int temperature: Str top-p: Str timeout-ms: Int headers: Vec(hm/Header)])
+
+(defn- unit-ms Int [u: &Str]
+  (let [x (str/upper-case u)]
+    (cond (= x "MILLISECONDS") 1 (= x "SECONDS") 1000 (= x "MINUTES") 60000 (= x "HOURS") 3600000 (= x "DAYS") 86400000 (= x "NANOSECONDS") 0 :else 1000)))
+
+(defn- conn-of Values(Vec(Conn) Str) [c: &conn/OpCall]
+  (let [cfg (:config c)
+        cn (if (= (count cfg) 0) [] (let [ch (:children (nth cfg 0))]
+                                     (loop [i 0] (if (>= i (count ch)) []
+                                                   (if (and (xml/elem? (nth ch i)) (str/ends-with? (xml/elem-local (nth ch i)) "-connection")) [(nth ch i)] (recur (+ i 1)))))))]
+    (cond
+      (= (count cn) 0) (values [] "ms-inference: the config has no connection")
+      (not= (xml/elem-local (nth cn 0)) "openai-compatible-connection")
+      (values [] (str "ms-inference:" (xml/elem-local (nth cn 0)) " is not supported by mulay (only openai-compatible-connection)"))
+      :else
+      (let [n (nth cn 0)
+            hs (let [ch (xml/elem-children n)
+                     hh (conn/child-elem ch "custom-headers")]
+                 (if (= (count hh) 0) []
+                   (let [xs (xml/elem-children (nth hh 0))]
+                     (loop [i 0 acc: Vec(hm/Header) []]
+                       (if (>= i (count xs)) acc
+                         (recur (+ i 1) (if (and (xml/elem? (nth xs i)) (= (xml/elem-local (nth xs i)) "default-header"))
+                                          (conj acc (hm/->Header (attr-of (nth xs i) "key" "") (attr-of (nth xs i) "value" ""))) acc)))))))
+            to (npz/int-or (attr-of n "timeout" "60") 60)]
+        (values [(->Conn (attr-of n "openAICompatibleURL" "https://server.endpoint.com") (attr-of n "openAICompatibleModelName" "gpt-4o-mini")
+                         (attr-of n "apiKey" "") (npz/int-or (attr-of n "maxTokens" "500") 500) (attr-of n "temperature" "0.9") (attr-of n "topP" "0.9")
+                         (* to (unit-ms (attr-of n "timeoutUnit" "SECONDS"))) hs)] "")))))
+
+(defn- text-param Values(Str Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [p (conn/param (:exprs c) local)]
+    (if (> (count p) 0)
+      (let [[x e] ((:eval c) (nth p 0) (:event c))]
+        (if (not= e "") (values "" [(err/mk "MULE" "EXPRESSION" e)]) (values (text-of x) [])))
+      (let [[tvs x] (conn/child-tv c local)]
+        (cond (> (count x) 0) (values "" x)
+              (= (count tvs) 0) (values "" [])
+              :else (let [[val t e] (ev/value (nth tvs 0))]
+                      (if (not= e "") (values "" [(err/mk "MULE" "EXPRESSION" e)]) (values (text-of val) []))))))))
+
+(defn- text-of Str [val: &v/Val]
+  (match (v/unmeta val)
+    (v/VStr s) (str s)
+    (v/VNull) ""
+    _ (compact val)))
+
+(defn- json-param Values(v/Val Str Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [[tvs x] (conn/child-tv c local)]
+    (cond (> (count x) 0) (values (v/null-v) "" x)
+          (= (count tvs) 0) (values (v/null-v) "" [])
+          :else (let [[val t e] (ev/value (nth tvs 0))]
+                  (if (not= e "") (values (v/null-v) "" [(err/mk "MULE" "EXPRESSION" e)])
+                    (match (v/unmeta val)
+                      (v/VStr s) (let [[j je] (reg/read-fmt "application/json" [] s)] (values j je []))
+                      _ (values val "" [])))))))
+
+(defn- msg v/Val [role: Str content: v/Val] (v/->VObj [(jfield "role" (v/->VStr role)) (jfield "content" content)]))
+
+(defn- messages-of Values(Vec(v/Val) Str) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VArr xs) (values (loop [i 0 acc: Vec(v/Val) []]
+                          (if (>= i (count xs)) acc
+                            (let [e (nth xs i)]
+                              (recur (+ i 1) (conj acc (v/->VObj [(jfield "role" (obj-first e "role")) (jfield "content" (obj-first e "content"))]))))))
+                        "")
+    (v/VObj fs) (values [] "Cannot deserialize value of type `java.util.ArrayList<com.mulesoft.connectors.inference.api.request.ChatPayloadRecord>` from Object value (token `JsonToken.START_OBJECT`)\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 1]")
+    _ (values [] "Cannot deserialize value of type `java.util.ArrayList<com.mulesoft.connectors.inference.api.request.ChatPayloadRecord>` from String value (token `JsonToken.VALUE_STRING`)\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 1]")))
+
+(defn- request-body Str [cn: &Conn msgs: &Vec(v/Val) tools: &v/Val]
+  (let [[tp te] (parse-double (:top-p cn))
+        [tt tte] (parse-double (:temperature cn))
+        base [(jfield "model" (v/->VStr (:model cn))) (jfield "messages" (v/->VArr msgs))
+              (jfield "max_tokens" (v/int-v (:max-tokens cn)))
+              (jfield "temperature" (num-of (:temperature cn))) (jfield "top_p" (num-of (:top-p cn)))]
+        fs (if (v/null? tools) base (conj base (jfield "tools" tools)))]
+    (compact (v/->VObj fs))))
+
+(defn- num-of v/Val [s: &Str] (let [[x e] (reg/read-fmt "application/json" [] s)] (if (not= e "") (v/null-v) x)))
+
+(defn- strip-slash Str [u: &Str] (str u))
+
+(defn- jackson-fail Str [text: &Str]
+  (let [t (str/trim text)
+        w (loop [i 0] (if (>= i (count t)) i (let [ch (nth t i)] (if (or (and (>= ch 97) (<= ch 122)) (and (>= ch 65) (<= ch 90)) (and (>= ch 48) (<= ch 57)) (= ch 95)) (recur (+ i 1)) i))))]
+    (if (> w 0)
+      (str "Unrecognized token '" (subs t 0 w) "': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: " (+ w 2) "]")
+      (if (= (count t) 0) "No content to map due to end-of-input"
+        (str "Unexpected character ('" (chr (nth t 0)) "' (code " (nth t 0) ")): expected a valid value (JSON String, Number, Array, Object or token 'null', 'true' or 'false')\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 2]")))))
+
+(defn- send-chat conn/OpResult [cn: &Conn msgs: &Vec(v/Val) tools: &v/Val tools-op: Bool]
+  (let [body (request-body cn msgs tools)
+        hs0: Vec(hm/Header) [(hm/->Header "Authorization" (str "Bearer " (:key cn))) (hm/->Header "Content-Type" "application/json")]
+        hs (loop [i 0 acc hs0] (if (>= i (count (:headers cn))) acc (recur (+ i 1) (conj acc (nth (:headers cn) i)))))
+        url (str (:url cn) "/chat/completions")
+        o0 (assoc (http/request-opts url) :method "POST" :headers hs :body body :max-redirects 0 :timeout-ms (:timeout-ms cn)
+                  :max-status-line h/MAX-STATUS-LINE :max-field-section h/MAX-FIELD-SECTION)
+        o1 (if (str/starts-with? url "https") (assoc o0 :tls (assoc (ctls/default-config) :alpn ["http/1.1"])) o0)
+        [resp e] (http/request o1)
+        cid (if tools-op "TOOLS_OPERATION_FAILURE" "CHAT_OPERATION_FAILURE")]
+    (cond
+      (not= e "") (failure "CHAT_OPERATION_FAILURE" (conn-fail-text e url))
+      (or (< (:status resp) 200) (> (:status resp) 299))
+      (failure (if (= (:status resp) 429) "RATE_LIMIT_EXCEEDED" "CHAT_OPERATION_FAILURE") (str "Request failed with status code: " (:status resp) " and message: " (:body resp)))
+      :else
+      (let [[j je] (reg/read-fmt "application/json" [] (:body resp))]
+        (if (not= je "") (failure cid (jackson-fail (:body resp)))
+          (let [chs (obj-first j "choices")]
+            (match (v/unmeta chs)
+              (v/VArr cs) (if (= (count cs) 0) (failure cid "Index 0 out of bounds for length 0") (shape j (nth cs 0)))
+              _ (failure cid "Cannot invoke \"java.util.List.get(int)\" because the return value of \"com.mulesoft.connectors.inference.internal.dto.textgeneration.response.ChatCompletionResponse.choices()\" is null"))))))))
+
+(defn- conn-fail-text Str [emsg: &Str url: &Str]
+  (let [lm (str/lower-case emsg)
+        k (str/index-of url "://")
+        rest (if (< k 0) (str url) (subs url (+ k 3) (count url)))
+        e (loop [i 0] (if (>= i (count rest)) i (if (= (nth rest i) 47) i (recur (+ i 1)))))
+        hp (subs rest 0 e)
+        c (str/index-of hp ":")
+        host (if (< c 0) hp (subs hp 0 c))
+        port (if (< c 0) (if (str/starts-with? url "https") "443" "80") (subs hp (+ c 1) (count hp)))
+        t (h/conn-fail-text emsg host port)]
+    (cond (or (str/includes? lm "timed out") (str/includes? lm "timeout") (str/includes? lm "deadline")) "Timeout exceeded."
+          (str/ends-with? t ".") (subs t 0 (- (count t) 1))
+          :else t)))
+
+(defn- shape conn/OpResult [j: &v/Val ch: &v/Val]
+  (let [mg (obj-first ch "message")
+        content (obj-first mg "content")
+        calls (obj-first mg "tool_calls")
+        has-calls (match (v/unmeta calls) (v/VArr xs) (> (count xs) 0) _ false)
+        p0: Vec(v/Field) []
+        p1 (if (v/null? content) p0 (conj p0 (jfield "response" content)))
+        p2 (if has-calls (conj p1 (jfield "tools" calls)) p1)
+        u (obj-first j "usage")
+        attrs (v/->VObj [(jfield "tokenUsage" (v/->VObj [(jfield "outputCount" (obj-first u "completion_tokens")) (jfield "totalCount" (obj-first u "total_tokens"))
+                                                         (jfield "inputCount" (obj-first u "prompt_tokens"))]))
+                         (jfield "additionalAttributes" (v/->VObj [(jfield "promptFilterResults" (v/null-v)) (jfield "contentFilterResults" (v/null-v))
+                                                                   (jfield "finishReason" (obj-first ch "finish_reason")) (jfield "model" (obj-first j "model"))
+                                                                   (jfield "id" (obj-first j "id"))]))])]
+    (conn/ok-result (ev/tv-raw (compact (v/->VObj p2)) "application/json; charset=UTF-8") (ev/tv-val attrs ev/JAVA))))
+
+(defn- fail-of conn/OpResult [x: &Vec(err/MErr)] (conn/fail-result (nth x 0)))
+
+(defn- run-with conn/OpResult [c: &conn/OpCall msgs: &Vec(v/Val) tools: &v/Val tools-op: Bool]
+  (let [[cs ce] (conn-of c)]
+    (if (not= ce "") (failure "CHAT_OPERATION_FAILURE" ce) (send-chat (nth cs 0) msgs tools tools-op))))
+
+(defn- template-msgs Vec(v/Val) [tp: &Str ins: &Str data: &Str]
+  [(msg "system" (v/->VStr (str tp " - " ins))) (msg "user" (v/->VStr data))])
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (let [op (:op c)]
+    (cond
+      (= op "chat-answer-prompt")
+      (let [[p x] (text-param c "prompt")]
+        (if (> (count x) 0) (fail-of x) (run-with c [(msg "user" (v/->VStr p))] (v/null-v) false)))
+      (= op "chat-completions")
+      (let [[mv me x] (json-param c "messages")]
+        (cond (> (count x) 0) (fail-of x)
+              (not= me "") (failure "CHAT_OPERATION_FAILURE" me)
+              :else (let [[ms mer] (messages-of mv)]
+                      (if (not= mer "") (failure "CHAT_OPERATION_FAILURE" mer) (run-with c ms (v/null-v) false)))))
+      (= op "agent-define-prompt-template")
+      (let [[tp x1] (text-param c "template") [ins x2] (text-param c "instructions") [data x3] (text-param c "data")]
+        (cond (> (count x1) 0) (fail-of x1) (> (count x2) 0) (fail-of x2) (> (count x3) 0) (fail-of x3)
+              :else (run-with c (template-msgs tp ins data) (v/null-v) false)))
+      (= op "tools-native-template")
+      (let [[tp x1] (text-param c "template") [ins x2] (text-param c "instructions") [data x3] (text-param c "data")
+            [tv te x4] (json-param c "tools")]
+        (cond (> (count x1) 0) (fail-of x1) (> (count x2) 0) (fail-of x2) (> (count x3) 0) (fail-of x3) (> (count x4) 0) (fail-of x4)
+              (not= te "") (failure "TOOLS_OPERATION_FAILURE" te)
+              :else (run-with c (template-msgs tp ins data) tv true)))
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "ms-inference:" op " is not supported by mulay"))))))
+
+(defn connector conn/Connector [] (conn/connector "ms-inference" NS (fn conn/OpResult [c: conn/OpCall] (run-op c))))

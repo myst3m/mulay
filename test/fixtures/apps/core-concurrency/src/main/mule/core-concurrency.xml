@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18153"/>
+    </http:listener-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  "type": error.errorType.namespace ++ ":" ++ error.errorType.identifier,
+  description: error.description,
+  failed: keysOf(error.errorMessage.payload.failures default {}),
+  results: (error.errorMessage.payload.results default {}) mapObject ((v, k) -> {(k): v.payload}),
+  failTypes: (error.errorMessage.payload.failures default {}) mapObject ((v, k) -> {(k): v.errorType.namespace ++ ":" ++ v.errorType.identifier})
+}]]></ee:set-payload></ee:message></ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="sg-timeout">
+        <http:listener config-ref="L" path="/sg-timeout"/>
+        <scatter-gather timeout="300">
+            <route><set-payload value="fast"/></route>
+            <route><set-payload value="#[dw::Runtime::wait('slow', 2000)]"/></route>
+        </scatter-gather>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="pfe-timeout">
+        <http:listener config-ref="L" path="/pfe-timeout"/>
+        <parallel-foreach collection="#[[1, 20]]" timeout="300">
+            <set-payload value="#[dw::Runtime::wait(payload, payload * 100)]"/>
+        </parallel-foreach>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="pfe-order">
+        <http:listener config-ref="L" path="/pfe-order"/>
+        <parallel-foreach collection="#[[3, 1, 2]]" maxConcurrency="1">
+            <set-payload value="#[dw::Runtime::wait(payload, payload * 50)]"/>
+        </parallel-foreach>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map $.payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="sg-max">
+        <http:listener config-ref="L" path="/sg-max"/>
+        <scatter-gather maxConcurrency="1">
+            <route><set-payload value="#[dw::Runtime::wait('a', 100)]"/></route>
+            <route><set-payload value="b"/></route>
+        </scatter-gather>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload mapObject ((v, k) -> {(k): v.payload})]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="pfe-error">
+        <http:listener config-ref="L" path="/pfe-error"/>
+        <parallel-foreach collection="#[[1, 2, 3]]">
+            <choice><when expression="#[payload == 2]"><raise-error type="APP:TWO" description="two failed"/></when></choice>
+        </parallel-foreach>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

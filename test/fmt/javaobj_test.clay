@@ -1,0 +1,29 @@
+(ns javaobj-test (:require [mulay.dw.javaobj :as jo] [mulay.dw.val :as v]))
+
+(defn- meta-class v/Val [c: Str x: v/Val] (v/->VMeta x [(v/field "class" (v/->VStr c))]))
+
+(deftest unknown-class
+  (let [[s ok] (jo/to-string (v/->VObj [(v/field "a" (v/->VStr "b"))]))
+        [s2 ok2] (jo/to-string (meta-class "java.util.HashMap" (v/->VObj [])))]
+    (is (= ok false))
+    (is (= s ""))
+    (is (= ok2 false))))
+
+(deftest response-attrs-empty-headers
+  (let [[s ok] (jo/to-string (meta-class "org.mule.extension.http.api.HttpResponseAttributes"
+                                         (v/->VObj [(v/field "headers" (v/->VObj [])) (v/field "reasonPhrase" (v/->VStr ""))
+                                                    (v/field "statusCode" (v/int-v 204))])))]
+    (is ok)
+    (is (= s "org.mule.extension.http.api.HttpResponseAttributes\n{\n   Status Code=204\n   Reason Phrase=\n   Headers=[]\n}"))))
+
+(deftest request-attrs-masks-secrets
+  (let [[s ok] (jo/to-string (meta-class "org.mule.extension.http.api.HttpRequestAttributes"
+                                         (v/->VObj [(v/field "headers" (v/->VObj [(v/field "x-my-secret" (v/->VStr "s")) (v/field "a" (v/->VStr "1"))]))
+                                                    (v/field "queryParams" (v/->VObj [(v/field "pass" (v/->VStr "p"))]))
+                                                    (v/field "queryString" (v/->VStr "pass=p"))
+                                                    (v/field "maskedRequestPath" (v/null-v))])))]
+    (is ok)
+    (is (= s (str "org.mule.extension.http.api.HttpRequestAttributes\n{\n   Request path=null\n   Raw request path=null\n   Method=null\n"
+                  "   Listener path=null\n   Local Address=null\n   Query String=****\n   Relative Path=null\n   Masked Request Path=null\n"
+                  "   Remote Address=null\n   Request Uri=null\n   Raw request Uri=null\n   Scheme=null\n   Version=null\n"
+                  "   Headers=[\n      x-my-secret=****\n      a=1\n   ]\n   Query Parameters=[\n      pass=****\n   ]\n   URI Parameters=[]\n}")))))

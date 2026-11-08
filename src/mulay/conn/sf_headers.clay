@@ -1,0 +1,251 @@
+(ns mulay.conn.sf_headers
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.conn.sf_core :as sc] [mulay.rt.conn :as conn] [mulay.rt.error :as err]
+            [mulay.rt.log :as log] [mulay.rt.engine :as eng] [mulay.mule.model :as m] [mulay.lib.xml :as xml] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(def ORDER ["AllOrNoneHeader" "AllowFieldTruncationHeader" "AssignmentRuleHeader" "CallOptions" "DisableFeedTrackingHeader"
+            "DuplicateRuleHeader" "EmailHeader" "MruHeader" "OwnerChangeOptions" "PackageVersionHeader" "QueryOptions" "UserTerritoryDeleteHeader"])
+
+(def OWNER-CHANGE-TYPES ["EnforceNewOwnerHasReadAccess" "TransferOpenActivities" "TransferNotesAndAttachments" "TransferOthersOpenOpportunities"
+                         "TransferOwnedOpenOpportunities" "TransferOwnedClosedOpportunities" "TransferOwnedOpenCases" "TransferAllOwnedCases"
+                         "TransferContracts" "TransferOrders" "TransferContacts" "TransferArticleOwnedPublishedVersion"
+                         "TransferArticleOwnedArchivedVersions" "TransferArticleAllVersions" "KeepAccountTeam" "KeepSalesTeam"
+                         "KeepSalesTeamGrantCurrentOwnerReadWriteAccess"])
+
+(def META-NAMES ["AllOrNoneHeader" "AllowFieldTruncationHeader" "AssignmentRuleHeader" "CallOptions" "DisableFeedTrackingHeader" "EmailHeader"
+                 "LocaleOptions" "MruHeader" "OwnerChangeOptions" "QueryOptions" "UserTerritoryDeleteHeader" "DuplicateRuleHeader"])
+
+(def META-ENUMS ["ALL_OR_NONE" "ALLOW_FIELD_TRUNCATION" "ASSIGNMENT_RULE" "CALL_OPTIONS" "DISABLE_FEED_TRACKING" "EMAIL"
+                 "LOCALE_OPTIONS" "MRU" "OWNER_CHANGE_OPTIONS" "QUERY_OPTIONS" "USER_TERRITORY_DELETE" "DUPLICATE_RULE"])
+
+(def NULL-HEADER "Cannot invoke \"Object.getClass()\" because the return value of \"java.util.Map$Entry.getValue()\" is null")
+
+(def CATEGORY "org.mule.extension.salesforce.internal.service.util.SalesforceUtils")
+
+(def INT-MAX 2147483647)
+(def INT-MIN -2147483648)
+
+(defn- index-ci Int [xs: &Vec(Str) k: &Str]
+  (let [lk (str/lower-case k)]
+    (loop [i 0] (if (>= i (count xs)) -1 (if (= (str/lower-case (nth xs i)) lk) i (recur (+ i 1)))))))
+
+(defn- in? Bool [xs: &Vec(Str) k: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) k) true (recur (+ i 1))))))
+
+(defn- get-ci Vec(v/Val) [fs: &Vec(v/Field) k: &Str]
+  (let [lk (str/lower-case k)]
+    (loop [i 0 r: Vec(v/Val) []]
+      (if (>= i (count fs)) r
+        (let [f (nth fs i)]
+          (recur (+ i 1) (if (= (str/lower-case (:name (:key f))) lk)
+                           (let [x (v/unmeta (:value f))] (if (v/null? x) [] [(:value f)]))
+                           r)))))))
+
+(defn- el Str [k: &Str s: &Str] (str "<urn:" k ">" s "</urn:" k ">"))
+
+(defn- class-of Str [x: &v/Val]
+  (match x
+    (v/VMeta y ms) (let [r (v/obj-get ms "class")] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) (str s) _ "")))
+    _ ""))
+
+(defn- rbool Values(Bool Bool) [fs: &Vec(v/Field) k: &Str]
+  (let [r (get-ci fs k)]
+    (if (= (count r) 0) (values false true)
+      (match (v/unmeta (nth r 0)) (v/VBool b) (values b true) _ (values false false)))))
+
+(defn- rint Values(Int Bool) [fs: &Vec(v/Field) k: &Str]
+  (let [r (get-ci fs k)]
+    (if (= (count r) 0) (values 0 false)
+      (let [x (nth r 0)
+            cls (class-of x)]
+        (if (and (not= cls "") (not= cls "java.lang.Integer")) (values 0 false)
+          (match (v/unmeta x)
+            (v/VInt i) (if (and (>= i INT-MIN) (<= i INT-MAX)) (values i true) (values 0 false))
+            (v/VNum n) (if (num/integer? n)
+                         (let [[i e] (num/to-int n)] (if (and (= e "") (>= i INT-MIN) (<= i INT-MAX)) (values i true) (values 0 false)))
+                         (values 0 false))
+            _ (values 0 false)))))))
+
+(defn- rstr Vec(Str) [fs: &Vec(v/Field) k: &Str]
+  (let [r (get-ci fs k)] (if (= (count r) 0) [] [(sc/field-text (v/unmeta (nth r 0)))])))
+
+(defn- bools Values(Str Bool) [fs: &Vec(v/Field) ks: &Vec(Str)]
+  (loop [i 0 out ""]
+    (if (>= i (count ks)) (values out true)
+      (let [[b ok] (rbool fs (nth ks i))]
+        (if (not ok) (values "" false) (recur (+ i 1) (str out (el (nth ks i) (if b "true" "false")))))))))
+
+(defn- opt-strs Str [fs: &Vec(v/Field) ks: &Vec(Str)]
+  (loop [i 0 out ""]
+    (if (>= i (count ks)) out
+      (let [s (rstr fs (nth ks i))] (recur (+ i 1) (if (= (count s) 0) out (str out (el (nth ks i) (sc/xml-esc (nth s 0))))))))))
+
+(defn- owner-option Values(Str Bool) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) (let [t (rstr fs "type")
+                      e (get-ci fs "execute")]
+                  (cond (or (= (count t) 0) (not (in? OWNER-CHANGE-TYPES (nth t 0)))) (values "" false)
+                        (= (count e) 0) (values "" false)
+                        :else (match (v/unmeta (nth e 0))
+                                (v/VBool b) (values (el "options" (str (el "type" (nth t 0)) (el "execute" (if b "true" "false")))) true)
+                                _ (values "" false))))
+    _ (values "" false)))
+
+(defn- package-version Values(Str Bool) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) (let [[a ao] (rint fs "majorNumber")
+                      [b bo] (rint fs "minorNumber")
+                      n (rstr fs "namespace")]
+                  (if (and ao bo (> (count n) 0))
+                    (values (el "packageVersions" (str (el "majorNumber" (str a)) (el "minorNumber" (str b)) (el "namespace" (sc/xml-esc (nth n 0))))) true)
+                    (values "" false)))
+    _ (values "" false)))
+
+(defn- each Values(Str Bool) [fs: &Vec(v/Field) k: &Str f: Fn(v/Val Values(Str Bool))]
+  (let [r (get-ci fs k)]
+    (if (= (count r) 0) (values "" false)
+      (match (v/unmeta (nth r 0))
+        (v/VArr xs) (loop [i 0 out ""]
+                      (if (>= i (count xs)) (values out true)
+                        (let [[s ok] (f (nth xs i))] (if (not ok) (values "" false) (recur (+ i 1) (str out s))))))
+        _ (values "" false)))))
+
+(defn- inner Values(Str Bool) [name: &Str fs: &Vec(v/Field)]
+  (cond
+    (= name "AllOrNoneHeader") (bools fs ["allOrNone"])
+    (= name "AllowFieldTruncationHeader") (bools fs ["allowFieldTruncation"])
+    (= name "AssignmentRuleHeader") (let [[b ok] (bools fs ["useDefaultRule"])] (values (str (opt-strs fs ["assignmentRuleId"]) b) ok))
+    (= name "CallOptions") (values (opt-strs fs ["client" "defaultNamespace"]) true)
+    (= name "DisableFeedTrackingHeader") (bools fs ["disableFeedTracking"])
+    (= name "DuplicateRuleHeader") (bools fs ["allowSave" "includeRecordDetails" "runAsCurrentUser"])
+    (= name "EmailHeader") (bools fs ["triggerAutoResponseEmail" "triggerOtherEmail" "triggerUserEmail"])
+    (= name "MruHeader") (bools fs ["updateMru"])
+    (= name "OwnerChangeOptions") (each fs "options" owner-option)
+    (= name "PackageVersionHeader") (each fs "packageVersions" package-version)
+    (= name "QueryOptions") (let [[n ok] (rint fs "batchSize")] (values (el "batchSize" (str n)) ok))
+    (= name "UserTerritoryDeleteHeader") (let [s (rstr fs "transferToUserId")]
+                                           (if (= (count s) 0) (values "" false) (values (el "transferToUserId" (sc/xml-esc (nth s 0))) true)))
+    :else (values "" false)))
+
+(defn headers-xml Values(Str Vec(Str) Str) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs)
+    (loop [i 0 slots: Vec(Str) (mapv (fn Str [s: Str] "") ORDER) logs: Vec(Str) []]
+      (if (>= i (count fs)) (values (str/join "" slots) logs "")
+        (let [k (:name (:key (nth fs i)))
+              hv (v/unmeta (:value (nth fs i)))]
+          (match hv
+            (v/VNull) (values "" logs NULL-HEADER)
+            (v/VObj hfs)
+            (let [idx (index-ci ORDER k)]
+              (if (< idx 0) (recur (+ i 1) slots (conj logs (str "Invalid header name: " k)))
+                (let [name (nth ORDER idx)
+                      [s ok] (inner name hfs)]
+                  (if ok (recur (+ i 1) (assoc slots idx (el name s)) logs)
+                    (recur (+ i 1) slots (conj logs (str "Header " k " is incorrect, couldn't be added to the request")))))))
+            _ (recur (+ i 1) slots (conj logs (str "The header " k " should be a Map")))))))
+    _ (values "" [] "")))
+
+(defn- attr-of Values(v/Val Vec(err/MErr)) [c: &conn/OpCall n: &xml/XNode base: &Str k: &Str]
+  (let [p (conn/param (:exprs c) (str base "@" k))]
+    (if (= (count p) 0) (values (v/->VStr (sc/at n k "")) [])
+      (let [[x e] ((:eval c) (nth p 0) (:event c))]
+        (if (not= e "") (values (v/null-v) [(err/mk "MULE" "EXPRESSION" e)]) (values x []))))))
+
+(defn- child-headers Values(Vec(v/Val) Vec(err/MErr)) [c: &conn/OpCall]
+  (let [hs (conn/child-elem (:children c) "headers")]
+    (if (= (count hs) 0) (values [] [])
+      (let [ks (xml/child-elems (nth hs 0))
+            kids (loop [i 0 a: Vec(xml/XNode) []] (if (>= i (count ks)) a (recur (+ i 1) (if (= (xml/elem-local (nth ks i)) "header") (conj a (nth ks i)) a))))
+            dup (> (count kids) 1)]
+        (loop [i 0 fs: Vec(v/Field) []]
+          (if (>= i (count kids)) (values [(v/->VObj fs)] [])
+            (let [base (if dup (str "headers/header[" i "]") "headers/header")
+                  [kx ke] (attr-of c (nth kids i) base "key")
+                  [vx ve] (attr-of c (nth kids i) base "value")]
+              (cond (> (count ke) 0) (values [] ke)
+                    (> (count ve) 0) (values [] ve)
+                    :else (recur (+ i 1) (conj fs (v/field (sc/field-text (v/unmeta kx)) vx)))))))))))
+
+(defn- headers-val Values(Vec(v/Val) Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[a ax] (conn/attr-val c "headers")]
+    (cond (> (count ax) 0) (values [] ax)
+          (> (count a) 0) (values a [])
+          :else (child-headers c))))
+
+(defn- emit-logs Int [logs: &Vec(Str)]
+  (loop [i 0] (if (>= i (count logs)) 0 (let [w (log/emit log/ERROR log/INFO "salesforce" CATEGORY (nth logs i))] (recur (+ i 1))))))
+
+(defn soap-headers Values(Str Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[b bx] (headers-val c)]
+    (cond
+      (> (count bx) 0) (values "" bx)
+      (= (count b) 0) (values "" [])
+      :else
+      (let [[s logs fatal] (headers-xml (nth b 0))
+            z (emit-logs logs)]
+        (if (not= fatal "") (values "" [(err/mk "MULE" "UNKNOWN" fatal)]) (values s []))))))
+
+(defn meta-logs Values(Vec(Str) Str) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs)
+    (loop [i 0 logs: Vec(Str) []]
+      (if (>= i (count fs)) (values logs "")
+        (let [k (:name (:key (nth fs i)))
+              idx (index-ci META-NAMES k)]
+          (if (< idx 0) (recur (+ i 1) (conj logs (str "Invalid header name: " k)))
+            (match (v/unmeta (:value (nth fs i)))
+              (v/VNull) (values logs NULL-HEADER)
+              (v/VObj hfs) (recur (+ i 1) (conj logs (str "Header " (nth META-ENUMS idx) " is incorrect, couldn't be added to the request")))
+              _ (recur (+ i 1) (conj logs (str "The header " (nth META-NAMES idx) " should be a Map"))))))))
+    _ (values [] "")))
+
+(defn meta-headers Vec(err/MErr) [c: &conn/OpCall]
+  (let [[b bx] (headers-val c)]
+    (cond
+      (> (count bx) 0) bx
+      (= (count b) 0) []
+      :else (let [[logs fatal] (meta-logs (nth b 0))
+                  z (emit-logs logs)]
+              (if (not= fatal "") [(err/mk "MULE" "UNKNOWN" fatal)] [])))))
+
+(defn- java-class Str [x: &v/Val]
+  (let [c (class-of x)]
+    (if (not= c "") c
+      (match (v/unmeta x)
+        (v/VStr s) "java.lang.String"
+        (v/VBool b) "java.lang.Boolean"
+        (v/VObj fs) "java.util.LinkedHashMap"
+        (v/VArr xs) "java.util.ArrayList"
+        (v/VInt i) (if (and (>= i INT-MIN) (<= i INT-MAX)) "java.lang.Integer" "java.lang.Long")
+        (v/VNum n) (if (num/integer? n)
+                     (let [[k e] (num/to-int n)] (cond (not= e "") "java.math.BigInteger" (and (>= k INT-MIN) (<= k INT-MAX)) "java.lang.Integer" :else "java.lang.Long"))
+                     "java.lang.Double")
+        _ "java.lang.Object"))))
+
+(defn bulk1-headers Vec(hm/Header) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) (loop [i 0 out: Vec(hm/Header) []]
+                  (if (>= i (count fs)) out
+                    (let [y (:value (nth fs i))]
+                      (recur (+ i 1) (if (v/null? (v/unmeta y)) out (conj out (hm/->Header (:name (:key (nth fs i))) (eng/java-str y))))))))
+    _ []))
+
+(defn bulk2-headers Values(Vec(hm/Header) Str) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) (loop [i 0 out: Vec(hm/Header) []]
+                  (if (>= i (count fs)) (values out "")
+                    (let [y (:value (nth fs i))]
+                      (match (v/unmeta y)
+                        (v/VNull) (recur (+ i 1) out)
+                        (v/VStr s) (recur (+ i 1) (conj out (hm/->Header (:name (:key (nth fs i))) (str s))))
+                        _ (let [jc (java-class y)]
+                            (values [] (str "class " jc " cannot be cast to class java.lang.String (" jc " and java.lang.String are in module java.base of loader 'bootstrap')")))))))
+    _ (values [] "")))
+
+(defn http-headers Values(Vec(hm/Header) Vec(err/MErr)) [c: &conn/OpCall v2: Bool]
+  (let [[b bx] (headers-val c)
+        none: Vec(hm/Header) []]
+    (cond
+      (> (count bx) 0) (values none bx)
+      (= (count b) 0) (values none [])
+      (not v2) (values (bulk1-headers (nth b 0)) [])
+      :else (let [[hs e] (bulk2-headers (nth b 0))] (if (not= e "") (values none [(err/mk "MULE" "UNKNOWN" e)]) (values hs []))))))

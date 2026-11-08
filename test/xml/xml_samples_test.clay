@@ -1,0 +1,38 @@
+(ns xml-samples-test (:require [mulay.lib.xml :as xml] [clay.string :as str] [clay.io :as io]))
+
+(defn- env Str [k: Str] (getenv k ""))
+
+;; every Mule configuration file of the mulet samples parses, and survives a
+;; write / re-parse round trip with the same element count.
+(defn- count-elems Int [n: &xml/XNode]
+  (let [cs (xml/child-elems n)]
+    (loop [i 0 acc 1] (if (>= i (count cs)) acc (recur (+ i 1) (+ acc (count-elems (nth cs i))))))))
+
+(defn- sample-files Vec(Str) []
+  (let [base "test/fixtures/mulet-samples"
+        [apps err] (io/list-dir base)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count apps)) acc
+        (let [dir (str base "/" (nth apps i) "/src/main/mule")
+              [fs e2] (io/list-dir dir)
+              acc2 (loop [j 0 a acc]
+                     (if (>= j (count fs)) a
+                       (recur (+ j 1) (if (str/ends-with? (nth fs j) ".xml") (conj a (str dir "/" (nth fs j))) a))))]
+          (recur (+ i 1) acc2))))))
+
+(deftest mule-samples
+  (is (>= (count (sample-files)) 12))
+  (is (let [fs (sample-files)]
+        (loop [i 0 ok true]
+          (if (>= i (count fs)) ok
+            (let [[src rerr] (read-file (nth fs i))
+                  [d err] (xml/parse src)
+                  root (xml/doc-root d)
+                  [out werr] (xml/write-doc (xml/default-wopts) d)
+                  [d2 err2] (xml/parse out)
+                  good (and (= rerr "") (= err "") (= werr "") (= err2 "")
+                            (= (xml/elem-local root) "mule")
+                            (= (xml/elem-uri root) "http://www.mulesoft.org/schema/mule/core")
+                            (= (count-elems root) (count-elems (xml/doc-root d2))))]
+              (if good (recur (+ i 1) ok)
+                (do (println (str "FAILED " (nth fs i) ": " err werr err2)) (recur (+ i 1) false)))))))))

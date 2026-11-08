@@ -1,0 +1,81 @@
+(ns mulay.rt.explain
+  (:require [mulay.lib.diag :as d] [mulay.dw.explain :as dx] [mulay.dw.engine :as eng] [mulay.dw.rt :as drt] [mulay.dw.err :as dwe] [mulay.mule.model :as m]
+            [mulay.rt.error :as err] [clay.string :as str]))
+
+(defn dw-x err/DwX [de: &dwe/DwErr src: &m/ExprSrc]
+  (let [sp (if (or (= (:origin de) "") (dwe/unset? (:pend de))) (:sp de) (:pend de)) off (:off src) n (count (:script src)) b (:base src)
+        ok (and (>= b 0) (>= (:start sp) off) (< (:start sp) n))
+        e0 (if (< (:end sp) (:start sp)) (:start sp) (if (> (:end sp) n) n (:end sp)))]
+    (err/->DwX (str (:msg de)) (str (:file src)) (if ok (+ b (- (:start sp) off)) -1) (if ok (+ b (- e0 off)) -1) (str (:script src)))))
+
+(defn- text-of Str [app: &m/App file: &Str]
+  (let [ts (:texts app)]
+    (if (contains? ts file) (str (get ts file ""))
+      (let [[t found] ((:res app) (str file))] (if found t "")))))
+
+(defrecord ElemAt [file: Str line: Int])
+
+(defn- elem-at Vec(ElemAt) [el: &Str]
+  (let [at (str/index-of el " @ ")]
+    (if (< at 0) []
+      (let [rest (subs el (+ at 3) (count el))
+            c1 (str/index-of rest ":")
+            c2 (str/last-index-of rest ":")]
+        (if (or (< c1 0) (<= c2 c1)) []
+          (let [[ln e] (parse-long (subs rest (+ c2 1) (count rest)))]
+            (if (not= e "") [] [(->ElemAt (subs rest (+ c1 1) c2) ln)])))))))
+
+(defn- line-start Int [t: &Str line: Int]
+  (loop [i 0 k 1] (cond (= k line) i (>= i (count t)) -1 (= (nth t i) 10) (recur (+ i 1) (+ k 1)) :else (recur (+ i 1) k))))
+
+(defn- tag-span Values(Int Int) [t: &Str line: Int]
+  (let [ls (line-start t line)
+        lt (if (< ls 0) -1 (str/index-of-after t "<" ls))]
+    (if (< lt 0) (values -1 -1)
+      (let [e (loop [j (+ lt 1)] (if (and (< j (count t)) (let [c (nth t j)] (not (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 47) (= c 62))))) (recur (+ j 1)) j))]
+        (values lt e)))))
+
+(defn- rest-lines Str [s: &Str] (let [i (str/index-of s "\n")] (if (< i 0) "" (str/trim (subs s (+ i 1) (count s))))))
+(defn- first-line Str [s: &Str] (let [i (str/index-of s "\n")] (if (< i 0) (str s) (subs s 0 i))))
+
+(defn exc-report d/Report [app: &m/App x: &err/MErr stack: &Str]
+  (let [ty (err/type-str x)
+        el (:elem x)
+        at (elem-at el)
+        dws (:dx x)
+        base (cond
+               (and (> (count dws) 0) (>= (:start (nth dws 0)) 0))
+               (let [w (nth dws 0)
+                     t (text-of app (:file w))
+                     r0 (d/report "error" ty (:msg w))
+                     r1 (if (= t "") (d/with-src r0 (:file w) "") (d/label (d/with-src r0 (:file w) t) (:start w) (:end w) "" true))
+                     cands (dx/candidates (:script w) (deref eng/BUILTINS) (dx/->Ctx m/BINDINGS false))]
+                 (dx/explain r1 (:msg w) cands (dx/->Ctx m/BINDINGS false)))
+               (> (count dws) 0)
+               (let [w (nth dws 0)
+                     r0 (d/report "error" ty (:msg w))
+                     r1 (if (> (count at) 0) (d/with-src r0 (str (:file (nth at 0)) ":" (:line (nth at 0))) "") r0)]
+                 (dx/explain r1 (:msg w) [] (dx/->Ctx m/BINDINGS false)))
+               (> (count at) 0)
+               (let [a (nth at 0)
+                     t (text-of app (:file a))
+                     [s e] (if (= t "") (values -1 -1) (tag-span t (:line a)))
+                     r0 (d/report "error" ty (first-line (:description x)))
+                     r1 (if (< s 0) (d/with-src r0 (str (:file a) ":" (:line a)) "")
+                          (d/label (d/with-src r0 (:file a) t) s e (if (str/includes? (:dsl x) "<raise-error") "raised here" "failed here") true))
+                     more (rest-lines (:description x))]
+                 (if (= more "") r1 (d/note r1 more)))
+               :else
+               (let [r0 (d/report "error" ty (first-line (:description x))) more (rest-lines (:description x))]
+                 (if (= more "") r0 (d/note r0 more))))
+        r2 (if (= el "") base (d/note base (str "element: " el)))]
+    (if (= stack "") r2 (d/note r2 (str "flow stack: " stack)))))
+
+(defn located d/Report [app: &m/App r: d/Report el: &Str label: &Str]
+  (let [at (elem-at el)]
+    (if (= (count at) 0) r
+      (let [a (nth at 0)
+            t (text-of app (:file a))
+            [s e] (if (= t "") (values -1 -1) (tag-span t (:line a)))]
+        (if (< s 0) (d/with-src r (str (:file a) ":" (:line a)) "")
+          (d/label (d/with-src r (:file a) t) s e (str label) true))))))

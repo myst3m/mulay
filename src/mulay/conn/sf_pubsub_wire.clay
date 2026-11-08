@@ -1,0 +1,92 @@
+(ns mulay.conn.sf_pubsub_wire
+  (:require [mulay.lib.protobuf :as pb] [clay.string :as str]))
+
+(def LATEST 0)
+(def EARLIEST 1)
+(def CUSTOM 2)
+
+(defrecord TopicInfo [topic: Str can-publish: Bool can-subscribe: Bool schema-id: Str])
+(defrecord SchemaInfo [json: Str id: Str])
+(defrecord PubResult [replay-id: Vec(Int) has-error: Bool err-code: Str err-msg: Str corr: Str])
+(defrecord ConsumerEvent [id: Str schema-id: Str payload: Str replay-id: Vec(Int)])
+(defrecord FetchResponse [events: Vec(ConsumerEvent) latest: Vec(Int) pending: Int])
+
+(defn- put-bytes Str [out: Str num: Int b: &Str]
+  (let [o1 (pb/put-varint out (bit-or (bit-shift-left num 3) 2))
+        o2 (pb/put-varint o1 (count b))]
+    (str o2 b)))
+
+(defn- put-int Str [out: Str num: Int n: Int]
+  (let [o1 (pb/put-varint out (bit-shift-left num 3))] (pb/put-varint o1 n)))
+
+(defn- opt-bytes Str [out: Str num: Int b: &Str] (if (= (count b) 0) out (put-bytes out num b)))
+
+(defn- opt-int Str [out: Str num: Int n: Int] (if (= n 0) out (put-int out num n)))
+
+(defn replay-bytes Str [n: Int] (pb/put-fixed-be "" n 8))
+
+(defn replay-of Vec(Int) [b: &Str] (if (< (count b) 8) [] [(pb/get-fixed-be b 0 8)]))
+
+(defn fetch-request Str [topic: &Str preset: Int replay: &Vec(Int) n: Int]
+  (let [o1 (opt-bytes "" 1 topic)
+        o2 (opt-int o1 2 preset)
+        o3 (if (= (count replay) 0) o2 (put-bytes o2 3 (replay-bytes (nth replay 0))))]
+    (opt-int o3 4 n)))
+
+(defn topic-request Str [topic: &Str] (opt-bytes "" 1 topic))
+
+(defn schema-request Str [id: &Str] (opt-bytes "" 1 id))
+
+(defn- producer-event Str [schema-id: &Str payload: &Str]
+  (let [o1 (opt-bytes "" 2 schema-id)] (opt-bytes o1 3 payload)))
+
+(defn publish-request Str [topic: &Str schema-id: &Str payloads: &Vec(Str)]
+  (loop [i 0 out (opt-bytes "" 1 topic)]
+    (if (>= i (count payloads)) out
+      (recur (+ i 1) (put-bytes out 2 (producer-event schema-id (nth payloads i)))))))
+
+(defn- raw-str Str [rs: &Vec(pb/Raw) num: Int]
+  (loop [i (- (count rs) 1)] (if (< i 0) "" (if (= (:num (nth rs i)) num) (str (:bytes (nth rs i))) (recur (- i 1))))))
+
+(defn- raw-int Int [rs: &Vec(pb/Raw) num: Int]
+  (loop [i (- (count rs) 1)] (if (< i 0) 0 (if (= (:num (nth rs i)) num) (:ival (nth rs i)) (recur (- i 1))))))
+
+(defn- raw-has Bool [rs: &Vec(pb/Raw) num: Int]
+  (loop [i 0] (if (>= i (count rs)) false (if (= (:num (nth rs i)) num) true (recur (+ i 1))))))
+
+(defn- raw-all Vec(Str) [rs: &Vec(pb/Raw) num: Int]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i (count rs)) acc (recur (+ i 1) (if (= (:num (nth rs i)) num) (conj acc (str (:bytes (nth rs i)))) acc)))))
+
+(defn topic-info Values(TopicInfo Str) [b: &Str]
+  (let [[rs e] (pb/scan b)]
+    (values (->TopicInfo (raw-str rs 1) (not= (raw-int rs 3) 0) (not= (raw-int rs 4) 0) (raw-str rs 5)) e)))
+
+(defn schema-info Values(SchemaInfo Str) [b: &Str]
+  (let [[rs e] (pb/scan b)] (values (->SchemaInfo (raw-str rs 1) (raw-str rs 2)) e)))
+
+(defn- error-name Str [n: Int] (cond (= n 0) "UNKNOWN" (= n 1) "PUBLISH" :else "UNRECOGNIZED"))
+
+(defn- pub-result Values(PubResult Str) [b: &Str]
+  (let [[rs e] (pb/scan b)
+        [es ee] (pb/scan (raw-str rs 2))]
+    (values (->PubResult (replay-of (raw-str rs 1)) (raw-has rs 2) (error-name (raw-int es 1)) (raw-str es 2) (raw-str rs 3))
+            (if (not= e "") e ee))))
+
+(defn publish-results Values(Vec(PubResult) Str) [b: &Str]
+  (let [[rs e] (pb/scan b)
+        parts (raw-all rs 1)]
+    (loop [i 0 acc: Vec(PubResult) [] err e]
+      (if (>= i (count parts)) (values acc err)
+        (let [[r re] (pub-result (nth parts i))] (recur (+ i 1) (conj acc r) (if (= err "") re err)))))))
+
+(defn- consumer-event Values(ConsumerEvent Str) [b: &Str]
+  (let [[rs e] (pb/scan b)
+        [ps pe] (pb/scan (raw-str rs 1))]
+    (values (->ConsumerEvent (raw-str ps 1) (raw-str ps 2) (raw-str ps 3) (replay-of (raw-str rs 2))) (if (not= e "") e pe))))
+
+(defn fetch-response Values(FetchResponse Str) [b: &Str]
+  (let [[rs e] (pb/scan b)
+        parts (raw-all rs 1)]
+    (loop [i 0 acc: Vec(ConsumerEvent) [] err e]
+      (if (>= i (count parts)) (values (->FetchResponse acc (replay-of (raw-str rs 2)) (raw-int rs 4)) err)
+        (let [[r re] (consumer-event (nth parts i))] (recur (+ i 1) (conj acc r) (if (= err "") re err)))))))

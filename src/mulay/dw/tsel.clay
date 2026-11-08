@@ -1,0 +1,61 @@
+(ns mulay.dw.tsel
+  (:require [mulay.dw.val :as v] [mulay.lib.time.types :as tt] [mulay.lib.time.local :as tl]
+            [mulay.lib.time.zoned :as tz] [mulay.lib.time.amount :as tam]))
+
+(defn- iv v/Val [i: Int] (v/int-v i))
+
+(defn- date-field Values(v/Val Bool) [d: &tt/LocalDate name: &Str]
+  (if (= name "year") (values (iv (:year d)) true)
+    (if (= name "month") (values (iv (:month d)) true)
+      (if (= name "day") (values (iv (:day d)) true)
+        (if (= name "dayOfWeek") (values (iv (tl/date-dow d)) true)
+          (if (= name "dayOfYear") (values (iv (tl/date-doy d)) true)
+            (if (= name "quarter") (values (iv (+ (quot (- (:month d) 1) 3) 1)) true)
+              (values (v/null-v) false))))))))
+
+(defn- time-field Values(v/Val Bool) [t: &tt/LocalTime name: &Str]
+  (if (= name "hour") (values (iv (:hour t)) true)
+    (if (= name "minutes") (values (iv (:minute t)) true)
+      (if (= name "seconds") (values (iv (:second t)) true)
+        (if (= name "nanoseconds") (values (iv (:nano t)) true)
+          (if (= name "milliseconds") (values (iv (quot (:nano t) 1000000)) true)
+            (values (v/null-v) false)))))))
+
+(defn- offset-field Values(v/Val Bool) [off: Int zone: &tt/TimeZone name: &Str]
+  (if (= name "offsetSeconds") (values (iv off) true)
+    (if (= name "timezone") (values (v/->VTimeZone zone) true)
+      (values (v/null-v) false))))
+
+(defn- duration-field Values(v/Val Bool) [d: &tt/Duration name: &Str]
+  (let [secs (:seconds d)]
+    (cond
+      (= name "hours") (values (iv (rem (quot secs 3600) 24)) true)
+      (= name "minutes") (values (iv (rem (quot secs 60) 60)) true)
+      (= name "secs") (values (iv (rem secs 60)) true)
+      (= name "seconds") (values (iv secs) true)
+      (= name "days") (values (iv (quot secs 86400)) true)
+      :else (values (v/null-v) false))))
+
+(defn field Values(v/Val Bool) [x: &v/Val name: &Str]
+  (let [[r ok] (field-of x name)
+        [s tok] (v/temporal-str x)]
+    (values r (or ok tok))))
+
+(defn- field-of Values(v/Val Bool) [x: &v/Val name: &Str]
+  (match x
+    (v/VDate d) (date-field d name)
+    (v/VLocalTime t) (time-field t name)
+    (v/VLocalDateTime y) (let [[a ok] (date-field (tl/ldt-date y) name)]
+                           (if ok (values a ok) (time-field (tl/ldt-time y) name)))
+    (v/VTime o) (let [[a ok] (time-field (:time o) name)]
+                  (if ok (values a ok) (offset-field (:offset o) (tt/->TzOffset (:offset o)) name)))
+    (v/VDateTime z) (let [[a ok] (date-field (tz/zdt-date z) name)]
+                      (if ok (values a ok)
+                        (let [[b ok2] (time-field (tz/zdt-time z) name)]
+                          (if ok2 (values b ok2) (offset-field (tz/zdt-offset z) (tt/->TzOffset (tz/zdt-offset z)) name)))))
+    (v/VPeriod p) (match p
+                    (tt/PerDate q) (if (= name "years") (values (iv (:years q)) true)
+                                     (if (= name "months") (values (iv (:months q)) true)
+                                       (if (= name "days") (values (iv (:days q)) true) (values (v/null-v) false))))
+                    (tt/PerTime d) (duration-field d name))
+    _ (values (v/null-v) false)))

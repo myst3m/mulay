@@ -1,0 +1,334 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="HTTP_Listener">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <vm:config name="VM_Config">
+        <vm:queues>
+            <vm:queue queueName="testQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="persistentQueue" queueType="PERSISTENT"/>
+            <vm:queue queueName="requestReplyQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="emptyQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="attrQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="inQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="outQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="noListenerQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="failQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="textQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="cidQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="cidReplyQueue" queueType="TRANSIENT"/>
+        </vm:queues>
+    </vm:config>
+
+    <!-- sendCorrelationId="NEVER" の設定 (相関 ID を送らない) -->
+    <vm:config name="VM_Never" sendCorrelationId="NEVER">
+        <vm:queues>
+            <vm:queue queueName="cidNeverQueue" queueType="TRANSIENT"/>
+            <vm:queue queueName="cidNeverReplyQueue" queueType="TRANSIENT"/>
+        </vm:queues>
+    </vm:config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- Flow 1: POST /vm/publish - Publish message to transient queue -->
+    <flow name="vmPublishFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/publish" allowedMethods="POST"/>
+        <vm:publish queueName="testQueue" config-ref="VM_Config">
+            <vm:content><![CDATA[#[payload]]]></vm:content>
+        </vm:publish>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "published"
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 2: GET /vm/consume - Consume message from transient queue -->
+    <flow name="vmConsumeFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/consume" allowedMethods="GET"/>
+        <vm:consume queueName="testQueue" config-ref="VM_Config" timeoutUnit="MILLISECONDS" timeout="5000"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 3: POST /vm/publish/persistent - Publish to persistent queue -->
+    <flow name="vmPublishPersistentFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/publish/persistent" allowedMethods="POST"/>
+        <vm:publish queueName="persistentQueue" config-ref="VM_Config">
+            <vm:content><![CDATA[#[payload]]]></vm:content>
+        </vm:publish>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "published"
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 4: GET /vm/consume/persistent - Consume from persistent queue -->
+    <flow name="vmConsumePersistentFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/consume/persistent" allowedMethods="GET"/>
+        <vm:consume queueName="persistentQueue" config-ref="VM_Config" timeoutUnit="MILLISECONDS" timeout="5000"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 5: POST /vm/publish-consume - Publish and wait for reply (request-reply pattern) -->
+    <flow name="vmPublishConsumeFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/publish-consume" allowedMethods="POST"/>
+        <vm:publish-consume queueName="requestReplyQueue" config-ref="VM_Config" timeoutUnit="SECONDS" timeout="10">
+            <vm:content><![CDATA[#[payload]]]></vm:content>
+        </vm:publish-consume>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 6: VM Listener on requestReplyQueue - processes and returns response -->
+    <flow name="vmListenerFlow">
+        <vm:listener queueName="requestReplyQueue" config-ref="VM_Config"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  echo: payload,
+  processed: true,
+  timestamp: now()
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 7: POST /vm/roundtrip - Full roundtrip: publish then consume from testQueue -->
+    <flow name="vmRoundtripFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/roundtrip" allowedMethods="POST"/>
+        <vm:publish queueName="testQueue" config-ref="VM_Config">
+            <vm:content><![CDATA[#[payload]]]></vm:content>
+        </vm:publish>
+        <vm:consume queueName="testQueue" config-ref="VM_Config" timeoutUnit="MILLISECONDS" timeout="5000"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 空のキューの consume (失敗の型) -->
+    <flow name="vmConsumeErrFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/consume-err"/>
+        <vm:consume queueName="emptyQueue" config-ref="VM_Config" timeoutUnit="MILLISECONDS" timeout="100"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- consume した message の attributes と mime -->
+    <flow name="vmAttrsFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/attrs" allowedMethods="POST"/>
+        <vm:publish queueName="attrQueue" config-ref="VM_Config"/>
+        <vm:consume queueName="attrQueue" config-ref="VM_Config"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{qn: attributes.queueName, ts: typeOf(attributes.timestamp), keys: keysOf(attributes), cls: attributes.^class default null, mime: payload.^mimeType, p: payload, sameCid: attributes.correlationId == correlationId}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- listener が別のキューへ publish する。それを consume する -->
+    <flow name="vmChainFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/chain" allowedMethods="POST"/>
+        <vm:publish queueName="inQueue" config-ref="VM_Config"/>
+        <vm:consume queueName="outQueue" config-ref="VM_Config" timeoutUnit="MILLISECONDS" timeout="5000"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{p: payload, qn: attributes.queueName, sameCid: attributes.correlationId == correlationId}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="vmInListenerFlow">
+        <vm:listener queueName="inQueue" config-ref="VM_Config"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{got: payload, from: attributes.queueName, attrKeys: keysOf(attributes), sameCid: attributes.correlationId == correlationId}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <vm:publish queueName="outQueue" config-ref="VM_Config"/>
+    </flow>
+
+    <!-- publish-consume: listener の無いキュー (時間切れ)、listener の失敗 -->
+    <flow name="vmPcTimeoutFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/pc-timeout" allowedMethods="POST"/>
+        <vm:publish-consume queueName="noListenerQueue" config-ref="VM_Config" timeoutUnit="MILLISECONDS" timeout="300"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="vmPcErrorFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/pc-error" allowedMethods="POST"/>
+        <vm:publish-consume queueName="failQueue" config-ref="VM_Config" timeoutUnit="SECONDS" timeout="5"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="vmFailListenerFlow">
+        <vm:listener queueName="failQueue" config-ref="VM_Config"/>
+        <raise-error type="APP:BOOM" description="boom in listener"/>
+    </flow>
+
+    <!-- publish-consume の後も vars は残る。text の往復 -->
+    <flow name="vmPcVarsFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/pc-vars" allowedMethods="POST"/>
+        <set-variable variableName="keep" value="#['kept']"/>
+        <vm:publish-consume queueName="textQueue" config-ref="VM_Config" timeoutUnit="SECONDS" timeout="5"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{p: payload, mime: payload.^mimeType, keep: vars.keep, qn: attributes.queueName default null, attrKeys: keysOf(attributes default {}), sameCid: attributes.correlationId == correlationId}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="vmTextListenerFlow">
+        <vm:listener queueName="textQueue" config-ref="VM_Config"/>
+        <set-payload value="#[payload ++ '!']" mimeType="text/plain"/>
+    </flow>
+
+    <!-- 宣言していないキュー -->
+    <flow name="vmUndeclaredFlow">
+        <http:listener config-ref="HTTP_Listener" path="/vm/undeclared"/>
+        <vm:publish queueName="nope" config-ref="VM_Config"/>
+        <error-handler ref="report"/>
+    </flow>
+
+
+    <!-- sendCorrelationId と publish の correlationId: consume した attributes.correlationId と、listener のフローの correlationId -->
+    <flow name="vmCidReplyFlow">
+        <vm:listener queueName="cidReplyQueue" config-ref="VM_Config"/>
+        <set-payload value="#[output application/json --- {cid: correlationId}]"/>
+    </flow>
+    <flow name="vmCidNeverReplyFlow">
+        <vm:listener queueName="cidNeverReplyQueue" config-ref="VM_Never"/>
+        <set-payload value="#[output application/json --- {cid: correlationId}]"/>
+    </flow>
+    <flow name="vmCid-consume-default">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/consume-default"/>
+        <vm:publish queueName="cidQueue" config-ref="VM_Config"/>
+        <vm:consume queueName="cidQueue" config-ref="VM_Config"/>
+        <set-payload value="#[output application/json --- {hasCid: attributes.correlationId != null, sameCid: attributes.correlationId == correlationId, cid: if (attributes.correlationId == null or attributes.correlationId == correlationId) null else attributes.correlationId}]"/>
+    </flow>
+    <flow name="vmCid-consume-never">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/consume-never"/>
+        <vm:publish queueName="cidNeverQueue" config-ref="VM_Never"/>
+        <vm:consume queueName="cidNeverQueue" config-ref="VM_Never"/>
+        <set-payload value="#[output application/json --- {hasCid: attributes.correlationId != null, sameCid: attributes.correlationId == correlationId, cid: if (attributes.correlationId == null or attributes.correlationId == correlationId) null else attributes.correlationId}]"/>
+    </flow>
+    <flow name="vmCid-consume-op-never">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/consume-op-never"/>
+        <vm:publish queueName="cidQueue" config-ref="VM_Config" sendCorrelationId="NEVER"/>
+        <vm:consume queueName="cidQueue" config-ref="VM_Config"/>
+        <set-payload value="#[output application/json --- {hasCid: attributes.correlationId != null, sameCid: attributes.correlationId == correlationId, cid: if (attributes.correlationId == null or attributes.correlationId == correlationId) null else attributes.correlationId}]"/>
+    </flow>
+    <flow name="vmCid-consume-op-auto">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/consume-op-auto"/>
+        <vm:publish queueName="cidNeverQueue" config-ref="VM_Never" sendCorrelationId="AUTO"/>
+        <vm:consume queueName="cidNeverQueue" config-ref="VM_Never"/>
+        <set-payload value="#[output application/json --- {hasCid: attributes.correlationId != null, sameCid: attributes.correlationId == correlationId, cid: if (attributes.correlationId == null or attributes.correlationId == correlationId) null else attributes.correlationId}]"/>
+    </flow>
+    <flow name="vmCid-consume-custom">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/consume-custom"/>
+        <vm:publish queueName="cidQueue" config-ref="VM_Config" correlationId="#['custom-9']"/>
+        <vm:consume queueName="cidQueue" config-ref="VM_Config"/>
+        <set-payload value="#[output application/json --- {hasCid: attributes.correlationId != null, sameCid: attributes.correlationId == correlationId, cid: if (attributes.correlationId == null or attributes.correlationId == correlationId) null else attributes.correlationId}]"/>
+    </flow>
+    <flow name="vmCid-consume-custom-never">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/consume-custom-never"/>
+        <vm:publish queueName="cidNeverQueue" config-ref="VM_Never" correlationId="#['custom-8']"/>
+        <vm:consume queueName="cidNeverQueue" config-ref="VM_Never"/>
+        <set-payload value="#[output application/json --- {hasCid: attributes.correlationId != null, sameCid: attributes.correlationId == correlationId, cid: if (attributes.correlationId == null or attributes.correlationId == correlationId) null else attributes.correlationId}]"/>
+    </flow>
+    <flow name="vmCid-listener-default">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/listener-default"/>
+        <vm:publish-consume queueName="cidReplyQueue" config-ref="VM_Config" timeoutUnit="SECONDS" timeout="10"/>
+        <set-payload value="#[output application/json --- {sameCid: payload.cid == correlationId, cid: if (payload.cid == correlationId) null else (if (payload.cid startsWith 'custom') payload.cid else 'other')}]"/>
+    </flow>
+    <flow name="vmCid-listener-never">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/listener-never"/>
+        <vm:publish-consume queueName="cidNeverReplyQueue" config-ref="VM_Never" timeoutUnit="SECONDS" timeout="10"/>
+        <set-payload value="#[output application/json --- {sameCid: payload.cid == correlationId, cid: if (payload.cid == correlationId) null else (if (payload.cid startsWith 'custom') payload.cid else 'other')}]"/>
+    </flow>
+    <flow name="vmCid-listener-custom">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/listener-custom"/>
+        <vm:publish-consume queueName="cidReplyQueue" config-ref="VM_Config" timeoutUnit="SECONDS" timeout="10" correlationId="#['custom-7']"/>
+        <set-payload value="#[output application/json --- {sameCid: payload.cid == correlationId, cid: if (payload.cid == correlationId) null else (if (payload.cid startsWith 'custom') payload.cid else 'other')}]"/>
+    </flow>
+    <flow name="vmCid-listener-op-never">
+        <http:listener config-ref="HTTP_Listener" path="/vm/cid/listener-op-never"/>
+        <vm:publish-consume queueName="cidReplyQueue" config-ref="VM_Config" timeoutUnit="SECONDS" timeout="10" sendCorrelationId="NEVER"/>
+        <set-payload value="#[output application/json --- {sameCid: payload.cid == correlationId, cid: if (payload.cid == correlationId) null else (if (payload.cid startsWith 'custom') payload.cid else 'other')}]"/>
+    </flow>
+
+</mule>

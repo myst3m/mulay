@@ -1,0 +1,1 @@
+output application/json --- {message: "caught", type: error.errorType.identifier}

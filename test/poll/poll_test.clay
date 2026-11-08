@@ -1,0 +1,38 @@
+(ns poll-test (:require [mulay.rt.poll :as rp] [mulay.rt.event :as ev] [mulay.dw.val :as v] [clay.string :as str]))
+
+(defn- item rp/Item [id: Str wm: v/Val]
+  (rp/->Item (ev/tv-val (v/->VStr id) ev/ANY) (ev/tv-null) [wm] id))
+
+(defn- run Str [k: Str items: Vec(rp/Item)]
+  (let [got (atom (->dyn ""))
+        n (rp/run-items k items (fn Values(Bool Str) [p: ev/TV a: ev/TV]
+                                  (let [[x t e] (ev/value p)
+                                        z (swap! got (fn Dyn [old: Dyn] (->dyn (str (dyn->str old) (match x (v/VStr s) s _ "?") ","))))]
+                                    (values true ""))))]
+    (dyn->str (deref got))))
+
+(deftest numbers-advance-and-reject-older
+  (let [a (run "n" [(item "1" (v/int-v 10)) (item "2" (v/int-v 20)) (item "3" (v/int-v 30))])
+        b (run "n" [(item "1" (v/int-v 10)) (item "2" (v/int-v 20)) (item "3" (v/int-v 30))])
+        c (run "n" [(item "3" (v/int-v 30)) (item "4" (v/int-v 40)) (item "5" (v/int-v 5))])
+        d (run "n" [(item "4" (v/int-v 40)) (item "6" (v/int-v 40))])]
+    (is (= a "1,2,3,"))
+    (is (= b ""))
+    (is (= c "4,"))
+    (is (= d "6,"))
+    (is (= (count (rp/watermark "n")) 1))))
+
+(deftest strings-compare-as-text
+  (let [a (run "s" [(item "1" (v/->VStr "10")) (item "2" (v/->VStr "20")) (item "3" (v/->VStr "30"))])
+        b (run "s" [(item "1" (v/->VStr "10")) (item "3" (v/->VStr "30")) (item "4" (v/->VStr "40")) (item "5" (v/->VStr "5"))])
+        c (run "s" [(item "4" (v/->VStr "40")) (item "5" (v/->VStr "5")) (item "6" (v/->VStr "40"))])]
+    (is (= a "1,2,3,"))
+    (is (= b "4,5,"))
+    (is (= c ""))
+    (is (match (nth (rp/watermark "s") 0) (v/VStr x) (= x "5") _ false))))
+
+(deftest same-watermark-new-id-in-one-poll
+  (let [a (run "e" [(item "1" (v/int-v 10)) (item "2" (v/int-v 10))])
+        b (run "e" [(item "1" (v/int-v 10)) (item "2" (v/int-v 10)) (item "3" (v/int-v 10))])]
+    (is (= a "1,2,"))
+    (is (= b "3,"))))

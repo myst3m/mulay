@@ -1,0 +1,45 @@
+(ns exc-test (:require [mulay.rt.explain :as rx] [mulay.rt.error :as err] [mulay.mule.load :as ld] [mulay.conn.registry :as creg] [mulay.lib.res :as res]
+                      [mulay.lib.diag :as d] [clay.string :as str]))
+
+(def XML (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\">\n"
+              "<flow name=\"f\">\n"
+              "  <raise-error type=\"APP:BOOM\" description=\"boom\"/>\n"
+              "  <logger message=\"#[1 / 0]\"/>\n"
+              "</flow>\n</mule>"))
+
+(defn- app-of ld/Loaded [] (ld/load-texts "t" ["a.xml"] [XML] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+
+(deftest raise-error-points-at-the-tag
+  (let [l (app-of)
+        x (assoc (assoc (err/mk "APP" "BOOM" "boom") :elem "f/processors/0 @ t:a.xml:3") :dsl "<raise-error type=\"APP:BOOM\" description=\"boom\"></raise-error>")]
+    (is (= (d/render (rx/exc-report (:app l) x "at f(f/processors/0 @ t:a.xml:3)") false)
+           (str/join "\n" ["error[APP:BOOM]: boom"
+                           " --> a.xml:3:3"
+                           "  |"
+                           "3 |   <raise-error type=\"APP:BOOM\" description=\"boom\"/>"
+                           "  |   ^^^^^^^^^^^^ raised here"
+                           "  |"
+                           "  = note: element: f/processors/0 @ t:a.xml:3"
+                           "  = note: flow stack: at f(f/processors/0 @ t:a.xml:3)"])))))
+
+(deftest dw-error-points-into-the-expression
+  (let [l (app-of)
+        s (+ (str/index-of XML "1 / 0") 0)
+        x (assoc (assoc (err/mk "MULE" "EXPRESSION" "\"Division by zero ..") :elem "f/processors/1 @ t:a.xml:4")
+                 :dx [(err/->DwX "Division by zero" "a.xml" s (+ s 5) "%dw 2.0\n---\n1 / 0")])]
+    (is (= (d/render (rx/exc-report (:app l) x "at f(f/processors/1 @ t:a.xml:4)") false)
+           (str/join "\n" ["error[MULE:EXPRESSION]: Division by zero"
+                           " --> a.xml:4:22"
+                           "  |"
+                           "4 |   <logger message=\"#[1 / 0]\"/>"
+                           "  |                      ^^^^^"
+                           "  |"
+                           "  = note: element: f/processors/1 @ t:a.xml:4"
+                           "  = note: flow stack: at f(f/processors/1 @ t:a.xml:4)"])))))
+
+(deftest unknown-place-still-has-the-facts
+  (let [l (app-of)
+        x (err/mk "HTTP" "NOT_FOUND" "HTTP GET on resource 'http://x' failed: not found (404).")]
+    (is (= (d/render (rx/exc-report (:app l) x "at f") false)
+           (str/join "\n" ["error[HTTP:NOT_FOUND]: HTTP GET on resource 'http://x' failed: not found (404)."
+                           "  = note: flow stack: at f"])))))

@@ -1,0 +1,246 @@
+(ns mulay.dw.lib.values
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.lib.tree :as tree]))
+
+(def M "dw::util::Values")
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+
+(defn- get1 v/Val [x: &v/Val name: Str]
+  (match (v/unmeta x)
+    (v/VObj fs) (let [r (v/obj-get fs name)] (if (= (count r) 0) (v/null-v) (nth r 0)))
+    _ (v/null-v)))
+
+(defn- elem v/Val [kind: Str ns: v/Val sel: v/Val]
+  (v/->VObj [(v/field "kind" (v/->VStr kind)) (v/field "namespace" ns) (v/field "selector" sel)]))
+
+(defn- attr-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (if (= (count a) 1) (ok (elem "Attribute" (v/null-v) (nth a 0))) (ok (elem "Attribute" (nth a 0) (nth a 1)))))
+(defn- field-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (if (= (count a) 1) (ok (elem "Object" (v/null-v) (nth a 0))) (ok (elem "Object" (nth a 0) (nth a 1)))))
+(defn- index-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (elem "Array" (v/null-v) (nth a 0))))
+
+(defn- provide Values(v/Val dwe/DwErr) [env: &rt/Env p: &v/Val a: v/Val b: v/Val]
+  (match (v/unmeta p)
+    (v/VFn f) (rt/env-call env f [a b])
+    _ (ok p)))
+
+(defn- to-elem v/Val [sel: &v/Val kind-for-str: Str]
+  (match (v/unmeta sel)
+    (v/VStr s) (elem kind-for-str (v/null-v) sel)
+    (v/VNum n) (elem "Array" (v/null-v) sel)
+    (v/VInt n-i) (elem "Array" (v/null-v) sel)
+    _ sel))
+
+(defn- ns-eq? Bool [want: &v/Val have: &v/Val]
+  (or (v/null? want) (v/equal? want have)))
+
+(defn- mask-run Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [value (nth a 0) sel (nth a 1) p (nth a 2)
+        kind (get1 sel "kind") selector (get1 sel "selector") sns (get1 sel "namespace")]
+    (mask-walk env value [] kind selector sns p)))
+
+(defn- mask-hit? Bool [path: &Vec(v/Val) kind: &v/Val selector: &v/Val sns: &v/Val]
+  (if (= (count path) 0) false
+    (let [last (nth path (- (count path) 1))]
+      (and (v/equal? kind (get1 last "kind")) (v/equal? (get1 last "selector") selector) (ns-eq? sns (get1 last "namespace"))))))
+
+(defn- mask-walk Values(v/Val dwe/DwErr) [env: &rt/Env x0: &v/Val path: Vec(v/Val) kind: &v/Val selector: &v/Val sns: &v/Val p: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VObj fs)
+      (loop [i 0 acc: Vec(v/Field) []]
+        (if (>= i (count fs)) (ok (v/->VObj acc))
+          (let [fl (nth fs i) k (:key fl)
+                [attrs ae] (loop [j 0 out: Vec(v/Attr) []]
+                             (if (>= j (count (:attrs k))) (values out (dwe/ok))
+                               (let [at (nth (:attrs k) j)
+                                     [y e] (mask-walk env (:value at) (conj path (tree/attr-elem at)) kind selector sns p)]
+                                 (if (dwe/ok? e) (recur (+ j 1) (conj out (v/->Attr (:ns at) (:name at) y))) (values out e)))))]
+            (if (not (dwe/ok? ae)) (values (v/null-v) ae)
+              (let [[y e] (mask-walk env (:value fl) (conj path (tree/key-elem "Object" k)) kind selector sns p)]
+                (if (not (dwe/ok? e)) (values y e)
+                  (recur (+ i 1) (conj acc (v/->Field (v/->Key (:ns k) (:name k) attrs) y)))))))))
+      (v/VArr xs) (mask-items env xs path kind selector sns p)
+      (v/VRange r1 r2) (mask-items env (v/items x) path kind selector sns p)
+      _ (if (mask-hit? path kind selector sns) (provide env p x0 (v/->VArr path)) (ok x0)))))
+
+(defn- mask-items Values(v/Val dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val) path: Vec(v/Val) kind: &v/Val selector: &v/Val sns: &v/Val p: &v/Val]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count xs)) (ok (v/->VArr acc))
+      (let [[y e] (mask-walk env (nth xs i) (conj path (tree/index-elem i)) kind selector sns p)]
+        (if (dwe/ok? e) (recur (+ i 1) (conj acc y)) (values y e))))))
+
+(defn- mask-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (rt/bind-builtin env M "mask#run" [(nth a 0) (to-elem (nth a 1) "Object")] 1))
+
+(defn- null-run Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/null-v)))
+(defn- null-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (rt/bind-builtin env M "null#run" [] 1))
+
+(defn- update1 Values(v/Val dwe/DwErr) [env: &rt/Env value: &v/Val sel: &v/Val p: &v/Val]
+  (let [x (v/unmeta value) s (v/unmeta sel)]
+    (match x
+      (v/VNull) (ok (v/null-v))
+      (v/VObj fs)
+      (match s
+        (v/VNum n) (rt/failure "InvalidFunctionArgs" "You called the function 'update' with these arguments: \n  1: Object\n  2: Number")
+        (v/VInt n-i) (let [n (num/from-int n-i)] (rt/failure "InvalidFunctionArgs" "You called the function 'update' with these arguments: \n  1: Object\n  2: Number"))
+        _ (let [e (to-elem sel "Object") name (let [[t te] (rt/to-text (get1 e "selector"))] t) sns (get1 e "namespace")]
+            (if (= (count (v/obj-get fs name)) 0) (ok value)
+              (loop [i 0 acc: Vec(v/Field) []]
+                (if (>= i (count fs)) (ok (v/->VObj acc))
+                  (let [fl (nth fs i) k (:key fl)]
+                    (if (and (= (:name k) name) (ns-eq? sns (tree/ns-val (:ns k))))
+                      (let [[y ye] (provide env p (:value fl) (v/int-v i))]
+                        (if (dwe/ok? ye) (recur (+ i 1) (conj acc (v/->Field k y))) (values y ye)))
+                      (recur (+ i 1) (conj acc fl)))))))))
+      (v/VArr xs) (update-arr env xs sel p)
+      (v/VRange r1 r2) (update-arr env (v/items x) sel p)
+      _ (rt/failure "InvalidFunctionArgs" (str "You called the function 'update' with these arguments: \n  1: " (v/type-name x))))))
+
+(defn- update-arr Values(v/Val dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val) sel: &v/Val p: &v/Val]
+  (let [e (to-elem sel "Object")]
+    (if (not= (tree/elem-kind e) "Array")
+      (loop [i 0 acc: Vec(v/Val) []]
+        (if (>= i (count xs)) (ok (v/->VArr acc))
+          (let [[y ye] (update1 env (nth xs i) e p)]
+            (if (dwe/ok? ye) (recur (+ i 1) (conj acc y)) (values y ye)))))
+      (let [[k ke] (match (v/unmeta (get1 e "selector")) (v/VNum n) (num/to-int n) (v/VInt n-i) (let [n (num/from-int n-i)] (num/to-int n)) _ (values 0 "x"))
+            n (count xs)
+            in-range (and (= ke "") (< k n) (>= k (- 0 n)))]
+        (if (not in-range) (ok (v/->VArr xs))
+          (loop [i 0 acc: Vec(v/Val) []]
+            (if (>= i n) (ok (v/->VArr acc))
+              (if (= i k)
+                (let [[y ye] (provide env p (nth xs i) (v/int-v i))]
+                  (if (dwe/ok? ye) (recur (+ i 1) (conj acc y)) (values y ye)))
+                (recur (+ i 1) (conj acc (nth xs i)))))))))))
+
+(defn- update-path Values(v/Val dwe/DwErr) [env: &rt/Env value: &v/Val path: &Vec(v/Val) from: Int p: &v/Val]
+  (if (v/null? value) (ok (v/null-v))
+    (if (>= from (count path)) (ok value)
+      (if (= from (- (count path) 1)) (update1 env value (nth path from) p)
+        (update-with env value (nth path from) path (+ from 1) p)))))
+
+(defn- update-with Values(v/Val dwe/DwErr) [env: &rt/Env value: &v/Val sel: &v/Val path: &Vec(v/Val) from: Int p: &v/Val]
+  (let [x (v/unmeta value) s (v/unmeta sel)]
+    (match x
+      (v/VObj fs)
+      (let [e (to-elem sel "Object") name (let [[t te] (rt/to-text (get1 e "selector"))] t) sns (get1 e "namespace")]
+        (if (= (count (v/obj-get fs name)) 0) (ok value)
+          (loop [i 0 acc: Vec(v/Field) []]
+            (if (>= i (count fs)) (ok (v/->VObj acc))
+              (let [fl (nth fs i) k (:key fl)]
+                (if (and (= (:name k) name) (ns-eq? sns (tree/ns-val (:ns k))))
+                  (let [[y ye] (update-path env (:value fl) path from p)]
+                    (if (dwe/ok? ye) (recur (+ i 1) (conj acc (v/->Field k y))) (values y ye)))
+                  (recur (+ i 1) (conj acc fl))))))))
+      (v/VArr xs)
+      (let [e (to-elem sel "Object")]
+        (if (not= (tree/elem-kind e) "Array")
+          (loop [i 0 acc: Vec(v/Val) []]
+            (if (>= i (count xs)) (ok (v/->VArr acc))
+              (let [[y ye] (update-with env (nth xs i) e path from p)]
+                (if (dwe/ok? ye) (recur (+ i 1) (conj acc y)) (values y ye)))))
+          (let [[k ke] (match (v/unmeta (get1 e "selector")) (v/VNum n) (num/to-int n) (v/VInt n-i) (let [n (num/from-int n-i)] (num/to-int n)) _ (values 0 "x"))]
+            (loop [i 0 acc: Vec(v/Val) []]
+              (if (>= i (count xs)) (ok (v/->VArr acc))
+                (if (and (= ke "") (= i k))
+                  (let [[y ye] (update-path env (nth xs i) path from p)]
+                    (if (dwe/ok? ye) (recur (+ i 1) (conj acc y)) (values y ye)))
+                  (recur (+ i 1) (conj acc (nth xs i)))))))))
+      (v/VNull) (ok (v/null-v))
+      _ (rt/failure "InvalidFunctionArgs" (str "You called the function 'update' with these arguments: \n  1: " (v/type-name x))))))
+
+(defn- update-attr Values(v/Val dwe/DwErr) [env: &rt/Env value: &v/Val path: &Vec(v/Val) p: &v/Val]
+  (let [n (count path)]
+    (if (< n 2) (rt/failure "InvalidFunctionArgs" "You called the function 'doUpdateAttr' with these arguments:")
+      (let [fsel (nth path (- n 2)) asel (nth path (- n 1))
+            prefix (loop [i 0 acc: Vec(v/Val) []] (if (>= i (- n 2)) acc (recur (+ i 1) (conj acc (nth path i)))))]
+        (if (= (count prefix) 0) (update-attr-at env value fsel asel p)
+          (update-path-fn env value prefix 0 fsel asel p))))))
+
+(defn- update-path-fn Values(v/Val dwe/DwErr) [env: &rt/Env value: &v/Val prefix: &Vec(v/Val) from: Int fsel: &v/Val asel: &v/Val p: &v/Val]
+  (if (v/null? value) (ok (v/null-v))
+    (if (>= from (count prefix)) (update-attr-at env value fsel asel p)
+      (let [x (v/unmeta value) e (to-elem (nth prefix from) "Object")]
+        (match x
+          (v/VObj fs)
+          (let [name (let [[t te] (rt/to-text (get1 e "selector"))] t) sns (get1 e "namespace")]
+            (loop [i 0 acc: Vec(v/Field) []]
+              (if (>= i (count fs)) (ok (v/->VObj acc))
+                (let [fl (nth fs i) k (:key fl)]
+                  (if (and (= (:name k) name) (ns-eq? sns (tree/ns-val (:ns k))))
+                    (let [[y ye] (update-path-fn env (:value fl) prefix (+ from 1) fsel asel p)]
+                      (if (dwe/ok? ye) (recur (+ i 1) (conj acc (v/->Field k y))) (values y ye)))
+                    (recur (+ i 1) (conj acc fl)))))))
+          (v/VArr xs)
+          (let [[k ke] (match (v/unmeta (get1 e "selector")) (v/VNum nn) (num/to-int nn) (v/VInt nn-i) (let [nn (num/from-int nn-i)] (num/to-int nn)) _ (values -1 "x"))]
+            (loop [i 0 acc: Vec(v/Val) []]
+              (if (>= i (count xs)) (ok (v/->VArr acc))
+                (if (or (not= ke "") (= i k))
+                  (let [[y ye] (update-path-fn env (nth xs i) prefix (if (= ke "") (+ from 1) from) fsel asel p)]
+                    (if (dwe/ok? ye) (recur (+ i 1) (conj acc y)) (values y ye)))
+                  (recur (+ i 1) (conj acc (nth xs i)))))))
+          _ (ok value))))))
+
+(defn- update-attr-at Values(v/Val dwe/DwErr) [env: &rt/Env value: &v/Val fsel: &v/Val asel: &v/Val p: &v/Val]
+  (match (v/unmeta value)
+    (v/VObj fs)
+    (let [e (to-elem fsel "Object") name (let [[t te] (rt/to-text (get1 e "selector"))] t) sns (get1 e "namespace")]
+      (if (= (count (v/obj-get fs name)) 0) (ok value)
+        (loop [i 0 acc: Vec(v/Field) []]
+          (if (>= i (count fs)) (ok (v/->VObj acc))
+            (let [fl (nth fs i) k (:key fl)]
+              (if (and (= (:name k) name) (ns-eq? sns (tree/ns-val (:ns k))))
+                (let [attrs-obj (v/->VObj (loop [j 0 out: Vec(v/Field) []]
+                                            (if (>= j (count (:attrs k))) out
+                                              (let [at (nth (:attrs k) j)]
+                                                (recur (+ j 1) (conj out (v/->Field (v/->Key (:ns at) (:name at) []) (:value at))))))))
+                      [y ye] (if (= (count (:attrs k)) 0) (values (v/null-v) (dwe/ok)) (update1 env attrs-obj asel p))]
+                  (if (not (dwe/ok? ye)) (values y ye)
+                    (let [attrs (match (v/unmeta y)
+                                  (v/VObj gs) (loop [j 0 out: Vec(v/Attr) []]
+                                                (if (>= j (count gs)) out
+                                                  (let [g (nth gs j)]
+                                                    (recur (+ j 1) (conj out (v/->Attr (:ns (:key g)) (:name (:key g)) (:value g)))))))
+                                  _ [])]
+                      (recur (+ i 1) (conj acc (v/->Field (v/->Key (:ns k) (:name k) attrs) (:value fl)))))))
+                (recur (+ i 1) (conj acc fl))))))))
+    _ (ok value)))
+
+(defn- last-is-attr? Bool [path: &Vec(v/Val)]
+  (and (> (count path) 0)
+       (let [l (nth path (- (count path) 1))]
+         (match (v/unmeta l) (v/VObj fs) (= (tree/elem-kind l) "Attribute") _ false))))
+
+(defn- update-run Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (update1 env (nth a 0) (nth a 1) (nth a 2)))
+
+(defn- update-path-run Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [path (v/items (v/unmeta (nth a 1)))]
+    (if (last-is-attr? path)
+      (if (v/null? (nth a 0)) (ok (v/null-v)) (update-attr env (nth a 0) path (nth a 2)))
+      (update-path env (nth a 0) path 0 (nth a 2)))))
+
+(defn- update-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (rt/bind-builtin env M "update#run" [(nth a 0) (nth a 1)] 1))
+(defn- update-path-fn0 Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (rt/bind-builtin env M "update#path" [(nth a 0) (nth a 1)] 1))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "attr" [(rt/b1 "String" attr-fn) (rt/b2 "Namespace" "String" attr-fn) (rt/b2 "Null" "String" attr-fn)])
+   (B "field" [(rt/b1 "String" field-fn) (rt/b2 "Namespace" "String" field-fn) (rt/b2 "Null" "String" field-fn)])
+   (B "index" [(rt/b1 "Number" index-fn)])
+   (B "mask" [(rt/b2 "Null" "String" null-fn) (rt/b2 "Null" "Number" null-fn) (rt/b2 "Null" "Object" null-fn)
+              (rt/b2 "Any" "Object" mask-fn) (rt/b2 "Any" "String" mask-fn) (rt/b2 "Any" "Number" mask-fn)])
+   (B "update" [(rt/b2 "Object" "String" update-fn) (rt/b2 "Object" "Object" update-fn)
+                (rt/b2 "Array" "Number" update-fn) (rt/b2 "Array" "String" update-fn) (rt/b2 "Array" "Object" update-fn)
+                (rt/b2 "Array" "Array" update-path-fn0) (rt/b2 "Object" "Array" update-path-fn0) (rt/b2 "Null" "Array" update-path-fn0)
+                (rt/b2 "Null" "Number" update-fn) (rt/b2 "Null" "String" update-fn) (rt/b2 "Null" "Object" update-fn)])
+   (B "mask#run" [(rt/overload ["Any" "Any" "Any"] mask-run)])
+   (B "null#run" [(rt/b1 "Any" null-run)])
+   (B "update#run" [(rt/overload ["Any" "Any" "Any"] update-run)])
+   (B "update#path" [(rt/overload ["Any" "Any" "Any"] update-path-run)])])

@@ -1,0 +1,379 @@
+%%% note
+Anypoint MQ コネクタ (anypoint-mq-connector 4.0.23) の subscriber (ソース): acknowledgementMode の AUTO (既定、prefetch。
+フローが成功すれば ack、失敗すれば nack して再配信され、mulay-test-redeliver の maxDeliveries 2 で mulay-test-dlq へ移る。
+on-error-continue で扱った失敗は成功と同じ)、IMMEDIATE (受けたときに ack。フローが失敗しても再配信されない)、MANUAL
+(polling、acknowledgementTimeout 3 秒。フローが ack / nack する。何もしないか失敗すれば 3 秒後に再配信)。交換 mulay-test-x に
+送ったものは mulay-test-xq1 (IMMEDIATE) と mulay-test-xq2 (MANUAL) の両方に届く。subscriber のフローは受けたものを VM の
+キュー (auto / imm / man) に入れ、HTTP の側が /next で 1 件ずつ取り出す。
+ブローカーは本物の Anypoint MQ (組織 T1、Sandbox、ap-northeast-1)。キューは mulay-test-redeliver、mulay-test-dlq、
+mulay-test-xq1、mulay-test-xq2 (と交換 mulay-test-x) だけを使う (操作の側の anypoint-mq-ops と重ならない)。
+subscriber は 20 秒の long poll で待つ。止めたプロセスの long poll はブローカーの側に残り、その間に送った message を取って
+ロック (120 秒) してしまうことがある (実 Mule も同じ)。このアプリを続けて走らせるときは 20 秒以上あける。
+認証情報は src/main/resources/mq-secret.yaml (リポジトリに入れない)。リポジトリの外の認証情報のファイル (MQ_URL などを定める env。ここでは $MQ_ENV_FILE) から作る:
+  (. "$MQ_ENV_FILE"; printf 'mq.url: "%s/organizations/%s/environments/%s"\nmq.clientId: "%s"\nmq.clientSecret: "%s"\n' "$MQ_URL" "$MQ_ORG" "$MQ_ENV" "$MQ_CLIENT_ID" "$MQ_CLIENT_SECRET") > src/main/resources/mq-secret.yaml
+%%% requires src/main/resources/mq-secret.yaml
+%%% port 18501
+%%% request GET /drain
+%%% response 200
+
+drained
+%%% request GET /send?to=redeliver&id=r-ok&act=ok
+%%% response 200
+content-type: application/java; charset=UTF-8
+
+r-ok
+%%% request GET /next?sub=auto
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-redeliver",
+  "id": "r-ok",
+  "n": 1,
+  "body": "body of r-ok",
+  "mime": "text/plain",
+  "token": false,
+  "act": "ok",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=auto&wait=3
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "VM:EMPTY_QUEUE",
+  "description": "Tried to consume messages from VM queue 'auto' but it was empty after timeout of 3 SECONDS"
+}
+%%% request GET /send?to=redeliver&id=r-fail&act=fail
+%%% response 200
+content-type: application/java; charset=UTF-8
+
+r-fail
+%%% request GET /next?sub=auto
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-redeliver",
+  "id": "r-fail",
+  "n": 1,
+  "body": "body of r-fail",
+  "mime": "text/plain",
+  "token": false,
+  "act": "fail",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=auto
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-redeliver",
+  "id": "r-fail",
+  "n": 2,
+  "body": "body of r-fail",
+  "mime": "text/plain",
+  "token": false,
+  "act": "fail",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "2",
+  "corrIsId": false
+}
+%%% request GET /dlq
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "id": "r-fail",
+  "n": 3,
+  "body": "body of r-fail",
+  "mime": "text/plain",
+  "props": {
+    "act": "fail",
+    "contentType": "text/plain"
+  }
+}
+%%% request GET /next?sub=auto&wait=3
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "VM:EMPTY_QUEUE",
+  "description": "Tried to consume messages from VM queue 'auto' but it was empty after timeout of 3 SECONDS"
+}
+%%% request GET /send?to=redeliver&id=r-cont&act=continue
+%%% response 200
+content-type: application/java; charset=UTF-8
+
+r-cont
+%%% request GET /next?sub=auto
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-redeliver",
+  "id": "r-cont",
+  "n": 1,
+  "body": "body of r-cont",
+  "mime": "text/plain",
+  "token": false,
+  "act": "continue",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=auto&wait=5
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "VM:EMPTY_QUEUE",
+  "description": "Tried to consume messages from VM queue 'auto' but it was empty after timeout of 5 SECONDS"
+}
+%%% request GET /send?to=x&id=x-ok&act=ok
+%%% response 200
+content-type: application/java; charset=UTF-8
+
+x-ok
+%%% request GET /next?sub=imm
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq1",
+  "id": "x-ok",
+  "n": 1,
+  "body": "body of x-ok",
+  "mime": "text/plain",
+  "token": false,
+  "act": "ok",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=man
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq2",
+  "id": "x-ok",
+  "n": 1,
+  "body": "body of x-ok",
+  "mime": "text/plain",
+  "token": true,
+  "act": "ok",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /send?to=x&id=x-nack&act=nack1
+%%% response 200
+content-type: application/java; charset=UTF-8
+
+x-nack
+%%% request GET /next?sub=imm
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq1",
+  "id": "x-nack",
+  "n": 1,
+  "body": "body of x-nack",
+  "mime": "text/plain",
+  "token": false,
+  "act": "nack1",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=man
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq2",
+  "id": "x-nack",
+  "n": 1,
+  "body": "body of x-nack",
+  "mime": "text/plain",
+  "token": true,
+  "act": "nack1",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=man
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq2",
+  "id": "x-nack",
+  "n": 2,
+  "body": "body of x-nack",
+  "mime": "text/plain",
+  "token": true,
+  "act": "nack1",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "2",
+  "corrIsId": false
+}
+%%% request GET /send?to=x&id=x-ign&act=ignore1
+%%% response 200
+content-type: application/java; charset=UTF-8
+
+x-ign
+%%% request GET /next?sub=imm
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq1",
+  "id": "x-ign",
+  "n": 1,
+  "body": "body of x-ign",
+  "mime": "text/plain",
+  "token": false,
+  "act": "ignore1",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=man
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq2",
+  "id": "x-ign",
+  "n": 1,
+  "body": "body of x-ign",
+  "mime": "text/plain",
+  "token": true,
+  "act": "ignore1",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=man
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq2",
+  "id": "x-ign",
+  "n": 2,
+  "body": "body of x-ign",
+  "mime": "text/plain",
+  "token": true,
+  "act": "ignore1",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "2",
+  "corrIsId": false
+}
+%%% request GET /send?to=x&id=x-fail&act=fail
+%%% response 200
+content-type: application/java; charset=UTF-8
+
+x-fail
+%%% request GET /next?sub=imm
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq1",
+  "id": "x-fail",
+  "n": 1,
+  "body": "body of x-fail",
+  "mime": "text/plain",
+  "token": false,
+  "act": "fail",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=man
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq2",
+  "id": "x-fail",
+  "n": 1,
+  "body": "body of x-fail",
+  "mime": "text/plain",
+  "token": true,
+  "act": "fail",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "1",
+  "corrIsId": false
+}
+%%% request GET /next?sub=man
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "q": "mulay-test-xq2",
+  "id": "x-fail",
+  "n": 2,
+  "body": "body of x-fail",
+  "mime": "text/plain",
+  "token": true,
+  "act": "fail",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "ct": "text/plain",
+  "hdr": "2",
+  "corrIsId": false
+}
+%%% request GET /next?sub=imm&wait=5
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "VM:EMPTY_QUEUE",
+  "description": "Tried to consume messages from VM queue 'imm' but it was empty after timeout of 5 SECONDS"
+}
+%%% request GET /next?sub=man&wait=5
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "VM:EMPTY_QUEUE",
+  "description": "Tried to consume messages from VM queue 'man' but it was empty after timeout of 5 SECONDS"
+}
+%%% request GET /next?sub=auto&wait=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "VM:EMPTY_QUEUE",
+  "description": "Tried to consume messages from VM queue 'auto' but it was empty after timeout of 1 SECONDS"
+}
+%%% request GET /dlq?poll=1000
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:TIMEOUT",
+  "description": "Failed to retrieve a Message. Didn't receive any message during polling interval of '1000' milliseconds"
+}

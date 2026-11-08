@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:grpc="http://www.mulesoft.org/schema/mule/grpc"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/grpc http://www.mulesoft.org/schema/mule/grpc/current/mule-grpc.xsd">
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18293"/>
+    </http:listener-config>
+
+    <!-- 相手は mule-oracle の gRPC のスタブ (%%% grpcserver 18292) -->
+    <grpc:client-config name="Cli">
+        <grpc:no-auth-connection host="localhost" port="18292">
+            <grpc:idl-definition>
+                <grpc:single-binary-protobuf protobufDescriptorFile="cs.desc"/>
+            </grpc:idl-definition>
+            <grpc:connection-mode>
+                <grpc:plain-text/>
+            </grpc:connection-mode>
+        </grpc:no-auth-connection>
+    </grpc:client-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: (error.description splitBy '\n\tat ')[0], acc: vars.acc default null}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- server-streaming: 応答を順に回す (Iterable) -->
+    <flow name="iter">
+        <http:listener config-ref="L" path="/iter/{m}"/>
+        <set-variable variableName="acc" value="#[[]]"/>
+        <set-variable variableName="m" value="#[attributes.uriParams.m]"/>
+        <choice>
+            <when expression="#[vars.m == 'Ticks']">
+                <grpc:server-streaming-call-with-response config-ref="Cli" method="cs.C/Ticks">
+                    <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: 'a'}]]]></grpc:content>
+                </grpc:server-streaming-call-with-response>
+            </when>
+            <when expression="#[vars.m == 'TicksSlow']">
+                <grpc:server-streaming-call-with-response config-ref="Cli" method="cs.C/TicksSlow">
+                    <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: 'a'}]]]></grpc:content>
+                </grpc:server-streaming-call-with-response>
+            </when>
+            <when expression="#[vars.m == 'TicksSlowLong']">
+                <grpc:server-streaming-call-with-response config-ref="Cli" method="cs.C/TicksSlow" pollTimeoutMs="3000">
+                    <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: 'a'}]]]></grpc:content>
+                </grpc:server-streaming-call-with-response>
+            </when>
+            <when expression="#[vars.m == 'TicksFail']">
+                <grpc:server-streaming-call-with-response config-ref="Cli" method="cs.C/TicksFail">
+                    <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: 'a'}]]]></grpc:content>
+                </grpc:server-streaming-call-with-response>
+            </when>
+            <otherwise>
+                <grpc:server-streaming-call-with-response config-ref="Cli" method="cs.C/TicksDeny">
+                    <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: 'a'}]]]></grpc:content>
+                </grpc:server-streaming-call-with-response>
+            </otherwise>
+        </choice>
+        <foreach>
+            <set-variable variableName="acc" value="#[output application/java --- vars.acc ++ [{p: payload, mime: payload.^mimeType, cls: payload.^class}]]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- {acc: vars.acc}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- 相手が答えない: コネクタは Deadline が無ければ 30 秒で打ち切る (Iterable は pollTimeout の 2 回分で NoSuchElementException になり、エラーハンドラを素通りして Java のスタックを返すので記録しない。ADR 080) -->
+    <flow name="hang-cs">
+        <http:listener config-ref="L" path="/hang/cs"/>
+        <grpc:client-streaming config-ref="Cli" method="cs.C/HangSum" requestId="h1" endClientStreaming="true"/>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="iter-class">
+        <http:listener config-ref="L" path="/iter-class"/>
+        <grpc:server-streaming-call-with-response config-ref="Cli" method="cs.C/Ticks">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: 'a'}]]]></grpc:content>
+        </grpc:server-streaming-call-with-response>
+        <set-payload value="#[output application/json --- {cls: payload.^class, mime: payload.^mimeType}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- client-streaming: requestId ごとに送り、end で応答を受ける -->
+    <flow name="cs">
+        <http:listener config-ref="L" path="/cs/{m}"/>
+        <set-variable variableName="q" value="#[attributes.queryParams]"/>
+        <choice>
+            <when expression="#[vars.q.name?]">
+                <set-variable variableName="msg" value="#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: vars.q.name}]"/>
+            </when>
+        </choice>
+        <choice>
+            <when expression="#[attributes.uriParams.m == 'Sum']">
+                <grpc:client-streaming config-ref="Cli" method="cs.C/Sum" requestId="#[vars.q.id]" endClientStreaming="#[vars.q.end == 'true']" content="#[vars.msg]"/>
+            </when>
+            <when expression="#[attributes.uriParams.m == 'SumWait']">
+                <grpc:client-streaming config-ref="Cli" method="cs.C/SumEarly" requestId="#[vars.q.id]" endClientStreaming="#[vars.q.end == 'true']" responseWaitTime="300" responseWaitTimeUnit="MILLISECONDS" content="#[vars.msg]"/>
+            </when>
+            <otherwise>
+                <grpc:client-streaming config-ref="Cli" method="cs.C/SumEarly" requestId="#[vars.q.id]" endClientStreaming="#[vars.q.end == 'true']" content="#[vars.msg]"/>
+            </otherwise>
+        </choice>
+        <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType, attrs: attributes, cls: attributes.^class}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 双方向: 送るのは操作、返事は routingId B の listener に届く -->
+    <flow name="bidi">
+        <http:listener config-ref="L" path="/bidi/{m}"/>
+        <set-variable variableName="q" value="#[attributes.queryParams]"/>
+        <choice>
+            <when expression="#[vars.q.name?]">
+                <set-variable variableName="msg" value="#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: vars.q.name}]"/>
+            </when>
+        </choice>
+        <choice>
+            <when expression="#[attributes.uriParams.m == 'Chat']">
+                <grpc:bidirectional-streaming config-ref="Cli" method="cs.C/Chat" routingId="B" requestId="#[vars.q.id]" endClientStreaming="#[vars.q.end == 'true']" content="#[vars.msg]"/>
+            </when>
+            <otherwise>
+                <grpc:bidirectional-streaming config-ref="Cli" method="cs.C/ChatFail" routingId="B" requestId="#[vars.q.id]" endClientStreaming="#[vars.q.end == 'true']" content="#[vars.msg]"/>
+            </otherwise>
+        </choice>
+        <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType, attrs: attributes, cls: attributes.^class}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="bidi-listen">
+        <grpc:bidi-streaming-listener config-ref="Cli" routingId="B"/>
+        <logger level="INFO" message="#[output application/json indent=false --- {bidi: payload, mime: payload.^mimeType, attrs: attributes, cls: attributes.^class}]"/>
+    </flow>
+
+    <!-- server-streaming を routingId D の listener に渡す -->
+    <flow name="deleg">
+        <http:listener config-ref="L" path="/deleg/{m}"/>
+        <choice>
+            <when expression="#[attributes.uriParams.m == 'Ticks']">
+                <grpc:server-streaming-call-with-delegation config-ref="Cli" method="cs.C/Ticks" routingId="D">
+                    <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: 'a'}]]]></grpc:content>
+                </grpc:server-streaming-call-with-delegation>
+            </when>
+            <otherwise>
+                <grpc:server-streaming-call-with-delegation config-ref="Cli" method="cs.C/TicksFail" routingId="D">
+                    <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='cs.desc', messageType='cs.Req' --- {name: 'a'}]]]></grpc:content>
+                </grpc:server-streaming-call-with-delegation>
+            </otherwise>
+        </choice>
+        <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="deleg-listen">
+        <grpc:server-streaming-delegated-listener config-ref="Cli" routingId="D"/>
+        <logger level="INFO" message="#[output application/json indent=false --- {deleg: payload, mime: payload.^mimeType, attrs: attributes, cls: attributes.^class}]"/>
+    </flow>
+</mule>

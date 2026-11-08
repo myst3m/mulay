@@ -1,0 +1,1625 @@
+(ns mulay.dw.parse
+  (:require [mulay.lib.numparse :as npz] [clay.core]
+            [clay.string :as str]
+            [mulay.dw.ast :as a]
+            [mulay.dw.lex :as l]))
+
+(def MAX-DEPTH 400)
+(def MAX-DIAGS 64)
+
+(def L-AS 3)
+(def L-MUL 4)
+(def L-ADD 5)
+(def L-REL 6)
+(def L-EQ 7)
+(def L-AND 8)
+(def L-OR 9)
+(def L-TOP 10)
+
+(defrecord St [pos: Int ds: Vec(a/Diag) depth: Int dead: Bool
+               v25: Bool
+               metas: Vec(Str)
+               hush: Int])
+
+(defn- sp a/Span [x: Int y: Int] (a/->Span x y))
+(def RESERVED-LIST ["if" "else" "unless" "using" "---" "as" "is" "null" "true" "false" "default" "case" "fun" "input"
+                    "output" "ns" "type" "import" "var" "and" "or" "throw" "do" "for" "yield" "enum" "private" "async"])
+
+(defn- reserved-msg Str [w: Str]
+  (let [head (str "Invalid field name identifier. Reason: The name `" w "` is a reserved word. List of reserved words: ")
+        lst (loop [i 0 out head] (if (>= i (count RESERVED-LIST)) out (recur (+ i 1) (str out "\n - " (nth RESERVED-LIST i)))))]
+    (str lst ". Possible solution wrap `" w "` into quotes e.g payload.'" w "'")))
+
+(defn- nd a/Node [e: a/Ex x: Int y: Int] (a/->Node e (sp x y)))
+(defn- nstart Int [n: &a/Node] (:start (:sp n)))
+(defn- nend Int [n: &a/Node] (:end (:sp n)))
+(defn- tend Int [t: &a/Ty] (:end (:sp t)))
+(defn- err-node a/Node [msg: Str x: Int y: Int] (nd (a/->EErr msg) x y))
+(defn- null-node a/Node [x: Int] (nd (a/->ENull) x x))
+
+(defn- pk l/Tok [s: &Str st: &St mode: Int] (l/next-tok s (:pos st) mode))
+(defn- to St [st: St p: Int] (assoc st :pos p))
+(defn- past St [st: St t: &l/Tok] (assoc st :pos (:e t)))
+
+(defn- one-line Str [m: &Str]
+  (loop [i 0 run 0 acc ""]
+    (if (>= i (count m)) (str acc (subs m run i))
+      (let [c (nth m i)]
+        (if (or (= c 10) (= c 13))
+          (recur (+ i 1) (+ i 1) (str acc (subs m run i) (if (= c 10) "\\n" "\\r")))
+          (recur (+ i 1) run acc))))))
+
+(defn- diag St [st: St x: Int y: Int msg: Str] (diag-lines st x y (one-line msg)))
+
+(defn- diag-lines St [st: St x: Int y: Int msg: Str]
+  (if (or (:dead st) (>= (count (:ds st)) MAX-DIAGS) (<= x (:hush st))) st
+    (let [ds: Vec(a/Diag) (:ds st)]
+      (if (and (> (count ds) 0) (= (:start (:sp (nth ds (- (count ds) 1)))) x)) st
+        (assoc st :ds (conj ds (a/->Diag msg (sp x y))))))))
+
+(defn- show Str [s: &Str t: &l/Tok]
+  (let [e0 (if (> (- (:e t) (:s t)) 24) (+ (:s t) 24) (:e t))
+        e (loop [i (:s t)] (if (or (>= i e0) (= (nth s i) 10) (= (nth s i) 13)) i (recur (+ i 1))))
+        txt (subs s (:s t) e)]
+    (if (= (count txt) 1) (str "'" txt "'") (str "\"" txt "\""))))
+
+(defn- unexpected Str [s: &Str t: &l/Tok what: &Str]
+  (if (= (:k t) l/K-EOF)
+    (str "Unexpected end of input, expected " what)
+    (if (= (:k t) l/K-ERR)
+      (let [c (l/at s (:s t))]
+        (if (or (= c 34) (= c 39) (= c 96)) "Unexpected end of input, expected cut"
+          (if (= c 47) "Unclosed regular expression, expected '/'"
+            (if (= c 124) "Invalid date literal, expected '|'"
+              (str "Invalid input " (show s t) ", expected " what)))))
+      (str "Invalid input " (show s t) ", expected " what))))
+
+(defn- diag-tok St [s: &Str st: St t: &l/Tok what: &Str]
+  (if (unclosed-str? s t) (diag st (count s) (+ (count s) 1) (unexpected s t what))
+    (let [y (if (= (:e t) (:s t)) (+ (:s t) 1) (:e t))]
+      (diag st (:s t) y (unexpected s t what)))))
+
+(defn- unclosed-str? Bool [s: &Str t: &l/Tok]
+  (and (= (:k t) l/K-ERR) (let [c (l/at s (:s t))] (or (= c 34) (= c 39) (= c 96)))))
+
+(defn- expect St [s: &Str st: St k: Int mode: Int what: &Str]
+  (let [t (pk s st mode)]
+    (if (= (:k t) k) (past st t) (diag-tok s st t what))))
+
+(defn- is-ident? Bool [s: &Str t: &l/Tok w: &Str]
+  (and (= (:k t) l/K-IDENT) (l/span-is? s (:s t) (:e t) w)))
+
+(defn- kw? Bool [k: Int] (>= k l/K-KW))
+
+(defn- closer? Bool [k: Int]
+  (or (= k l/K-RPAREN) (= k l/K-RBRACK) (= k l/K-RBRACE) (= k l/K-COMMA) (= k l/K-EOF) (= k l/K-SEP)))
+
+(defn- skip-in St [s: &Str st: St close: Int]
+  (loop [p (:pos st) depth 0]
+    (let [t (l/next-tok s p l/M-INFIX)
+          k (:k t)]
+      (if (or (= k l/K-EOF) (= k l/K-SEP)) (to st (:s t))
+        (if (and (= depth 0) (or (= k l/K-COMMA) (= k close))) (to st (:s t))
+          (if (or (= k l/K-LPAREN) (= k l/K-LBRACK) (= k l/K-LBRACE)) (recur (:e t) (+ depth 1))
+            (if (or (= k l/K-RPAREN) (= k l/K-RBRACK) (= k l/K-RBRACE))
+              (recur (:e t) (if (= depth 0) 0 (- depth 1)))
+              (recur (:e t) depth))))))))
+
+(defn- skip-to-closer St [s: &Str st: St]
+  (loop [p (:pos st) depth 0]
+    (let [t (l/next-tok s p l/M-INFIX)
+          k (:k t)]
+      (if (= k l/K-EOF) (to st (:s t))
+        (if (and (= depth 0) (closer? k)) (to st (:s t))
+          (if (or (= k l/K-LPAREN) (= k l/K-LBRACK) (= k l/K-LBRACE)) (recur (:e t) (+ depth 1))
+            (if (or (= k l/K-RPAREN) (= k l/K-RBRACK) (= k l/K-RBRACE)) (recur (:e t) (- depth 1))
+              (recur (:e t) depth))))))))
+
+(defn- restore St [st: St pos: Int nds: Int]
+  (if (:dead st) st
+    (let [ds: Vec(a/Diag) (:ds st)]
+      (if (= (count ds) nds) (to st pos)
+        (assoc (to st pos) :ds (take nds ds))))))
+
+(defn- hexv Int [c: Int]
+  (if (digit? c) (- c 48) (if (and (>= c 97) (<= c 102)) (- c 87) (if (and (>= c 65) (<= c 70)) (- c 55) -1))))
+
+(defn- hex4 Int [s: &Str i: Int]
+  (let [a (hexv (l/at s i)) b (hexv (l/at s (+ i 1))) c (hexv (l/at s (+ i 2))) d (hexv (l/at s (+ i 3)))]
+    (if (or (< a 0) (< b 0) (< c 0) (< d 0)) -1 (+ (* a 4096) (* b 256) (* c 16) d))))
+
+(defn- utf8 Str [cp: Int]
+  (if (< cp 128) (chr cp)
+    (if (< cp 2048) (str (chr (+ 192 (bit-shift-right cp 6))) (chr (+ 128 (bit-and cp 63))))
+      (if (< cp 65536)
+        (str (chr (+ 224 (bit-shift-right cp 12))) (chr (+ 128 (bit-and (bit-shift-right cp 6) 63)))
+             (chr (+ 128 (bit-and cp 63))))
+        (str (chr (+ 240 (bit-shift-right cp 18))) (chr (+ 128 (bit-and (bit-shift-right cp 12) 63)))
+             (chr (+ 128 (bit-and (bit-shift-right cp 6) 63))) (chr (+ 128 (bit-and cp 63))))))))
+
+(defn- unescape Values(Str Int) [s: &Str i: Int]
+  (let [c (l/at s (+ i 1))]
+    (case c
+      110 (values "\n" (+ i 2))
+      116 (values "\t" (+ i 2))
+      114 (values "\r" (+ i 2))
+      98 (values (chr 8) (+ i 2))
+      102 (values (chr 12) (+ i 2))
+      92 (values "\\" (+ i 2))
+      47 (values "/" (+ i 2))
+      34 (values "\"" (+ i 2))
+      39 (values "'" (+ i 2))
+      96 (values "`" (+ i 2))
+      36 (values "$" (+ i 2))
+      117 (let [cp (hex4 s (+ i 2))]
+            (if (< cp 0) (values (subs s i (+ i 2)) (+ i 2))
+              (if (and (>= cp 55296) (<= cp 56319) (= (l/at s (+ i 6)) 92) (= (l/at s (+ i 7)) 117))
+                (let [lo (hex4 s (+ i 8))]
+                  (if (and (>= lo 56320) (<= lo 57343))
+                    (values (utf8 (+ 65536 (* (- cp 55296) 1024) (- lo 56320))) (+ i 12))
+                    (values (utf8 cp) (+ i 6))))
+                (values (utf8 cp) (+ i 6)))))
+      (if (< c 0) (values "\\" (+ i 1)) (values (subs s i (+ i 2)) (+ i 2))))))
+
+(defn- push-text Vec(a/StrPart) [parts: Vec(a/StrPart) txt: Str]
+  (if (= (count txt) 0) parts (conj parts (a/->SPText txt))))
+
+(defn- p-str-parts Values(Vec(a/StrPart) St) [s: &Str st0: St t: &l/Tok]
+  (let [e (- (:e t) 1)]
+    (loop [i (+ (:s t) 1) run (+ (:s t) 1) acc "" parts: Vec(a/StrPart) [] st st0]
+      (if (>= i e)
+        (values (push-text parts (str acc (subs s run e))) (to st (:e t)))
+        (let [c (nth s i)]
+          (if (= c 92)
+            (let [[u j] (unescape s i)] (recur j j (str acc (subs s run i) u) parts st))
+            (if (= c 36)
+              (let [ps (push-text parts (str acc (subs s run i)))
+                    c1 (l/at s (+ i 1))]
+                (if (= c1 40)
+                  (let [[ex st2] (p-expr s (to st (+ i 2)))
+                        t2 (pk s st2 l/M-INFIX)]
+                    (if (= (:k t2) l/K-RPAREN)
+                      (recur (:e t2) (:e t2) "" (conj ps (a/->SPExpr ex)) st2)
+                      (values (conj ps (a/->SPExpr ex)) (to (diag-tok s st2 t2 "')' for the string interpolation") (:e t)))))
+                  (if (and (l/ident-start? c1) (not (l/reserved? (subs s (+ i 1) (l/ident-end s (+ i 1))))))
+                    (let [ne (l/ident-end s (+ i 1))]
+                      (recur ne ne "" (conj ps (a/->SPExpr (nd (a/->ERef (subs s (+ i 1) ne)) (+ i 1) ne))) st))
+                    (let [ndl (if (= c1 36) (if (= (l/at s (+ i 2)) 36) 3 2) 1)
+                          j (+ i ndl)
+                          st2 (if (and (> ndl 1) (= (l/at s j) 40))
+                                (diag st i (+ j 1) (str "Invalid input \"" (subs s i (+ j 1)) "\", expected $( <expression> ) or $variable"))
+                                st)]
+                      (recur j j "" (conj ps (a/->SPExpr (nd (a/->ERef (subs s i j)) i j))) st2)))))
+              (recur (+ i 1) run acc parts st))))))))
+
+(defn- plain-text Values(Bool Str) [parts: &Vec(a/StrPart)]
+  (if (= (count parts) 0) (values true "")
+    (if (> (count parts) 1) (values false "")
+      (match (nth parts 0)
+        (a/SPText x) (values true x)
+        (a/SPExpr ex) (values false "")))))
+
+(defn- regex-body Str [s: &Str a0: Int b: Int]
+  (loop [i a0 run a0 acc ""]
+    (if (>= i b) (str acc (subs s run b))
+      (if (and (= (nth s i) 92) (= (l/at s (+ i 1)) 47))
+        (recur (+ i 2) (+ i 2) (str acc (subs s run i) "/"))
+        (if (= (nth s i) 92) (recur (+ i 2) run acc) (recur (+ i 1) run acc))))))
+
+(defn- has-byte? Bool [x: &Str c: Int]
+  (loop [i 0] (if (>= i (count x)) false (if (= (nth x i) c) true (recur (+ i 1))))))
+
+(defn- digits? Bool [x: &Str i: Int n: Int]
+  (loop [j 0] (if (>= j n) true (if (digit? (l/at x (+ i j))) (recur (+ j 1)) false))))
+
+(defn- scan-date Int [x: &Str i: Int]
+  (if (not (digits? x i 4)) -1
+    (if (not (and (= (l/at x (+ i 4)) 45) (digits? x (+ i 5) 2))) (+ i 4)
+      (if (not (and (= (l/at x (+ i 7)) 45) (digits? x (+ i 8) 2))) (+ i 7)
+        (+ i 10)))))
+
+(defn- scan-time Int [x: &Str i: Int]
+  (if (not (and (digits? x i 2) (= (l/at x (+ i 2)) 58) (digits? x (+ i 3) 2))) -1
+    (if (and (= (l/at x (+ i 5)) 58) (digits? x (+ i 6) 2))
+      (if (and (= (l/at x (+ i 8)) 46) (digit? (l/at x (+ i 9))))
+        (loop [j (+ i 9)] (if (digit? (l/at x j)) (recur (+ j 1)) j))
+        (+ i 8))
+      (+ i 5))))
+
+(defn- scan-zone Int [x: &Str i: Int]
+  (let [c (l/at x i)]
+    (if (= c 90) (+ i 1)
+      (if (and (or (= c 43) (= c 45)) (digits? x (+ i 1) 2) (= (l/at x (+ i 3)) 58) (digits? x (+ i 4) 2)) (+ i 6) -1))))
+
+(defn- scan-period-units Int [x: &Str i0: Int units: &Str]
+  (loop [i i0 ui 0]
+    (let [j0 (if (= (l/at x i) 45) (+ i 1) i)
+          j (loop [k j0] (if (digit? (l/at x k)) (recur (+ k 1)) k))]
+      (if (= j j0) (if (= j0 i) i -1)
+        (let [jf (if (and (= (l/at x j) 46) (digit? (l/at x (+ j 1))))
+                   (loop [k (+ j 1)] (if (digit? (l/at x k)) (recur (+ k 1)) k))
+                   j)
+              u (l/at x jf)
+              pos (loop [q ui] (if (>= q (count units)) -1 (if (= (nth units q) u) q (recur (+ q 1)))))]
+          (if (or (< pos 0) (and (> jf j) (not (= u 83)))) -1
+            (recur (+ jf 1) (+ pos 1))))))))
+
+(defn- scan-period Bool [x: &Str]
+  (let [n (count x)]
+    (if (= (l/at x 1) 84)
+      (= (scan-period-units x 2 "HMS") n)
+      (let [e (scan-period-units x 1 "YMD")]
+        (if (< e 0) false
+          (if (= e n) true
+            (if (not (= (l/at x e) 84)) false
+              (let [d-only (loop [q 1] (if (>= q e) true (if (or (= (nth x q) 89) (= (nth x q) 77)) false (recur (+ q 1)))))]
+                (and d-only (= (scan-period-units x (+ e 1) "HMS") n))))))))))
+
+(defn- temporal-parse Values(Str Str) [x: &Str]
+  (let [n (count x)]
+    (if (= (l/at x 0) 80)
+      (if (scan-period x) (values "period" (str x)) (values "" ""))
+      (let [d (scan-date x 0)]
+        (if (> d 0)
+          (if (= d n) (values "date" (str x))
+            (if (= (l/at x d) 84)
+              (let [t (scan-time x (+ d 1))]
+                (if (< t 0) (values "" "")
+                  (if (= t n) (values "localdatetime" (str x))
+                    (if (= (scan-zone x t) n) (values "datetime" (str x)) (values "" "")))))
+              (if (= (scan-zone x d) n) (values "date" (subs x 0 d)) (values "" ""))))
+          (let [t (scan-time x 0)]
+            (if (> t 0)
+              (if (= t n) (values "localtime" (str x))
+                (if (= (scan-zone x t) n) (values "time" (str x)) (values "" "")))
+              (if (= (scan-zone x 0) n) (values "timezone" (str x)) (values "" "")))))))))
+
+(defn- ty a/Ty [t: a/TyE x: Int y: Int] (a/->Ty t (sp x y)))
+(defn- err-ty a/Ty [x: Int y: Int] (ty (a/->TName "Any" []) x y))
+
+(defn- depth-ok? Bool [st: &St] (< (:depth st) MAX-DEPTH))
+
+(defn- left-kid Vec(a/Node) [n: &a/Node]
+  (match (:e n)
+    (a/EBin op l r o) [l]
+    (a/ESelect t sl) [t]
+    (a/EExists t) [t]
+    (a/EAssert t) [t]
+    (a/EAs e ty) [e]
+    (a/EIs e ty) [e]
+    (a/EMetaSet e m) [e]
+    (a/EMatch t cs) [t]
+    (a/EUpdate t cs) [t]
+    (a/ECall f args) (match (:e f) (a/ERef nm) (if (> (count args) 0) [(nth args 0)] []) _ [f])
+    _ []))
+
+(defn- chain-len Int [n: &a/Node k: Int]
+  (if (> k MAX-DEPTH) k (let [c (left-kid n)] (if (= (count c) 0) k (chain-len (nth c 0) (+ k 1))))))
+
+(defn- chain-deep? Bool [st: &St n: &a/Node] (>= (+ (:depth st) (chain-len n 0)) MAX-DEPTH))
+
+(defn- too-deep St [s: &Str st: St]
+  (let [st2 (diag st (:pos st) (+ (:pos st) 1)
+                  (str "The expression is nested too deeply (the limit is " MAX-DEPTH " levels)"))]
+    (assoc (to st2 (count s)) :dead true)))
+
+(defn- p-type-args Values(Vec(a/Ty) Bool St) [s: &Str st0: St]
+  (let [save (:pos st0) nds (count (:ds st0))]
+    (loop [st (past st0 (pk s st0 l/M-TYPE)) args: Vec(a/Ty) []]
+      (let [[t1 st1] (p-type s st)
+            t (pk s st1 l/M-TYPE)
+            ok (= (count (:ds st1)) nds)]
+        (if (not ok) (values [] false (restore st1 save nds))
+          (if (= (:k t) l/K-COMMA) (recur (past st1 t) (conj args t1))
+            (if (= (:k t) l/K-GT) (values (conj args t1) true (past st1 t))
+              (values [] false (restore st1 save nds)))))))))
+
+(defn- p-tfield Values(a/TField St) [s: &Str st0: St]
+  (let [t (pk s st0 l/M-TYPE)
+        k (:k t)
+        [key ns st1]
+        (if (or (= k l/K-IDENT) (kw? k))
+          (if (and (= (l/at s (:e t)) 35) (l/ident-start? (l/at s (+ (:e t) 1))))
+            (let [ne (l/ident-end s (+ (:e t) 1))]
+              (values (subs s (+ (:e t) 1) ne) (l/tok-text s t) (to st0 ne)))
+            (let [nm (l/tok-text s t)] (values nm "" (past st0 t))))
+          (if (= k l/K-STR)
+            (let [[parts st2] (p-str-parts s st0 t)
+                  [plain txt] (plain-text parts)]
+              (values txt "" st2))
+            (if (= k l/K-LPAREN)
+              (let [[kt st2] (p-type s (past st0 t))]
+                (values "" "" (expect s st2 l/K-RPAREN l/M-TYPE "')'")))
+              (values "" "" (diag-tok s st0 t "a field name")))))
+        [opt2 rep attrs st4]
+        (loop [st st1 opt false rep false as: Vec(a/TField) []]
+          (let [t2 (pk s st l/M-TYPE)
+                k2 (:k t2)]
+            (if (= k2 l/K-QUEST) (recur (past st t2) true rep as)
+              (if (= k2 l/K-STAR) (recur (past st t2) opt true as)
+                (if (and (= k2 l/K-AT) (= (l/at s (l/skip-trivia s (:e t2))) 40))
+                  (let [[as2 st9] (p-tattrs s (to st (+ (l/skip-trivia s (:e t2)) 1)))]
+                    (recur st9 opt rep as2))
+                  (values opt rep as st))))))
+        st5 (expect s st4 l/K-COLON l/M-TYPE "':'")
+        [vt st6] (p-type s st5)]
+    (values (a/->TField key ns opt2 rep vt attrs) st6)))
+
+(defn- p-tattrs Values(Vec(a/TField) St) [s: &Str st0: St]
+  (loop [st st0 acc: Vec(a/TField) []]
+    (let [t (pk s st l/M-TYPE)]
+      (if (= (:k t) l/K-RPAREN) (values acc (past st t))
+        (if (= (:k t) l/K-EOF) (values acc (diag-tok s st t "')'"))
+          (let [[f st1] (p-tfield s st)
+                t2 (pk s st1 l/M-TYPE)]
+            (if (= (:k t2) l/K-COMMA) (recur (past st1 t2) (conj acc f))
+              (if (= (:k t2) l/K-RPAREN) (values (conj acc f) (past st1 t2))
+                (values (conj acc f) (diag-tok s st1 t2 "',' or ')'"))))))))))
+
+(defn- p-tobject Values(a/Ty St) [s: &Str st0: St open: &l/Tok]
+  (let [closed (= (:k open) l/K-LBRACE-PIPE)
+        ordered (= (:k open) l/K-LBRACE-DASH)
+        close-k (if closed l/K-PIPE-RBRACE (if ordered l/K-DASH-RBRACE l/K-RBRACE))
+        what (if closed "'|}'" (if ordered "'-}'" "'}'"))]
+    (loop [st (past st0 open) fields: Vec(a/TField) []]
+      (let [t (pk s st l/M-TYPE)]
+        (if (= (:k t) close-k)
+          (values (ty (a/->TObj fields closed ordered) (:s open) (:e t)) (past st t))
+          (if (= (:k t) l/K-EOF)
+            (values (ty (a/->TObj fields closed ordered) (:s open) (:s t)) (diag-tok s st t what))
+            (let [[f st1] (p-tfield s st)
+                  t2 (pk s st1 l/M-TYPE)]
+              (if (= (:k t2) l/K-COMMA) (recur (past st1 t2) (conj fields f))
+                (if (= (:k t2) close-k)
+                  (values (ty (a/->TObj (conj fields f) closed ordered) (:s open) (:e t2)) (past st1 t2))
+                  (let [st2 (diag-tok s st1 t2 (str "',' or " what))
+                        st3 (skip-in s st2 close-k)
+                        t3 (pk s st3 l/M-TYPE)]
+                    (if (= (:k t3) l/K-COMMA) (recur (past st3 t3) (conj fields f))
+                      (values (ty (a/->TObj (conj fields f) closed ordered) (:s open) (:e t3))
+                              (if (= (:k t3) l/K-EOF) st3 (past st3 t3))))))))))))))
+
+(defn- p-tparen Values(a/Ty St) [s: &Str st0: St open: &l/Tok]
+  (loop [st (past st0 open) params: Vec(a/Ty) [] named false]
+    (let [t (pk s st l/M-TYPE)]
+      (if (= (:k t) l/K-RPAREN)
+        (let [st1 (past st t)
+              t2 (pk s st1 l/M-TYPE)]
+          (if (= (:k t2) l/K-ARROW)
+            (let [[rt st2] (p-type s (past st1 t2))]
+              (values (ty (a/->TFn params rt) (:s open) (tend rt)) st2))
+            (if (and (= (count params) 1) (not named))
+              (let [p0: a/Ty (nth params 0)] (values (ty (:t p0) (:s open) (:e t)) st1))
+              (values (err-ty (:s open) (:e t)) (diag-tok s st1 t2 "'->' for the function type")))))
+        (let [
+              t1 (l/next-tok s (:e t) l/M-TYPE)
+              [nm st1] (if (and (= (:k t) l/K-IDENT) (= (:k t1) l/K-COLON)) (values true (past (past st t) t1)) (values false st))
+              [pt st2] (p-type s st1)
+              t3 (pk s st2 l/M-TYPE)]
+          (if (= (:k t3) l/K-COMMA) (recur (past st2 t3) (conj params pt) (or named nm))
+            (if (= (:k t3) l/K-RPAREN) (recur st2 (conj params pt) (or named nm))
+              (values (err-ty (:s open) (:e t3)) (diag-tok s st2 t3 "',' or ')'")))))))))
+
+(defn- p-tatom Values(a/Ty St) [s: &Str st: St]
+  (let [t (pk s st l/M-TYPE)
+        k (:k t)]
+    (cond
+      (= k l/K-IDENT)
+      (let [ne (modname-end s t)
+            st1 (to st ne)
+            nm (subs s (:s t) ne)]
+        (if (= (:k (pk s st1 l/M-TYPE)) l/K-LT)
+          (let [[args ok st2] (p-type-args s st1)]
+            (if ok (values (ty (a/->TName nm args) (:s t) (:pos st2)) st2)
+              (values (ty (a/->TName nm []) (:s t) (:e t)) st2)))
+          (values (ty (a/->TName nm []) (:s t) (:e t)) st1)))
+      (or (= k l/K-LBRACE) (= k l/K-LBRACE-PIPE) (= k l/K-LBRACE-DASH)) (p-tobject s st t)
+      (= k l/K-LPAREN) (p-tparen s st t)
+      (= k l/K-STR)
+      (let [[parts st1] (p-str-parts s st t)]
+        (values (ty (a/->TLit (nd (a/->EStr parts) (:s t) (:e t))) (:s t) (:e t)) st1))
+      (= k l/K-NUM) (values (ty (a/->TLit (nd (a/->ENum (l/tok-text s t)) (:s t) (:e t))) (:s t) (:e t)) (past st t))
+      (and (= k l/K-MINUS) (digit? (l/at s (:e t))))
+      (let [ne (l/num-end s (:e t))]
+        (values (ty (a/->TLit (nd (a/->ENum (subs s (:s t) ne)) (:s t) ne)) (:s t) ne) (to st ne)))
+      (or (= k l/KW-TRUE) (= k l/KW-FALSE))
+      (values (ty (a/->TLit (nd (a/->EBool (= k l/KW-TRUE)) (:s t) (:e t))) (:s t) (:e t)) (past st t))
+      (= k l/KW-NULL) (values (ty (a/->TLit (nd (a/->ENull) (:s t) (:e t))) (:s t) (:e t)) (past st t))
+      :else (values (err-ty (:s t) (:e t)) (diag-tok s st t "a type")))))
+
+(defn- p-tpost Values(a/Ty St) [s: &Str st0: St]
+  (let [[base0 st0b] (p-tatom s st0)
+        [base st1]
+        (loop [b base0 st st0b]
+          (let [td (pk s st l/M-INFIX)
+                c (l/at s (:e td))]
+            (if (and (= (:k td) l/K-DOT) (or (l/ident-start? c) (= c 34) (= c 39) (= c 96)))
+              (let [[ns nm dyn e st2] (p-selname s (past st td) (:e td))
+                    x (:start (:sp b))]
+                (if (> (count dyn) 0)
+                  (values b (diag st2 (:s td) e "A type selector can not use an interpolated name"))
+                  (recur (ty (a/->TSel b ns nm) x e) st2)))
+              (values b st))))
+        t (pk s st1 l/M-INFIX)]
+    (if (= (:k t) l/K-LBRACE)
+      (let [[o st2] (p-object s st1)
+            x (:start (:sp base))
+            y (nend o)]
+        (values (ty (a/->TMeta base o) x y) st2))
+      (if (= (:k t) l/K-META)
+        (if (= (:k (l/next-tok s (:e t) l/M-INFIX)) l/K-LBRACE)
+          (let [[o st2] (p-object s (past st1 t))
+                x (:start (:sp base))
+                y (nend o)]
+            (values (ty (a/->TMeta base o) x y) st2))
+          (values base (diag (past st1 t) (:s t) (:e t) "Missing Schema")))
+        (values base st1)))))
+
+(defn- p-tinter Values(a/Ty St) [s: &Str st0: St]
+  (let [[t0 st1] (p-tpost s st0)]
+    (loop [st st1 parts: Vec(a/Ty) [t0]]
+      (let [t (pk s st l/M-TYPE)]
+        (if (= (:k t) l/K-AMP)
+          (let [[t2 st2] (p-tpost s (past st t))] (recur st2 (conj parts t2)))
+          (if (= (count parts) 1) (values (nth parts 0) st)
+            (let [x (:start (:sp (nth parts 0))) y (tend (nth parts (- (count parts) 1)))]
+              (values (ty (a/->TInter parts) x y) st))))))))
+
+(defn- p-type Values(a/Ty St) [s: &Str st0: St]
+  (if (not (depth-ok? st0))
+    (values (err-ty (:pos st0) (:pos st0)) (too-deep s st0))
+    (let [d (:depth st0)
+          [t0 st1] (p-tinter s (assoc st0 :depth (+ d 1)))]
+      (loop [st st1 alts: Vec(a/Ty) [t0]]
+        (let [t (pk s st l/M-TYPE)]
+          (if (= (:k t) l/K-PIPE)
+            (let [[t2 st2] (p-tinter s (past st t))] (recur st2 (conj alts t2)))
+            (if (= (count alts) 1) (values (nth alts 0) (assoc st :depth d))
+              (let [x (:start (:sp (nth alts 0))) y (tend (nth alts (- (count alts) 1)))]
+                (values (ty (a/->TUnion alts) x y) (assoc st :depth d))))))))))
+
+(defn- ws-char? Bool [c: Int] (or (= c 32) (= c 9) (= c 10) (= c 13)))
+
+(defn- starts-expr? Bool [k: Int]
+  (or (= k l/K-IDENT) (= k l/K-NUM) (= k l/K-STR) (= k l/K-REGEX) (= k l/K-TEMPORAL) (= k l/K-DOLLAR)
+      (= k l/K-LPAREN) (= k l/K-LBRACK) (= k l/K-LBRACE) (= k l/K-MINUS) (= k l/K-BANG) (= k l/K-AT)
+      (= k l/KW-NULL) (= k l/KW-TRUE) (= k l/KW-FALSE) (= k l/KW-IF) (= k l/KW-UNLESS) (= k l/KW-DO)
+      (= k l/KW-USING)))
+
+(defn- op-level Int [s: &Str t: &l/Tok]
+  (let [k (:k t)]
+    (cond
+      (= k l/KW-AS) L-AS
+      (or (= k l/K-STAR) (= k l/K-SLASH)) L-MUL
+      (or (= k l/K-PLUS) (= k l/K-MINUS) (= k l/K-SHR) (= k l/K-SHL)) L-ADD
+      (or (= k l/K-LT) (= k l/K-GT) (= k l/K-LE) (= k l/K-GE) (= k l/KW-IS)) L-REL
+      (or (= k l/K-EQ) (= k l/K-NE) (= k l/K-SIM)) L-EQ
+      (= k l/KW-AND) L-AND
+      (= k l/KW-OR) L-OR
+      (or (= k l/KW-DEFAULT) (= k l/K-META) (= k l/K-PLUSPLUS) (= k l/K-MINUSMINUS)) L-TOP
+      (and (= k l/K-IDENT) (not (l/span-is? s (:s t) (:e t) "annotation"))
+           (or (not (= (l/at s (:e t)) 33)) (= (l/at s (+ (:e t) 1)) 61) (l/ident-start? (l/at s (+ (:e t) 1))))) L-TOP
+      (= k l/K-DOLLAR) L-TOP
+      :else 0)))
+
+(defn- p-lv Values(a/Node St) [s: &Str st0: St maxlv: Int]
+  (if (not (depth-ok? st0))
+    (values (err-node "too deep" (:pos st0) (:pos st0)) (too-deep s st0))
+    (let [d (:depth st0)
+          [n st1] (p-level s (assoc st0 :depth (+ d 1)) maxlv)]
+      (values n (assoc st1 :depth d)))))
+
+(defn- p-expr Values(a/Node St) [s: &Str st: St] (p-lv s st L-TOP))
+
+(defn- p-annotation Values(a/Annotation St) [s: &Str st0: St]
+  (let [t-at (pk s st0 l/M-INFIX)
+        st1 (past st0 t-at)
+        tn (pk s st1 l/M-INFIX)]
+    (if (not (= (:k tn) l/K-IDENT))
+      (values (a/->Annotation "" []) (diag-tok s st1 tn "an annotation name"))
+      (let [nm (l/tok-text s tn)
+            st2 (past st1 tn)
+            tp (pk s st2 l/M-INFIX)]
+        (if (not (= (:k tp) l/K-LPAREN)) (values (a/->Annotation nm []) st2)
+          (loop [st (past st2 tp) args: Vec(a/Node) []]
+            (let [t (pk s st l/M-INFIX)]
+              (if (= (:k t) l/K-RPAREN) (values (a/->Annotation nm args) (past st t))
+                (if (not (= (:k t) l/K-IDENT))
+                  (values (a/->Annotation nm args) (skip-to-closer s (diag-tok s st t "an annotation argument name")))
+                  (let [st3 (expect s (past st t) l/K-ASSIGN l/M-INFIX "'='")
+                        [v st4] (p-expr s st3)
+                        arg (nd (a/->EObj [(a/->EKV (a/->KName "" (l/tok-text s t)) [] v [])]) (:s t) (nend v))
+                        t2 (pk s st4 l/M-INFIX)]
+                    (if (= (:k t2) l/K-COMMA) (recur (past st4 t2) (conj args arg))
+                      (if (= (:k t2) l/K-RPAREN) (values (a/->Annotation nm (conj args arg)) (past st4 t2))
+                        (values (a/->Annotation nm (conj args arg))
+                                (skip-to-closer s (diag-tok s st4 t2 "')' for annotation")))))))))))))))
+
+(defn- p-annotations Values(Vec(a/Annotation) St) [s: &Str st0: St]
+  (loop [st st0 acc: Vec(a/Annotation) []]
+    (if (= (:k (pk s st l/M-INFIX)) l/K-AT)
+      (let [[an st1] (p-annotation s st)] (recur st1 (conj acc an)))
+      (values acc st))))
+
+(defn- p-params Values(Vec(a/Param) Bool St) [s: &Str st0: St strict: Bool]
+  (loop [st st0 acc: Vec(a/Param) [] first true]
+    (let [t (pk s st l/M-INFIX)]
+      (if (and first (= (:k t) l/K-RPAREN)) (values acc true (past st t))
+        (let [[ans st1] (p-annotations s st)
+              tn (pk s st1 l/M-INFIX)]
+          (if (not (= (:k tn) l/K-IDENT))
+            (if strict (values acc false (skip-to-closer s (diag-tok s st1 tn "a parameter name")))
+              (values acc false st1))
+            (let [st2 (past st1 tn)
+                  tc (pk s st2 l/M-INFIX)
+                  [ptys st3] (if (= (:k tc) l/K-COLON)
+                               (let [[pt st4] (p-type s (past st2 tc))] (values [pt] st4))
+                               (values [] st2))
+                  td (pk s st3 l/M-INFIX)
+                  [pdef st5] (if (= (:k td) l/K-ASSIGN)
+                               (let [[dv st6] (p-expr s (past st3 td))] (values [dv] st6))
+                               (values [] st3))
+                  pm (a/->Param (l/tok-text s tn) ptys pdef)
+                  t2 (pk s st5 l/M-INFIX)]
+              (if (= (:k t2) l/K-COMMA) (recur (past st5 t2) (conj acc pm) false)
+                (if (= (:k t2) l/K-RPAREN) (values (conj acc pm) true (past st5 t2))
+                  (if strict (values (conj acc pm) false (skip-to-closer s (diag-tok s st5 t2 "',' or ')'")))
+                    (values acc false st5)))))))))))
+
+(defn- try-lambda Values(Bool a/Node St) [s: &Str st0: St open: &l/Tok]
+  (let [save (:pos st0)
+        nds (count (:ds st0))
+        [params ok st1] (p-params s (past st0 open) false)]
+    (if (or (not ok) (> (count (:ds st1)) nds)) (values false (null-node 0) (restore st1 save nds))
+      (let [t (pk s st1 l/M-INFIX)
+            [ret st2] (if (= (:k t) l/K-COLON)
+                        (let [[rt st3] (p-type s (past st1 t))] (values [rt] st3))
+                        (values [] st1))
+            ta (pk s st2 l/M-INFIX)]
+        (if (or (not (= (:k ta) l/K-ARROW)) (> (count (:ds st2)) nds))
+          (values false (null-node 0) (restore st2 save nds))
+          (let [[body st4] (p-expr s (need-expr s (past st2 ta) "Missing Lambda Expression."))]
+            (values true (nd (a/->ELambda params ret body) (:s open) (nend body)) st4)))))))
+
+(defn- p-paren Values(a/Node St) [s: &Str st0: St open: &l/Tok]
+  (let [[inner st1] (p-expr s (past st0 open))
+        t (pk s st1 l/M-INFIX)]
+    (if (= (:k t) l/K-RPAREN)
+      (values (a/->Node (:e inner) (sp (:s open) (:e t))) (past st1 t))
+      (values inner (skip-to-closer s (diag-tok s st1 t "')' for the enclosed expression."))))))
+
+(defn- p-key Values(a/Key Int St) [s: &Str st0: St t: &l/Tok]
+  (let [k (:k t)]
+    (if (= k l/K-STR)
+      (let [[parts st1] (p-str-parts s st0 t)] (values (a/->KStr parts) (:e t) st1))
+      (if (and (= (l/at s (:e t)) 35) (l/ident-start? (l/at s (+ (:e t) 1))))
+        (let [ne (l/ident-end s (+ (:e t) 1))]
+          (values (a/->KName (l/tok-text s t) (subs s (+ (:e t) 1) ne)) ne (to st0 ne)))
+        (let [st1 (if (kw? k)
+                    (diag-lines st0 (:s t) (:e t)
+                          (reserved-msg (l/tok-text s t)))
+                    st0)]
+          (values (a/->KName "" (l/tok-text s t)) (:e t) (past st1 t)))))))
+
+(defn- key-start? Bool [k: Int] (or (= k l/K-IDENT) (= k l/K-STR) (kw? k)))
+
+(defn- p-attrs Values(Vec(a/Attr) St) [s: &Str st0: St]
+  (let [t-at (pk s st0 l/M-INFIX)
+        st1 (expect s (past st0 t-at) l/K-LPAREN l/M-INFIX "'('")]
+    (loop [st st1 acc: Vec(a/Attr) []]
+      (let [t (pk s st l/M-INFIX)]
+        (if (= (:k t) l/K-RPAREN) (values acc (past st t))
+          (let [[at st2]
+                (if (= (:k t) l/K-LPAREN)
+                  (let [tk (pk s (past st t) l/M-INFIX)]
+                    (if (not (and (key-start? (:k tk)) (kv-follows? s tk)))
+                      (let [[e st3] (p-expr s (past st t))
+                            st4 (expect s st3 l/K-RPAREN l/M-INFIX "')'")
+                            ti (pk s st4 l/M-PREFIX)]
+                        (if (= (:k ti) l/KW-IF)
+                          (let [[c st5] (p-lv s (past st4 ti) L-TOP)] (values (a/->Attr "" "" e [c] true) st5))
+                          (values (a/->Attr "" "" e [] true) st4)))
+                      (let [[key ke st3] (p-key s (past st t) tk)
+                            st4 (expect s st3 l/K-COLON l/M-INFIX "':'")
+                            [v st5] (p-expr s st4)
+                            st6 (expect s st5 l/K-RPAREN l/M-INFIX "')'")
+                            ti (pk s st6 l/M-PREFIX)]
+                        (if (= (:k ti) l/KW-IF)
+                          (let [[c st7] (p-lv s (past st6 ti) L-TOP)]
+                            (values (match key
+                                      (a/KName ns nm) (a/->Attr ns nm v [c] false)
+                                      (a/KStr parts) (let [[pl txt] (plain-text parts)] (a/->Attr "" txt v [c] false))
+                                      (a/KExpr ns e) (a/->Attr "" "" v [c] false))
+                                    st7))
+                          (values (a/->Attr "" "" v [] false) (diag-tok s st6 ti "'if'"))))))
+                  (if (key-start? (:k t))
+                    (let [[key ke st3] (p-key s st t)
+                          st4 (expect s st3 l/K-COLON l/M-INFIX "':'")
+                          [v st5] (p-expr s st4)]
+                      (values (match key
+                                (a/KName ns nm) (a/->Attr ns nm v [] false)
+                                (a/KStr parts) (let [[pl txt] (plain-text parts)] (a/->Attr "" txt v [] false))
+                                (a/KExpr ns e) (a/->Attr "" "" v [] false))
+                              st5))
+                    (values (a/->Attr "" "" (null-node (:s t)) [] false) (diag-tok s st t "an attribute name"))))
+                t2 (pk s st2 l/M-INFIX)]
+            (if (= (:k t2) l/K-COMMA) (recur (past st2 t2) (conj acc at))
+              (if (= (:k t2) l/K-RPAREN) (values (conj acc at) (past st2 t2))
+                (let [st3 (skip-in s (diag-tok s st2 t2 "',' or ')' for the attributes") l/K-RPAREN)
+                      t3 (pk s st3 l/M-INFIX)]
+                  (if (= (:k t3) l/K-COMMA) (recur (past st3 t3) (conj acc at))
+                    (values (conj acc at) (if (= (:k t3) l/K-RPAREN) (past st3 t3) st3))))))))))))
+
+(defn- p-kv Values(a/Entry St) [s: &Str st0: St t: &l/Tok]
+  (let [[key ke st1] (p-key s st0 t)
+        ta (pk s st1 l/M-INFIX)
+        [attrs st2] (if (and (= (:k ta) l/K-AT) (= (:k (l/next-tok s (:e ta) l/M-INFIX)) l/K-LPAREN))
+                      (p-attrs s st1)
+                      (values [] st1))
+        st3 (expect s st2 l/K-COLON l/M-INFIX "':'")
+        [v st4] (p-expr s (need-expr s st3 "Missing Object Field Expression. e.g  {a: 123}"))]
+    (values (a/->EKV key attrs v []) st4)))
+
+(defn- cond-entry a/Entry [inner: a/Node c: a/Node]
+  (let [single (match (:e inner)
+                 (a/EObj es) (and (= (count es) 1)
+                                  (match (nth es 0)
+                                    (a/EKV k at v cs) (= (count cs) 0)
+                                    (a/ESpread e cs) false))
+                 _ false)]
+    (if single
+      (match (:e inner)
+        (a/EObj es) (match (nth es 0)
+                      (a/EKV k at v cs) (a/->EKV k at v [c])
+                      (a/ESpread e cs) (a/->ESpread inner [c]))
+        _ (a/->ESpread inner [c]))
+      (a/->ESpread inner [c]))))
+
+(defn- p-entry Values(a/Entry St) [s: &Str st0: St]
+  (let [t (pk s st0 l/M-PREFIX)]
+    (if (= (:k t) l/K-LPAREN)
+      (let [[inner st1] (p-paren s st0 t)
+            t2 (pk s st1 l/M-INFIX)]
+        (cond
+          (= (:k t2) l/K-COLON)
+          (let [[v st2] (p-expr s (past st1 t2))]
+            (values (a/->EKV (a/->KExpr "" inner) [] v []) st2))
+          (and (= (:k t2) l/K-AT) (= (:k (l/next-tok s (:e t2) l/M-INFIX)) l/K-LPAREN))
+          (let [[attrs0 st2] (p-attrs s st1)
+                attrs (if (= (count attrs0) 0) [(a/->Attr "" "" (null-node (:s t2)) [] true)] attrs0)
+                st3 (expect s st2 l/K-COLON l/M-INFIX "':'")
+                [v st4] (p-expr s st3)]
+            (values (a/->EKV (a/->KExpr "" inner) attrs v []) st4))
+          :else
+          (if (= (:k t2) l/KW-IF)
+            (let [[c st2] (p-lv s (past st1 t2) L-TOP)
+                  en (cond-entry inner c)
+                  st3 (match en
+                        (a/EKV k at v cs) st2
+                        (a/ESpread e cs) (diag st2 (:s t2) (:e t2)
+                                               "Invalid input 'if': only a key-value pair `(key: value) if condition` can be conditional in an object"))]
+              (values en st3))
+            (values (a/->ESpread inner []) st1))))
+      (if (key-start? (:k t)) (p-kv s st0 t)
+        (values (a/->ESpread (err-node "bad entry" (:s t) (:e t)) [])
+                (diag-tok s st0 t "a key or '}' for the object expression"))))))
+
+(defn- p-object Values(a/Node St) [s: &Str st0: St]
+  (let [open (pk s st0 l/M-INFIX)]
+    (loop [st (past st0 open) acc: Vec(a/Entry) []]
+      (let [t (pk s st l/M-PREFIX)]
+        (if (= (:k t) l/K-RBRACE) (values (nd (a/->EObj acc) (:s open) (:e t)) (past st t))
+          (if (= (:k t) l/K-EOF)
+            (values (nd (a/->EObj acc) (:s open) (:s t)) (diag-tok s st t "`}` or ',' for the object expression."))
+            (let [[en st1a] (p-entry s st)
+                  st1 (ht-check s st1a (= (count acc) 0) "{key: value ~ tail}")
+                  t2 (pk s st1 l/M-INFIX)]
+              (if (= (:k t2) l/K-COMMA) (recur (past st1 t2) (conj acc en))
+                (if (= (:k t2) l/K-RBRACE) (values (nd (a/->EObj (conj acc en)) (:s open) (:e t2)) (past st1 t2))
+                  (let [st2 (skip-in s (diag-tok s st1 t2 "`}` or ',' for the object expression.") l/K-RBRACE)
+                        t3 (pk s st2 l/M-INFIX)]
+                    (if (= (:k t3) l/K-COMMA) (recur (past st2 t3) (conj acc en))
+                      (if (= (:k t3) l/K-RBRACE) (values (nd (a/->EObj (conj acc en)) (:s open) (:e t3)) (past st2 t3))
+                        (values (nd (a/->EObj (conj acc en)) (:s open) (:s t3)) st2)))))))))))))
+
+(defn- ht-check St [s: &Str st: St first: Bool what: &Str]
+  (let [t (pk s st l/M-INFIX)]
+    (if (not (and first (= (:k t) l/K-TILDE))) st
+      (let [[tail st2] (p-expr s (past st t))]
+        (diag st2 (:s t) (:e t) (str "Head-tail constructors (" what ") are not supported yet"))))))
+
+(defn- p-array Values(a/Node St) [s: &Str st0: St open: &l/Tok]
+  (loop [st (past st0 open) acc: Vec(a/Elem) []]
+    (let [t (pk s st l/M-PREFIX)]
+      (if (= (:k t) l/K-RBRACK) (values (nd (a/->EArr acc) (:s open) (:e t)) (past st t))
+        (if (= (:k t) l/K-EOF)
+          (values (nd (a/->EArr acc) (:s open) (:s t)) (diag-tok s st t "']' or ',' for the array expression."))
+          (let [[v st1a] (p-expr s st)
+                st1 (ht-check s st1a (= (count acc) 0) "[head ~ tail]")
+                ti (pk s st1 l/M-PREFIX)
+                [el st2] (if (= (:k ti) l/KW-IF)
+                           (let [[c st3] (p-lv s (past st1 ti) L-TOP)] (values (a/->Elem v [c]) st3))
+                           (values (a/->Elem v []) st1))
+                t2 (pk s st2 l/M-INFIX)]
+            (if (= (:k t2) l/K-COMMA) (recur (past st2 t2) (conj acc el))
+              (if (= (:k t2) l/K-RBRACK) (values (nd (a/->EArr (conj acc el)) (:s open) (:e t2)) (past st2 t2))
+                (let [st4 (skip-in s (diag-tok s st2 t2 "']' or ',' for the array expression.") l/K-RBRACK)
+                      t3 (pk s st4 l/M-INFIX)]
+                  (if (= (:k t3) l/K-COMMA) (recur (past st4 t3) (conj acc el))
+                    (if (= (:k t3) l/K-RBRACK) (values (nd (a/->EArr (conj acc el)) (:s open) (:e t3)) (past st4 t3))
+                      (values (nd (a/->EArr (conj acc el)) (:s open) (:s t3)) st4))))))))))))
+
+(defn- p-kv-expr Values(a/Node St) [s: &Str st0: St t: &l/Tok]
+  (let [[en st1] (p-kv s st0 t)
+        y (match en (a/EKV k at v cs) (nend v) (a/ESpread e cs) (nend e))]
+    (values (nd (a/->EObj [en]) (:s t) y) st1)))
+
+(defn- kv-follows? Bool [s: &Str t: &l/Tok]
+  (let [t2 (l/next-tok s (:e t) l/M-INFIX)]
+    (or (and (= (:k t2) l/K-COLON) (not (= (l/at s (+ (:s t2) 1)) 58)))
+        (and (= (:k t2) l/K-AT) (= (:k (l/next-tok s (:e t2) l/M-INFIX)) l/K-LPAREN))
+        (and (= (:e t2) (+ (:e t) 1)) (= (:k t2) l/K-HASH) (l/ident-start? (l/at s (:e t2)))
+             (let [ne (l/ident-end s (:e t2))
+                   t3 (l/next-tok s ne l/M-INFIX)]
+               (or (= (:k t3) l/K-COLON) (= (:k t3) l/K-AT)))))))
+
+(defn- p-if Values(a/Node St) [s: &Str st0: St t: &l/Tok]
+  (let [unless (= (:k t) l/KW-UNLESS)
+        st1 (expect s (past st0 t) l/K-LPAREN l/M-INFIX "'(' for the if expression.")
+        st1b (if (= (:k (pk s st1 l/M-PREFIX)) l/K-EOF) (diag-tok s st1 (pk s st1 l/M-PREFIX) "')' for the if expression.") st1)
+        [c st2] (p-expr s st1b)
+        st3 (expect s st2 l/K-RPAREN l/M-INFIX "')' for the if expression.")
+        [th st4] (p-expr s (need-expr s st3 "Missing If Body Expression"))
+        te (pk s st4 l/M-INFIX)]
+    (if (not (= (:k te) l/KW-ELSE))
+      (values (nd (a/->EIf c th (null-node (:s te))) (:s t) (nend th)) (diag st4 (:s te) (+ (:s te) 1) "Missing Else"))
+      (let [[el st5] (p-expr s (need-expr s (past st4 te) "Missing else Expression"))
+            cc (if unless (nd (a/->EUnary "not" c) (nstart c) (nend c)) c)]
+        (values (nd (a/->EIf cc th el) (:s t) (nend el)) st5)))))
+
+(defn- p-using Values(a/Node St) [s: &Str st0: St t: &l/Tok]
+  (let [st1 (expect s (past st0 t) l/K-LPAREN l/M-INFIX "'('")]
+    (loop [st st1 acc: Vec(a/DeclAt) []]
+      (let [tn (pk s st l/M-INFIX)]
+        (if (not (= (:k tn) l/K-IDENT))
+          (let [st2 (skip-to-closer s (diag-tok s st tn "a variable name"))
+                st3 (expect s st2 l/K-RPAREN l/M-INFIX "')'")
+                [b st4] (p-expr s st3)]
+            (values (nd (a/->EUsing acc b) (:s t) (nend b)) st4))
+          (let [st2 (expect s (past st tn) l/K-ASSIGN l/M-INFIX "'='")
+                [v st3] (p-expr s st2)
+                d (a/->DeclAt (a/->DVar (l/tok-text s tn) [] v) (sp (:s tn) (nend v)))
+                t2 (pk s st3 l/M-INFIX)]
+            (if (= (:k t2) l/K-COMMA) (recur (past st3 t2) (conj acc d))
+              (let [st4 (expect s st3 l/K-RPAREN l/M-INFIX "',' or ')'")
+                    [b st5] (p-expr s st4)]
+                (values (nd (a/->EUsing (conj acc d) b) (:s t) (nend b)) st5)))))))))
+
+(defn- p-do Values(a/Node St) [s: &Str st0: St t: &l/Tok]
+  (let [st1a (expect s (past st0 t) l/K-LBRACE l/M-INFIX "'{' for the do block")
+        st1 (if (= (:k (pk s st1a l/M-PREFIX)) l/K-EOF) (diag-tok s st1a (pk s st1a l/M-PREFIX) "'}' for the do block") st1a)
+        [ver dirs decls stop st2] (p-decls s st1 true)
+        ts (pk s st2 l/M-INFIX)
+        st3 (if (= (:k ts) l/K-SEP)
+              (if (= (count decls) 0)
+                (diag (past st2 ts) (:s ts) (:e ts) "Invalid input '-', expected '}' for the do block")
+                (need-expr s (past st2 ts) "Missing Body Expression. i.e dw 2.0\n --- \n true"))
+              (if (= (count decls) 0) st2 (diag-tok s st2 ts "'}' for the do block")))
+        [b st4] (p-expr s st3)
+        tc (pk s st4 l/M-INFIX)]
+    (if (= (:k tc) l/K-RBRACE)
+      (values (nd (a/->EDo decls b) (:s t) (:e tc)) (past st4 tc))
+      (values (nd (a/->EDo decls b) (:s t) (nend b)) (diag-tok s st4 tc "'}' for the do block")))))
+
+(defn- p-template Values(a/Node St) [s: &Str st0: St t: &l/Tok tb: &l/Tok]
+  (let [[parts st1] (p-str-parts s (past st0 t) tb)
+        [strs exprs last]
+        (loop [i 0 strs: Vec(a/Elem) [] exprs: Vec(a/Elem) [] cur ""]
+          (if (>= i (count parts))
+            (values strs exprs cur)
+            (match (nth parts i)
+              (a/SPText x) (recur (+ i 1) strs exprs (str cur x))
+              (a/SPExpr e) (recur (+ i 1) (conj strs (a/->Elem (nd (a/->EStr (push-text [] cur)) (:s tb) (:e tb)) [])) (conj exprs (a/->Elem e [])) ""))))
+        strs2 (conj strs (a/->Elem (nd (a/->EStr (push-text [] last)) (:s tb) (:e tb)) []))
+        f (nd (a/->ERef (l/tok-text s t)) (:s t) (:e t))]
+    (values (nd (a/->ECall f [(nd (a/->EArr strs2) (:s tb) (:e tb)) (nd (a/->EArr exprs) (:s tb) (:e tb))]) (:s t) (:e tb)) st1)))
+
+(defn- p-primary Values(a/Node St) [s: &Str st: St]
+  (let [t (pk s st l/M-PREFIX)
+        k (:k t)
+        x (:s t)
+        y (:e t)]
+    (cond
+      (= k l/K-NUM) (values (nd (a/->ENum (l/tok-text s t)) x y) (past st t))
+      (and (= k l/K-MINUS) (digit? (l/at s y)))
+      (let [ne (l/num-end s y)] (values (nd (a/->ENum (subs s x ne)) x ne) (to st ne)))
+      (= k l/K-STR)
+      (if (kv-follows? s t) (p-kv-expr s st t)
+        (let [[parts st1] (p-str-parts s st t)] (values (nd (a/->EStr parts) x y) st1)))
+      (= k l/K-IDENT)
+      (if (kv-follows? s t) (p-kv-expr s st t)
+        (let [tb (l/next-tok s y l/M-INFIX)]
+          (if (and (= (:k tb) l/K-STR) (= (l/at s (:s tb)) 96))
+            (p-template s st t tb)
+            (if (and (= (l/at s y) 33) (l/ident-start? (l/at s (+ y 1))))
+              (let [me (modname-end s t)] (values (nd (a/->ERef (subs s x me)) x me) (to st me)))
+              (values (nd (a/->ERef (l/tok-text s t)) x y) (past st t))))))
+      (= k l/K-DOLLAR) (values (nd (a/->ERef (l/tok-text s t)) x y) (past st t))
+      (or (= k l/K-PLUSPLUS) (= k l/K-MINUSMINUS))
+      (let [ne (l/ident-end s y)] (values (nd (a/->ERef (subs s x ne)) x ne) (to st ne)))
+      (= k l/KW-NULL) (values (nd (a/->ENull) x y) (past st t))
+      (= k l/KW-TRUE) (values (nd (a/->EBool true) x y) (past st t))
+      (= k l/KW-FALSE) (values (nd (a/->EBool false) x y) (past st t))
+      (= k l/K-REGEX) (values (nd (a/->ERegex (regex-body s (+ x 1) (- y 1)) "") x y) (past st t))
+      (= k l/K-TEMPORAL)
+      (let [raw (subs s (+ x 1) (- y 1))
+            [kind txt] (temporal-parse raw)]
+        (if (= (count kind) 0)
+          (values (err-node "date literal" x y)
+                  (past (diag st x y (str "Invalid date literal " (subs s x y)
+                                          ", expected a Date, DateTime, LocalDateTime, Time, LocalTime, TimeZone or Period"))
+                        t))
+          (values (nd (a/->ETemporal kind txt) x y) (past st t))))
+      (= k l/K-LPAREN)
+      (let [[ok lam st1] (try-lambda s st t)]
+        (if ok (values lam st1)
+          (let [[inner st2] (p-paren s st1 t)
+                t2 (pk s st2 l/M-INFIX)]
+            (if (and (= (:k t2) l/K-COLON) (not (= (l/at s (+ (:s t2) 1)) 58)))
+              (let [[v st3] (p-expr s (past st2 t2))]
+                (values (nd (a/->EObj [(a/->EKV (a/->KExpr "" inner) [] v [])]) x (nend v)) st3))
+              (values inner st2)))))
+      (= k l/K-LBRACK) (p-array s st t)
+      (= k l/K-LBRACE) (p-object s st)
+      (or (= k l/KW-IF) (= k l/KW-UNLESS)) (p-if s st t)
+      (= k l/KW-DO) (p-do s st t)
+      (= k l/KW-USING) (p-using s st t)
+      (kw? k)
+      (values (err-node "reserved" x y)
+              (past (diag st x y (str "Invalid input " (show s t) ", expected Expression (`" (l/tok-text s t)
+                                      "` is a reserved word)"))
+                    t))
+      :else
+      (values (err-node "expected expression" x (if (= y x) (+ x 1) y))
+              (let [st1 (if (at-eof-in-bracket? s st) (eof-bracket-diag s st) (diag-tok s st t "Expression"))]
+                (if (or (closer? k) (= k l/K-ARROW) (kw? k)) st1 (past st1 t)))))))
+
+(defn- p-selname Values(Str Str Vec(a/Node) Int St) [s: &Str st0: St after: Int]
+  (let [t (l/next-tok s after l/M-INFIX)
+        k (:k t)]
+    (if (and (or (= k l/K-PLUSPLUS) (= k l/K-MINUSMINUS)) (l/ident-char? (l/at s (:e t))))
+      (let [ne (l/ident-end s (:e t))] (values "" (subs s (:s t) ne) [] ne (to st0 ne)))
+    (if (= k l/K-IDENT)
+      (if (and (= (l/at s (:e t)) 35) (l/ident-start? (l/at s (+ (:e t) 1))))
+        (let [ne (l/ident-end s (+ (:e t) 1))]
+          (values (l/tok-text s t) (subs s (+ (:e t) 1) ne) [] ne (to st0 ne)))
+        (let [c (l/at s (+ (:e t) 1))]
+          (if (and (= (l/at s (:e t)) 35) (or (= c 34) (= c 39) (= c 96)))
+            (let [ts (l/next-tok s (+ (:e t) 1) l/M-INFIX)
+                  [parts st1] (p-str-parts s st0 ts)
+                  [plain txt] (plain-text parts)]
+              (if plain (values (l/tok-text s t) txt [] (:e ts) st1)
+                (values (l/tok-text s t) "" [(nd (a/->EStr parts) (:s ts) (:e ts))] (:e ts) st1)))
+            (values "" (l/tok-text s t) [] (:e t) (past st0 t)))))
+      (if (= k l/K-STR)
+        (let [[parts st1] (p-str-parts s st0 t)
+              [plain txt] (plain-text parts)]
+          (if plain (values "" txt [] (:e t) st1)
+            (values "" "" [(nd (a/->EStr parts) (:s t) (:e t))] (:e t) st1)))
+        (if (kw? k)
+          (let [w (l/tok-text s t)]
+            (values "" w [] (:e t)
+                    (past (diag-lines st0 (:s t) (:e t)
+                                (reserved-msg w))
+                          t)))
+          (values "" "" [] after (diag st0 after (+ after 1) "Missing Field Name for Selector Expression."))))))))
+
+(defn- sel-node a/Node [target: a/Node sel: a/Sel y: Int]
+  (let [x (nstart target)] (nd (a/->ESelect target sel) x y)))
+
+(defn- index-sel a/Sel [e: a/Node]
+  (let [[is-key txt] (match (:e e)
+                       (a/EStr ps) (plain-text ps)
+                       _ (values false ""))]
+    (if is-key (a/->SelKey "" txt) (index-sel2 e))))
+
+(defn- index-sel2 a/Sel [e: a/Node]
+  (let [rng (match (:e e)
+              (a/ECall f args) (and (= (count args) 2)
+                                    (match (:e f) (a/ERef nm) (= nm "to") _ false))
+              _ false)]
+    (if rng
+      (match (:e e)
+        (a/ECall f args) (a/->SelRange (nth args 0) (nth args 1))
+        _ (a/->SelDyn e))
+      (a/->SelDyn e))))
+
+(defn- is-select? Bool [n: &a/Node] (match (:e n) (a/ESelect t sel) true _ false))
+
+(defn- p-postfix-from Values(a/Node St) [s: &Str st0: St n0: a/Node]
+  (loop [st st0 n n0]
+    (if (chain-deep? st n) (values (err-node "too deep" (:pos st) (:pos st)) (too-deep s st))
+    (let [t (pk s st l/M-INFIX)
+          k (:k t)
+          y (:e t)]
+      (cond
+        (= k l/K-DOT)
+        (let [c (l/at s y)]
+          (cond
+            (= c 42)
+            (if (= (l/at s (+ y 1)) 64)
+              (let [[ns nm dyn e st1] (p-selname s (to st (+ y 2)) (+ y 2))]
+                (recur st1 (sel-node n (a/->SelAttrQ ns nm true) e)))
+              (let [[ns nm dyn e st1] (p-selname s (to st (+ y 1)) (+ y 1))]
+                (if (> (count dyn) 0) (recur st1 (sel-node n (a/->SelDyn (nth dyn 0)) e))
+                  (recur st1 (sel-node n (a/->SelMulti ns nm) e)))))
+            (= c 64)
+            (if (l/ident-start? (l/at s (+ y 1)))
+              (let [ne (l/ident-end s (+ y 1))]
+                (if (and (= (l/at s ne) 35) (l/ident-start? (l/at s (+ ne 1))))
+                  (let [ne2 (l/ident-end s (+ ne 1))]
+                    (recur (to st ne2) (sel-node n (a/->SelAttrQ (subs s (+ y 1) ne) (subs s (+ ne 1) ne2) false) ne2)))
+                  (recur (to st ne) (sel-node n (a/->SelAttr (subs s (+ y 1) ne)) ne))))
+              (if (or (= (l/at s (+ y 1)) 34) (= (l/at s (+ y 1)) 39))
+                (let [[ns nm dyn e st1] (p-selname s (to st (+ y 1)) (+ y 1))]
+                  (recur st1 (sel-node n (a/->SelAttr nm) e)))
+                (recur (to st (+ y 1)) (sel-node n (a/->SelAllAttrs) (+ y 1)))))
+            (= c 38)
+            (if (l/ident-start? (l/at s (+ y 1)))
+              (let [ne (l/ident-end s (+ y 1))] (recur (to st ne) (sel-node n (a/->SelKV (subs s (+ y 1) ne)) ne)))
+              (values n (diag (to st (+ y 1)) (:s t) (+ y 1) "Missing Field Name for Selector Expression.")))
+            (= c 35) (recur (to st (+ y 1)) (sel-node n (a/->SelNs) (+ y 1)))
+            (= c 94)
+            (if (l/ident-start? (l/at s (+ y 1)))
+              (let [ne (l/ident-end s (+ y 1))] (recur (to st ne) (sel-node n (a/->SelMeta (subs s (+ y 1) ne)) ne)))
+              (recur (to st (+ y 1)) (sel-node n (a/->SelMeta "") (+ y 1))))
+            :else
+            (let [[ns nm dyn e st1] (p-selname s (past st t) y)]
+              (if (> (count dyn) 0) (recur st1 (sel-node n (if (= ns "") (a/->SelDyn (nth dyn 0)) (a/->SelQDyn ns (nth dyn 0))) e))
+                (if (and (= nm "") (= ns "") (= e y)) (values n st1)
+                  (recur st1 (sel-node n (a/->SelKey ns nm) e)))))))
+        (= k l/K-DOTDOT)
+        (let [c (l/at s y)]
+          (if (and (= c 38) (l/ident-start? (l/at s (+ y 1))))
+            (let [ne (l/ident-end s (+ y 1))] (recur (to st ne) (sel-node n (a/->SelDescKV (subs s (+ y 1) ne)) ne)))
+          (if (and (= c 42) (let [tn2 (l/next-tok s (+ y 1) l/M-INFIX)] (or (= (:k tn2) l/K-IDENT) (= (:k tn2) l/K-STR))))
+            (let [[ns nm dyn e st1] (p-selname s (to st (+ y 1)) (+ y 1))]
+              (recur st1 (sel-node n (a/->SelDescMulti ns nm) e)))
+            (let [tn (l/next-tok s y l/M-INFIX)]
+              (if (or (= (:k tn) l/K-IDENT) (= (:k tn) l/K-STR) (kw? (:k tn)))
+                (let [[ns nm dyn e st1] (p-selname s (past st t) y)]
+                  (recur st1 (sel-node n (a/->SelDesc ns nm) e)))
+                (recur (past st t) (sel-node n (a/->SelDesc "" "") y)))))))
+        (= k l/K-LBRACK)
+        (let [t2 (pk s (past st t) l/M-PREFIX)]
+          (if (and (= (:k t2) l/K-QUEST) (= (:k (l/next-tok s (:e t2) l/M-INFIX)) l/K-LPAREN))
+            (let [tp (l/next-tok s (:e t2) l/M-INFIX)
+                  [pred st1] (p-expr s (to st (:e tp)))
+                  st2 (expect s st1 l/K-RPAREN l/M-INFIX "')'")
+                  tc (pk s st2 l/M-INFIX)]
+              (if (= (:k tc) l/K-RBRACK)
+                (recur (past st2 tc) (sel-node n (a/->SelFilter pred) (:e tc)))
+                (values (sel-node n (a/->SelFilter pred) (:pos st2)) (diag-tok s st2 tc "']'"))))
+            (let [[ix st1] (p-expr s (eof-expect s (past st t) "']' for the selector expression."))
+                  tc (pk s st1 l/M-INFIX)]
+              (if (= (:k tc) l/K-RBRACK)
+                (recur (past st1 tc) (sel-node n (index-sel ix) (:e tc)))
+                (values (sel-node n (index-sel ix) (nend ix)) (skip-to-closer s (diag-tok s st1 tc "']' for the selector expression.")))))))
+        (and (= k l/K-LT) (:v25 st))
+        (let [nds (count (:ds st))
+              [targs ok st1] (p-type-args s st)
+              tp (pk s st1 l/M-INFIX)]
+          (if (and ok (= (:k tp) l/K-LPAREN)) (recur st1 n) (values n (restore st1 (:pos st) nds))))
+        (= k l/K-LPAREN)
+        (let [t1 (pk s (past st t) l/M-PREFIX)]
+          (if (= (:k t1) l/K-RPAREN)
+            (recur (past st t1) (nd (a/->ECall n []) (nstart n) (:e t1)))
+            (let [[args end st1]
+                  (loop [st2 (past st t) acc: Vec(a/Node) []]
+                    (let [ta (pk s st2 l/M-PREFIX)
+                          st2b (if (unclosed-str? s ta)
+                                 (diag st2 (:s ta) (+ (:s ta) 1) (str "Invalid input '" (chr (l/at s (:s ta))) "', expected ')' for the function call."))
+                                 (eof-expect s st2 "')' for the function call."))
+                          [v st3] (p-expr s st2b)
+                          tc (pk s st3 l/M-INFIX)]
+                      (if (= (:k tc) l/K-COMMA)
+                        (if (= (:k (pk s (past st3 tc) l/M-INFIX)) l/K-RPAREN)
+                          (let [tr (pk s (past st3 tc) l/M-INFIX)]
+                            (values (conj acc v) (:e tr) (past (diag st3 (:s tc) (:e tc) "Missing Parameter Expression") tr)))
+                          (recur (past st3 tc) (conj acc v)))
+                        (if (= (:k tc) l/K-RPAREN) (values (conj acc v) (:e tc) (past st3 tc))
+                          (let [st4 (skip-in s (diag-tok s st3 tc "')' for the function call.") l/K-RPAREN)
+                                t4 (pk s st4 l/M-INFIX)]
+                            (if (= (:k t4) l/K-COMMA) (recur (past st4 t4) (conj acc v))
+                              (values (conj acc v) (:pos st4) (if (= (:k t4) l/K-RPAREN) (past st4 t4) st4))))))))]
+              (recur st1 (nd (a/->ECall n args) (nstart n) end)))))
+        (and (= k l/K-QUEST) (= (:s t) (nend n)) (is-select? n))
+        (values (nd (a/->EExists n) (nstart n) y) (past st t))
+        (and (or (= k l/K-BANG) (= k l/K-NE)) (= (:s t) (nend n)) (is-select? n))
+        (values (nd (a/->EAssert n) (nstart n) (+ (:s t) 1)) (to st (+ (:s t) 1)))
+        :else (values n st))))))
+
+(defn- p-postfix Values(a/Node St) [s: &Str st: St]
+  (let [[n st1] (p-primary s st)] (p-postfix-from s st1 n)))
+
+(defn- p-unary Values(a/Node St) [s: &Str st: St]
+  (let [t (pk s st l/M-PREFIX)
+        k (:k t)]
+    (if (and (= k l/K-MINUS) (not (digit? (l/at s (:e t)))))
+      (let [tn (l/next-tok s (:e t) l/M-PREFIX)
+            st0 (if (= (:k tn) l/K-NUM)
+                  (diag st (:s t) (:e tn) (str "Invalid input \"" (subs s (:s t) (:e tn)) "\", expected a number right after '-'"))
+                  st)
+            [e st1] (p-lv s (past st0 t) L-OR)]
+        (values (nd (a/->EUnary "-" e) (:s t) (nend e)) st1))
+      (if (and (is-ident? s t "not") (ws-char? (l/at s (:e t))))
+        (let [[e st1] (p-lv s (past st t) L-OR)] (values (nd (a/->EUnary "not" e) (:s t) (nend e)) st1))
+        (if (= k l/K-BANG)
+          (if (not (depth-ok? st)) (values (err-node "too deep" (:s t) (:e t)) (too-deep s st))
+            (let [d (:depth st)
+                  [e st1] (p-postfix s (assoc (past st t) :depth (+ d 1)))]
+              (values (nd (a/->EUnary "!" e) (:s t) (nend e)) (assoc st1 :depth d))))
+          (p-postfix s st))))))
+
+(defn- p-lit-pattern Values(a/Node St) [s: &Str st0: St]
+  (let [t (pk s st0 l/M-PREFIX)
+        k (:k t)]
+    (if (or (= k l/K-STR) (= k l/K-NUM) (= k l/K-TEMPORAL) (= k l/KW-TRUE) (= k l/KW-FALSE) (= k l/KW-NULL)
+            (and (= k l/K-MINUS) (digit? (l/at s (:e t)))))
+      (p-primary s st0)
+      (values (err-node "pattern" (:s t) (:e t))
+              (diag-tok s st0 t "a literal, 'is', 'matches', '[', '{' or a name in the pattern")))))
+
+(defn- p-pattern Values(Str a/Pat St) [s: &Str st0: St]
+  (let [t (pk s st0 l/M-PREFIX)
+        k (:k t)]
+    (cond
+      (= k l/K-LBRACK)
+      (let [t1 (pk s (past st0 t) l/M-INFIX)]
+        (if (= (:k t1) l/K-RBRACK)
+          (values "" (a/->PLit (nd (a/->EArr []) (:s t) (:e t1))) (past (past st0 t) t1))
+          (let [st1 (past st0 t)
+                th (pk s st1 l/M-INFIX)
+                st2 (if (= (:k th) l/K-IDENT) (past st1 th) (diag-tok s st1 th "a name for the head"))
+                st3 (expect s st2 l/K-TILDE l/M-INFIX "'~'")
+                tt (pk s st3 l/M-INFIX)
+                st4 (if (= (:k tt) l/K-IDENT) (past st3 tt) (diag-tok s st3 tt "a name for the tail"))
+                st5 (expect s st4 l/K-RBRACK l/M-INFIX "']'")]
+            (values "" (a/->PArrDestr (l/tok-text s th) (l/tok-text s tt)) st5))))
+      (= k l/K-LBRACE)
+      (let [t1 (pk s (past st0 t) l/M-INFIX)]
+        (if (= (:k t1) l/K-RBRACE)
+          (values "" (a/->PLit (nd (a/->EObj []) (:s t) (:e t1))) (past (past st0 t) t1))
+          (let [st1 (past st0 t)
+                tk (pk s st1 l/M-INFIX)
+                st2 (if (= (:k tk) l/K-IDENT) (past st1 tk) (diag-tok s st1 tk "a name for the key"))
+                st3 (expect s st2 l/K-COLON l/M-INFIX "':'")
+                tv (pk s st3 l/M-INFIX)
+                st4 (if (= (:k tv) l/K-IDENT) (past st3 tv) (diag-tok s st3 tv "a name for the value"))
+                st5 (expect s st4 l/K-TILDE l/M-INFIX "'~'")
+                tt (pk s st5 l/M-INFIX)
+                st6 (if (= (:k tt) l/K-IDENT) (past st5 tt) (diag-tok s st5 tt "a name for the tail"))
+                st7 (expect s st6 l/K-RBRACE l/M-INFIX "'}'")]
+            (values "" (a/->PObjDestr (l/tok-text s tk) (l/tok-text s tv) (l/tok-text s tt)) st7))))
+      (= k l/KW-IS) (let [[ty st1] (p-type s (past st0 t))] (values "" (a/->PType ty) st1))
+      (and (is-ident? s t "matches") (= (:k (l/next-tok s (:e t) l/M-PREFIX)) l/K-REGEX))
+      (let [[re st1] (p-primary s (past st0 t))] (values "" (a/->PRegex re) st1))
+      (= k l/K-IDENT)
+      (let [nm (l/tok-text s t)
+            st1 (past st0 t)
+            t2 (pk s st1 l/M-PREFIX)
+            k2 (:k t2)]
+        (cond
+          (= k2 l/KW-IF) (let [[c st2] (p-lv s (past st1 t2) L-TOP)] (values nm (a/->PGuard c) st2))
+          (= k2 l/KW-IS) (let [[ty st2] (p-type s (past st1 t2))] (values nm (a/->PType ty) st2))
+          (and (is-ident? s t2 "matches")) (let [[re st2] (p-primary s (past st1 t2))] (values nm (a/->PRegex re) st2))
+          (= k2 l/K-COLON) (let [[v st2] (p-lit-pattern s (past st1 t2))] (values nm (a/->PLit v) st2))
+          :else (values nm (a/->PElse) (diag-tok s st1 t2 "'if', 'is', 'matches' or ':' in the pattern"))))
+      :else
+      (let [[v st1] (p-lit-pattern s st0)] (values "" (a/->PLit v) st1)))))
+
+(defn- p-match Values(a/Node St) [s: &Str st0: St target: a/Node]
+  (let [open (pk s st0 l/M-INFIX)]
+    (loop [st (past st0 open) cases: Vec(a/Case) []]
+      (let [t (pk s st l/M-PREFIX)
+            k (:k t)]
+        (cond
+          (= k l/K-RBRACE) (values (nd (a/->EMatch target cases) (nstart target) (:e t)) (past st t))
+          (or (= k l/KW-CASE) (= k l/KW-ELSE))
+          (let [st0c (if (and (= k l/KW-CASE) (not (and (ws-char? (l/at s (- (:s t) 1))) (ws-char? (l/at s (:e t))))))
+                       (diag st (:s t) (:e t) "Invalid input 'c', expected whitespace around 'case'")
+                       st)
+                [bind pat st1] (if (= k l/KW-ELSE) (values "" (a/->PElse) (past st0c t)) (p-pattern s (past st0c t)))
+                st2 (expect s st1 l/K-ARROW l/M-INFIX "'->'")
+                [body st3] (p-expr s st2)]
+            (recur st3 (conj cases (a/->Case bind pat body (sp (:s t) (nend body))))))
+          :else
+          (values (nd (a/->EMatch target cases) (nstart target) (:s t))
+                  (diag-tok s st t "'}' for the Pattern Matching.")))))))
+
+(defn- p-upd-path Values(Vec(a/Sel) St) [s: &Str st0: St]
+  (loop [st st0 acc: Vec(a/Sel) []]
+    (let [t (pk s st l/M-INFIX)
+          k (:k t)
+          y (:e t)]
+      (if (= k l/K-DOT)
+        (let [c (l/at s y)]
+          (if (= c 64)
+            (let [ne (l/ident-end s (+ y 1))]
+              (if (= ne (+ y 1))
+                (let [[ns nm dyn e st1] (p-selname s (to st (+ y 1)) (+ y 1))] (recur st1 (conj acc (a/->SelAttr nm))))
+                (recur (to st ne) (conj acc (a/->SelAttr (subs s (+ y 1) ne))))))
+            (if (= c 42)
+              (let [[ns nm dyn e st1] (p-selname s (to st (+ y 1)) (+ y 1))] (recur st1 (conj acc (a/->SelMulti ns nm))))
+              (let [[ns nm dyn e st1] (p-selname s (past st t) y)]
+                (if (> (count dyn) 0) (recur st1 (conj acc (a/->SelDyn (nth dyn 0))))
+                  (recur st1 (conj acc (a/->SelKey ns nm))))))))
+        (if (= k l/K-LBRACK)
+          (let [[ix st1] (p-expr s (past st t))
+                st2 (expect s st1 l/K-RBRACK l/M-INFIX "']'")]
+            (recur st2 (conj acc (a/->SelDyn ix))))
+          (values acc (if (= (count acc) 0) (diag-tok s st t "a selector ('.name' or '[index]') for the update") st)))))))
+
+(defn- p-guard Values(a/Node St) [s: &Str st0: St]
+  (let [t (pk s st0 l/M-PREFIX)]
+    (if (= (:k t) l/K-LPAREN)
+      (let [[inner st1] (p-paren s st0 t)
+            [n st2] (p-postfix-from s st1 inner)]
+        (p-level-loop s st2 n L-TOP 0))
+      (p-lv s st0 L-TOP))))
+
+(defn- p-update Values(a/Node St) [s: &Str st0: St target: a/Node]
+  (let [open (pk s st0 l/M-INFIX)]
+    (loop [st (past st0 open) cases: Vec(a/UpdCase) []]
+      (let [t (pk s st l/M-PREFIX)
+            k (:k t)]
+        (if (= k l/K-RBRACE) (values (nd (a/->EUpdate target cases) (nstart target) (:e t)) (past st t))
+          (if (not (= k l/KW-CASE))
+            (values (nd (a/->EUpdate target cases) (nstart target) (:s t))
+                    (diag-tok s st t "'case' or '}' for the update expression"))
+            (let [st1 (past st t)
+                  t1 (pk s st1 l/M-INFIX)
+                  t2 (l/next-tok s (:e t1) l/M-INFIX)
+                  [bind idx st2]
+                  (if (and (= (:k t1) l/K-IDENT) (is-ident? s t2 "at"))
+                    (values (l/tok-text s t1) "" (past (past st1 t1) t2))
+                    (if (= (:k t1) l/K-LPAREN)
+                      (let [tv (l/next-tok s (:e t1) l/M-INFIX)
+                            tc (l/next-tok s (:e tv) l/M-INFIX)
+                            ti (l/next-tok s (:e tc) l/M-INFIX)
+                            tr (l/next-tok s (:e ti) l/M-INFIX)
+                            ta (l/next-tok s (:e tr) l/M-INFIX)]
+                        (if (and (= (:k tv) l/K-IDENT) (= (:k tc) l/K-COMMA) (= (:k ti) l/K-IDENT)
+                                 (= (:k tr) l/K-RPAREN) (is-ident? s ta "at"))
+                          (values (l/tok-text s tv) (l/tok-text s ti) (past st1 ta))
+                          (values "" "" (diag-tok s st1 t1 "'<name> at' or a selector"))))
+                      (values "" "" st1)))
+                  [path st3] (p-upd-path s st2)
+                  tb (pk s st3 l/M-INFIX)
+                  [ups st4] (if (= (:k tb) l/K-BANG) (values true (past st3 tb)) (values false st3))
+                  ti (pk s st4 l/M-PREFIX)
+                  [cnd st5] (if (= (:k ti) l/KW-IF)
+                              (let [[c st6] (p-guard s (past st4 ti))] (values [c] st6))
+                              (values [] st4))
+                  st7 (expect s st5 l/K-ARROW l/M-INFIX "'->'")
+                  [body st8] (p-expr s (need-expr s st7 "Missing Update Expression i.e `{a: 1} update {\n case aValue at .a -> aValue + 1\n}`"))]
+              (recur st8 (conj cases (a/->UpdCase bind path cnd body (sp (:s t) (nend body)) idx ups))))))))))
+
+(defn- no-expr? Bool [s: &Str st: &St]
+  (let [k (:k (pk s st l/M-PREFIX))]
+    (or (= k l/K-EOF) (= k l/K-RBRACE) (= k l/K-RPAREN) (= k l/K-RBRACK) (= k l/K-COMMA))))
+
+(defn- need-expr St [s: &Str st: St msg: &Str]
+  (cond (not (no-expr? s st)) st
+        (at-eof-in-bracket? s st) (eof-bracket-diag s st)
+        :else (missing st (:pos st) (:s (pk s st l/M-PREFIX)) msg)))
+
+(defn- missing St [st: St at: Int next: Int msg: &Str]
+  (let [st1 (diag-lines st at (+ at 1) msg)] (assoc st1 :hush (if (> next at) next at))))
+
+(defn- eof-context Str [s: &Str]
+  (loop [p 0 pv false ptxt "" stack: Vec(Str) [] n 0]
+    (let [t (l/next-tok s p (if pv l/M-INFIX l/M-PREFIX))
+          k (:k t)
+          top (if (= n 0) "" (nth stack (- n 1)))]
+      (if (or (= k l/K-EOF) (<= (:e t) p)) top
+        (let [opened (cond
+                       (= k l/K-LPAREN) (cond (or (= ptxt "if") (= ptxt "unless")) "')' for the if expression."
+                                              pv "')' for the function call."
+                                              :else "')' for the enclosed expression.")
+                       (= k l/K-LBRACK) (if pv "']' for the selector expression." "']' or ',' for the array expression.")
+                       (= k l/K-LBRACE) (cond (= ptxt "do") "'}' for the do block"
+                                              (= ptxt "match") "'}' for the Pattern Matching."
+                                              :else "`}` or ',' for the object expression.")
+                       :else "-")
+              closes (or (= k l/K-RPAREN) (= k l/K-RBRACK) (= k l/K-RBRACE))
+              npv (cond (= k l/K-IDENT) (not pv)
+                        (or (= k l/K-NUM) (= k l/K-STR) closes) true
+                        :else false)
+              txt (l/tok-text s t)]
+          (cond
+            (not= opened "-") (recur (:e t) false txt (if (< n (count stack)) (assoc stack n opened) (conj stack opened)) (+ n 1))
+            (and closes (> n 0)) (recur (:e t) npv txt stack (- n 1))
+            :else (recur (:e t) npv txt stack n)))))))
+
+(defn- at-eof-in-bracket? Bool [s: &Str st: &St]
+  (and (= (:k (pk s st l/M-PREFIX)) l/K-EOF) (not= (eof-context s) "")))
+
+(defn- eof-bracket-diag St [s: &Str st: St]
+  (diag-tok s st (pk s st l/M-PREFIX) (eof-context s)))
+
+(defn- eof-expect St [s: &Str st: St what: &Str]
+  (let [t (pk s st l/M-PREFIX)] (if (= (:k t) l/K-EOF) (diag-tok s st t what) st)))
+
+(defn- missing-rhs St [s: &Str st: St op: &l/Tok]
+  (if (not (no-expr? s st)) st
+    (if (at-eof-in-bracket? s st) (eof-bracket-diag s st)
+      (let [o (l/tok-text s op)
+            m (cond (= o "+") "Missing addition expression."
+                    (= o "-") "Missing minus expression."
+                    (or (= o "*") (= o "/")) "Missing Division Expression."
+                    (or (= o ">>") (= o "<<")) "Missing Shift Expression."
+                    (or (= o "and") (= o "or")) "Missing Boolean Expression"
+                    (= o "default") "Missing default expression."
+                    :else "Missing Expression")]
+        (missing st (:e op) (:s (pk s st l/M-PREFIX)) m)))))
+
+(defn- p-level-loop Values(a/Node St) [s: &Str st0: St lhs0: a/Node maxlv: Int cur0: Int]
+  (loop [st st0 lhs lhs0 cur cur0]
+    (if (chain-deep? st lhs) (values (err-node "too deep" (:pos st) (:pos st)) (too-deep s st))
+    (let [t (pk s st l/M-INFIX)
+          lv (op-level s t)]
+      (if (or (= lv 0) (> lv maxlv) (< lv cur)) (values lhs st)
+        (let [k (:k t)
+              x (nstart lhs)
+              st1 (if (or (= k l/KW-AS) (= k l/KW-IS) (= k l/K-META)) (past st t) (missing-rhs s (past st t) t))]
+          (cond
+            (= k l/KW-AS)
+            (let [[ty st2] (p-type s st1)] (recur st2 (nd (a/->EAs lhs ty) x (tend ty)) lv))
+            (= k l/KW-IS)
+            (let [[ty st2] (p-type s st1)] (recur st2 (nd (a/->EIs lhs ty) x (tend ty)) lv))
+            (= k l/K-META)
+            (let [[r st2] (p-unary s st1)] (recur st2 (nd (a/->EMetaSet lhs r) x (nend r)) lv))
+            (or (= k l/K-IDENT) (= k l/K-DOLLAR))
+            (let [tb (pk s st1 l/M-INFIX)]
+              (if (and (= (:k tb) l/K-LBRACE) (is-ident? s t "match"))
+                (let [[m st2] (p-match s st1 lhs)] (recur st2 m lv))
+                (if (and (= (:k tb) l/K-LBRACE) (is-ident? s t "update")
+                         (= (:k (l/next-tok s (:e tb) l/M-PREFIX)) l/KW-CASE))
+                  (let [[u st2] (p-update s st1 lhs)] (recur st2 u lv))
+                  (let [ne (if (= k l/K-IDENT) (modname-end s t) (:e t))
+                        [r st2] (p-lv s (to st1 ne) L-OR)
+                        f (nd (a/->ERef (subs s (:s t) ne)) (:s t) ne)]
+                    (recur st2 (nd (a/->ECall f [lhs r]) x (nend r)) lv)))))
+            (and (or (= k l/K-PLUSPLUS) (= k l/K-MINUSMINUS)) (l/ident-char? (l/at s (:e t))))
+            (if (l/ident-start? (l/at s (:e t)))
+              (let [ne (l/ident-end s (:e t))
+                    f (nd (a/->ERef (subs s (:s t) ne)) (:s t) ne)
+                    st1c (if (and (= (l/at s ne) 33) (not (= (l/at s (+ ne 1)) 61)))
+                           (diag (to st ne) ne (+ ne 1) "Invalid input '!', expected an expression") (to st ne))
+                    [r st2] (p-lv s st1c L-OR)]
+                (recur st2 (nd (a/->ECall f [lhs r]) x (nend r)) lv))
+              (let [[r st2] (p-lv s (diag st1 (:e t) (+ (:e t) 1) "Missing Expression") L-OR)]
+                (recur st2 (nd (a/->EBin (l/tok-text s t) lhs r (sp (:s t) (:e t))) x (nend r)) lv)))
+            (= lv L-TOP)
+            (let [[r st2] (p-lv s st1 L-OR)]
+              (recur st2 (nd (a/->EBin (l/tok-text s t) lhs r (sp (:s t) (:e t))) x (nend r)) lv))
+            :else
+            (let [[r st2] (p-lv s st1 (- lv 1))] (recur st2 (nd (a/->EBin (l/tok-text s t) lhs r (sp (:s t) (:e t))) x (nend r)) lv)))))))))
+
+(defn- p-level Values(a/Node St) [s: &Str st0: St maxlv: Int]
+  (let [[ans st0b] (if (and (= maxlv L-TOP) (= (:k (pk s st0 l/M-PREFIX)) l/K-AT))
+                     (p-annotations s st0)
+                     (values [] st0))
+        [lhs st1] (p-unary s st0b)
+        [e st2] (p-level-loop s st1 lhs maxlv 0)]
+    (values (meta-annots e ans (:metas st2)) st2)))
+
+(defn- meta-key Str [metas: &Vec(Str) name: &Str]
+  (let [pre (str name " ")]
+    (loop [i 0] (if (>= i (count metas)) ""
+                  (if (str/starts-with? (nth metas i) pre) (subs (nth metas i) (count pre) (count (nth metas i))) (recur (+ i 1)))))))
+
+(defn- annot-arg Vec(a/Node) [an: &a/Annotation name: &Str]
+  (let [args (:args an)]
+    (loop [i 0]
+      (if (>= i (count args)) []
+        (let [hit (match (:e (nth args i))
+                    (a/EObj es) (match (nth es 0)
+                                  (a/EKV k at v cs) (match k (a/KName ns nm) (if (= nm name) [v] []) _ [])
+                                  _ [])
+                    _ [])]
+          (if (> (count hit) 0) hit (recur (+ i 1))))))))
+
+(defn- meta-annots a/Node [e: a/Node ans: &Vec(a/Annotation) metas: &Vec(Str)]
+  (loop [i 0 n e]
+    (if (>= i (count ans)) n
+      (let [an (nth ans i)
+            key (meta-key metas (:name an))
+            v (annot-arg an "value")]
+        (recur (+ i 1)
+               (if (or (= key "") (= (count v) 0)) n
+                 (let [x (:start (:sp n)) y (:end (:sp n))]
+                   (nd (a/->EMetaSet n (nd (a/->EObj [(a/->EKV (a/->KName "" key) [] (nth v 0) [])]) x y)) x y))))))))
+
+(defn- p-generics Values(Vec(Str) St) [s: &Str st0: St]
+  (let [t (pk s st0 l/M-TYPE)]
+    (if (not (= (:k t) l/K-LT)) (values [] st0)
+      (loop [st (past st0 t) acc: Vec(Str) []]
+        (let [tn (pk s st l/M-TYPE)]
+          (if (not (= (:k tn) l/K-IDENT)) (values acc (diag-tok s st tn "a type parameter name"))
+            (let [st1 (past st tn)
+                  tb (pk s st1 l/M-TYPE)
+                  st2 (if (and (= (:k tb) l/K-LT) (= (l/at s (:e tb)) 58))
+                        (let [[bt st3] (p-type s (to st1 (+ (:e tb) 1)))] st3)
+                        st1)
+                  tc (pk s st2 l/M-TYPE)]
+              (if (= (:k tc) l/K-COMMA) (recur (past st2 tc) (conj acc (l/tok-text s tn)))
+                (if (= (:k tc) l/K-GT) (values (conj acc (l/tok-text s tn)) (past st2 tc))
+                  (values (conj acc (l/tok-text s tn)) (diag-tok s st2 tc "',' or '>'")))))))))))
+
+(defn- mime-end Int [s: &Str ms: Int]
+  (let [te (loop [j ms] (let [c (l/at s j)] (if (and (l/ident-char? c) (not (= c 95)) (< c 128)) (recur (+ j 1)) j)))]
+    (if (and (> te ms) (= (l/at s te) 47) (l/ident-char? (l/at s (+ te 1))) (not (= (l/at s (+ te 1)) 95)))
+      (loop [j (+ te 1)]
+        (let [c (l/at s j)]
+          (if (and (l/ident-char? c) (< c 128)) (recur (+ j 1))
+            (if (and (or (= c 46) (= c 43) (= c 45)) (l/ident-char? (l/at s (+ j 1))) (< (l/at s (+ j 1)) 128)) (recur (+ j 1))
+              j))))
+      (loop [j ms] (let [c (l/at s j)] (if (and (l/ident-char? c) (< c 128)) (recur (+ j 1)) j))))))
+
+(defn- p-props Values(a/Node St) [s: &Str st0: St at: Int]
+  (loop [st st0 acc: Vec(a/Entry) [] x -1 y at]
+    (let [t (pk s st l/M-INFIX)
+          t2 (l/next-tok s (:e t) l/M-INFIX)]
+      (if (not (and (= (:k t) l/K-IDENT) (= (:k t2) l/K-ASSIGN)))
+        (values (if (= (count acc) 0) (null-node at) (nd (a/->EObj acc) x y)) st)
+        (let [st1 (past st t2)
+              tv (pk s st1 l/M-PREFIX)
+              kv (:k tv)
+              [v st2]
+              (cond
+                (= kv l/K-STR) (let [[parts st3] (p-str-parts s st1 tv)] (values (nd (a/->EStr parts) (:s tv) (:e tv)) st3))
+                (= kv l/K-NUM) (values (nd (a/->ENum (l/tok-text s tv)) (:s tv) (:e tv)) (past st1 tv))
+                (and (= kv l/K-MINUS) (digit? (l/at s (:e tv))))
+                (let [ne (l/num-end s (:e tv))] (values (nd (a/->ENum (subs s (:s tv) ne)) (:s tv) ne) (to st1 ne)))
+                (or (= kv l/KW-TRUE) (= kv l/KW-FALSE)) (values (nd (a/->EBool (= kv l/KW-TRUE)) (:s tv) (:e tv)) (past st1 tv))
+                :else (values (null-node (:s tv)) (diag-tok s st1 tv "a string, number or boolean for the property")))
+              en (a/->EKV (a/->KName "" (l/tok-text s t)) [] v [])
+              x2 (if (< x 0) (:s t) x)
+              y2 (nend v)
+              tc (pk s st2 l/M-INFIX)]
+          (if (= (:k tc) l/K-COMMA) (recur (past st2 tc) (conj acc en) x2 y2)
+            (values (nd (a/->EObj (conj acc en)) x2 y2) st2)))))))
+
+(defn- p-directive Values(a/Directive St) [s: &Str st0: St t: &l/Tok]
+  (let [input (= (:k t) l/KW-INPUT)
+        st1 (past st0 t)
+        tn (pk s st1 l/M-INFIX)
+        [name st2] (if input
+                     (if (= (:k tn) l/K-IDENT) (values (l/tok-text s tn) (past st1 tn))
+                       (values "" (diag-tok s st1 tn "an input name")))
+                     (values "" st1))
+        tc (pk s st2 l/M-INFIX)
+        [tys st3] (if (and input (= (:k tc) l/K-COLON))
+                    (let [[ity st4] (p-type s (past st2 tc))] (values [ity] st4))
+                    (values [] st2))
+        ms (l/skip-trivia s (:pos st3))
+        me (mime-end s ms)
+        st4 (if (= me ms) (diag-tok s st3 (l/next-tok s ms l/M-INFIX) "a content type (e.g. application/json)") (to st3 me))
+        tw (pk s st4 l/M-INFIX)
+        [fmt st5] (if (and (is-ident? s tw "with") (= (:k (l/next-tok s (:e tw) l/M-INFIX)) l/K-IDENT))
+                    (let [tf (l/next-tok s (:e tw) l/M-INFIX)] (values (l/tok-text s tf) (past st4 tf)))
+                    (values "" st4))
+        [props st6] (p-props s st5 (:pos st5))]
+    (values (a/->Directive (if input "input" "output") name (subs s ms me) props (sp (:s t) (:pos st6)) fmt tys) st6)))
+
+(defn- modname-end Int [s: &Str t: &l/Tok]
+  (if (and (= (l/at s (:e t)) 33) (l/ident-start? (l/at s (+ (:e t) 1))))
+    (:e (l/next-tok s (+ (:e t) 1) l/M-INFIX))
+    (:e t)))
+
+(defn- p-import Values(a/Decl St) [s: &Str st0: St t: &l/Tok]
+  (let [st1 (if (ws-char? (l/at s (:e t))) (past st0 t)
+              (diag (past st0 t) (:e t) (+ (:e t) 1) "Invalid input after 'import', expected whitespace"))
+        t1 (pk s st1 l/M-INFIX)]
+    (if (and (= (:k t1) l/K-IDENT) (= (l/at s (:e t1)) 33))
+      (let [me (modname-end s t1)
+            st2 (to st1 me)
+            ta (pk s st2 l/M-INFIX)]
+        (if (and (= (:k ta) l/KW-AS) (= (:k (l/next-tok s (:e ta) l/M-INFIX)) l/K-IDENT))
+          (let [tal (l/next-tok s (:e ta) l/M-INFIX)]
+            (values (a/->DImport (subs s (:s t1) me) [] false (l/tok-text s tal)) (past st2 tal)))
+          (values (a/->DImport (subs s (:s t1) me) [] false "") st2)))
+      (if (= (:k t1) l/K-STAR)
+        (let [st2 (if (ws-char? (l/at s (:e t1))) (past st1 t1)
+                    (diag (past st1 t1) (:s t1) (+ (:e t1) 1) (str "Invalid input \"" (subs s (:s t1) (min (+ (:e t1) 1) (count s))) "\", expected whitespace after '*'")))
+              tf (pk s st2 l/M-INFIX)
+              st3 (if (is-ident? s tf "from") (past st2 tf) (diag-tok s st2 tf "'from'"))
+              tm (pk s st3 l/M-INFIX)]
+          (if (= (:k tm) l/K-IDENT) (values (a/->DImport (subs s (:s tm) (modname-end s tm)) [] true "") (to st3 (modname-end s tm)))
+            (values (a/->DImport "" [] true "") (diag-tok s st3 tm "a module name"))))
+        (loop [st st1 names: Vec(a/ImportName) []]
+          (let [tn (pk s st l/M-INFIX)]
+            (if (not (= (:k tn) l/K-IDENT))
+              (values (a/->DImport "" names false "") (diag-tok s st tn "a module or function name"))
+              (let [st2 (past st tn)
+                    ta (pk s st2 l/M-INFIX)
+                    [alias st3] (if (= (:k ta) l/KW-AS)
+                                  (let [tal (pk s (past st2 ta) l/M-INFIX)]
+                                    (if (= (:k tal) l/K-IDENT) (values (l/tok-text s tal) (past (past st2 ta) tal))
+                                      (values "" (diag-tok s (past st2 ta) tal "an alias name"))))
+                                  (values "" st2))
+                    names2 (conj names (a/->ImportName (l/tok-text s tn) alias))
+                    tc (pk s st3 l/M-INFIX)]
+                (if (= (:k tc) l/K-COMMA) (recur (past st3 tc) names2)
+                  (if (is-ident? s tc "from")
+                    (let [st4 (past st3 tc)
+                          tm (pk s st4 l/M-INFIX)]
+                      (if (= (:k tm) l/K-IDENT) (values (a/->DImport (subs s (:s tm) (modname-end s tm)) names2 false "") (to st4 (modname-end s tm)))
+                        (values (a/->DImport "" names2 false "") (diag-tok s st4 tm "a module name"))))
+                    (if (= (count names2) 1)
+                      (let [n0: a/ImportName (nth names2 0)]
+                        (values (a/->DImport (:name n0) [] false (:alias n0)) st3))
+                      (values (a/->DImport "" names2 false "") (diag-tok s st3 tc "'from'")))))))))))))
+
+(def SYSTEM-TYPES ["String" "Number" "Boolean" "Object" "Array" "Null" "Any" "Nothing" "Date" "DateTime"
+                   "LocalDateTime" "Time" "LocalTime" "TimeZone" "Period" "Binary" "Regex" "Key" "Name"
+                   "Namespace" "Uri" "Range" "Type" "Function"])
+
+(defn- system-type? Bool [nm: &Str]
+  (loop [i 0] (if (>= i (count SYSTEM-TYPES)) false (if (= (nth SYSTEM-TYPES i) nm) true (recur (+ i 1))))))
+
+(defn- p-decls Values(Str Vec(a/Directive) Vec(a/DeclAt) Int St) [s: &Str st0: St in-do: Bool]
+  (loop [st st0 ver "" dirs: Vec(a/Directive) [] decls: Vec(a/DeclAt) []]
+    (let [[ans st1] (p-annotations s st)
+          t (pk s st1 l/M-INFIX)
+          k (:k t)]
+      (cond
+        (or (= k l/K-SEP) (= k l/K-EOF) (and in-do (= k l/K-RBRACE)))
+        (values ver dirs decls 0 (if (> (count ans) 0) (diag-tok s st1 t "a declaration after the annotation") st1))
+        (and (= k l/K-PERCENT) (l/span-is? s (:e t) (l/ident-end s (:e t)) "dw") (not in-do))
+        (let [vs (l/skip-trivia s (+ (:e t) 2))
+              ma (loop [j vs] (if (digit? (l/at s j)) (recur (+ j 1)) j))
+              mi0 (+ ma 1)
+              mi (if (= (l/at s mi0) 48) (+ mi0 1) (loop [j mi0] (if (digit? (l/at s j)) (recur (+ j 1)) j)))]
+          (if (or (= ma vs) (not (= (l/at s ma) 46)) (= mi mi0))
+            (recur (to (diag st1 (:s t) (if (> ma vs) ma (+ (:e t) 2)) "Missing version separator i.e. %dw 2.0") (if (> ma vs) ma (+ (:e t) 2)))
+                   ver dirs decls)
+            (let [major (npz/int-or (subs s vs ma) 0)
+                  minor (npz/int-or (subs s mi0 mi) 0)]
+              (recur (assoc (to st1 mi) :v25 (or (> major 2) (and (= major 2) (>= minor 5)))) (subs s vs mi) dirs decls))))
+        (and (or (= k l/KW-OUTPUT) (= k l/KW-INPUT)) (not in-do))
+        (let [[d st2] (p-directive s st1 t)] (recur st2 ver (conj dirs d) decls))
+        (= k l/KW-VAR)
+        (let [st2 (past st1 t)
+              tn (pk s st2 l/M-INFIX)
+              [nm st3] (if (= (:k tn) l/K-IDENT) (values (l/tok-text s tn) (past st2 tn))
+                         (values "" (diag-tok s st2 tn "a variable name")))
+              tc (pk s st3 l/M-INFIX)
+              [tys st4] (if (= (:k tc) l/K-COLON) (let [[vt st5] (p-type s (past st3 tc))] (values [vt] st5)) (values [] st3))
+              st6 (expect s st4 l/K-ASSIGN l/M-INFIX "'='")
+              [v st7] (p-expr s st6)]
+          (recur st7 ver dirs (conj decls (a/->DeclAt (a/->DVar nm tys v) (sp (:s t) (nend v))))))
+        (= k l/KW-FUN)
+        (let [st2 (past st1 t)
+              tn (pk s st2 l/M-INFIX)
+              [nm st3] (if (= (:k tn) l/K-IDENT) (values (l/tok-text s tn) (past st2 tn))
+                         (values "" (diag-tok s st2 tn "a function name")))
+              [gens st4] (p-generics s st3)
+              st5 (expect s st4 l/K-LPAREN l/M-INFIX "'(' for the function parameters")
+              [params ok st6] (p-params s st5 true)
+              tc (pk s st6 l/M-INFIX)
+              [ret st7] (if (= (:k tc) l/K-COLON) (let [[rt st8] (p-type s (past st6 tc))] (values [rt] st8)) (values [] st6))
+              st9 (expect s st7 l/K-ASSIGN l/M-INFIX "'='")
+              [body st10] (p-expr s st9)]
+          (recur st10 ver dirs (conj decls (a/->DeclAt (a/->DFun nm params ret body ans gens) (sp (:s t) (nend body))))))
+        (= k l/KW-TYPE)
+        (let [st2 (past st1 t)
+              tn (pk s st2 l/M-INFIX)
+              [nm st3a] (if (= (:k tn) l/K-IDENT) (values (l/tok-text s tn) (past st2 tn))
+                          (values "" (diag-tok s st2 tn "a type name")))
+              st3 (if (system-type? nm)
+                    (diag st3a (:s tn) (:e tn) (str "Cannot use `" nm "` as a type name. It is a system reserved type."))
+                    st3a)
+              [gens st4] (p-generics s st3)
+              st5 (expect s st4 l/K-ASSIGN l/M-INFIX "'='")
+              [tyv st6] (p-type s st5)]
+          (recur st6 ver dirs (conj decls (a/->DeclAt (a/->DType nm gens tyv) (sp (:s t) (tend tyv))))))
+        (= k l/KW-NS)
+        (let [st2 (past st1 t)
+              tn (pk s st2 l/M-INFIX)
+              [nm st3] (if (= (:k tn) l/K-IDENT) (values (l/tok-text s tn) (past st2 tn))
+                         (values "" (diag-tok s st2 tn "a namespace prefix")))
+              st3w (if (or (= (count nm) 0) (ws-char? (l/at s (:pos st3)))) st3
+                     (diag st3 (:s tn) (:e tn) "Missing namespace name"))
+              us (l/skip-trivia s (:pos st3w))
+              ue (loop [j us] (let [c (l/at s j)] (if (or (< c 0) (= c 32) (= c 10) (= c 9) (= c 13)) j (recur (+ j 1)))))
+              st4 (if (= ue us) (diag-tok s st3w (l/next-tok s us l/M-INFIX) "a namespace URI") (to st3w ue))]
+          (recur st4 ver dirs (conj decls (a/->DeclAt (a/->DNs nm (subs s us ue)) (sp (:s t) ue)))))
+        (= k l/KW-IMPORT)
+        (let [[d st2] (p-import s st1 t)]
+          (recur st2 ver dirs (conj decls (a/->DeclAt d (sp (:s t) (:pos st2))))))
+        (and (is-ident? s t "annotation") (= (:k (l/next-tok s (:e t) l/M-INFIX)) l/K-IDENT))
+        (let [tn (l/next-tok s (:e t) l/M-INFIX)
+              st2 (expect s (past st1 tn) l/K-LPAREN l/M-INFIX "'('")
+              [params ok st3] (p-params s st2 true)
+              mk (loop [i 0] (if (>= i (count ans)) []
+                               (if (= (:name (nth ans i)) "Metadata") (annot-arg (nth ans i) "key") (recur (+ i 1)))))
+              key (if (= (count mk) 0) "" (match (:e (nth mk 0)) (a/EStr ps) (let [[pl txt] (plain-text ps)] txt) _ ""))
+              st4 (cond
+                    (= key "") st3
+                    (not= (count params) 1)
+                    (diag st3 (:s t) (:pos st3) (str "Annotation parameters should be only one but found " (count params) " with name `value` for metadata annotations."))
+                    :else (assoc st3 :metas (conj (:metas st3) (str (l/tok-text s tn) " " key))))]
+          (recur st4 ver dirs (conj decls (a/->DeclAt (a/->DAnnotationDef (l/tok-text s tn) params) (sp (:s t) (:pos st3))))))
+        :else
+        (values ver dirs decls 1 st1)))))
+
+(defn- header-start? Bool [s: &Str t: &l/Tok]
+  (let [k (:k t)]
+    (or (= k l/K-SEP) (= k l/KW-VAR) (= k l/KW-FUN) (= k l/KW-TYPE) (= k l/KW-NS) (= k l/KW-IMPORT)
+        (= k l/KW-OUTPUT) (= k l/KW-INPUT)
+        (and (= k l/K-PERCENT) (l/span-is? s (:e t) (l/ident-end s (:e t)) "dw"))
+        (and (is-ident? s t "annotation") (= (:k (l/next-tok s (:e t) l/M-INFIX)) l/K-IDENT)))))
+
+(defn- starts-header? Bool [s: &Str st: &St]
+  (loop [p (:pos st)]
+    (let [t (l/next-tok s p l/M-INFIX)]
+      (if (= (:k t) l/K-AT)
+        (let [tn (l/next-tok s (:e t) l/M-INFIX)
+              tp (l/next-tok s (:e tn) l/M-INFIX)]
+          (if (= (:k tp) l/K-LPAREN)
+            (let [e (l/skip-balanced s (l/skip-trivia s (:e tn)))] (if (< e 0) false (recur e)))
+            (recur (:e tn))))
+        (header-start? s t)))))
+
+(defn- finish Values(a/Script Vec(a/Diag)) [s: &Str st: St ver: Str dirs: Vec(a/Directive) decls: Vec(a/DeclAt) body: a/Node]
+  (let [t (pk s st l/M-INFIX)
+        uc (l/unclosed-comment s (:pos st))
+        st1 (if (= (:k t) l/K-EOF)
+              (if (>= uc 0) (diag st uc (+ uc 2) "Unclosed comment, expected '*/'") st)
+              (diag-tok s st t "end of input"))]
+    (values (a/->Script ver dirs decls body) (with-positions s (:ds st1)))))
+
+(defn- with-positions Vec(a/Diag) [s: &Str ds: Vec(a/Diag)]
+  (loop [i 0 acc: Vec(a/Diag) []]
+    (if (>= i (count ds)) acc
+      (let [d (nth ds i) m (:msg d)]
+        (recur (+ i 1)
+               (conj acc (if (or (str/starts-with? m "Invalid input ") (str/starts-with? m "Unexpected end of input"))
+                           (let [[ln col] (line-col s (:start (:sp d)))]
+                             (a/->Diag (str m " (line " ln ", column " col "):\n") (:sp d)))
+                           d)))))))
+
+(defn- line-col Values(Int Int) [s: &Str p0: Int]
+  (let [p (if (> p0 (count s)) (count s) p0)
+        [ln ls] (loop [i 0 ln 1 ls 0] (if (>= i p) (values ln ls) (if (= (nth s i) 10) (recur (+ i 1) (+ ln 1) (+ i 1)) (recur (+ i 1) ln ls))))
+        col (loop [i ls n 1] (if (>= i p) n (recur (+ i 1) (if (= (bit-and (nth s i) 192) 128) n (+ n 1)))))]
+    (values ln col)))
+
+(defn parse Values(a/Script Vec(a/Diag)) [s: &Str]
+  (let [st00 (->St 0 [] 0 false false [] -1)
+        t0 (pk s st00 l/M-INFIX)
+        st0 (if (= (:k t0) l/K-SEP) (diag st00 (:s t0) (:e t0) "Invalid input \"---\", expected document") st00)]
+    (if (not (starts-header? s st0))
+      (let [[body st1] (p-expr s st0)] (finish s st1 "" [] [] body))
+      (let [[ver dirs decls stop st1] (p-decls s st0 false)
+            t (pk s st1 l/M-INFIX)]
+        (if (= (:k t) l/K-SEP)
+          (let [[body st2] (p-expr s (past st1 t))] (finish s st2 ver dirs decls body))
+          (if (= (:k t) l/K-EOF)
+            (finish s (diag st1 (:s t) (:s t) "Missing Mapping Expression ie. var a = 1 --- a")
+                    ver dirs decls (null-node (:s t)))
+            (let [st2 (diag-tok s st1 t "a directive or '---'")
+                  [body st3] (p-expr s st2)]
+              (finish s st3 ver dirs decls body))))))))
+
+(defn parse-module Values(a/Script Vec(a/Diag)) [s: &Str]
+  (let [st0 (->St 0 [] 0 false false [] -1)
+        [ver dirs decls stop st1] (p-decls s st0 false)
+        t (pk s st1 l/M-INFIX)
+        st2 (if (= (:k t) l/K-EOF) st1
+              (if (= (:k t) l/K-SEP) (diag st1 (:s t) (:e t) "A module can not have a body ('---')")
+                (diag-tok s st1 t "a directive")))]
+    (values (a/->Script ver dirs decls (null-node (count s))) (:ds st2))))

@@ -1,0 +1,59 @@
+(ns csv-test (:require [mulay.lib.csv :as csv] [clay.string :as str]))
+(defn show Str [rows: &Vec(Vec(Str))]
+  (loop [i 0 out ""]
+    (if (>= i (count rows)) out
+      (recur (+ i 1) (str out "[" (str/join "|" (nth rows i)) "]")))))
+(defn rd Str [text: Str o: csv/CsvOpts]
+  (let [[h rows err] (csv/read-all text o)]
+    (if (not (= err "")) (str "ERR " err) (str "H[" (str/join "|" h) "]" (show rows)))))
+(defn opts csv/CsvOpts [] (csv/default-opts))
+(deftest read-basic
+  (is (= (rd "a,b,c\n1,2,3\n4,5,6\n" (opts)) "H[a|b|c][1|2|3][4|5|6]"))
+  (is (= (rd "a,b\r\n1,2\r\n" (opts)) "H[a|b][1|2]"))
+  (is (= (rd "a,b\r1,2" (opts)) "H[a|b][1|2]"))
+  (is (= (rd "a,b\n\"x,y\",\"say \"\"hi\"\"\"\n" (opts)) "H[a|b][x,y|say \"hi\"]"))
+  (is (= (rd "a,b\n\"multi\nline\",2\n3,4\n" (opts)) "H[a|b][multi\nline|2][3|4]"))
+  (is (= (rd "a,b\n\"esc \\\" q\",\"back\\\\slash\"\n" (opts)) "H[a|b][esc \" q|back\\slash]"))
+  (is (= (rd "a,b\n,\n1,\n,2\n" (opts)) "H[a|b][|][1|][|2]"))
+  (is (= (rd "a,b\n\n1,2\n\n" (opts)) "H[a|b][1|2]"))
+  (is (= (rd "a,b\n\n1,2\n" (assoc (opts) :ignore-empty-line false)) "H[a|b][][1|2]"))
+  (is (= (rd (str (chr 239) (chr 187) (chr 191) "a\n1\n") (opts)) "H[a][1]"))
+  (is (= (rd "a;b\n1;2\n" (assoc (opts) :separator ";")) "H[a|b][1|2]"))
+  (is (= (rd "a\tb\n1\t2\n" (assoc (opts) :separator "\t")) "H[a|b][1|2]"))
+  (is (= (rd "a,b\n'x,y',z\n" (assoc (opts) :quote "'")) "H[a|b][x,y|z]"))
+  (is (= (rd "1,2\n3,4\n" (assoc (opts) :header false)) "H[][1|2][3|4]"))
+  (is (= (rd "a,b\n\"open,1\n" (opts)) "ERR line 2: unterminated quoted field"))
+  (is (= (rd "" (opts)) "H[]"))
+  (is (= (rd "a,b\n\"q\"tail,x\n" (opts)) "H[a|b][qtail|x]"))
+  (is (= (rd "a,b\n\"\",\"\"\n" (opts)) "H[a|b][|]"))
+  (is (= (rd "日本,語\nあ,い\n" (opts)) "H[日本|語][あ|い]")))
+(deftest line-numbers
+  ;; header on line 2 (0-based): the two comment lines are not CSV
+  (is (= (rd "# c1\n# \"c2\nh1,h2\n1,2\n" (assoc (opts) :header-line 2)) "H[h1|h2][1|2]"))
+  ;; body starts at line 3: line 1 after the header is skipped
+  (is (= (rd "h1,h2\nunits,units\n1,2\n" (assoc (opts) :body-start 2)) "H[h1|h2][1|2]"))
+  (is (= (rd "junk\n1,2\n" (assoc (opts) :header false :body-start 1)) "H[][1|2]")))
+(deftest streaming
+  (is (let [[r0 h err] (csv/reader "a,b\n1,2\n\"x\ny\",3\n" (opts))
+            [r1 row1 has1 e1] (csv/next-row r0)
+            l1 (csv/reader-line r1)
+            [r2 row2 has2 e2] (csv/next-row r1)
+            [r3 row3 has3 e3] (csv/next-row r2)]
+        (and (= h ["a" "b"]) has1 (= row1 ["1" "2"]) (= l1 3) has2 (= row2 ["x\ny" "3"]) (not has3) (= (csv/reader-line r3) 5)))))
+(deftest write-basic
+  (is (= (csv/write ["a" "b"] [["1" "x,y"] ["say \"hi\"" "multi\nline"] ["" "plain"]] (opts))
+         "a,b\n1,\"x,y\"\n\"say \\\"hi\\\"\",\"multi\nline\"\n,plain\n"))
+  (is (= (csv/write ["a" "b"] [["1" "2"]] (assoc (opts) :quote-values true :quote-header true :line-separator "\r\n" :separator ";"))
+         "\"a\";\"b\"\r\n\"1\";\"2\"\r\n"))
+  (is (= (csv/write ["a"] [["q\"x"]] (assoc (opts) :escape "\"")) "a\n\"q\"\"x\"\n"))
+  (is (= (csv/write ["a"] [["1"]] (assoc (opts) :header false)) "1\n")))
+(deftest roundtrip
+  (is (let [rows [["x,y" "say \"hi\"" "multi\nline"] ["back\\slash" "" "日本"] ["a\\\"b" "c" "d"]]
+            text (csv/write ["h1" "h2" "h3"] rows (opts))
+            [h rows2 err] (csv/read-all text (opts))]
+        (and (= err "") (= h ["h1" "h2" "h3"]) (= rows2 rows))))
+  (is (let [rows [["x,y" "say \"hi\"" "multi\r\nline"]]
+            o (assoc (opts) :escape "\"")
+            text (csv/write ["h1" "h2" "h3"] rows o)
+            [h rows2 err] (csv/read-all text o)]
+        (and (= err "") (= rows2 rows)))))

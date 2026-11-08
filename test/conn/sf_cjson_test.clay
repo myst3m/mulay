@@ -1,0 +1,52 @@
+(ns sf-cjson-test (:require [mulay.conn.sf_cjson :as cj] [mulay.dw.val :as v] [clay.string :as str]))
+
+;; 期待値は Jackson 2.22.3 (ObjectMapper の既定) を Java 17 で直接呼んで得たもの
+
+(def SRC "\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); ")
+
+(defn- err-of Str [s: &Str] (let [[x e] (cj/read-java s false)] e))
+(defn- map-err Str [s: &Str] (let [[x e] (cj/read-java s true)] e))
+
+(deftest parse-errors
+  (is (= (err-of "not json") (str "Unrecognized token 'not': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')" SRC "line: 1, column: 1]")))
+  (is (= (err-of "{\"a\": nope}") (str "Unrecognized token 'nope': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')" SRC "line: 1, column: 7]")))
+  (is (= (err-of "{\"a\":1") (str "Unexpected end-of-input: expected close marker for Object (start marker at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 1])" SRC "line: 1, column: 7]")))
+  (is (= (err-of "{\"a\" 1}") (str "Unexpected character ('1' (code 49)): was expecting a colon to separate field name and value" SRC "line: 1, column: 6]")))
+  (is (= (err-of "[1,]") (str "Unexpected character (']' (code 93)): expected a value" SRC "line: 1, column: 4]")))
+  (is (= (err-of "{\"a\":1,}") (str "Unexpected character ('}' (code 125)): was expecting double-quote to start field name" SRC "line: 1, column: 8]")))
+  (is (= (err-of "\"abc") (str "Unexpected end-of-input in VALUE_STRING" SRC "line: 1, column: 5]")))
+  (is (= (err-of "{\"a\":\"x\ny\"}") (str "Illegal unquoted character ((CTRL-CHAR, code 10)): has to be escaped using backslash to be included in string value" SRC "line: 1, column: 8]")))
+  (is (= (err-of "[1 2]") (str "Unexpected character ('2' (code 50)): was expecting comma to separate Array entries" SRC "line: 1, column: 4]")))
+  (is (= (err-of "{1:2}") (str "Unexpected character ('1' (code 49)): was expecting double-quote to start field name" SRC "line: 1, column: 2]")))
+  (is (= (err-of "  \n  xyz") (str "Unrecognized token 'xyz': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')" SRC "line: 2, column: 3]")))
+  (is (= (err-of "-") (str "Unexpected end-of-input in null" SRC "line: 1, column: 2]")))
+  (is (= (err-of "01") (str "Invalid numeric value: Leading zeroes not allowed" SRC "line: 1, column: 2]")))
+  (is (= (err-of "1.") (str "Unexpected character ('.' (code 46)) in numeric value: Decimal point not followed by a digit" SRC "line: 1, column: 2]")))
+  (is (= (err-of "\"\\q\"") (str "Unrecognized character escape 'q' (code 113)" SRC "line: 1, column: 3]")))
+  (is (= (err-of "{\"a\":[1,{\"b\":2]}") (str "Unexpected close marker ']': expected '}' (for Object starting at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 9])" SRC "line: 1, column: 15]"))))
+
+(deftest map-reader-top
+  (is (= (map-err "[1,]") (str "Cannot deserialize value of type `java.util.HashMap<java.lang.String,java.lang.Object>` from Array value (token `JsonToken.START_ARRAY`)" SRC "line: 1, column: 1]")))
+  (is (= (map-err "\"s\"") (str "Cannot construct instance of `java.util.HashMap` (although at least one Creator exists): no String-argument constructor/factory method to deserialize from String value ('s')" SRC "line: 1, column: 1]")))
+  (is (= (map-err "1") (str "Cannot deserialize value of type `java.util.HashMap<java.lang.String,java.lang.Object>` from Integer value (token `JsonToken.VALUE_NUMBER_INT`)" SRC "line: 1, column: 1]")))
+  (is (= (map-err "1.5") (str "Cannot deserialize value of type `java.util.HashMap<java.lang.String,java.lang.Object>` from Floating-point value (token `JsonToken.VALUE_NUMBER_FLOAT`)" SRC "line: 1, column: 1]")))
+  (is (= (map-err "true") (str "Cannot deserialize value of type `java.util.HashMap<java.lang.String,java.lang.Object>` from Boolean value (token `JsonToken.VALUE_TRUE`)" SRC "line: 1, column: 1]")))
+  (is (= (map-err "null") "")))
+
+(defn- keys-of Vec(Str) [x: &v/Val]
+  (match (v/unmeta x) (v/VObj fs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (:name (:key (nth fs i))))))) _ []))
+
+(deftest values-and-order
+  (let [[x e] (cj/read-java "{\"totalSize\":1,\"done\":true,\"nextRecordsUrl\":\"u\",\"records\":[]}" true)
+        [y e2] (cj/read-java "{\"b\":1,\"a\":2,\"b\":3} trailing" false)
+        [w we] (cj/write-java (v/->VObj [(v/field "s" (v/->VStr (str "a" (chr 1) (chr 31) "\"\\/é")))]))]
+    (is (= e ""))
+    (is (= (keys-of x) ["nextRecordsUrl" "totalSize" "records" "done"]))
+    (is (= e2 ""))
+    (is (= (keys-of y) ["b" "a"]))
+    (is (= w "{\"s\":\"a\\u0001\\u001F\\\"\\\\/é\"}"))))
+
+(deftest time-values-fail
+  (let [[w e] (cj/write-java (cj/hash-map [(v/field "batchRequests" (v/->VArr [(v/->VObj [(v/field "when" (v/->VStr "x")) (v/field "d" (v/->VNull))])]))]))]
+    (is (= e ""))
+    (is (= w "{\"batchRequests\":[{\"when\":\"x\",\"d\":null}]}"))))

@@ -1,0 +1,173 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
+
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18565"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="SF">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <sub-flow name="pick">
+        <set-variable variableName="mode" value="#[attributes.queryParams.mode default 'none']"/>
+        <set-variable variableName="h" value="#[output application/java --- {
+  none: {},
+  chunkbad: {'Sforce-Enable-PKChunking': 'chunkSize=999999'},
+  chunktrue: {'Sforce-Enable-PKChunking': true},
+  chunknull: {'Sforce-Enable-PKChunking': null},
+  xmlct: {'Content-Type': 'application/xml'},
+  calloptions: {'Sforce-Call-Options': 'client=mulay'},
+  intval: {'X-Mulay': 1},
+  nullval: {'X-Mulay': null},
+  mapval: {'X-Mulay': {a: 1}},
+  aon: {AllOrNoneHeader: {allOrNone: true}},
+  metanull: {AllOrNoneHeader: null},
+  unknownnull: {Foo: null, PackageVersionHeader: {packageVersions: []}, LocaleOptions: {language: 'ja'}},
+  notmap: {allornoneheader: 'x'}
+}[vars.mode]]"/>
+    </sub-flow>
+
+    <sub-flow name="wait-batch">
+        <until-successful maxRetries="90" millisBetweenRetries="1000">
+            <salesforce:batch-info config-ref="SF">
+                <salesforce:batch-to-retrieve>#[vars.batch]</salesforce:batch-to-retrieve>
+            </salesforce:batch-info>
+            <choice>
+                <when expression="#[payload.state == 'Queued' or payload.state == 'InProgress']">
+                    <raise-error type="APP:WAIT" description="batch not done"/>
+                </when>
+            </choice>
+        </until-successful>
+    </sub-flow>
+
+    <!-- Bulk v1: create-job の headers は HTTP ヘッダ (値は toString、null は送らない) -->
+    <flow name="v1-job">
+        <http:listener config-ref="HTTP" path="/v1/job" allowedMethods="POST"/>
+        <flow-ref name="pick"/>
+        <salesforce:create-job config-ref="SF" operation="query" type="Account" headers="#[vars.h]"/>
+        <set-variable variableName="job" value="#[payload]"/>
+        <salesforce:abort-job config-ref="SF" jobId="#[vars.job.id]"/>
+        <set-payload value="#[output application/json --- {created: vars.job.state, after: payload.state}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 子要素の形 -->
+    <flow name="v1-job-child">
+        <http:listener config-ref="HTTP" path="/v1/job-child" allowedMethods="POST"/>
+        <salesforce:create-job config-ref="SF" operation="query" type="Account">
+            <salesforce:headers>
+                <salesforce:header key="Sforce-Enable-PKChunking" value="chunkSize=999999"/>
+            </salesforce:headers>
+        </salesforce:create-job>
+        <salesforce:abort-job config-ref="SF" jobId="#[payload.id]"/>
+        <set-payload value="#[output application/json --- {after: payload.state}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- PK chunking: 元のバッチは NotProcessed になり、分けたバッチが足される -->
+    <flow name="v1-pk">
+        <http:listener config-ref="HTTP" path="/v1/pk" allowedMethods="POST"/>
+        <flow-ref name="pick"/>
+        <salesforce:create-job config-ref="SF" operation="query" type="Account" headers="#[vars.h]"/>
+        <set-variable variableName="job" value="#[payload]"/>
+        <salesforce:create-batch-for-query config-ref="SF" jobInfoBatchForQuery="#[vars.job]">
+            <salesforce:batch-query>SELECT Id FROM Account</salesforce:batch-query>
+        </salesforce:create-batch-for-query>
+        <set-variable variableName="batch" value="#[payload]"/>
+        <flow-ref name="wait-batch"/>
+        <set-variable variableName="info" value="#[payload]"/>
+        <salesforce:batch-info-list config-ref="SF" jobId="#[vars.job.id]"/>
+        <set-variable variableName="list" value="#[payload]"/>
+        <salesforce:abort-job config-ref="SF" jobId="#[vars.job.id]"/>
+        <set-payload value="#[output application/json --- {state: vars.info.state, batches: sizeOf(vars.list) > 1}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- Bulk v2: 最初の POST にだけ付く。既定のヘッダ (Content-Type など) を上書きする -->
+    <flow name="v2-query">
+        <http:listener config-ref="HTTP" path="/v2/query" allowedMethods="POST"/>
+        <flow-ref name="pick"/>
+        <salesforce:create-query-job-bulk-api-v2 config-ref="SF" query="SELECT Id FROM Account LIMIT 1" headers="#[vars.h]"/>
+        <set-variable variableName="job" value="#[payload]"/>
+        <try>
+            <salesforce:abort-query-job-bulk-api-v2 config-ref="SF" id="#[vars.job.id]"/>
+            <error-handler><on-error-continue/></error-handler>
+        </try>
+        <until-successful maxRetries="110" millisBetweenRetries="1000">
+            <salesforce:get-query-job-info-bulk-api-v2 config-ref="SF" id="#[vars.job.id]"/>
+            <choice>
+                <when expression="#[not (['JobComplete', 'Failed', 'Aborted'] contains payload.state)]">
+                    <raise-error type="APP:PENDING" description="#[payload.state]"/>
+                </when>
+            </choice>
+        </until-successful>
+        <salesforce:delete-query-job-bulk-api-v2 config-ref="SF" id="#[vars.job.id]"/>
+        <set-payload value="#[output application/json --- {operation: vars.job.operation, object: vars.job.object}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="v2-ingest">
+        <http:listener config-ref="HTTP" path="/v2/ingest" allowedMethods="POST"/>
+        <flow-ref name="pick"/>
+        <salesforce:create-job-bulk-api-v2 config-ref="SF" objectType="Account" operation="insert" headers="#[vars.h]">
+            <salesforce:s-objects>#[output text/plain --- "Name\nmulay bhdr ingest"]</salesforce:s-objects>
+        </salesforce:create-job-bulk-api-v2>
+        <set-payload value="#[output application/json --- {state: payload.state}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- メタデータ: 成功する行と失敗する行を 1 度に作る -->
+    <flow name="meta">
+        <http:listener config-ref="HTTP" path="/meta" allowedMethods="POST"/>
+        <flow-ref name="pick"/>
+        <salesforce:create-metadata config-ref="SF" type="RemoteSiteSetting" headers="#[vars.h]">
+            <salesforce:objects>#[[{fullName: "MulayHdr1", url: "https://example.com", isActive: true}, {fullName: "MulayHdr2", isActive: true}]]</salesforce:objects>
+        </salesforce:create-metadata>
+        <set-variable variableName="items" value="#[payload map {fullName: $.fullName, success: $.success}]"/>
+        <salesforce:read-metadata config-ref="SF" type="RemoteSiteSetting" headers="#[vars.h]">
+            <salesforce:full-names>#[["MulayHdr1"]]</salesforce:full-names>
+        </salesforce:read-metadata>
+        <set-variable variableName="found" value="#[payload map $.fullName]"/>
+        <flow-ref name="meta-clean"/>
+        <set-payload value="#[output application/json --- {items: vars.items, found: vars.found}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <sub-flow name="meta-clean">
+        <salesforce:delete-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:full-names>#[["MulayHdr1", "MulayHdr2"]]</salesforce:full-names>
+        </salesforce:delete-metadata>
+    </sub-flow>
+
+    <flow name="reset">
+        <http:listener config-ref="HTTP" path="/reset" allowedMethods="POST"/>
+        <flow-ref name="meta-clean"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>SELECT Id FROM Account WHERE Name LIKE 'mulay bhdr%'</salesforce:salesforce-query>
+        </salesforce:query>
+        <choice>
+            <when expression="#[sizeOf(vars.found) > 0]">
+                <salesforce:delete config-ref="SF"><salesforce:ids>#[vars.found map $.Id]</salesforce:ids></salesforce:delete>
+            </when>
+        </choice>
+        <set-payload value="#[output application/json --- {ok: true}]"/>
+    </flow>
+</mule>

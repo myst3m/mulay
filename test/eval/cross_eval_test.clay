@@ -1,0 +1,29 @@
+(ns cross-eval-test (:require [mulay.dw.engine :as eng] [mulay.dw.eval :as ev] [mulay.dw.val :as v] [mulay.dw.err :as dwe]))
+
+(defn- exported Values(v/Val Str) [head: Str body: Str]
+  (let [c (eng/compile (str "%dw 2.0\noutput application/java\n" head "---\n" body) [])
+        [x e cx] (eng/eval-compiled-w c [] ev/NO-WRAP)]
+    (if (dwe/ok? e) (values (ev/export-val (fn v/Val [g: v/FnV] (ev/export-fn cx g)) x) "") (values (v/null-v) (str (:msg e))))))
+
+(defn- call-with Str [f: v/Val body: Str]
+  (let [c (eng/compile (str "%dw 2.0\noutput application/java\n---\n" body) ["f"])
+        [x e] (eng/eval-compiled c [f])]
+    (if (dwe/ok? e)
+      (match (v/unmeta x) (v/VInt n) (str n) (v/VStr s) (str s) (v/VFn g) "function" _ "other")
+      (str "ERR " (:msg e)))))
+
+(deftest a-function-from-another-evaluation-runs-in-its-own-program
+  (let [[inc ie] (exported "" "(x) -> x + 1")
+        [ap ae] (exported "" "(g, y) -> g(y)")
+        [mk me] (exported "" "(n) -> (x) -> x + n")
+        [cl ce] (exported "var k = 10\n" "(x) -> x + k")
+        [ob oe] (exported "" "{f: (s) -> upper(s)}")]
+    (is (= ie ""))
+    (is (= (call-with inc "f(41)") "42"))
+    (is (= (call-with inc "([1, 2] map ((v) -> f(v)))[1]") "3"))
+    (is (= (call-with ap "f((z) -> z * 2, 21)") "42"))
+    (is (= (call-with mk "f(1)(41)") "42"))
+    (is (= (call-with mk "f(1)") "function"))
+    (is (= (call-with cl "f(1)") "11"))
+    (is (= (call-with ob "f.f('ab')") "AB"))))
+

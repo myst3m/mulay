@@ -1,0 +1,93 @@
+(ns mulay.app.exchange
+  (:require [mulay.lib.numparse :as npz] [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.num :as num]
+            [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.engine :as en]
+            [mulay.rt.stream :as stream] [mulay.conn.httpmsg :as hx] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(defrecord Reply [status: Int headers: Vec(hm/Header) body: Str reason: Str err: Str piped: Bool bt: ev/TV mode: Str])
+
+(defn- reply-err Reply [msg: Str] (->Reply 500 [] "" "" msg false (ev/tv-null) ""))
+
+(defn reply Reply [c: &en/Ctx src: &m/Source e: ev/Event x: Vec(err/MErr)]
+  (match src
+    (m/SrcHttpListener cref path methods rs rh rb es eh eb rr er sm om oe loc)
+    (let [ok (= (count x) 0)
+          e0 (if ok e (ev/with-error e x))
+          [st-v e1 x1] (eval-opt c (if ok rs es) e0)
+          [hd-v e2 x2] (eval-opt c (if ok rh eh) e1)
+          [rr-v e2b x2b] (eval-opt c (if ok rr er) e2)
+          [bd-tv e3 x3] (if ok (if (= (count rb) 0) (values [(:payload e2)] e2 []) (eval-opt-tv c rb e2))
+                          (if (= (count eb) 0) (values [(ev/tv-val (v/->VStr (:description (nth x 0))) "text/plain; charset=UTF-8")] e2 [])
+                            (eval-opt-tv c eb e2)))
+          gx (first-errs x1 x2 (if (> (count x2b) 0) x2b x3))
+          cu (if ok [] (custom-of (nth x 0)))]
+      (if (> (count gx) 0) (reply-err (str (:description (nth gx 0))))
+        (let [[st sx] (if (= (count st-v) 0) (values (cond ok 200 (> (count cu) 0) (:status (nth cu 0)) :else 500) [])
+                        (status-of (nth st-v 0) (en/expr-text (nth (if ok rs es) 0))))
+              bt (nth bd-tv 0)
+              piped (and (= (:state bt) ev/PIPE) (stream/fresh? (:raw bt)) (chunk-body? sm true st 1))
+              [body be] (if piped (values "" "") (ev/wire-bytes bt))
+              ct0 (ev/content-type bt)
+              [hs0 ct0b he0] (if (= (count cu) 0) (values [] "" "") (hx/header-list (:headers (nth cu 0))))
+              [hs1 ct1 he] (if (= (count hd-v) 0) (values [] "" "") (hx/header-list (nth hd-v 0)))
+              hs (loop [i 0 acc hs0] (if (>= i (count hs1)) acc (recur (+ i 1) (conj acc (nth hs1 i)))))
+              ct (if (= ct1 "") ct0 ct1)
+              reason (cond (> (count rr-v) 0) (let [[t te] (drt/to-text (nth rr-v 0))] t)
+                           (and (= (count st-v) 0) (> (count cu) 0) (not= (:reason (nth cu 0)) "")) (:reason (nth cu 0))
+                           (or (> (count (if ok rs es)) 0) (not ok)) (hx/mule-reason st)
+                           :else "")]
+          (cond
+            (> (count sx) 0) (reply-err (str (:description (nth sx 0))))
+            (< st 200) (reply-err "java.lang.IllegalArgumentException: Cannot send a status code lower than 200")
+            (not= he "") (reply-err (en/pval-value-desc he (nth hd-v 0) (nth (if ok rh eh) 0)))
+            (not= be "") (reply-err (str be))
+            :else (let [hs2 (if (= ct "") hs (conj hs (hm/->Header "Content-Type" ct)))]
+                    (->Reply st hs2 body reason "" piped bt (str sm)))))))
+    _ (reply-err "no listener")))
+
+(defn- custom-of Vec(hx/Custom) [e: &err/MErr]
+  (if (and (or (err/matches? e "HTTP:NOT_FOUND") (err/matches? e "HTTP:BASIC_AUTHENTICATION") (err/matches? e "MULE:SECURITY"))
+           (> (count (:attrs e)) 0))
+    (hx/listener-custom (nth (:attrs e) 0))
+    []))
+
+(defn request-event ev/Event [method: &Str uri: &Str hlist: &Vec(hm/Header) body: Str ct: &Str listener-path: &Str base: &Str
+                              params: Vec(v/Field) port: Int remote: &Str scheme: &Str cert: &Str version: &Str src: &m/Source corr: Str flow: &Str]
+  (let [attrs (hx/request-attributes method uri listener-path base hlist params port remote scheme cert version)
+        [om oe] (listener-output src)
+        payload (ev/tv-raw body (cond (not= om "") (str (base-mime om) "; charset=" (if (= oe "") "UTF-8" oe))
+                                      (or (= ct "") (= version "HTTP/2")) ev/ANY
+                                      :else (ev/with-charset ct)))]
+    (ev/new-event payload (ev/tv-val attrs ev/JAVA) corr (str flow))))
+
+(defn- eval-opt Values(Vec(v/Val) ev/Event Vec(err/MErr)) [c: &en/Ctx p: &Vec(m/PVal) e: ev/Event]
+  (if (= (count p) 0) (values [] e [])
+    (let [[x e2 errs] (en/eval-val c (nth p 0) e)] (values [x] e2 errs))))
+
+(defn- eval-opt-tv Values(Vec(ev/TV) ev/Event Vec(err/MErr)) [c: &en/Ctx p: &Vec(m/PVal) e: ev/Event]
+  (if (= (count p) 0) (values [] e [])
+    (let [[t e2 errs] (en/eval-pval c (nth p 0) e)] (values [t] e2 errs))))
+
+(defn- status-of Values(Int Vec(err/MErr)) [x: &v/Val expr: &Str]
+  (match (v/unmeta x)
+    (v/VNum n) (let [[i e] (num/to-int n)] (if (= e "") (values i []) (values 0 [(en/convert-err x "Integer" expr)])))
+    (v/VInt n-i) (let [n (num/from-int n-i)] (let [[i e] (num/to-int n)] (if (= e "") (values i []) (values 0 [(en/convert-err x "Integer" expr)]))))
+    (v/VStr s) (let [t (str/trim s)
+                     digits (and (> (count t) 0) (loop [i 0] (if (>= i (count t)) true (if (and (>= (nth t i) 48) (<= (nth t i) 57)) (recur (+ i 1)) false))))]
+                 (if (and digits (< (count t) 10)) (values (npz/int-or t 0) []) (values 0 [(en/convert-err x "Integer" expr)])))
+    _ (values 0 [(en/convert-err x "Integer" expr)])))
+
+(defn- first-errs Vec(err/MErr) [a: &Vec(err/MErr) b: &Vec(err/MErr) c: &Vec(err/MErr)]
+  (if (> (count a) 0) (str-errs a) (if (> (count b) 0) (str-errs b) (str-errs c))))
+
+(defn- str-errs Vec(err/MErr) [a: &Vec(err/MErr)] (loop [i 0 acc: Vec(err/MErr) []] (if (>= i (count a)) acc (recur (+ i 1) (conj acc (nth a i))))))
+
+(defn chunk-body? Bool [mode: &Str stream: Bool st: Int n: Int]
+  (and (> n 0) (not= st 204) (not= st 304)
+       (or (= mode "ALWAYS") (and (= mode "AUTO") stream))))
+
+(defn listener-output Values(Str Str) [s: &m/Source]
+  (match s
+    (m/SrcHttpListener cref path methods rs rh rb es eh eb rr er sm om oe loc) (values (str om) (str oe))
+    _ (values "" "")))
+
+(defn base-mime Str [m: &Str] (let [k (str/index-of m ";")] (str/trim (if (< k 0) (str m) (subs m 0 k)))))

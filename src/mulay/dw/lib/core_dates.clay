@@ -1,0 +1,120 @@
+(ns mulay.dw.lib.core_dates
+  (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core] [mulay.lib.uni :as uni]
+            [mulay.dw.coerce_time :as ct] [mulay.lib.time.types :as tt] [mulay.lib.time.local :as tl]
+            [mulay.lib.time.zoned :as tz] [mulay.lib.time.tz :as tzr] [mulay.lib.time.amount :as tam]))
+
+(def M "dw::Core")
+
+(defn- dterr Values(v/Val dwe/DwErr) [e: Str] (rt/failure "DateTimeException" e))
+
+(defn- now-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (rt/ret (v/->VDateTime (tz/now-zdt))))
+
+(defn- leap Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [x (v/unmeta (nth a 0))]
+    (match x
+      (v/VDate dd) (rt/ret (v/bool-v (tl/date-leap? dd)))
+      (v/VDateTime z) (rt/ret (v/bool-v (tl/date-leap? (tz/zdt-date z))))
+      (v/VLocalDateTime y) (rt/ret (v/bool-v (tl/date-leap? (tl/ldt-date y))))
+      _ (let [[r1 e1] (ct/to-type x "DateTime")]
+          (if (dwe/ok? e1) (leap env [r1])
+            (let [[r2 e2] (ct/to-type x "Date")]
+              (if (dwe/ok? e2) (leap env [r2])
+                (let [[r3 e3] (ct/to-type x "LocalDateTime")]
+                  (if (dwe/ok? e3) (leap env [r3]) (ct/bad-args "isLeapYear" a))))))))))
+
+(defn- days-between Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[x e1] (ct/to-type (nth a 0) "Date")
+        [y e2] (ct/to-type (nth a 1) "Date")]
+    (if (not (and (dwe/ok? e1) (dwe/ok? e2))) (ct/bad-args "daysBetween" a)
+      (match (v/unmeta x)
+        (v/VDate p) (match (v/unmeta y)
+                      (v/VDate q) (rt/ret (v/int-v (- (tl/date-epoch-day q) (tl/date-epoch-day p))))
+                      _ (ct/bad-args "daysBetween" a))
+        _ (ct/bad-args "daysBetween" a)))))
+
+(defn- shift-zone Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (match (v/unmeta (nth a 0))
+    (v/VDateTime z)
+    (match (v/unmeta (nth a 1))
+      (v/VTimeZone zone) (rt/ret (v/->VDateTime (tz/zdt-with-zone-same-instant z zone)))
+      (v/VStr s) (let [[zone e] (ct/parse-zone s)]
+                   (if (= e "") (rt/ret (v/->VDateTime (tz/zdt-with-zone-same-instant z zone)))
+                     (ct/bad-args ">>" a)))
+      _ (ct/bad-args ">>" a))
+    _ (ct/bad-args ">>" a)))
+
+(defn- zone-offset-now Int [zone: &tt/TimeZone]
+  (match zone
+    (tt/TzOffset o) o
+    (tt/TzRegion id) (tz/zdt-offset (tz/now-zdt-in zone))))
+
+(defn- cat-zone Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [x (v/unmeta (nth a 0)) y (v/unmeta (nth a 1))
+        swap (match x (v/VTimeZone z) true _ false)
+        t (if swap y x)
+        zv (if swap x y)]
+    (match zv
+      (v/VTimeZone zone)
+      (match t
+        (v/VDate dd) (rt/ret (v/->VDateTime (tz/zdt-of-local (tl/ldt dd (tt/->LocalTime 0 0 0 0)) zone [])))
+        (v/VLocalDateTime p) (rt/ret (v/->VDateTime (tz/zdt-of-local p zone [])))
+        (v/VLocalTime lt) (rt/ret (v/->VTime (tt/->OffsetTime lt (zone-offset-now zone))))
+        _ (ct/bad-args "++" a))
+      _ (ct/bad-args "++" a))))
+
+(defn- period-number Values(num/Num Str) [p: &tt/DwPeriod]
+  (match p
+    (tt/PerDate q) (values (num/from-int (tam/period-total-months q)) "")
+    (tt/PerTime du) (values (num/from-int (:seconds du)) "")))
+
+(defn- arg-period tt/DwPeriod [a: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth a i)) (v/VPeriod p) p _ (tt/->PerDate (tam/period 0 0 0))))
+
+(defn- pp-op Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [op: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (let [[x e1] (period-number (arg-period a 0)) [y e2] (period-number (arg-period a 1))]
+      (core/arith (if (= op "+") 1 2) x y))))
+
+(defn- neg-period tt/DwPeriod [p: &tt/DwPeriod]
+  (match p
+    (tt/PerDate q) (tt/->PerDate (tam/period-negated q))
+    (tt/PerTime d) (tt/->PerTime (tam/duration-negated d))))
+
+(defn plus-period Values(v/Val dwe/DwErr) [x0: &v/Val p: &tt/DwPeriod]
+  (match (v/unmeta x0)
+    (v/VDate dd) (match p
+                   (tt/PerDate q) (let [[r e] (tl/date-plus-period dd q)] (if (= e "") (rt/ret (v/->VDate r)) (dterr e)))
+                   (tt/PerTime du) (let [[r e] (tl/date-plus-duration dd du)] (if (= e "") (rt/ret (v/->VDate r)) (dterr e))))
+    (v/VDateTime z) (let [[r e] (tz/zdt-plus-dw z p)] (if (= e "") (rt/ret (v/->VDateTime r)) (dterr e)))
+    (v/VLocalDateTime x) (let [[r e] (tl/ldt-plus-dw x p)] (if (= e "") (rt/ret (v/->VLocalDateTime r)) (dterr e)))
+    (v/VLocalTime t) (match p
+                       (tt/PerTime du) (rt/ret (v/->VLocalTime (tl/time-plus-duration t du)))
+                       (tt/PerDate q) (let [[r e] (tl/time-plus-period t q)] (if (= e "") (rt/ret (v/->VLocalTime r)) (dterr e))))
+    (v/VTime o) (match p
+                  (tt/PerTime du) (rt/ret (v/->VTime (tz/ot-plus-duration o du)))
+                  _ (rt/ret (v/->VTime o)))
+    _ (rt/failure "InvalidArgs" "+")))
+
+(defn- period-plus Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (plus-period (nth a 1) (arg-period a 0)))
+(defn- period-minus Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (plus-period (nth a 1) (neg-period (arg-period a 0))))
+
+(defn- size-temporal Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[s ok] (v/temporal-str (v/unmeta (nth a 0)))] (rt/ret (v/int-v (u8/codepoint-count s)))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "now" [(rt/overload [] now-f)])
+   (B "isLeapYear" [(rt/b1 "DateTime" leap) (rt/b1 "Date" leap) (rt/b1 "LocalDateTime" leap) (rt/b1 "String" leap)])
+   (B "daysBetween" [(rt/b2 "Date" "Date" days-between) (rt/b2 "Any" "Any" days-between)])
+   (B ">>" [(rt/b2 "DateTime" "TimeZone" shift-zone) (rt/b2 "DateTime" "String" shift-zone)])
+   (B "++" [(rt/b2 "Date" "TimeZone" cat-zone) (rt/b2 "TimeZone" "Date" cat-zone)
+            (rt/b2 "TimeZone" "LocalDateTime" cat-zone)
+            (rt/b2 "LocalTime" "TimeZone" cat-zone) (rt/b2 "TimeZone" "LocalTime" cat-zone)])
+   (B "+" [(rt/b2 "Period" "Period" (pp-op "+"))
+           (rt/b2 "Period" "Date" period-plus) (rt/b2 "Period" "DateTime" period-plus) (rt/b2 "Period" "LocalDateTime" period-plus)
+           (rt/b2 "Period" "LocalTime" period-plus) (rt/b2 "Period" "Time" period-plus)])
+   (B "-" [(rt/b2 "Period" "Period" (pp-op "-"))
+           (rt/b2 "Period" "Date" period-minus) (rt/b2 "Period" "DateTime" period-minus) (rt/b2 "Period" "LocalDateTime" period-minus)
+           (rt/b2 "Period" "LocalTime" period-minus) (rt/b2 "Period" "Time" period-minus)])
+   (B "sizeOf" [(rt/b1 "Period" size-temporal) (rt/b1 "DateTime" size-temporal) (rt/b1 "LocalDateTime" size-temporal)])])

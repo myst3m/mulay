@@ -1,0 +1,498 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="SF">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="setup">
+        <http:listener config-ref="HTTP" path="/setup" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="a">
+            <salesforce:salesforce-query>SELECT Id FROM Account WHERE Name LIKE 'mulay2 %'</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:query config-ref="SF" target="l">
+            <salesforce:salesforce-query>SELECT Id FROM Lead WHERE LastName LIKE 'mulay2%'</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:query config-ref="SF" target="c">
+            <salesforce:salesforce-query>SELECT Id FROM Contact WHERE LastName LIKE 'mulay2%'</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:delete config-ref="SF"><salesforce:ids>#[(vars.c map $.Id) ++ (vars.l map $.Id) ++ (vars.a map $.Id)]</salesforce:ids></salesforce:delete>
+        <set-payload value="clean"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="merge">
+        <http:listener config-ref="HTTP" path="/merge" allowedMethods="POST"/>
+        <salesforce:create config-ref="SF" type="Account"><salesforce:records>#[[{Name: "mulay2 master"}, {Name: "mulay2 dup1"}, {Name: "mulay2 dup2"}]]</salesforce:records></salesforce:create>
+        <set-variable variableName="ids" value="#[payload.items map $.id]"/>
+        <salesforce:merge config-ref="SF" type="Account">
+            <salesforce:ids>#[vars.ids[1 to 2]]</salesforce:ids>
+            <salesforce:master-record>#[{Id: vars.ids[0], Description: "merged"}]</salesforce:master-record>
+        </salesforce:merge>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+{payloadClass: payload.^class, result: s(payload) mapObject ((v, k) -> {(k): if (v is Array) sizeOf(v) else v})}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="merge-multiple">
+        <http:listener config-ref="HTTP" path="/merge-multiple" allowedMethods="POST"/>
+        <salesforce:create config-ref="SF" type="Account"><salesforce:records>#[[{Name: "mulay2 mm master1"}, {Name: "mulay2 mm dup1"}, {Name: "mulay2 mm master2"}, {Name: "mulay2 mm dup2"}]]</salesforce:records></salesforce:create>
+        <set-variable variableName="ids" value="#[payload.items map $.id]"/>
+        <salesforce:merge-multiple config-ref="SF">
+            <salesforce:merge-records>#[[{masterRecord: {Id: vars.ids[0], "type": "Account", Description: "mm1"}, recordToMergeIds: [vars.ids[1]]},
+                                         {masterRecord: {id: vars.ids[2], "Type": "Account"}, recordToMergeIds: [vars.ids[3]]}]]</salesforce:merge-records>
+        </salesforce:merge-multiple>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+{payloadClass: payload.^class, itemClass: payload[0].^class,
+ results: payload map (r) -> (s(r) mapObject ((v, k) -> {(k): if (v is Array) sizeOf(v) else if ((k as String) == "id") (v == vars.ids[0] or v == vars.ids[2]) else v}))}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="merge-multiple-no-type">
+        <http:listener config-ref="HTTP" path="/merge-multiple/no-type" allowedMethods="POST"/>
+        <salesforce:merge-multiple config-ref="SF">
+            <salesforce:merge-records>#[[{masterRecord: {Id: "001000000000000AAB"}, recordToMergeIds: ["001000000000000AAA"]}]]</salesforce:merge-records>
+        </salesforce:merge-multiple>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="merge-multiple-no-ids">
+        <http:listener config-ref="HTTP" path="/merge-multiple/no-ids" allowedMethods="POST"/>
+        <salesforce:merge-multiple config-ref="SF">
+            <salesforce:merge-records>#[[{masterRecord: {Id: "001000000000000AAB", "type": "Account"}, recordToMergeIds: []}]]</salesforce:merge-records>
+        </salesforce:merge-multiple>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="merge-bad">
+        <http:listener config-ref="HTTP" path="/merge/bad" allowedMethods="POST"/>
+        <salesforce:merge config-ref="SF" type="Account">
+            <salesforce:ids>#[["001000000000000AAA"]]</salesforce:ids>
+            <salesforce:master-record>#[{Id: "001000000000000AAB"}]</salesforce:master-record>
+        </salesforce:merge>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+s(payload)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="convert">
+        <http:listener config-ref="HTTP" path="/convert" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="st">
+            <salesforce:salesforce-query>SELECT MasterLabel FROM LeadStatus WHERE IsConverted = true LIMIT 1</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:create config-ref="SF" type="Lead"><salesforce:records>#[[{LastName: "mulay2 lead", Company: "mulay2 co"}]]</salesforce:records></salesforce:create>
+        <salesforce:convert-lead config-ref="SF">
+            <salesforce:lead-convert-request>#[{leadId: payload.items[0].id, convertedStatus: vars.st[0].MasterLabel, doNotCreateOpportunity: true, sendEmailToOwner: false, overWriteLeadSource: false}]</salesforce:lead-convert-request>
+        </salesforce:convert-lead>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+{payloadClass: payload.^class, keys: keysOf(payload) orderBy $, types: s(payload mapObject ((v, k) -> {(k): typeOf(v)}))}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="convert-bad">
+        <http:listener config-ref="HTTP" path="/convert/bad" allowedMethods="POST"/>
+        <salesforce:convert-lead config-ref="SF">
+            <salesforce:lead-convert-request>#[{leadId: "00Q000000000000AAA", convertedStatus: "Nope", doNotCreateOpportunity: true}]</salesforce:lead-convert-request>
+        </salesforce:convert-lead>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+s(payload)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="dups">
+        <http:listener config-ref="HTTP" path="/dups" allowedMethods="POST"/>
+        <salesforce:find-duplicates config-ref="SF" type="Account">
+            <salesforce:criteria>#[[{Name: "mulay2 master", BillingCity: "Tokyo"}]]</salesforce:criteria>
+        </salesforce:find-duplicates>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+{payloadClass: payload.^class, value: s(payload)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="dups-ids">
+        <http:listener config-ref="HTTP" path="/dups/ids" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="a">
+            <salesforce:salesforce-query>SELECT Id FROM Account WHERE Name = 'mulay2 master'</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:find-duplicates-by-ids config-ref="SF">
+            <salesforce:ids>#[vars.a map $.Id]</salesforce:ids>
+        </salesforce:find-duplicates-by-ids>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+{payloadClass: payload.^class, value: s(payload)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="allornone">
+        <http:listener config-ref="HTTP" path="/allornone" allowedMethods="POST"/>
+        <salesforce:create config-ref="SF" type="Account">
+            <salesforce:records>#[[{Name: "mulay2 aon"}, {Industry: "x"}]]</salesforce:records>
+            <salesforce:headers>
+                <salesforce:header key="AllOrNoneHeader" value="allOrNone=true"/>
+            </salesforce:headers>
+        </salesforce:create>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{successful: payload.successful, items: payload.items map {id: $.id, successful: $.successful, statusCode: $.statusCode, message: $.message}}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bulk1">
+        <http:listener config-ref="HTTP" path="/bulk1" allowedMethods="POST"/>
+        <salesforce:create-job config-ref="SF" operation="insert" type="Account">
+            <salesforce:create-job-request>#[{contentType: "XML", concurrencyMode: "Parallel"}]</salesforce:create-job-request>
+        </salesforce:create-job>
+        <set-variable variableName="job" value="#[payload]"/>
+        <salesforce:create-batch config-ref="SF" jobInfoBatch="#[vars.job]">
+            <salesforce:objects>#[[{Name: "mulay2 bulk1"}]]</salesforce:objects>
+        </salesforce:create-batch>
+        <set-variable variableName="batch" value="#[payload]"/>
+        <salesforce:batch-info-list config-ref="SF" jobId="#[vars.job.id]"/>
+        <set-variable variableName="list" value="#[payload]"/>
+        <salesforce:close-job config-ref="SF" jobId="#[vars.job.id]"/>
+        <set-variable variableName="closed" value="#[payload]"/>
+        <salesforce:job-info config-ref="SF" jobId="#[vars.job.id]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+{
+  jobClass: vars.job.^class, job: s(vars.job mapObject ((v, k) -> {("t_" ++ k): typeOf(v)})), jobOp: vars.job.operation, jobObject: vars.job.object, jobState: vars.job.state, jobContent: vars.job.contentType,
+  batchClass: vars.batch.^class, batch: s(vars.batch mapObject ((v, k) -> {("t_" ++ k): typeOf(v)})), batchJob: vars.batch.jobId == vars.job.id,
+  listType: typeOf(vars.list), listSize: sizeOf(vars.list),
+  closedState: vars.closed.state, infoState: payload.state
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bulk1-abort">
+        <http:listener config-ref="HTTP" path="/bulk1/abort" allowedMethods="POST"/>
+        <salesforce:create-job config-ref="SF" operation="insert" type="Account"/>
+        <salesforce:abort-job config-ref="SF" jobId="#[payload.id]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+{state: payload.state, contentType: payload.contentType, concurrency: payload.concurrencyMode}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="xml-stream">
+        <http:listener config-ref="HTTP" path="/xml-stream" allowedMethods="GET"/>
+        <salesforce:query-xml-stream config-ref="SF">
+            <salesforce:salesforce-query>SELECT Name FROM Account WHERE Name = 'mulay2 master'</salesforce:salesforce-query>
+        </salesforce:query-xml-stream>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{mime: payload.^mimeType, "type": typeOf(payload), size: sizeOf(payload), first: typeOf(payload[0]), firstMime: payload[0].^mimeType, first: payload[0], firstKeys: keysOf(payload[0])}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="search-params">
+        <http:listener config-ref="HTTP" path="/search/params" allowedMethods="GET"/>
+        <salesforce:search config-ref="SF">
+            <salesforce:search-string>FIND {:term} IN NAME FIELDS RETURNING Account(Name)</salesforce:search-string>
+            <salesforce:parameters>#[{term: "mulayoraclenomatch2"}]</salesforce:parameters>
+        </salesforce:search>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{records: payload.searchRecords}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- バッチが終わるまで待つ (vars.batch) -->
+    <sub-flow name="wait-batch">
+        <until-successful maxRetries="60" millisBetweenRetries="1000">
+            <salesforce:batch-info config-ref="SF">
+                <salesforce:batch-to-retrieve>#[vars.batch]</salesforce:batch-to-retrieve>
+            </salesforce:batch-info>
+            <choice>
+                <when expression="#[payload.state == 'Queued' or payload.state == 'InProgress']">
+                    <raise-error type="APP:WAIT" description="batch not done"/>
+                </when>
+            </choice>
+        </until-successful>
+    </sub-flow>
+
+    <flow name="bulk1-query">
+        <http:listener config-ref="HTTP" path="/bulk1/query" allowedMethods="POST"/>
+        <salesforce:create-job config-ref="SF" operation="query" type="Account"/>
+        <set-variable variableName="job" value="#[payload]"/>
+        <salesforce:create-batch-for-query config-ref="SF" jobInfoBatchForQuery="#[vars.job]">
+            <salesforce:batch-query>SELECT Name FROM Account WHERE Name = 'mulay2 master'</salesforce:batch-query>
+        </salesforce:create-batch-for-query>
+        <set-variable variableName="batch" value="#[payload]"/>
+        <flow-ref name="wait-batch"/>
+        <set-variable variableName="info" value="#[payload]"/>
+        <salesforce:query-result-list config-ref="SF">
+            <salesforce:batch-to-retrieve>#[vars.batch]</salesforce:batch-to-retrieve>
+        </salesforce:query-result-list>
+        <set-variable variableName="list" value="#[payload]"/>
+        <salesforce:query-result-stream-by-id config-ref="SF">
+            <salesforce:batch-to-retrieve>#[vars.batch]</salesforce:batch-to-retrieve>
+            <salesforce:result-id>#[vars.list[0]]</salesforce:result-id>
+        </salesforce:query-result-stream-by-id>
+        <set-variable variableName="mime" value="#[output application/java --- payload.^mimeType]"/>
+        <set-variable variableName="ptype" value="#[output application/java --- typeOf(payload)]"/>
+        <set-payload value="#[payload]" mimeType="text/plain"/>
+        <salesforce:close-job config-ref="SF" jobId="#[vars.job.id]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  batchState: vars.batch.state, infoState: vars.info.state, processed: vars.info.numberRecordsProcessed,
+  listType: typeOf(vars.list), listSize: sizeOf(vars.list), itemType: typeOf(vars.list[0]),
+  mime: vars.mime, ptype: vars.ptype
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bulk1-query-body">
+        <http:listener config-ref="HTTP" path="/bulk1/query/body" allowedMethods="POST"/>
+        <salesforce:create-job config-ref="SF" operation="query" type="Account"/>
+        <set-variable variableName="job" value="#[payload]"/>
+        <salesforce:create-batch-for-query config-ref="SF" jobInfoBatchForQuery="#[vars.job]">
+            <salesforce:batch-query>SELECT Name FROM Account WHERE Name = 'mulay2 master'</salesforce:batch-query>
+        </salesforce:create-batch-for-query>
+        <set-variable variableName="batch" value="#[payload]"/>
+        <flow-ref name="wait-batch"/>
+        <salesforce:query-result-list config-ref="SF">
+            <salesforce:batch-to-retrieve>#[vars.batch]</salesforce:batch-to-retrieve>
+        </salesforce:query-result-list>
+        <salesforce:query-result-stream-by-id config-ref="SF" target="body">
+            <salesforce:batch-to-retrieve>#[vars.batch]</salesforce:batch-to-retrieve>
+            <salesforce:result-id>#[payload[0]]</salesforce:result-id>
+        </salesforce:query-result-stream-by-id>
+        <salesforce:close-job config-ref="SF" jobId="#[vars.job.id]"/>
+        <set-payload value="#[vars.body]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bulk1-result">
+        <http:listener config-ref="HTTP" path="/bulk1/result" allowedMethods="POST"/>
+        <salesforce:create-job config-ref="SF" operation="insert" type="Account"/>
+        <set-variable variableName="job" value="#[payload]"/>
+        <salesforce:create-batch config-ref="SF" jobInfoBatch="#[vars.job]">
+            <salesforce:objects>#[[{Name: "mulay2 bulkr"}, {Name: ""}]]</salesforce:objects>
+        </salesforce:create-batch>
+        <set-variable variableName="batch" value="#[payload]"/>
+        <salesforce:close-job config-ref="SF" jobId="#[vars.job.id]"/>
+        <flow-ref name="wait-batch"/>
+        <set-variable variableName="info" value="#[payload]"/>
+        <salesforce:batch-result config-ref="SF">
+            <salesforce:batch-to-retrieve>#[vars.batch]</salesforce:batch-to-retrieve>
+        </salesforce:batch-result>
+        <set-variable variableName="result" value="#[payload]"/>
+        <salesforce:batch-result-stream config-ref="SF">
+            <salesforce:batch-to-retrieve>#[vars.batch]</salesforce:batch-to-retrieve>
+        </salesforce:batch-result-stream>
+        <set-variable variableName="mime" value="#[output application/java --- payload.^mimeType]"/>
+        <set-variable variableName="ptype" value="#[output application/java --- typeOf(payload)]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+{
+  infoState: vars.info.state, processed: vars.info.numberRecordsProcessed, failed: vars.info.numberRecordsFailed,
+  resultClass: vars.result.^class,
+  result: s({id: vars.result.id, successful: vars.result.successful,
+             items: vars.result.items map ((it) -> (it - "exception") ++ {exceptionMessage: it.exception.message, exceptionCause: it.exception.cause})}),
+  mime: vars.mime, ptype: vars.ptype
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bulk1-csv">
+        <http:listener config-ref="HTTP" path="/bulk1/csv" allowedMethods="POST"/>
+        <salesforce:create-job config-ref="SF" operation="insert" type="Account">
+            <salesforce:create-job-request>#[{contentType: "CSV"}]</salesforce:create-job-request>
+        </salesforce:create-job>
+        <set-variable variableName="job" value="#[payload]"/>
+        <salesforce:create-batch-stream config-ref="SF" jobInfoBatchStream="#[vars.job]">
+            <salesforce:stream>#[output application/csv --- [{Name: "mulay2 csv"}]]</salesforce:stream>
+        </salesforce:create-batch-stream>
+        <set-variable variableName="batch" value="#[payload]"/>
+        <salesforce:close-job config-ref="SF" jobId="#[vars.job.id]"/>
+        <flow-ref name="wait-batch"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{jobContent: vars.job.contentType, batchClass: vars.batch.^class, state: payload.state, processed: payload.numberRecordsProcessed, failed: payload.numberRecordsFailed}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="cleanup">
+        <http:listener config-ref="HTTP" path="/cleanup" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="a">
+            <salesforce:salesforce-query>SELECT Id FROM Account WHERE Name LIKE 'mulay2 %'</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:query config-ref="SF" target="c">
+            <salesforce:salesforce-query>SELECT Id FROM Contact WHERE LastName LIKE 'mulay2%'</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:delete config-ref="SF"><salesforce:ids>#[(vars.c map $.Id) ++ (vars.a map $.Id)]</salesforce:ids></salesforce:delete>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{deleted: sizeOf(payload.items), ok: payload.successful}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+</mule>

@@ -1,0 +1,239 @@
+(ns mulay.lib.sqlfile (:require [clay.bytes :as bytes] [mulay.lib.ieee :as ieee]))
+
+(def MALFORMED "database disk image is malformed")
+
+(defvariant Val (VNull) (VInt n: Int) (VReal x: Float) (VText s: Str) (VBlob s: Str))
+
+(defrecord Db [data: Str page-size: Int usable: Int pages: Int])
+(defrecord Row [rowid: Int vals: Vec(Val)])
+(defrecord SchemaRow [type: Str name: Str tbl-name: Str root: Int sql: Str])
+
+(defn get-varint Values(Int Int Bool) [b: &Str pos: Int]
+  (loop [i 0 v 0]
+    (cond
+      (>= (+ pos i) (count b)) (values 0 pos false)
+      (= i 8) (values (bit-or (bit-shift-left v 8) (nth b (+ pos 8))) (+ pos 9) true)
+      :else
+      (let [c (nth b (+ pos i)) v2 (bit-or (bit-shift-left v 7) (bit-and c 127))]
+        (if (< c 128) (values v2 (+ pos (+ i 1)) true) (recur (+ i 1) v2))))))
+
+(defn serial-len Int [t: Int]
+  (cond (< t 5) t (= t 5) 6 (or (= t 6) (= t 7)) 8 (< t 12) 0 :else (quot (- t 12) 2)))
+
+(defn- be-signed Int [b: &Str pos: Int n: Int]
+  (let [v (bytes/unpack b pos n true)]
+    (if (and (< n 8) (>= v (bit-shift-left 1 (- (* 8 n) 1)))) (- v (bit-shift-left 1 (* 8 n))) v)))
+
+(defn int-at Int [b: &Str pos: Int t: Int]
+  (cond (= t 8) 0 (= t 9) 1 (> (+ pos (serial-len t)) (count b)) 0 :else (be-signed b pos (serial-len t))))
+
+(defn value-at Val [b: &Str pos: Int t: Int]
+  (cond (= t 0) (->VNull)
+        (> (+ pos (serial-len t)) (count b)) (->VNull)
+        (<= t 6) (->VInt (be-signed b pos (serial-len t)))
+        (= t 7) (->VReal (ieee/bits->double (bytes/unpack b pos 8 true)))
+        (= t 8) (->VInt 0)
+        (= t 9) (->VInt 1)
+        (= (mod t 2) 0) (->VBlob (subs b pos (+ pos (serial-len t))))
+        :else (->VText (subs b pos (+ pos (serial-len t))))))
+
+(defn decode-record Values(Vec(Val) Bool) [p: &Str]
+  (let [[hlen p1 ok] (get-varint p 0)
+        none: Vec(Val) []]
+    (if (or (not ok) (< hlen p1) (> hlen (count p))) (values none false)
+      (loop [hp p1 dp hlen acc none]
+        (if (>= hp hlen) (values acc (= hp hlen))
+          (let [[t hp2 ok2] (get-varint p hp)
+                n (serial-len t)]
+            (if (or (not ok2) (> hp2 hlen) (= t 10) (= t 11) (< t 0) (> n (- (count p) dp))) (values acc false)
+              (recur hp2 (+ dp n) (conj acc (value-at p dp t))))))))))
+
+(defn put-varint Str [n: Int]
+  (if (and (>= n 0) (< n 128)) (chr n)
+    (if (or (< n 0) (>= n 72057594037927936))
+      (let [head (loop [i 0 out ""] (if (>= i 8) out
+                                       (recur (+ i 1) (str out (chr (bit-or 128 (bit-and (unsigned-bit-shift-right n (- 57 (* 7 i))) 127)))))))]
+        (str head (chr (bit-and n 255))))
+      (let [groups (loop [v n acc: Vec(Int) []] (if (= v 0) acc (recur (unsigned-bit-shift-right v 7) (conj acc (bit-and v 127)))))]
+        (loop [i (- (count groups) 1) out ""]
+          (if (< i 0) out (recur (- i 1) (str out (chr (if (> i 0) (bit-or 128 (nth groups i)) (nth groups i)))))))))))
+
+(defn- int-type Int [n: Int]
+  (cond (= n 0) 8 (= n 1) 9
+        (and (>= n -128) (< n 128)) 1
+        (and (>= n -32768) (< n 32768)) 2
+        (and (>= n -8388608) (< n 8388608)) 3
+        (and (>= n -2147483648) (< n 2147483648)) 4
+        (and (>= n -140737488355328) (< n 140737488355328)) 5
+        :else 6))
+
+(defn- serial-of Int [v: &Val]
+  (match v
+    (VNull) 0
+    (VInt n) (int-type n)
+    (VReal x) 7
+    (VText s) (+ 13 (* 2 (count s)))
+    (VBlob s) (+ 12 (* 2 (count s)))))
+
+(defn encode-record Str [vals: &Vec(Val)]
+  (let [n (count vals)
+        hdr (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (add-varint out (serial-of (nth vals i))))))
+        n0 (+ (count hdr) 1)
+        hlen (if (< n0 128) n0 (+ (count hdr) (count (put-varint (+ (count hdr) 2)))))
+        head (add-varint "" hlen)
+        out0 (str head hdr)]
+    (loop [i 0 out out0] (if (>= i n) out (recur (+ i 1) (add-body out (nth vals i)))))))
+
+(defn- add-varint Str [out: Str n: Int]
+  (if (and (>= n 0) (< n 128)) (str out (chr n))
+    (let [v (put-varint n)] (str out v))))
+
+(defn- add-body Str [out: Str v: &Val]
+  (match v
+    (VInt n) (let [t (int-type n)] (if (or (= t 8) (= t 9)) out (add-be out n (serial-len t))))
+    (VReal x) (add-be out (ieee/double->bits x) 8)
+    (VText s) (str out s)
+    (VBlob s) (str out s)
+    _ out))
+
+(defn- add-be Str [out: Str n: Int k: Int]
+  (loop [i (- k 1) o out] (if (< i 0) o (recur (- i 1) (str o (chr (bit-and (unsigned-bit-shift-right n (* 8 i)) 255)))))))
+
+(defn open-bytes Values(Db Str) [data: Str]
+  (let [n (count data)]
+    (if (or (< n 100) (not= (subs data 0 16) (str "SQLite format 3" (chr 0))))
+      (values (->Db "" 0 0 0) "file is not a database")
+      (let [ps0 (bytes/unpack data 16 2 true)
+            ps (if (= ps0 1) 65536 ps0)
+            reserved (nth data 20)
+            in-header (bytes/unpack data 28 4 true)
+            enc (bytes/unpack data 56 4 true)
+            pages (if (and (> in-header 0) (= (bytes/unpack data 24 4 true) (bytes/unpack data 92 4 true))) in-header (quot n (max ps 1)))]
+        (cond
+          (or (< ps 512) (> ps 65536) (not= (bit-and ps (- ps 1)) 0)) (values (->Db "" 0 0 0) "file is not a database")
+          (or (= (nth data 18) 2) (= (nth data 19) 2)) (values (->Db "" 0 0 0) "unsupported: WAL database")
+          (and (not= enc 0) (not= enc 1)) (values (->Db "" 0 0 0) "unsupported: UTF-16 database")
+          (< (- ps reserved) 480) (values (->Db "" 0 0 0) MALFORMED)
+          :else (values (->Db data ps (- ps reserved) (min pages (quot n ps))) ""))))))
+
+(defn- page-off Int [db: &Db n: Int]
+  (if (or (< n 1) (> n (:pages db))) -1 (* (- n 1) (:page-size db))))
+
+(defn- hdr-off Int [db: &Db n: Int] (+ (page-off db n) (if (= n 1) 100 0)))
+
+(defn- u16 Int [db: &Db pos: Int] (bytes/unpack (:data db) pos 2 true))
+(defn- u32 Int [db: &Db pos: Int] (bytes/unpack (:data db) pos 4 true))
+
+(defn- local-size Int [db: &Db p: Int table-leaf: Bool]
+  (let [u (:usable db)
+        x (if table-leaf (- u 35) (- (quot (* (- u 12) 64) 255) 23))
+        m (- (quot (* (- u 12) 32) 255) 23)
+        k (+ m (mod (- p m) (- u 4)))]
+    (cond (<= p x) p (<= k x) k :else m)))
+
+(defn- read-payload Values(Str Bool) [db: &Db pos: Int p: Int table-leaf: Bool pend: Int]
+  (let [local (local-size db p table-leaf)
+        d (:data db)]
+    (cond
+      (or (< p 0) (> (+ pos local) pend)) (values "" false)
+      (= local p) (values (subs d pos (+ pos p)) true)
+      (> (+ pos (+ local 4)) pend) (values "" false)
+      :else
+      (let [head (subs d pos (+ pos local))]
+        (loop [out head next (u32 db (+ pos local)) hops 0]
+          (cond
+            (>= (count out) p) (values out true)
+            (or (> hops (:pages db)) (< (page-off db next) 0)) (values out false)
+            :else
+            (let [off (page-off db next)
+                  k (min (- p (count out)) (- (:usable db) 4))
+                  part (subs d (+ off 4) (+ off (+ 4 k)))]
+              (recur (str out part) (u32 db off) (+ hops 1)))))))))
+
+(defn- cells Values(Int Vec(Int) Int Bool) [db: &Db n: Int]
+  (let [h (hdr-off db n) base (page-off db n) none: Vec(Int) []]
+    (if (or (< base 0) (> (+ h 12) (+ base (:usable db)))) (values 0 none 0 false)
+      (let [kind (nth (:data db) h)
+            leaf (or (= kind 10) (= kind 13))
+            ncell (u16 db (+ h 3))
+            ptrs (+ h (if leaf 8 12))
+            right (if leaf 0 (u32 db (+ h 8)))
+            end (+ base (:usable db))]
+        (if (or (not (or (= kind 2) (= kind 5) (= kind 10) (= kind 13))) (> (+ ptrs (* 2 ncell)) end)) (values kind none 0 false)
+          (loop [i 0 acc none]
+            (if (>= i ncell) (values kind acc right true)
+              (let [c (+ base (u16 db (+ ptrs (* 2 i))))]
+                (if (or (< c ptrs) (> (+ c 4) end)) (values kind acc right false) (recur (+ i 1) (conj acc c)))))))))))
+
+(defn table-rows Values(Vec(Row) Str) [db: &Db root: Int]
+  (let [none: Vec(Row) []]
+    (loop [stack [root] acc none steps 0]
+      (if (= (count stack) 0) (values acc "")
+        (let [pg (nth stack (- (count stack) 1))
+              rest (pop-last stack)
+              [kind cs right ok] (cells db pg)]
+          (cond
+            (or (not ok) (> steps (:pages db))) (values acc MALFORMED)
+            (= kind 13)
+            (let [[acc2 ok2] (leaf-rows db pg cs acc)] (if ok2 (recur rest acc2 (+ steps 1)) (values acc2 MALFORMED)))
+            (= kind 5)
+            (let [kids (loop [i (- (count cs) 1) k (conj rest right)]
+                         (if (< i 0) k (recur (- i 1) (conj k (u32 db (nth cs i))))))]
+              (recur kids acc (+ steps 1)))
+            :else (values acc MALFORMED)))))))
+
+(defn- pop-last Vec(Int) [v: &Vec(Int)] (loop [i 0 acc: Vec(Int) []] (if (>= i (- (count v) 1)) acc (recur (+ i 1) (conj acc (nth v i))))))
+
+(defn- leaf-rows Values(Vec(Row) Bool) [db: &Db pg: Int cs: &Vec(Int) acc0: Vec(Row)]
+  (let [end (+ (page-off db pg) (:usable db))]
+    (loop [i 0 acc acc0]
+      (if (>= i (count cs)) (values acc true)
+        (let [[p p1 o1] (get-varint (:data db) (nth cs i))
+              [rowid p2 o2] (get-varint (:data db) p1)
+              [payload o3] (if (and o1 o2) (read-payload db p2 p true end) (values "" false))
+              [vals o4] (if o3 (decode-record payload) (values [] false))]
+          (if (not (and o1 o2 o3 o4)) (values acc false) (recur (+ i 1) (conj acc (->Row rowid vals)))))))))
+
+(defn index-keys Values(Vec(Vec(Val)) Str) [db: &Db root: Int]
+  (let [none: Vec(Vec(Val)) []]
+    (loop [stack [root] acc none steps 0]
+      (if (= (count stack) 0) (values acc "")
+        (let [top (nth stack (- (count stack) 1))
+              rest (pop-last stack)]
+          (if (< top 0)
+            (let [[k ok] (index-cell db (- (- 0 top) 1) false)] (if ok (recur rest (conj acc k) steps) (values acc MALFORMED)))
+            (let [[kind cs right ok] (cells db top)]
+              (cond
+                (or (not ok) (> steps (:pages db))) (values acc MALFORMED)
+                (= kind 10)
+                (let [[acc2 ok2] (loop [i 0 a acc]
+                                   (if (>= i (count cs)) (values a true)
+                                     (let [[k ok3] (index-cell db (nth cs i) true)] (if ok3 (recur (+ i 1) (conj a k)) (values a false)))))]
+                  (if ok2 (recur rest acc2 (+ steps 1)) (values acc2 MALFORMED)))
+                (= kind 2)
+                (let [kids (loop [i (- (count cs) 1) k (conj rest right)]
+                             (if (< i 0) k (recur (- i 1) (conj (conj k (- 0 (+ (nth cs i) 1))) (u32 db (nth cs i))))))]
+                  (recur kids acc (+ steps 1)))
+                :else (values acc MALFORMED)))))))))
+
+(defn- index-cell Values(Vec(Val) Bool) [db: &Db c: Int leaf: Bool]
+  (let [start (if leaf c (+ c 4))
+        pg-end (+ (* (quot c (:page-size db)) (:page-size db)) (:usable db))
+        [p p1 o1] (get-varint (:data db) start)
+        [payload o2] (if o1 (read-payload db p1 p false pg-end) (values "" false))
+        [vals o3] (if o2 (decode-record payload) (values [] false))]
+    (values vals (and o1 o2 o3))))
+
+(defn- text-of Str [v: &Val] (match v (VText s) (str s) _ ""))
+(defn- int-of Int [v: &Val] (match v (VInt n) n _ 0))
+
+(defn schema Values(Vec(SchemaRow) Str) [db: &Db]
+  (let [[rows e] (table-rows db 1)
+        none: Vec(SchemaRow) []]
+    (if (not= e "") (values none e)
+      (loop [i 0 acc none]
+        (if (>= i (count rows)) (values acc "")
+          (let [vs (:vals (nth rows i))]
+            (if (< (count vs) 5) (values acc MALFORMED)
+              (recur (+ i 1) (conj acc (->SchemaRow (text-of (nth vs 0)) (text-of (nth vs 1)) (text-of (nth vs 2))
+                                                   (int-of (nth vs 3)) (text-of (nth vs 4))))))))))))

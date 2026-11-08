@@ -1,0 +1,111 @@
+(ns legacy-test (:require [mulay.conn.mcp :as mcp] [clay.httpmsg :as hm] [clay.string :as str]))
+
+;; MCP の旧式の SSE トランスポートのサーバー (sse-server-connection)。期待値は実 Mule (mcp 1.5.0) の記録 (test/fixtures/apps/mcp-sse)。
+
+(def TOOLS [(mcp/->Tool "add" "Adds" "{\"type\":\"object\"}" 0)])
+(def SRV (mcp/->Server "LS" "L" "/sse" true "Sse" "1.0.0" TOOLS [] [] [(hm/->Header "X-M" "2")] 0 [] "/message" [(hm/->Header "X-S" "1")]))
+
+(def JSON-CT "application/json")
+(def INIT "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\"}}")
+(def PING "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}")
+(def INITED "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+
+(defn- hv Str [a: &mcp/Answer name: &Str]
+  (match (hm/header-of (:headers a) name) (Some v) v (None) "<none>"))
+
+(defn- sid-of Str [] (let [[resp sid] (mcp/legacy-connect SRV)] sid))
+
+(defn- post mcp/Step [sid: &Str ct: &Str body: &Str] (mcp/legacy-begin SRV "POST" sid ct body))
+
+(deftest connect-opens-an-uninitialized-session
+  (let [[resp sid] (mcp/legacy-connect SRV)]
+    (is (= (:status resp) 200))
+    (is (= (count sid) 36))
+    (is (= (count (mcp/session-ver-of SRV sid)) 1))
+    (is (= (nth (mcp/session-ver-of SRV sid) 0) ""))))
+
+(deftest only-post-is-handled-on-the-message-path
+  (is (= (:status (:answer (mcp/legacy-begin SRV "GET" "x" JSON-CT ""))) 405)))
+
+(deftest missing-and-unknown-session-ids
+  (let [a (:answer (post "" JSON-CT PING))
+        b (:answer (post "zzz" JSON-CT PING))]
+    (is (= (:status a) 400))
+    (is (= (:body a) "Missing session id"))
+    (is (= (:status b) 503))
+    (is (= (:body b) "No active SSE connection for sessionId: zzz"))))
+
+(deftest content-type-must-be-json
+  (let [sid (sid-of)
+        a (:answer (post sid "text/plain" PING))
+        b (:answer (post sid "" PING))]
+    (is (= (:status a) 400))
+    (is (= (:body a) "Unsupported content type: text/plain"))
+    (is (= (:body b) "Unsupported content type: null"))
+    (is (= (:status (:answer (post sid "application/json; charset=UTF-8" INITED))) 202))))
+
+(deftest bodies-that-are-not-messages
+  (let [sid (sid-of)]
+    (is (= (:body (:answer (post sid JSON-CT ""))) "Invalid message format"))
+    (is (= (:body (:answer (post sid JSON-CT "[{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}]"))) "Invalid message format"))
+    (is (= (:body (:answer (post sid JSON-CT "{bad"))) "Invalid message format"))
+    (is (= (:body (:answer (post sid JSON-CT "{\"jsonrpc\":\"2.0\",\"id\":9}"))) "Invalid message format"))
+    (is (= (:status (:answer (post sid JSON-CT "{bad"))) 400))))
+
+(deftest initialize-is-accepted-and-sets-the-version
+  (let [sid (sid-of)
+        a (:answer (post sid JSON-CT INIT))]
+    (is (= (:status a) 202))
+    (is (= (:body a) "Accepted"))
+    (is (= (hv a "mcp-protocol-version") "2024-11-05"))
+    (is (= (hv a "x-m") "2"))
+    (is (= (nth (mcp/session-ver-of SRV sid) 0) "2024-11-05"))))
+
+(deftest messages-after-initialize-are-accepted
+  (let [sid (sid-of)
+        z (post sid JSON-CT INIT)
+        n (:answer (post sid JSON-CT INITED))
+        p (:answer (post sid JSON-CT PING))]
+    (is (= (:status n) 202))
+    (is (= (:status p) 202))
+    (is (= (hv p "mcp-protocol-version") "2024-11-05"))))
+
+(deftest tools-call-runs-the-flow-and-then-replies
+  (let [sid (sid-of)
+        z (post sid JSON-CT INIT)
+        st (post sid JSON-CT "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"add\",\"arguments\":{}}}")
+        a (mcp/legacy-reply SRV sid (mcp/finish SRV st [(mcp/->Item "text" "3" "" "" "" [] "")] false))]
+    (is (= (:kind st) "call"))
+    (is (= (:sid st) sid))
+    (is (= (:status a) 202))
+    (is (= (:body a) "Accepted"))))
+
+(deftest a-request-before-initialize-is-an-error
+  (let [sid (sid-of)
+        a (:answer (post sid JSON-CT PING))]
+    (is (= (:status a) 500))
+    (is (str/includes? (:body a) "hasn't been initialized yet"))))
+
+(deftest session-lookup-comes-before-the-body-check
+  (let [a (:answer (post "zzz" JSON-CT "{bad"))]
+    (is (= (:status a) 503))))
+
+;; on-new-session-listener 付きの SSE: 接続のとき sessionId を決めてからフローを流し、通れば同じ sessionId でストリームを開く
+(def SRV-NS (mcp/->Server "LN" "L" "/sse" true "Sse" "1.0.0" [] [] [] [] 0 [3] "/message" []))
+
+(deftest legacy-session-step-runs-the-new-session-flow
+  (let [st (mcp/legacy-session SRV-NS "sid-1")]
+    (is (= (:kind st) "session"))
+    (is (= (:tool st) 3))
+    (is (= (:sid st) "sid-1"))))
+
+(deftest legacy-connect-as-uses-the-given-session-id
+  (let [[resp sid] (mcp/legacy-connect-as SRV "fixed-id")]
+    (is (= sid "fixed-id"))
+    (is (= (:status resp) 200))
+    (is (= (count (mcp/session-ver-of SRV "fixed-id")) 1))))
+
+(deftest finishing-a-legacy-session-opens-nothing-and-signals-go-ahead
+  (let [a (mcp/finish-session SRV-NS (mcp/legacy-session SRV-NS "sid-2"))]
+    (is (= (:status a) 0))
+    (is (= (count (mcp/session-ver-of SRV-NS "sid-2")) 0))))

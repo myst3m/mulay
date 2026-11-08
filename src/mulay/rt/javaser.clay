@@ -1,0 +1,141 @@
+(ns mulay.rt.javaser (:require [mulay.lib.ieee :as ie] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as drt]))
+
+(defrecord- W [out: Str next: Int classes: Vec(Str) handles: Vec(Int)])
+
+(def BASE 8257536)
+
+(defn- b1 W [w: W x: Int] (assoc w :out (str (:out w) (chr (bit-and x 255)))))
+(defn- b2 W [w: W x: Int] (b1 (b1 w (bit-shift-right x 8)) x))
+(defn- b4 W [w: W x: Int] (b2 (b2 w (bit-shift-right x 16)) x))
+(defn- b8 W [w: W x: Int] (b4 (b4 w (bit-shift-right x 32)) x))
+(defn- raw W [w: W s: &Str] (assoc w :out (str (:out w) s)))
+
+(defn- assign W [w: W] (assoc w :next (+ (:next w) 1)))
+
+(defn- mutf8 Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (cond
+          (= c 0) (recur (+ i 1) (str out (chr 192) (chr 128)))
+          (and (>= c 240) (< (+ i 3) (+ (count s) 0)))
+          (let [cp (+ (* (bit-and c 7) 262144) (* (bit-and (nth s (+ i 1)) 63) 4096) (* (bit-and (nth s (+ i 2)) 63) 64) (bit-and (nth s (+ i 3)) 63))
+                u (- cp 65536)
+                hi (+ 55296 (bit-shift-right u 10))
+                lo (+ 56320 (bit-and u 1023))]
+            (recur (+ i 4) (str out (chr (+ 224 (bit-shift-right hi 12))) (chr (+ 128 (bit-and (bit-shift-right hi 6) 63))) (chr (+ 128 (bit-and hi 63)))
+                                (chr (+ 224 (bit-shift-right lo 12))) (chr (+ 128 (bit-and (bit-shift-right lo 6) 63))) (chr (+ 128 (bit-and lo 63))))))
+          :else (recur (+ i 1) (str out (chr c))))))))
+
+(defn- wstr W [w: W s: &Str]
+  (let [m (mutf8 s)]
+    (if (<= (count m) 65535)
+      (raw (b2 (assign (b1 w 116)) (count m)) m)
+      (raw (b8 (assign (b1 w 124)) (count m)) m))))
+
+(defrecord- Desc [name: Str suid-hi: Int suid-lo: Int flags: Int fields: Vec(Str) super: Str])
+
+(defn- desc-of Vec(Desc) [name: &Str]
+  (cond
+    (= name "java.lang.Number") [(->Desc "java.lang.Number" 2259457309 194306187 2 [] "")]
+    (= name "java.lang.Integer") [(->Desc "java.lang.Integer" 316842148 4152461112 2 ["I value"] "java.lang.Number")]
+    (= name "java.lang.Long") [(->Desc "java.lang.Long" 999023760 3431932895 2 ["J value"] "java.lang.Number")]
+    (= name "java.lang.Double") [(->Desc "java.lang.Double" 2159264330 694942468 2 ["D value"] "java.lang.Number")]
+    (= name "java.lang.Boolean") [(->Desc "java.lang.Boolean" 3441455744 3583834862 2 ["Z value"] "")]
+    (= name "java.util.ArrayList") [(->Desc "java.util.ArrayList" 2021773853 2579980701 3 ["I size"] "")]
+    (= name "java.util.HashMap") [(->Desc "java.util.HashMap" 84400833 3273023697 3 ["F loadFactor" "I threshold"] "")]
+    (= name "java.util.LinkedHashMap") [(->Desc "java.util.LinkedHashMap" 885018204 275562747 2 ["Z accessOrder"] "java.util.HashMap")]
+    (= name "[B") [(->Desc "[B" 2901612536 101209312 2 [] "")]
+    (= name "[I") [(->Desc "[I" 1304059942 1995092645 2 [] "")]
+    :else []))
+
+(defn- class-desc W [w: W name: &Str]
+  (if (= name "") (b1 w 112)
+    (let [cs (:classes w)
+          k (loop [i 0] (if (>= i (count cs)) -1 (if (= (nth cs i) name) i (recur (+ i 1)))))]
+      (if (>= k 0) (b4 (b1 w 113) (+ BASE (nth (:handles w) k)))
+        (let [d (nth (desc-of name) 0)
+              w1 (b1 w 114)
+              h (:next w1)
+              w2 (assoc (assoc (assign w1) :classes (conj (:classes w1) (str name))) :handles (conj (:handles w1) h))
+              w3 (raw (b2 w2 (count name)) name)
+              w4 (b4 (b4 w3 (:suid-hi d)) (:suid-lo d))
+              w5 (b2 (b1 w4 (:flags d)) (count (:fields d)))
+              w6 (loop [i 0 x w5]
+                   (if (>= i (count (:fields d))) x
+                     (let [f (nth (:fields d) i)
+                           nm (subs f 2 (count f))]
+                       (recur (+ i 1) (raw (b2 (b1 x (nth f 0)) (count nm)) nm)))))]
+          (class-desc (b1 w6 120) (:super d)))))))
+
+(defn- new-object W [w: W cls: &Str] (assign (class-desc (b1 w 115) cls)))
+
+(defn- wnum W [w: W n: &num/Num]
+  (let [[i ie] (num/to-int n)]
+    (if (and (num/integer? n) (= ie ""))
+      (if (and (>= i -2147483648) (<= i 2147483647))
+        (b4 (new-object w "java.lang.Integer") i)
+        (b8 (new-object w "java.lang.Long") i))
+      (b8 (new-object w "java.lang.Double") (ie/double->bits (num/to-float n))))))
+
+(defn- meta-class Str [x: &v/Val]
+  (match x
+    (v/VMeta y fs) (let [c (v/obj-get fs "class")] (if (= (count c) 0) "" (match (nth c 0) (v/VStr s) (str s) _ "")))
+    _ ""))
+
+(defn- wints W [w: W xs: &Vec(v/Val)]
+  (let [w1 (b4 (assign (class-desc (b1 w 117) "[I")) (count xs))]
+    (loop [i 0 a w1]
+      (if (>= i (count xs)) a
+        (let [n (match (v/unmeta (nth xs i)) (v/VInt k) k (v/VNum m) (let [[k e] (num/to-int m)] k) _ 0)]
+          (recur (+ i 1) (b4 a n)))))))
+
+(defn- wval W [w: W x0: &v/Val]
+  (let [x (v/unmeta x0)
+        cls (meta-class x0)]
+    (match x
+      (v/VArr xs) (if (= cls "int[]") (wints w xs) (warr w xs))
+      (v/VNull) (b1 w 112)
+      (v/VStr s) (wstr w s)
+      (v/VBool b) (b1 (new-object w "java.lang.Boolean") (if b 1 0))
+      (v/VNum n) (wnum w n)
+      (v/VInt n-i) (let [n (num/from-int n-i)] (wnum w n))
+      (v/VRange a b) (warr w (v/items x))
+      (v/VObj fs) (wmap w fs)
+      (v/VBin bs) (raw (b4 (assign (class-desc (b1 w 117) "[B")) (count bs)) bs)
+      _ (let [[s e] (drt/to-text x)] (wstr w s)))))
+
+(defn- warr W [w: W xs: &Vec(v/Val)]
+  (let [w1 (b4 (new-object w "java.util.ArrayList") (count xs))
+        w2 (b4 (b1 (b1 w1 119) 4) (count xs))
+        w3 (loop [i 0 a w2] (if (>= i (count xs)) a (recur (+ i 1) (wval a (nth xs i)))))]
+    (b1 w3 120)))
+
+(defn- dedupe-keys Vec(v/Field) [fs: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(v/Field) [] pos: Map(Str Int) {}]
+    (if (>= i (count fs)) acc
+      (let [f (nth fs i)
+            nm (:name (:key f))]
+        (if (contains? pos nm) (recur (+ i 1) (assoc acc (get! pos nm) f) pos)
+          (let [at (count acc)] (recur (+ i 1) (conj acc f) (assoc pos nm at))))))))
+
+(defn- capacity Int [n: Int]
+  (loop [c 16] (if (> n (quot (* c 3) 4)) (recur (* c 2)) c)))
+
+(defn- wmap W [w: W fs0: &Vec(v/Field)]
+  (let [fs (dedupe-keys fs0)
+        n (count fs)
+        cap (capacity n)
+        thr (if (= n 0) 0 (quot (* cap 3) 4))
+        w1 (b4 (b4 (new-object w "java.util.LinkedHashMap") 1061158912) thr)
+        w2 (b4 (b4 (b1 (b1 w1 119) 8) cap) n)
+        w3 (loop [i 0 a w2]
+             (if (>= i n) a
+               (let [f (nth fs i)]
+                 (recur (+ i 1) (wval (wstr a (:name (:key f))) (:value f))))))]
+    (b1 (b1 w3 120) 0)))
+
+(defn serialize Str [x: &v/Val]
+  (let [z: Vec(Str) [] zi: Vec(Int) []
+        w (wval (->W (str (chr 172) (chr 237) (chr 0) (chr 5)) 0 z zi) x)]
+    (:out w)))

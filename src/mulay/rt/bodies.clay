@@ -1,0 +1,19 @@
+(ns mulay.rt.bodies (:require [mulay.lib.spool :as spool] [mulay.rt.stream :as stream] [mulay.dw.val :as v]))
+
+(def PIECE 65536)
+(def IN-MEMORY 524288)
+
+(defn- source stream/Source [sp: spool/Spool base: Bool]
+  (let [off (atom 0) s1 sp]
+    (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int]
+                       (loop [k 0 rows: Vec(v/Val) []]
+                         (if (or (>= k n) (>= k 16)) (values rows (>= (deref off) (spool/size s1)) "")
+                           (let [[p e] (spool/read-at s1 (deref off) PIECE)]
+                             (cond (not= e "") (values rows true e)
+                                   (= (count p) 0) (values rows true "")
+                                   :else (let [z (swap! off (fn Int [x: Int] (+ x (count p))))] (recur (+ k 1) (conj rows (v/->VStr p)))))))))
+                     (fn Int [broken: Bool] (if base (let [e (spool/delete s1)] 0) 0))
+                     false)))
+
+(defn open Str [owner: &Str sp: spool/Spool]
+  (let [s1 sp] (stream/open-repeatable owner (fn stream/Source [base: Bool] (source s1 base)))))

@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18166"/>
+    </http:listener-config>
+
+    <http:request-config name="Basic">
+        <http:request-connection host="localhost" port="18166">
+            <http:authentication>
+                <http:basic-authentication username="user" password="p:ss ü"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <http:request-config name="BasicLazy">
+        <http:request-connection host="localhost" port="18166">
+            <http:authentication>
+                <http:basic-authentication username="user" password="pw" preemptive="false"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <http:request-config name="BasicExpr">
+        <http:request-connection host="localhost" port="18166">
+            <http:authentication>
+                <http:basic-authentication username="#[vars.u]" password="#[vars.p]"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <http:request-config name="Digest">
+        <http:request-connection host="localhost" port="18166">
+            <http:authentication>
+                <http:digest-authentication username="dig" password="secret"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <http:request-config name="DigestLazy">
+        <http:request-connection host="localhost" port="18166">
+            <http:authentication>
+                <http:digest-authentication username="dig" password="secret" preemptive="false"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <!-- 裏側: 受け取った Authorization を返す。?challenge=basic|digest なら、Authorization が無いとき (digest は挑戦の nonce を
+         使っていないときも) 401 と WWW-Authenticate -->
+    <flow name="back">
+        <http:listener config-ref="L" path="/back">
+            <http:response statusCode="#[vars.status default 200]">
+                <http:headers><![CDATA[#[vars.hdrs default {}]]]></http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.status default 500]">
+                <http:headers><![CDATA[#[vars.hdrs default {}]]]></http:headers>
+            </http:error-response>
+        </http:listener>
+        <set-variable variableName="ch" value="#[attributes.queryParams.challenge default '']"/>
+        <choice>
+            <when expression="#[vars.ch != '' and (attributes.headers.authorization == null or (vars.ch == 'digest' and not (attributes.headers.authorization contains 'nonce=&quot;abc123&quot;')))]">
+                <set-variable variableName="status" value="#[401]"/>
+                <set-variable variableName="hdrs" value='#[if (vars.ch == "digest") (if (attributes.queryParams.plain == "1") {"WWW-Authenticate": "Digest realm=\"r2\", nonce=\"abc123\""} else {"WWW-Authenticate": "Digest realm=\"r1\", qop=\"auth\", nonce=\"abc123\", opaque=\"op9\""}) else {"WWW-Authenticate": "Basic realm=\"r1\""}]'/>
+                <set-payload value="need auth"/>
+            </when>
+            <otherwise>
+                <set-payload value='#[output application/json --- {
+  auth: (attributes.headers.authorization default "")
+}]'/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <sub-flow name="out">
+        <set-payload value='#[output application/json --- {status: attributes.statusCode, body: payload}]'/>
+    </sub-flow>
+
+    <flow name="basic">
+        <http:listener config-ref="L" path="/t/basic"/>
+        <http:request config-ref="Basic" method="GET" path="/back"/>
+        <flow-ref name="out"/>
+    </flow>
+
+    <flow name="basic-lazy">
+        <http:listener config-ref="L" path="/t/basic-lazy"/>
+        <http:request config-ref="BasicLazy" method="GET" path="/back">
+            <http:query-params><![CDATA[#[{challenge: attributes.queryParams.challenge default ""}]]]></http:query-params>
+            <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+        </http:request>
+        <flow-ref name="out"/>
+    </flow>
+
+    <flow name="basic-expr">
+        <http:listener config-ref="L" path="/t/basic-expr"/>
+        <set-variable variableName="u" value="#[attributes.queryParams.u]"/>
+        <set-variable variableName="p" value="#[attributes.queryParams.p]"/>
+        <http:request config-ref="BasicExpr" method="GET" path="/back"/>
+        <flow-ref name="out"/>
+    </flow>
+
+    <flow name="basic-header-wins">
+        <http:listener config-ref="L" path="/t/basic-header"/>
+        <http:request config-ref="Basic" method="GET" path="/back">
+            <http:headers><![CDATA[#[{Authorization: "Bearer mine"}]]]></http:headers>
+        </http:request>
+        <flow-ref name="out"/>
+    </flow>
+
+    <flow name="digest">
+        <http:listener config-ref="L" path="/t/digest"/>
+        <http:request config-ref="Digest" method="GET" path="/back">
+            <http:query-params><![CDATA[#[{challenge: "digest", plain: attributes.queryParams.plain default "0"}]]]></http:query-params>
+            <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+        </http:request>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="digest-lazy">
+        <http:listener config-ref="L" path="/t/digest-lazy"/>
+        <http:request config-ref="DigestLazy" method="POST" path="/back">
+            <http:body><![CDATA[#["x"]]]></http:body>
+            <http:query-params><![CDATA[#[{challenge: "digest", q: "1"}]]]></http:query-params>
+            <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+        </http:request>
+        <flow-ref name="out"/>
+    </flow>
+</mule>

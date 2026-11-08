@@ -1,0 +1,747 @@
+(ns mulay.dw.fmt.xml
+  (:require [mulay.lib.host :as host] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.fmt.props :as p] [mulay.lib.xml :as x] [mulay.lib.regex :as rx]
+            [mulay.dw.fmt.scalar :as sc] [mulay.dw.err :as dwe] [mulay.dw.fmt.out :as fo]
+            [clay.base64 :as b64] [clay.charset :as ccs] [clay.string :as str] [clay.utf8 :as u8]))
+
+(defrecord ROpts [null-on: Str])
+
+(defn- ws-only? Bool [s: &Str]
+  (loop [i 0] (if (>= i (count s)) true
+                (let [c (nth s i)] (if (or (= c 32) (= c 9) (= c 10) (= c 13)) (recur (+ i 1)) false)))))
+
+(defn- ns-v Vec(v/Ns) [uri: Str pre: Str]
+  (if (= uri "") [] [(v/->Ns pre uri)]))
+
+(defn- tok-key v/Key [r: &x/XmlReader]
+  (let [[uri pre loc] (x/token-name r)
+        na (x/token-attr-count r)
+        attrs (loop [i 0 acc: Vec(v/Attr) []]
+                (if (>= i na) acc
+                  (let [[plain au ap al av] (x/token-attr r i)]
+                    (recur (+ i 1) (if plain (conj acc (v/->Attr (ns-v au ap) al (v/->VStr av))) acc)))))]
+    (v/->Key (ns-v uri pre) loc attrs)))
+
+(defn- attr-too-long? Bool [r: &x/XmlReader mx: Int]
+  (and (>= mx 0)
+       (loop [i 0]
+         (if (>= i (x/token-attr-count r)) false
+           (let [[plain au ap al av] (x/token-attr r i)]
+             (if (and plain (> (u8/codepoint-count av) mx)) true (recur (+ i 1))))))))
+
+(defn- cdata-str v/Val [t: Str cd: Bool]
+  (if cd (v/->VMeta (v/->VStr t) [(v/field "cdata" (v/bool-v true))]) (v/->VStr t)))
+
+(defn- text-val v/Val [t: Str cdata: Bool o: &ROpts]
+  (let [nul (case (:null-on o)
+              "none" false
+              "empty" (= (count t) 0)
+              (ws-only? t))]
+    (if nul (v/null-v) (cdata-str t cdata))))
+
+(defrecord- Run [acc: Str seg: Str cd: Bool])
+
+(def- NO-RUN (->Run "" "" false))
+
+(defn- no-run? Bool [ua: &Str us: &Str uc: Bool] (and (not uc) (= (count us) 0) (= (count ua) 0)))
+
+(defn- run-text Str [ua: &Str us: &Str uc: Bool]
+  (if (not uc) us (if (ws-only? us) ua (str ua us))))
+
+(defn- cdata-acc Str [ua: &Str us: &Str t: &Str]
+  (let [acc (if (ws-only? us) ua (str ua us))] (str acc t)))
+
+(defn- seg-add Str [us: &Str t: Str] (if (= (count us) 0) t (str us t)))
+
+(defn- flush-run Vec(v/Field) [acc: Vec(v/Field) ua: &Str us: &Str uc: Bool]
+  (let [t (run-text ua us uc)]
+    (if (ws-only? t) acc (conj acc (v/field "__text" (cdata-str t uc))))))
+
+(defn- push-run Values(Vec(v/Field) Int) [fl: Vec(v/Field) fln: Int ua: &Str us: &Str uc: Bool]
+  (let [t (run-text ua us uc)]
+    (if (ws-only? t) (values fl fln) (values (vset fl fln (v/field "__text" (cdata-str t uc))) (+ fln 1)))))
+
+(defn- vset Vec(a) [v: Vec(a) i: Int x: a]
+  (if (< i (count v)) (assoc v i x) (conj v x)))
+
+(defn- doctype-meta Vec(v/Field) [m0: Vec(v/Field) dt: &Str pub: &Str sys: &Str]
+  (if (= dt "") m0
+    (conj m0 (v/field "docType"
+                      (v/->VObj (let [a: Vec(v/Field) [(v/field "rootName" (v/->VStr (str dt)))]
+                                      b (if (= pub "") a (conj a (v/field "publicId" (v/->VStr (str pub)))))]
+                                  (if (= sys "") b (conj b (v/field "systemId" (v/->VStr (str sys)))))))))))
+
+(defrecord XSrc [fetch: Fn(Int Values(Str Bool Str)) close: Fn(Int Int)])
+
+(defn- no-more Values(Str Bool Str) [k: Int] (values "" true ""))
+
+(defn- no-close Int [k: Int] 0)
+
+(defn- refill Values(x/XmlReader Str) [r: x/XmlReader fetch: &Fn(Int Values(Str Bool Str)) name: &Str]
+  (let [[t done fe] (fetch 0)]
+    (if (not= fe "") (values r (str fe ", while reading `" name "` as Xml."))
+      (let [[r2 e2] (x/feed r t done)]
+        (if (not= e2 "") (values r2 (read-err-win r2 e2 name)) (values r2 ""))))))
+
+(defn- tok-err Str [r: &x/XmlReader name: &Str] (let [e (x/token-error r)] (read-err-win r e name)))
+
+(defn- pull Values(x/XmlReader Int Str) [r0: x/XmlReader fetch: &Fn(Int Values(Str Bool Str)) name: &Str]
+  (loop [r r0]
+    (let [[r2 k] (x/next-token r)]
+      (cond
+        (= k x/T-NEED) (let [[r3 e3] (refill r2 fetch name)] (if (not= e3 "") (values r3 x/T-ERR e3) (recur r3)))
+        (= k x/T-ERR) (let [e (tok-err r2 name)] (values r2 k e))
+        :else (values r2 k "")))))
+
+(defn- skip-ws-text? Bool [r: &x/XmlReader ua: &Str us: &Str uc: Bool kids: Bool]
+  (and (no-run? ua us uc) (x/token-ws? r)
+       (let [m (x/next-markup r)] (or (= m 1) (and (= m 2) kids)))))
+
+(defn- build-node Values(x/XmlReader v/Val Str) [r0: x/XmlReader k0: v/Key o: &ROpts mxa: Int fetch: &Fn(Int Values(Str Bool Str)) name: &Str]
+  (loop [r r0 d 1 keys: Vec(v/Key) [k0] he: Vec(Bool) [false] fs: Vec(Int) [0] fl: Vec(v/Field) [] fln 0 ua "" us "" uc false]
+    (let [[r2 k] (x/next-token r)]
+      (cond
+        (= k x/T-NEED) (let [[r3 e3] (refill r2 fetch name)] (if (not= e3 "") (values r3 (v/null-v) e3) (recur r3 d keys he fs fl fln ua us uc)))
+        (= k x/T-ERR) (let [e (tok-err r2 name)] (values r2 (v/null-v) e))
+        (= k x/T-START)
+        (if (attr-too-long? r2 mxa)
+          (values r2 (v/null-v) (str "Maximum attribute size limit (" mxa ") exceeded"))
+          (let [ck (tok-key r2)
+                [fl2 fln2] (push-run fl fln ua us uc)
+                he2 (assoc he (- d 1) true)]
+            (recur r2 (+ d 1) (vset keys d ck) (vset he2 d false) (vset fs d fln2) fl2 fln2 "" "" false)))
+        (= k x/T-END)
+        (let [d2 (- d 1)
+              st (nth fs d2)
+              val (if (nth he d2) (v/->VObj (flush-run (subvec fl st fln) ua us uc)) (text-val (run-text ua us uc) uc o))]
+          (if (= d2 0) (values r2 val "")
+            (recur r2 d2 keys he fs (vset fl st (v/->Field (nth keys d2) val)) (+ st 1) "" "" false)))
+        (= k x/T-TEXT)
+        (if (skip-ws-text? r2 ua us uc (nth he (- d 1))) (recur r2 d keys he fs fl fln ua us uc)
+          (let [t (x/token-text r2)] (recur r2 d keys he fs fl fln ua (seg-add us t) uc)))
+        (= k x/T-CDATA) (let [t (x/token-span r2)] (recur r2 d keys he fs fl fln (cdata-acc ua us t) "" true))
+        :else (recur r2 d keys he fs fl fln ua us uc)))))
+
+(defn- build Values(v/Val Str) [r0: x/XmlReader o: &ROpts mxa: Int name: &Str mime: &Str fetch: &Fn(Int Values(Str Bool Str))]
+  (loop [r r0 root: Vec(v/Field) [] dt "" pub "" sys ""]
+    (let [[r2 k err] (pull r fetch name)]
+      (cond
+        (not= err "") (values (v/null-v) err)
+        (= k x/T-DOCTYPE) (let [[n p y] (x/token-doctype r2)] (recur r2 root n p y))
+        (= k x/T-START)
+        (if (attr-too-long? r2 mxa)
+          (values (v/null-v) (str "Maximum attribute size limit (" mxa ") exceeded"))
+          (let [ck (tok-key r2)
+                [r3 val e3] (build-node r2 ck o mxa fetch name)]
+            (if (not= e3 "") (values (v/null-v) e3) (recur r3 (conj root (v/->Field ck val)) dt pub sys))))
+        (= k x/T-ENDDOC)
+        (values (v/->VMeta (v/->VObj root) (doctype-meta (p/reader-meta mime) dt pub sys)) "")
+        :else (recur r2 root dt pub sys)))))
+
+(defn read Values(v/Val Str) [text: &Str props: &Vec(v/Field) mime: &Str] (read-named text props mime "payload"))
+
+(defn- ext-file Values(Str Bool) [id: Str]
+  (let [path (if (str/starts-with? id "file://") (subs id 7 (count id)) (str id))
+        [data err] (host/file-read path)]
+    (if (= err "") (values data true) (values "" false))))
+
+(defn- read-opts Values(x/XmlOpts Str) [props: &Vec(v/Field)]
+  (let [[dtd e1] (p/pbool props "supportDtd" false)
+        [mx e2] (p/pint props "maxEntityCount" 1)
+        [ext e3] (p/pbool props "externalEntities" false)
+        o0 (assoc (assoc (assoc (assoc (x/default-opts) :dtd dtd) :max-expansions mx) :max-depth 1000) :max-attrs 1000)]
+    (values (if (and ext dtd) (assoc o0 :ext ext-file) o0) (p/either-err (p/either-err e1 e2) e3))))
+
+(defn read-named Values(v/Val Str) [text: &Str props: &Vec(v/Field) mime: &Str name: &Str]
+  (let [[nul0 e1] (p/pstr props "nullValueOn" "blank")
+        nul (if (or (= nul0 "blank") (= nul0 "empty")) nul0 "none")
+        [mxa ea] (p/pint props "maxAttributeSize" -1)
+        [xo oe] (read-opts props)]
+    (cond
+      (not= e1 "") (values (v/null-v) e1)
+      (not= ea "") (values (v/null-v) ea)
+      (not= oe "") (values (v/null-v) oe)
+      :else
+      (let [[r0 re] (x/reader text xo)]
+        (if (not= re "") (values (v/null-v) (read-err text re name))
+          (build r0 (->ROpts nul) mxa name mime no-more))))))
+
+(defn- read-setup Values(ROpts Int x/XmlOpts Str) [props: &Vec(v/Field)]
+  (let [[nul0 e1] (p/pstr props "nullValueOn" "blank")
+        nul (if (or (= nul0 "blank") (= nul0 "empty")) nul0 "none")
+        [mxa ea] (p/pint props "maxAttributeSize" -1)
+        [xo oe] (read-opts props)]
+    (values (->ROpts nul) mxa xo (p/either-err (p/either-err e1 ea) oe))))
+
+(defn- open-root Values(x/XmlReader XSrc v/Key Vec(Str) Str) [open: &Fn(Int XSrc) xo: &x/XmlOpts mxa: Int name: &Str]
+  (let [s (open 0)
+        f (:fetch s)
+        [r0 re] (x/reader-chunked xo)
+        none: Vec(Str) []]
+    (loop [r r0 dt none]
+      (let [[r2 k err] (pull r f name)]
+        (cond
+          (not= err "") (values r2 s (v/simple-key "") dt err)
+          (= k x/T-DOCTYPE) (let [[n pb sy] (x/token-doctype r2)] (recur r2 [(str n) (str pb) (str sy)]))
+          (= k x/T-START) (if (attr-too-long? r2 mxa)
+                            (values r2 s (v/simple-key "") dt (str "Maximum attribute size limit (" mxa ") exceeded"))
+                            (let [ck (tok-key r2)] (values r2 s ck dt "")))
+          (= k x/T-ENDDOC) (values r2 s (v/simple-key "") dt "no root")
+          :else (recur r2 dt))))))
+
+(defn- first-child? Values(Bool Str) [r0: x/XmlReader f: &Fn(Int Values(Str Bool Str)) name: &Str]
+  (loop [r r0]
+    (let [[r2 k err] (pull r f name)]
+      (cond
+        (not= err "") (values false err)
+        (= k x/T-START) (values true "")
+        (or (= k x/T-END) (= k x/T-ENDDOC)) (values false "")
+        :else (recur r2)))))
+
+(defn- first-bytes Str [open: &Fn(Int XSrc)]
+  (let [s (open 0)
+        f (:fetch s)
+        t (loop [acc ""]
+            (let [[t done e] (f 0)
+                  a2 (str acc t)]
+              (cond (not= e "") ""
+                    (or done (>= (count a2) 1024) (>= (str/index-of-after a2 "?>" 0) 0)) a2
+                    :else (recur a2))))
+        z ((:close s) 0)]
+    t))
+
+(defn lazy-read Values(v/Val Bool) [open: Fn(Int XSrc) props: &Vec(v/Field) mime: &Str name: &Str]
+  (let [[o mxa xo pe] (read-setup props)]
+    (if (or (not= pe "") (not (x/chunkable? (first-bytes open)))) (values (v/null-v) false)
+      (let [[r s k dt re] (open-root open xo mxa name)
+            [lazy ce] (if (= re "") (first-child? r (:fetch s) name) (values false re))
+            z ((:close s) 0)]
+        (if (or (not lazy) (not= ce "")) (values (v/null-v) false)
+          (let [op open o2 o m2 mxa x2 xo nm (str name)
+                q (v/->FSeq (fn Fn(Int Values(v/Field Bool dwe/DwErr)) [kk: Int] (root-reader op o2 m2 x2 nm)))
+                meta (if (= (count dt) 0) (p/reader-meta mime) (doctype-meta (p/reader-meta mime) (nth dt 0) (nth dt 1) (nth dt 2)))]
+            (values (v/->VMeta (v/->VObj [(v/->Field k (v/->VOSeq q))]) meta) true)))))))
+
+(defn- root-reader Fn(Int Values(v/Field Bool dwe/DwErr)) [open: &Fn(Int XSrc) o: ROpts mxa: Int xo: x/XmlOpts name: Str]
+  (let [[r0 s k dt re] (open-root open xo mxa name)
+        [dummy de] (x/reader-chunked xo)
+        rd (atom r0)
+        u (atom NO-RUN)
+        buf: Atom(Vec(v/Field)) (atom [])
+        bi (atom 0)
+        st (atom (if (= re "") 0 2))
+        why (atom re)
+        src s nm name ro o
+        f (:fetch s)]
+    (fn Values(v/Field Bool dwe/DwErr) [kk: Int]
+      (loop []
+        (let [b (deref buf) i (deref bi)]
+          (cond
+            (< i (count b)) (let [z (reset! bi (+ i 1))] (values (nth b i) false (dwe/ok)))
+            (= (deref st) 1) (let [z ((:close src) 0)] (values v/NO-FIELD true (dwe/ok)))
+            (= (deref st) 2) (let [z ((:close src) 0) z2 (reset! st 3)] (values v/NO-FIELD true (dwe/input-err (deref why))))
+            (= (deref st) 3) (values v/NO-FIELD true (dwe/input-err (deref why)))
+            :else
+            (let [r1 (deref rd)
+                  z0 (reset! rd dummy)
+                  [r2 k err] (pull r1 f nm)]
+              (cond
+                (not= err "") (let [z1 (reset! why err) z2 (reset! st 2)] (recur))
+                (= k x/T-START)
+                (if (attr-too-long? r2 mxa)
+                  (let [z1 (reset! why (str "Maximum attribute size limit (" mxa ") exceeded")) z2 (reset! st 2)] (recur))
+                  (let [cur (deref u)
+                        [pre pn] (push-run [] 0 (:acc cur) (:seg cur) (:cd cur))
+                        ck (tok-key r2)
+                        [r3 val e3] (build-node r2 ck ro mxa f nm)]
+                    (if (not= e3 "") (let [z1 (reset! why e3) z2 (reset! st 2)] (recur))
+                      (let [z1 (reset! rd r3) z2 (reset! u NO-RUN) z3 (reset! buf (conj (subvec pre 0 pn) (v/->Field ck val))) z4 (reset! bi 0)] (recur)))))
+                (= k x/T-END)
+                (let [cur (deref u)
+                      tail (flush-run [] (:acc cur) (:seg cur) (:cd cur))
+                      [r3 de] (drain-epilog r2 f nm)
+                      z1 (reset! rd r3) z2 (reset! buf tail) z3 (reset! bi 0)
+                      z4 (if (= de "") (reset! st 1) (let [w (reset! why de)] (reset! st 2)))]
+                  (recur))
+                (= k x/T-TEXT)
+                (let [cur (deref u)
+                      z1 (if (skip-ws-text? r2 (:acc cur) (:seg cur) (:cd cur) true) 0
+                           (let [t (x/token-text r2) z (reset! u (->Run (:acc cur) (seg-add (:seg cur) t) (:cd cur)))] 0))
+                      z2 (reset! rd r2)]
+                  (recur))
+                (= k x/T-CDATA)
+                (let [t (x/token-span r2) cur (deref u) z1 (reset! u (->Run (cdata-acc (:acc cur) (:seg cur) t) "" true)) z2 (reset! rd r2)] (recur))
+                :else (let [z1 (reset! rd r2)] (recur))))))))))
+
+(defn- drain-epilog Values(x/XmlReader Str) [r0: x/XmlReader f: &Fn(Int Values(Str Bool Str)) name: &Str]
+  (loop [r r0]
+    (let [[r2 k err] (pull r f name)]
+      (cond
+        (not= err "") (values r2 err)
+        (= k x/T-ENDDOC) (values r2 "")
+        :else (recur r2)))))
+
+(defn- read-err-win Str [r: &x/XmlReader e: &Str name: &Str]
+  (let [[w bl bc] (x/window r)] (read-err-b w e name bl bc)))
+
+(defn- read-err Str [text: &Str e: &Str name: &Str] (read-err-b text e name 1 1))
+
+(defn- read-err-b Str [text: &Str e: &Str name: &Str bl: Int bc: Int]
+  (if (not (str/starts-with? e "line "))
+    (str e ", while reading `" name "` as Xml.")
+    (let [[why line c] (woodstox-at-b text e bl bc)]
+      (str why "\n at [row,col {unknown-source}]: [" line "," c "], while reading `" name "` as Xml.\n [row,col]: [" line "," c "]"))))
+
+(defn woodstox-at Values(Str Int Int) [text: &Str e: &Str] (woodstox-at-b text e 1 1))
+
+(defn- woodstox-at-b Values(Str Int Int) [text: &Str e: &Str bl: Int bc: Int]
+  (if (not (str/starts-with? e "line ")) (values (str e) 0 0)
+    (let [i (str/index-of e ": ")
+          lc (subs e 5 (if (< i 0) (count e) i))
+          k (str/index-of lc ", column ")
+          line (if (< k 0) 1 (digits-int (subs lc 0 k)))
+          col (if (< k 0) 1 (digits-int (subs lc (+ k 9) (count lc))))
+          msg (if (< i 0) "" (subs e (+ i 2) (count e)))
+          off (line-offset text (+ (- line bl) 1) (if (= line bl) (- col bc) (- col 1)))
+          c0 (- col 1)
+          [why c] (woodstox-msg text msg off c0)]
+      (values why line c))))
+
+(defn- digits-int Int [t: &Str]
+  (loop [i 0 acc 0] (if (or (>= i (count t)) (< (nth t i) 48) (> (nth t i) 57)) acc (recur (+ i 1) (+ (* acc 10) (- (nth t i) 48))))))
+
+(defn- line-offset Int [s: &Str line: Int c0: Int]
+  (loop [i 0 l 1] (if (or (>= l line) (>= i (count s))) (+ i c0) (recur (+ i 1) (if (= (nth s i) 10) (+ l 1) l)))))
+
+(defn- name-len Int [s: &Str i0: Int]
+  (loop [i i0] (if (and (< i (count s)) (let [c (nth s i)] (not (or (= c 32) (= c 10) (= c 13) (= c 9) (= c 62) (= c 47))))) (recur (+ i 1)) (- i i0))))
+
+(defn- char-desc Str [s: &Str i: Int]
+  (if (>= i (count s)) "'?'" (str "'" (subs s i (+ i 1)) "' (code " (nth s i) ")")))
+
+(defn- between Str [m: &Str a: &Str b: &Str]
+  (let [i (str/index-of m a)]
+    (if (< i 0) "" (let [j (str/index-of-after m b (+ i (count a)))] (if (< j 0) "" (subs m (+ i (count a)) j))))))
+
+(defn- woodstox-msg Values(Str Int) [s: &Str m: &Str off: Int c0: Int]
+  (cond
+    (str/starts-with? m "unexpected end of input: element <")
+    (values (str "Unexpected EOF; was expecting a close tag for element <" (between m "element <" "> is not closed") ">") c0)
+    (str/starts-with? m "mismatched end tag: expected </")
+    (let [want (between m "expected </" ">") got (between m "found </" ">")]
+      (values (str "Unexpected close tag </" got ">; expected </" want ">.") (+ c0 2 (count got))))
+    (= m "content is not allowed in prolog")
+    (values (str "Unexpected character " (char-desc s off) " in prolog; expected '<'") (+ c0 1))
+    (= m "attribute value must be quoted")
+    (values (str "Unexpected character " (char-desc s off) " in start tag Expected a quote") (+ c0 1))
+    (str/starts-with? m "undeclared entity '")
+    (let [n (between m "entity '" "'")] (values (str "Undeclared general entity \"" n "\"") (+ c0 (count n) 2)))
+    (= m "only one root element is allowed")
+    (values "Illegal to have multiple roots (start tag in epilog?)." (+ c0 1 (name-len s (+ off 1))))
+    (str/starts-with? m "duplicate attribute '")
+    (let [end (loop [i off] (if (or (>= i (count s)) (= (nth s i) 62)) i (recur (+ i 1))))]
+      (values (str "Duplicate attribute '" (between m "attribute '" "'") "'.") (+ c0 (- end off) 1)))
+    (= m "invalid element name")
+    (values (str "Unexpected character " (char-desc s (+ off 1)) " in content after '<' (malformed start element?).") (+ c0 2))
+    (= m "no root element")
+    (values "Unexpected EOF in prolog" c0)
+    (= m "'<' is not allowed in an attribute value")
+    (values "Unexpected character '<' (code 60) in attribute value" (+ c0 1))
+    (= m "end tag outside the root element")
+    (values "Unexpected character combination '</' in prolog." (+ c0 2))
+    (str/starts-with? m "reference to external entity '")
+    (values (str "[com.ctc.wstx.exc.WstxLazyException] Encountered a reference to external entity \"" (between m "entity '" "'")
+                 "\", but stream reader has feature \"javax.xml.stream.isSupportingExternalEntities\" disabled") c0)
+    (str/starts-with? m "element nesting exceeds the maximum depth ")
+    (values (str "Maximum Element Depth limit (" (subs m 42 (count m)) ") Exceeded") c0)
+    :else (values (str m) c0)))
+
+(defrecord WOpts [indent: Bool decl: Bool dq-decl: Bool encoding: Str escape-gt: Bool escape-cr: Bool
+                  inline-empty: Bool invalid: Str nil-on-null: Bool skip-elems: Bool skip-attrs: Bool
+                  default-ns: Str decl-ns: Vec(v/Ns)])
+
+(defn opts-of Values(WOpts Str) [props: &Vec(v/Field)]
+  (let [[ind e1] (p/pbool props "indent" true)
+        [decl e2] (p/pbool props "writeDeclaration" true)
+        [dq e3] (p/pbool props "doubleQuoteInDeclaration" false)
+        [enc e4] (p/pstr props "encoding" "UTF-8")
+        [gt e5] (p/pbool props "escapeGT" false)
+        [cr e6] (p/pbool props "escapeCR" false)
+        [ic e7] (p/pstr props "inlineCloseOn" "empty")
+        [inv e8] (p/pstr props "onInvalidChar" "none")
+        [nn e9] (p/pbool props "writeNilOnNull" false)
+        [sk e10] (p/pstr props "skipNullOn" "")
+        [dn e11] (p/pstr props "defaultNamespace" "")
+        e (p/either-err (p/either-err (p/either-err e1 e2) (p/either-err e3 e4)) (p/either-err (p/either-err e5 e6) (p/either-err e7 e8)))
+        e2x (p/either-err (p/either-err e e9) (p/either-err e10 e11))]
+    (values (->WOpts ind decl dq enc gt cr (= ic "empty") inv nn
+                     (or (= sk "elements") (= sk "everywhere")) (or (= sk "attributes") (= sk "everywhere")) dn [])
+            (let [[wd ewd] (p/pstr props "writeDeclaredNamespaces" "")]
+              (cond (not= e2x "") e2x
+                    (not= ewd "") ewd
+                    (or (and (= wd "") (not (p/has? props "writeDeclaredNamespaces"))) (= wd "All") (str/starts-with? wd "regex:") (str/starts-with? wd "ids:")) ""
+                    :else "Value for `writeDeclaredNamespaces` is not valid. Valid values are: `All`, `regex:<regex>`, `ids:<ns ids separated by comma>`")))))
+
+(defn- declared-ns Values(Vec(v/Ns) Str) [props: &Vec(v/Field) nss: &Vec(v/Ns)]
+  (let [[wd e] (p/pstr props "writeDeclaredNamespaces" "")
+        none: Vec(v/Ns) []]
+    (cond
+      (= wd "") (values none "")
+      (= wd "All") (values (loop [i 0 acc: Vec(v/Ns) []] (if (>= i (count nss)) acc (recur (+ i 1) (conj acc (nth nss i))))) "")
+      (str/starts-with? wd "regex:")
+      (let [[re ce] (rx/compile (subs wd 6 (count wd)) 0)]
+        (if (not= ce "") (values none ce)
+          (loop [i 0 acc: Vec(v/Ns) []]
+            (if (>= i (count nss)) (values acc "")
+              (let [[ok me] (rx/matches? re (:uri (nth nss i)))]
+                (recur (+ i 1) (if ok (conj acc (nth nss i)) acc)))))))
+      (str/starts-with? wd "ids:")
+      (let [ids: Vec(Str) (str/split (subs wd 4 (count wd)) ",")]
+        (loop [i 0 acc: Vec(v/Ns) []]
+          (if (>= i (count ids)) (values acc "")
+            (let [id (str/trim (nth ids i))
+                  f (loop [j 0] (if (>= j (count nss)) -1 (if (= (:prefix (nth nss j)) id) j (recur (+ j 1)))))]
+              (if (< f 0) (values none (str "Unable to find declared namespace with id `" id "`, required by the Xml writer property `writeDeclaredNamespaces`."))
+                (recur (+ i 1) (conj acc (nth nss f))))))))
+      :else (values none ""))))
+
+(defrecord W [last-end: Bool nss: Vec(v/Ns) err: dwe/DwErr])
+
+(defn- pad Str [out: Str depth: Int]
+  (loop [acc out i 0] (if (>= i depth) acc (recur (str acc "  ") (+ i 1)))))
+
+(defn- lookup Vec(Str) [nss: &Vec(v/Ns) pre: &Str]
+  (loop [i (- (count nss) 1)]
+    (if (< i 0) (if (= pre "") [""] [])
+      (if (= (:prefix (nth nss i)) pre) [(:uri (nth nss i))] (recur (- i 1))))))
+
+(defn- bound? Bool [nss: &Vec(v/Ns) pre: &Str uri: &Str]
+  (let [r (lookup nss pre)] (and (> (count r) 0) (= (nth r 0) uri))))
+
+(defn- hex Str [n: Int]
+  (loop [k n acc ""] (if (= k 0) (if (= acc "") "0" acc) (recur (quot k 16) (str (subs "0123456789abcdef" (mod k 16) (+ (mod k 16) 1)) acc)))))
+
+(defn- invalid-at Int [s: &Str]
+  (loop [i 0] (if (>= i (count s)) -1
+                (let [c (nth s i)] (if (and (< c 32) (not= c 9) (not= c 10) (not= c 13)) i (recur (+ i 1)))))))
+
+(defn- strip-invalid Str [s: &Str]
+  (loop [i 0 out ""] (if (>= i (count s)) out
+                       (let [c (nth s i)] (recur (+ i 1) (if (and (< c 32) (not= c 9) (not= c 10) (not= c 13)) out (str out (subs s i (+ i 1)))))))))
+
+(defn- ref-limit Int [o: &WOpts]
+  (match (ccs/canonical-name (:encoding o))
+    (None) -1
+    (Some cs) (cond (str/starts-with? cs "UTF-") -1
+                    (= cs "US-ASCII") 128
+                    :else 256)))
+
+(defn- cp-at Values(Int Int) [s: &Str i: Int]
+  (let [c (nth s i) n (count s)]
+    (if (< c 128) (values c 1)
+      (if (and (>= c 224) (< c 240) (< (+ i 2) n))
+        (values (+ (* (- c 224) 4096) (* (- (nth s (+ i 1)) 128) 64) (- (nth s (+ i 2)) 128)) 3)
+        (if (and (>= c 240) (< (+ i 3) n))
+          (values (+ (* (- c 240) 262144) (* (- (nth s (+ i 1)) 128) 4096) (* (- (nth s (+ i 2)) 128) 64) (- (nth s (+ i 3)) 128)) 4)
+          (if (< (+ i 1) n) (values (+ (* (- c 192) 64) (- (nth s (+ i 1)) 128)) 2) (values c 1)))))))
+
+(defn- esc Str [out: Str s: &Str attr: Bool o: &WOpts]
+  (let [n (count s) lim (ref-limit o)]
+    (loop [acc out i 0]
+      (if (>= i n) acc
+        (let [c (nth s i)]
+          (if (and (> lim 0) (>= c 128))
+            (let [[cp len] (cp-at s i)]
+              (recur (if (>= cp lim) (str acc "&#x" (hex cp) ";") (str acc (subs s i (+ i len)))) (+ i len)))
+            (recur (case c
+                     60 (str acc "&lt;")
+                     38 (str acc "&amp;")
+                     62 (if (and (not attr) (or (:escape-gt o) (and (> i 0) (= (nth s (- i 1)) 93)))) (str acc "&gt;") (str acc ">"))
+                     13 (if (:escape-cr o) (str acc "&#xd;") (str acc "\r"))
+                     34 (if attr (str acc "&quot;") (str acc "\""))
+                     10 (if attr (str acc "&#xa;") (str acc "\n"))
+                     9 (if attr (str acc "&#x9;") (str acc "\t"))
+                     (str acc (subs s i (+ i 1))))
+                   (+ i 1))))))))
+
+(defn- qn Str [pre: &Str local: &Str] (if (= pre "") (str local) (str pre ":" local)))
+
+(defn- ensure-ns Values(Str W Str) [out: Str w: W ns: &Vec(v/Ns) elem: Bool]
+  (if (= (count ns) 0)
+    (if (and elem (not (bound? (:nss w) "" "")))
+      (values (str out " xmlns=\"\"") (->W (:last-end w) (conj (:nss w) (v/->Ns "" "")) (:err w)) "")
+      (values out w ""))
+    (let [pre0 (:prefix (nth ns 0)) uri (:uri (nth ns 0))
+          pre (if (and (not elem) (= pre0 "")) "ns0" pre0)]
+      (if (bound? (:nss w) pre uri) (values out w pre)
+        (let [o1 (str out (if (= pre "") " xmlns=\"" (str " xmlns:" pre "=\"")))
+              o2 (esc o1 uri true (->WOpts false false false "UTF-8" false false true "none" false false false "" []))]
+          (values (str o2 "\"") (->W (:last-end w) (conj (:nss w) (v/->Ns pre (str uri))) (:err w)) pre))))))
+
+(defn- fail-w W [w: W msg: Str] (->W (:last-end w) (:nss w) (fo/writer-err msg)))
+
+(defn- fail-de W [w: W e: dwe/DwErr] (->W (:last-end w) (:nss w) e))
+
+(defn- scalar-text Values(Str Str) [x: &v/Val]
+  (match x
+    (v/VStr s) (values s "")
+    (v/VNum n) (values (num/to-string n) "")
+    (v/VInt n-i) (let [n (num/from-int n-i)] (values (num/to-string n) ""))
+    (v/VBool b) (values (if b "true" "false") "")
+    (v/VKey k) (values (:name k) "")
+    (v/VRegex s f) (values s "")
+    (v/VNsV n) (values (:uri n) "")
+    (v/VNull) (values "null" "")
+    _ (values "" (str "Cannot coerce " (v/type-name x) " to String"))))
+
+(defn- elem-text Values(Str Str) [x0: &v/Val]
+  (let [[ns nf ne] (sc/number-text x0)]
+    (if nf (values ns ne) (attr-text x0))))
+
+(defn- attr-text Values(Str Str) [x0: &v/Val]
+  (let [[ts tt te] (sc/temporal-text x0 false)]
+    (if tt (values ts te) (scalar-text (v/unmeta x0)))))
+
+(defn- empty-val? Bool [x: &v/Val]
+  (match x
+    (v/VNull) true
+    (v/VStr s) (= (count s) 0)
+    (v/VObj fs) (= (count fs) 0)
+    (v/VArr xs) (= (count xs) 0)
+    _ false))
+
+(defn- attrs-after-skip Vec(v/Attr) [as: &Vec(v/Attr) o: &WOpts]
+  (loop [i 0 acc: Vec(v/Attr) []]
+    (if (>= i (count as)) acc
+      (let [a (nth as i)]
+        (recur (+ i 1) (if (and (:skip-attrs o) (v/null? (:value a))) acc (conj acc a)))))))
+
+(defn- value-ns Values(Str W) [out: Str w: W x: &v/Val]
+  (match x
+    (v/VMeta y ms) (let [p (v/obj-get ms "nsPrefix") u (v/obj-get ms "nsUri")]
+                     (if (or (= (count p) 0) (= (count u) 0)) (values out w)
+                       (let [[t1 e1] (scalar-text (v/unmeta (nth p 0))) [t2 e2] (scalar-text (v/unmeta (nth u 0)))]
+                         (if (or (= t1 "") (not= e1 "") (not= e2 "")) (values out w)
+                           (let [[o2 w2 pre] (ensure-ns out w [(v/->Ns t1 t2)] false)] (values o2 w2))))))
+    _ (values out w)))
+
+(defn- write-field Values(Str W) [out: Str w: W k: &v/Key x0: &v/Val depth: Int o: &WOpts snk: &fo/Sink]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VArr xs) (loop [o2 out w2 w i 0]
+                    (if (or (>= i (count xs)) (not (dwe/ok? (:err w2)))) (values o2 w2)
+                      (let [[o3 w3] (repeat-elem o2 w2 k (nth xs i) depth o snk)] (recur o3 w3 (+ i 1)))))
+      (v/VSeq q) (let [nx ((:open q) 0)]
+                   (loop [o2 out w2 w]
+                     (if (not (dwe/ok? (:err w2))) (values o2 w2)
+                       (let [[y done e] (nx 0)]
+                         (cond (not (dwe/ok? e)) (values o2 (fail-de w2 e))
+                               done (values o2 w2)
+                               :else (let [[o3 w3] (repeat-elem o2 w2 k y depth o snk)] (recur o3 w3)))))))
+      _ (write-elem out w k x0 depth o snk))))
+
+(defn- repeat-elem Values(Str W) [out: Str w: W k: &v/Key y: &v/Val depth: Int o: &WOpts snk: &fo/Sink]
+  (match (v/unmeta y)
+    (v/VArr ys) (values out (fail-w w "Cannot coerce Array to String"))
+    (v/VSeq q) (values out (fail-w w "Cannot coerce Array to String"))
+    _ (let [[o3 w3] (write-elem out w k y depth o snk)] (flushed o3 w3 snk))))
+
+(defn- flushed Values(Str W) [out: Str w: W snk: &fo/Sink]
+  (if (not (dwe/ok? (:err w))) (values out w)
+    (let [[o2 e] (fo/flush out snk)] (if (dwe/ok? e) (values o2 w) (values o2 (fail-de w e))))))
+
+(defn- write-elem Values(Str W) [out0: Str w0: W k: &v/Key x0: &v/Val depth: Int o: &WOpts snk: &fo/Sink]
+  (let [x (v/unmeta x0)
+        as (attrs-after-skip (:attrs k) o)]
+    (if (and (:skip-elems o) (v/null? x) (= (count as) 0)) (values out0 w0)
+      (let [saved (:nss w0)
+            o0 (if (and (:indent o) (> depth 0)) (pad (str out0 "\n") depth) out0)
+            pre (if (= (count (:ns k)) 0) "" (:prefix (nth (:ns k) 0)))
+            nm (qn pre (:name k))
+            dflt (and (not= (:default-ns o) "") (= (count (:ns k)) 0))
+            [o1 w1b pre2] (if dflt (values (str o0 "<" nm) (->W false (:nss w0) (:err w0)) "")
+                            (ensure-ns (str o0 "<" nm) (->W false (:nss w0) (:err w0)) (:ns k) true))
+            [o2 w2] (if (and dflt (not (bound? (:nss w1b) "" (:default-ns o))))
+                      (values (str o1 " xmlns=\"" (:default-ns o) "\"") (->W false (conj (:nss w1b) (v/->Ns "" (:default-ns o))) (dwe/ok)))
+                      (values o1 w1b))
+            [o2 w2] (if (= depth 0)
+                      (loop [oo o2 w w2 i 0]
+                        (if (>= i (count (:decl-ns o))) (values oo w)
+                          (let [n (nth (:decl-ns o) i)]
+                            (if (bound? (:nss w) (:prefix n) (:uri n)) (recur oo w (+ i 1))
+                              (let [oa (esc (str oo (if (= (:prefix n) "") " xmlns=\"" (str " xmlns:" (:prefix n) "=\""))) (:uri n) true o)]
+                                (recur (str oa "\"") (->W false (conj (:nss w) (v/->Ns (:prefix n) (str (:uri n)))) (:err w)) (+ i 1)))))))
+                      (values o2 w2))
+            [o3 w3] (loop [oo o2 w w2 i 0]
+                      (if (>= i (count as)) (values oo w)
+                        (let [a (nth as i)
+                              an (:name a)]
+                          (if (or (= an "xmlns") (str/starts-with? an "xmlns:"))
+                            (let [[t e] (attr-text (:value a))
+                                  oa (esc (str oo " " an "=\"") t true o)]
+                              (recur (str oa "\"") w (+ i 1)))
+                            (let [[ob wb] (value-ns oo w (:value a))
+                                  [oc wa apre] (ensure-ns ob wb (:ns a) false)
+                                  [t e] (attr-text (:value a))]
+                              (if (not= e "") (values oc (fail-w wa e))
+                                (let [od (esc (str oc " " (qn apre an) "=\"") t true o)]
+                                  (recur (str od "\"") (->W false (:nss wa) (:err wa)) (+ i 1)))))))))]
+        (if (not (dwe/ok? (:err w3))) (values o3 w3)
+          (let [[o4 w4] (write-content o3 w3 nm x0 depth o snk)]
+            (values o4 (->W (:last-end w4) saved (:err w4)))))))))
+
+(defn- close-empty Values(Str W) [out: Str w: W nm: &Str o: &WOpts]
+  (if (:inline-empty o) (values (str out "/>") (->W true (:nss w) (:err w)))
+    (values (str out "></" nm ">") (->W true (:nss w) (:err w)))))
+
+(defn- base64-elem Values(Str W) [out: Str w: W nm: &Str t: &Str]
+  (let [[o2 w2 pd] (ensure-ns out w [(v/->Ns "xsd" "http://www.w3.org/2001/XMLSchema")] false)
+        [o3 w3 pi] (ensure-ns o2 w2 [(v/->Ns "xsi" "http://www.w3.org/2001/XMLSchema-instance")] false)
+        e (b64/encode (str t))]
+    (values (str o3 " " pi ":type=\"" pd ":base64Binary\">" e "</" nm ">") (->W true (:nss w3) (:err w3)))))
+
+(defn- child Values(Str W) [out: Str w: W f: &v/Field depth: Int o: &WOpts snk: &fo/Sink]
+  (let [k (:key f)
+        [o4 w4] (if (and (= (:name k) "__text") (= (count (:ns k)) 0))
+                  (write-text out w (:value f) o)
+                  (write-field out w k (:value f) (+ depth 1) o snk))]
+    (flushed o4 w4 snk)))
+
+(defn- close-children Values(Str W) [o2: Str w2: W nm: &Str depth: Int o: &WOpts]
+  (if (not (dwe/ok? (:err w2))) (values o2 w2)
+    (let [o1 (if (and (:indent o) (:last-end w2)) (pad (str o2 "\n") depth) o2)]
+      (values (str o1 "</" nm ">") (->W true (:nss w2) (dwe/ok))))))
+
+(defn- write-content Values(Str W) [out: Str w: W nm: &Str x0: &v/Val depth: Int o: &WOpts snk: &fo/Sink]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VNull) (if (:nil-on-null o)
+                  (let [[o2 w2 pre] (ensure-ns out w [(v/->Ns "xsi" "http://www.w3.org/2001/XMLSchema-instance")] false)]
+                    (close-empty (str o2 " " pre ":nil=\"true\"") (->W false (:nss w2) (:err w2)) nm o))
+                  (close-empty out w nm o))
+      (v/VObj fs) (if (= (count fs) 0) (close-empty out w nm o)
+                    (let [[o2 w2] (loop [o3 (str out ">") w3 (->W false (:nss w) (:err w)) i 0]
+                                    (if (or (>= i (count fs)) (not (dwe/ok? (:err w3)))) (values o3 w3)
+                                      (let [[o4 w4] (child o3 w3 (nth fs i) depth o snk)] (recur o4 w4 (+ i 1)))))]
+                      (close-children o2 w2 nm depth o)))
+      (v/VOSeq q) (let [nx ((:open q) 0)
+                        [f0 d0 e0] (nx 0)]
+                    (cond (not (dwe/ok? e0)) (values out (fail-de w e0))
+                          d0 (close-empty out w nm o)
+                          :else (let [[o2 w2] (loop [o3 (str out ">") w3 (->W false (:nss w) (:err w)) f f0]
+                                                (let [[o4 w4] (child o3 w3 f depth o snk)]
+                                                  (if (not (dwe/ok? (:err w4))) (values o4 w4)
+                                                    (let [[f1 d1 e1] (nx 0)]
+                                                      (cond (not (dwe/ok? e1)) (values o4 (fail-de w4 e1))
+                                                            d1 (values o4 w4)
+                                                            :else (recur o4 w4 f1))))))]
+                                  (close-children o2 w2 nm depth o))))
+      (v/VArr xs) (if (= (count xs) 0) (close-empty out w nm o) (values out (fail-w w "Cannot coerce Array to String")))
+      (v/VSeq q) (let [nx ((:open q) 0)
+                       [y d e] (nx 0)]
+                   (cond (not (dwe/ok? e)) (values out (fail-de w e))
+                         d (close-empty out w nm o)
+                         :else (values out (fail-w w "Cannot coerce Array to String"))))
+      (v/VBin b) (base64-elem out w nm b)
+      _ (if (empty-val? x) (close-empty out w nm o)
+          (let [[t e] (elem-text x0)]
+            (if (not= e "") (values out (fail-w w e))
+              (let [bad (invalid-at t)]
+                (if (and (>= bad 0) (= (:invalid o) "base64"))
+                  (base64-elem out w nm t)
+                  (let [[o2 w2] (write-text (str out ">") (->W false (:nss w) (:err w)) x0 o)]
+                    (if (not (dwe/ok? (:err w2))) (values o2 w2)
+                      (values (str o2 "</" nm ">") (->W true (:nss w2) (dwe/ok)))))))))))))
+
+(defn- write-text Values(Str W) [out: Str w: W x0: &v/Val o: &WOpts]
+  (let [x (v/unmeta x0)
+        [t0 e] (elem-text x0)]
+    (if (not= e "") (values out (fail-w w e))
+      (let [bad (invalid-at t0)]
+        (if (and (>= bad 0) (not= (:invalid o) "ignore") (not= (:invalid o) "base64"))
+          (values out (fail-w w (str "Invalid white space character (0x" (hex (nth t0 bad)) ") in text to output (in xml 1.1, could output as a character entity), while writing Xml at .")))
+          (let [t (if (>= bad 0) (strip-invalid t0) t0)]
+            (if (p/meta-true? x0 "cdata")
+              (values (str out "<![CDATA[" (str/replace t "]]>" "]]]]><![CDATA[>") "]]>") (->W false (:nss w) (:err w)))
+              (values (esc out t false o) (->W false (:nss w) (:err w))))))))))
+
+(defn write Values(Str Str) [x0: &v/Val props: &Vec(v/Field)] (write-ns x0 props []))
+
+(defn write-ns Values(Str Str) [x0: &v/Val props: &Vec(v/Field) nss: &Vec(v/Ns)]
+  (let [[t e] (write-ns-to x0 props nss (fo/whole))] (values t (if (dwe/ok? e) "" (str (:msg e))))))
+
+(defn write-to Values(Str dwe/DwErr) [x0: &v/Val props: &Vec(v/Field) snk: &fo/Sink] (write-ns-to x0 props [] snk))
+
+(defn- kept-root? Bool [f: &v/Field o: &WOpts]
+  (not (and (:skip-elems o) (v/null? (:value f)) (= (count (attrs-after-skip (:attrs (:key f)) o)) 0))))
+
+(defn- root-fields Values(Vec(v/Field) Bool dwe/DwErr) [x: &v/Val o: &WOpts]
+  (match x
+    (v/VObj fs0) (values (loop [i 0 acc: Vec(v/Field) []]
+                           (if (>= i (count fs0)) acc (recur (+ i 1) (if (kept-root? (nth fs0 i) o) (conj acc (nth fs0 i)) acc))))
+                         true (dwe/ok))
+    (v/VOSeq q) (let [nx ((:open q) 0)]
+                  (loop [acc: Vec(v/Field) []]
+                    (if (>= (count acc) 2) (values acc true (dwe/ok))
+                      (let [[f done e] (nx 0)]
+                        (cond (not (dwe/ok? e)) (values acc true e)
+                              done (values acc true (dwe/ok))
+                              :else (recur (if (kept-root? f o) (conj acc f) acc)))))))
+    _ (values [] false (dwe/ok))))
+
+(defn- more-than-one? Values(Bool dwe/DwErr) [x: &v/Val]
+  (match x
+    (v/VArr xs) (values (> (count xs) 1) (dwe/ok))
+    (v/VSeq q) (let [nx ((:open q) 0)
+                     [a da ea] (nx 0)]
+                 (cond (not (dwe/ok? ea)) (values false ea)
+                       da (values false (dwe/ok))
+                       :else (let [[b db eb] (nx 0)] (values (and (dwe/ok? eb) (not db)) eb))))
+    _ (values false (dwe/ok))))
+
+(defn write-ns-to Values(Str dwe/DwErr) [x0: &v/Val props: &Vec(v/Field) nss: &Vec(v/Ns) snk: &fo/Sink]
+  (let [[o0 oe] (opts-of props)
+        [dn de] (if (= oe "") (declared-ns props nss) (values [] ""))
+        o (assoc o0 :decl-ns dn)]
+    (if (not= (p/either-err oe de) "") (values "" (fo/writer-err (p/either-err oe de)))
+      (let [x (v/unmeta x0)
+            [fs obj fe] (root-fields x o)]
+        (cond
+          (not (dwe/ok? fe)) (values "" fe)
+          obj
+          (if (= (count fs) 0) (values "" (fo/writer-err "Trying to write END_DOCUMENT when document has no root (ie. trying to output empty document), while writing Xml at "))
+            (let [f (nth fs 0)
+                  k (:key f)
+                  [multi me] (more-than-one? (v/unmeta (:value f)))]
+              (cond
+                (not (dwe/ok? me)) (values "" me)
+                (or (> (count fs) 1) multi)
+                (values "" (fo/writer-err (str "Trying to output second root, <" (:name (:key (nth fs (if multi 0 1)))) ">, while writing Xml at .")))
+                :else
+                (let [q (if (:dq-decl o) "\"" "'")
+                      d0 (if (:decl o) (str "<?xml version=" q "1.0" q " encoding=" q (:encoding o) q "?>" (if (:indent o) "\n" "")) "")
+                      d1 (doctype-into d0 x0 o)
+                      [ow w] (write-field d1 (->W false [(v/->Ns "xml" "http://www.w3.org/XML/1998/namespace")] (dwe/ok)) k (:value f) 0 o snk)]
+                  (if (not (dwe/ok? (:err w))) (values "" (:err w)) (values ow (dwe/ok)))))))
+          :else
+          (match x
+            (v/VNull) (values "" (fo/writer-err "Trying to write END_DOCUMENT when document has no root (ie. trying to output empty document), while writing Xml at "))
+            (v/VStr s) (values "" (fo/writer-err "Trying to output non-whitespace characters outside main element tree (in prolog or epilog), while writing Xml at ."))
+            (v/VNum n) (values "" (fo/writer-err "Trying to output non-whitespace characters outside main element tree (in prolog or epilog), while writing Xml at ."))
+            (v/VInt n-i) (values "" (fo/writer-err "Trying to output non-whitespace characters outside main element tree (in prolog or epilog), while writing Xml at ."))
+            (v/VBool b) (values "" (fo/writer-err "Trying to output non-whitespace characters outside main element tree (in prolog or epilog), while writing Xml at ."))
+            _ (values "" (fo/writer-err (str "Cannot coerce " (v/type-name x) " to String")))))))))
+
+(defn- doctype-into Str [out: Str x0: &v/Val o: &WOpts]
+  (let [r (p/meta-get x0 "docType")]
+    (if (= (count r) 0) out
+      (match (v/unmeta (nth r 0))
+        (v/VObj fs) (let [name (field-str fs "rootName") pub (field-str fs "publicId") sys (field-str fs "systemId")]
+                      (if (= name "") out
+                        (let [a (str out "<!DOCTYPE " name)
+                              b (if (not= pub "") (str a " PUBLIC \"" pub "\" \"" sys "\"")
+                                  (if (not= sys "") (str a " SYSTEM \"" sys "\"") a))]
+                          (str b ">" (if (:indent o) "\n" "")))))
+        _ out))))
+
+(defn- field-str Str [fs: &Vec(v/Field) k: &Str]
+  (let [q (v/obj-get fs k)] (if (= (count q) 0) "" (match (v/unmeta (nth q 0)) (v/VStr s) s _ ""))))

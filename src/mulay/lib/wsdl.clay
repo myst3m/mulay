@@ -1,0 +1,205 @@
+(ns mulay.lib.wsdl
+  (:require [mulay.lib.xml :as xml] [clay.string :as str]))
+
+(def WSDL-NS "http://schemas.xmlsoap.org/wsdl/")
+(def SOAP11-NS "http://schemas.xmlsoap.org/wsdl/soap/")
+(def SOAP12-NS "http://schemas.xmlsoap.org/wsdl/soap12/")
+
+(defrecord Op [name: Str one-way: Bool action: Str has-action: Bool])
+(defrecord Port [name: Str address: Vec(Str) version: Str style: Str ops: Vec(Op)])
+(defrecord Service [name: Str ports: Vec(Port)])
+(defrecord Wsdl [style: Str services: Vec(Service)])
+
+(defrecord Def [kind: Str tns: Str name: Str node: xml/XNode scope: Vec(xml/XNs) path: Str])
+
+(defn- scheme-len Int [s: &Str]
+  (let [k (str/index-of s ":")]
+    (if (<= k 1) 0
+      (if (loop [i 0] (if (>= i k) true (let [c (nth s i)] (if (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (> i 0) (>= c 48) (<= c 57)) (= c 43) (= c 45) (= c 46)) (recur (+ i 1)) false))))
+        (+ k 1) 0))))
+
+(defn- norm-path Str [p: &Str]
+  (let [abs (str/starts-with? p "/")
+        segs: Vec(Str) (str/split p "/")
+        out (loop [i 0 acc: Vec(Str) []]
+              (if (>= i (count segs)) acc
+                (let [s (nth segs i)]
+                  (cond (or (= s ".") (and (= s "") (< i (- (count segs) 1)))) (recur (+ i 1) acc)
+                        (= s "..") (recur (+ i 1) (if (and (> (count acc) 0) (not= (nth acc (- (count acc) 1)) "..")) (subvec acc 0 (- (count acc) 1)) (if abs acc (conj acc s))))
+                        :else (recur (+ i 1) (conj acc s))))))
+        body (str/join "/" out)]
+    (if abs (str "/" body) body)))
+
+(defn resolve-url Str [base: &Str rel: &Str]
+  (cond
+    (> (scheme-len rel) 0) (str rel)
+    :else
+    (let [sl (scheme-len base)
+          scheme (subs base 0 sl)
+          rest (subs base sl (count base))
+          [auth path] (if (str/starts-with? rest "//")
+                        (let [k (str/index-of-after rest "/" 2)] (if (< k 0) (values rest "/") (values (subs rest 0 k) (subs rest k (count rest)))))
+                        (values "" rest))
+          q (str/index-of path "?")
+          path0 (if (< q 0) path (subs path 0 q))]
+      (if (str/starts-with? rel "/") (str scheme auth (norm-path rel))
+        (let [slash (str/last-index-of path0 "/")
+              dir (if (< slash 0) "" (subs path0 0 (+ slash 1)))]
+          (str scheme auth (norm-path (str dir rel))))))))
+
+(defn- xerces-msg Str [e: &Str]
+  (let [i (str/index-of e ": ")
+        m (if (and (str/starts-with? e "line ") (>= i 0)) (subs e (+ i 2) (count e)) (str e))]
+    (cond
+      (= m "no root element") "Premature end of file."
+      (= m "content is not allowed in prolog") "Content is not allowed in prolog."
+      (str/starts-with? m "mismatched end tag: expected </")
+      (let [a (+ (str/index-of m "</") 2) b (str/index-of-after m ">" a) n (subs m a b)]
+        (str "The element type \"" n "\" must be terminated by the matching end-tag \"</" n ">\"."))
+      (str/starts-with? m "unexpected end of input") "XML document structures must start and end within the same entity."
+      :else m)))
+
+(defn- fail-at Str [url: &Str path: &Str code: &Str msg: &Str]
+  (str "WsdlParsingException: Error processing WSDL file [" url "]: WSDLException (at " path "): faultCode=" code ": " msg))
+
+(defn- load-doc Values(xml/XNode Str) [url: &Str load: &Fn(Str Values(Str Str))]
+  (let [none (xml/->XnText "")
+        [bytes le] (load (str url))]
+    (if (not= le "") (values none (str "WsdlGettingException: Error Getting the resource [" url "]: " le))
+      (let [[doc pe] (xml/parse bytes)]
+        (if (not= pe "")
+          (values none (str "WsdlParsingException: Error processing WSDL file [" url "]: faultCode=PARSER_ERROR: Problem parsing '" url "'.: org.xml.sax.SAXParseException: " (xerces-msg pe)))
+          (let [root (xml/doc-root doc)]
+            (if (or (not= (xml/elem-uri root) WSDL-NS) (not= (xml/elem-local root) "definitions"))
+              (values none (fail-at url (str "/" (xml/qname-str (xml/elem-name root))) "INVALID_WSDL"
+                                    (str "Expected element '{" WSDL-NS "}definitions'.")))
+              (values root ""))))))))
+
+(defn- cat-ns Vec(xml/XNs) [a: Vec(xml/XNs) b: &Vec(xml/XNs)]
+  (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- cat-defs Vec(Def) [a: Vec(Def) b: &Vec(Def)]
+  (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- collect Values(Vec(Def) Vec(Str) Str) [url: &Str top: &Str load: &Fn(Str Values(Str Str)) seen0: Vec(Str)]
+  (let [[root e] (load-doc url load)]
+    (if (not= e "") (values [] seen0 e)
+      (let [tns (xml/attr root "" "targetNamespace" "")
+            scope (xml/elem-ns root)
+            rpath (str "/" (xml/qname-str (xml/elem-name root)))
+            kids (xml/child-elems root)
+            seen (conj seen0 (str url))]
+        (loop [i 0 acc: Vec(Def) [] sn seen]
+          (if (>= i (count kids)) (values acc sn "")
+            (let [k (nth kids i)
+                  local (xml/elem-local k)]
+              (if (not= (xml/elem-uri k) WSDL-NS) (recur (+ i 1) acc sn)
+                (if (= local "import")
+                  (let [loc (xml/attr k "" "location" "")
+                        u (resolve-url url loc)]
+                    (if (or (= loc "") (has? sn u)) (recur (+ i 1) acc sn)
+                      (let [[ds sn2 ie] (collect u top load sn)]
+                        (if (not= ie "")
+                          (values [] sn2 (if (str/starts-with? ie "WsdlGettingException: ")
+                                           "NullPointerException: Cannot invoke \"java.net.URI.toURL()\" because the return value of \"org.apache.cxf.resource.URIResolver.getURI()\" is null"
+                                           ie))
+                          (recur (+ i 1) (cat-defs acc ds) sn2)))))
+                  (if (or (= local "portType") (= local "binding") (= local "service"))
+                    (recur (+ i 1) (conj acc (->Def local tns (xml/attr k "" "name" "") k (cat-ns (subvec scope 0 (count scope)) (xml/elem-ns k))
+                                                    (str rpath "/" (xml/qname-str (xml/elem-name k)))))
+                           sn)
+                    (recur (+ i 1) acc sn)))))))))))
+
+(defn- has? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn- resolve-qname Values(Str Str Bool) [s0: &Str scope: &Vec(xml/XNs)]
+  (let [s (str/trim s0)
+        k (str/index-of s ":")
+        prefix (if (< k 0) "" (subs s 0 k))
+        local (if (< k 0) s (subs s (+ k 1) (count s)))
+        found (loop [i (- (count scope) 1)] (if (< i 0) -1 (if (= (:prefix (nth scope i)) prefix) i (recur (- i 1)))))]
+    (if (< found 0) (values "" local (= prefix "")) (values (:uri (nth scope found)) local true))))
+
+(defn- find-def Vec(Def) [ds: &Vec(Def) kind: &Str uri: &Str name: &Str]
+  (loop [i 0] (if (>= i (count ds)) []
+                (let [d (nth ds i)] (if (and (= (:kind d) kind) (= (:tns d) uri) (= (:name d) name)) [d] (recur (+ i 1)))))))
+
+(defn- ext-child Vec(xml/XNode) [n: &xml/XNode uris: &Vec(Str) local: &Str]
+  (let [ks (xml/child-elems n)]
+    (loop [i 0] (if (>= i (count ks)) []
+                  (let [k (nth ks i)] (if (and (= (xml/elem-local k) local) (has? uris (xml/elem-uri k))) [k] (recur (+ i 1))))))))
+
+(defn- one-way? Bool [pt: &Vec(Def) name: &Str]
+  (if (= (count pt) 0) false
+    (let [ops (xml/child-elems (:node (nth pt 0)))
+          k (loop [i 0] (if (>= i (count ops)) -1 (let [o (nth ops i)] (if (and (= (xml/elem-local o) "operation") (= (xml/attr o "" "name" "") name)) i (recur (+ i 1))))))]
+      (if (< k 0) false
+        (let [kids (xml/child-elems (nth ops k))]
+          (and (loop [i 0] (if (>= i (count kids)) false (if (= (xml/elem-local (nth kids i)) "input") true (recur (+ i 1)))))
+               (not (loop [i 0] (if (>= i (count kids)) false (if (= (xml/elem-local (nth kids i)) "output") true (recur (+ i 1))))))))))))
+
+(defn- port-of Values(Port Str) [p: &xml/XNode scope: &Vec(xml/XNs) path: &Str ds: &Vec(Def) top: &Str]
+  (let [name (xml/attr p "" "name" "")
+        sc (cat-ns (subvec scope 0 (count scope)) (xml/elem-ns p))
+        addr (ext-child p [SOAP11-NS SOAP12-NS] "address")
+        address (if (= (count addr) 0) [] [(xml/attr (nth addr 0) "" "location" "")])
+        bref (xml/attr p "" "binding" "")
+        [buri blocal ok] (resolve-qname bref sc)
+        none (->Port name address "" "" [])]
+    (if (not ok) (values none (fail-at top (str path "/" (xml/qname-str (xml/elem-name p))) "UNBOUND_PREFIX" (str "Unable to determine namespace of '" bref "'.")))
+      (let [bd (find-def ds "binding" buri blocal)]
+        (if (= (count bd) 0) (values none "")
+          (let [b (:node (nth bd 0))
+                s11 (ext-child b [SOAP11-NS] "binding")
+                s12 (ext-child b [SOAP12-NS] "binding")
+                sb (if (> (count s11) 0) s11 s12)
+                st (if (= (count sb) 0) "" (if (= (xml/attr (nth sb 0) "" "style" "") "rpc") "RPC" "DOC_LITERAL"))
+                ver (cond (= (count sb) 0) "" (> (count s11) 0) "SOAP11" :else "SOAP12")
+                [puri plocal pok] (resolve-qname (xml/attr b "" "type" "") (:scope (nth bd 0)))
+                pt (find-def ds "portType" puri plocal)
+                bops (xml/child-elems b)
+                ops (loop [i 0 acc: Vec(Op) []]
+                      (if (>= i (count bops)) acc
+                        (let [o (nth bops i)]
+                          (if (or (not= (xml/elem-uri o) WSDL-NS) (not= (xml/elem-local o) "operation")) (recur (+ i 1) acc)
+                            (let [oname (xml/attr o "" "name" "")
+                                  so (ext-child o [SOAP11-NS SOAP12-NS] "operation")
+                                  act (if (= (count so) 0) "" (xml/attr (nth so 0) "" "soapAction" ""))
+                                  has (and (> (count so) 0) (xml/has-attr? (nth so 0) "" "soapAction"))]
+                              (recur (+ i 1) (conj acc (->Op oname (one-way? pt oname) act has))))))))]
+            (values (->Port name address ver st ops) "")))))))
+
+(defn parse Values(Wsdl Str) [url: &Str load: &Fn(Str Values(Str Str))]
+  (let [none (->Wsdl "" [])
+        [ds sn e] (collect url url load [])]
+    (if (not= e "") (values none e)
+      (let [[svs err] (loop [i 0 acc: Vec(Service) []]
+                        (if (>= i (count ds)) (values acc "")
+                          (let [d (nth ds i)]
+                            (if (not= (:kind d) "service") (recur (+ i 1) acc)
+                              (let [ps (xml/child-elems (:node d))
+                                    [ports pe] (loop [k 0 pa: Vec(Port) []]
+                                                 (if (>= k (count ps)) (values pa "")
+                                                   (let [p (nth ps k)]
+                                                     (if (or (not= (xml/elem-uri p) WSDL-NS) (not= (xml/elem-local p) "port")) (recur (+ k 1) pa)
+                                                       (let [[pt ee] (port-of p (:scope d) (:path d) ds url)]
+                                                         (cond (not= ee "") (values pa ee)
+                                                               (= (:version pt) "") (recur (+ k 1) pa)
+                                                               :else (recur (+ k 1) (conj pa pt))))))))]
+                                (if (not= pe "") (values acc pe) (recur (+ i 1) (conj acc (->Service (:name d) ports)))))))))
+            rpc (loop [i 0] (if (>= i (count ds)) false
+                              (let [d (nth ds i)]
+                                (if (and (= (:kind d) "binding")
+                                         (let [sb (ext-child (:node d) [SOAP11-NS SOAP12-NS] "binding")]
+                                           (and (> (count sb) 0) (= (xml/attr (nth sb 0) "" "style" "") "rpc"))))
+                                  true (recur (+ i 1))))))]
+        (if (not= err "") (values none err) (values (->Wsdl (if rpc "RPC" "DOC_LITERAL") svs) ""))))))
+
+(defn find-service Vec(Service) [w: &Wsdl name: &Str]
+  (let [ss (:services w)] (loop [i 0] (if (>= i (count ss)) [] (if (= (:name (nth ss i)) name) [(nth ss i)] (recur (+ i 1)))))))
+
+(defn find-port Vec(Port) [s: &Service name: &Str]
+  (let [ps (:ports s)] (loop [i 0] (if (>= i (count ps)) [] (if (= (:name (nth ps i)) name) [(nth ps i)] (recur (+ i 1)))))))
+
+(defn find-op Vec(Op) [p: &Port name: &Str]
+  (let [os (:ops p)] (loop [i 0] (if (>= i (count os)) [] (if (= (:name (nth os i)) name) [(nth os i)] (recur (+ i 1)))))))

@@ -1,0 +1,111 @@
+(ns mulay.rt.log (:require [mulay.lib.host :as host] [mulay.lib.xml :as xml] [clay.string :as str] [mulay.lib.time.zoned :as tz] [mulay.lib.time.tz :as tzc] [mulay.lib.time.fmt :as tf]))
+
+(def TRACE 0)
+(def DEBUG 1)
+(def INFO 2)
+(def WARN 3)
+(def ERROR 4)
+
+(defn level-of Int [s: &Str]
+  (let [u (str/upper-case s)]
+    (if (= u "TRACE") TRACE (if (= u "DEBUG") DEBUG (if (= u "WARN") WARN (if (= u "ERROR") ERROR INFO))))))
+
+(defn level-name Str [l: Int]
+  (if (= l TRACE) "TRACE" (if (= l DEBUG) "DEBUG" (if (= l WARN) "WARN " (if (= l ERROR) "ERROR" "INFO ")))))
+
+(defrecord Rule [name: Str level: Int])
+(defrecord Config [on: Bool root: Int rules: Vec(Rule)])
+
+(def CONFIG (atom (->Config false 0 [])))
+
+(defn- level-num Values(Int Bool) [s: &Str]
+  (let [u (str/upper-case (str/trim s))]
+    (cond (= u "ALL") (values TRACE true) (= u "TRACE") (values TRACE true) (= u "DEBUG") (values DEBUG true)
+          (= u "INFO") (values INFO true) (= u "WARN") (values WARN true) (= u "ERROR") (values ERROR true)
+          (= u "FATAL") (values ERROR true) (= u "OFF") (values 99 true)
+          :else (values 0 false))))
+
+(defn use-config! Int [xml-text: &Str]
+  (if (= (str/trim xml-text) "") (let [z (reset! CONFIG (->Config false 0 []))] 0)
+    (let [[doc e] (xml/parse xml-text)]
+      (if (not= e "") (let [z (reset! CONFIG (->Config false 0 []))] 0)
+        (let [root (xml/doc-root doc)
+              lg (loop [i 0 ks (xml/child-elems root)] (if (>= i (count ks)) [] (if (= (xml/elem-local (nth ks i)) "Loggers") [(nth ks i)] (recur (+ i 1) ks))))
+              kids (if (= (count lg) 0) [] (xml/child-elems (nth lg 0)))
+              [rt rules] (loop [i 0 r ERROR acc: Vec(Rule) []]
+                           (if (>= i (count kids)) (values r acc)
+                             (let [k (nth kids i) l (xml/elem-local k)
+                                   [n ok] (level-num (xml/attr k "" "level" ""))]
+                               (cond (and ok (or (= l "Root") (= l "AsyncRoot"))) (recur (+ i 1) n acc)
+                                     (and ok (or (= l "Logger") (= l "AsyncLogger"))) (recur (+ i 1) r (conj acc (->Rule (xml/attr k "" "name" "") n)))
+                                     :else (recur (+ i 1) r acc)))))
+              z (reset! CONFIG (->Config true rt rules))]
+          0)))))
+
+(defn- threshold Int [c: &Config cat: &Str]
+  (loop [i 0 best -1 lv (:root c)]
+    (if (>= i (count (:rules c))) lv
+      (let [r (nth (:rules c) i) n (:name r)
+            hit (and (> (count n) best) (or (= cat n) (and (str/starts-with? cat n) (> (count cat) (count n)) (= (nth cat (count n)) 46))))]
+        (if hit (recur (+ i 1) (count n) (:level r)) (recur (+ i 1) best lv))))))
+
+(defn enabled? Bool [l: Int min: Int cat: &Str]
+  (let [c: Config (deref CONFIG)]
+    (if (:on c) (if (= min INFO) (>= l (threshold c cat)) (>= l min))
+      (let [floor (if (or (str/starts-with? cat "org.mule.") (str/starts-with? cat "mulay") (str/starts-with? cat "com.mulesoft.")) INFO WARN)]
+        (and (>= l min) (>= l floor))))))
+
+(defn- pad3 Str [n: Int] (if (< n 10) (str "00" n) (if (< n 100) (str "0" n) (str n))))
+
+(defn timestamp Str []
+  (let [[t e] (tf/format-pattern-zdt "yyyy-MM-dd HH:mm:ss,SSS" (tz/now-zdt))] t))
+
+(defn- flush-out Int [] (host/flush-stdout))
+
+(defrecord Rec [ms: Int ts: Str level: Int logger: Str msg: Str thread: Str])
+
+(defn- empty-ring Vec(Rec) [] (let [v: Vec(Rec) []] v))
+(def RING-CAP (atom 0))
+(def RING (atom (empty-ring)))
+
+(defn ring-install! Int [cap: Int] (let [a (reset! RING (empty-ring)) b (reset! RING-CAP cap)] 0))
+(defn ring-capacity Int [] (deref RING-CAP))
+(defn ring-snapshot Vec(Rec) [] (deref RING))
+
+(defn- ring-push Vec(Rec) [v: &Vec(Rec) r: Rec cap: Int]
+  (loop [i (if (>= (count v) cap) (+ (- (count v) cap) 1) 0) acc: Vec(Rec) []]
+    (if (>= i (count v)) (conj acc r) (recur (+ i 1) (conj acc (nth v i))))))
+
+(defn- ring-add! Int [level: Int where: &Str category: &Str msg: &Str]
+  (let [cap (deref RING-CAP)]
+    (if (or (<= cap 0) (str/starts-with? category "mulay")) 0
+      (let [[sec ns] (tzc/now-instant-ns)
+            [ts e] (tf/format-pattern-zdt "yyyy-MM-dd HH:mm:ss.SSS" (tz/now-zdt))
+            r (->Rec (+ (* sec 1000) (/ ns 1000000)) ts level (str category) (str msg) (str where))
+            z (swap! RING (fn Vec(Rec) [v: Vec(Rec)] (ring-push v r cap)))]
+        0))))
+
+(def SINK (atom (let [v: Vec(Fn(Int Str Str Bool Int)) []] v)))
+
+(defn set-sink! Int [f: Fn(Int Str Str Bool Int)] (let [z (reset! SINK [f])] 0))
+
+(defn clear-sink! Int [] (let [z (reset! SINK (let [v: Vec(Fn(Int Str Str Bool Int)) []] v))] 0))
+
+(defn capturing? Bool [] (let [v: Vec(Fn(Int Str Str Bool Int)) (deref SINK)] (> (count v) 0)))
+
+(defn capture Int [level: Int category: &Str msg: &Str shown: Bool]
+  (let [v: Vec(Fn(Int Str Str Bool Int)) (deref SINK)] (if (= (count v) 0) 0 ((nth v 0) level (str category) (str msg) shown))))
+
+(defn emit Int [level: Int min: Int where: &Str category: &Str msg: &Str]
+  (cond
+    (not (enabled? level min category)) 0
+    (capturing?) (capture level category msg true)
+    :else
+    (let [rz (ring-add! level where category msg)
+          line (str (level-name level) " " (timestamp) " [" where "] " category ": " msg)]
+      (if (>= level WARN) (let [z (eprintln line)] 0) (let [z (println line)] (flush-out))))))
+
+(defn use-app-config! Int [res: &Fn(Str Values(Str Bool))]
+  (let [[t1 f1] (res "log4j2-test.xml")
+        [t2 f2] (if f1 (values "" false) (res "log4j2.xml"))]
+    (use-config! (cond f1 t1 f2 t2 :else ""))))

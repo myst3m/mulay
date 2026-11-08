@@ -1,0 +1,122 @@
+(ns mulay.dw.lib.multipart (:require [mulay.lib.host :as host] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+                                     [mulay.dw.urls :as urls] [mulay.dw.lib.mime :as mime]))
+
+(def M "dw::module::Multipart")
+
+(defn- sv v/Val [s: Str] (v/->VStr s))
+
+(defn- str-arg Values(Str Str) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VStr s) (values s "")
+    (v/VKey k) (values (:name k) "")
+    _ (values "" (str "Expecting Type: `String`, but got: `" (mime/show-arg x) "`."))))
+
+(defn make-field v/Val [name: &Str value: &v/Val mt: &Str fname: &Str]
+  (let [cd (v/->VObj (let [a: Vec(v/Field) [(v/field "name" (sv (str name)))]] (if (= fname "") a (conj a (v/field "filename" (sv (str fname)))))))
+        hs (let [a: Vec(v/Field) (if (= mt "") [] [(v/field "Content-Type" (sv (str mt)))])] (conj a (v/field "Content-Disposition" cd)))]
+    (v/->VObj [(v/field "headers" (v/->VObj hs)) (v/field "content" value)])))
+
+(defn- field4 Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[n e1] (str-arg (nth a 0))
+        [m e2] (if (> (count a) 2) (str-arg (nth a 2)) (values "" ""))
+        [f e3] (if (> (count a) 3) (str-arg (nth a 3)) (values "" ""))
+        e (if (not= e1 "") e1 (if (not= e2 "") e2 e3))]
+    (if (not= e "") (rt/failure "TypeMismatch" e) (rt/ret (make-field n (nth a 1) m f)))))
+
+(defn- opts-of Values(Vec(v/Field) Str) [x: &v/Val allowed: Vec(Str) sig: &Str]
+  (match (v/unmeta x)
+    (v/VObj fs) (loop [i 0]
+                  (if (>= i (count fs)) (values fs "")
+                    (let [k (:name (:key (nth fs i)))
+                          ok (loop [j 0] (if (>= j (count allowed)) false (if (= (nth allowed j) k) true (recur (+ j 1)))))]
+                      (if ok (recur (+ i 1))
+                        (values fs (str "Property: `" k ": " (mime/show-arg (:value (nth fs i))) "` was not defined in: `" sig "`. No additional properties is allowed."))))))
+    _ (values [] (str "Expecting Type: `" sig "`, but got: `" (mime/show-arg x) "`."))))
+
+(defn- opt-str Values(Str Str) [fs: &Vec(v/Field) k: &Str default: Str]
+  (let [r (v/obj-get fs k)] (if (= (count r) 0) (values default "") (str-arg (nth r 0)))))
+
+(defn- field-opts Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[fs e0] (opts-of (nth a 0) ["name" "value" "mime" "fileName"] "{|name: String, valu... fileName?: String|}")]
+    (if (not= e0 "") (rt/failure "TypeMismatch" e0)
+      (let [nr (v/obj-get fs "name")]
+        (if (= (count nr) 0) (rt/failure "TypeMismatch" "Missing required property: `name` required by `{|name: String, valu... fileName?: String|}`.")
+          (let [[n e1] (str-arg (nth nr 0))
+                vr (v/obj-get fs "value")
+                [m e2] (opt-str fs "mime" "")
+                [f e3] (opt-str fs "fileName" "")
+                e (if (not= e1 "") e1 (if (not= e2 "") e2 e3))]
+            (if (not= e "") (rt/failure "TypeMismatch" e)
+              (rt/ret (make-field n (if (= (count vr) 0) (v/null-v) (nth vr 0)) m f)))))))))
+
+(defn- file-impl Values(v/Val dwe/DwErr) [name: &Str path: &Str mt: &Str fname: &Str]
+  (let [[t e] (urls/load-url (str "classpath://" path))]
+    (if (not= e "") (rt/failure "ResourceNotFound" e)
+      (rt/ret (make-field name (v/->VBin t) mt fname)))))
+
+(defn- file4 Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[n e1] (str-arg (nth a 0))
+        [p e2] (str-arg (nth a 1))
+        [m e3] (if (> (count a) 2) (str-arg (nth a 2)) (values "application/octet-stream" ""))
+        [f e4] (if (> (count a) 3) (str-arg (nth a 3)) (values "filename" ""))
+        e (if (not= e1 "") e1 (if (not= e2 "") e2 (if (not= e3 "") e3 e4)))]
+    (if (not= e "") (rt/failure "TypeMismatch" e) (file-impl n p m f))))
+
+(defn- file-opts Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[fs e0] (opts-of (nth a 0) ["name" "path" "mime" "fileName"] "{|name: String, path... fileName?: String|}")]
+    (if (not= e0 "") (rt/failure "TypeMismatch" e0)
+      (let [[n e1] (opt-str fs "name" "")
+            [p e2] (opt-str fs "path" "")
+            [m e3] (opt-str fs "mime" "application/octet-stream")
+            [f e4] (opt-str fs "fileName" "filename")
+            e (if (not= e1 "") e1 (if (not= e2 "") e2 (if (not= e3 "") e3 e4)))]
+        (if (not= e "") (rt/failure "TypeMismatch" e) (file-impl n p m f))))))
+
+(defn- form Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (match (v/unmeta (nth a 0))
+    (v/VArr xs)
+    (let [errs (loop [i 0 acc: Vec(Str) []]
+                 (if (>= i (count xs)) acc
+                   (recur (+ i 1)
+                          (match (v/unmeta (nth xs i))
+                            (v/VObj fs) (if (= (count (v/obj-get fs "content")) 0) (conj acc "Missing required property: `content` required by `MultipartPart`.") acc)
+                            _ (conj acc (str "Expecting Type: `MultipartPart`, but got: `" (mime/show-arg (nth xs i)) "`."))))))]
+      (if (> (count errs) 0)
+        (rt/failure "TypeMismatch" (if (= (count errs) 1) (nth errs 0)
+                                  (loop [i 0 out ""] (if (>= i (count errs)) out (recur (+ i 1) (str out (if (> i 0) "\n" "") "- " (nth errs i)))))))
+        (let [[fs e] (loop [i 0 acc: Vec(v/Field) []]
+                       (if (>= i (count xs)) (values acc "")
+                         (let [p (nth xs i)
+                               nm (match (v/unmeta p)
+                                    (v/VObj fs) (let [h (v/obj-get fs "headers")]
+                                                  (if (= (count h) 0) []
+                                                    (match (v/unmeta (nth h 0))
+                                                      (v/VObj hs) (let [cd (v/obj-get hs "Content-Disposition")]
+                                                                    (if (= (count cd) 0) []
+                                                                      (match (v/unmeta (nth cd 0))
+                                                                        (v/VObj ds) (let [n (v/obj-get ds "name")] (if (= (count n) 0) [] (match (v/unmeta (nth n 0)) (v/VStr s) [s] _ [])))
+                                                                        _ [])))
+                                                      _ [])))
+                                    _ [])]
+                           (if (= (count nm) 0) (values acc "Cannot coerce Null (null) to Key")
+                             (recur (+ i 1) (conj acc (v/field (nth nm 0) p)))))))]
+          (if (not= e "") (rt/failure "CoercionException" e) (rt/ret (v/->VObj [(v/field "parts" (v/->VObj fs))]))))))
+    _ (rt/failure "TypeMismatch" (str "Expecting Type: `Array<MultipartPart>`, but got: `" (mime/show-arg (nth a 0)) "`."))))
+
+(def BOUNDARY-CHARS "-_1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+(defn- gen Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[n e] (if (> (count a) 0) (num/to-int (core/arg-num a 0)) (values 70 ""))]
+    (rt/ret (sv (loop [i 0 out ""]
+                  (if (>= i n) out
+                    (let [k (host/rand-below (count BOUNDARY-CHARS))] (recur (+ i 1) (str out (subs BOUNDARY-CHARS k (+ k 1)))))))))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "field" [(rt/b1 "Any" field-opts) (rt/b2 "Any" "Any" field4) (rt/overload ["Any" "Any" "Any"] field4)
+               (rt/overload ["Any" "Any" "Any" "Any"] field4)])
+   (B "file" [(rt/b1 "Any" file-opts) (rt/b2 "Any" "Any" file4) (rt/overload ["Any" "Any" "Any"] file4)
+              (rt/overload ["Any" "Any" "Any" "Any"] file4)])
+   (B "form" [(rt/b1 "Any" form)])
+   (B "generateBoundary" [(rt/overload [] gen) (rt/b1 "Number" gen)])])

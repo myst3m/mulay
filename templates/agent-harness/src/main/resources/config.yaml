@@ -1,0 +1,96 @@
+# エージェントの設定。実行時に key=value (mulay run . llm.url=...) か -D で上書きできる。
+http:
+  port: "8081"
+
+# LLM。provider: auto (既定。url が空なら stat、あれば openai) | stat | openai。
+#   stat:   統計的なモデル (stat.xml。LLM を使わず、問いを例文と比べてツールを選び、ひな形で答える。stat.* を参照)
+#   openai: OpenAI 互換の chat/completions (url、model、key。key は本番では secure property に置く)
+llm:
+  provider: "auto"
+  url: ""
+  model: ""
+  key: ""
+
+# 同じアプリの偽の LLM (mock-llm.xml、テスト用)。使うときは started にして llm.url を http://localhost:<port>/mock-llm/v1 に向ける
+mockLlm:
+  state: "stopped"
+
+# 統計的なモデル。threshold: 問いと例文の TF-IDF のコサインがこれ以上ならそのツールを選ぶ。
+# noAnswer: どのツールにも文書にも当たらないときの答え
+stat:
+  threshold: "0.3"
+  noAnswer: "Sorry, I could not find an answer."
+
+# ツールを出す MCP サーバー。既定は同じアプリの tools.xml。
+mcp:
+  url: "http://localhost:${http.port}"
+  path: "/mcp"
+
+# A2A: このエージェントの公開 (a2a.path) と、ask_agent ツールが頼むエージェント (a2a.peerUrl。既定はこのアプリ自身)
+a2a:
+  path: "/agent"
+  name: "Mulay Agent Harness"
+  description: "An agent built from the agent-harness template"
+  publicUrl: "http://localhost:${http.port}/agent"
+  peerUrl: "http://localhost:${http.port}/agent"
+
+# 注文システム (SOAP の Web サービス、tools.xml の Orders)。既定は同じアプリの偽物 (mock-llm.xml)。
+# 本物に向けるときは url を変え、mockOrders.state を stopped にする
+mockOrders:
+  state: "started"
+
+orders:
+  url: "http://localhost:${http.port}/mock-orders"
+
+# 文書の検索 (RAG、rag.xml) の埋め込み。Ollama の /api/embeddings (Vectors コネクタの ollama-connection)。
+# 既定は同じアプリの統計的な埋め込み (stat.xml。モデルを使わず、言葉が同じ文どうしが近くなる)。
+# 本物のモデルに向けるときは url と model を変える (例: http://localhost:11434、nomic-embed-text)。
+# 保存先は model ごとに分かれる (docs.store)。替えたら管理用の MCP の reindex_documents で作り直す
+embed:
+  url: "http://localhost:${http.port}/stat-embed"
+  model: "stat-hash-512"
+
+# 文書の置き場所 (Vectors の ephemeral-file。相対ならプロセスのカレントディレクトリから。無ければ add_document が作る)、
+# 保存先の名前 (埋め込みのモデルごと)、分割の大きさと重なり (文字)、検索で返す数と下限のスコア。
+# スコアは Vectors コネクタ (LangChain4j) の relevance score = (コサイン類似度 + 1) / 2 で、無関係 (コサイン 0) が 0.5。
+# 0.6 はコサイン 0.2: 統計的な埋め込みで、言葉が 1〜2 語重なるくらい。ニューラルの埋め込みなら 0.75 くらいからが目安
+docs:
+  dir: "docs-store"
+  store: "docs-${embed.model}"
+  chunkSize: "500"
+  chunkOverlap: "50"
+  maxResults: "3"
+  minScore: "0.6"
+
+# 管理用の MCP サーバー (admin.xml: 文書を入れる・消す・一覧する・探す・作り直す)。
+# key は Authorization: Bearer <key> で確かめる鍵。空なら管理用の口は閉じている (どの要求も断る)。
+# 本番では secure property か、デプロイ先の保護されたプロパティに置く
+admin:
+  path: "/admin/mcp"
+  key: ""
+
+# テスト用の口 (mock-llm.xml の /mock-llm/last、/mock-hook、DELETE /test/docs)。要求の中身が見えたり文書が消えたりするので、既定では止める
+testHooks:
+  state: "stopped"
+
+# 会話の履歴と A2A のタスクの記録の Object Store。persistent なら再起動をまたぐ。ttlHours を過ぎたものは消える
+store:
+  persistent: "true"
+  ttlHours: "24"
+
+agent:
+  # 会話の履歴として残すメッセージの数 (問いと答えで 2 つ。古いものから捨てる)
+  historyMax: "20"
+  # 履歴の文字数の上限 (残すメッセージの content の合計。超える分は古いものから丸ごと捨てる。
+  # 最新の問いと答えだけで超えると、履歴は空になる)
+  historyMaxChars: "8000"
+  # true なら、捨てるメッセージを前の要約と一緒に LLM に要約させ、履歴の先頭に {role: summary} として残す。
+  # 上限に達した後は会話ごとに LLM の呼び出しが 1 回増える (答えを返す前に要約する)。
+  # 要約は summaryMaxChars 文字で切り、historyMax / historyMaxChars には数えない (LLM に渡す履歴は最大 historyMaxChars + summaryMaxChars 文字)
+  summarize: "false"
+  summaryMaxChars: "1000"
+  summaryPrompt: "Summarize the earlier part of a conversation between a user and an agent, for the agent to remember. Keep facts, names, numbers and decisions; drop small talk."
+  # LLM を呼ぶ回数の上限 (ツールの呼び出しが続いて止まらないときの歯止め)
+  maxSteps: "5"
+  systemPrompt: "You are a helpful agent. Use the tools when they help."
+  instructions: "The data is JSON: question, history (earlier turns, oldest first; an item with role summary sums up the turns before them) and toolResults (tools already called in this turn). Answer the question; call a tool only when the answer needs it."

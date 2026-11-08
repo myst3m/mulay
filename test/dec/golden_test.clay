@@ -1,0 +1,109 @@
+(ns golden-test (:require [mulay.lib.numparse :as npz] [mulay.lib.bigint :as bi] [clay.bigint :as big] [mulay.lib.dec :as d] [clay.string :as str] [dec-golden-data :as g] [dec-edge-data :as edge]))
+
+;; tools/gen-dec-golden.java が Java 21 で作った期待値 (test/dec/golden_data.clay) との照合。
+;; 1 行 = 演算名 入力... 期待値 (タブ区切り)。失敗した行は表示して数える。
+
+(defn- bp big/BigInt [s: Str] (let [[x e] (bi/parse s)] x))
+(defn- dp d/Dec [s: Str] (let [[x e] (d/parse s)] x))
+(defn- ds Str [x: d/Dec] (d/to-string x))
+(defn- or-err Str [v: Str e: Str] (if (= e "") v "ERR"))
+(defn- dres Str [x: d/Dec e: Str] (if (= e "") (d/to-string x) "ERR"))
+(defn- fld Str [f: &Vec(Str) i: Int] (nth f i))
+(defn- num Int [f: &Vec(Str) i: Int] (npz/int-or (nth f i) 0))
+
+(defn- run-bigint Str [f: Vec(Str)]
+  (let [op (fld f 0)]
+    (cond
+      (= op "add") (bi/to-string (bi/add (bp (fld f 1)) (bp (fld f 2))))
+      (= op "sub") (bi/to-string (bi/sub (bp (fld f 1)) (bp (fld f 2))))
+      (= op "mul") (bi/to-string (bi/mul (bp (fld f 1)) (bp (fld f 2))))
+      (= op "divmod") (let [[q r e] (bi/divmod (bp (fld f 1)) (bp (fld f 2)))]
+                        (or-err (str (bi/to-string q) "," (bi/to-string r)) e))
+      (= op "gcd") (bi/to-string (bi/gcd (bp (fld f 1)) (bp (fld f 2))))
+      (= op "cmp") (str (bi/cmp (bp (fld f 1)) (bp (fld f 2))))
+      (= op "toint") (let [[n e] (bi/to-int (bp (fld f 1)))] (or-err (str n) e))
+      (= op "pow") (let [[p e] (bi/pow-big (bp (fld f 1)) (num f 2))] (or-err (bi/to-string p) e))
+      (= op "parse") (let [[x e] (bi/parse (fld f 1))] (or-err (bi/to-string x) e))
+      :else (str "unknown op " op))))
+
+(defn- run-dec Str [f: Vec(Str)]
+  (let [op (fld f 0)]
+    (cond
+      (= op "parse") (let [[x e] (d/parse (fld f 1))]
+                       (if (= e "")
+                         (str (d/to-string x) "\t" (if (> (count f) 3) (if (= (fld f 3) "-") "-" (d/to-plain-str x)) "")
+                              "\t" (bi/to-string (d/unscaled x)) "\t" (d/scale x))
+                         "ERR"))
+      (= op "add") (let [[x e] (d/add (dp (fld f 1)) (dp (fld f 2)))] (dres x e))
+      (= op "sub") (let [[x e] (d/sub (dp (fld f 1)) (dp (fld f 2)))] (dres x e))
+      (= op "mul") (ds (d/mul (dp (fld f 1)) (dp (fld f 2))))
+      (= op "cmp") (str (d/cmp (dp (fld f 1)) (dp (fld f 2))))
+      (= op "rem") (let [[x e] (d/rem-dec (dp (fld f 1)) (dp (fld f 2)))] (dres x e))
+      (= op "divex") (let [[x e] (d/div-exact (dp (fld f 1)) (dp (fld f 2)))] (dres x e))
+      (= op "div") (let [[x e] (d/div (dp (fld f 1)) (dp (fld f 2)) d/DECIMAL128 d/HALF-EVEN)] (dres x e))
+      (= op "strip") (ds (d/strip-trailing-zeros (dp (fld f 1))))
+      (= op "neg") (ds (d/neg (dp (fld f 1))))
+      (= op "abs") (ds (d/abs-dec (dp (fld f 1))))
+      (= op "eq") (str (d/equals? (dp (fld f 1)) (dp (fld f 2))))
+      (= op "intq") (str (d/integer? (dp (fld f 1))))
+      (= op "toint") (let [[n e] (d/to-int-exact (dp (fld f 1)))] (or-err (str n) e))
+      (= op "floor") (let [[x e] (d/floor-int (dp (fld f 1)))] (dres x e))
+      (= op "ceil") (let [[x e] (d/ceil-int (dp (fld f 1)))] (dres x e))
+      (= op "prec") (str (d/precision (dp (fld f 1))))
+      (= op "divmc") (let [[x e] (d/div-mc (dp (fld f 1)) (dp (fld f 2)) (num f 3) (num f 4))] (dres x e))
+      (= op "divsc") (let [[x e] (d/div-scale (dp (fld f 1)) (dp (fld f 2)) (num f 3) (num f 4))] (dres x e))
+      (= op "round") (let [[x e] (d/round-mc (dp (fld f 1)) (num f 2) (num f 3))] (dres x e))
+      (= op "setsc") (let [[x e] (d/set-scale (dp (fld f 1)) (num f 2) (num f 3))] (dres x e))
+      (= op "powmc") (let [[x e] (d/pow-mc (dp (fld f 1)) (num f 2) (num f 3) (num f 4))] (dres x e))
+      (= op "pow") (let [[x e] (d/pow-exact (dp (fld f 1)) (num f 2))] (dres x e))
+      (= op "dtostr") (d/float->shortest-str (npz/flt (fld f 1)))
+      (= op "dvalueof") (let [[x e] (d/from-float (npz/flt (fld f 1)))] (dres x e))
+      (= op "todouble") (d/float->shortest-str (d/to-float (dp (fld f 1))))
+      :else (str "unknown op " op))))
+
+;; 2^53 以上 2^63 未満の整数の double は Java 17 の整数の道筋で桁にする (ADR 003)。この golden は Java 21 で作ったので
+;; 比べない (dtoa_long_test が Java 17 の期待値で確かめる)。
+(defn- jdk17-long-range? Bool [f: &Vec(Str)]
+  (let [op (nth f 0)
+        x (cond (or (= op "dtostr") (= op "dvalueof")) (npz/flt (fld f 1))
+                (= op "todouble") (d/to-float (dp (fld f 1)))
+                :else 0.0)
+        ax (if (< x 0.0) (- 0.0 x) x)]
+    (and (>= ax 9007199254740992.0) (< ax 9223372036854775808.0))))
+
+;; 期待値の列: parse は入力の後ろ全部、それ以外は最後の 1 列。
+(defn- expected Str [f: &Vec(Str)]
+  (if (and (= (nth f 0) "parse") (> (count f) 3))
+    (str/join "\t" (subvec f 2 (count f)))
+    (nth f (- (count f) 1))))
+
+(defn- check Int [data: Str big: Bool]
+  (let [lines: Vec(Str) (str/split data "\n")]
+    (loop [i 0 bad 0]
+      (if (>= i (count lines)) bad
+        (let [ln (nth lines i)]
+          (if (= (count ln) 0) (recur (+ i 1) bad)
+            (let [f: Vec(Str) (str/split ln "\t")
+                  want (expected f)
+                  got (if big (run-bigint f) (run-dec f))]
+              (if (or (= got want) (and (not big) (jdk17-long-range? f))) (recur (+ i 1) bad)
+                (let [z (if (< bad 15) (println (str "MISMATCH " ln "\n   got: " got)) 0)]
+                  (recur (+ i 1) (+ bad 1)))))))))))
+
+;; 空のデータで素通りしないように、行数も確かめる
+(defn- nlines Int [data: Str] (count (str/split data "\n")))
+
+(deftest golden-not-vacuous
+  (is (> (nlines (g/bigint-cases)) 3000))
+  (is (> (nlines (g/dec-parse-cases)) 600))
+  (is (> (nlines (g/dec-arith-cases)) 4000))
+  (is (> (nlines (g/dec-round-cases)) 1500))
+  (is (> (nlines (g/float-cases)) 1500))
+  (is (> (nlines (edge/edge-cases)) 25000)))
+
+(deftest golden-bigint (is (= (check (g/bigint-cases) true) 0)))
+(deftest golden-dec-parse (is (= (check (g/dec-parse-cases) false) 0)))
+(deftest golden-dec-arith (is (= (check (g/dec-arith-cases) false) 0)))
+(deftest golden-dec-round (is (= (check (g/dec-round-cases) false) 0)))
+(deftest golden-float (is (= (check (g/float-cases) false) 0)))
+(deftest golden-dec-edge (is (= (check (edge/edge-cases) false) 0)))

@@ -1,0 +1,428 @@
+(ns mulay.lib.time.tz
+  (:require [mulay.lib.host :as host] [mulay.lib.time.types :as t]
+            [mulay.lib.time.civil :as cv]
+            [mulay.lib.time.num :as n]
+            [clay.string :as str]))
+
+(defrecord PosixRule [kind: Int a: Int b: Int c: Int time: Int])
+(defrecord PosixTz [std-abbr: Str std-off: Int dst-abbr: Str dst-off: Int has-dst: Bool start: PosixRule end: PosixRule])
+
+(defrecord ZoneRules [id: Str trans: Vec(Int) types: Vec(Int) toffs: Vec(Int) tdst: Vec(Int) tabbr: Vec(Str)
+                      has-tail: Bool tail: PosixTz neg-from: Int valid: Bool])
+
+(defn rules-id Str [r: &ZoneRules] (:id r))
+(defn rules-fixed? Bool [r: &ZoneRules] (and (= (count (:trans r)) 0) (not (:has-tail r))))
+
+(defn- empty-posix PosixTz []
+  (->PosixTz "" 0 "" 0 false (->PosixRule 0 0 0 0 0) (->PosixRule 0 0 0 0 0)))
+
+(defn fixed-rules ZoneRules [id: Str off: Int]
+  (->ZoneRules id [] [] [off] [0] [(t/offset-id off)] false (empty-posix) n/LMAX true))
+
+(defn- off-num Values(Int Str) [s: &Str pos: Int colon: Bool]
+  (if (and colon (not= (nth s (- pos 1)) 58))
+    (values 0 (str "Invalid ID for ZoneOffset, colon not found when expected: " s))
+    (let [a (nth s pos) b (nth s (+ pos 1))]
+      (if (and (digit? a) (digit? b)) (values (+ (* (- a 48) 10) (- b 48)) "")
+        (values 0 (str "Invalid ID for ZoneOffset, non numeric characters found: " s))))))
+
+(defn- off-validate Str [h: Int m: Int x: Int]
+  (if (or (< h -18) (> h 18)) (str "Zone offset hours not in valid range: value " h " is not in the range -18 to 18")
+    (if (or (< m -59) (> m 59)) (str "Zone offset minutes not in valid range: value " m " is not in the range -59 to 59")
+      (if (or (< x -59) (> x 59)) (str "Zone offset seconds not in valid range: value " x " is not in the range -59 to 59")
+        (if (and (or (= h 18) (= h -18)) (or (not= m 0) (not= x 0))) "Zone offset not in valid range: -18:00 to +18:00"
+          "")))))
+
+(defn offset-of-id Values(Int Str) [s0: &Str]
+  (if (= s0 "Z") (values 0 "")
+    (let [s (if (= (count s0) 2) (str (subs s0 0 1) "0" (subs s0 1 2)) (str s0))
+          len (count s)
+          [h m x e]
+          (case len
+            3 (let [[h e1] (off-num s 1 false)] (values h 0 0 e1))
+            5 (let [[h e1] (off-num s 1 false) [m e2] (if (= e1 "") (off-num s 3 false) (values 0 e1))] (values h m 0 e2))
+            6 (let [[h e1] (off-num s 1 false) [m e2] (if (= e1 "") (off-num s 4 true) (values 0 e1))] (values h m 0 e2))
+            7 (let [[h e1] (off-num s 1 false) [m e2] (if (= e1 "") (off-num s 3 false) (values 0 e1))
+                    [x e3] (if (= e2 "") (off-num s 5 false) (values 0 e2))] (values h m x e3))
+            9 (let [[h e1] (off-num s 1 false) [m e2] (if (= e1 "") (off-num s 4 true) (values 0 e1))
+                    [x e3] (if (= e2 "") (off-num s 7 true) (values 0 e2))] (values h m x e3))
+            (values 0 0 0 (str "Invalid ID for ZoneOffset, invalid format: " s)))]
+      (if (not= e "") (values 0 e)
+        (let [c0 (nth s 0)]
+          (if (not (or (= c0 43) (= c0 45)))
+            (values 0 (str "Invalid ID for ZoneOffset, plus/minus not found when expected: " s))
+            (let [sg (if (= c0 45) -1 1)
+                  ve (off-validate (* sg h) (* sg m) (* sg x))]
+              (if (not= ve "") (values 0 ve)
+                (values (* sg (+ (* h 3600) (* m 60) x)) "")))))))))
+
+(defn- be32 Int [b: &Str pos: Int]
+  (let [v (+ (* (nth b pos) 16777216) (* (nth b (+ pos 1)) 65536) (* (nth b (+ pos 2)) 256) (nth b (+ pos 3)))]
+    (if (>= v 2147483648) (- v 4294967296) v)))
+
+(defn- be64 Int [b: &Str pos: Int]
+  (let [hi (be32 b pos)
+        lo (+ (* (nth b (+ pos 4)) 16777216) (* (nth b (+ pos 5)) 65536) (* (nth b (+ pos 6)) 256) (nth b (+ pos 7)))]
+    (+ (* hi 4294967296) lo)))
+
+(defn- cstr-at Str [b: &Str pos: Int end: Int]
+  (loop [i pos] (if (and (< i end) (not= (nth b i) 0)) (recur (+ i 1)) (subs b pos i))))
+
+(defn- posix-name Values(Str Int Bool) [s: &Str pos: Int]
+  (if (= (n/byte-at s pos) 60)
+    (let [e (loop [i (+ pos 1)] (if (and (< i (count s)) (not= (nth s i) 62)) (recur (+ i 1)) i))]
+      (if (>= e (count s)) (values "" pos false) (values (subs s (+ pos 1) e) (+ e 1) true)))
+    (let [e (loop [i pos] (let [c (n/byte-at s i)] (if (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))) (recur (+ i 1)) i)))]
+      (if (< (- e pos) 3) (values "" pos false) (values (subs s pos e) e true)))))
+
+(defn- posix-hms Values(Int Int Bool) [s: &Str pos: Int]
+  (let [c (n/byte-at s pos)
+        neg (= c 45)
+        p0 (if (or neg (= c 43)) (+ pos 1) pos)
+        [h e1 o1] (n/scan-digits s p0 3)]
+    (if (= e1 p0) (values 0 pos false)
+      (let [[m e2] (if (= (n/byte-at s e1) 58) (let [[m e o] (n/scan-digits s (+ e1 1) 2)] (values m e)) (values 0 e1))
+            [x e3] (if (and (> e2 e1) (= (n/byte-at s e2) 58)) (let [[x e o] (n/scan-digits s (+ e2 1) 2)] (values x e)) (values 0 e2))
+            tot (+ (* h 3600) (* m 60) x)]
+        (values (if neg (- 0 tot) tot) e3 true)))))
+
+(defn- posix-rule Values(PosixRule Int Bool) [s: &Str pos: Int]
+  (let [c (n/byte-at s pos)
+        z (->PosixRule 0 0 0 0 7200)
+        [r e ok]
+        (if (= c 74)
+          (let [[v e o] (n/scan-digits s (+ pos 1) 3)] (values (->PosixRule 0 v 0 0 7200) e (> e (+ pos 1))))
+          (if (= c 77)
+            (let [[m e1 o1] (n/scan-digits s (+ pos 1) 2)
+                  [w e2 o2] (n/scan-digits s (+ e1 1) 1)
+                  [d e3 o3] (n/scan-digits s (+ e2 1) 1)]
+              (values (->PosixRule 2 m w d 7200) e3 (and (= (n/byte-at s e1) 46) (= (n/byte-at s e2) 46) (> e3 (+ e2 1)))))
+            (let [[v e o] (n/scan-digits s pos 3)] (values (->PosixRule 1 v 0 0 7200) e (> e pos)))))]
+    (if (not ok) (values z pos false)
+      (if (= (n/byte-at s e) 47)
+        (let [[tm e2 ok2] (posix-hms s (+ e 1))]
+          (values (->PosixRule (:kind r) (:a r) (:b r) (:c r) tm) e2 ok2))
+        (values r e true)))))
+
+(defn parse-posix Values(PosixTz Bool) [s: &Str]
+  (let [[sn e1 o1] (posix-name s 0)
+        [so e2 o2] (if o1 (posix-hms s e1) (values 0 e1 false))]
+    (if (not (and o1 o2)) (values (empty-posix) false)
+      (if (>= e2 (count s))
+        (values (->PosixTz sn (- 0 so) "" (- 0 so) false (->PosixRule 0 0 0 0 0) (->PosixRule 0 0 0 0 0)) true)
+        (let [[dn e3 o3] (posix-name s e2)
+              [dofs e4 o4] (if (and o3 (< e3 (count s)) (not= (n/byte-at s e3) 44)) (posix-hms s e3) (values (- so 3600) e3 true))]
+          (if (not (and o3 o4)) (values (empty-posix) false)
+            (if (>= e4 (count s))
+              (values (->PosixTz sn (- 0 so) dn (- 0 dofs) true (->PosixRule 2 3 2 0 7200) (->PosixRule 2 11 1 0 7200)) true)
+              (let [[r1 e5 o5] (if (= (n/byte-at s e4) 44) (posix-rule s (+ e4 1)) (values (->PosixRule 0 0 0 0 0) e4 false))
+                    [r2 e6 o6] (if (and o5 (= (n/byte-at s e5) 44)) (posix-rule s (+ e5 1)) (values (->PosixRule 0 0 0 0 0) e5 false))]
+                (if (and o5 o6) (values (->PosixTz sn (- 0 so) dn (- 0 dofs) true r1 r2) true)
+                  (values (empty-posix) false))))))))))
+
+(defn- posix-dow Int [ed: Int] (mod (+ ed 4) 7))
+
+(defn- rule-day Int [r: &PosixRule y: Int]
+  (let [k (:kind r)]
+    (if (= k 0)
+      (let [v (:a r)] (+ (cv/epoch-day y 1 1) (- v 1) (if (and (cv/leap? y) (>= v 60)) 1 0)))
+      (if (= k 1) (+ (cv/epoch-day y 1 1) (:a r))
+        (let [m (:a r) w (:b r) d (:c r)
+              ed1 (cv/epoch-day y m 1)
+              first (+ ed1 (mod (- d (posix-dow ed1)) 7))
+              cand (+ first (* 7 (- w 1)))
+              last (+ ed1 (cv/month-length y m) -1)]
+          (loop [x cand] (if (> x last) (recur (- x 7)) x)))))))
+
+(defn- tail-transitions Values(Int Int) [p: &PosixTz y: Int]
+  (let [st (:start p) en (:end p)]
+    (values (- (+ (* (rule-day st y) 86400) (:time st)) (:std-off p))
+            (- (+ (* (rule-day en y) 86400) (:time en)) (:dst-off p)))))
+
+(defn- tail-at Values(Int Bool) [p: &PosixTz s: Int]
+  (if (not (:has-dst p)) (values (:std-off p) false)
+    (let [[y m d] (cv/from-epoch-day (cv/fdiv (+ s (:std-off p)) 86400))
+          [a b] (tail-transitions p y)
+          dst (if (< a b) (and (>= s a) (< s b)) (not (and (>= s b) (< s a))))]
+      (values (if dst (:dst-off p) (:std-off p)) dst))))
+
+(defn- trans-index Int [r: &ZoneRules s: Int]
+  (let [tr (:trans r)]
+    (loop [lo 0 hi (count tr)]
+      (if (>= lo hi) (- lo 1)
+        (let [mid (/ (+ lo hi) 2)]
+          (if (<= (nth tr mid) s) (recur (+ mid 1) hi) (recur lo mid)))))))
+
+(defn- in-tail? Bool [r: &ZoneRules s: Int]
+  (let [tr (:trans r)]
+    (and (:has-tail r) (or (= (count tr) 0) (>= s (nth tr (- (count tr) 1)))))))
+
+(defn- type-at Int [r: &ZoneRules s: Int]
+  (let [i (trans-index r s)] (if (< i 0) 0 (nth (:types r) i))))
+
+(defn offset-at Int [r: &ZoneRules s: Int]
+  (if (in-tail? r s)
+    (let [[o d] (tail-at (:tail r) s)] o)
+    (nth (:toffs r) (type-at r s))))
+
+(defn dst-at? Bool [r: &ZoneRules s: Int]
+  (if (>= s (:neg-from r))
+    (not= (offset-at r s) (:dst-off (:tail r)))
+    (if (in-tail? r s)
+      (let [[o d] (tail-at (:tail r) s)] d)
+      (= (nth (:tdst r) (type-at r s)) 1))))
+
+(defn abbr-at Str [r: &ZoneRules s: Int]
+  (if (in-tail? r s)
+    (let [p (:tail r) [o d] (tail-at p s)] (if d (:dst-abbr p) (:std-abbr p)))
+    (nth (:tabbr r) (type-at r s))))
+
+(defn std-offset-at Int [r: &ZoneRules s: Int]
+  (if (>= s (:neg-from r)) (:dst-off (:tail r))
+    (if (not (dst-at? r s)) (offset-at r s)
+      (if (in-tail? r s)
+        (:std-off (:tail r))
+        (let [tys (:types r)
+              i0 (trans-index r s)
+              nxt (loop [i (+ i0 1)]
+                    (if (>= i (count tys))
+                      (if (:has-tail r) (:std-off (:tail r)) n/LMIN)
+                      (let [k (nth tys i)]
+                        (if (= (nth (:tdst r) k) 0) (nth (:toffs r) k) (recur (+ i 1))))))
+              prv (loop [i i0]
+                    (if (< i 0) (nth (:toffs r) 0)
+                      (let [k (nth tys i)]
+                        (if (= (nth (:tdst r) k) 0) (nth (:toffs r) k) (recur (- i 1))))))
+              cur (offset-at r s)
+              dn (if (= nxt n/LMIN) n/LMAX (if (< nxt cur) (- cur nxt) (- nxt cur)))
+              dp (if (< prv cur) (- cur prv) (- prv cur))]
+          (if (< dn dp) nxt prv))))))
+
+(defn- transitions-in Vec(Int) [r: &ZoneRules a: Int b: Int]
+  (let [tr (:trans r)
+        n0 (count tr)
+        i0 (+ (trans-index r (- a 1)) 1)
+        explicit (loop [i i0 acc: Vec(Int) []]
+                   (if (and (< i n0) (<= (nth tr i) b)) (recur (+ i 1) (conj acc (nth tr i))) acc))
+        p (:tail r)]
+    (if (not (and (:has-tail r) (:has-dst p))) explicit
+      (let [last (if (= n0 0) n/LMIN (nth tr (- n0 1)))
+            [ya ma da] (cv/from-epoch-day (cv/fdiv a 86400))
+            [yb mb db] (cv/from-epoch-day (cv/fdiv b 86400))
+            gen (loop [y (- ya 1) acc: Vec(Int) []]
+                  (if (> y (+ yb 1)) acc
+                    (let [[x1 x2] (tail-transitions p y)
+                          lo (if (< x1 x2) x1 x2) hi (if (< x1 x2) x2 x1)
+                          acc1 (if (and (> lo last) (>= lo a) (<= lo b)) (conj acc lo) acc)
+                          acc2 (if (and (> hi last) (>= hi a) (<= hi b)) (conj acc1 hi) acc1)]
+                      (recur (+ y 1) acc2))))]
+        (loop [i 0 acc explicit] (if (>= i (count gen)) acc (recur (+ i 1) (conj acc (nth gen i)))))))))
+
+(defn local-info Values(Int Int Int Int) [r: &ZoneRules local: Int]
+  (if (rules-fixed? r) (let [o (nth (:toffs r) 0)] (values 0 o o 0))
+    (let [a (- local 172800) b (+ local 172800)
+          ts (transitions-in r a b)
+          o0 (offset-at r a)]
+      (loop [i 0 cur o0]
+        (if (>= i (count ts)) (values 0 cur cur 0)
+          (let [tt (nth ts i)
+                ob (offset-at r (- tt 1))
+                oa (offset-at r tt)]
+            (if (= ob oa) (recur (+ i 1) oa)
+              (let [lo (if (< ob oa) ob oa) hi (if (< ob oa) oa ob)]
+                (if (< local (+ tt lo)) (values 0 ob ob 0)
+                  (if (>= local (+ tt hi)) (recur (+ i 1) oa)
+                    (values (if (> oa ob) 1 2) ob oa tt)))))))))))
+
+(defn next-transition Values(Int Int Int Bool) [r: &ZoneRules s: Int]
+  (if (rules-fixed? r) (values 0 0 0 false)
+    (let [tr (:trans r)
+          i (+ (trans-index r s) 1)
+          lim (if (in-tail? r s) (+ s (* 3 366 86400)) (if (< i (count tr)) (+ (nth tr i) (* 3 366 86400)) (+ s (* 3 366 86400))))
+          ts (transitions-in r (+ s 1) lim)]
+      (loop [k 0]
+        (if (>= k (count ts)) (values 0 0 0 false)
+          (let [tt (nth ts k) ob (offset-at r (- tt 1)) oa (offset-at r tt)]
+            (if (= ob oa) (recur (+ k 1)) (values tt ob oa true))))))))
+
+(defn prev-transition Values(Int Int Int Bool) [r: &ZoneRules s: Int]
+  (if (rules-fixed? r) (values 0 0 0 false)
+    (let [ts (transitions-in r (- s (* 3 366 86400)) s)
+          i (trans-index r s)
+          ts2 (if (and (= (count ts) 0) (>= i 0)) (transitions-in r (- (nth (:trans r) i) 1) s) ts)]
+      (loop [k (- (count ts2) 1)]
+        (if (< k 0) (values 0 0 0 false)
+          (let [tt (nth ts2 k) ob (offset-at r (- tt 1)) oa (offset-at r tt)]
+            (if (= ob oa) (recur (- k 1)) (values tt ob oa true))))))))
+
+(defn- neg-start Int [trans: &Vec(Int) types: &Vec(Int) toffs: &Vec(Int) tdst: &Vec(Int) k: Int std: Int]
+  (loop [i (- k 1) best (nth trans k)]
+    (if (< i 0) best
+      (let [ty (nth types i)]
+        (if (and (= (nth tdst ty) 0) (= (nth toffs ty) std)) (recur (- i 1) (nth trans i)) best)))))
+
+(defn- tzif-header Values(Int Int Int Int Int Int) [b: &Str p: Int]
+  (values (be32 b (+ p 20)) (be32 b (+ p 24)) (be32 b (+ p 28)) (be32 b (+ p 32)) (be32 b (+ p 36)) (be32 b (+ p 40))))
+
+(defn- parse-tzif Values(ZoneRules Bool) [id: &Str b: &Str]
+  (let [bad (->ZoneRules (str id) [] [] [0] [0] ["UTC"] false (empty-posix) n/LMAX false)]
+    (if (or (< (count b) 44) (not (= (subs b 0 4) "TZif"))) (values bad false)
+      (let [ver (nth b 4)
+            [isut isstd leap tcnt tycnt chcnt] (tzif-header b 0)
+            v1len (+ (* tcnt 5) (* tycnt 6) chcnt (* leap 8) isstd isut)
+            v2 (>= ver 50)
+            base (if v2 (+ 44 v1len) 0)
+            [isut2 isstd2 leap2 tcnt2 tycnt2 chcnt2] (if v2 (tzif-header b base) (values isut isstd leap tcnt tycnt chcnt))
+            tsz (if v2 8 4)
+            p0 (+ base 44)
+            need (+ p0 (* tcnt2 (+ tsz 1)) (* tycnt2 6) chcnt2 (* leap2 (+ tsz 4)) isstd2 isut2)]
+        (if (or (> need (count b)) (= tycnt2 0)) (values bad false)
+          (let [trans (loop [i 0 acc: Vec(Int) []]
+                        (if (>= i tcnt2) acc
+                          (recur (+ i 1) (conj acc (if v2 (be64 b (+ p0 (* i 8))) (be32 b (+ p0 (* i 4))))))))
+                pidx (+ p0 (* tcnt2 tsz))
+                types (loop [i 0 acc: Vec(Int) []] (if (>= i tcnt2) acc (recur (+ i 1) (conj acc (nth b (+ pidx i))))))
+                pty (+ pidx tcnt2)
+                pch (+ pty (* tycnt2 6))
+                [toffs tdst tabbr]
+                (loop [k 0 o: Vec(Int) [] d: Vec(Int) [] a: Vec(Str) []]
+                  (if (>= k tycnt2) (values o d a)
+                    (let [q (+ pty (* k 6))]
+                      (recur (+ k 1) (conj o (be32 b q)) (conj d (nth b (+ q 4)))
+                             (conj a (cstr-at b (+ pch (nth b (+ q 5))) (+ pch chcnt2)))))))
+                [tail has-tail]
+                (if (and v2 (< need (count b)) (= (nth b need) 10))
+                  (let [e (loop [i (+ need 1)] (if (and (< i (count b)) (not= (nth b i) 10)) (recur (+ i 1)) i))
+                        ts (subs b (+ need 1) e)]
+                    (if (= (count ts) 0) (values (empty-posix) false) (parse-posix ts)))
+                  (values (empty-posix) false))
+                neg-from (if (and has-tail (:has-dst tail) (< (:dst-off tail) (:std-off tail)))
+                           (loop [i 0]
+                             (if (>= i (count trans)) n/LMAX
+                               (let [k (nth types i)]
+                                 (if (and (= (nth tdst k) 1) (= (nth toffs k) (:dst-off tail))
+                                          (> i 0) (> (nth toffs (nth types (- i 1))) (nth toffs k)))
+                                   (neg-start trans types toffs tdst i (:std-off tail)) (recur (+ i 1))))))
+                           n/LMAX)]
+            (values (->ZoneRules (str id) trans types toffs tdst tabbr has-tail tail neg-from true) true)))))))
+
+(defn- tzdir Str [] (match (host/env "TZDIR") (Some e) (if (> (count e) 0) e "/usr/share/zoneinfo") (None) "/usr/share/zoneinfo"))
+
+(defn- region-id-ok? Bool [id: &Str]
+  (let [len (count id) c0 (n/byte-at id 0)]
+    (and (>= len 2)
+         (or (and (>= c0 65) (<= c0 90)) (and (>= c0 97) (<= c0 122)))
+         (loop [i 1]
+           (if (>= i len) true
+             (let [c (nth id i)]
+               (if (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (digit? c)
+                       (= c 126) (= c 47) (= c 46) (= c 95) (= c 43) (= c 45))
+                 (recur (+ i 1)) false)))))))
+
+(defn- loadable-id? Bool [id: &Str]
+  (and (region-id-ok? id)
+       (not (str/includes? id ".."))
+       (not (str/starts-with? id "posix/"))
+       (not (str/starts-with? id "right/"))
+       (not (= id "posixrules"))
+       (not (= id "localtime"))))
+
+(defn- link-target Str [id: &Str]
+  (let [zi (host/file-read-or (str (tzdir) "/tzdata.zi") "")
+        key (str " " id "\n")]
+    (loop [pos 0]
+      (let [k (str/index-of-after zi key pos)]
+        (if (< k 0) ""
+          (let [ls (loop [j k] (if (and (> j 0) (not= (nth zi (- j 1)) 10)) (recur (- j 1)) j))]
+            (if (and (= (nth zi ls) 76) (= (nth zi (+ ls 1)) 32))
+              (subs zi (+ ls 2) k)
+              (recur (+ k 1)))))))))
+
+(def rules-cache (atom (->dyn (let [m: Map(Str Dyn) {}] m))))
+
+(defn rules-for-id Values(ZoneRules Bool) [id: &Str]
+  (let [m: Map(Str Dyn) (dyn->map (deref rules-cache))]
+    (if (contains? m id)
+      (let [r: ZoneRules (dyn->rec (get! m id))] (values r (:valid r)))
+      (let [[r ok] (if (loadable-id? id)
+                     (let [[b e] (host/file-read (str (tzdir) "/" id))]
+                       (if (= e "") (parse-tzif id b)
+                         (let [target (link-target id)
+                               [b2 e2] (if (and (> (count target) 0) (loadable-id? target)) (host/file-read (str (tzdir) "/" target)) (values "" "none"))]
+                           (if (= e2 "") (parse-tzif id b2)
+                             (values (->ZoneRules (str id) [] [] [0] [0] ["UTC"] false (empty-posix) n/LMAX false) false)))))
+                     (values (->ZoneRules (str id) [] [] [0] [0] ["UTC"] false (empty-posix) n/LMAX false) false))
+            m2: Map(Str Dyn) (dyn->map (deref rules-cache))
+            z (reset! rules-cache (->dyn (assoc m2 (str id) r)))]
+        (values r ok)))))
+
+(defn zone-available? Bool [id: &Str]
+  (let [[r ok] (rules-for-id id)] ok))
+
+(defn- prefixed-offset Values(Int Bool) [id: &Str]
+  (let [pl (if (or (str/starts-with? id "UTC") (str/starts-with? id "GMT")) 3 (if (str/starts-with? id "UT") 2 0))]
+    (if (= pl 0) (values 0 false)
+      (if (= (count id) pl) (values 0 true)
+        (let [c (nth id pl)]
+          (if (not (or (= c 43) (= c 45))) (values 0 false)
+            (let [[o e] (offset-of-id (subs id pl (count id)))] (values o (= e "")))))))))
+
+(defn zone-of-id Values(t/TimeZone Str) [s: &Str]
+  (let [len (count s) c0 (n/byte-at s 0)]
+    (if (or (<= len 1) (= c0 43) (= c0 45))
+      (let [[o e] (offset-of-id s)] (values (t/->TzOffset o) e))
+      (let [pl (if (or (str/starts-with? s "UTC") (str/starts-with? s "GMT")) 3 (if (str/starts-with? s "UT") 2 0))
+            nc (n/byte-at s pl)]
+        (if (and (> pl 0) (= len pl)) (values (t/->TzRegion (str s)) "")
+          (if (and (> pl 0) (or (= nc 43) (= nc 45)))
+            (let [[o e] (offset-of-id (subs s pl len))]
+              (if (not= e "") (values (t/utc) (str "Invalid ID for offset-based ZoneId: " s))
+                (values (t/->TzRegion (if (= o 0) (subs s 0 pl) (str (subs s 0 pl) (t/offset-id o)))) "")))
+            (if (not (region-id-ok? s)) (values (t/utc) (str "Invalid ID for region-based ZoneId, invalid format: " s))
+              (if (zone-available? s) (values (t/->TzRegion (str s)) "")
+                (values (t/utc) (str "Unknown time-zone ID: " s))))))))))
+
+(defn rules-of ZoneRules [z: &t/TimeZone]
+  (match z
+    (t/TzOffset o) (fixed-rules (t/offset-id o) o)
+    (t/TzRegion id)
+    (let [[o pre] (prefixed-offset id)]
+      (if pre (fixed-rules id o)
+        (let [[r ok] (rules-for-id id)] (if ok r (fixed-rules id 0)))))))
+
+(defn- readlink Str [p: &Str] (host/read-link p))
+
+(defn- id-from-path Str [p: &Str]
+  (let [k (str/index-of p "zoneinfo/")]
+    (if (< k 0) "" (subs p (+ k 9) (count p)))))
+
+(defrecord SysZone [key: Str zone: t/TimeZone])
+
+(def SYS-ZONE: Atom(Vec(SysZone)) (atom (let [v: Vec(SysZone) []] v)))
+
+(defn system-zone t/TimeZone []
+  (let [tzo (host/env "TZ")
+        tzenv: Str (match tzo (Some x) x (None) "")
+        key (match tzo (Some x) (str "=" x) (None) "-")
+        c (deref SYS-ZONE)]
+    (if (and (= (count c) 1) (= (:key (nth c 0)) key)) (:zone (nth c 0))
+      (let [z (lookup-system-zone tzenv)
+            r (reset! SYS-ZONE [(->SysZone key z)])]
+        z))))
+
+(defn- lookup-system-zone t/TimeZone [tzenv: &Str]
+  (let [tz1 (if (str/starts-with? tzenv ":") (subs tzenv 1 (count tzenv)) (str tzenv))]
+    (if (> (count tz1) 0)
+      (let [id (if (str/starts-with? tz1 "/") (id-from-path tz1) tz1)
+            [z e] (zone-of-id id)]
+        (if (= e "") z (t/utc)))
+      (let [etc (str/trim (host/file-read-or "/etc/timezone" ""))
+            [z1 e1] (if (> (count etc) 0) (zone-of-id etc) (values (t/utc) "none"))]
+        (if (= e1 "") z1
+          (let [lk (id-from-path (readlink "/etc/localtime"))
+                [z2 e2] (if (> (count lk) 0) (zone-of-id lk) (values (t/utc) "none"))]
+            (if (= e2 "") z2 (t/utc))))))))
+
+(defn now-instant-ns Values(Int Int) [] (host/now-ns))
+
+(defn now-instant Values(Int Int) [] (let [[s ns] (host/now-ns)] (values s (* (/ ns 1000) 1000))))

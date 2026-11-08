@@ -1,0 +1,225 @@
+(ns mulay.lib.fs
+  (:require [mulay.lib.host :as host] [clay.core] [clay.string :as str] [clay.io :as io]))
+(def NONE 0)
+(def FILE 1)
+(def DIR 2)
+(def OTHER 3)
+
+(defrecord Stat [kind: Int size: Int mtime-s: Int mtime-ns: Int atime-s: Int atime-ns: Int link: Bool])
+
+(target-when "wasm"
+(do
+(defn stat Stat [path: &Str]
+  (cond (host/mem-dir? path) (->Stat DIR 0 0 0 0 0 false)
+        (host/mem-exists? path) (let [[t e] (host/mem-read path)] (->Stat FILE (count t) 0 0 0 0 false))
+        :else (->Stat NONE 0 0 0 0 0 false)))
+(defn create-new Values(Bool Str) [path: &Str]
+  (if (host/mem-exists? path) (values true "") (let [z (host/mem-write path "")] (values false ""))))
+(defn create-new-private Values(Bool Str) [path: &Str] (create-new path))
+(defn perm Int [path: &Str] (if (= (:kind (stat path)) NONE) -1 (if (= (:kind (stat path)) DIR) 448 384)))
+(defn- os-mkdir-private Str [path: &Str] (host/make-dir path))
+(defn- os-chmod Str [path: &Str mode: Int] "")
+(defn disk-space Values(Int Int Str) [path: &Str] (values 0 0 (str path ": no disk on wasm")))
+(defn- os-rmdir Str [path: &Str] "")
+(defn- os-unlink Str [path: &Str] (host/mem-delete path))
+(defn- os-rename Values(Str Bool) [src: &Str dst: &Str] (values (str src ": rename is not on wasm") true)))
+(do
+(defextern malloc malloc)
+(defextern stat-bytes (c/sizeof "struct stat"))
+(defextern c-stat stat)
+(defextern c-lstat lstat)
+(defextern stat-st-mode-at (c/offsetof "struct stat" "st_mode"))
+(defextern mode-t-bytes (c/sizeof "mode_t"))
+(defextern stat-st-size-at (c/offsetof "struct stat" "st_size"))
+(defextern off-t-bytes (c/sizeof "off_t"))
+(defextern stat-st-mtim.tv-sec-at (c/offsetof "struct stat" "st_mtim.tv_sec"))
+(defextern c-time-t-bytes (c/sizeof "time_t"))
+(defextern stat-st-mtim.tv-nsec-at (c/offsetof "struct stat" "st_mtim.tv_nsec"))
+(defextern c-long-bytes (c/sizeof "long"))
+(defextern stat-st-atim.tv-sec-at (c/offsetof "struct stat" "st_atim.tv_sec"))
+(defextern stat-st-atim.tv-nsec-at (c/offsetof "struct stat" "st_atim.tv_nsec"))
+(defextern free free)
+(defextern s-ifmt S_IFMT)
+(defextern s-ifreg S_IFREG)
+(defextern s-ifdir S_IFDIR)
+(defextern s-iflnk S_IFLNK)
+(defextern c-strerror strerror)
+(defextern c-errno errno)
+(defextern exdev EXDEV)
+(defextern c-open open)
+(defextern o-wronly O_WRONLY)
+(defextern o-creat O_CREAT)
+(defextern o-excl O_EXCL)
+(defextern close close)
+(defextern eexist EEXIST)
+(defextern rmdir rmdir)
+(defextern unlink unlink)
+(defextern c-rename rename)
+(defextern c-mkdir mkdir)
+(defextern c-chmod chmod)
+(defextern c-statvfs statvfs)
+(defextern statvfs-bytes (c/sizeof "struct statvfs"))
+(defextern statvfs-f-bavail-at (c/offsetof "struct statvfs" "f_bavail"))
+(defextern statvfs-f-blocks-at (c/offsetof "struct statvfs" "f_blocks"))
+(defextern statvfs-f-frsize-at (c/offsetof "struct statvfs" "f_frsize"))
+(defextern fsblkcnt-bytes (c/sizeof "fsblkcnt_t"))
+(defextern c-ulong-bytes (c/sizeof "unsigned long"))
+
+(c-include "<sys/stat.h>")
+(c-include "<errno.h>")
+(c-include "<fcntl.h>")
+(c-include "<unistd.h>")
+(c-include "<sys/statvfs.h>")
+
+
+(c-include "<sys/stat.h>")
+(c-include "<errno.h>")
+(c-include "<fcntl.h>")
+(c-include "<unistd.h>")
+
+(defn- ^:unsafe rd Int [a: Int n: Int] (if (= n 8) (prim/mem-read64 (prim/int->addr a)) (prim/mem-read32 (prim/int->addr a))))
+
+(defn- raw-stat Values(Bool Int Int Int Int Int Int) [path: &Str follow: Bool]
+  (unsafe
+    (match (malloc (stat-bytes))
+      (Some st) (let [r (if follow (c-stat path st) (c-lstat path st))
+                      a (prim/addr->int st)
+                      mode (rd (+ a (stat-st-mode-at)) (mode-t-bytes))
+                      size (rd (+ a (stat-st-size-at)) (off-t-bytes))
+                      ms (rd (+ a (stat-st-mtim.tv-sec-at)) (c-time-t-bytes))
+                      mn (rd (+ a (stat-st-mtim.tv-nsec-at)) (c-long-bytes))
+                      as (rd (+ a (stat-st-atim.tv-sec-at)) (c-time-t-bytes))
+                      an (rd (+ a (stat-st-atim.tv-nsec-at)) (c-long-bytes))
+                      z (free st)]
+                  (values (= r 0) mode size ms mn as an))
+      (None) (values false 0 0 0 0 0 0))))
+
+(defn- mode-kind Int [mode: Int]
+  (let [t (bit-and mode (unsafe (s-ifmt)))]
+    (cond (= t (unsafe (s-ifreg))) FILE (= t (unsafe (s-ifdir))) DIR :else OTHER)))
+
+(defn stat Stat [path: &Str]
+  (let [[lok lmode ls lms lmn las lan] (raw-stat path false)]
+    (if (not lok) (->Stat NONE 0 0 0 0 0 false)
+      (let [link (= (bit-and lmode (unsafe (s-ifmt))) (unsafe (s-iflnk)))]
+        (if (not link) (->Stat (mode-kind lmode) ls lms lmn las lan false)
+          (let [[ok mode s ms mn as an] (raw-stat path true)]
+            (if ok (->Stat (mode-kind mode) s ms mn as an true) (->Stat OTHER ls lms lmn las lan true))))))))
+
+(defn- errno-msg Str [what: &Str]
+  (let [n (unsafe (c-errno))]
+    (str what ": " (match (unsafe (c-strerror n)) (Some m) m (None) (str "Unknown error " n)))))
+(defn- exdev? Bool [] (= (unsafe (c-errno)) (unsafe (exdev))))
+
+(defn create-new Values(Bool Str) [path: &Str] (create-new-mode path 438))
+
+(defn create-new-private Values(Bool Str) [path: &Str] (create-new-mode path 384))
+
+(defn perm Int [path: &Str]
+  (let [[ok mode s ms mn as an] (raw-stat path true)] (if ok (bit-and mode 511) -1)))
+
+(defn- os-mkdir-private Str [path: &Str]
+  (cond (= (unsafe (c-mkdir path 448)) 0) ""
+        (dir? path) (os-chmod path 448)
+        :else (errno-msg path)))
+
+(defn disk-space Values(Int Int Str) [path: &Str]
+  (unsafe
+    (match (malloc (statvfs-bytes))
+      (Some st) (let [r (c-statvfs path st)
+                      a (prim/addr->int st)
+                      bs (rd (+ a (statvfs-f-frsize-at)) (c-ulong-bytes))
+                      av (rd (+ a (statvfs-f-bavail-at)) (fsblkcnt-bytes))
+                      bl (rd (+ a (statvfs-f-blocks-at)) (fsblkcnt-bytes))
+                      e (if (= r 0) "" (errno-msg path))
+                      z (free st)]
+                  (if (= e "") (values (* av bs) (* bl bs) "") (values 0 0 e)))
+      (None) (values 0 0 "out of memory"))))
+
+(defn- os-chmod Str [path: &Str mode: Int] (if (= (unsafe (c-chmod path mode)) 0) "" (errno-msg path)))
+
+(defn- create-new-mode Values(Bool Str) [path: &Str mode: Int]
+  (let [fd (unsafe (c-open path (bit-or (bit-or (o-wronly) (o-creat)) (o-excl)) mode))]
+    (cond
+      (>= fd 0) (let [z (unsafe (close fd))] (values false ""))
+      (= (unsafe (c-errno)) (unsafe (eexist))) (values true "")
+      :else (values false (errno-msg path)))))
+
+(defn- os-rmdir Str [path: &Str] (if (= (unsafe (rmdir path)) 0) "" (errno-msg path)))
+(defn- os-unlink Str [path: &Str] (if (= (unsafe (unlink path)) 0) "" (errno-msg path)))
+(defn- os-rename Values(Str Bool) [src: &Str dst: &Str]
+  (if (= (unsafe (c-rename src dst)) 0) (values "" false) (values (errno-msg src) (exdev?))))))
+
+(defn file? Bool [path: &Str] (= (:kind (stat path)) FILE))
+(defn dir? Bool [path: &Str] (= (:kind (stat path)) DIR))
+(defn exists? Bool [path: &Str] (not= (:kind (stat path)) NONE))
+
+(defn join Str [dir: &Str name: &Str]
+  (cond (= (count dir) 0) (str name)
+        (= (nth dir (- (count dir) 1)) 47) (str dir name)
+        :else (str dir "/" name)))
+
+(defn- trim-slash Str [p: &Str]
+  (loop [n (count p)] (if (and (> n 1) (= (nth p (- n 1)) 47)) (recur (- n 1)) (subs p 0 n))))
+
+(defn base-name Str [path: &Str]
+  (let [p (trim-slash path)
+        k (loop [i (- (count p) 1)] (if (< i 0) -1 (if (= (nth p i) 47) i (recur (- i 1)))))]
+    (if (and (= k 0) (= (count p) 1)) (str p) (subs p (+ k 1) (count p)))))
+
+(defn parent Str [path: &Str]
+  (let [p (trim-slash path)
+        k (loop [i (- (count p) 1)] (if (< i 0) -1 (if (= (nth p i) 47) i (recur (- i 1)))))]
+    (cond (< k 0) "" (= k 0) "/" :else (subs p 0 k))))
+
+(defn mkdirs Str [path: &Str]
+  (cond (= (count path) 0) ""
+        (dir? path) ""
+        :else (let [pe (let [pp (parent path)] (if (or (= pp "") (= pp path)) "" (mkdirs pp)))]
+                (if (not= pe "") pe (host/make-dir (str path))))))
+
+(defn mkdirs-private Str [path: &Str]
+  (cond (= (count path) 0) ""
+        (dir? path) (os-chmod path 448)
+        :else (let [pe (let [pp (parent path)] (if (or (= pp "") (= pp path) (dir? pp)) "" (mkdirs-private pp)))]
+                (if (not= pe "") pe (os-mkdir-private path)))))
+
+(defn remove-tree Str [path: &Str]
+  (let [st (stat path)]
+    (if (and (= (:kind st) DIR) (not (:link st)))
+      (let [[names le] (host/file-list path)]
+        (if (not= le "") le
+          (let [e (loop [i 0] (if (>= i (count names)) ""
+                                (let [r (remove-tree (join path (nth names i)))] (if (not= r "") r (recur (+ i 1))))))]
+            (if (not= e "") e
+              (os-rmdir path)))))
+      (os-unlink path))))
+
+(defn copy-tree Str [src: &Str dst: &Str]
+  (let [st (stat src)]
+    (cond
+      (= (:kind st) DIR)
+      (let [me (mkdirs dst)
+            [names le] (host/file-list src)]
+        (cond (not= me "") me
+              (not= le "") le
+              :else (loop [i 0] (if (>= i (count names)) ""
+                                  (let [r (copy-tree (join src (nth names i)) (join dst (nth names i)))]
+                                    (if (not= r "") r (recur (+ i 1))))))))
+      (= (:kind st) NONE) (str src ": No such file or directory")
+      :else (let [[data re] (host/file-read src)]
+              (if (not= re "") re (host/file-write dst data))))))
+
+(defn move Str [src: &Str dst: &Str]
+  (let [[re xd] (os-rename src dst)]
+  (if (= re "") ""
+    (if (not xd) re
+      (let [ce (copy-tree src dst)]
+        (if (not= ce "") ce (remove-tree src)))))))
+
+(defn sh-quote Str [p: &Str]
+  (let [s (if (str/starts-with? p "-") (str "./" p) (str p))]
+    (loop [i 0 out "'"]
+      (if (>= i (count s)) (str out "'")
+        (let [c (nth s i)]
+          (recur (+ i 1) (if (= c 39) (str out "'\\''") (str out (chr c)))))))))

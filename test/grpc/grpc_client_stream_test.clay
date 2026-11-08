@@ -1,0 +1,69 @@
+(ns grpc-client-stream-test (:require [mulay.conn.grpc :as g] [clay.httpmsg :as hm] [mulay.dw.val :as v]))
+
+(defn- st Str [hs: Vec(hm/Header) tr: Vec(hm/Header)] (let [[c m] (g/stream-status hs tr)] (str c "|" m)))
+
+;; 応答の status はコネクタの MuleHttpClientCall.closeWithStatus と同じ: trailer の grpc-status、無ければ頭のもの。
+;; 無い、数でない時は 0。範囲の外は UNKNOWN (Status.fromCodeValue)。grpc-message はパーセント符号を戻す
+(deftest stream-status
+  (is (= (st [] [(hm/->Header "grpc-status" "10") (hm/->Header "grpc-message" "stopped")]) "10|stopped"))
+  (is (= (st [(hm/->Header "grpc-status" "7") (hm/->Header "grpc-message" "denied")] []) "7|denied"))
+  (is (= (st [] []) "0|"))
+  (is (= (st [] [(hm/->Header "grpc-status" "abc")]) "0|"))
+  (is (= (st [] [(hm/->Header "grpc-status" "99")]) "2|Unknown code 99"))
+  (is (= (st [] [(hm/->Header "grpc-status" "5") (hm/->Header "grpc-message" "nicht %C3%BC")]) "5|nicht ü")))
+
+;; io.grpc.Status の文字列 (StatusRuntimeException の文言、listener の errorMessage)
+(deftest status-text
+  (is (= (g/status-text 10 "stopped") "ABORTED: stopped"))
+  (is (= (g/status-text 13 "") "INTERNAL")))
+
+;; Iterable を回して失敗した時の文言 (実 Mule は DW の中で例外になり、この後に Java のスタックが続く)
+(deftest iterate-error
+  (is (= (g/iterate-error 7 "denied")
+         (str "Internal execution exception while executing the script, this is most probably a bug, file an issue with the script and the input data.\n"
+              "NOTE: Enable dump option using `-Dcom.mulesoft.dw.dump_files=true` to log all required information.\n"
+              "Caused by:\nio.grpc.StatusRuntimeException: PERMISSION_DENIED: denied\nCaused by: io.grpc.StatusRuntimeException: PERMISSION_DENIED: denied"))))
+
+;; client-streaming の失敗は RequestId を Additional Details に並べる (GrpcModuleException の details)
+(deftest client-stream-error
+  (is (= (g/client-stream-error 9 "too early" "cs.C/SumEarly" "r2")
+         "gRPC operation 'CLIENT_STREAMING' failed with status FAILED_PRECONDITION: too early\nAdditional Details:\n  Method: cs.C/SumEarly\n  RequestId: r2"))
+  (is (= (g/client-stream-error 13 "" "p.S/M" "x")
+         "gRPC operation 'CLIENT_STREAMING' failed with status INTERNAL: No description\nAdditional Details:\n  Method: p.S/M\n  RequestId: x")))
+
+(defn- keys-of Str [x: &v/Val]
+  (match (v/unmeta x) (v/VObj fs) (loop [i 0 o ""] (if (>= i (count fs)) o (recur (+ i 1) (str o (:name (:key (nth fs i))) ",")))) _ ""))
+
+;; 属性の項目の並びは実 Mule の JSON の出力 (grpc-client-stream)
+(deftest client-attributes
+  (is (= (keys-of (g/client-attributes "r1" false true)) "endOfStream,messageSent,requestId,"))
+  (is (= (keys-of (g/frame-attributes "B" "q1" true false "")) "routingId,endOfStream,errorMessage,error,requestId,")))
+
+;; grpc-timeout の値は 8 桁までの数と単位 (gRPC over HTTP2)
+(deftest timeout-header
+  (is (= (g/timeout-header 1000) "1000m"))
+  (is (= (g/timeout-header 99999999) "99999999m"))
+  (is (= (g/timeout-header 100000000) "100000S")))
+
+;; grpc-status の無い応答: HTTP の status が 200 でなければそこから決め、200 なら UNKNOWN
+(defn- ls Str [st: Int hs: Vec(hm/Header) tr: Vec(hm/Header)] (let [[c m] (g/live-status st hs tr)] (str c "|" m)))
+
+(deftest live-status
+  (is (= (ls 200 [] [(hm/->Header "grpc-status" "0")]) "0|"))
+  (is (= (ls 503 [] []) "14|HTTP status code 503"))
+  (is (= (ls 200 [] []) "2|Missing grpc-status in the response")))
+
+;; Iterable と操作の失敗の文言 (GrpcModuleException)
+(deftest op-error
+  (is (= (g/grpc-op-error "SERVER_STREAMING" 10 "stopped" "cs.C/TicksFail") "gRPC operation 'SERVER_STREAMING' failed with status ABORTED: stopped\nMethod: cs.C/TicksFail")))
+
+;; listener に渡すフレームは routing ごとの順
+(deftest frame-queue
+  (let [z1 (g/push-frame "s|Cli|D" (g/->Frame "id1" "m1" "" false false ""))
+        z2 (g/push-frame "s|Cli|D" (g/->Frame "id1" "" "" true false ""))
+        [f1 ok1] (g/take-frame "s|Cli|D")
+        [f2 ok2] (g/take-frame "s|Cli|D")
+        [f3 ok3] (g/take-frame "s|Cli|D")]
+    (is ok1) (is ok2) (is (not ok3))
+    (is (= (:bytes f1) "m1"))
+    (is (:end f2))))

@@ -1,0 +1,294 @@
+(ns mulay.lib.time.local
+  (:require [mulay.lib.time.types :as t]
+            [mulay.lib.time.civil :as cv]
+            [mulay.lib.time.num :as n]
+            [mulay.lib.time.amount :as am]
+            [clay.string :as str]))
+
+(defn- range-err Str [field: &Str lo: &Str hi: &Str v: Int]
+  (str "Invalid value for " field " (valid values " lo " - " hi "): " v))
+
+(def MONTH-NAMES ["January" "February" "March" "April" "May" "June" "July" "August" "September" "October" "November" "December"])
+
+(defn of-date Values(t/LocalDate Str) [y: Int m: Int d: Int]
+  (let [z (t/->LocalDate 1970 1 1)]
+    (if (or (< y cv/MIN-YEAR) (> y cv/MAX-YEAR)) (values z (range-err "Year" "-999999999" "999999999" y))
+      (if (or (< m 1) (> m 12)) (values z (range-err "MonthOfYear" "1" "12" m))
+        (if (or (< d 1) (> d 31)) (values z (range-err "DayOfMonth" "1" "28/31" d))
+          (if (> d (cv/month-length y m))
+            (values z (if (and (= m 2) (= d 29))
+                        (str "Invalid date 'February 29' as '" y "' is not a leap year")
+                        (str "Invalid date '" (str/upper-case (nth MONTH-NAMES (- m 1))) " " d "'")))
+            (values (t/->LocalDate y m d) "")))))))
+
+(defn of-year-day Values(t/LocalDate Str) [y: Int doy: Int]
+  (let [z (t/->LocalDate 1970 1 1)]
+    (if (or (< y cv/MIN-YEAR) (> y cv/MAX-YEAR)) (values z (range-err "Year" "-999999999" "999999999" y))
+      (if (or (< doy 1) (> doy 366)) (values z (range-err "DayOfYear" "1" "365/366" doy))
+        (if (and (= doy 366) (not (cv/leap? y)))
+          (values z (str "Invalid date 'DayOfYear 366' as '" y "' is not a leap year"))
+          (let [[yy mm dd] (cv/from-epoch-day (+ (cv/epoch-day y 1 1) (- doy 1)))]
+            (values (t/->LocalDate yy mm dd) "")))))))
+
+(defn date-epoch-day Int [d: &t/LocalDate]
+  (cv/epoch-day (:year d) (:month d) (:day d)))
+
+(defn date-of-epoch-day t/LocalDate [ed: Int]
+  (let [[y m d] (cv/from-epoch-day ed)] (t/->LocalDate y m d)))
+
+(defn- date-of-epoch-day-checked Values(t/LocalDate Str) [ed: Int]
+  (let [[y m d] (cv/from-epoch-day ed)]
+    (if (or (< y cv/MIN-YEAR) (> y cv/MAX-YEAR))
+      (values (t/->LocalDate 1970 1 1) (range-err "Year" "-999999999" "999999999" y))
+      (values (t/->LocalDate y m d) ""))))
+
+(defn date-dow Int [d: &t/LocalDate] (cv/day-of-week (date-epoch-day d)))
+(defn date-doy Int [d: &t/LocalDate] (cv/day-of-year (:year d) (:month d) (:day d)))
+(defn date-leap? Bool [d: &t/LocalDate] (cv/leap? (:year d)))
+(defn date-length-of-month Int [d: &t/LocalDate] (cv/month-length (:year d) (:month d)))
+(defn date-length-of-year Int [d: &t/LocalDate] (cv/year-length (:year d)))
+
+(defn date-plus-days Values(t/LocalDate Str) [d: &t/LocalDate k: Int]
+  (if (= k 0) (values (t/->LocalDate (:year d) (:month d) (:day d)) "")
+    (let [[ed ok] (n/add-exact (date-epoch-day d) k)]
+      (if ok (date-of-epoch-day-checked ed) (values (t/->LocalDate 1970 1 1) "long overflow")))))
+
+(defn date-plus-weeks Values(t/LocalDate Str) [d: &t/LocalDate k: Int]
+  (let [[w ok] (n/mul-exact k 7)]
+    (if ok (date-plus-days d w) (values (t/->LocalDate 1970 1 1) "long overflow"))))
+
+(defn- resolve-prev-valid t/LocalDate [y: Int m: Int d: Int]
+  (let [ml (cv/month-length y m)] (t/->LocalDate y m (if (> d ml) ml d))))
+
+(defn date-plus-months Values(t/LocalDate Str) [d: &t/LocalDate k: Int]
+  (if (= k 0) (values (t/->LocalDate (:year d) (:month d) (:day d)) "")
+    (let [pm (+ (* (:year d) 12) (- (:month d) 1))
+          [calc ok] (n/add-exact pm k)
+          ny (cv/fdiv calc 12)
+          nm (+ (mod calc 12) 1)]
+      (if (and ok (>= ny cv/MIN-YEAR) (<= ny cv/MAX-YEAR))
+        (values (resolve-prev-valid ny nm (:day d)) "")
+        (values (t/->LocalDate 1970 1 1) (range-err "Year" "-999999999" "999999999" ny))))))
+
+(defn date-plus-years Values(t/LocalDate Str) [d: &t/LocalDate k: Int]
+  (if (= k 0) (values (t/->LocalDate (:year d) (:month d) (:day d)) "")
+    (let [[ny ok] (n/add-exact (:year d) k)]
+      (if (and ok (>= ny cv/MIN-YEAR) (<= ny cv/MAX-YEAR))
+        (values (resolve-prev-valid ny (:month d) (:day d)) "")
+        (values (t/->LocalDate 1970 1 1) (range-err "Year" "-999999999" "999999999" ny))))))
+
+(defn date-plus-period Values(t/LocalDate Str) [d: &t/LocalDate p: &t/Period]
+  (let [[a e1] (date-plus-months d (am/period-total-months p))]
+    (if (not= e1 "") (values a e1) (date-plus-days a (:days p)))))
+
+(defn date-minus-period Values(t/LocalDate Str) [d: &t/LocalDate p: &t/Period]
+  (let [[a e1] (date-plus-months d (- 0 (am/period-total-months p)))]
+    (if (not= e1 "") (values a e1) (date-plus-days a (- 0 (:days p))))))
+
+(defn date-plus-duration Values(t/LocalDate Str) [d: &t/LocalDate dur: &t/Duration]
+  (let [same (t/->LocalDate (:year d) (:month d) (:day d))]
+    (if (not= (:seconds dur) 0) (values same "Unsupported unit: Seconds")
+      (if (not= (:nanos dur) 0) (values same "Unsupported unit: Nanos")
+        (values same "")))))
+
+(defn date-with-day Values(t/LocalDate Str) [d: &t/LocalDate k: Int]
+  (of-date (:year d) (:month d) k))
+
+(defn date-with-month Values(t/LocalDate Str) [d: &t/LocalDate k: Int]
+  (if (or (< k 1) (> k 12)) (values (t/->LocalDate 1970 1 1) (range-err "MonthOfYear" "1" "12" k))
+    (values (resolve-prev-valid (:year d) k (:day d)) "")))
+
+(defn date-with-year Values(t/LocalDate Str) [d: &t/LocalDate k: Int]
+  (if (or (< k cv/MIN-YEAR) (> k cv/MAX-YEAR)) (values (t/->LocalDate 1970 1 1) (range-err "Year" "-999999999" "999999999" k))
+    (values (resolve-prev-valid k (:month d) (:day d)) "")))
+
+(defn date-with-doy Values(t/LocalDate Str) [d: &t/LocalDate k: Int]
+  (of-year-day (:year d) k))
+
+(defn- cmp Int [a: Int b: Int] (if (< a b) -1 (if (> a b) 1 0)))
+
+(defn date-compare Int [a: &t/LocalDate b: &t/LocalDate]
+  (let [c1 (cmp (:year a) (:year b))]
+    (if (not= c1 0) c1
+      (let [c2 (cmp (:month a) (:month b))]
+        (if (not= c2 0) c2 (cmp (:day a) (:day b)))))))
+
+(defn- proleptic-month Int [d: &t/LocalDate] (+ (* (:year d) 12) (- (:month d) 1)))
+
+(defn period-between t/Period [a: &t/LocalDate b: &t/LocalDate]
+  (let [tm0 (- (proleptic-month b) (proleptic-month a))
+        days0 (- (:day b) (:day a))]
+    (if (and (> tm0 0) (< days0 0))
+      (let [tm (- tm0 1)
+            [calc e] (date-plus-months a tm)
+            days (- (date-epoch-day b) (date-epoch-day calc))]
+        (t/->Period (/ tm 12) (rem tm 12) days))
+      (if (and (< tm0 0) (> days0 0))
+        (let [tm (+ tm0 1)
+              days (- days0 (date-length-of-month b))]
+          (t/->Period (/ tm 12) (rem tm 12) days))
+        (t/->Period (/ tm0 12) (rem tm0 12) days0)))))
+
+(defn- months-until Int [a: &t/LocalDate b: &t/LocalDate]
+  (let [p1 (+ (* (proleptic-month a) 32) (:day a))
+        p2 (+ (* (proleptic-month b) 32) (:day b))]
+    (/ (- p2 p1) 32)))
+
+(defn date-until Values(Int Str) [a: &t/LocalDate b: &t/LocalDate unit: &Str]
+  (let [days (- (date-epoch-day b) (date-epoch-day a))]
+    (case unit
+      "DAYS" (values days "")
+      "WEEKS" (values (/ days 7) "")
+      "MONTHS" (values (months-until a b) "")
+      "YEARS" (values (/ (months-until a b) 12) "")
+      "DECADES" (values (/ (months-until a b) 120) "")
+      "CENTURIES" (values (/ (months-until a b) 1200) "")
+      "MILLENNIA" (values (/ (months-until a b) 12000) "")
+      "ERAS" (values (- (if (>= (:year b) 1) 1 0) (if (>= (:year a) 1) 1 0)) "")
+      (values 0 (str "Unsupported unit: " (unit-display unit))))))
+
+(defn unit-display Str [unit: &Str]
+  (case unit
+    "NANOS" "Nanos" "MICROS" "Micros" "MILLIS" "Millis" "SECONDS" "Seconds" "MINUTES" "Minutes"
+    "HOURS" "Hours" "HALF_DAYS" "HalfDays" "DAYS" "Days" "WEEKS" "Weeks" "MONTHS" "Months"
+    "YEARS" "Years" "DECADES" "Decades" "CENTURIES" "Centuries" "MILLENNIA" "Millennia" "ERAS" "Eras"
+    "FOREVER" "Forever"
+    (str unit)))
+
+(defn unit-nanos Int [unit: &Str]
+  (case unit
+    "NANOS" 1 "MICROS" 1000 "MILLIS" 1000000 "SECONDS" 1000000000 "MINUTES" 60000000000
+    "HOURS" 3600000000000 "HALF_DAYS" 43200000000000
+    0))
+
+(defn of-time Values(t/LocalTime Str) [h: Int m: Int s: Int ns: Int]
+  (let [z (t/->LocalTime 0 0 0 0)]
+    (if (or (< h 0) (> h 23)) (values z (range-err "HourOfDay" "0" "23" h))
+      (if (or (< m 0) (> m 59)) (values z (range-err "MinuteOfHour" "0" "59" m))
+        (if (or (< s 0) (> s 59)) (values z (range-err "SecondOfMinute" "0" "59" s))
+          (if (or (< ns 0) (> ns 999999999)) (values z (range-err "NanoOfSecond" "0" "999999999" ns))
+            (values (t/->LocalTime h m s ns) "")))))))
+
+(defn time-nano-of-day Int [x: &t/LocalTime]
+  (+ (* (+ (* (:hour x) 3600) (* (:minute x) 60) (:second x)) t/NANOS-PER-SECOND)
+     (:nano x)))
+
+(defn time-second-of-day Int [x: &t/LocalTime]
+  (+ (* (:hour x) 3600) (* (:minute x) 60) (:second x)))
+
+(defn time-of-nano-of-day t/LocalTime [nod: Int]
+  (let [secs (/ nod t/NANOS-PER-SECOND)]
+    (t/->LocalTime (/ secs 3600) (rem (/ secs 60) 60) (rem secs 60) (rem nod t/NANOS-PER-SECOND))))
+
+(defn time-plus-nanos t/LocalTime [x: &t/LocalTime k: Int]
+  (let [kk (rem k t/NANOS-PER-DAY)]
+    (time-of-nano-of-day (mod (+ (time-nano-of-day x) kk) t/NANOS-PER-DAY))))
+
+(defn time-plus-seconds t/LocalTime [x: &t/LocalTime k: Int]
+  (time-plus-nanos x (* (rem k 86400) t/NANOS-PER-SECOND)))
+
+(defn time-plus-duration t/LocalTime [x: &t/LocalTime d: &t/Duration]
+  (time-plus-nanos (time-plus-seconds x (:seconds d)) (:nanos d)))
+
+(defn time-minus-duration t/LocalTime [x: &t/LocalTime d: &t/Duration]
+  (time-plus-duration x (am/duration-negated d)))
+
+(defn time-plus-period Values(t/LocalTime Str) [x: &t/LocalTime p: &t/Period]
+  (let [same (t/->LocalTime (:hour x) (:minute x) (:second x) (:nano x))]
+    (if (not= (:months p) 0) (values same "Unsupported unit: Months")
+      (if (not= (:years p) 0) (values same "Unsupported unit: Years")
+        (if (not= (:days p) 0) (values same "Unsupported unit: Days")
+          (values same ""))))))
+
+(defn time-compare Int [a: &t/LocalTime b: &t/LocalTime]
+  (cmp (time-nano-of-day a) (time-nano-of-day b)))
+
+(defn time-until Values(Int Str) [a: &t/LocalTime b: &t/LocalTime unit: &Str]
+  (let [u (unit-nanos unit)]
+    (if (= u 0) (values 0 (str "Unsupported unit: " (unit-display unit)))
+      (values (/ (- (time-nano-of-day b) (time-nano-of-day a)) u) ""))))
+
+(defn duration-between-times t/Duration [a: &t/LocalTime b: &t/LocalTime]
+  (am/duration 0 (- (time-nano-of-day b) (time-nano-of-day a))))
+
+(defn ldt t/LocalDateTime [d: t/LocalDate x: t/LocalTime] (t/->LocalDateTime d x))
+(defn ldt-date t/LocalDate [x: &t/LocalDateTime] (:date x))
+(defn ldt-time t/LocalTime [x: &t/LocalDateTime] (:time x))
+
+(defn of-ldt Values(t/LocalDateTime Str) [y: Int mo: Int d: Int h: Int mi: Int s: Int ns: Int]
+  (let [[dd e1] (of-date y mo d)
+        [tt e2] (of-time h mi s ns)]
+    (values (t/->LocalDateTime dd tt) (if (not= e1 "") e1 e2))))
+
+(defn ldt-to-epoch-second Int [x: &t/LocalDateTime offset: Int]
+  (- (+ (* (date-epoch-day (:date x)) 86400) (time-second-of-day (:time x))) offset))
+
+(defn ldt-of-epoch-second t/LocalDateTime [secs: Int nanos: Int offset: Int]
+  (let [ls (+ secs offset)
+        ed (cv/fdiv ls 86400)
+        sod (mod ls 86400)]
+    (t/->LocalDateTime (date-of-epoch-day ed) (time-of-nano-of-day (+ (* sod t/NANOS-PER-SECOND) nanos)))))
+
+(defn ldt-plus-seconds Values(t/LocalDateTime Str) [x: &t/LocalDateTime secs: Int nanos: Int]
+  (let [tm (:time x)
+        dsec (cv/fdiv secs 86400)
+        rsec (mod secs 86400)
+        dn (cv/fdiv nanos t/NANOS-PER-DAY)
+        rn (mod nanos t/NANOS-PER-DAY)
+        tot (+ (time-nano-of-day tm) (* rsec t/NANOS-PER-SECOND) rn)
+        dd (+ dsec dn (cv/fdiv tot t/NANOS-PER-DAY))
+        nod (mod tot t/NANOS-PER-DAY)
+        [nd e] (date-plus-days (:date x) dd)]
+    (values (t/->LocalDateTime nd (time-of-nano-of-day nod)) e)))
+
+(defn ldt-plus-duration Values(t/LocalDateTime Str) [x: &t/LocalDateTime d: &t/Duration]
+  (ldt-plus-seconds x (:seconds d) (:nanos d)))
+
+(defn ldt-minus-duration Values(t/LocalDateTime Str) [x: &t/LocalDateTime d: &t/Duration]
+  (ldt-plus-duration x (am/duration-negated d)))
+
+(defn ldt-plus-period Values(t/LocalDateTime Str) [x: &t/LocalDateTime p: &t/Period]
+  (let [[d e] (date-plus-period (:date x) p)]
+    (values (t/->LocalDateTime d (:time x)) e)))
+
+(defn ldt-minus-period Values(t/LocalDateTime Str) [x: &t/LocalDateTime p: &t/Period]
+  (let [[d e] (date-minus-period (:date x) p)]
+    (values (t/->LocalDateTime d (:time x)) e)))
+
+(defn ldt-plus-dw Values(t/LocalDateTime Str) [x: &t/LocalDateTime p: &t/DwPeriod]
+  (match p
+    (t/PerDate q) (ldt-plus-period x q)
+    (t/PerTime d) (ldt-plus-duration x d)))
+
+(defn ldt-minus-dw Values(t/LocalDateTime Str) [x: &t/LocalDateTime p: &t/DwPeriod]
+  (match p
+    (t/PerDate q) (ldt-minus-period x q)
+    (t/PerTime d) (ldt-minus-duration x d)))
+
+(defn ldt-compare Int [a: &t/LocalDateTime b: &t/LocalDateTime]
+  (let [c (date-compare (:date a) (:date b))]
+    (if (not= c 0) c (time-compare (:time a) (:time b)))))
+
+(defn ldt-until Values(Int Str) [a: &t/LocalDateTime b: &t/LocalDateTime unit: &Str]
+  (let [u (unit-nanos unit)
+        da (:date a) db (:date b)
+        ta (:time a) tb (:time b)]
+    (if (= u 0)
+      (let [c (date-compare db da)
+            [end e] (if (and (> c 0) (< (time-compare tb ta) 0)) (date-plus-days db -1)
+                      (if (and (< c 0) (> (time-compare tb ta) 0)) (date-plus-days db 1)
+                        (values db "")))]
+        (date-until da end unit))
+      (let [days0 (- (date-epoch-day db) (date-epoch-day da))
+            tnanos0 (- (time-nano-of-day tb) (time-nano-of-day ta))
+            days (if (and (> days0 0) (< tnanos0 0)) (- days0 1) (if (and (< days0 0) (> tnanos0 0)) (+ days0 1) days0))
+            tnanos (if (and (> days0 0) (< tnanos0 0)) (+ tnanos0 t/NANOS-PER-DAY)
+                     (if (and (< days0 0) (> tnanos0 0)) (- tnanos0 t/NANOS-PER-DAY) tnanos0))
+            per-day (/ t/NANOS-PER-DAY u)
+            [a1 o1] (n/mul-exact days per-day)
+            [a2 o2] (n/add-exact a1 (/ tnanos u))]
+        (if (and o1 o2) (values a2 "") (values 0 "long overflow"))))))
+
+(defn duration-between-ldts t/Duration [a: &t/LocalDateTime b: &t/LocalDateTime]
+  (let [ds (- (ldt-to-epoch-second b 0) (ldt-to-epoch-second a 0))]
+    (am/duration ds (- (:nano (:time b)) (:nano (:time a))))))

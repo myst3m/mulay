@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <!-- OpenTelemetry のメトリクス (mule.openTelemetry.meter.exporter.*) の数え方を実 Mule と比べるためのアプリ。
+         フローの数 (trigger / private / apikit、active と declared)、error-count の数え方 (on-error-continue、
+         flow-ref 越しの propagate、try、扱わないエラー)、received.events と dispatched.* を数えるフロー -->
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18510"/>
+    </http:listener-config>
+
+    <sub-flow name="sub">
+        <set-payload value="sub"/>
+    </sub-flow>
+
+    <flow name="private-ok">
+        <flow-ref name="sub"/>
+    </flow>
+
+    <flow name="private-propagates">
+        <raise-error type="APP:CHILD"/>
+        <error-handler>
+            <on-error-propagate/>
+        </error-handler>
+    </flow>
+
+    <flow name="private-no-handler">
+        <raise-error type="APP:CHILD_BARE"/>
+    </flow>
+
+    <!-- APIkit が生成する名前 (method:\resource:config)。source が無いフロー -->
+    <flow name="get:\things:api-config">
+        <set-payload value="things"/>
+    </flow>
+
+    <flow name="stopped" initialState="stopped">
+        <http:listener config-ref="L" path="/stopped"/>
+        <set-payload value="stopped"/>
+    </flow>
+
+    <flow name="ok">
+        <http:listener config-ref="L" path="/ok"/>
+        <flow-ref name="private-ok"/>
+    </flow>
+
+    <flow name="continue">
+        <http:listener config-ref="L" path="/continue"/>
+        <raise-error type="APP:CONTINUED"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="continued"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="propagate">
+        <http:listener config-ref="L" path="/propagate"/>
+        <flow-ref name="private-propagates"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="caught"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="bare">
+        <http:listener config-ref="L" path="/bare"/>
+        <flow-ref name="private-no-handler"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="caught"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="try">
+        <http:listener config-ref="L" path="/try"/>
+        <try>
+            <raise-error type="APP:TRIED"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="tried"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="unhandled">
+        <http:listener config-ref="L" path="/unhandled"/>
+        <raise-error type="APP:UNHANDLED"/>
+    </flow>
+
+    <flow name="apikit-call">
+        <http:listener config-ref="L" path="/apikit"/>
+        <flow-ref name="get:\things:api-config"/>
+    </flow>
+</mule>

@@ -1,0 +1,1121 @@
+%%% note
+Anypoint MQ コネクタ (anypoint-mq-connector 4.0.23) の操作: publish (本文の種類と contentType / MULE_ENCODING の
+プロパティ、sendContentType=false、<anypoint-mq:body>、ユーザーのプロパティ、deliveryDelay、messageId の無いとき)、
+consume (IMMEDIATE / MANUAL、attributes の形と並び、payload の mime (知らない mime は Binary)、outputMimeType /
+outputEncoding、pollingTime=0 の空、TIMEOUT)、ack / nack
+(ackToken。nack の再配信で deliveryCount 2、ack の後の nack)、FIFO キュー (messageGroupId と順)、失敗の型と文言
+(存在しないキュー、交換からの consume、範囲外の pollingTime、ackToken の空・壊れたもの、messageGroupId と deliveryDelay と
+本文の検査、ブローカーの 500、偽の client app、組織の無い URL)。/typeof と /ctecho は MQ を使わない比べ
+(知らない Content-Type の要求の payload の型、式の値に mimeType を付けた set-payload の応答の Content-Type)。
+ブローカーは本物の Anypoint MQ (組織 T1、Sandbox、ap-northeast-1)。キューは mulay-test-q と mulay-test-fifo だけを使う
+(subscriber の側の anypoint-mq-sub と重ならない)。標準のキューは順を保たないので、1 件送ったら受けてから次を送る。
+-Dmax.retries.failure.operation=0: ブローカーの 5xx を送り直さない (既定の 5 回だと 31〜62 秒待つ)。
+偽の client app の要求 (bad-creds) はトークンの口に 5 回続けて送る。口は 1 分ほどの間に 10 回までなので、続けて 2 回以上
+走らせると 429 (Too Many Requests) で文言が変わることがある (少し待ってからやり直す)。
+FIFO のキューは同じ messageId を 5 分の間は重複として捨てるので、/fifo は実行ごとの印を付けた messageId で送る。
+認証情報は src/main/resources/mq-secret.yaml (リポジトリに入れない)。リポジトリの外の認証情報のファイル (MQ_URL などを定める env。ここでは $MQ_ENV_FILE) から作る:
+  (. "$MQ_ENV_FILE"; printf 'mq.url: "%s/organizations/%s/environments/%s"\nmq.clientId: "%s"\nmq.clientSecret: "%s"\n' "$MQ_URL" "$MQ_ORG" "$MQ_ENV" "$MQ_CLIENT_ID" "$MQ_CLIENT_SECRET") > src/main/resources/mq-secret.yaml
+%%% requires src/main/resources/mq-secret.yaml
+%%% jvm -Dmax.retries.failure.operation=0
+%%% port 18500
+%%% mask
+"lockId": "([^"]*)"
+"created": "([^"]*)"
+"ackToken": "([^"]+)"
+LockId: ([^ ]+) provided
+"messageId": "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+%%% request GET /drain
+%%% response 200
+
+drained
+%%% request POST /typeof
+Content-Type: app/override
+
+abc
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "app/override",
+  "type": "Binary",
+  "text": "abc"
+}
+%%% request POST /pub?id=op-1
+Content-Type: text/plain
+
+hello mq
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "encoding": "UTF-8",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-1"
+  },
+  "body": "hello mq"
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "text/plain",
+  "encoding": "UTF-8",
+  "type": "String",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-1",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-1",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "text/plain; charset=UTF-8",
+    "properties": {
+      "contentType": "text/plain; charset=UTF-8",
+      "MULE_ENCODING": "UTF-8"
+    }
+  },
+  "body": "hello mq"
+}
+%%% request GET /pubkind?kind=json&id=op-json
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-json"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "application/json",
+  "encoding": "UTF-8",
+  "type": "Object",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-json",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-json",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "application/json; charset=UTF-8",
+    "properties": {
+      "contentType": "application/json; charset=UTF-8",
+      "MULE_ENCODING": "UTF-8"
+    }
+  },
+  "body": "{\n  \"a\": 1,\n  \"b\": \"two\",\n  \"c\": [\n    true,\n    null\n  ]\n}"
+}
+%%% request GET /pubkind?kind=text&id=op-text
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-text"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "text/plain",
+  "encoding": "UTF-8",
+  "type": "String",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-text",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-text",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "text/plain",
+    "properties": {
+      "contentType": "text/plain"
+    }
+  },
+  "body": "héllo text"
+}
+%%% request GET /pubkind?kind=none&id=op-none
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-none"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "encoding": "UTF-8",
+  "type": "Binary",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-none",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-none",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "*/*",
+    "properties": {
+      "contentType": "*/*"
+    }
+  },
+  "body": "plain value"
+}
+%%% request GET /pubkind?kind=noct&id=op-noct
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-noct"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "encoding": "UTF-8",
+  "type": "Binary",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-noct",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-noct",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": null,
+    "properties": {
+      
+    }
+  },
+  "body": "{\"x\": 1}"
+}
+%%% request GET /pubkind?kind=latin1&id=op-latin1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-latin1"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "text/plain",
+  "encoding": "ISO-8859-1",
+  "type": "String",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-latin1",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-latin1",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "text/plain; charset=ISO-8859-1",
+    "properties": {
+      "contentType": "text/plain; charset=ISO-8859-1",
+      "MULE_ENCODING": "ISO-8859-1"
+    }
+  },
+  "body": "café"
+}
+%%% request GET /pubkind?kind=xml&id=op-xml
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-xml"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "application/xml",
+  "encoding": "UTF-8",
+  "type": "Object",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-xml",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-xml",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "application/xml; charset=UTF-8",
+    "properties": {
+      "contentType": "application/xml; charset=UTF-8",
+      "MULE_ENCODING": "UTF-8"
+    }
+  },
+  "body": "<?xml version='1.0' encoding='UTF-8'?>\n<root>\n  <a>1</a>\n</root>"
+}
+%%% request GET /pubkind?kind=body&id=op-body
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-body"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "application/json",
+  "encoding": "UTF-8",
+  "type": "Object",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-body",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-body",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "application/json; charset=UTF-8",
+    "properties": {
+      "contentType": "application/json; charset=UTF-8",
+      "MULE_ENCODING": "UTF-8"
+    }
+  },
+  "body": "{\n  \"fromBody\": true\n}"
+}
+%%% request GET /pubkind?kind=props&id=op-props
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-props"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "app/override",
+  "encoding": "UTF-8",
+  "type": "Binary",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-props",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-props",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "app/override",
+    "properties": {
+      "big": 12345678901234,
+      "b": "true",
+      "s": "x",
+      "d": 1.5,
+      "contentType": "app/override",
+      "n": 1
+    }
+  },
+  "body": "with props"
+}
+%%% request GET /pubkind?kind=json&id=op-raw
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-raw"
+  }
+}
+%%% request GET /conraw headers=* framing=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+transfer-encoding: chunked
+
+{
+  "a": 1,
+  "b": "two",
+  "c": [
+    true,
+    null
+  ]
+}
+%%% request GET /pubkind?kind=delay&id=op-delay
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-delay"
+  }
+}
+%%% request GET /con?poll=8000
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "text/plain",
+  "encoding": "UTF-8",
+  "type": "String",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-delay",
+      "ttl": "120000",
+      "deliveryCount": "1",
+      "deliveryDelay": "2000"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-delay",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "text/plain",
+    "properties": {
+      "contentType": "text/plain"
+    }
+  },
+  "body": "delayed"
+}
+%%% request GET /pubkind?kind=expr&id=op-expr
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-expr"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "text/plain",
+  "encoding": "UTF-8",
+  "type": "String",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-expr",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-expr",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "text/plain",
+    "properties": {
+      "contentType": "text/plain"
+    }
+  },
+  "body": "expr op-expr"
+}
+%%% request GET /ctecho
+%%% response 200
+content-type: text/plain
+
+expr x
+%%% request GET /pubkind?kind=json&id=op-out1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-out1"
+  }
+}
+%%% request GET /conout
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "application/json",
+  "encoding": "UTF-8",
+  "type": "Object",
+  "body": {
+    "a": 1,
+    "b": "two",
+    "c": [
+      true,
+      null
+    ]
+  },
+  "ct": "application/json; charset=UTF-8"
+}
+%%% request GET /pubkind?kind=json&id=op-out2
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-out2"
+  }
+}
+%%% request GET /conout?enc=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "application/json",
+  "encoding": "ISO-8859-1",
+  "type": "Object",
+  "body": {
+    "a": 1,
+    "b": "two",
+    "c": [
+      true,
+      null
+    ]
+  },
+  "ct": "application/json; charset=UTF-8"
+}
+%%% request GET /pubkind?kind=noid
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "***"
+  }
+}
+%%% request GET /con
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "text/plain",
+  "encoding": "UTF-8",
+  "type": "String",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "***",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "***",
+    "ackToken": null,
+    "deliveryCount": 1,
+    "contentType": "text/plain",
+    "properties": {
+      "contentType": "text/plain"
+    }
+  },
+  "body": "no id"
+}
+%%% request POST /pub?id=op-man
+Content-Type: text/plain
+
+manual
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "encoding": "UTF-8",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessagePublishAttributes",
+  "attrs": {
+    "messageId": "op-man"
+  },
+  "body": "manual"
+}
+%%% capture TOKEN regex:"ackToken":\s"([^"]*)"
+%%% request GET /con?mode=MANUAL
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "text/plain",
+  "encoding": "UTF-8",
+  "type": "String",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-man",
+      "ttl": "120000",
+      "deliveryCount": "1"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-man",
+    "ackToken": "***",
+    "deliveryCount": 1,
+    "contentType": "text/plain; charset=UTF-8",
+    "properties": {
+      "contentType": "text/plain; charset=UTF-8",
+      "MULE_ENCODING": "UTF-8"
+    }
+  },
+  "body": "manual"
+}
+%%% request POST /nack
+Content-Type: text/plain
+
+{{TOKEN}}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payload": "before",
+  "mime": "text/plain",
+  "attrs": "org.mule.extension.http.api.HttpRequestAttributes"
+}
+%%% capture TOKEN2 regex:"ackToken":\s"([^"]*)"
+%%% request GET /con?mode=MANUAL
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "text/plain",
+  "encoding": "UTF-8",
+  "type": "String",
+  "class": "com.mulesoft.extension.mq.api.attributes.AnypointMQMessageAttributes",
+  "isNull": false,
+  "attrs": {
+    "headers": {
+      "lockId": "***",
+      "created": "***",
+      "messageId": "op-man",
+      "ttl": "120000",
+      "deliveryCount": "2"
+    },
+    "destination": "mulay-test-q",
+    "messageId": "op-man",
+    "ackToken": "***",
+    "deliveryCount": 2,
+    "contentType": "text/plain; charset=UTF-8",
+    "properties": {
+      "contentType": "text/plain; charset=UTF-8",
+      "MULE_ENCODING": "UTF-8"
+    }
+  },
+  "body": "manual"
+}
+%%% request POST /ack
+Content-Type: text/plain
+
+{{TOKEN2}}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payload": "before",
+  "mime": "text/plain",
+  "attrs": "org.mule.extension.http.api.HttpRequestAttributes"
+}
+%%% request POST /ack
+Content-Type: text/plain
+
+{{TOKEN2}}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payload": "before",
+  "mime": "text/plain",
+  "attrs": "org.mule.extension.http.api.HttpRequestAttributes"
+}
+%%% request POST /nack
+Content-Type: text/plain
+
+{{TOKEN2}}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:NACKING",
+  "parent": "MULE:ANY",
+  "description": "Failed to NACK the message with id 'op-man': An error occurred while executing the operation: NOT-ACK ONE MESSAGE. Cause: 400 - Bad Request ({\n  \"status\" : \"failure\",\n  \"statusMessage\" : \"LockId: *** provided is expired\"\n})."
+}
+%%% request GET /con?poll=1000
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:TIMEOUT",
+  "parent": "ANYPOINT-MQ:CONSUMING",
+  "description": "Failed to retrieve a Message. Didn't receive any message during polling interval of '1000' milliseconds"
+}
+%%% request GET /con?poll=0
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "mime": "*/*",
+  "encoding": "UTF-8",
+  "type": "Null",
+  "class": null,
+  "isNull": true,
+  "attrs": null,
+  "body": null
+}
+%%% request GET /fifo
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+[
+  {
+    "id": "f1",
+    "group": "grp-a",
+    "body": "body of f1",
+    "n": 1,
+    "keys": [
+      "lockId",
+      "messageGroupId",
+      "created",
+      "messageId",
+      "ttl",
+      "deliveryCount"
+    ]
+  },
+  {
+    "id": "f2",
+    "group": "grp-a",
+    "body": "body of f2",
+    "n": 1,
+    "keys": [
+      "lockId",
+      "messageGroupId",
+      "created",
+      "messageId",
+      "ttl",
+      "deliveryCount"
+    ]
+  },
+  {
+    "id": "f3",
+    "group": "grp-a",
+    "body": "body of f3",
+    "n": 1,
+    "keys": [
+      "lockId",
+      "messageGroupId",
+      "created",
+      "messageId",
+      "ttl",
+      "deliveryCount"
+    ]
+  }
+]
+%%% request GET /err?k=pub-notfound
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:DESTINATION_NOT_FOUND",
+  "parent": "MULE:ANY",
+  "description": "Failed to publish message to destination 'mulay-no-such-queue': An error occurred while executing the operation: SEND ONE MESSAGE. Cause: 404 - Not Found ({\n  \"status\" : \"failure\",\n  \"statusMessage\" : \"Destination not found\"\n})."
+}
+%%% request GET /err?k=con-notfound
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:DESTINATION_NOT_FOUND",
+  "parent": "MULE:ANY",
+  "description": "Failed to consume from destination 'mulay-no-such-queue': An error occurred while executing the operation: RECEIVE MESSAGES. Cause: 404 - Not Found ({\n  \"status\" : \"failure\",\n  \"statusMessage\" : \"Destination not found\"\n})."
+}
+%%% request GET /err?k=con-exchange
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:CONSUMING",
+  "parent": "MULE:ANY",
+  "description": "Failed to consume from destination 'mulay-test-x': An error occurred while executing the operation: RECEIVE MESSAGES. Cause: 400 - Bad Request ({\n  \"status\" : \"failure\",\n  \"statusMessage\" : \"The destination should be a queue\"\n})."
+}
+%%% request GET /err?k=con-range
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:CONSUMING",
+  "parent": "MULE:ANY",
+  "description": "Polling time `30000` is not in the '0 to 20000' milliseconds range"
+}
+%%% request GET /err?k=con-negack
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:CONSUMING",
+  "parent": "MULE:ANY",
+  "description": "Acknowledgement timeout cannot be less than zero, but was `-1`"
+}
+%%% request GET /err?k=con-timeout
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:TIMEOUT",
+  "parent": "ANYPOINT-MQ:CONSUMING",
+  "description": "Failed to retrieve a Message. Didn't receive any message during polling interval of '1000' milliseconds"
+}
+%%% request GET /err?k=ack-empty
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ACKING",
+  "parent": "MULE:ANY",
+  "description": "Invalid token: The 'ackToken' cannot be an empty String"
+}
+%%% request GET /err?k=ack-blank
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ACKING",
+  "parent": "MULE:ANY",
+  "description": "Invalid token: The 'ackToken' cannot be an empty String"
+}
+%%% request GET /err?k=ack-null
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "MULE:UNKNOWN",
+  "parent": "MULE:ANY",
+  "description": "Required parameter 'ackToken' was assigned with value '#[null]' which resolved to null. Required parameters need to be assigned with non null values"
+}
+%%% request GET /err?k=ack-garbage
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ACKING",
+  "parent": "MULE:ANY",
+  "description": "The provided ackToken 'not-a-token' is invalid and could not be decoded: Illegal base64 character 2d"
+}
+%%% request GET /err?k=ack-notjson
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ACKING",
+  "parent": "MULE:ANY",
+  "description": "The provided ackToken 'aGVsbG8=' is invalid and could not be decoded: java.lang.IllegalStateException: Expected BEGIN_OBJECT but was STRING at line 1 column 1 path $\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"
+}
+%%% request GET /err?k=nack-garbage
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:NACKING",
+  "parent": "MULE:ANY",
+  "description": "The provided ackToken 'not-a-token' is invalid and could not be decoded: Illegal base64 character 2d"
+}
+%%% request GET /err?k=nack-empty
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:NACKING",
+  "parent": "MULE:ANY",
+  "description": "Invalid token: The 'ackToken' cannot be an empty String"
+}
+%%% request GET /err?k=ack-nulltoken
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "MULE:UNKNOWN",
+  "parent": "MULE:ANY",
+  "description": "Cannot invoke \"com.mulesoft.extension.mq.internal.model.AckToken.getMessageId()\" because \"token\" is null"
+}
+%%% request GET /err?k=ack-emptyobj
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "MULE:UNKNOWN",
+  "parent": "MULE:ANY",
+  "description": "unknown description"
+}
+%%% request GET /err?k=ack-nolock
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ACKING",
+  "parent": "MULE:ANY",
+  "description": "Failed to ACK the message with id 'm': An error occurred while executing the operation: ACK ONE MESSAGE. Cause: 500 - Internal Server Error ({\n  \"status\" : \"failure\",\n  \"statusMessage\" : \"Unexpected error\"\n})."
+}
+%%% request GET /err?k=ack-noid
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "MULE:UNKNOWN",
+  "parent": "MULE:ANY",
+  "description": "Cannot invoke \"String.length()\" because \"s\" is null"
+}
+%%% request GET /err?k=ack-nomsg
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ACKING",
+  "parent": "MULE:ANY",
+  "description": "Failed to ACK the message with id 'nosuch': An error occurred while executing the operation: ACK ONE MESSAGE. Cause: 500 - Internal Server Error ({\n  \"status\" : \"failure\",\n  \"statusMessage\" : \"Unexpected error\"\n})."
+}
+%%% request GET /err?k=nack-nomsg
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:NACKING",
+  "parent": "MULE:ANY",
+  "description": "Failed to NACK the message with id 'nosuch': An error occurred while executing the operation: NOT-ACK ONE MESSAGE. Cause: 500 - Internal Server Error ({\n  \"status\" : \"failure\",\n  \"statusMessage\" : \"Unexpected error\"\n})."
+}
+%%% request GET /err?k=ack-noqueue
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:DESTINATION_NOT_FOUND",
+  "parent": "MULE:ANY",
+  "description": "Failed to ACK the message with id 'm': An error occurred while executing the operation: ACK ONE MESSAGE. Cause: 404 - Not Found ({\n  \"status\" : \"failure\",\n  \"statusMessage\" : \"Destination not found\"\n})."
+}
+%%% request GET /err?k=group-bad
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ILLEGAL_MESSAGE_GROUP_ID",
+  "parent": "ANYPOINT-MQ:PUBLISHING",
+  "description": "The field messageGroupId can be up to 128 characters and must contain only alphanumeric characters and punctuation (!\"#$%&\\'()*+,-./:;<=>?@[\\\\]^_`{|}~) ."
+}
+%%% request GET /err?k=group-long
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ILLEGAL_MESSAGE_GROUP_ID",
+  "parent": "ANYPOINT-MQ:PUBLISHING",
+  "description": "The field messageGroupId can be up to 128 characters and must contain only alphanumeric characters and punctuation (!\"#$%&\\'()*+,-./:;<=>?@[\\\\]^_`{|}~) ."
+}
+%%% request GET /err?k=group-empty
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ILLEGAL_MESSAGE_GROUP_ID",
+  "parent": "ANYPOINT-MQ:PUBLISHING",
+  "description": "The field messageGroupId can be up to 128 characters and must contain only alphanumeric characters and punctuation (!\"#$%&\\'()*+,-./:;<=>?@[\\\\]^_`{|}~) ."
+}
+%%% request GET /err?k=delay-bad
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ILLEGAL_DELAY",
+  "parent": "ANYPOINT-MQ:PUBLISHING",
+  "description": "Delivery delay must be within the range of 0 - 900000 milliseconds"
+}
+%%% request GET /err?k=delay-neg
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ILLEGAL_DELAY",
+  "parent": "ANYPOINT-MQ:PUBLISHING",
+  "description": "Delivery delay must be within the range of 0 - 900000 milliseconds"
+}
+%%% request GET /err?k=body-null
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:ILLEGAL_BODY",
+  "parent": "ANYPOINT-MQ:PUBLISHING",
+  "description": "The Body of the message cannot be 'null'"
+}
+%%% request GET /err?k=prop-null
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "MULE:UNKNOWN",
+  "parent": "MULE:ANY",
+  "description": "Property value can not be null"
+}
+%%% request GET /err?k=prop-obj
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "MULE:UNKNOWN",
+  "parent": "MULE:ANY",
+  "description": "Property value accept only string or number or boolean as values"
+}
+%%% request GET /err?k=bad-creds
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:CONNECTIVITY",
+  "parent": "MULE:CONNECTIVITY",
+  "description": "Failed to connect with Anypoint MQ Service: [401] Unauthorized"
+}
+%%% request GET /err?k=bad-url
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:CONNECTIVITY",
+  "parent": "MULE:CONNECTIVITY",
+  "description": "Invalid api url provided https://mq-ap-northeast-1.anypoint.mulesoft.com/api/v1"
+}
+%%% request GET /perfpub?n=3
+%%% response 200
+
+published
+%%% request GET /perfcon?n=3
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "count": 3,
+  "distinct": 3
+}
+%%% request GET /con?poll=1000
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:TIMEOUT",
+  "parent": "ANYPOINT-MQ:CONSUMING",
+  "description": "Failed to retrieve a Message. Didn't receive any message during polling interval of '1000' milliseconds"
+}
+%%% request GET /con?q=mulay-test-fifo&poll=1000
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "ANYPOINT-MQ:TIMEOUT",
+  "parent": "ANYPOINT-MQ:CONSUMING",
+  "description": "Failed to retrieve a Message. Didn't receive any message during polling interval of '1000' milliseconds"
+}

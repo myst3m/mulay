@@ -1,0 +1,271 @@
+(ns mulay.note.contract
+  (:require [mulay.dw.val :as v] [mulay.dw.fmt.registry :as reg] [mulay.mule.model :as m] [mulay.mule.amodel :as am]
+            [mulay.lib.xml :as xml] [mulay.conn.apikit :as apikit] [mulay.conn.db :as dbc] [mulay.db.emu :as emu] [mulay.db.sql :as sql] [mulay.lib.host :as host] [mulay.conn.apispec :as sp] [mulay.lib.yaml :as y] [clay.json :as json] [clay.string :as str]))
+
+(defrecord Link [name: Str url: Str main: Str files: Map(Str Str)])
+
+(defn jq Str [s: &Str] (str "\"" (json/escape (str s)) "\""))
+
+(defn- fstr Str [fs: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get fs k)] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) (str s) _ ""))))
+
+(defn- fobj Vec(v/Field) [fs: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get fs k)] (if (= (count r) 0) [] (match (v/unmeta (nth r 0)) (v/VObj gs) gs _ []))))
+
+(defn- link-of Values(Vec(Link) Str) [x: &v/Val]
+  (let [none: Vec(Link) []]
+    (match (v/unmeta x)
+      (v/VObj fs)
+      (let [sp (fobj fs "spec")
+            files (fobj sp "files")
+            m (loop [i 0 acc: Map(Str Str) {}]
+                (if (>= i (count files)) acc
+                  (let [f (nth files i)]
+                    (recur (+ i 1) (match (v/unmeta (:value f)) (v/VStr s) (assoc acc (str (:name (:key f))) (str s)) _ acc)))))
+            name (fstr fs "name") url (fstr fs "url") main (fstr sp "main")]
+        (cond (or (= name "") (= url "")) (values none "@links: each link needs a name and a url")
+              (and (not= main "") (not (contains? m main))) (values none (str "@links: " name ": spec.main '" main "' is not in spec.files"))
+              :else (values [(->Link name url main m)] "")))
+      _ (values none "@links: each link must be a JSON object"))))
+
+(defn links-json Values(Vec(Link) Str) [t: &Str]
+  (let [none: Vec(Link) []
+        [x xe] (reg/read-named "application/json" [] t "json")]
+    (if (not= xe "") (values none (str "@links: " xe))
+      (match (v/unmeta x)
+        (v/VArr xs) (loop [i 0 acc: Vec(Link) []]
+                      (if (>= i (count xs)) (values acc "")
+                        (let [[l e] (link-of (nth xs i))] (if (not= e "") (values none e) (recur (+ i 1) (conj acc (nth l 0)))))))
+        _ (values none "@links must be a JSON array")))))
+
+(def LINKS (atom (let [z: Vec(Link) []] z)))
+
+(defn set-links! Int [ls: Vec(Link)] (let [z (reset! LINKS ls)] 0))
+
+(defn links Vec(Link) [] (deref LINKS))
+
+(defn api-of Values(sp/Api Str) [l: &Link]
+  (let [fs (:files l)
+        res (fn Values(Str Bool) [p: Str] (if (contains? fs p) (values (get! fs p) true) (values "" false)))]
+    (if (= (:main l) "") (values (sp/->Api [] (y/->YNull) false) "no spec")
+      (apikit/parse-api (get! fs (:main l)) (:main l) res ""))))
+
+(defn- ops-in Vec(m/Proc) [ps: &Vec(m/Proc) acc0: Vec(m/Proc)]
+  (loop [i 0 acc acc0]
+    (if (>= i (count ps)) acc
+      (let [p (nth ps i)]
+        (recur (+ i 1)
+               (match p
+                 (m/PrConnectorOp a b d f g h k t tv l) (let [a1 (conj acc p)] (loop [j 0 a2 a1] (if (>= j (count k)) a2 (recur (+ j 1) (ops-in (:procs (nth k j)) a2)))))
+                 (m/PrChoice ws o l) (ops-in o (loop [j 0 a2 acc] (if (>= j (count ws)) a2 (recur (+ j 1) (ops-in (:procs (nth ws j)) a2)))))
+                 (m/PrForEach a b d f ps2 l) (ops-in ps2 acc)
+                 (m/PrParallelForEach a b d f ps2 l) (ops-in ps2 acc)
+                 (m/PrScatterGather rs a b d l) (loop [j 0 a2 acc] (if (>= j (count rs)) a2 (recur (+ j 1) (ops-in (:procs (nth rs j)) a2))))
+                 (m/PrTry ps2 hs r ta l) (handlers-ops hs (ops-in ps2 acc))
+                 (m/PrUntilSuccessful a b ps2 l) (ops-in ps2 acc)
+                 (m/PrAsync ps2 a l) (ops-in ps2 acc)
+                 (m/PrCache a b ps2 l) (ops-in ps2 acc)
+                 (m/PrFirstSuccessful rs l) (loop [j 0 a2 acc] (if (>= j (count rs)) a2 (recur (+ j 1) (ops-in (:procs (nth rs j)) a2))))
+                 (m/PrRoundRobin rs a l) (loop [j 0 a2 acc] (if (>= j (count rs)) a2 (recur (+ j 1) (ops-in (:procs (nth rs j)) a2))))
+                 (m/PrBatchJob a b d f ss oc l) (ops-in oc (loop [j 0 a2 acc] (if (>= j (count ss)) a2 (recur (+ j 1) (ops-in (:procs (nth ss j)) a2)))))
+                 _ acc))))))
+
+(defn- handlers-ops Vec(m/Proc) [hs: &Vec(m/Handler) acc0: Vec(m/Proc)]
+  (loop [j 0 a acc0] (if (>= j (count hs)) a (recur (+ j 1) (ops-in (:procs (nth hs j)) a)))))
+
+(defn connector-ops Vec(m/Proc) [app: &m/App]
+  (let [fs (:flows app)
+        a1 (loop [i 0 acc: Vec(m/Proc) []] (if (>= i (count fs)) acc (recur (+ i 1) (handlers-ops (:handlers (nth fs i)) (ops-in (:procs (nth fs i)) acc)))))
+        gs (:global-handlers app)]
+    (loop [i 0 acc a1] (if (>= i (count gs)) acc (recur (+ i 1) (handlers-ops (:handlers (nth gs i)) acc))))))
+
+(def EXPR (str (chr 0)))
+
+(defn- lit Str [ps: &Vec(m/Param) k: &Str]
+  (loop [i 0] (if (>= i (count ps)) "" (if (= (:name (nth ps i)) k) (match (:v (nth ps i)) (m/PLit s) (str s) _ EXPR) (recur (+ i 1))))))
+
+(defn- config-of Vec(m/Config) [app: &m/App name: &Str]
+  (let [cs (:configs app)] (loop [i 0] (if (>= i (count cs)) [] (if (= (:name (nth cs i)) name) [(nth cs i)] (recur (+ i 1)))))))
+
+(defn- conn-attr Str [cfg: &m/Config k: &Str default: Str]
+  (let [ks (:children cfg)]
+    (loop [i 0]
+      (if (>= i (count ks)) default
+        (let [c (nth ks i)]
+          (if (= (xml/elem-local c) "request-connection") (xml/attr c "" k default) (recur (+ i 1))))))))
+
+(defn- join-path Str [a: &Str b: &Str]
+  (let [x (if (str/ends-with? a "/") (subs a 0 (- (count a) 1)) (str a))
+        y (if (str/starts-with? b "/") (str b) (str "/" b))]
+    (if (= y "/") (if (= x "") "/" x) (str x y))))
+
+(defn- norm-url Str [u: &Str]
+  (let [s (str/lower-case (str/trim u))
+        t (if (str/ends-with? s "/") (subs s 0 (- (count s) 1)) s)
+        k (str/index-of t "://")
+        rest (if (< k 0) t (subs t (+ k 3) (count t)))
+        sl (str/index-of rest "/")
+        hp (if (< sl 0) rest (subs rest 0 sl))
+        p (if (< sl 0) "" (subs t (+ k 3 sl) (count t)))
+        scheme (if (< k 0) "http" (subs t 0 k))
+        hp2 (cond (and (= scheme "http") (str/ends-with? hp ":80")) (subs hp 0 (- (count hp) 3))
+                  (and (= scheme "https") (str/ends-with? hp ":443")) (subs hp 0 (- (count hp) 4))
+                  :else hp)
+        orig-path (if (< sl 0) "" (let [o (str/trim u) j (str/index-of o "://") r (if (< j 0) o (subs o (+ j 3) (count o))) s2 (str/index-of r "/")] (if (< s2 0) "" (subs r s2 (count r)))))
+        op2 (if (str/ends-with? orig-path "/") (subs orig-path 0 (- (count orig-path) 1)) orig-path)]
+    (str scheme "://" hp2 op2)))
+
+(defrecord Call [method: Str url: Str path: Str])
+
+(defn- call-of Vec(Call) [app: &m/App p: &m/Proc]
+  (match p
+    (m/PrConnectorOp a op cref ps g h k t tv l)
+    (if (or (not= a "http") (not= op "request")) []
+      (let [method (str/upper-case (let [x (lit ps "method")] (if (= x "") "GET" x)))
+            path (let [x (lit ps "path")] (if (= x "") "/" x))
+            url0 (lit ps "url")
+            cs (config-of app cref)]
+        (cond (or (str/includes? method EXPR) (str/includes? path EXPR) (str/includes? url0 EXPR)) []
+              (not= url0 "") [(->Call method (norm-url url0) "")]
+              (= (count cs) 0) []
+              :else
+              (let [cfg (nth cs 0)
+                    proto (str/lower-case (conn-attr cfg "protocol" "HTTP"))
+                    scheme (if (= proto "https") "https" "http")
+                    host (conn-attr cfg "host" "localhost")
+                    port (conn-attr cfg "port" (if (= scheme "https") "443" "80"))
+                    base (lit (:params cfg) "basePath")]
+                (if (str/includes? base EXPR) []
+                  [(->Call method (norm-url (str scheme "://" host ":" port (join-path base path))) "")])))))
+    _ []))
+
+(defn- segs Vec(Str) [p: &Str] (filterv (fn Bool [s: Str] (not= s "")) (str/split (str p) "/")))
+
+(defn- tmpl? Bool [s: &Str] (and (str/starts-with? s "{") (str/ends-with? s "}")))
+
+(defn- seg-match? Bool [a: &Str b: &Str] (or (= a b) (tmpl? b)))
+
+(defn- res-match? Bool [rs: &Vec(Str) ss: &Vec(Str)]
+  (and (= (count rs) (count ss)) (loop [i 0] (if (>= i (count rs)) true (if (seg-match? (nth rs i) (nth ss i)) (recur (+ i 1)) false)))))
+
+(defn- under Vec(Str) [url: &Str base: &Str]
+  (cond (= url base) ["/"]
+        (and (str/starts-with? url base) (= (nth url (count base)) 47)) [(subs url (count base) (count url))]
+        :else []))
+
+(defn- data Str [pairs: &Vec(Vec(Str))]
+  (str "{" (str/join "," (mapv (fn Str [p: Vec(Str)] (str (jq (nth p 0)) ":" (jq (nth p 1)))) pairs)) "}"))
+
+(defn- check-call Vec(am/ADiag) [md: &am/AModel path: &Str c: &Call l: &Link a: &sp/Api rel: &Str]
+  (let [rsegs (segs rel)
+        rs (:res a)
+        hits (filterv (fn Bool [r: sp/Res] (res-match? rsegs (segs (:path r)))) rs)
+        lm (str/lower-case (:method c))
+        withm (filterv (fn Bool [r: sp/Res] (> (count (filterv (fn Bool [o: sp/Op] (= (:method o) lm)) (:ops r))) 0)) hits)
+        who (str (:name l) " (" (:main l) ")")
+        base [["link" (str (:name l))] ["spec" (str (:main l))] ["method" (str (:method c))]]]
+    (if (= (count withm) 0)
+      [(am/warning md path (str who " has no operation " (:method c) " " rel) "contract.no-operation" (data (conj base ["path" (str rel)])))]
+      (let [r (nth withm 0)
+            ss (segs (:path r))
+            bad (loop [i 0] (if (>= i (count rsegs)) -1 (if (and (tmpl? (nth rsegs i)) (tmpl? (nth ss i)) (not= (nth rsegs i) (nth ss i))) i (recur (+ i 1)))))]
+        (if (< bad 0) []
+          (let [inner (fn Str [s: Str] (subs s 1 (- (count s) 1)))
+                got (inner (nth rsegs bad)) want (inner (nth ss bad))]
+            [(am/warning md path (str "the URI parameter '" got "' is called '" want "' in " who ": " (:method c) " " (:path r)) "contract.uri-param"
+                         (data (conj (conj (conj base ["path" (str (:path r))]) ["param" got]) ["expected" want])))]))))))
+
+(defn http-warnings Vec(am/ADiag) [app: &m/App md: &am/AModel ls: &Vec(Link)]
+  (let [ops (connector-ops app)
+        apis (mapv (fn sp/Api [l: Link] (let [[a e] (api-of l)] a)) ls)
+        aerrs (mapv (fn Str [l: Link] (let [[a e] (api-of l)] e)) ls)]
+    (loop [i 0 out: Vec(am/ADiag) []]
+      (if (>= i (count ops)) out
+        (let [p (nth ops i)
+              cs (call-of app p)
+              path (str (:path (m/proc-loc p)))
+              ws (if (= (count cs) 0) []
+                   (let [c (nth cs 0)]
+                     (loop [k 0]
+                       (if (>= k (count ls)) []
+                         (let [l (nth ls k)
+                               u (under (:url c) (norm-url (:url l)))
+                               a (nth apis k) ae (nth aerrs k)]
+                           (if (or (= (count u) 0) (not= ae "") (= (:main l) "")) (recur (+ k 1))
+                             (check-call md path c l a (nth u 0))))))))]
+          (recur (+ i 1) (loop [k 0 o out] (if (>= k (count ws)) o (recur (+ k 1) (conj o (nth ws k)))))))))))
+
+(def SQL-OPS ["select" "insert" "update" "delete" "bulk-insert" "bulk-update" "bulk-delete"])
+
+(defn- has-name? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn- sql-of Str [ks: &Vec(xml/XNode) exprs: &Vec(m/Param)]
+  (let [e (loop [i 0] (if (>= i (count exprs)) "" (if (= (:name (nth exprs i)) "sql") (match (:v (nth exprs i)) (m/PLit s) (str s) _ EXPR) (recur (+ i 1)))))]
+    (if (not= e "") e
+      (loop [i 0] (if (>= i (count ks)) "" (if (= (xml/elem-local (nth ks i)) "sql") (str/trim (xml/text-content (nth ks i))) (recur (+ i 1))))))))
+
+(defn sql-warnings Vec(am/ADiag) [app: &m/App md: &am/AModel dir: &Str]
+  (let [ops (connector-ops app)
+        emus (atom (let [m: Map(Str Vec(emu/Emu)) {}] m))
+        emu-for (fn Vec(emu/Emu) [cref: Str]
+                  (let [m (deref emus)]
+                    (if (contains? m cref) (get! m cref)
+                      (let [cs (config-of app cref)
+                            seed (host/file-read-or (str dir "/livenote/db/" cref ".sql") "")
+                            r (if (or (= (count cs) 0) (= seed "")) []
+                                (let [[k sc de] (dbc/dialect-of (nth cs 0))]
+                                  (if (or (not= de "") (= k "sqlite")) []
+                                    (let [[e ee] (emu/open k sc seed)] (if (sql/ok? ee) [e] [])))))
+                            z (swap! emus (fn Map(Str Vec(emu/Emu)) [o: Map(Str Vec(emu/Emu))] (assoc o (str cref) r)))]
+                        r))))
+        out (loop [i 0 out: Vec(am/ADiag) []]
+              (if (>= i (count ops)) out
+                (let [p (nth ops i)
+                      ws (match p
+                           (m/PrConnectorOp a op cref ps ks ex k t tv l)
+                           (let [text (sql-of ks ex)]
+                             (if (or (not= a "db") (not (has-name? SQL-OPS op)) (= text "") (str/includes? text EXPR) (str/includes? text "#[")) []
+                               (let [es (emu-for (str cref))]
+                                 (if (= (count es) 0) []
+                                   (let [[kind tb col] (emu/check (nth es 0) text)
+                                         path (str (:path l))
+                                         file (str "livenote/db/" cref ".sql")]
+                                     (cond (= kind "table") [(am/warning md path (str "the table '" tb "' is not in " file) "sql.unknown-table" (data [["config" (str cref)] ["table" tb]]))]
+                                           (= kind "column") [(am/warning md path (str "the column '" col "' is not in " file) "sql.unknown-column" (data [["config" (str cref)] ["table" tb] ["column" col]]))]
+                                           :else []))))))
+                           _ [])]
+                  (recur (+ i 1) (loop [k 0 o out] (if (>= k (count ws)) o (recur (+ k 1) (conj o (nth ws k)))))))))
+        m (deref emus)
+        zc (loop [ks (keys m) i 0] (if (>= i (count ks)) 0 (let [v (get! m (nth ks i)) z (if (> (count v) 0) (emu/close (nth v 0)) 0)] (recur ks (+ i 1)))))]
+    out))
+
+(defrecord Answer [meta: Str status: Int mime: Str body: Str])
+
+(defn- code-int Int [s: &Str] (let [[n e] (parse-long (str/trim s))] (if (= e "") n 0)))
+
+(defn answer Vec(Answer) [url: &Str method: &Str]
+  (let [ls (links)
+        u0 (let [q (str/index-of url "?")] (if (< q 0) (str url) (subs url 0 q)))
+        nu (norm-url u0)
+        lm (str/lower-case method)]
+    (loop [k 0]
+      (if (>= k (count ls)) []
+        (let [l (nth ls k)
+              u (under nu (norm-url (:url l)))]
+          (if (or (= (count u) 0) (= (:main l) "")) (recur (+ k 1))
+            (let [[a ae] (api-of l)
+                  rsegs (segs (nth u 0))
+                  hits (filterv (fn Bool [r: sp/Res] (res-match? rsegs (segs (:path r)))) (:res a))
+                  found (loop [i 0]
+                          (if (>= i (count hits)) []
+                            (let [r (nth hits i)
+                                  os (filterv (fn Bool [o: sp/Op] (= (:method o) lm)) (:ops r))]
+                              (if (= (count os) 0) (recur (+ i 1))
+                                (let [xs (filterv (fn Bool [x: sp/Example] (let [c (code-int (:code x))] (and (>= c 200) (< c 300)))) (:examples (nth os 0)))
+                                      best (loop [j 0 b -1] (if (>= j (count xs)) b (recur (+ j 1) (if (or (< b 0) (< (code-int (:code (nth xs j))) (code-int (:code (nth xs b))))) j b))))]
+                                  (if (< best 0) []
+                                    (let [x (nth xs best) c (code-int (:code x))
+                                          meta (str "{" (jq "link") ":" (jq (:name l)) "," (jq "spec") ":" (jq (:main l)) "," (jq "method") ":" (jq (str/upper-case method))
+                                                    "," (jq "path") ":" (jq (:path r)) "," (jq "status") ":" c "," (jq "mediaType") ":" (jq (:mime x)) "}")]
+                                      [(->Answer meta c (str (:mime x)) (str (:json x)))])))))))]
+              (if (or (not= ae "") (= (count found) 0)) (recur (+ k 1)) found))))))))

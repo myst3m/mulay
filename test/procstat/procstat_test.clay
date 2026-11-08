@@ -1,0 +1,67 @@
+(ns procstat-test (:require [mulay.lib.procstat :as ps]))
+
+(def STATUS "Name:\tmulay\nVmPeak:\t  200000 kB\nVmSize:\t  123456 kB\nVmRSS:\t    7890 kB\nThreads:\t12\nvoluntary_ctxt_switches:\t5\n")
+
+(deftest status-kb-to-bytes
+  (is (= (ps/status-field STATUS "VmRSS") (* 7890 1024)))
+  (is (= (ps/status-field STATUS "VmSize") (* 123456 1024))))
+
+(deftest status-count-without-unit
+  (is (= (ps/status-field STATUS "Threads") 12)))
+
+(deftest status-missing-is-minus-one
+  (is (= (ps/status-field STATUS "VmSwap") -1))
+  (is (= (ps/status-field "" "VmRSS") -1)))
+
+(deftest status-name-is-not-a-prefix-match
+  ;; "VmRSS" は "VmRSSx" や他の行の途中には当たらない
+  (is (= (ps/status-field "XVmRSS:\t5 kB\nVmRSS:\t6 kB\n" "VmRSS") (* 6 1024))))
+
+;; /proc/<pid>/stat: pid (comm) state ppid ... 14 番目が utime、15 番目が stime、22 番目が starttime。
+;; comm には空白や ")" が入りうるので、最後の ")" の後ろから数える
+(def STAT "42 (my (weird) cmd) S 1 42 42 0 -1 4194560 100 0 0 0 250 50 0 0 20 0 3 0 9000 1000 100 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n")
+
+(deftest stat-times
+  (let [[u s st] (ps/stat-times STAT)]
+    (is (= u 250))
+    (is (= s 50))
+    (is (= st 9000))))
+
+(deftest stat-times-garbage
+  (let [[u s st] (ps/stat-times "garbage")]
+    (is (= u 0))
+    (is (= s 0))
+    (is (= st 0))))
+
+;; /proc/stat の cpu 行: user nice system idle iowait irq softirq steal ..
+(deftest cpu-ticks
+  (let [[busy total] (ps/cpu-ticks "cpu  100 10 50 800 20 5 15 0 0 0\ncpu0 1 1 1 1 1 1 1 0 0 0\n")]
+    (is (= busy 180))        ; user + nice + system + irq + softirq + steal
+    (is (= total 1000))))    ; busy + idle + iowait
+
+(deftest meminfo
+  (is (= (ps/status-field "MemTotal:       16000000 kB\nMemFree:         4000000 kB\n" "MemFree") (* 4000000 1024))))
+
+(deftest loadavg-first-field
+  (is (= (ps/loadavg-1 "0.52 0.40 0.30 1/200 12345\n") 0.52))
+  (is (= (ps/loadavg-1 "") -1.0)))
+
+(deftest live-self
+  (is (> (ps/self-rss) 0))
+  (is (> (ps/self-threads) 0))
+  (is (> (ps/self-cpu-ns) -1))
+  (is (>= (ps/uptime-ms) 0))
+  (is (> (ps/start-ms) 1000000000000))
+  (is (> (ps/ncpu) 0)))
+
+;; /proc/<pid>/task/<tid>/stat の状態 (comm の後の 1 文字)。comm に空白と ")" があってもよい
+(deftest stat-state
+  (is (= (ps/stat-state "1234 (mulay) R 1 2 3") "R"))
+  (is (= (ps/stat-state "1234 (a b) c)) S 1 2 3") "S"))
+  (is (= (ps/stat-state "garbage") "")))
+
+;; このプロセスのスレッドの状態: [main の状態、他のスレッドの状態..]。少なくとも main は読める
+(deftest live-tasks
+  (let [ts (ps/self-task-states)]
+    (is (> (count ts) 0))
+    (is (not= (nth ts 0) ""))))

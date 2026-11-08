@@ -1,0 +1,411 @@
+%%% note
+mulet samples/http-test。HTTP listener (allowedMethods、uriParams、queryParams、headers、
+http:response の statusCode と headers) と http:request (同じ Mule 内の別 listener を呼ぶ。
+GET/POST/PUT/DELETE、query-params、headers、outputMimeType、応答の既定の検証
+= 4xx/5xx でエラー HTTP:NOT_FOUND など、try + on-error-continue) と scatter-gather。
+now() と相関 ID は mask で伏せる。
+%%% port 18102
+%%% mask
+"timestamp": "([^"]*)"
+"x-correlation-id": "([^"]*)"
+%%% note
+--- target 側 (直接叩く)
+%%% request GET /target/json
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "message": "hello",
+  "timestamp": "***",
+  "method": "GET"
+}
+%%% request POST /target/json
+%%% response 405
+content-type: text/plain
+
+Method not allowed for endpoint: /target/json
+%%% request GET /target/json/extra
+%%% response 404
+content-type: text/plain
+
+No listener for endpoint: /target/json/extra
+%%% request POST /target/echo?a=1&a=2&b=x%20y
+Content-Type: application/json
+
+{"name": "mule", "n": [1, 2.50, true, null]}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": {
+    "name": "mule",
+    "n": [
+      1,
+      2.5,
+      true,
+      null
+    ]
+  },
+  "headers": {
+    "host": "localhost:18102",
+    "content-type": "application/json",
+    "content-length": "44"
+  },
+  "method": "POST",
+  "queryParams": {
+    "a": "1",
+    "a": "2",
+    "b": "x y"
+  }
+}
+%%% request GET /target/echo
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": "",
+  "headers": {
+    "host": "localhost:18102"
+  },
+  "method": "GET",
+  "queryParams": {
+    
+  }
+}
+%%% request PUT /target/echo
+Content-Type: text/plain
+
+plain text body
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": "plain text body",
+  "headers": {
+    "host": "localhost:18102",
+    "content-type": "text/plain",
+    "content-length": "15"
+  },
+  "method": "PUT",
+  "queryParams": {
+    
+  }
+}
+%%% request POST /target/echo
+Content-Type: application/x-www-form-urlencoded
+
+a=1&b=hello+world&c=%E3%81%82
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": {
+    "a": "1",
+    "b": "hello world",
+    "c": "あ"
+  },
+  "headers": {
+    "host": "localhost:18102",
+    "content-type": "application/x-www-form-urlencoded",
+    "content-length": "29"
+  },
+  "method": "POST",
+  "queryParams": {
+    
+  }
+}
+%%% request POST /target/echo
+Content-Type: application/xml
+
+<root><a x="1">t</a></root>
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": {
+    "root": {
+      "a": "t"
+    }
+  },
+  "headers": {
+    "host": "localhost:18102",
+    "content-type": "application/xml",
+    "content-length": "27"
+  },
+  "method": "POST",
+  "queryParams": {
+    
+  }
+}
+%%% request POST /target/echo
+Content-Type: application/json
+
+{"broken": 
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+"Unexpected end-of-input at payload@[1:12] (line:column), expected false or true or null or {...} or [...] or number but was , while reading `payload` as Json.
+ 
+1| {"broken": 
+              ^" evaluating expression: "%dw 2.0
+output application/json
+---
+{
+    body: payload,
+    headers: attributes.headers,
+    method: attributes.method,
+    queryParams: attributes.queryParams
+}".
+%%% request PATCH /target/echo
+Content-Type: application/json
+
+{}
+%%% response 405
+content-type: text/plain
+
+Method not allowed for endpoint: /target/echo
+%%% request GET /target/xml
+%%% response 200
+content-type: application/xml
+
+<root><item id="1">Alpha</item><item id="2">Beta</item></root>
+%%% request PUT /target/status/201 headers=*
+%%% response 201
+content-type: application/json
+
+{
+  "status": "201",
+  "message": "Response with status 201"
+}
+%%% request GET /target/status/404
+%%% response 404
+content-type: application/json
+
+{
+  "status": "404",
+  "message": "Response with status 404"
+}
+%%% request GET /target/status/500
+%%% response 500
+content-type: application/json
+
+{
+  "status": "500",
+  "message": "Response with status 500"
+}
+%%% request GET /target/status/abc
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+"Unable to convert 'abc' with class 'java.lang.String' to class 'Integer', while writing Java at uriParams.code." evaluating expression: "attributes.uriParams.code".
+%%% request GET /target/slow log
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "delayed": true
+}
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: Starting slow response processing...
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: Still processing...
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: Almost done...
+%%% request GET /target/headers
+X-Custom: one
+X-Multi: first
+X-Multi: second
+Accept: application/json
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "host": "localhost:18102",
+  "x-custom": "one",
+  "x-multi": "first",
+  "x-multi": "second",
+  "accept": "application/json"
+}
+%%% note
+--- http:request を経由する側
+%%% request GET /test/get
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "message": "hello",
+  "timestamp": "***",
+  "method": "GET"
+}
+%%% request POST /test/post
+Content-Type: application/json
+
+{"k": "v"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": {
+    "k": "v"
+  },
+  "headers": {
+    "host": "localhost:18102",
+    "user-agent": "Mule HTTP Client",
+    "x-correlation-id": "***",
+    "content-type": "application/json; charset=UTF-8",
+    "content-length": "10",
+    "accept": "*/*",
+    "connection": "keep-alive"
+  },
+  "method": "POST",
+  "queryParams": {
+    
+  }
+}
+%%% request POST /test/post
+Content-Type: text/plain
+
+raw text
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": "raw text",
+  "headers": {
+    "host": "localhost:18102",
+    "user-agent": "Mule HTTP Client",
+    "x-correlation-id": "***",
+    "content-type": "text/plain; charset=UTF-8",
+    "content-length": "8",
+    "accept": "*/*",
+    "connection": "keep-alive"
+  },
+  "method": "POST",
+  "queryParams": {
+    
+  }
+}
+%%% request GET /test/query-params
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": "",
+  "headers": {
+    "host": "localhost:18102",
+    "user-agent": "Mule HTTP Client",
+    "x-correlation-id": "***",
+    "accept": "*/*",
+    "connection": "keep-alive"
+  },
+  "method": "GET",
+  "queryParams": {
+    "foo": "bar",
+    "baz": "123"
+  }
+}
+%%% request GET /test/custom-headers
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "host": "localhost:18102",
+  "user-agent": "Mule HTTP Client",
+  "x-custom-one": "value-one",
+  "x-custom-two": "value-two",
+  "x-correlation-id": "***",
+  "accept": "*/*",
+  "connection": "keep-alive"
+}
+%%% request PUT /test/put
+Content-Type: application/json
+
+[1, 2, 3]
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": [
+    1,
+    2,
+    3
+  ],
+  "headers": {
+    "host": "localhost:18102",
+    "user-agent": "Mule HTTP Client",
+    "x-correlation-id": "***",
+    "content-type": "application/json; charset=UTF-8",
+    "content-length": "9",
+    "accept": "*/*",
+    "connection": "keep-alive"
+  },
+  "method": "PUT",
+  "queryParams": {
+    
+  }
+}
+%%% request DELETE /test/delete
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "body": "",
+  "headers": {
+    "host": "localhost:18102",
+    "user-agent": "Mule HTTP Client",
+    "x-correlation-id": "***",
+    "accept": "*/*",
+    "content-length": "0",
+    "connection": "keep-alive"
+  },
+  "method": "DELETE",
+  "queryParams": {
+    
+  }
+}
+%%% request GET /test/parse-json
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "original": {
+    "message": "hello",
+    "timestamp": "***",
+    "method": "GET"
+  },
+  "extracted": "hello"
+}
+%%% request GET /test/parse-xml
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "root": {
+    "item": "Alpha",
+    "item": "Beta"
+  },
+  "firstItem": "A",
+  "secondItem": "l"
+}
+%%% request GET /test/status-codes
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Error(s) were found for route(s):
+	Route 2: org.mule.runtime.core.api.expression.ExpressionRuntimeException: "Unable to parse empty input, while reading `payload` as Json.
+ 
+1| 
+   ^" evaluating expression: "%dw 2.0
+output application/json
+---
+{
+    status: attributes.statusCode,
+    body: payload
+}".
+%%% request GET /test/error-handling
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": true,
+  "status": 404,
+  "description": "HTTP GET on resource 'http://localhost:18102/target/status/404' failed: not found (404)."
+}

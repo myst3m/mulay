@@ -1,0 +1,146 @@
+(ns fnargs-test (:require [mulay.dw.engine :as eng] [mulay.dw.val :as v] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.ast :as ast]
+                              [mulay.dw.fmt.registry :as reg]))
+
+;; 組み込み関数のどのオーバーロードにも当てはまらないときの文言 (UnexpectedFunctionCallTypesException)。
+;; 期待値は実 DW 2.11.2 (tools/dw-oracle) の結果。値は定数だと静的な型検査で先に落ちるので payload から渡す。
+
+(defn- run Str [expr: Str payload: Str]
+  (let [fs: Vec(v/Field) []
+        ins [(eng/->Input "payload" "application/json" fs payload)]
+        [mime out err] (eng/run-text (str "%dw 2.0\noutput application/json\n---\n" expr) ins)]
+    (if (= err "") out err)))
+
+(defn- as Str [n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out "a")))))
+
+(def COMBOS-PLUS (str "But it expects one of these combinations:\n"
+                      "  (Array, Array)\n  (Date, Time)\n  (Date, LocalTime)\n  (Date, TimeZone)\n  (LocalDateTime, TimeZone)\n"
+                      "  (LocalTime, Date)\n  (LocalTime, TimeZone)\n  (Object, Object)\n  (String, String)\n  (Time, Date)\n"
+                      "  (TimeZone, LocalDateTime)\n  (TimeZone, Date)\n  (TimeZone, LocalTime)"))
+
+(deftest object-value-one-line
+  (is (= (run "payload.o mod 2" "{\"o\": {\"a\": 1, \"b\": [1, 2], \"c\": \"x\"}}")
+         (str "You called the function 'mod' with these arguments: \n  1: Object ({a: 1,b: [1, 2],c: \"x\"})\n  2: Number (2)\n\n"
+              "But it expects arguments of these types:\n  1: Number\n  2: Number\n"))))
+
+(deftest long-value-abbreviated
+  (is (= (run "payload.s mod 2" (str "{\"s\": \"" (as 96) "\"}"))
+         (str "You called the function 'mod' with these arguments: \n  1: String (\"" (as 76) "...)\n  2: Number (2)\n\n"
+              "But it expects arguments of these types:\n  1: Number\n  2: Number\n"))))
+
+(deftest null-overloads-left-out
+  (is (= (run "upper(payload.a)" "{\"a\": [1]}")
+         "You called the function 'upper' with these arguments: \n  1: Array ([1])\n\nBut it expects arguments of these types:\n  1: String\n")))
+
+;; 組み合わせは引数の型との食い違いの重みで並べ、最初の引数の型の名前で (安定に) 並べ直したもの
+(deftest combinations-ordered
+  (is (= (run "payload.a ++ payload.n" "{\"a\": [1, {\"x\": \"y\"}], \"n\": 3}")
+         (str "You called the function '++' with these arguments: \n  1: Array ([1, {x: \"y\"}])\n  2: Number (3)\n\n" COMBOS-PLUS)))
+  (is (= (run "payload.s ++ payload.n" "{\"s\": \"X\", \"n\": null}")
+         (str "You called the function '++' with these arguments: \n  1: String (\"X\")\n  2: Null (null)\n\n" COMBOS-PLUS))))
+
+;; 失敗の位置 (抜粋の ^ と Trace の列)。名前で呼ぶ呼び出しと ++ -- は名前・演算子、算術の演算子は式全体 (実 DW)
+(def HEAD "%dw 2.0\noutput application/json\n---\n")
+
+(defn- err-span Str [expr: Str payload: Str]
+  (let [fs: Vec(v/Field) []
+        script (str HEAD expr)
+        c (eng/compile script ["payload"])
+        [x re] (reg/read-named "application/json" fs payload "payload")
+        [y e] (eng/eval-compiled c [x])
+        sp (:sp e)]
+    (subs script (:start sp) (:end sp))))
+
+(deftest error-location
+  (is (= (err-span "payload.s[0] ++ payload.o" "{\"s\": \"x\", \"o\": {}}") "++"))
+  (is (= (err-span "payload.o -- payload.s" "{\"s\": \"x\", \"o\": 1}") "--"))
+  (is (= (err-span "upper(payload.a)" "{\"a\": [1]}") "upper"))
+  (is (= (err-span "payload.o mod 2" "{\"o\": {}}") "mod"))
+  (is (= (err-span "payload.o to payload.a" "{\"o\": {}, \"a\": []}") "to"))
+  (is (= (err-span "do { var f = upper --- f(payload.a) }" "{\"a\": [1]}") "f"))
+  (is (= (err-span "payload.o + payload.a" "{\"o\": {}, \"a\": []}") "payload.o + payload.a")))
+
+;; --- ユーザーの関数 (fun、var に置いたラムダ) を直接呼ぶときの引数の型 ---------------------------------
+;; 実 DW は、型が合わなければ as と同じ変換を試し、できなければ組み込み関数と同じ文言で失敗する。
+;; 組み込み関数から呼ばれる関数値 (map のラムダなど) は検査も変換もしない。
+
+(def PL "{\"a\": [1], \"s\": \"x\", \"o\": {\"k\": 1}, \"n\": 1, \"z\": null, \"t\": true, \"num\": \"12\", \"ao\": [{\"a\": 1}]}")
+
+(defn- runh Str [header: Str expr: Str]
+  (let [fs: Vec(v/Field) []
+        ins [(eng/->Input "payload" "application/json" fs PL)]
+        [mime out err] (eng/run-text (str "%dw 2.0\noutput application/json indent=false\n" header "\n---\n" expr) ins)]
+    (if (= err "") out err)))
+
+(defn- called Str [name: Str args: Str] (str "You called the function '" name "' with these arguments: \n" args "\n\n"))
+
+(deftest user-fn-type-mismatch
+  (is (= (runh "fun f(a: String) = a" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: String\n")))
+  (is (= (runh "fun f(a: String) = a" "f(payload.z)")
+         (str (called "f" "  1: Null (null)") "But it expects arguments of these types:\n  1: String\n")))
+  (is (= (runh "fun f(a: String, b: Number = 1) = a" "f(payload.s, payload.o)")
+         (str (called "f" "  1: String (\"x\")\n  2: Object ({k: 1})") "But it expects arguments of these types:\n  1: String\n  2: Number\n"))))
+
+(deftest user-fn-coerces
+  (is (= (runh "fun f(a: String) = a" "f(payload.n)") "\"1\""))
+  (is (= (runh "fun f(a: Number) = a + 1" "f(payload.num)") "13"))
+  (is (= (runh "fun f(a: Number | Boolean) = a" "f(payload.num)") "12"))
+  (is (= (runh "fun f(a: Date) = typeOf(a)" "f(\"2020-01-02\" as String)") "\"Date\"")))
+
+(deftest user-fn-type-display
+  (is (= (runh "fun f(a: String | Number) = a" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: String | Number\n")))
+  (is (= (runh "fun f(a: {k: String}) = a" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: {(k: String)}\n")))
+  (is (= (runh "fun f(a: {| k: Number, j?: String |}) = a" "f(payload.a)")
+         (str (called "f" "  1: Array ([1])") "But it expects arguments of these types:\n  1: {|(k: Number), (j: String)|}\n")))
+  (is (= (runh "type T = String\nfun f(a: T) = a" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: T\n")))
+  (is (= (runh "fun f(a: \"x\" | \"y\") = a" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: String | String\n")))
+  (is (= (runh "fun f(a: \"x\") = a" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: \"x\"\n")))
+  (is (= (runh "fun f(a: Array<String>) = a" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: Array\n")))
+  (is (= (runh "fun f(a: String & Number) = a" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: String & Number\n"))))
+
+(deftest user-fn-overloads
+  (is (= (runh "fun f(a: String) = 1\nfun f(a: Number) = 2" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects one of these combinations:\n  (Number)\n  (String)")))
+  (is (= (runh "fun f(a: String) = 1\nfun f(a: Null) = 2" "f(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: String\n")))
+  (is (= (runh "fun f(a: Array<Number>, b: Object) = 1\nfun f(a: String, b: Number) = 2\nfun f(a: Number, b: String) = 3" "f(payload.o, payload.o)")
+         (str (called "f" "  1: Object ({k: 1})\n  2: Object ({k: 1})") "But it expects one of these combinations:\n  (Array, Object)\n  (Number, String)\n  (String, Number)")))
+  (is (= (runh "fun f(a: String) = 1\nfun f(a: Number) = 2\nfun f(a: Boolean) = 3" "f(payload.num)") "1"))
+  (is (= (runh "fun f(a: Number, b: Number) = 1\nfun f(a: String, b: String) = 2" "f(payload.t, payload.n)") "2"))
+  (is (= (runh "fun f(a: Number) = 1\nfun f(a: String) = 2" "f(payload.t)") "2")))
+
+(deftest user-fn-names
+  (is (= (runh "var g = (a: String) -> a" "g(payload.o)")
+         (str (called "g" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: String\n")))
+  (is (= (runh "fun f(a: String) = a\nvar h = f" "h(payload.o)")
+         (str (called "f" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: String\n")))
+  (is (= (runh "" "((a: String) -> a)(payload.o)")
+         (str (called "AnonymousFunction" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: String\n")))
+  (is (= (runh "" "do { var g = (a: String) -> a --- g(payload.o) }")
+         (str (called "g" "  1: Object ({k: 1})") "But it expects arguments of these types:\n  1: String\n"))))
+
+;; 組み込み関数から呼ばれるラムダは検査も変換もしない
+(deftest lambda-from-builtin-unchecked
+  (is (= (runh "" "payload.a map (x: String) -> x") "[1]"))
+  (is (= (runh "" "payload.ao map (x: String) -> x") "[{\"a\": 1}]")))
+
+;; var に置いたラムダの中の失敗は、その名前の枠を持つ (実 DW: "at g (line: 3, column: 18)")
+(defn- frame-names Str [header: Str expr: Str]
+  (let [fs: Vec(v/Field) []
+        c (eng/compile (str HEAD0 header "\n---\n" expr) ["payload"])
+        [x re] (reg/read-named "application/json" fs PL "payload")
+        [y e] (eng/eval-compiled c [x])
+        st (dwe/stack-of e)]
+    (loop [i 0 out ""] (if (>= i (count st)) out (recur (+ i 1) (str out (if (> i 0) " " "") (:name (nth st i))))))))
+
+(def HEAD0 "%dw 2.0\noutput application/json\n")
+
+(deftest var-lambda-frame
+  (is (= (frame-names "var g = (a) -> a ++ payload.n" "g(payload.o)") "g main")))

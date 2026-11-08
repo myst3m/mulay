@@ -1,0 +1,51 @@
+(ns lint-test (:require [mulay.mule.lint :as lint] [clay.string :as str]))
+
+;; mulay が通して実 Mule が落とす書き方の警告 (mulay validate が出す)。
+
+(def HEAD "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\">\n<flow name=\"f\">\n")
+
+(defn- doc Str [body: &Str] (str HEAD body "\n</flow></mule>"))
+
+;; スキーマの順は body、headers、uri-params、query-params、response-validator。
+(deftest http-request-children-in-schema-order
+  (let [w (lint/check "a.xml" (doc "<http:request method=\"GET\" url=\"x\"><http:body>#[payload]</http:body><http:headers>#[{}]</http:headers></http:request>"))]
+    (is (= (count w) 0))))
+
+(deftest http-request-headers-before-body
+  (let [w (lint/check "a.xml" (doc "<http:request method=\"POST\" url=\"x\">\n<http:headers>#[{}]</http:headers>\n<http:body>#[payload]</http:body></http:request>"))]
+    (is (= (count w) 1))
+    (is (str/starts-with? (nth w 0) "a.xml:5: <http:request>: <http:body> must come before <http:headers>"))))
+
+(deftest http-request-query-before-uri
+  (let [w (lint/check "a.xml" (doc "<http:request url=\"x\"><http:query-params>#[{}]</http:query-params><http:uri-params>#[{}]</http:uri-params></http:request>"))]
+    (is (= (count w) 1))
+    (is (str/includes? (nth w 0) "<http:uri-params> must come before <http:query-params>"))))
+
+(deftest malformed-xml-is-not-lint-business
+  (is (= (count (lint/check "a.xml" "<mule")) 0)))
+
+;; 実コネクタの XSD にあって mulay が読まない属性 (mule/ignored の表)。書かれていれば、無視すると警告する。
+(def DBHEAD "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:db=\"http://www.mulesoft.org/schema/mule/db\" xmlns:foo=\"urn:other\">\n<flow name=\"f\">\n")
+
+(defn- dbdoc Str [body: &Str] (str DBHEAD body "\n</flow></mule>"))
+
+(deftest ignored-attribute-is-warned
+  (let [w (lint/check "a.xml" (dbdoc "<db:select config-ref=\"C\" useColumnNumbers=\"true\">\n<db:sql>select 1</db:sql></db:select>"))]
+    (is (= (count w) 1))
+    (is (= (nth w 0) "a.xml:3: <db:select>: attribute 'useColumnNumbers' is not supported and is ignored (docs/connectors.md)"))))
+
+(deftest every-ignored-attribute-is-reported
+  (let [w (lint/check "a.xml" (dbdoc "<db:select config-ref=\"C\" useColumnNumbers=\"true\" transactionIsolation=\"SERIALIZABLE\"><db:sql>select 1</db:sql></db:select>"))]
+    (is (= (count w) 2))))
+
+(deftest supported-attributes-are-not-warned
+  (let [w (lint/check "a.xml" (dbdoc "<db:select config-ref=\"C\" maxRows=\"5\" fetchSize=\"10\" queryTimeout=\"5\" queryTimeoutUnit=\"SECONDS\" target=\"t\"><db:sql>select 1</db:sql></db:select>"))]
+    (is (= (count w) 0))))
+
+(deftest same-name-in-another-namespace-is-not-warned
+  (let [w (lint/check "a.xml" (dbdoc "<foo:select useColumnNumbers=\"true\"/>"))]
+    (is (= (count w) 0))))
+
+(deftest prefixed-attributes-are-not-warned
+  (let [w (lint/check "a.xml" (dbdoc "<db:select config-ref=\"C\" foo:useColumnNumbers=\"true\"><db:sql>select 1</db:sql></db:select>"))]
+    (is (= (count w) 0))))

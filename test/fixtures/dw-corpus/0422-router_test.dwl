@@ -1,0 +1,1 @@
+sizeOf(payload.items) > 0

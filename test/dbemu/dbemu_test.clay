@@ -1,0 +1,99 @@
+(ns dbemu-test (:require [mulay.db.emu :as emu] [mulay.db.sql :as sql] [clay.string :as str]))
+
+(defn- cell Str [c: &sql/Cell]
+  (match c
+    (sql/CNull) "null" (sql/CInt i) (str "Int:" i) (sql/CLong i) (str "Long:" i) (sql/CDouble f) (str "Double:" f)
+    (sql/CFloat s) (str "Float:" s) (sql/CDecimal s) (str "Dec:" s) (sql/CStr s) (str "Str:" s) (sql/CBytes b) (str "Bytes:" (count b))
+    (sql/CBool b) (str "Bool:" b) (sql/CDate s) (str "Date:" s) (sql/CTimestamp s) (str "Ts:" s) (sql/CBigInt s) (str "BigInt:" s)
+    (sql/CLdt s) (str "Ldt:" s) (sql/CTime s) (str "Time:" s) (sql/CZoned s) (str "Zoned:" s) (sql/CDatum c b z) (str "Datum:" c ":" (count b))
+    (sql/CClob s) (str "Clob:" s)))
+
+(defn- rows Str [r: &sql/Rows]
+  (str (str/join "," (:cols r)) " | "
+       (str/join " / " (mapv (fn Str [row: Vec(sql/Cell)] (str/join "," (mapv (fn Str [c: sql/Cell] (cell c)) row))) (:rows r)))))
+
+(defn- q Str [e: &emu/Emu text: Str ps: Vec(sql/Cell)]
+  (let [[o er] (emu/run e text ps false)]
+    (if (sql/ok? er) (if (> (count (:cols (:rows o))) 0) (rows (:rows o)) (str "count " (:count o)))
+      (str "ERR " (:state er) " " (:code er) " " (:exc er) " " (:msg er)))))
+
+(def ORA-SEED (str "CREATE TABLE customers (id NUMBER(10) PRIMARY KEY, name VARCHAR2(50) NOT NULL, note VARCHAR2(20), created DATE, ts TIMESTAMP, amount NUMBER(10,2));\n"
+                   "-- seed\n"
+                   "INSERT INTO customers VALUES (1, 'Acme; Inc', '', TO_DATE_X, NULL, 12.50);\n"))
+
+(deftest oracle
+  (let [[e er] (emu/open "oracle" "MULAY" (str/replace ORA-SEED "TO_DATE_X" "'2024-01-02 03:04:05'"))]
+    (is (sql/ok? er))
+    (is (= (q e "select id, name, note, created, amount from customers" [])
+           "ID,NAME,NOTE,CREATED,AMOUNT | Dec:1,Str:Acme; Inc,null,Ts:2024-01-02T03:04:05,Dec:12.5"))
+    (is (= (q e "SELECT count(*), NVL(note, 'none') AS \"Note\" FROM customers WHERE name = :1" [(sql/->CStr "Acme; Inc")])
+           "COUNT(*),Note | Dec:1,Str:none"))
+    (is (= (q e "select 1 + 1 as two from dual" []) "TWO | Dec:2"))
+    (is (= (q e "insert into customers (id, name, ts) values (2, 'B', '2024-05-06 07:08:09.5')" []) "count 1"))
+    (is (= (q e "select ts from customers where id = 2" []) "TS | Datum:oracle.sql.TIMESTAMP:11"))
+    (is (= (q e "insert into customers (id, name) values (1, 'dup')" [])
+           "ERR 23000 1 java.sql.SQLIntegrityConstraintViolationException ORA-00001: unique constraint (MULAY.SYS_C0000001) violated on table MULAY.CUSTOMERS columns (ID)\n\nhttps://docs.oracle.com/error-help/db/ora-00001/"))
+    (is (= (q e "insert into customers (id, name) values (3, '')" [])
+           "ERR 23000 1400 java.sql.SQLIntegrityConstraintViolationException ORA-01400: cannot insert NULL into (\"MULAY\".\"CUSTOMERS\".\"NAME\")\n\nhttps://docs.oracle.com/error-help/db/ora-01400/"))
+    (is (= (q e "select * from nope" []) "ERR 42000 942 java.sql.SQLSyntaxErrorException ORA-00942: table or view \"MULAY\".\"NOPE\" does not exist\n\nhttps://docs.oracle.com/error-help/db/ora-00942/"))
+    (is (str/starts-with? (q e "select to_char(created, 'YYYY') from customers" []) "ERR EMU01 0 "))))
+
+(def PG-SEED "CREATE TABLE orders (id SERIAL PRIMARY KEY, item TEXT NOT NULL UNIQUE, qty INTEGER, big BIGINT, price NUMERIC(8,2), paid BOOLEAN, day DATE, at TIMESTAMPTZ);")
+
+(deftest postgres
+  (let [[e er] (emu/open "postgresql" "public" PG-SEED)]
+    (is (sql/ok? er))
+    (is (= (q e "insert into orders (item, qty, big, price, paid, day, at) values ($1, 2, 9000000000, 3.5, true, '2024-01-02', '2024-01-02 03:04:05') returning id" [(sql/->CStr "pen")])
+           "id | Int:1"))
+    (is (= (q e "select item, qty, big, price, paid, day, at from orders where item ILIKE 'PEN'" [])
+           "item,qty,big,price,paid,day,at | Str:pen,Int:2,Long:9000000000,Dec:3.5,Bool:true,Date:2024-01-02,Ts:2024-01-02T03:04:05"))
+    (is (= (q e "SELECT count(*), qty::text AS \"Qty\", sum(qty) + 1 FROM orders GROUP BY qty" []) "count,Qty,?column? | Long:1,Str:2,Long:3"))
+    (is (= (q e "insert into orders (item) values ('pen')" [])
+           "ERR 23505 0 org.postgresql.util.PSQLException ERROR: duplicate key value violates unique constraint \"orders_item_key\"\n  Detail: Key (item)=(pen) already exists."))
+    (is (= (q e "select * from nope" []) "ERR 42P01 0 org.postgresql.util.PSQLException ERROR: relation \"nope\" does not exist\n  Position: 15"))))
+
+(def MY-SEED "CREATE TABLE `items` (`id` INT AUTO_INCREMENT PRIMARY KEY, `name` VARCHAR(20) NOT NULL UNIQUE, `active` TINYINT(1), `n` BIGINT, `at` DATETIME, `stamp` TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\nINSERT INTO items (name, active, n, at) VALUES ('a', 1, 5, '2024-01-02 03:04:05'), ('b', 0, 6, NULL);")
+
+(deftest mysql
+  (let [[e er] (emu/open "mysql" "shop" MY-SEED)]
+    (is (sql/ok? er))
+    (is (= (q e "SELECT `id`, Name, active, n, at FROM items ORDER BY id LIMIT 1, 1" []) "id,Name,active,n,at | Int:2,Str:b,Bool:false,Long:6,null"))
+    (is (= (q e "select at, count(*) from items where id = ? group by at" [(sql/->CInt 1)]) "at,count(*) | Ldt:2024-01-02T03:04:05,Long:1"))
+    (is (= (q e "insert into items (name) values ('a')" [])
+           "ERR 23000 1062 java.sql.SQLIntegrityConstraintViolationException Duplicate entry 'a' for key 'items.name'"))
+    (is (= (q e "select * from nope" []) "ERR 42S02 1146 java.sql.SQLSyntaxErrorException Table 'shop.nope' doesn't exist"))))
+
+(deftest unsupported-statements-are-not-app-errors
+  (let [[e er] (emu/open "oracle" "MULAY" "")
+        [e2 er2] (emu/open "oracle" "MULAY" "CREATE TABLE t (")]
+    (is (sql/ok? er))
+    (is (str/starts-with? (q e "BEGIN do_it(:1); END;" [(sql/->CInt 1)]) "ERR EMU01 0 "))
+    (is (not (sql/ok? er2)))
+    (is (= (:state er2) "EMU01"))))
+
+(deftest postgres-update-and-delete-returning
+  (let [[e er] (emu/open "postgresql" "public" "CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT, qty INTEGER); INSERT INTO t (name, qty) VALUES ('a', 1), ('b', 2), ('c', 3);")]
+    (is (= (q e "update t set qty = qty + $1 where id >= $2 returning id, qty" [(sql/->CInt 10) (sql/->CInt 2)]) "id,qty | Int:2,Int:12 / Int:3,Int:13"))
+    (is (= (q e "delete from t where name = $1 returning *" [(sql/->CStr "a")]) "id,name,qty | Int:1,Str:a,Int:1"))
+    (is (= (q e "select count(*) from t" []) "count | Long:2"))))
+
+(defn- chk Str [e: &emu/Emu text: Str] (let [[k t c] (emu/check e text)] (str k "|" t "|" c)))
+
+(deftest check-finds-unknown-tables-and-columns
+  (let [[e er] (emu/open "oracle" "SHOP" "CREATE TABLE customers (id NUMBER(10), name VARCHAR2(50) NOT NULL);")]
+    (is (= (chk e "SELECT id, name FROM customers WHERE id = :id") "||"))
+    (is (= (chk e "SELECT tierr FROM customers WHERE id = :id") "column||tierr"))
+    (is (= (chk e "SELECT c.tierr FROM customers c") "column|c|tierr"))
+    (is (= (chk e "SELECT name FROM nope") "table|nope|"))
+    (is (= (chk e "INSERT INTO customers (id, tierr) VALUES (:id, :t)") "column|customers|tierr"))
+    (is (= (chk e "UPDATE customers SET name = :n WHERE zzz = 1") "column||zzz"))
+    (is (= (chk e "INSERT INTO customers (id, name) VALUES (1, NULL)") "||"))
+    (is (= (chk e "SELECT count(*) FROM customers") "||"))))
+
+(deftest insert-unknown-column-errors-like-the-driver
+  (let [[o oe] (emu/open "oracle" "SHOP" "CREATE TABLE customers (id NUMBER(10), name VARCHAR2(50));")
+        [p pe] (emu/open "postgresql" "public" "CREATE TABLE customers (id INTEGER, name TEXT);")
+        [m me] (emu/open "mysql" "shop" "CREATE TABLE customers (id INT, name VARCHAR(50));")]
+    (is (= (q o "INSERT INTO customers (id, tierr) VALUES (1, 2)" []) "ERR 42000 904 java.sql.SQLSyntaxErrorException ORA-00904: \"TIERR\": invalid identifier\n\nhttps://docs.oracle.com/error-help/db/ora-00904/"))
+    (is (= (q p "insert into customers (id, tierr) values (1, 2)" []) "ERR 42703 0 org.postgresql.util.PSQLException ERROR: column \"tierr\" of relation \"customers\" does not exist\n  Position: 28"))
+    (is (= (q m "insert into customers (id, tierr) values (1, 2)" []) "ERR 42S22 1054 java.sql.SQLSyntaxErrorException Unknown column 'tierr' in 'field list'"))))

@@ -1,0 +1,352 @@
+(ns mulay.conn.sf_pubsub
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as drt] [mulay.mule.model :as m] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.rt.event :as ev] [mulay.rt.ostore :as st] [mulay.lib.xml :as xml]
+            [mulay.lib.jhash :as jh] [mulay.dw.coerce_time :as ct] [mulay.lib.avro :as av] [mulay.conn.sf_core :as sc] [mulay.conn.grpc :as grpc]
+            [mulay.conn.sf_pubsub_wire :as w] [mulay.conn.sf_pubsub_avro :as pa]
+            [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/salesforce-pub-sub")
+(def EVENT-CLASS "com.mulesoft.connector.salesforce.pubsub.api.EventDTO")
+(def SERVICE "eventbus.v1.PubSub")
+(def ENCODE-ERROR "An exception has occurred during event encoding.")
+(def MAX-BATCH 100)
+
+(def ERROR-PARENTS
+  ["SALESFORCE-PUB-SUB:CONNECTIVITY" "MULE:CONNECTIVITY"
+   "SALESFORCE-PUB-SUB:INVALID_INPUT" "MULE:VALIDATION"
+   "SALESFORCE-PUB-SUB:SECURITY" "MULE:SECURITY"
+   "SALESFORCE-PUB-SUB:SERVER_ERROR" "MULE:CRITICAL"
+   "SALESFORCE-PUB-SUB:FAULTY_RESPONSE" "MULE:ANY"
+   "SALESFORCE-PUB-SUB:NOT_FOUND" "MULE:CONNECTIVITY"
+   "SALESFORCE-PUB-SUB:TIMEOUT" "MULE:CONNECTIVITY"
+   "SALESFORCE-PUB-SUB:LIMIT_EXCEEDED" "MULE:ANY"
+   "SALESFORCE-PUB-SUB:MUTUAL_AUTHENTICATION_FAILED" "MULE:CONNECTIVITY"
+   "SALESFORCE-PUB-SUB:RETRY_EXHAUSTED" "MULE:RETRY_EXHAUSTED"])
+
+(defn- pserr err/MErr [id: Str desc: Str] (err/mk "SALESFORCE-PUB-SUB" id desc))
+
+(defn status-type Str [code: Int]
+  (cond (or (= code 10) (= code 1)) "FAULTY_RESPONSE"
+        (or (= code 15) (= code 13) (= code 12) (= code 2)) "SERVER_ERROR"
+        (or (= code 14) (= code 16) (= code 8)) "CONNECTIVITY"
+        (or (= code 9) (= code 3) (= code 6) (= code 11)) "INVALID_INPUT"
+        (= code 5) "NOT_FOUND"
+        (= code 7) "SECURITY"
+        (= code 4) "TIMEOUT"
+        :else "CONNECTIVITY"))
+
+(defrecord Grpc [host: Str port: Int timeout-ms: Int])
+
+(defn- conn-elem Vec(xml/XNode) [cfg: &m/Config]
+  (let [cs (:children cfg)]
+    (loop [i 0] (if (>= i (count cs)) []
+                  (let [c (nth cs i)] (if (and (xml/elem? c) (str/ends-with? (xml/elem-local c) "-connection")) [c] (recur (+ i 1))))))))
+
+(defn- unit-ms Int [n: Int unit: &Str]
+  (let [u (str/upper-case unit)]
+    (cond (= u "MILLISECONDS") n (= u "MICROSECONDS") (quot n 1000) (= u "NANOSECONDS") (quot n 1000000)
+          (= u "MINUTES") (* n 60000) (= u "HOURS") (* n 3600000) (= u "DAYS") (* n 86400000)
+          :else (* n 1000))))
+
+(defn- grpc-of Grpc [cfg: &m/Config]
+  (let [ce (conn-elem cfg)]
+    (if (= (count ce) 0) (->Grpc "api.pubsub.salesforce.com" 7443 0)
+      (let [c (nth ce 0)
+            [p pe] (parse-long (str/trim (sc/at c "port" "7443")))
+            [t te] (parse-long (str/trim (sc/at c "publishRequestTimeout" "0")))]
+        (->Grpc (sc/at c "host" "api.pubsub.salesforce.com") (if (= pe "") p 7443)
+                (if (and (= te "") (> t 0)) (unit-ms t (sc/at c "publishRequestTimeoutUnit" "SECONDS")) 0))))))
+
+(defrecord Who [token: Str instance: Str tenant: Str])
+
+(defn- cache-get Str [cache: &Atom k: &Str]
+  (let [mm: Map (dyn->map (deref cache))] (if (contains? mm k) (dyn->str (get! mm k)) "")))
+
+(defn- cache-put Int [cache: &Atom k: Str x: Str]
+  (let [z (swap! cache (fn Dyn [old: Dyn] (let [m2: Map (dyn->map old)] (->dyn (assoc m2 k (->dyn x))))))] 0))
+
+(defn- tenant-of Values(Str Str) [cache: &Atom cfg: &m/Config]
+  (let [k (str "tenant:" (:name cfg))
+        have (cache-get cache k)]
+    (if (not= have "") (values have "")
+      (let [[st body x] (sc/rest-call cache cfg "GET" "/query?q=SELECT+Id+FROM+Organization" "" "")]
+        (if (> (count x) 0) (values "" (:description (nth x 0)))
+          (let [j (sc/json-val body)
+                rs (match j (v/VObj fs) (let [r (v/obj-get fs "records")] (if (= (count r) 0) [] (match (v/unmeta (nth r 0)) (v/VArr a) a _ []))) _ [])
+                id (if (= (count rs) 0) "" (sc/vfield (v/unmeta (nth rs 0)) "Id"))]
+            (if (= id "") (values "" "Unable to read the organization id")
+              (let [z (cache-put cache k id)] (values id "")))))))))
+
+(defn- who Values(Who Str) [cache: &Atom cfg: &m/Config fresh: Bool]
+  (let [[s se] (sc/session cache cfg fresh)]
+    (if (not= se "") (values (->Who "" "" "") se)
+      (let [[t te] (tenant-of cache cfg)]
+        (values (->Who (:token s) (:instance s) t) te)))))
+
+(defn- call-headers Vec(hm/Header) [wh: &Who]
+  [(hm/->Header "content-type" "application/grpc") (hm/->Header "te" "trailers")
+   (hm/->Header "accesstoken" (:token wh)) (hm/->Header "instanceurl" (:instance wh)) (hm/->Header "tenantid" (:tenant wh))])
+
+(defn- url-of Str [g: &Grpc method: &Str] (str "https://" (:host g) ":" (:port g) "/" SERVICE "/" method))
+
+(defn- unary-once Values(Str Int Str) [g: &Grpc wh: &Who method: &Str msg: &Str dl: Int]
+  (let [hs0 (call-headers wh)
+        hs (if (> dl 0) (conj hs0 (hm/->Header "grpc-timeout" (grpc/timeout-header dl))) hs0)
+        o (assoc (http/request-opts (url-of g method)) :method "POST" :headers hs :body (grpc/frame msg) :max-redirects 0 :timeout-ms (if (> dl 0) dl 60000))
+        [r re] (http/request o)]
+    (if (not= re "")
+      (if (and (> dl 0) (str/includes? (str/lower-case re) "time")) (values "" 4 "Deadline exceeded") (values "" 14 re))
+      (let [[code gm body] (grpc/read-reply (:status r) (:headers r) (:trailers r) (:body r))] (values body code gm)))))
+
+(defn- unary Values(Str Int Str) [cache: &Atom cfg: &m/Config method: &Str msg: &Str dl: Int]
+  (let [g (grpc-of cfg)
+        [wh we] (who cache cfg false)]
+    (if (not= we "") (values "" 16 we)
+      (let [[b code gm] (unary-once g wh method msg dl)]
+        (if (not= code 16) (values b code gm)
+          (let [[wh2 we2] (who cache cfg true)]
+            (if (not= we2 "") (values "" 16 we2) (unary-once g wh2 method msg dl))))))))
+
+(def SCHEMAS: Atom(Map(Str av/Schema)) (atom (let [m: Map(Str av/Schema) {}] m)))
+(def TOPICS: Atom(Map(Str Str)) (atom (let [m: Map(Str Str) {}] m)))
+
+(defn- schema-by-id Values(Vec(av/Schema) Int Str) [cache: &Atom cfg: &m/Config id: &Str]
+  (let [have (deref SCHEMAS)]
+    (if (contains? have id) (values [(get! have id)] 0 "")
+      (let [[b code gm] (unary cache cfg "GetSchema" (w/schema-request id) 0)]
+        (if (not= code 0) (values [] code gm)
+          (let [[si se] (w/schema-info b)
+                [sch pe] (av/parse-schema (:json si))]
+            (if (or (not= se "") (not= pe "")) (values [] 13 (if (not= se "") se pe))
+              (let [k (str id) z (swap! SCHEMAS (fn Map(Str av/Schema) [mm: Map(Str av/Schema)] (assoc mm k sch)))] (values [sch] 0 "")))))))))
+
+(defn- topic-schema Values(Str Vec(av/Schema) Int Str) [cache: &Atom cfg: &m/Config topic: &Str]
+  (let [have (deref TOPICS)
+        [sid code gm] (if (contains? have topic) (values (get! have topic) 0 "")
+                        (let [[b c2 g2] (unary cache cfg "GetTopic" (w/topic-request topic) 0)]
+                          (if (not= c2 0) (values "" c2 g2)
+                            (let [[ti te] (w/topic-info b)
+                                  k (str topic)
+                                  z (if (= te "") (swap! TOPICS (fn Map(Str Str) [mm: Map(Str Str)] (assoc mm k (:schema-id ti)))) have)]
+                              (values (:schema-id ti) (if (= te "") 0 13) te)))))]
+    (if (not= code 0) (values "" [] code gm)
+      (let [[s c3 g3] (schema-by-id cache cfg sid)] (values sid s c3 g3)))))
+
+(defn- cmeta v/Val [x: v/Val cls: &Str] (v/->VMeta x [(v/field "class" (v/->VStr (str cls)))]))
+
+(defn- status-err err/MErr [code: Int msg: &Str]
+  (pserr (status-type code) (str "io.grpc.StatusRuntimeException: " (grpc/status-name code) (if (= msg "") "" (str ": " msg)))))
+
+(defn- encode-err err/MErr [te: &Str]
+  (let [k (str/index-of te "|")
+        t (subs te 0 k)
+        msg (subs te (+ k 1) (count te))]
+    (if (= t "INVALID_INPUT") (pserr t msg) (err/mk "MULE" "UNKNOWN" msg))))
+
+(defn- result-val v/Val [r: &w/PubResult body: &v/Val]
+  (let [base: Vec(v/Field) [(v/field "correlationKey" (v/->VStr (:corr r))) (v/field "eventBody" body)
+                            (v/field "hasError" (v/bool-v (:has-error r)))]
+        fs (if (:has-error r)
+             (conj base (v/field "error" (cmeta (sc/hashmap-obj [(v/field "message" (v/->VStr (:err-msg r))) (v/field "errorCode" (v/->VStr (:err-code r)))]) "java.util.HashMap")))
+             (conj (conj base (v/field "error" (v/null-v)))
+                   (v/field "replayId" (if (= (count (:replay-id r)) 0) (v/null-v) (cmeta (v/int-v (nth (:replay-id r) 0)) "java.lang.Long")))))]
+    (cmeta (sc/hashmap-obj fs) "java.util.HashMap")))
+
+(defn- publish conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config]
+  (let [[topic tx] (conn/attr-str c "topic" "")
+        [evs0 src ex] (sc/child-val-src c "events")
+        evs (v/unmeta evs0)]
+    (cond
+      (> (count tx) 0) (conn/fail-result (nth tx 0))
+      (> (count ex) 0) (conn/fail-result (nth ex 0))
+      (match evs (v/VArr a) false (v/VNull) false _ true)
+      (conn/fail-result (err/mk "MULE" "EXPRESSION" (str "\"Cannot coerce " (v/type-name evs) " (" (ct/show-val evs0) ") to Array\" evaluating expression: \"" src "\".")))
+      :else
+      (let [es (match evs (v/VArr a) a _ [])
+            [sid schs code gm] (topic-schema cache cfg topic)]
+        (if (not= code 0) (conn/fail-result (status-err code gm))
+          (let [sch (nth schs 0)
+                [payloads pe] (loop [i 0 acc: Vec(Str) []]
+                                (if (>= i (count es)) (values acc "")
+                                  (let [[b t e] (pa/encode-event sch (nth es i))]
+                                    (if (not= e "") (values acc (str t "|" e)) (recur (+ i 1) (conj acc b))))))]
+            (if (not= pe "") (conn/fail-result (encode-err pe))
+              (let [g (grpc-of cfg)
+                    [b c2 g2] (unary cache cfg "Publish" (w/publish-request topic sid payloads) (:timeout-ms g))]
+                (if (not= c2 0) (conn/fail-result (status-err c2 g2))
+                  (let [[rs re] (w/publish-results b)]
+                    (if (not= re "") (conn/fail-result (pserr "SERVER_ERROR" re))
+                      (conn/ok-result
+                        (ev/tv-val (cmeta (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                                                       (if (>= i (count rs)) acc
+                                                         (recur (+ i 1) (conj acc (result-val (nth rs i) (if (< i (count es)) (nth es i) (v/null-v))))))))
+                                          "java.util.ArrayList")
+                                   ev/JAVA)
+                        (ev/tv-null)))))))))))))
+
+(defn- run conn/OpResult [cache: &Atom c: conn/OpCall]
+  (if (= (count (:config c)) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" "salesforce-pub-sub needs config-ref"))
+    (let [cfg (nth (:config c) 0)]
+      (cond
+        (= (:op c) "publish-event") (publish cache c cfg)
+        (= (:op c) "unauthorize") (conn/keep-result c)
+        :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation salesforce-pub-sub:" (:op c))))))))
+
+(defrecord Start [preset: Int replay: Vec(Int) err: Str])
+
+(defn- replay-child Vec(xml/XNode) [s: &conn/SrcCall]
+  (let [ro (sc/elem-by (:children s) "replay-option")]
+    (if (= (count ro) 0) [] (let [k (xml/child-elems (nth ro 0))] (if (= (count k) 0) [] [(nth k 0)])))))
+
+(defn- os-replay Vec(Int) [os: &Str key: &Str]
+  (let [es (st/entries os)]
+    (if (not (contains? es key)) []
+      (let [t (:value (get! es key))
+            [x tt xe] (ev/value t)]
+        (match (v/unmeta x)
+          (v/VInt n) [n]
+          (v/VNum n) (let [[k ke] (num/to-int n)] (if (= ke "") [k] []))
+          (v/VStr s) (let [[k ke] (parse-long s)] (if (= ke "") [k] []))
+          (v/VBin b) (let [[k ke] (parse-long b)] (if (= ke "") [k] []))
+          _ [])))))
+
+(defn- valid-replay? Bool [cache: &Atom cfg: &m/Config topic: &Str rid: Int]
+  (let [g (grpc-of cfg)
+        [wh we] (who cache cfg false)]
+    (if (not= we "") true
+      (let [o (assoc (http/request-opts (url-of g "Subscribe")) :method "POST" :headers (call-headers wh) :timeout-ms 0)
+            [call e] (http/open-call o)]
+        (if (not= e "") true
+          (let [z (http/call-send call (grpc/frame (w/fetch-request topic w/CUSTOM [rid] 1)))
+                r (loop [head: Vec(hm/Header) [] st 200 buf ""]
+                    (let [[evt ee] (http/call-next call)]
+                      (if (not= ee "") true
+                        (match evt
+                          (http/CallHead h) (recur (:headers h) (:status h) buf)
+                          (http/CallData b) (let [[msgs rest] (grpc/unframe (str buf b))] (if (> (count msgs) 0) true (recur head st rest)))
+                          (http/CallEnd tr) (let [[code msg] (grpc/live-status st head tr)] (not= code 3))))))
+                z2 (http/call-cancel call)]
+            r))))))
+
+(defn- start-of Start [cache: &Atom cfg: &m/Config s: &conn/SrcCall topic: &Str]
+  (let [k (replay-child s)
+        nm (if (= (count k) 0) "earliest" (xml/elem-local (nth k 0)))]
+    (cond
+      (= nm "latest") (->Start w/LATEST [] "")
+      (= nm "custom-replay-id")
+      (let [raw (sc/at (nth k 0) "replayId" "")
+            [rid re] (parse-long (str/trim raw))]
+        (cond (not= re "") (->Start w/EARLIEST [] (str "ReplayId must be Integer."))
+              (valid-replay? cache cfg topic rid) (->Start w/CUSTOM [rid] "")
+              :else (->Start w/EARLIEST [] (str "The provided replay id is not valid. ReplayId: " rid ", Channel: " topic "."))))
+      (= nm "replay-id-from-object-store")
+      (let [r (os-replay (sc/at (nth k 0) "osName" "") (sc/at (nth k 0) "osKey" ""))]
+        (if (and (> (count r) 0) (valid-replay? cache cfg topic (nth r 0))) (->Start w/CUSTOM r "") (->Start w/EARLIEST [] "")))
+      :else (->Start w/EARLIEST [] ""))))
+
+(defrecord Sub [call: http/Call head: Vec(hm/Header) status: Int buf: Str processed: Int fetch: Str])
+
+(def SUBS: Atom(Map(Str Sub)) (atom (let [m: Map(Str Sub) {}] m)))
+
+(defn- sub-get Vec(Sub) [k: &Str] (let [mm (deref SUBS)] (if (contains? mm k) [(get! mm k)] [])))
+
+(defn- sub-put Int [k: &Str x: Sub] (let [kk (str k) z (swap! SUBS (fn Map(Str Sub) [mm: Map(Str Sub)] (assoc mm kk x)))] 0))
+
+(defn- sub-drop Int [k: &Str] (let [kk (str k) z (swap! SUBS (fn Map(Str Sub) [mm: Map(Str Sub)] (dissoc mm kk)))] 0))
+
+(defn- batch-of Int [s: &conn/SrcCall]
+  (let [[n e] (parse-long (str/trim (conn/param-lit (:params s) "eventBatchSize" "100")))]
+    (cond (not= e "") 100 (> n MAX-BATCH) MAX-BATCH (< n 1) 1 :else n)))
+
+(defn- open-sub Values(Vec(Sub) Str Bool) [cache: &Atom cfg: &m/Config s: &conn/SrcCall]
+  (let [topic (conn/param-lit (:params s) "channelName" "")
+        stt (start-of cache cfg s topic)]
+    (if (not= (:err stt) "") (values [] (:err stt) true)
+      (let [g (grpc-of cfg)
+            [wh we] (who cache cfg false)]
+        (if (not= we "") (values [] we false)
+          (let [o (assoc (http/request-opts (url-of g "Subscribe")) :method "POST" :headers (call-headers wh) :timeout-ms 0)
+                [call e] (http/open-call o)]
+            (if (not= e "") (values [] e false)
+              (let [fetch (grpc/frame (w/fetch-request topic (:preset stt) (:replay stt) (batch-of s)))
+                    se (http/call-send call fetch)
+                    none: Vec(hm/Header) []]
+                (if (not= se "") (values [] se false) (values [(->Sub call none 200 "" 0 fetch)] "" false))))))))))
+
+(defn- event-val v/Val [ce: &w/ConsumerEvent rec: v/Val]
+  (cmeta (v/->VObj [(v/field "eventId" (cmeta (v/->VStr (:id ce)) "java.lang.String"))
+                    (v/field "replayId" (cmeta (v/int-v (if (= (count (:replay-id ce)) 0) 0 (nth (:replay-id ce) 0))) "java.lang.Long"))
+                    (v/field "event" rec)])
+         EVENT-CLASS))
+
+(defn- deliver Values(Int Str) [cache: &Atom cfg: &m/Config s: &conn/SrcCall sub: &Sub ce: &w/ConsumerEvent]
+  (let [[schs code gm] (schema-by-id cache cfg (:schema-id ce))]
+    (if (not= code 0) (values 0 (grpc/status-text code gm))
+      (let [[rec re] (pa/decode-event (nth schs 0) (:payload ce))]
+        (if (not= re "") (values 0 re)
+          (let [[ok desc] ((:dispatch s) (ev/tv-val (event-val ce rec) ev/ANY) (ev/tv-null))] (values 1 "")))))))
+
+(defn- handle-data Values(Int Str) [cache: &Atom cfg: &m/Config s: &conn/SrcCall key: &Str sub: Sub b: &Str]
+  (let [[msgs rest] (grpc/unframe (str (:buf sub) b))
+        batch (batch-of s)]
+    (loop [i 0 cur sub n 0 err ""]
+      (if (>= i (count msgs)) (let [z (sub-put key (assoc cur :buf rest))] (values n err))
+        (let [[fr fe] (w/fetch-response (nth msgs i))]
+          (if (not= fe "") (recur (+ i 1) cur n fe)
+            (let [evs (:events fr)
+                  [cur2 n2 err2] (loop [k 0 c2 cur nn n e2 err]
+                                   (if (>= k (count evs)) (values c2 nn e2)
+                                     (let [[d de] (deliver cache cfg s c2 (nth evs k))
+                                           p (+ (:processed c2) 1)
+                                           sent (if (= (mod p batch) 0) (http/call-send (:call c2) (:fetch c2)) "")]
+                                       (recur (+ k 1) (assoc c2 :processed p) (+ nn d) (if (not= de "") de e2)))))]
+              (recur (+ i 1) cur2 n2 err2))))))))
+
+(defn- ended Values(Int Str) [key: &Str sub: &Sub code: Int msg: &Str]
+  (let [z (sub-drop key)
+        z2 (http/call-cancel (:call sub))
+        z3 (sleep-ms 500)]
+    (values 0 (if (= code 0) "The server has unexpectedly closed the stream." (grpc/status-text code msg)))))
+
+(defn- poll Values(Int Str) [cache: &Atom s: conn/SrcCall]
+  (if (= (count (:config s)) 0) (values 0 "salesforce-pub-sub listener needs config-ref")
+    (let [cfg (nth (:config s) 0)
+          key (:flow s)
+          have (sub-get key)]
+      (cond
+        (= (cache-get (:state s) "dead") "1") (let [z (sleep-ms 60000)] (values 0 ""))
+        (= (count have) 0)
+        (let [[sb e fatal] (open-sub cache cfg s)]
+          (cond
+            fatal (let [z (cache-put (:state s) "dead" "1")] (values 0 e))
+            (not= e "") (let [z (sleep-ms 2000)] (values 0 e))
+            :else (let [z (sub-put key (nth sb 0))] (values 0 ""))))
+        :else
+        (let [sub (nth have 0)
+              [evt ee] (http/call-next (:call sub))]
+          (if (not= ee "") (ended key sub 14 ee)
+            (match evt
+              (http/CallHead h) (let [z (sub-put key (assoc (assoc sub :head (:headers h)) :status (:status h)))] (values 0 ""))
+              (http/CallData b) (handle-data cache cfg s key sub b)
+              (http/CallEnd tr) (let [[code msg] (grpc/live-status (:status sub) (:head sub) tr)] (ended key sub code msg)))))))))
+
+(defn- init Vec(Str) [cache: &Atom app: &m/App]
+  (let [cs (:configs app)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count cs)) acc
+        (let [c (nth cs i)]
+          (recur (+ i 1) (if (= (:kind c) "salesforce-pub-sub:pubsub-config")
+                           (let [[a e] (sc/auth-of c)
+                                 z (if (= e "") (sc/load-jwt-key cache c (:res app)) 0)]
+                             (if (= e "") acc (conj acc (str/replace e "salesforce:sfdc-config" "salesforce-pub-sub:pubsub-config"))))
+                           acc)))))))
+
+(defn connector conn/Connector []
+  (let [z: Map {}
+        cache (atom (->dyn z))]
+    (assoc (conn/connector "salesforce-pub-sub" NS (fn conn/OpResult [c: conn/OpCall] (run cache c)))
+           :sources ["subscribe-channel-listener"]
+           :push ["subscribe-channel-listener"]
+           :poll (fn Values(Int Str) [s: conn/SrcCall] (poll cache s))
+           :init (fn Vec(Str) [a: m/App] (init cache a))
+           :error-parents ERROR-PARENTS)))

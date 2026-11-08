@@ -1,0 +1,44 @@
+(ns gen (:require [mulay.lib.sqlbtree :as bt] [mulay.lib.sqlfile :as sf] [mulay.lib.sqlval :as sv]))
+
+;; 純 Clay の B-tree (mulay.lib.sqlbtree) で DB を作り、ファイルに書く (tools/sqlbtree-check/check.sh が sqlite3 で確かめる)。
+;; 表 t (a TEXT, b INTEGER) と索引 i (a)。擬似乱数の rowid で n 行を入れ、del 個おきに消す。a の長さを変えて overflow を作る
+
+(defn- cmp-keys Int [a: Str b: Str] (sv/record-compare a b ["BINARY"] [false]))
+(defn- cmp-at Int [a: Str ao: Int b: Str] (sv/record-compare-at a ao b ["BINARY"] [false]))
+(defn- rnd Int [x: Int] (bit-and (+ (* x 6364136223846793005) 1442695040888963407) 9223372036854775807))
+(defn- text-of-len Str [n: Int seed: Int] (loop [out ""] (if (>= (count out) n) (subs out 0 n) (recur (str out (chr (+ 97 (mod (+ seed (count out)) 26))))))))
+(defn- a-of sf/Val [k: Int] (sf/->VText (text-of-len (mod (* k 37) 2500) k)))
+
+(defn- build Str [page-size: Int n: Int del: Int]
+  (let [kc (bt/->KeyCmp cmp-at)
+        p0 (bt/new-pager page-size 0)
+        [p1 troot] (bt/create-tree p0 true)
+        [p2 iroot] (bt/create-tree p1 false)
+        ps (bt/table-insert p2 1 1 (sf/encode-record [(sf/->VText "table") (sf/->VText "t") (sf/->VText "t") (sf/->VInt troot) (sf/->VText "CREATE TABLE t (a TEXT, b INTEGER)")]))
+        ps2 (bt/table-insert ps 1 2 (sf/encode-record [(sf/->VText "index") (sf/->VText "i") (sf/->VText "t") (sf/->VInt iroot) (sf/->VText "CREATE INDEX i ON t (a)")]))
+        p3 (loop [i 0 p ps2 x 7]
+             (if (>= i n) p
+               (let [x2 (rnd x) rowid (+ 1 (mod x2 1000000)) [old found] (bt/table-find p troot rowid)]
+                 (recur (+ i 1)
+                        (if found p (bt/index-insert (bt/table-insert p troot rowid (sf/encode-record [(a-of rowid) (sf/->VInt rowid)])) iroot
+                                                     (sf/encode-record [(a-of rowid) (sf/->VInt rowid)]) kc))
+                        x2))))
+        rowids (loop [c (bt/cur-first p3 troot) k 0 acc: Vec(Int) []]
+                 (if (not (bt/valid? c)) acc (recur (bt/cur-next p3 c) (+ k 1) (if (= (mod k del) 0) (conj acc (bt/cur-rowid p3 c)) acc))))
+        p4 (loop [j 0 q p3]
+             (if (>= j (count rowids)) q
+               (let [r (nth rowids j) [q2 ok] (bt/table-delete q troot r) [q3 ok2] (bt/index-delete q2 iroot (sf/encode-record [(a-of r) (sf/->VInt r)]) kc)]
+                 (recur (+ j 1) q3))))]
+    (bt/to-bytes (bt/bump-schema p4) 3)))
+
+(defn main Int []
+  (let [dir (if (> (argv-len) 1) (argv-nth 1) ".")
+        cases [[512 600 3] [1024 2000 2] [4096 3000 4] [1024 800 1] [65536 400 5] [4096 50 1]]
+        z (loop [i 0] (if (>= i (count cases)) 0
+                        (let [c (nth cases i)
+                              data (build (nth c 0) (nth c 1) (nth c 2))
+                              path (str dir "/case" i ".db")
+                              e (write-file path data)
+                              z (println (str path " " (nth c 0) " " (nth c 1) " " (nth c 2) " " (count data)))]
+                          (recur (+ i 1)))))]
+    0))

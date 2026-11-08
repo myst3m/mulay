@@ -1,0 +1,91 @@
+(ns explain-test (:require [mulay.dw.explain :as ex] [mulay.dw.engine :as eng] [mulay.dw.rt :as drt] [mulay.dw.err :as dwe] [mulay.lib.diag :as d] [clay.string :as str]))
+
+(defn- run Str [script: Str ins: Vec(eng/Input)]
+  (let [[mime out err c de] (eng/run-text-full script ins)
+        names (loop [i 0 acc: Vec(Str) []] (if (>= i (count ins)) acc (recur (+ i 1) (conj acc (:name (nth ins i))))))
+        ctx (ex/->Ctx names true)
+        r (cond (not (eng/ok? c)) (ex/compile-report "s.dwl" script c ctx)
+                (not (dwe/ok? de)) (ex/run-report "s.dwl" script c de ctx)
+                :else (ex/explain (d/with-src (d/report "error" "DW" err) "s.dwl" script) err [] ctx))]
+    (if (= err "") "" (d/render r false))))
+
+(defn- lines Str [xs: Vec(Str)] (str/join "\n" xs))
+
+(def HEAD "%dw 2.0\noutput application/json\n")
+
+(deftest unknown-name-suggests-a-close-one
+  (is (= (run (str HEAD "var items = [1]\n---\nsizeOf(itmes)") [])
+         (lines ["error[DW]: cannot find `itmes` in this scope"
+                 " --> s.dwl:5:8"
+                 "  |"
+                 "5 | sizeOf(itmes)"
+                 "  |        ^^^^^ not found in this scope"
+                 "  |"
+                 "  = note: DataWeave: Unable to resolve reference of: `itmes`."
+                 "  = help: a similar name exists: `items`"]))))
+
+(deftest lambda-parameters-are-candidates
+  (is (str/includes? (run (str HEAD "---\n[1] map (item) -> itme") []) "a similar name exists: `item`")))
+
+(deftest missing-input-on-the-command-line
+  (is (str/includes? (run (str HEAD "---\npayload.a") []) "help: `payload` is an input; pass it on the command line")))
+
+(deftest reserved-word-key
+  (is (= (run (str HEAD "---\n{ if: 1 }") [])
+         (lines ["error[DW]: `if` is a reserved word and can't be used as a bare key"
+                 " --> s.dwl:4:3"
+                 "  |"
+                 "4 | { if: 1 }"
+                 "  |   ^^ reserved word"
+                 "  |"
+                 "  = help: quote the key: \"if\": ..."]))))
+
+(deftest used-before-defined-points-at-the-later-definition
+  (is (= (run (str HEAD "var a = b\nvar b = 1\n---\na") [])
+         (lines ["error[DW]: `b` is used before it is defined"
+                 " --> s.dwl:3:9"
+                 "  |"
+                 "3 | var a = b"
+                 "  |         ^ used here"
+                 "4 | var b = 1"
+                 "  | ----- defined here, later"
+                 "  |"
+                 "  = note: DataWeave: There is no variable named 'b'"
+                 "  = help: move `var b` above its first use (variables are defined top to bottom)"]))))
+
+(deftest string-plus-number
+  (let [out (run (str HEAD "---\n1 + \"x\"") [])]
+    (is (str/starts-with? out "error[DW]: `+` can't take (Number, String)\n --> s.dwl:4:1"))
+    (is (str/includes? out "help: to join text, use `++`"))
+    (is (str/includes? out "note: `+` accepts: (Array, Any)"))))
+
+(deftest null-inside-a-library-call
+  (let [out (run (str HEAD "var xs = [{a: 1}, {a: 2}]\n---\nsum(xs map $.b)") [])]
+    (is (str/starts-with? out "error[DW]: `+` can't take (Null, Null) (inside `sum`)"))
+    (is (str/includes? out "^^^ `+` failed inside this call"))
+    (is (str/includes? out "help: the value is null (a missing or misspelled field?)"))))
+
+(deftest text-that-is-not-a-number
+  (let [out (run (str HEAD "---\n\"a\" as Number") [])]
+    (is (str/starts-with? out "error[DW]: can't convert String `a` to Number"))
+    (is (str/includes? out "help: `a` isn't a number"))))
+
+(deftest unknown-writer-option
+  (is (= (run "%dw 2.0\noutput application/json indnet=true\n---\n1" [])
+         (lines ["error[DW]: unknown option `indnet`"
+                 " --> s.dwl:2:25"
+                 "  |"
+                 "2 | output application/json indnet=true"
+                 "  |                         ^^^^^^ unknown option"
+                 "  |"
+                 "  = note: DataWeave: Option `indnet` is not valid. Valid options are: `writeAttributes`, `indent`, `encoding`, `bufferSize`, `skipNullOn`, `deferred`, `duplicateKeyAsArray`"
+                 "  = help: did you mean `indent`?"]))))
+
+(deftest parse-error-says-what-was-expected
+  (let [out (run (str HEAD "---\n{ a: 1\n") [])]
+    (is (str/starts-with? out "error[DW]: Unexpected end of input, expected `}` or ',' for the object expression."))
+    (is (str/includes? out "^ expected `}` or ','"))))
+
+(deftest description-stays-mules-text
+  (let [[mime out err c de] (eng/run-text-full (str HEAD "---\n1 + \"x\"") [])]
+    (is (str/starts-with? err "You called the function '+' with these arguments:"))))

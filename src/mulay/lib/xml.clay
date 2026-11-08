@@ -1,0 +1,1632 @@
+(ns mulay.lib.xml
+  (:require [clay.core]
+            [clay.charset :as ccs] [clay.string :as str]))
+
+(def NS-XML "http://www.w3.org/XML/1998/namespace")
+(def NS-XMLNS "http://www.w3.org/2000/xmlns/")
+
+(defrecord QName [uri: Str prefix: Str local: Str])
+(defrecord XAttr [name: QName value: Str])
+(defrecord XNs [prefix: Str uri: Str])
+
+(defvariant XEvent
+  (XeStartDoc version: Str encoding: Str standalone: Str)
+  (XeDoctype name: Str public-id: Str system-id: Str)
+  (XeStart name: QName attrs: Vec(XAttr) ns: Vec(XNs))
+  (XeEnd name: QName)
+  (XeText text: Str)
+  (XeCData text: Str)
+  (XeComment text: Str)
+  (XePI target: Str data: Str)
+  (XeEndDoc))
+
+(defvariant XNode
+  (XnElem name: QName attrs: Vec(XAttr) ns: Vec(XNs) children: Vec(XNode))
+  (XnText text: Str)
+  (XnCData text: Str)
+  (XnComment text: Str)
+  (XnPI target: Str data: Str))
+
+(defrecord XDoc [version: Str encoding: Str standalone: Str
+                 doctype: Str public-id: Str system-id: Str
+                 children: Vec(XNode)])
+
+(defrecord XASpan [name: Str raw: Str start: Int end: Int vstart: Int vend: Int quote: Int])
+(defrecord XSpan [open: Int open-end: Int close: Int close-end: Int attrs: Vec(XASpan)])
+(defrecord XLines [line: Int kids: Vec(XLines) span: XSpan])
+
+(defn no-span XSpan [] (let [z: Vec(XASpan) []] (->XSpan -1 -1 -1 -1 z)))
+
+(defrecord XmlOpts [max-depth: Int max-expansions: Int max-expanded-bytes: Int drop-ws-text: Bool dtd: Bool max-attrs: Int
+                    ext: Fn(Str Values(Str Bool)) spans: Bool])
+
+(defn no-ext Values(Str Bool) [id: Str] (values "" false))
+
+(defn default-opts XmlOpts [] (->XmlOpts 10000 64000 10000000 false true -1 no-ext false))
+
+(defn- too-many Str [opts: &XmlOpts] (str "Maximum entity expansion count limit (" (:max-expansions opts) ") exceeded"))
+
+(defn qname QName [uri: Str prefix: Str local: Str] (->QName uri prefix local))
+
+(defn qname-str Str [q: &QName]
+  (if (= (count (:prefix q)) 0) (str (:local q)) (str (:prefix q) ":" (:local q))))
+
+(defn- at Int [s: &Str i: Int] (if (and (>= i 0) (< i (count s))) (nth s i) -1))
+
+(defn- vset Vec(a) [v: Vec(a) i: Int x: a]
+  (if (< i (count v)) (assoc v i x) (conj v x)))
+
+(defn- ws? Bool [c: Int] (or (= c 32) (= c 10) (= c 9) (= c 13)))
+
+(defn- skip-ws Int [s: &Str i: Int]
+  (let [n (count s)]
+    (loop [j i] (if (and (< j n) (ws? (nth s j))) (recur (+ j 1)) j))))
+
+(defn- name-start? Bool [c: Int]
+  (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90))
+      (= c 95) (= c 58) (>= c 128)))
+
+(defn- name-char? Bool [c: Int]
+  (or (name-start? c) (and (>= c 48) (<= c 57)) (= c 45) (= c 46)))
+
+(defn- scan-name Int [s: &Str i: Int]
+  (let [n (count s)]
+    (if (and (< i n) (name-start? (nth s i)))
+      (loop [j (+ i 1)] (if (and (< j n) (name-char? (nth s j))) (recur (+ j 1)) j))
+      i)))
+
+(defn- starts-at? Bool [s: &Str i: Int lit: &Str]
+  (let [m (count lit)]
+    (if (> (+ i m) (count s)) false
+      (loop [k 0] (if (>= k m) true (if (= (nth s (+ i k)) (nth lit k)) (recur (+ k 1)) false))))))
+
+(defn- has-byte? Bool [s: &Str c: Int] (< (str/index-of-byte s 0 c) (count s)))
+
+(defn- find-lit Int [s: &Str lit: &Str i: Int j: Int]
+  (let [c0 (nth lit 0)]
+    (loop [k i]
+      (if (>= k j) -1
+        (if (and (= (nth s k) c0) (starts-at? s k lit)) k (recur (+ k 1)))))))
+
+(defn- utf8 Str [cp: Int]
+  (cond
+    (< cp 128) (chr cp)
+    (< cp 2048) (str (chr (bit-or 192 (bit-shift-right cp 6))) (chr (bit-or 128 (bit-and cp 63))))
+    (< cp 65536) (str (chr (bit-or 224 (bit-shift-right cp 12)))
+                      (chr (bit-or 128 (bit-and (bit-shift-right cp 6) 63)))
+                      (chr (bit-or 128 (bit-and cp 63))))
+    :else (str (chr (bit-or 240 (bit-shift-right cp 18)))
+               (chr (bit-or 128 (bit-and (bit-shift-right cp 12) 63)))
+               (chr (bit-or 128 (bit-and (bit-shift-right cp 6) 63)))
+               (chr (bit-or 128 (bit-and cp 63))))))
+
+(defn- xml-char? Bool [cp: Int]
+  (or (= cp 9) (= cp 10) (= cp 13)
+      (and (>= cp 32) (<= cp 55295))
+      (and (>= cp 57344) (<= cp 65533))
+      (and (>= cp 65536) (<= cp 1114111))))
+
+(defn- upper Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1) (str out (chr (if (and (>= c 97) (<= c 122)) (- c 32) c))))))))
+
+(defn- line-col Str [s: &Str pos: Int bline: Int bcol: Int]
+  (let [p (if (> pos (count s)) (count s) pos)
+        line (loop [i 0 line bline] (if (>= i p) line (recur (+ i 1) (if (= (nth s i) 10) (+ line 1) line))))
+        ls (loop [i (- p 1)] (if (< i 0) -1 (if (= (nth s i) 10) (+ i 1) (recur (- i 1)))))
+        col (loop [i (if (< ls 0) 0 ls) c (if (< ls 0) bcol 1)]
+              (if (>= i p) c
+                (let [b (nth s i)] (recur (+ i 1) (if (= (bit-and b 192) 128) c (+ c 1))))))]
+    (str "line " line ", column " col)))
+
+(defn- decl-pseudo Str [s: &Str key: &Str]
+  (if (not (starts-at? s 0 "<?xml")) ""
+    (let [e0 (str/index-of-after s "?>" 0)
+          e (if (< e0 0) (if (< (count s) 200) (count s) 200) e0)
+          k (str/index-of-after s key 0)]
+      (if (or (< k 0) (> k e)) ""
+        (let [i (skip-ws s (+ k (count key)))
+              i2 (if (= (at s i) 61) (skip-ws s (+ i 1)) -1)
+              q (at s i2)]
+          (if (or (= q 34) (= q 39))
+            (let [j (loop [j (+ i2 1)] (if (or (>= j e) (= (nth s j) q)) j (recur (+ j 1))))]
+              (subs s (+ i2 1) j))
+            ""))))))
+
+(defn- utf16->utf8 Values(Str Str) [s: &Str start: Int le: Bool]
+  (let [n (count s)]
+    (loop [i start out "" ]
+      (if (>= (+ i 1) n)
+        (if (< i n) (values out "UTF-16 input has an odd number of bytes") (values out ""))
+        (let [u (if le (+ (nth s i) (* 256 (nth s (+ i 1)))) (+ (* 256 (nth s i)) (nth s (+ i 1))))]
+          (if (and (>= u 55296) (<= u 56319))
+            (if (>= (+ i 3) n) (values out "truncated UTF-16 surrogate pair")
+              (let [u2 (if le (+ (nth s (+ i 2)) (* 256 (nth s (+ i 3)))) (+ (* 256 (nth s (+ i 2))) (nth s (+ i 3))))]
+                (if (and (>= u2 56320) (<= u2 57343))
+                  (recur (+ i 4) (str out (utf8 (+ 65536 (+ (* (- u 55296) 1024) (- u2 56320))))))
+                  (values out "invalid UTF-16 surrogate pair"))))
+            (if (and (>= u 56320) (<= u 57343)) (values out "unpaired UTF-16 low surrogate")
+              (recur (+ i 2) (str out (utf8 u))))))))))
+
+(defn- latin1->utf8 Str [s: &Str start: Int]
+  (let [n (count s)]
+    (loop [i start out ""]
+      (if (>= i n) out
+        (let [j (loop [j i] (if (and (< j n) (< (nth s j) 128)) (recur (+ j 1)) j))
+              out2 (if (> j i) (str out (subs s i j)) out)]
+          (if (>= j n) out2 (recur (+ j 1) (str out2 (utf8 (nth s j))))))))))
+
+(def CP1252 [8364 65533 8218 402 8222 8230 8224 8225 710 8240 352 8249 338 65533 381 65533
+             65533 8216 8217 8220 8221 8226 8211 8212 732 8482 353 8250 339 65533 382 376])
+
+(defn- cp1252->utf8 Str [s: &Str start: Int]
+  (let [n (count s)]
+    (loop [i start out ""]
+      (if (>= i n) out
+        (let [c (nth s i)]
+          (recur (+ i 1)
+                 (cond (< c 128) (str out (chr c))
+                       (< c 160) (str out (utf8 (nth CP1252 (- c 128))))
+                       :else (str out (utf8 c)))))))))
+
+(defn- utf8-invalid-at Int [s: &Str start: Int]
+  (let [n (count s)]
+    (loop [i start]
+      (if (>= i n) -1
+        (let [b (nth s i)]
+          (if (< b 128) (recur (+ i (prim/str-ascii-run s i)))
+            (let [k (cond (= (bit-and b 224) 192) (if (< b 194) 0 1)
+                          (= (bit-and b 240) 224) 2
+                          (= (bit-and b 248) 240) (if (> b 244) 0 3)
+                          :else 0)]
+              (if (or (= k 0) (> (+ i k) (- n 1)))
+                i
+                (let [ok (loop [j 1] (if (> j k) true (if (= (bit-and (nth s (+ i j)) 192) 128) (recur (+ j 1)) false)))
+                      b1 (nth s (+ i 1))
+                      ok2 (cond (not ok) false
+                                (= b 224) (>= b1 160)
+                                (= b 237) (< b1 160)
+                                (= b 240) (>= b1 144)
+                                (= b 244) (< b1 144)
+                                :else true)]
+                  (if ok2 (recur (+ i (+ k 1))) i))))))))))
+
+(defn- normalize-newlines Str [s: Str]
+  (if (< (str/index-of-after s (chr 13) 0) 0) s
+    (let [n (count s)]
+      (loop [i 0 out ""]
+        (if (>= i n) out
+          (let [j (str/index-of-byte s i 13)
+                out2 (if (> j i) (str out (subs s i j)) out)]
+            (if (>= j n) out2
+              (recur (if (= (at s (+ j 1)) 10) (+ j 2) (+ j 1)) (str out2 (chr 10))))))))))
+
+(defn decode-to-utf8 Values(Str Str Str) [raw: &Str]
+  (let [b0 (at raw 0) b1 (at raw 1) b2 (at raw 2) b3 (at raw 3)]
+    (cond
+      (and (= b0 239) (= b1 187) (= b2 191))
+      (let [bad (utf8-invalid-at raw 3)]
+        (if (>= bad 0) (values "" "UTF-8" (str "invalid UTF-8 byte sequence at byte offset " bad))
+          (values (normalize-newlines (subs raw 3 (count raw))) "UTF-8" "")))
+      (and (= b0 255) (= b1 254))
+      (let [[t e] (utf16->utf8 raw 2 true)] (values (normalize-newlines t) "UTF-16LE" e))
+      (and (= b0 254) (= b1 255))
+      (let [[t e] (utf16->utf8 raw 2 false)] (values (normalize-newlines t) "UTF-16BE" e))
+      (and (= b0 60) (= b1 0) (= b2 63) (= b3 0))
+      (let [[t e] (utf16->utf8 raw 0 true)] (values (normalize-newlines t) "UTF-16LE" e))
+      (and (= b0 0) (= b1 60) (= b2 0) (= b3 63))
+      (let [[t e] (utf16->utf8 raw 0 false)] (values (normalize-newlines t) "UTF-16BE" e))
+      :else
+      (let [enc (upper (decl-pseudo raw "encoding"))]
+        (cond
+          (or (= enc "") (= enc "UTF-8") (= enc "UTF8"))
+          (let [bad (utf8-invalid-at raw 0)]
+            (if (>= bad 0) (values "" "UTF-8" (str "invalid UTF-8 byte sequence at byte offset " bad))
+              (values (normalize-newlines (str raw)) "UTF-8" "")))
+          (or (= enc "ISO-8859-1") (= enc "ISO8859-1") (= enc "ISO_8859-1") (= enc "LATIN1") (= enc "LATIN-1") (= enc "L1"))
+          (values (normalize-newlines (latin1->utf8 raw 0)) "ISO-8859-1" "")
+          (or (= enc "WINDOWS-1252") (= enc "CP1252"))
+          (values (normalize-newlines (cp1252->utf8 raw 0)) "WINDOWS-1252" "")
+          (or (= enc "US-ASCII") (= enc "ASCII"))
+          (let [bad (loop [i 0] (if (>= i (count raw)) -1 (if (>= (nth raw i) 128) i (recur (+ i 1)))))]
+            (if (>= bad 0) (values "" "US-ASCII" (str "non-ASCII byte in US-ASCII document at byte offset " bad))
+              (values (normalize-newlines (str raw)) "US-ASCII" "")))
+          (or (= enc "UTF-16") (= enc "UTF-16LE") (= enc "UTF-16BE"))
+          (values "" enc "UTF-16 declared but the document is not UTF-16 encoded (no BOM)")
+          :else
+          (match (ccs/canonical-name enc)
+            (None) (values "" enc (str "unsupported encoding: " enc))
+            (Some cs) (let [[t e] (ccs/decode raw cs false)] (values (normalize-newlines t) cs ""))))))))
+
+(def T-ERR 0)
+(def T-STARTDOC 1)
+(def T-DOCTYPE 2)
+(def T-START 3)
+(def T-END 4)
+(def T-TEXT 5)
+(def T-CDATA 6)
+(def T-COMMENT 7)
+(def T-PI 8)
+(def T-ENDDOC 9)
+(def T-NEED 10)
+
+(defrecord XmlReader
+  [src: Str pos: Int state: Int opts: XmlOpts enc: Str
+   depth: Int dn: Vec(Int) du: Vec(Int)
+   nsb: Vec(XNs) nsn: Int nsmark: Vec(Int)
+   ents: Map(Str Str) exts: Map(Str Str) adefs: Vec(XAttDef)
+   pend: Bool
+   esrc: Vec(Str) epos: Vec(Int) ename: Vec(Str) en: Int
+   nexp: Int nbytes: Int
+   seen-doctype: Bool
+   tpos: Int aspans: Vec(XASpan)
+   bline: Int bcol: Int eof: Bool all: Bool tail: Str fed: Int
+   ta: Int tb: Int tc: Int td: Int tt: Str err: Str v1: Str v2: Str v3: Str
+   na: Int ai: Vec(Int) av: Vec(Str) ao: Vec(Int) au: Vec(Int)
+   ih: Vec(Int) inm: Vec(Str) ipre: Vec(Str) iloc: Vec(Str) iok: Vec(Bool) ikd: Vec(Int) ihs: Vec(Int)])
+
+(defrecord- XAttDef [elem: Str attr: Str cdata: Bool has-default: Bool value: Str])
+
+(defn reader-depth Int [r: &XmlReader] (:depth r))
+
+(defn- zeros Vec(Int) [n: Int] (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc 0)))))
+
+(defn reader Values(XmlReader Str) [bytes: &Str opts: XmlOpts]
+  (let [[text enc err] (decode-to-utf8 bytes)
+        e0: Map(Str Str) {}
+        e1: Map(Str Str) {}
+        dn: Vec(Int) [] du: Vec(Int) []
+        vn: Vec(XNs) []
+        vi: Vec(Int) []
+        vs2: Vec(Str) []
+        vi2: Vec(Int) []
+        vs3: Vec(Str) []
+        ad: Vec(XAttDef) []
+        sp: Vec(XASpan) []
+        ai: Vec(Int) [] av: Vec(Str) [] ao: Vec(Int) [] au: Vec(Int) []
+        i1: Vec(Str) [] i2: Vec(Str) [] i3: Vec(Str) [] i4: Vec(Bool) [] i5: Vec(Int) [] i6: Vec(Int) []]
+    (values (->XmlReader text 0 0 opts enc 0 dn du vn 0 vi e0 e1 ad false vs2 vi2 vs3 0 0 0 false 0 sp 1 1 true false "" (count bytes)
+                         0 0 0 0 "" "" "" "" ""
+                         0 ai av ao au
+                         (zeros 64) i1 i2 i3 i4 i5 i6)
+            err)))
+
+(defn- msg-at Str [r: &XmlReader pos: Int msg: &Str]
+  (if (> (:en r) 0)
+    (str (line-col (nth (:esrc r) 0) (nth (:epos r) 0) (:bline r) (:bcol r)) ": " msg
+         " (in the replacement text of entity '" (nth (:ename r) (- (:en r) 1)) "')")
+    (str (line-col (:src r) pos (:bline r) (:bcol r)) ": " msg)))
+
+(defn- failure Values(XmlReader Int) [r: XmlReader pos: Int msg: &Str]
+  (let [m (msg-at r pos msg)]
+    (values (assoc r :state 5 :err m) T-ERR)))
+
+(defn- fail-tag Values(XmlReader Int) [r: XmlReader p: Int pos: Int msg: &Str]
+  (if (and (not (:eof r)) (< (tag-end (:src r) p) 0)) (values r T-NEED) (failure r pos msg)))
+
+(defn- bad-char-at Int [s: &Str i: Int j: Int]
+  (loop [k i]
+    (if (>= k j) -1
+      (let [c (nth s k)]
+        (cond (< c 32) (if (or (= c 9) (= c 10) (= c 13)) (recur (+ k 1)) k)
+              (and (= c 239) (= (at s (+ k 1)) 191) (>= (at s (+ k 2)) 190)) k
+              :else (recur (+ k 1)))))))
+
+(defn- parse-ref Values(Int Str Int Str) [s: &Str p: Int]
+  (if (= (at s (+ p 1)) 35)
+    (let [hex (= (at s (+ p 2)) 120)
+          d0 (if hex (+ p 3) (+ p 2))
+          [v d] (loop [d d0 v 0]
+                  (let [c (at s d)
+                        dv (cond (and (>= c 48) (<= c 57)) (- c 48)
+                                 (and hex (>= c 97) (<= c 102)) (+ 10 (- c 97))
+                                 (and hex (>= c 65) (<= c 70)) (+ 10 (- c 65))
+                                 :else -1)]
+                    (if (or (< dv 0) (> v 1114111)) (values v d)
+                      (recur (+ d 1) (+ (* v (if hex 16 10)) dv)))))]
+      (cond (or (= d d0) (not (= (at s d) 59))) (values 0 "" p "malformed character reference")
+            (not (xml-char? v)) (values 0 "" p (str "character reference to an illegal XML character (#" v ")"))
+            :else (values 0 (utf8 v) (+ d 1) "")))
+    (let [e (scan-name s (+ p 1))]
+      (if (or (= e (+ p 1)) (not (= (at s e) 59)))
+        (values 1 "" p "malformed entity reference ('&' must be escaped as &amp;)")
+        (values 1 (subs s (+ p 1) e) (+ e 1) "")))))
+
+(defn- predefined Str [name: &Str]
+  (cond (= name "lt") "<" (= name "gt") ">" (= name "amp") "&"
+        (= name "apos") "'" (= name "quot") (chr 34) :else ""))
+
+(defn- predefined? Bool [name: &Str]
+  (or (= name "lt") (= name "gt") (= name "amp") (= name "apos") (= name "quot")))
+
+(defn- expand-for-attr Values(Str Int Int Str)
+  [ents: &Map(Str Str) exts: &Map(Str Str) name: &Str depth: Int nexp0: Int nbytes0: Int opts: &XmlOpts]
+  (cond
+    (contains? exts name) (values "" nexp0 nbytes0 (str "reference to external entity '" name "' is not allowed in an attribute value"))
+    (not (contains? ents name)) (values "" nexp0 nbytes0 (str "undeclared entity '" name "'"))
+    (> depth 40) (values "" nexp0 nbytes0 (str "entity '" name "' is nested too deeply (recursive?)"))
+    :else
+    (let [v: Str (get ents name "")
+          nexp (+ nexp0 1)
+          nb (+ nbytes0 (count v))]
+      (cond
+        (> nexp (:max-expansions opts)) (values "" nexp nb (too-many opts))
+        (> nb (:max-expanded-bytes opts)) (values "" nexp nb "entity expansion exceeds the size limit")
+        :else (attr-text v ents exts depth nexp nb opts (str " in entity '" name "'"))))))
+
+(defn- attr-text Values(Str Int Int Str)
+  [v: &Str ents: &Map(Str Str) exts: &Map(Str Str) depth: Int nexp: Int nb: Int opts: &XmlOpts where: &Str]
+  (loop [i 0 out "" ne nexp nby nb]
+    (if (>= i (count v)) (values out ne nby "")
+      (let [c (nth v i)]
+        (cond
+          (= c 60) (values "" ne nby (str "'<' is not allowed in an attribute value" where))
+          (= c 38)
+          (let [[kind t p2 err] (parse-ref v i)]
+            (cond (not (= err "")) (values "" ne nby (str err where))
+                  (= kind 0) (recur p2 (str out t) ne nby)
+                  (predefined? t) (recur p2 (str out (predefined t)) ne nby)
+                  :else (let [[t2 ne2 nby2 err2] (expand-for-attr ents exts t (+ depth 1) ne nby opts)]
+                          (if (= err2 "") (recur p2 (str out t2) ne2 nby2) (values "" ne2 nby2 err2)))))
+          (or (= c 9) (= c 10) (= c 13)) (recur (+ i 1) (str out " ") ne nby)
+          :else (recur (+ i 1) (str out (chr c)) ne nby))))))
+
+(defn- collapse-spaces Str [v: &Str]
+  (loop [i 0 out "" pend false]
+    (if (>= i (count v)) out
+      (let [c (nth v i)]
+        (if (= c 32) (recur (+ i 1) out (> (count out) 0))
+          (recur (+ i 1) (str out (if pend " " "") (chr c)) false))))))
+
+(defn- parse-attr-value Values(Str Int Int Int Str Int) [r: &XmlReader p: Int ne0: Int nb0: Int]
+  (let [s (:src r)
+        q (at s p)
+        n (count s)]
+    (if (not (or (= q 34) (= q 39))) (values "" p 0 0 "attribute value must be quoted" p)
+      (loop [i (+ p 1) out "" ne ne0 nb nb0]
+        (if (>= i n) (values "" i ne nb "unterminated attribute value" p)
+          (let [c (nth s i)]
+            (cond
+              (= c q) (values out (+ i 1) ne nb "" 0)
+              (= c 60) (values "" i ne nb "'<' is not allowed in an attribute value" i)
+              (= c 38)
+              (let [[kind t p2 err] (parse-ref s i)]
+                (cond (not (= err "")) (values "" i ne nb err p2)
+                      (= kind 0) (recur p2 (str out t) ne nb)
+                      (predefined? t) (recur p2 (str out (predefined t)) ne nb)
+                      :else (let [[t2 ne2 nb2 err2] (expand-for-attr (:ents r) (:exts r) t 0 ne nb (:opts r))]
+                              (if (= err2 "") (recur p2 (str out t2) ne2 nb2) (values "" i ne2 nb2 err2 i)))))
+              (or (= c 9) (= c 10) (= c 13)) (recur (+ i 1) (str out " ") ne nb)
+              (< c 32) (values "" i ne nb "illegal XML character in attribute value" i)
+              :else
+              (let [j (loop [j (+ i 1)]
+                        (if (>= j n) j
+                          (let [d (nth s j)] (if (or (= d q) (= d 60) (= d 38) (< d 32)) j (recur (+ j 1))))))]
+                (recur j (str out (subs s i j)) ne nb)))))))))
+
+(defn- ns-lookup Values(Str Bool) [nsb: &Vec(XNs) nsn: Int prefix: &Str]
+  (loop [k (- nsn 1)]
+    (if (< k 0)
+      (cond (= prefix "xml") (values NS-XML true)
+            (= prefix "xmlns") (values NS-XMLNS true)
+            (= prefix "") (values "" true)
+            :else (values "" false))
+      (let [b (nth nsb k)]
+        (if (= (:prefix b) prefix) (values (:uri b) true) (recur (- k 1)))))))
+
+(def- IMAX 65536)
+
+(defn- split-name Values(Str Str Bool) [raw: Str]
+  (let [c (str/index-of-byte raw 0 58)]
+    (if (>= c (count raw)) (values "" raw true)
+      (let [pre (subs raw 0 c)
+            loc (subs raw (+ c 1) (count raw))
+            ok (and (> (count pre) 0) (> (count loc) 0) (not (has-byte? loc 58)) (name-start? (at loc 0)))]
+        (values pre loc ok)))))
+
+(defn- attr-kind Int [raw: &Str pre: &Str ok: Bool]
+  (cond (= raw "xmlns") 1 (= pre "xmlns") 2 ok 0 :else 3))
+
+(defn- hash-step Int [h: Int c: Int] (bit-and (* (bit-xor h c) 16777619) 4294967295))
+
+(defn- scan-name-h Values(Int Int) [s: &Str i: Int]
+  (let [n (count s)]
+    (if (and (< i n) (name-start? (nth s i)))
+      (loop [j (+ i 1) h (hash-step 2166136261 (nth s i))]
+        (if (and (< j n) (name-char? (nth s j))) (recur (+ j 1) (hash-step h (nth s j))) (values j h)))
+      (values i 0))))
+
+(defn- str-hash Int [t: &Str] (loop [i 0 h 2166136261] (if (>= i (count t)) h (recur (+ i 1) (hash-step h (nth t i))))))
+
+(defn- span= Bool [s: &Str a: Int b: Int t: &Str]
+  (and (= (- b a) (count t))
+       (loop [k 0] (if (>= k (count t)) true (if (= (nth s (+ a k)) (nth t k)) (recur (+ k 1)) false)))))
+
+(defn- rehash Vec(Int) [hs: &Vec(Int) size: Int]
+  (let [mask (- size 1)]
+    (loop [i 0 tab (zeros size)]
+      (if (>= i (count hs)) tab
+        (let [slot (loop [k (bit-and (nth hs i) mask)] (if (= (nth tab k) 0) k (recur (bit-and (+ k 1) mask))))]
+          (recur (+ i 1) (assoc tab slot (+ i 1))))))))
+
+(defn- find-name Int [r: &XmlReader s: &Str a: Int b: Int h: Int]
+  (let [tab (:ih r)
+        mask (- (count tab) 1)]
+    (loop [k (bit-and h mask)]
+      (let [e (nth tab k)]
+        (cond (= e 0) (- -1 k)
+              (and (= (nth (:ihs r) (- e 1)) h) (span= s a b (nth (:inm r) (- e 1)))) (- e 1)
+              :else (recur (bit-and (+ k 1) mask)))))))
+
+(defn- intern Values(XmlReader Int) [r: XmlReader s: &Str a: Int b: Int h: Int]
+  (let [f (find-name r s a b h)]
+    (if (>= f 0) (values r f)
+      (let [raw (subs s a b)
+            [pre loc ok] (split-name raw)
+            kind (attr-kind raw pre ok)
+            idx (count (:inm r))
+            r2 (assoc r :inm (conj (:inm r) raw) :ipre (conj (:ipre r) pre) :iloc (conj (:iloc r) loc)
+                        :iok (conj (:iok r) ok) :ikd (conj (:ikd r) kind) :ihs (conj (:ihs r) h) :ih (assoc (:ih r) (- -1 f) (+ idx 1)))
+            size (count (:ih r2))]
+        (values (if (> (* 2 (+ idx 1)) size) (assoc r2 :ih (rehash (:ihs r2) (* 2 size))) r2) idx)))))
+
+(defn- intern-str Values(XmlReader Int) [r: XmlReader t: &Str] (intern r t 0 (count t) (str-hash t)))
+
+(defn- intern-gc XmlReader [r0: XmlReader]
+  (let [old (:inm r0)
+        d (:depth r0)
+        z1: Vec(Str) [] z2: Vec(Str) [] z3: Vec(Str) [] z4: Vec(Bool) [] z5: Vec(Int) [] z6: Vec(Int) []
+        r1 (assoc r0 :ih (zeros 64) :inm z1 :ipre z2 :iloc z3 :iok z4 :ikd z5 :ihs z6)]
+    (loop [k 0 r r1]
+      (if (>= k d) r
+        (let [nm (nth old (nth (:dn r) k))
+              [r2 idx] (intern-str r nm)]
+          (recur (+ k 1) (assoc r2 :dn (assoc (:dn r2) k idx))))))))
+
+(defn- ns-index Values(Int Bool) [nsb: &Vec(XNs) nsn: Int prefix: &Str]
+  (loop [k (- nsn 1)]
+    (if (< k 0)
+      (cond (= (count prefix) 0) (values -1 true)
+            (= prefix "xml") (values -2 true)
+            (= prefix "xmlns") (values -3 true)
+            :else (values -1 false))
+      (if (= (:prefix (nth nsb k)) prefix) (values k true) (recur (- k 1))))))
+
+(defn- uri-at Str [r: &XmlReader k: Int]
+  (cond (>= k 0) (:uri (nth (:nsb r) k)) (= k -2) NS-XML (= k -3) NS-XMLNS :else ""))
+
+(defn- read-start Values(XmlReader Int) [r00: XmlReader p: Int]
+  (let [r0 (if (>= (count (:inm r00)) IMAX) (intern-gc r00) r00)
+        s (:src r0)
+        n (count s)
+        [ne eh] (scan-name-h s (+ p 1))]
+    (cond
+      (and (>= ne n) (not (:eof r0))) (values r0 T-NEED)
+      (= ne (+ p 1)) (fail-tag r0 p p "invalid element name")
+      :else
+      (let [[r1 ei] (intern r0 s (+ p 1) ne eh)
+            want (:spans (:opts r1))
+            n0 (:nexp r1)
+            b0 (:nbytes r1)
+            [r2 na endp empty nexp nbytes sps err errpos]
+            (loop [r r1 i ne na 0 nexp n0 nbytes b0 sacc: Vec(XASpan) []]
+              (let [j (skip-ws s i)
+                    c (at s j)]
+                (cond
+                  (= c 62) (values r na (+ j 1) false nexp nbytes sacc "" 0)
+                  (and (= c 47) (= (at s (+ j 1)) 62)) (values r na (+ j 2) true nexp nbytes sacc "" 0)
+                  (< c 0) (values r na j false nexp nbytes sacc (str "unexpected end of input in start tag <" (nth (:inm r) ei) ">") p)
+                  (= j i) (values r na j false nexp nbytes sacc "whitespace required between attributes" j)
+                  :else
+                  (let [[ae ah] (scan-name-h s j)
+                        k (skip-ws s ae)
+                        q (skip-ws s (+ k 1))
+                        qc (at s q)]
+                    (cond
+                      (= ae j) (values r na j false nexp nbytes sacc (str "invalid attribute name in <" (nth (:inm r) ei) ">") j)
+                      (not (= (at s k) 61)) (values r na k false nexp nbytes sacc (str "expected '=' after attribute '" (subs s j ae) "'") k)
+                      (not (or (= qc 34) (= qc 39))) (values r na q false nexp nbytes sacc "attribute value must be quoted" q)
+                      :else
+                      (let [e (loop [m (+ q 1)]
+                                (if (>= m n) m
+                                  (let [x (nth s m)] (if (or (= x qc) (= x 60) (= x 38) (< x 32)) m (recur (+ m 1))))))
+                            [v e2 nexp2 nbytes2 aerr aerrpos]
+                            (cond (>= e n) (values "" e nexp nbytes "unterminated attribute value" q)
+                                  (= (nth s e) qc) (values (subs s (+ q 1) e) (+ e 1) nexp nbytes "" 0)
+                                  :else (parse-attr-value r q nexp nbytes))]
+                        (if (not (= aerr "")) (values r na e2 false nexp2 nbytes2 sacc aerr aerrpos)
+                          (let [[ra ix] (intern r s j ae ah)
+                                sacc2 (if want (conj sacc (->XASpan (str (nth (:inm ra) ix)) (subs s (+ q 1) (- e2 1)) j e2 (+ q 1) (- e2 1) qc)) sacc)]
+                            (recur (assoc ra :ai (vset (:ai ra) na ix) :av (vset (:av ra) na v) :ao (vset (:ao ra) na j))
+                                   e2 (+ na 1) nexp2 nbytes2 sacc2)))))))))]
+        (if (not (= err "")) (fail-tag r2 p errpos err)
+          (let [r3 (if (= (count (:adefs r2)) 0) (assoc r2 :na na) (apply-attdefs (assoc r2 :na na) ei p))]
+            (process-start r3 p ei empty endp nexp nbytes sps)))))))
+
+(defn- apply-attdefs XmlReader [r0: XmlReader ei: Int p: Int]
+  (let [defs (:adefs r0)
+        raw (nth (:inm r0) ei)]
+    (loop [k 0 r r0]
+      (if (>= k (count defs)) r
+        (let [d (nth defs k)]
+          (if (not (= (:elem d) raw)) (recur (+ k 1) r)
+            (let [na (:na r)
+                  idx (loop [i 0] (if (>= i na) -1 (if (= (nth (:inm r) (nth (:ai r) i)) (:attr d)) i (recur (+ i 1)))))]
+              (cond
+                (>= idx 0)
+                (if (:cdata d) (recur (+ k 1) r)
+                  (let [cv (collapse-spaces (nth (:av r) idx))]
+                    (recur (+ k 1) (assoc r :av (vset (:av r) idx cv)))))
+                (:has-default d)
+                (let [[r2 ix] (intern-str r (:attr d))
+                      v (if (:cdata d) (str (:value d)) (collapse-spaces (:value d)))]
+                  (recur (+ k 1) (assoc r2 :na (+ na 1) :ai (vset (:ai r2) na ix) :av (vset (:av r2) na v) :ao (vset (:ao r2) na p))))
+                :else (recur (+ k 1) r)))))))))
+
+(defn- dup-raw Int [r: &XmlReader na: Int]
+  (cond
+    (< na 2) -1
+    (<= na 16)
+    (loop [j 1]
+      (if (>= j na) -1
+        (let [nj (nth (:ai r) j)
+              hit (loop [i 0] (if (>= i j) false (if (= (nth (:ai r) i) nj) true (recur (+ i 1)))))]
+          (if hit j (recur (+ j 1))))))
+    :else
+    (loop [j 0 seen: Map(Str Bool) {}]
+      (if (>= j na) -1
+        (let [aj (nth (:inm r) (nth (:ai r) j))]
+          (if (contains? seen aj) j (recur (+ j 1) (assoc seen aj true))))))))
+
+(defn- kind-at Int [r: &XmlReader i: Int] (nth (:ikd r) (nth (:ai r) i)))
+
+(defn- decl-error Values(Str Int) [r: &XmlReader na: Int]
+  (loop [i 0]
+    (if (>= i na) (values "" 0)
+      (let [k (kind-at r i)]
+        (if (or (= k 0) (= k 3)) (recur (+ i 1))
+          (let [pre (if (= k 1) "" (nth (:iloc r) (nth (:ai r) i)))
+                uri (nth (:av r) i)
+                pos (nth (:ao r) i)]
+            (cond
+              (and (> (count pre) 0) (= uri "")) (values (str "namespace prefix '" pre "' cannot be undeclared") pos)
+              (and (= pre "xml") (not (= uri NS-XML))) (values "prefix 'xml' cannot be rebound" pos)
+              (= pre "xmlns") (values "prefix 'xmlns' cannot be declared" pos)
+              (and (not (= pre "xml")) (or (= uri NS-XML) (= uri NS-XMLNS)))
+              (values (str "namespace '" uri "' cannot be bound to prefix '" pre "'") pos)
+              (has-byte? pre 58) (values "invalid namespace prefix" pos)
+              :else (recur (+ i 1)))))))))
+
+(defn- push-decls Vec(XNs) [nsb: Vec(XNs) r: &XmlReader na: Int base: Int]
+  (loop [i 0 k base v nsb]
+    (if (>= i na) v
+      (let [kd (kind-at r i)]
+        (if (or (= kd 0) (= kd 3)) (recur (+ i 1) k v)
+          (recur (+ i 1) (+ k 1) (vset v k (->XNs (if (= kd 1) "" (nth (:iloc r) (nth (:ai r) i))) (nth (:av r) i)))))))))
+
+(defn- ns-dup? Bool [r: &XmlReader i: Int uri: &Str]
+  (let [loc (nth (:iloc r) (nth (:ai r) i))]
+    (loop [j 0]
+      (if (>= j i) false
+        (if (and (= (kind-at r j) 0) (= (nth (:iloc r) (nth (:ai r) j)) loc) (= (uri-at r (nth (:au r) j)) uri)) true (recur (+ j 1)))))))
+
+(defn- attr-uris Values(XmlReader Str Int) [r0: XmlReader na: Int nsn: Int]
+  (loop [i 0 r r0 seen: Map(Str Bool) {}]
+    (if (>= i na) (values r "" 0)
+      (let [k (kind-at r i)
+            ix (nth (:ai r) i)]
+        (cond
+          (or (= k 1) (= k 2)) (recur (+ i 1) (assoc r :au (vset (:au r) i -1)) seen)
+          (= k 3) (values r (str "invalid qualified name '" (nth (:inm r) ix) "'") (nth (:ao r) i))
+          :else
+          (let [apre (nth (:ipre r) ix)
+                [ku afound] (if (= apre "") (values -1 true) (ns-index (:nsb r) nsn apre))
+                apos (nth (:ao r) i)]
+            (cond
+              (not afound) (values r (str "unbound namespace prefix '" apre "' on attribute '" (nth (:inm r) ix) "'") apos)
+              (< na 2) (recur (+ i 1) (assoc r :au (vset (:au r) i ku)) seen)
+              :else
+              (let [auri (uri-at r ku)
+                    aloc (nth (:iloc r) ix)]
+                (if (<= na 16)
+                  (if (ns-dup? r i auri) (values r (str "duplicate attribute '" aloc "' in namespace '" auri "'") apos)
+                    (recur (+ i 1) (assoc r :au (vset (:au r) i ku)) seen))
+                  (let [key (str auri " " aloc)]
+                    (if (contains? seen key) (values r (str "duplicate attribute '" aloc "' in namespace '" auri "'") apos)
+                      (recur (+ i 1) (assoc r :au (vset (:au r) i ku)) (assoc seen key true)))))))))))))
+
+(defn- process-start Values(XmlReader Int)
+  [r: XmlReader p: Int ei: Int empty: Bool endp: Int nexp: Int nbytes: Int sps: Vec(XASpan)]
+  (let [na (:na r)
+        lim (:max-attrs (:opts r))
+        dup (if (< na 2) -1 (dup-raw r na))]
+    (cond
+      (and (>= lim 0) (> na lim)) (failure r (nth (:ao r) lim) (str "Attribute limit (" lim ") exceeded"))
+      (>= dup 0) (failure r (nth (:ao r) dup) (str "duplicate attribute '" (nth (:inm r) (nth (:ai r) dup)) "'"))
+      :else
+      (let [[nerr nerrpos] (if (= na 0) (values "" 0) (decl-error r na))]
+        (if (not (= nerr "")) (failure r nerrpos nerr)
+          (let [depth (:depth r)
+                base (:nsn r)
+                nd (loop [i 0 c 0] (if (>= i na) c (recur (+ i 1) (let [k (kind-at r i)] (if (or (= k 1) (= k 2)) (+ c 1) c)))))
+                nsn (+ base nd)
+                r1 (if (= nd 0) r (assoc r :nsb (push-decls (:nsb r) r na base) :nsn nsn))
+                epre (nth (:ipre r1) ei)
+                [eu efound] (ns-index (:nsb r1) nsn epre)
+                maxd (:max-depth (:opts r1))]
+            (cond
+              (not (nth (:iok r1) ei)) (failure r1 p (str "invalid qualified name '" (nth (:inm r1) ei) "'"))
+              (not efound) (failure r1 p (str "unbound namespace prefix '" epre "' on element <" (nth (:inm r1) ei) ">"))
+              (>= depth maxd) (failure r1 p (str "element nesting exceeds the maximum depth " maxd))
+              :else
+              (let [[r2 aerr aerrpos] (if (= na 0) (values r1 "" 0) (attr-uris r1 na nsn))]
+                (if (not (= aerr "")) (failure r2 aerrpos aerr)
+                  (let [r3 (assoc r2 :nsmark (vset (:nsmark r2) depth base) :dn (vset (:dn r2) depth ei) :du (vset (:du r2) depth eu)
+                                     :depth (+ depth 1) :pos endp)
+                        r4 (if (= (:state r3) 2) r3 (assoc r3 :state 2))
+                        r5 (if empty (assoc r4 :pend true) r4)
+                        r6 (if (and (= nexp (:nexp r5)) (= nbytes (:nbytes r5))) r5 (assoc r5 :nexp nexp :nbytes nbytes))]
+                    (values (if (:spans (:opts r6)) (assoc r6 :tpos p :aspans sps) r6) T-START)))))))))))
+
+(defn- pop-element Values(XmlReader Int) [r: XmlReader]
+  (let [d (- (:depth r) 1)
+        m (nth (:nsmark r) d)
+        r1 (assoc r :depth d)
+        r2 (if (= m (:nsn r1)) r1 (assoc r1 :nsn m))
+        r3 (if (:pend r2) (assoc r2 :pend false) r2)]
+    (values (if (= d 0) (assoc r3 :state 3) r3) T-END)))
+
+(defn- read-end Values(XmlReader Int) [r: XmlReader p: Int]
+  (let [s (:src r)
+        ne (scan-name s (+ p 2))
+        k (skip-ws s ne)
+        d (:depth r)]
+    (cond
+      (= ne (+ p 2)) (fail-tag r p p "invalid end tag")
+      (not (= (at s k) 62)) (fail-tag r p k (str "expected '>' to close end tag </" (subs s (+ p 2) ne)))
+      (= d 0) (failure r p (str "end tag </" (subs s (+ p 2) ne) "> without a matching start tag"))
+      (not (span= s (+ p 2) ne (nth (:inm r) (nth (:dn r) (- d 1)))))
+      (failure r p (str "mismatched end tag: expected </" (nth (:inm r) (nth (:dn r) (- d 1))) "> but found </" (subs s (+ p 2) ne) ">"))
+      :else (pop-element (if (:spans (:opts r)) (assoc r :pos (+ k 1) :tpos p) (assoc r :pos (+ k 1)))))))
+
+(defn- read-comment Values(XmlReader Int) [r: XmlReader p: Int]
+  (let [s (:src r)
+        e (str/index-of-after s "--" (+ p 4))]
+    (cond
+      (< e 0) (failure r p "unterminated comment")
+      (not (= (at s (+ e 2)) 62)) (failure r e "'--' is not allowed inside a comment")
+      :else
+      (let [bad (bad-char-at s (+ p 4) e)]
+        (if (>= bad 0) (failure r bad "illegal XML character in comment")
+          (values (assoc r :pos (+ e 3) :ta (+ p 4) :tb e) T-COMMENT))))))
+
+(defn- read-pi Values(XmlReader Int) [r: XmlReader p: Int]
+  (let [s (:src r)
+        te (scan-name s (+ p 2))
+        target (subs s (+ p 2) te)]
+    (cond
+      (= te (+ p 2)) (failure r p "invalid processing instruction target")
+      (= (upper target) "XML") (failure r p "XML declaration is only allowed at the start of the document")
+      (has-byte? target 58) (failure r p "processing instruction target must not contain ':'")
+      :else
+        (let [e (str/index-of-after s "?>" te)]
+          (cond
+            (< e 0) (failure r p "unterminated processing instruction")
+            (and (> e te) (not (ws? (nth s te)))) (failure r te "whitespace required after processing instruction target")
+            :else
+            (let [ds (skip-ws s te)
+                  d0 (if (> ds e) e ds)
+                  bad (bad-char-at s d0 e)]
+              (if (>= bad 0) (failure r bad "illegal XML character in processing instruction")
+                (values (assoc r :pos (+ e 2) :ta (+ p 2) :tb te :tc d0 :td e) T-PI))))))))
+
+(defn- read-cdata Values(XmlReader Int) [r: XmlReader p: Int]
+  (let [s (:src r)
+        e (str/index-of-after s "]]>" (+ p 9))]
+    (if (< e 0) (failure r p "unterminated CDATA section")
+      (let [bad (bad-char-at s (+ p 9) e)]
+        (if (>= bad 0) (failure r bad "illegal XML character in CDATA section")
+          (values (assoc r :pos (+ e 3) :ta (+ p 9) :tb e) T-CDATA))))))
+
+(defn- push-entity XmlReader [r: XmlReader name: Str value: Str after: Int]
+  (let [en (:en r)]
+    (assoc r
+           :esrc (vset (:esrc r) en (:src r))
+           :epos (vset (:epos r) en after)
+           :ename (vset (:ename r) en name)
+           :en (+ en 1)
+           :src value
+           :pos 0)))
+
+(defn- pop-entity XmlReader [r: XmlReader]
+  (let [en (- (:en r) 1)]
+    (assoc r :src (nth (:esrc r) en) :pos (nth (:epos r) en) :en en)))
+
+(defn- entity-active? Bool [r: &XmlReader name: &Str]
+  (loop [k 0] (if (>= k (:en r)) false (if (= (nth (:ename r) k) name) true (recur (+ k 1))))))
+
+(defn- accumulate-text Values(XmlReader Str Str) [r0: XmlReader]
+  (loop [r r0 acc ""]
+    (let [s (:src r)
+          p (:pos r)
+          n (count s)]
+      (if (>= p n)
+        (if (> (:en r) 0) (recur (pop-entity r) acc) (values r acc ""))
+        (let [c (nth s p)]
+          (cond
+            (= c 60) (values r acc "")
+            (= c 38)
+            (let [[kind t p2 err] (parse-ref s p)
+                  [xv xf] (if (and (= err "") (not= kind 0) (not (predefined? t)) (contains? (:exts r) t))
+                            ((:ext (:opts r)) (get (:exts r) t ""))
+                            (values "" false))]
+              (cond
+                (not (= err "")) (values r acc (msg-at r p err))
+                (= kind 0) (recur (assoc r :pos p2) (str acc t))
+                (predefined? t) (recur (assoc r :pos p2) (str acc (predefined t)))
+                (and (contains? (:exts r) t) (not xf)) (values r acc (msg-at r p (str "reference to external entity '" t "' is not allowed")))
+                (and (not (contains? (:ents r) t)) (not xf)) (values r acc (msg-at r p (str "undeclared entity '" t "'")))
+                (entity-active? r t) (values r acc (msg-at r p (str "recursive reference to entity '" t "'")))
+                :else
+                (let [v: Str (if xf (str xv) (get (:ents r) t ""))
+                      nexp (+ (:nexp r) 1)
+                      nb (+ (:nbytes r) (count v))]
+                  (cond
+                    (> nexp (:max-expansions (:opts r))) (values r acc (msg-at r p (too-many (:opts r))))
+                    (> nb (:max-expanded-bytes (:opts r))) (values r acc (msg-at r p "entity expansion exceeds the size limit"))
+                    (and (not (has-byte? v 60)) (not (has-byte? v 38)))
+                    (recur (assoc r :pos p2 :nexp nexp :nbytes nb) (str acc v))
+                    :else (recur (push-entity (assoc r :nexp nexp :nbytes nb) t v p2) acc)))))
+            :else
+            (let [j (str/index-of-either s p 60 38)
+                  bad (bad-char-at s p j)
+                  cd (find-lit s "]]>" p j)]
+              (cond
+                (>= bad 0) (values r acc (msg-at r bad "illegal XML character in content"))
+                (>= cd 0) (values r acc (msg-at r cd "']]>' is not allowed in content"))
+                :else (recur (assoc r :pos j) (str acc (subs s p j)))))))))))
+
+(defn- read-text Values(XmlReader Int) [r: XmlReader]
+  (let [s (:src r)
+        p (:pos r)
+        n (count s)
+        live (not (:eof r))
+        j (str/index-of-either s p 60 38)]
+    (cond
+      (and live (>= j n)) (values r T-NEED)
+      (and live (= (nth s j) 38) (>= (str/index-of-byte s j 60) n)) (values r T-NEED)
+      (or (and (< j n) (= (nth s j) 60)) (and (>= j n) (= (:en r) 0)))
+      (let [bad (bad-char-at s p j)
+            cd (find-lit s "]]>" p j)]
+        (cond (>= bad 0) (failure r bad "illegal XML character in content")
+              (>= cd 0) (failure r cd "']]>' is not allowed in content")
+              :else (values (assoc r :pos j :ta p) T-TEXT)))
+      :else
+      (let [[r2 acc err] (accumulate-text r)]
+        (cond (not (= err "")) (values (assoc r2 :state 5 :err err) T-ERR)
+              (> (count acc) 0) (values (assoc r2 :tt acc :ta -1) T-TEXT)
+              :else (values r2 -1))))))
+
+(defn- quoted Values(Str Int Str) [s: &Str p: Int]
+  (let [q (at s p)]
+    (if (not (or (= q 34) (= q 39))) (values "" p "expected a quoted literal")
+      (let [e (str/index-of-byte s (+ p 1) q)]
+        (if (>= e (count s)) (values "" p "unterminated literal")
+          (values (subs s (+ p 1) e) (+ e 1) ""))))))
+
+(defn- parse-xml-decl Values(Str Str Str Int Str Int) [s: &Str]
+  (let [e (str/index-of-after s "?>" 5)]
+    (if (< e 0) (values "" "" "" 0 "unterminated XML declaration" 0)
+      (loop [i 5 ver "" enc "" sa "" stage 0]
+        (let [j (skip-ws s i)]
+          (if (>= j e)
+            (cond (= ver "") (values "" "" "" 0 "XML declaration without version" 0)
+                  :else (values ver enc sa (+ e 2) "" 0))
+            (if (= j i) (values "" "" "" 0 "whitespace required in XML declaration" j)
+              (let [ke (scan-name s j)
+                    key (subs s j ke)
+                    k2 (skip-ws s ke)
+                    [v ve verr] (if (= (at s k2) 61) (quoted s (skip-ws s (+ k2 1))) (values "" k2 "expected '='"))]
+                (cond
+                  (not (= verr "")) (values "" "" "" 0 (str verr " in XML declaration") k2)
+                  (> ve e) (values "" "" "" 0 "malformed XML declaration" j)
+                  (and (= key "version") (= stage 0))
+                  (if (and (starts-at? v 0 "1.") (> (count v) 2)) (recur ve v enc sa 1)
+                    (values "" "" "" 0 (str "unsupported XML version '" v "'") j))
+                  (and (= key "encoding") (= stage 1)) (recur ve ver v sa 2)
+                  (and (= key "standalone") (>= stage 1) (< stage 3))
+                  (if (or (= v "yes") (= v "no")) (recur ve ver enc v 3)
+                    (values "" "" "" 0 "standalone must be 'yes' or 'no'" j))
+                  :else (values "" "" "" 0 (str "unexpected '" key "' in XML declaration") j))))))))))
+
+(defn- skip-decl Int [s: &Str p: Int]
+  (let [n (count s)]
+    (loop [i p q 0]
+      (if (>= i n) -1
+        (let [c (nth s i)]
+          (cond (> q 0) (recur (+ i 1) (if (= c q) 0 q))
+                (or (= c 34) (= c 39)) (recur (+ i 1) c)
+                (= c 62) (+ i 1)
+                :else (recur (+ i 1) 0)))))))
+
+(defn- entity-value Values(Str Str) [lit: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count lit)) (values out "")
+      (let [c (nth lit i)]
+        (if (and (= c 38) (= (at lit (+ i 1)) 35))
+          (let [[kind t p2 err] (parse-ref lit i)]
+            (if (= err "") (recur p2 (str out t)) (values "" err)))
+          (if (= c 37) (values "" "parameter entity references are not supported in entity values")
+            (recur (+ i 1) (str out (chr c)))))))))
+
+(defn- parse-entity-decl Values(Map(Str Str) Map(Str Str) Int Str Int) [s: &Str p: Int ents: Map(Str Str) exts: Map(Str Str) keep: Bool]
+  (let [i (skip-ws s (+ p 8))]
+    (cond
+      (= i (+ p 8)) (values ents exts 0 "whitespace required after <!ENTITY" i)
+      (= (at s i) 37)
+      (let [e (skip-decl s i)] (if (< e 0) (values ents exts 0 "unterminated entity declaration" p) (values ents exts e "" 0)))
+      :else
+      (let [ne (scan-name s i)
+            name (subs s i ne)
+            j (skip-ws s ne)
+            c (at s j)]
+        (cond
+          (= ne i) (values ents exts 0 "invalid entity name" i)
+          (= j ne) (values ents exts 0 "whitespace required after entity name" j)
+          (or (= c 34) (= c 39))
+          (let [[lit le lerr] (quoted s j)
+                [v verr] (entity-value lit)
+                k (skip-ws s le)]
+            (cond
+              (not (= lerr "")) (values ents exts 0 lerr j)
+              (not (= verr "")) (values ents exts 0 verr j)
+              (not (= (at s k) 62)) (values ents exts 0 "expected '>' to close entity declaration" k)
+              (or (contains? ents name) (contains? exts name) (predefined? name)) (values ents exts (+ k 1) "" 0)
+              :else (values (if keep (assoc ents name v) ents) exts (+ k 1) "" 0)))
+          (or (starts-at? s j "SYSTEM") (starts-at? s j "PUBLIC"))
+          (let [pub (starts-at? s j "PUBLIC")
+                [l1 e1 err1] (quoted s (skip-ws s (+ j 6)))
+                [l2 e2 err2] (if pub (quoted s (skip-ws s e1)) (values l1 e1 err1))
+                e (skip-decl s e2)]
+            (cond
+              (not (= err1 "")) (values ents exts 0 err1 j)
+              (not (= err2 "")) (values ents exts 0 err2 j)
+              (< e 0) (values ents exts 0 "unterminated entity declaration" p)
+              (or (contains? ents name) (contains? exts name)) (values ents exts e "" 0)
+              :else (values ents (if keep (assoc exts name l2) exts) e "" 0)))
+          :else (values ents exts 0 "expected entity value or external identifier" j))))))
+
+(defn- parse-attlist Values(Vec(XAttDef) Int Str Int Int Int)
+  [s: &Str p: Int defs0: Vec(XAttDef) ents: &Map(Str Str) exts: &Map(Str Str) opts: &XmlOpts nexp0: Int nb0: Int]
+  (let [i (skip-ws s (+ p 9))
+        ne (scan-name s i)
+        elem (subs s i ne)]
+    (if (or (= i (+ p 9)) (= ne i)) (values defs0 0 "malformed ATTLIST declaration" p nexp0 nb0)
+      (loop [j ne defs defs0 nx nexp0 nbx nb0]
+        (let [a (skip-ws s j)]
+          (cond
+            (= (at s a) 62) (values defs (+ a 1) "" 0 nx nbx)
+            (< (at s a) 0) (values defs 0 "unterminated ATTLIST declaration" p nx nbx)
+            (= a j) (values defs 0 "whitespace required in ATTLIST declaration" a nx nbx)
+            :else
+            (let [ae (scan-name s a)
+                  aname (subs s a ae)
+                  t (skip-ws s ae)
+                  [cdata te terr] (cond
+                                    (= (at s t) 40)
+                                    (let [e (str/index-of-byte s t 41)] (if (>= e (count s)) (values false t "malformed enumerated type") (values false (+ e 1) "")))
+                                    (starts-at? s t "NOTATION")
+                                    (let [o (skip-ws s (+ t 8)) e (str/index-of-byte s o 41)]
+                                      (if (or (not (= (at s o) 40)) (>= e (count s))) (values false t "malformed NOTATION type") (values false (+ e 1) "")))
+                                    :else (let [e (scan-name s t)]
+                                            (if (= e t) (values false t "missing attribute type") (values (= (subs s t e) "CDATA") e ""))))
+                  d (skip-ws s te)
+                  fixed (starts-at? s d "#FIXED")
+                  d2 (if fixed (skip-ws s (+ d 6)) d)
+                  [has lit de derr] (cond
+                                      (starts-at? s d2 "#REQUIRED") (values false "" (+ d2 9) "")
+                                      (starts-at? s d2 "#IMPLIED") (values false "" (+ d2 8) "")
+                                      :else (let [[l e err] (quoted s d2)] (values true l e err)))]
+              (cond
+                (= ae a) (values defs 0 "invalid attribute name in ATTLIST" a nx nbx)
+                (not (= terr "")) (values defs 0 terr t nx nbx)
+                (not (= derr "")) (values defs 0 derr d2 nx nbx)
+                :else
+                (let [[v ne2 nb2 verr] (if has (attr-text lit ents exts 0 nx nbx opts " (attribute default)") (values "" nx nbx ""))
+                      dup (loop [k 0] (if (>= k (count defs)) false (let [x (nth defs k)] (if (and (= (:elem x) elem) (= (:attr x) aname)) true (recur (+ k 1))))))]
+                  (cond
+                    (not (= verr "")) (values defs 0 verr d2 ne2 nb2)
+                    dup (recur de defs ne2 nb2)
+                    :else (recur de (conj defs (->XAttDef (str elem) aname cdata has v)) ne2 nb2)))))))))))
+
+(defn- parse-int-subset Values(Map(Str Str) Map(Str Str) Vec(XAttDef) Int Str Int Int Int)
+  [s: &Str p0: Int ents0: Map(Str Str) exts0: Map(Str Str) defs0: Vec(XAttDef) opts: &XmlOpts nexp0: Int nb0: Int]
+  (loop [p p0 ents ents0 exts exts0 defs defs0 nx nexp0 nbx nb0]
+    (let [i (skip-ws s p)
+          c (at s i)]
+      (cond
+        (< c 0) (values ents exts defs 0 "unterminated DOCTYPE internal subset" p0 nx nbx)
+        (= c 93) (values ents exts defs (+ i 1) "" 0 nx nbx)
+        (= c 37) (let [e (str/index-of-byte s i 59)]
+                   (if (>= e (count s)) (values ents exts defs 0 "malformed parameter entity reference" i nx nbx) (recur (+ e 1) ents exts defs nx nbx)))
+        (starts-at? s i "<!--")
+        (let [e (str/index-of-after s "-->" (+ i 4))] (if (< e 0) (values ents exts defs 0 "unterminated comment" i nx nbx) (recur (+ e 3) ents exts defs nx nbx)))
+        (starts-at? s i "<?")
+        (let [e (str/index-of-after s "?>" (+ i 2))] (if (< e 0) (values ents exts defs 0 "unterminated processing instruction" i nx nbx) (recur (+ e 2) ents exts defs nx nbx)))
+        (starts-at? s i "<!ENTITY")
+        (let [[ents2 exts2 e err errpos] (parse-entity-decl s i ents exts (:dtd opts))]
+          (if (not= err "") (values ents2 exts2 defs 0 err errpos nx nbx) (recur e ents2 exts2 defs nx nbx)))
+        (starts-at? s i "<!ATTLIST")
+        (if (:dtd opts)
+          (let [[defs2 e err errpos nx2 nbx2] (parse-attlist s i defs ents exts opts nx nbx)]
+            (if (= err "") (recur e ents exts defs2 nx2 nbx2) (values ents exts defs2 0 err errpos nx2 nbx2)))
+          (let [e (skip-decl s i)] (if (< e 0) (values ents exts defs 0 "unterminated ATTLIST declaration" i nx nbx) (recur e ents exts defs nx nbx))))
+        (or (starts-at? s i "<!ELEMENT") (starts-at? s i "<!NOTATION"))
+        (let [e (skip-decl s i)] (if (< e 0) (values ents exts defs 0 "unterminated markup declaration" i nx nbx) (recur e ents exts defs nx nbx)))
+        :else (values ents exts defs 0 "unexpected content in DOCTYPE internal subset" i nx nbx)))))
+
+(defn- read-doctype Values(XmlReader Int) [r: XmlReader p: Int]
+  (let [s (:src r)
+        i (skip-ws s (+ p 9))
+        ne (scan-name s i)
+        name (subs s i ne)
+        j (skip-ws s ne)]
+    (cond
+      (:seen-doctype r) (failure r p "only one DOCTYPE declaration is allowed")
+      (or (= i (+ p 9)) (= ne i)) (failure r i "DOCTYPE requires a root element name")
+      :else
+      (let [pub (starts-at? s j "PUBLIC")
+            sys (starts-at? s j "SYSTEM")
+            [pubid e1 err1] (if pub (quoted s (skip-ws s (+ j 6))) (values "" j ""))
+            [sysid e2 err2] (cond pub (quoted s (skip-ws s e1))
+                                  sys (quoted s (skip-ws s (+ j 6)))
+                                  :else (values "" j ""))
+            k (skip-ws s e2)]
+        (cond
+          (not (= err1 "")) (failure r j err1)
+          (not (= err2 "")) (failure r j err2)
+          (= (at s k) 91)
+          (let [[ents exts adefs e err errpos nx nbx] (parse-int-subset s (+ k 1) (:ents r) (:exts r) (:adefs r) (:opts r) (:nexp r) (:nbytes r))
+                k2 (skip-ws s e)]
+            (cond (not (= err "")) (failure r errpos err)
+                  (not (= (at s k2) 62)) (failure r k2 "expected '>' to close DOCTYPE")
+                  :else (values (assoc r :ents ents :exts exts :adefs adefs :pos (+ k2 1) :seen-doctype true :nexp nx :nbytes nbx
+                                         :v1 name :v2 pubid :v3 sysid)
+                                T-DOCTYPE)))
+          (= (at s k) 62) (values (assoc r :pos (+ k 1) :seen-doctype true :v1 name :v2 pubid :v3 sysid) T-DOCTYPE)
+          :else (failure r k "malformed DOCTYPE declaration"))))))
+
+(defn- markup-ready Int [s: &Str p: Int n: Int]
+  (cond
+    (< (- n p) 9) 0
+    (starts-at? s p "<!--") (if (>= (str/index-of-after s "-->" (+ p 4)) 0) 1 0)
+    (starts-at? s p "<![CDATA[") (if (>= (str/index-of-after s "]]>" (+ p 9)) 0) 1 0)
+    (starts-at? s p "<!DOCTYPE") 2
+    (starts-at? s p "<?") (if (>= (str/index-of-after s "?>" (+ p 2)) 0) 1 0)
+    :else (if (>= (tag-end s p) 0) 1 0)))
+
+(defn- read-decl Values(XmlReader Int) [r: XmlReader]
+  (let [s (:src r)
+        n (count s)
+        decl (and (starts-at? s 0 "<?xml") (or (ws? (at s 5)) (starts-at? s 5 "?>")))]
+    (cond
+      (and (not (:eof r)) (or (< n 6) (and decl (< (str/index-of-after s "?>" 0) 0)))) (values r T-NEED)
+      decl (let [[ver enc sa e err errpos] (parse-xml-decl s)]
+             (if (= err "") (values (assoc r :pos e :state 1 :v1 ver :v2 enc :v3 sa) T-STARTDOC) (failure r errpos err)))
+      :else (values (assoc r :state 1 :v1 "" :v2 "" :v3 "") T-STARTDOC))))
+
+(defn- read-outside Values(XmlReader Int) [r: XmlReader]
+  (let [s (:src r)
+        st (:state r)
+        n (count s)
+        p (skip-ws s (:pos r))
+        c (at s p)
+        live (not (:eof r))]
+    (cond
+      (< c 0) (cond live (values r T-NEED)
+                    (= st 1) (failure r p "no root element")
+                    :else (values (assoc r :pos p :state 4) T-ENDDOC))
+      (not (= c 60)) (failure r p (if (= st 1) "content is not allowed in prolog" "content is not allowed after the root element"))
+      (and live (>= (+ p 1) n)) (values r T-NEED)
+      (or (= (at s (+ p 1)) 33) (= (at s (+ p 1)) 63))
+      (let [u (if live (markup-ready s p n) 1)]
+        (cond (= u 0) (values r T-NEED)
+              (= u 2) (values (assoc r :all true) T-NEED)
+              (starts-at? s p "<!--") (read-comment r p)
+              (starts-at? s p "<?") (read-pi r p)
+              (starts-at? s p "<!DOCTYPE") (if (= st 1) (read-doctype r p) (failure r p "DOCTYPE is not allowed after the root element"))
+              :else (failure r p "markup is not allowed outside the root element")))
+      (= (at s (+ p 1)) 47) (fail-tag r p p "end tag outside the root element")
+      (= st 3) (fail-tag r p p "only one root element is allowed")
+      :else (read-start r p))))
+
+(defn- read-content Values(XmlReader Int) [r: XmlReader]
+  (let [s (:src r)
+        p (:pos r)
+        n (count s)
+        c (at s p)
+        live (not (:eof r))]
+    (cond
+      (< c 0) (cond (> (:en r) 0) (values (pop-entity r) -1)
+                    live (values r T-NEED)
+                    :else (failure r p (str "unexpected end of input: element <" (nth (:inm r) (nth (:dn r) (- (:depth r) 1))) "> is not closed")))
+      (= c 60)
+      (let [c1 (at s (+ p 1))]
+        (cond
+          (and live (< c1 0)) (values r T-NEED)
+          (= c1 47) (read-end r p)
+          (or (= c1 33) (= c1 63))
+          (let [u (if live (markup-ready s p n) 1)]
+            (cond (= u 0) (values r T-NEED)
+                  (= u 2) (values (assoc r :all true) T-NEED)
+                  (starts-at? s p "<!--") (read-comment r p)
+                  (starts-at? s p "<![CDATA[") (read-cdata r p)
+                  (starts-at? s p "<?") (read-pi r p)
+                  :else (failure r p "markup declaration is not allowed in content")))
+          :else (read-start r p)))
+      :else (read-text r))))
+
+(defn next-token Values(XmlReader Int) [r0: XmlReader]
+  (loop [r r0]
+    (let [st (:state r)]
+      (cond
+        (:pend r) (pop-element r)
+        (>= st 4) (values r T-ENDDOC)
+        (and (:all r) (not (:eof r))) (values r T-NEED)
+        (= st 0) (read-decl r)
+        (or (= st 1) (= st 3)) (let [[r2 k] (read-outside r)] (if (< k 0) (recur r2) (values r2 k)))
+        :else
+        (let [s (:src r)
+              p (:pos r)
+              c (at s p)]
+          (cond
+            (= c 60)
+            (let [c1 (at s (+ p 1))]
+              (cond
+                (= c1 47) (read-end r p)
+                (and (>= c1 0) (not (= c1 33)) (not (= c1 63))) (read-start r p)
+                :else (let [[r2 k] (read-content r)] (if (< k 0) (recur r2) (values r2 k)))))
+            (> c 0) (let [[r2 k] (read-text r)] (if (< k 0) (recur r2) (values r2 k)))
+            :else (let [[r2 k] (read-content r)] (if (< k 0) (recur r2) (values r2 k)))))))))
+
+(defn- qname-at QName [r: &XmlReader d: Int]
+  (let [ix (nth (:dn r) d)] (->QName (uri-at r (nth (:du r) d)) (nth (:ipre r) ix) (nth (:iloc r) ix))))
+
+(defn- token-attrs Vec(XAttr) [r: &XmlReader]
+  (loop [i 0 acc: Vec(XAttr) []]
+    (if (>= i (:na r)) acc
+      (let [ix (nth (:ai r) i)]
+        (recur (+ i 1) (if (= (nth (:ikd r) ix) 0) (conj acc (->XAttr (->QName (uri-at r (nth (:au r) i)) (nth (:ipre r) ix) (nth (:iloc r) ix)) (nth (:av r) i))) acc))))))
+
+(defn- token-decls Vec(XNs) [r: &XmlReader]
+  (let [base (nth (:nsmark r) (- (:depth r) 1))]
+    (loop [k base acc: Vec(XNs) []] (if (>= k (:nsn r)) acc (recur (+ k 1) (conj acc (nth (:nsb r) k)))))))
+
+(defn token-event Values(XEvent Str) [r: &XmlReader k: Int]
+  (cond
+    (= k T-START) (values (->XeStart (qname-at r (- (:depth r) 1)) (token-attrs r) (token-decls r)) "")
+    (= k T-END) (values (->XeEnd (qname-at r (:depth r))) "")
+    (= k T-TEXT) (values (->XeText (token-text r)) "")
+    (= k T-CDATA) (values (->XeCData (token-span r)) "")
+    (= k T-COMMENT) (values (->XeComment (token-span r)) "")
+    (= k T-PI) (values (->XePI (token-span r) (subs (:src r) (:tc r) (:td r))) "")
+    (= k T-STARTDOC) (values (->XeStartDoc (:v1 r) (:v2 r) (:v3 r)) "")
+    (= k T-DOCTYPE) (values (->XeDoctype (:v1 r) (:v2 r) (:v3 r)) "")
+    (= k T-ERR) (values (->XeEndDoc) (:err r))
+    :else (values (->XeEndDoc) "")))
+
+(defn next-event Values(XmlReader XEvent Str) [r0: XmlReader]
+  (let [[r k] (next-token r0)
+        [ev err] (token-event r k)]
+    (values r ev err)))
+
+(defn- ws-only? Bool [s: &Str]
+  (loop [i 0] (if (>= i (count s)) true (if (ws? (nth s i)) (recur (+ i 1)) false))))
+
+(defn chunkable? Bool [first: &Str]
+  (let [b0 (at first 0) b1 (at first 1)]
+    (cond (or (and (= b0 255) (= b1 254)) (and (= b0 254) (= b1 255)) (and (= b0 60) (= b1 0)) (and (= b0 0) (= b1 60))) false
+          :else (let [raw (if (and (= b0 239) (= b1 187) (= (at first 2) 191)) (subs first 3 (count first)) (str first))
+                      enc (upper (decl-pseudo raw "encoding"))]
+                  (and (or (not (starts-at? raw 0 "<?xml")) (>= (str/index-of-after raw "?>" 0) 0))
+                       (or (= enc "") (= enc "UTF-8") (= enc "UTF8")))))))
+
+(defn- held Int [raw: &Str]
+  (let [n (count raw)
+        lead (loop [k 1]
+               (if (or (> k 3) (> k n)) 0
+                 (let [b (nth raw (- n k))]
+                   (cond (< b 128) 0
+                         (>= b 192) (let [need (cond (= (bit-and b 224) 192) 2 (= (bit-and b 240) 224) 3 (= (bit-and b 248) 240) 4 :else 1)]
+                                      (if (> need k) k 0))
+                         :else (recur (+ k 1))))))]
+    (if (> lead 0) lead (if (and (> n 0) (= (nth raw (- n 1)) 13)) 1 0))))
+
+(defn- base-after Values(Int Int) [s: &Str k: Int bline: Int bcol: Int]
+  (let [[lines last] (loop [i 0 nl 0 lst -1]
+                       (let [j (str/index-of-byte s i 10)]
+                         (if (>= j k) (values nl lst) (recur (+ j 1) (+ nl 1) j))))
+        from (if (< last 0) 0 (+ last 1))
+        cols (loop [i from c 0] (if (>= i k) c (recur (+ i 1) (if (= (bit-and (nth s i) 192) 128) c (+ c 1)))))]
+    (values (+ bline lines) (if (< last 0) (+ bcol cols) (+ 1 cols)))))
+
+(defn feed Values(XmlReader Str) [r: XmlReader more: &Str eof: Bool]
+  (let [raw0 (str (:tail r) more)
+        start (if (and (= (:fed r) 0) (= (at raw0 0) 239) (= (at raw0 1) 187) (= (at raw0 2) 191)) 3 0)
+        h (if eof 0 (held raw0))
+        cut (- (count raw0) h)
+        part (subs raw0 start (if (< cut start) start cut))
+        bad (utf8-invalid-at part 0)]
+    (if (>= bad 0) (values (assoc r :eof true) (str "invalid UTF-8 byte sequence at byte offset " (+ (:fed r) start bad)))
+      (let [text (normalize-newlines part)
+            src (:src r)
+            k (if (= (:en r) 0) (:pos r) 0)
+            [bl bc] (base-after src k (:bline r) (:bcol r))
+            kept (subs src k (count src))]
+        (values (assoc r :src (str kept text) :pos (- (:pos r) k) :tpos -1 :bline bl :bcol bc
+                       :eof eof :tail (subs raw0 (if (< cut start) start cut) (count raw0)) :fed (+ (:fed r) (if (< cut start) start cut)))
+                "")))))
+
+(defn window Values(Str Int Int) [r: &XmlReader]
+  (if (> (:en r) 0) (values (str (nth (:esrc r) 0)) (:bline r) (:bcol r)) (values (str (:src r)) (:bline r) (:bcol r))))
+
+(defn reader-chunked Values(XmlReader Str) [opts: XmlOpts]
+  (let [[r e] (reader "" opts)] (values (assoc r :eof false :fed 0) e)))
+
+(defn- tag-end Int [s: &Str p: Int]
+  (let [n (count s)]
+    (if (= (at s (+ p 1)) 47)
+      (let [g (str/index-of-byte s (+ p 2) 62)] (if (>= g n) -1 g))
+      (loop [i (+ p 1) q 0]
+        (cond (>= i n) -1
+              (> q 0) (recur (+ i 1) (if (= (nth s i) q) 0 q))
+              (or (= (nth s i) 34) (= (nth s i) 39)) (recur (+ i 1) (nth s i))
+              (= (nth s i) 62) i
+              :else (recur (+ i 1) 0))))))
+
+(defn next-chunk Values(XmlReader XEvent Bool Str) [r0: XmlReader]
+  (let [[r k] (next-token r0)]
+    (if (= k T-NEED) (values r (->XeEndDoc) true "")
+      (let [[ev err] (token-event r k)] (values r ev false err)))))
+
+(defn token-text Str [r: &XmlReader] (if (< (:ta r) 0) (:tt r) (subs (:src r) (:ta r) (:pos r))))
+
+(defn token-ws? Bool [r: &XmlReader]
+  (if (< (:ta r) 0) (ws-only? (:tt r))
+    (let [s (:src r) b (:pos r)] (loop [i (:ta r)] (if (>= i b) true (if (ws? (nth s i)) (recur (+ i 1)) false))))))
+
+(defn token-span Str [r: &XmlReader] (subs (:src r) (:ta r) (:tb r)))
+
+(defn token-error Str [r: &XmlReader] (:err r))
+
+(defn token-doctype Values(Str Str Str) [r: &XmlReader] (values (:v1 r) (:v2 r) (:v3 r)))
+
+(defn token-name Values(Str Str Str) [r: &XmlReader]
+  (let [d (- (:depth r) 1) ix (nth (:dn r) d)] (values (uri-at r (nth (:du r) d)) (nth (:ipre r) ix) (nth (:iloc r) ix))))
+
+(defn token-attr-count Int [r: &XmlReader] (:na r))
+
+(defn token-attr Values(Bool Str Str Str Str) [r: &XmlReader i: Int]
+  (let [ix (nth (:ai r) i)]
+    (values (= (nth (:ikd r) ix) 0) (uri-at r (nth (:au r) i)) (nth (:ipre r) ix) (nth (:iloc r) ix) (nth (:av r) i))))
+
+(defn next-markup Int [r: &XmlReader]
+  (let [s (:src r) p (:pos r)]
+    (if (not (= (at s p) 60)) 0
+      (let [c (at s (+ p 1))] (cond (= c 47) 2 (and (>= c 0) (name-start? c)) 1 :else 0)))))
+
+(defn- build-dom Values(XDoc XLines Str) [bytes: &Str opts: XmlOpts]
+  (let [dropws (:drop-ws-text opts)
+        want (:spans opts)
+        [r0 e0] (reader bytes opts)
+        zl: Vec(XLines) []
+        za: Vec(XASpan) []
+        bom (if (and want (= (at bytes 0) 239) (= (at bytes 1) 187) (= (at bytes 2) 191)) 3 0)
+        cuts (if (and want (or (= (:enc r0) "UTF-8") (= (:enc r0) "US-ASCII"))) (crlf-cuts bytes bom) (let [z: Vec(Int) []] z))]
+    (if (not (= e0 ""))
+      (let [z: Vec(XNode) []] (values (->XDoc "" "" "" "" "" "" z) (->XLines 0 zl NO-SPAN) e0))
+      (loop [r r0 d 0
+             fq: Vec(QName) [] fa: Vec(Vec(XAttr)) [] fns: Vec(Vec(XNs)) [] fs: Vec(Int) []
+             pend: Vec(XNode) [] pn 0
+             fl: Vec(Int) [] fls: Vec(Int) [] lp: Vec(XLines) [] lpn 0 lpos 0 line 1
+             fo: Vec(Int) [] foe: Vec(Int) [] fas: Vec(Vec(XASpan)) []
+             ver "" enc "" sa "" dt "" pub "" sys ""]
+        (let [src (:src r)
+              p0 (if (= (:en r) 0) (skip-ws src (:pos r)) lpos)
+              [r2 ev err] (next-event r)]
+          (if (not (= err ""))
+            (let [z: Vec(XNode) []] (values (->XDoc "" "" "" "" "" "" z) (->XLines 0 zl NO-SPAN) err))
+            (match ev
+              (XeStartDoc v e s) (recur r2 d fq fa fns fs pend pn fl fls lp lpn lpos line fo foe fas v e s dt pub sys)
+              (XeDoctype n p y) (recur r2 d fq fa fns fs pend pn fl fls lp lpn lpos line fo foe fas ver enc sa n p y)
+              (XeStart n as ns)
+              (let [line2 (if (> p0 lpos) (count-newlines src lpos p0 line) line)
+                    lpos2 (if (> p0 lpos) p0 lpos)
+                    here (and want (= (:en r2) 0))
+                    os (if here (:tpos r2) -1)
+                    oe (if here (:pos r2) -1)
+                    sas (if here (:aspans r2) za)]
+                (recur r2 (+ d 1) (vset fq d n) (vset fa d as) (vset fns d ns) (vset fs d pn) pend pn
+                       (vset fl d line2) (vset fls d lpn) lp lpn lpos2 line2
+                       (if want (vset fo d os) fo) (if want (vset foe d oe) foe) (if want (vset fas d sas) fas) ver enc sa dt pub sys))
+              (XeEnd n)
+              (let [d2 (- d 1)
+                    st (nth fs d2)
+                    kids (subvec pend st pn)
+                    node (->XnElem (nth fq d2) (nth fa d2) (nth fns d2) kids)
+                    lst (nth fls d2)
+                    os (if want (nth fo d2) -1)
+                    tp (:tpos r2)
+                    closed (and (>= os 0) (not= tp os) (= (:en r2) 0))
+                    sp (if want
+                         (->XSpan (to-raw cuts bom os) (to-raw cuts bom (nth foe d2))
+                                  (if closed (to-raw cuts bom tp) -1) (if closed (to-raw cuts bom (:pos r2)) -1)
+                                  (raw-aspans cuts bom (nth fas d2)))
+                         NO-SPAN)
+                    lnode (->XLines (nth fl d2) (subvec lp lst lpn) sp)]
+                (recur r2 d2 fq fa fns fs (vset pend st node) (+ st 1) fl fls (vset lp lst lnode) (+ lst 1) lpos line fo foe fas ver enc sa dt pub sys))
+              (XeText t)
+              (if (and dropws (ws-only? t)) (recur r2 d fq fa fns fs pend pn fl fls lp lpn lpos line fo foe fas ver enc sa dt pub sys)
+                (recur r2 d fq fa fns fs (vset pend pn (->XnText t)) (+ pn 1) fl fls lp lpn lpos line fo foe fas ver enc sa dt pub sys))
+              (XeCData t) (recur r2 d fq fa fns fs (vset pend pn (->XnCData t)) (+ pn 1) fl fls lp lpn lpos line fo foe fas ver enc sa dt pub sys)
+              (XeComment t) (recur r2 d fq fa fns fs (vset pend pn (->XnComment t)) (+ pn 1) fl fls lp lpn lpos line fo foe fas ver enc sa dt pub sys)
+              (XePI t x) (recur r2 d fq fa fns fs (vset pend pn (->XnPI t x)) (+ pn 1) fl fls lp lpn lpos line fo foe fas ver enc sa dt pub sys)
+              (XeEndDoc)
+              (values (->XDoc ver (if (= enc "") (str (:enc r2)) enc) sa dt pub sys (subvec pend 0 pn))
+                      (if (> lpn 0) (nth lp 0) (->XLines 0 zl NO-SPAN)) ""))))))))
+
+(def NO-SPAN (no-span))
+
+(defn- crlf-cuts Vec(Int) [raw: &Str bom: Int]
+  (let [n (count raw)]
+    (loop [i bom acc: Vec(Int) []]
+      (let [j (str/index-of-byte raw i 13)]
+        (if (>= j n) acc
+          (if (= (at raw (+ j 1)) 10)
+            (recur (+ j 2) (conj acc (- (+ j 1) bom (+ (count acc) 1))))
+            (recur (+ j 1) acc)))))))
+
+(defn- to-raw Int [cuts: &Vec(Int) bom: Int p: Int]
+  (if (< p 0) -1
+    (let [k (loop [lo 0 hi (count cuts)]
+              (if (>= lo hi) lo
+                (let [mid (quot (+ lo hi) 2)]
+                  (if (< (nth cuts mid) p) (recur (+ mid 1) hi) (recur lo mid)))))]
+      (+ p bom k))))
+
+(defn- raw-aspans Vec(XASpan) [cuts: &Vec(Int) bom: Int as: &Vec(XASpan)]
+  (loop [i 0 acc: Vec(XASpan) []]
+    (if (>= i (count as)) acc
+      (let [a (nth as i)]
+        (recur (+ i 1) (conj acc (->XASpan (str (:name a)) (str (:raw a)) (to-raw cuts bom (:start a)) (to-raw cuts bom (:end a))
+                                           (to-raw cuts bom (:vstart a)) (to-raw cuts bom (:vend a)) (:quote a))))))))
+
+(defn- count-newlines Int [s: &Str from: Int to: Int line: Int]
+  (let [e (if (> to (count s)) (count s) to)]
+    (loop [i from l line] (if (>= i e) l (recur (+ i 1) (if (= (nth s i) 10) (+ l 1) l))))))
+
+(defn parse-with Values(XDoc Str) [bytes: &Str opts: XmlOpts]
+  (let [[d ls err] (build-dom bytes opts)] (values d err)))
+
+(defn parse-with-lines Values(XDoc XLines Str) [bytes: &Str opts: XmlOpts] (build-dom bytes opts))
+
+(defn parse Values(XDoc Str) [bytes: &Str] (parse-with bytes (default-opts)))
+
+(defn elem? Bool [n: &XNode]
+  (match n (XnElem q a s c) true _ false))
+
+(defn elem-name QName [n: &XNode]
+  (match n (XnElem q a s c) q _ (->QName "" "" "")))
+
+(defn elem-local Str [n: &XNode] (:local (elem-name n)))
+(defn elem-uri Str [n: &XNode] (:uri (elem-name n)))
+
+(defn elem-attrs Vec(XAttr) [n: &XNode]
+  (match n (XnElem q a s c) a _ (let [z: Vec(XAttr) []] z)))
+
+(defn elem-ns Vec(XNs) [n: &XNode]
+  (match n (XnElem q a s c) s _ (let [z: Vec(XNs) []] z)))
+
+(defn elem-children Vec(XNode) [n: &XNode]
+  (match n (XnElem q a s c) c _ (let [z: Vec(XNode) []] z)))
+
+(defn child-elems Vec(XNode) [n: &XNode]
+  (let [cs (elem-children n)]
+    (loop [i 0 acc: Vec(XNode) []]
+      (if (>= i (count cs)) acc
+        (let [c (nth cs i)] (recur (+ i 1) (if (elem? c) (conj acc c) acc)))))))
+
+(defn has-attr? Bool [n: &XNode uri: &Str local: &Str]
+  (let [as (elem-attrs n)]
+    (loop [i 0]
+      (if (>= i (count as)) false
+        (let [q (:name (nth as i))]
+          (if (and (= (:local q) local) (= (:uri q) uri)) true (recur (+ i 1))))))))
+
+(defn attr Str [n: &XNode uri: &Str local: &Str default: Str]
+  (let [as (elem-attrs n)]
+    (loop [i 0]
+      (if (>= i (count as)) default
+        (let [a (nth as i) q (:name a)]
+          (if (and (= (:local q) local) (= (:uri q) uri)) (:value a) (recur (+ i 1))))))))
+
+(defn text-content Str [n: &XNode]
+  (match n
+    (XnText t) (str t)
+    (XnCData t) (str t)
+    (XnElem q a s c0)
+    (loop [sc: Vec(Vec(XNode)) [] si: Vec(Int) [] sn 0 cur c0 i 0 out ""]
+      (if (< i (count cur))
+        (let [c (nth cur i)]
+          (match c
+            (XnText t) (recur sc si sn cur (+ i 1) (str out t))
+            (XnCData t) (recur sc si sn cur (+ i 1) (str out t))
+            (XnElem q2 a2 s2 c2) (recur (vset sc sn cur) (vset si sn (+ i 1)) (+ sn 1) c2 0 out)
+            _ (recur sc si sn cur (+ i 1) out)))
+        (if (= sn 0) out
+          (recur sc si (- sn 1) (nth sc (- sn 1)) (nth si (- sn 1)) out))))
+    _ ""))
+
+(defn doc-root XNode [d: &XDoc]
+  (let [cs (:children d)]
+    (loop [i 0]
+      (if (>= i (count cs)) (let [z: Vec(XAttr) [] y: Vec(XNs) [] x: Vec(XNode) []] (->XnElem (->QName "" "" "") z y x))
+        (let [c (nth cs i)] (if (elem? c) c (recur (+ i 1))))))))
+
+(defrecord XwOpts [indent: Str decl: Bool encoding: Str standalone: Str
+                   short-empty: Bool decl-single-quote: Bool escape-gt: Bool])
+
+(defn default-wopts XwOpts [] (->XwOpts "" true "UTF-8" "" true false true))
+
+(defrecord XmlWriter
+  [out: Str opts: XwOpts depth: Int open: Bool started: Bool
+   names: Vec(Str) flags: Vec(Int)
+   nsb: Vec(XNs) nsn: Int nsmark: Vec(Int)
+   gen: Int err: Str])
+
+(defn writer XmlWriter [opts: XwOpts]
+  (let [vs: Vec(Str) [] vf: Vec(Int) [0] vn: Vec(XNs) [] vm: Vec(Int) []]
+    (->XmlWriter "" opts 0 false false vs vf vn 0 vm 0 "")))
+
+(defn escape-text-with Str [s: &Str gt: Bool]
+  (let [n (count s)]
+    (loop [i 0 out ""]
+      (if (>= i n) out
+        (let [j (loop [j i] (if (>= j n) j (let [c (nth s j)] (if (or (= c 38) (= c 60) (= c 62) (= c 13)) j (recur (+ j 1))))))
+              out2 (if (> j i) (str out (subs s i j)) out)]
+          (if (>= j n) out2
+            (let [c (nth s j)]
+              (recur (+ j 1)
+                     (cond (= c 38) (str out2 "&amp;")
+                           (= c 60) (str out2 "&lt;")
+                           (= c 62) (if (or gt (and (>= j 2) (= (nth s (- j 1)) 93) (= (nth s (- j 2)) 93))) (str out2 "&gt;") (str out2 ">"))
+                           :else (str out2 "&#xD;"))))))))))
+
+(defn escape-text Str [s: &Str] (escape-text-with s true))
+
+(defn escape-attr Str [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 out ""]
+      (if (>= i n) out
+        (let [j (loop [j i] (if (>= j n) j (let [c (nth s j)] (if (or (= c 38) (= c 60) (= c 62) (= c 34) (= c 9) (= c 10) (= c 13)) j (recur (+ j 1))))))
+              out2 (if (> j i) (str out (subs s i j)) out)]
+          (if (>= j n) out2
+            (let [c (nth s j)]
+              (recur (+ j 1)
+                     (cond (= c 38) (str out2 "&amp;")
+                           (= c 60) (str out2 "&lt;")
+                           (= c 62) (str out2 "&gt;")
+                           (= c 34) (str out2 "&quot;")
+                           (= c 9) (str out2 "&#x9;")
+                           (= c 10) (str out2 "&#xA;")
+                           :else (str out2 "&#xD;"))))))))))
+
+(defn- w-ensure-decl XmlWriter [w: XmlWriter]
+  (if (:started w) w
+    (let [o (:opts w)]
+      (if (:decl o)
+        (let [q (if (:decl-single-quote o) "'" (chr 34))
+              d (str "<?xml version=" q "1.0" q " encoding=" q (:encoding o) q
+                     (if (= (:standalone o) "") "" (str " standalone=" q (:standalone o) q)) "?>")]
+          (assoc w :out (str (:out w) d) :started true))
+        (assoc w :started true)))))
+
+(defn- w-close-open XmlWriter [w: XmlWriter]
+  (if (:open w) (assoc w :out (str (:out w) ">") :open false) w))
+
+(defn- indent-str Str [unit: &Str n: Int]
+  (loop [i 0 out "\n"] (if (>= i n) out (recur (+ i 1) (str out unit)))))
+
+(defn- w-break XmlWriter [w: XmlWriter]
+  (let [unit (:indent (:opts w))
+        l (:depth w)]
+    (if (and (> (count unit) 0) (= (bit-and (nth (:flags w) l) 2) 0) (> (count (:out w)) 0))
+      (assoc w :out (str (:out w) (indent-str unit l)))
+      (if (and (= l 0) (> (count (:out w)) 0))
+        (assoc w :out (str (:out w) "\n"))
+        w))))
+
+(defn- w-mark XmlWriter [w: XmlWriter bit: Int]
+  (let [l (:depth w)]
+    (assoc w :flags (assoc (:flags w) l (bit-or (nth (:flags w) l) bit)))))
+
+(defn- w-lookup Values(Str Bool) [w: &XmlWriter prefix: &Str] (ns-lookup (:nsb w) (:nsn w) prefix))
+
+(defn- w-bind XmlWriter [w: XmlWriter prefix: Str uri: Str]
+  (let [decl (if (= prefix "") (str " xmlns=" (chr 34) (escape-attr uri) (chr 34))
+               (str " xmlns:" prefix "=" (chr 34) (escape-attr uri) (chr 34)))]
+    (assoc w :out (str (:out w) decl)
+           :nsb (vset (:nsb w) (:nsn w) (->XNs prefix uri))
+           :nsn (+ (:nsn w) 1))))
+
+(defn- w-local-decl? Bool [w: &XmlWriter prefix: &Str]
+  (let [base (nth (:nsmark w) (- (:depth w) 1))]
+    (loop [k base] (if (>= k (:nsn w)) false (if (= (:prefix (nth (:nsb w) k)) prefix) true (recur (+ k 1)))))))
+
+(defn w-start XmlWriter [w0: XmlWriter q: &QName]
+  (let [w1 (w-break (w-close-open (w-ensure-decl w0)))
+        w (w-mark w1 1)
+        uri (:uri q)
+        pre (if (= uri "") "" (str (:prefix q)))
+        raw (if (= pre "") (str (:local q)) (str pre ":" (:local q)))
+        d (:depth w)
+        w2 (assoc w :out (str (:out w) "<" raw)
+                  :names (vset (:names w) d raw)
+                  :nsmark (vset (:nsmark w) d (:nsn w))
+                  :depth (+ d 1)
+                  :flags (vset (:flags w) (+ d 1) 0)
+                  :open true)
+        [cur found] (w-lookup w2 pre)]
+    (cond
+      (= pre "xml") w2
+      (and found (= cur uri)) w2
+      (and (not found) (= uri "")) w2
+      :else (w-bind w2 pre uri))))
+
+(defn w-ns XmlWriter [w: XmlWriter prefix: &Str uri: &Str]
+  (if (not (:open w)) (assoc w :err "namespace declaration outside a start tag")
+    (if (w-local-decl? w prefix) w
+      (let [[cur found] (w-lookup w prefix)]
+        (if (and found (= cur uri)) w (w-bind w (str prefix) (str uri)))))))
+
+(defn- w-prefix-for Str [w: &XmlWriter uri: &Str]
+  (loop [k (- (:nsn w) 1)]
+    (if (< k 0) ""
+      (let [b (nth (:nsb w) k)]
+        (if (and (= (:uri b) uri) (> (count (:prefix b)) 0))
+          (let [[cur found] (w-lookup w (:prefix b))]
+            (if (= cur uri) (str (:prefix b)) (recur (- k 1))))
+          (recur (- k 1)))))))
+
+(defn- w-gen-prefix Values(XmlWriter Str) [w: XmlWriter]
+  (loop [g (:gen w)]
+    (let [p (str "ns" g)
+          [cur found] (w-lookup w p)]
+      (if found (recur (+ g 1)) (values (assoc w :gen (+ g 1)) p)))))
+
+(defn w-attr XmlWriter [w: XmlWriter q: &QName value: &Str]
+  (if (not (:open w)) (assoc w :err "attribute outside a start tag")
+    (let [uri (:uri q)
+          av (str "=" (chr 34) (escape-attr value) (chr 34))]
+      (cond
+        (= uri "") (assoc w :out (str (:out w) " " (:local q) av))
+        (= uri NS-XML) (assoc w :out (str (:out w) " xml:" (:local q) av))
+        :else
+        (let [p (:prefix q)
+              [cur found] (w-lookup w p)]
+          (cond
+            (and (> (count p) 0) found (= cur uri)) (assoc w :out (str (:out w) " " p ":" (:local q) av))
+            (and (> (count p) 0) (not (w-local-decl? w p)))
+            (let [w2 (w-bind w (str p) (str uri))] (assoc w2 :out (str (:out w2) " " p ":" (:local q) av)))
+            :else
+            (let [ex (w-prefix-for w uri)]
+              (if (> (count ex) 0) (assoc w :out (str (:out w) " " ex ":" (:local q) av))
+                (let [[w2 g] (w-gen-prefix w)
+                      w3 (w-bind w2 g (str uri))]
+                  (assoc w3 :out (str (:out w3) " " g ":" (:local q) av)))))))))))
+
+(defn w-text XmlWriter [w0: XmlWriter s: &Str]
+  (if (= (count s) 0) w0
+    (let [w (w-mark (w-close-open (w-ensure-decl w0)) 2)]
+      (assoc w :out (str (:out w) (escape-text-with s (:escape-gt (:opts w))))))))
+
+(defn w-cdata XmlWriter [w0: XmlWriter s: &Str]
+  (let [w (w-mark (w-close-open (w-ensure-decl w0)) 2)]
+    (assoc w :out (str (:out w) "<![CDATA[" (str/replace (str s) "]]>" "]]]]><![CDATA[>") "]]>"))))
+
+(defn w-comment XmlWriter [w0: XmlWriter s: &Str]
+  (let [w (w-mark (w-break (w-close-open (w-ensure-decl w0))) 1)]
+    (assoc w :out (str (:out w) "<!--" s "-->"))))
+
+(defn w-pi XmlWriter [w0: XmlWriter target: &Str data: &Str]
+  (let [w (w-mark (w-break (w-close-open (w-ensure-decl w0))) 1)]
+    (assoc w :out (str (:out w) "<?" target (if (= (count data) 0) "" " ") data "?>"))))
+
+(defn w-doctype XmlWriter [w0: XmlWriter name: &Str public-id: &Str system-id: &Str]
+  (let [w (w-mark (w-break (w-ensure-decl w0)) 1)
+        q (chr 34)
+        ext (cond (> (count public-id) 0) (str " PUBLIC " q public-id q " " q system-id q)
+                  (> (count system-id) 0) (str " SYSTEM " q system-id q)
+                  :else "")]
+    (assoc w :out (str (:out w) "<!DOCTYPE " name ext ">"))))
+
+(defn w-end XmlWriter [w: XmlWriter]
+  (if (= (:depth w) 0) (assoc w :err "w-end without an open element")
+    (let [d (- (:depth w) 1)
+          name (nth (:names w) d)
+          fl (nth (:flags w) (:depth w))
+          unit (:indent (:opts w))
+          tail (cond
+                 (and (:open w) (:short-empty (:opts w))) "/>"
+                 (:open w) (str "></" name ">")
+                 (and (> (count unit) 0) (= (bit-and fl 1) 1) (= (bit-and fl 2) 0)) (str (indent-str unit d) "</" name ">")
+                 :else (str "</" name ">"))]
+      (assoc w :out (str (:out w) tail) :open false :depth d :nsn (nth (:nsmark w) d)))))
+
+(defn- cp-at Values(Int Int) [s: &Str i: Int]
+  (let [b (nth s i)]
+    (cond
+      (< b 128) (values b 1)
+      (and (= (bit-and b 224) 192) (< (+ i 1) (count s)))
+      (values (+ (* (bit-and b 31) 64) (bit-and (nth s (+ i 1)) 63)) 2)
+      (and (= (bit-and b 240) 224) (< (+ i 2) (count s)))
+      (values (+ (* (bit-and b 15) 4096) (* (bit-and (nth s (+ i 1)) 63) 64) (bit-and (nth s (+ i 2)) 63)) 3)
+      (and (= (bit-and b 248) 240) (< (+ i 3) (count s)))
+      (values (+ (* (bit-and b 7) 262144) (* (bit-and (nth s (+ i 1)) 63) 4096) (* (bit-and (nth s (+ i 2)) 63) 64) (bit-and (nth s (+ i 3)) 63)) 4)
+      :else (values 65533 1))))
+
+(defn- u16 Str [u: Int le: Bool]
+  (if le (str (chr (bit-and u 255)) (chr (bit-shift-right u 8)))
+    (str (chr (bit-shift-right u 8)) (chr (bit-and u 255)))))
+
+(defn encode-from-utf8 Values(Str Str) [s: &Str enc: &Str]
+  (let [e (upper enc)
+        n (count s)]
+    (cond
+      (or (= e "UTF-8") (= e "UTF8")) (values (str s) "")
+      (or (= e "ISO-8859-1") (= e "LATIN1") (= e "US-ASCII") (= e "ASCII"))
+      (let [lim (if (or (= e "US-ASCII") (= e "ASCII")) 128 256)]
+        (loop [i 0 out ""]
+          (if (>= i n) (values out "")
+            (let [j (loop [j i] (if (and (< j n) (< (nth s j) 128)) (recur (+ j 1)) j))
+                  out2 (if (> j i) (str out (subs s i j)) out)]
+              (if (>= j n) (values out2 "")
+                (let [[cp len] (cp-at s j)]
+                  (recur (+ j len) (if (< cp lim) (str out2 (chr cp)) (str out2 "&#" cp ";")))))))))
+      (or (= e "UTF-16") (= e "UTF-16BE") (= e "UTF-16LE"))
+      (let [le (= e "UTF-16LE")]
+        (loop [i 0 out (if (= e "UTF-16") (str (chr 254) (chr 255)) "")]
+          (if (>= i n) (values out "")
+            (let [[cp len] (cp-at s i)]
+              (recur (+ i len)
+                     (if (< cp 65536) (str out (u16 cp le))
+                       (let [v (- cp 65536)]
+                         (str out (u16 (+ 55296 (bit-shift-right v 10)) le) (u16 (+ 56320 (bit-and v 1023)) le)))))))))
+      :else (values "" (str "unsupported output encoding: " enc)))))
+
+(defn w-finish Values(Str Str) [w0: XmlWriter]
+  (let [w (loop [w (w-ensure-decl w0)] (if (> (:depth w) 0) (recur (w-end w)) w))]
+    (if (not (= (:err w) "")) (values "" (:err w))
+      (encode-from-utf8 (:out w) (:encoding (:opts w))))))
+
+(defn write-node XmlWriter [w: XmlWriter node: &XNode]
+  (match node
+    (XnElem q as ns cs)
+    (let [w1 (w-start w q)
+          w2 (loop [i 0 w w1] (if (>= i (count ns)) w (recur (+ i 1) (w-ns w (:prefix (nth ns i)) (:uri (nth ns i))))))
+          w3 (loop [i 0 w w2] (if (>= i (count as)) w (recur (+ i 1) (w-attr w (:name (nth as i)) (:value (nth as i))))))
+          w4 (loop [i 0 w w3] (if (>= i (count cs)) w (recur (+ i 1) (write-node w (nth cs i)))))]
+      (w-end w4))
+    (XnText t) (w-text w t)
+    (XnCData t) (w-cdata w t)
+    (XnComment t) (w-comment w t)
+    (XnPI t d) (w-pi w t d)))
+
+(defn write-doc Values(Str Str) [opts: XwOpts doc: &XDoc]
+  (let [w0 (writer opts)
+        w1 (if (= (:doctype doc) "") w0 (w-doctype w0 (:doctype doc) (:public-id doc) (:system-id doc)))
+        cs (:children doc)
+        w2 (loop [i 0 w w1] (if (>= i (count cs)) w (recur (+ i 1) (write-node w (nth cs i)))))]
+    (w-finish w2)))

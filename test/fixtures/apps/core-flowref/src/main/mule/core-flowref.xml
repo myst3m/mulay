@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18116"/>
+    </http:listener-config>
+
+    <sub-flow name="add-a">
+        <set-variable variableName="trail" value="#[vars.trail + 'sub-a']"/>
+        <set-payload value="#[output application/json --- {from: 'sub-a', was: payload}]"/>
+    </sub-flow>
+
+    <flow name="private-b">
+        <set-variable variableName="trail" value="#[vars.trail + 'flow-b']"/>
+        <set-variable variableName="setInB" value="visible-after-return"/>
+        <flow-ref name="add-a"/>
+    </flow>
+
+    <!-- flow-ref で sub-flow と flow を呼ぶ。変数と payload は呼び出し元に戻る -->
+    <flow name="chain">
+        <http:listener config-ref="L" path="/chain"/>
+        <set-variable variableName="trail" value="#[['main']]"/>
+        <flow-ref name="private-b"/>
+        <set-variable variableName="trail" value="#[vars.trail + 'main-after']"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{trail: vars.trail, setInB: vars.setInB, payload: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- target: 呼び出し結果を変数に入れ、payload は変えない -->
+    <flow name="target">
+        <http:listener config-ref="L" path="/target"/>
+        <set-variable variableName="trail" value="#[[]]"/>
+        <set-payload value="original" mimeType="text/plain"/>
+        <flow-ref name="add-a" target="result"/>
+        <flow-ref name="add-a" target="onlyFrom" targetValue="#[payload.from]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payload: payload, result: vars.result, onlyFrom: vars.onlyFrom, trail: vars.trail}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 名前を式で決める -->
+    <flow name="dynamic">
+        <http:listener config-ref="L" path="/dynamic/{name}"/>
+        <set-variable variableName="trail" value="#[[]]"/>
+        <flow-ref name="#[attributes.uriParams.name]"/>
+        <set-payload value="#[output application/json --- {trail: vars.trail, payload: payload}]"/>
+    </flow>
+
+    <!-- 呼ばれた flow の中の on-error-continue: 呼び出し元は正常に続く -->
+    <flow name="child-continues">
+        <raise-error type="APP:CHILD" description="child failed"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="child recovered"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- 呼ばれた flow の中の on-error-propagate: 呼び出し元にエラーが伝わる -->
+    <flow name="child-propagates">
+        <raise-error type="APP:CHILD" description="child failed"/>
+        <error-handler>
+            <on-error-propagate>
+                <set-variable variableName="childHandlerRan" value="#[true]"/>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <!-- sub-flow のエラーは呼び出し元のハンドラが扱う (sub-flow はハンドラを持てない) -->
+    <sub-flow name="sub-fails">
+        <raise-error type="APP:SUB" description="sub-flow failed"/>
+    </sub-flow>
+
+    <flow name="errors">
+        <http:listener config-ref="L" path="/errors/{which}"/>
+        <flow-ref name="#[attributes.uriParams.which]"/>
+        <set-payload value="#[output application/json --- {continued: true, payload: payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{caughtInCaller: error.errorType.namespace ++ ":" ++ error.errorType.identifier,
+ description: error.description, childHandlerRan: vars.childHandlerRan default false}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+</mule>

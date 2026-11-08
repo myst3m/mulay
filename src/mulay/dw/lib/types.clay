@@ -1,0 +1,143 @@
+(ns mulay.dw.lib.types
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]))
+
+(def M "dw::core::Types")
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- tv v/Val [t: v/TypeV] (v/->VType t))
+(defn- any-t v/TypeV [] (v/->TypeV "any" "Any" [] [] [] []))
+
+(defn- arg-type v/TypeV [a: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth a i)) (v/VType t) t _ (any-t)))
+
+(defn- alias? Bool [t: &v/TypeV] (or (= (:kind t) "alias") (= (:kind t) "ref")))
+
+(defn- unalias v/TypeV [t: &v/TypeV]
+  (if (and (alias? t) (> (count (:args t)) 0)) (unalias (nth (:args t) 0)) t))
+
+(defn- base v/TypeV [t: &v/TypeV]
+  (let [d (unalias t)]
+    (v/->TypeV (:kind d) (:name d) (:args d) (:fields d) (:lits d) [])))
+
+(defn- show Str [t: &v/TypeV]
+  (let [k (:kind t)]
+    (cond
+      (or (= k "name") (alias? t)) (:name t)
+      (= k "any") "Any"
+      (= k "union") (loop [i 0 out ""] (if (>= i (count (:args t))) out (recur (+ i 1) (str out (if (> i 0) " | " "") (show (nth (:args t) i))))))
+      (= k "inter") (loop [i 0 out ""] (if (>= i (count (:args t))) out (recur (+ i 1) (str out (if (> i 0) " & " "") (show (nth (:args t) i))))))
+      (= k "lit") (if (> (count (:lits t)) 0) (let [[s e] (rt/to-text (nth (:lits t) 0))] s) "")
+      (= k "obj") "Object"
+      (= k "fn") "Function"
+      :else k)))
+
+(defn- is-name Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [name: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (let [b (base (arg-type a 0))]
+      (ok (v/bool-v (if (and (= name "Any") (= (:kind b) "any")) true
+                       (and (= (:kind b) "name") (= (:name b) name))))))))
+
+(defn- is-kind Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [kind: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (let [d (unalias (arg-type a 0)) k (:kind d)]
+      (ok (v/bool-v (cond
+                       (= kind "obj") (or (= k "obj") (and (= k "name") (= (:name d) "Object")))
+                       (= kind "arr") (and (= k "name") (= (:name d) "Array"))
+                       (= kind "fn") (or (= k "fn") (and (= k "name") (= (:name d) "Function")))
+                       :else (= k kind)))))))
+
+(defn- expect-err Values(v/Val dwe/DwErr) [want: Str t: &v/TypeV]
+  (rt/failure "InvalidType" (str "Expecting type to be `" want "` but got `" (show t) "`.")))
+
+(defn- items-of Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [kind: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (let [t (arg-type a 0) d (unalias t)]
+      (if (not= (:kind d) kind) (expect-err "Union" t)
+        (ok (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                        (if (>= i (count (:args d))) acc (recur (+ i 1) (conj acc (tv (nth (:args d) i))))))))))))
+
+(defn- literal-value Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [t (arg-type a 0) d (unalias t)]
+    (if (and (= (:kind d) "lit") (> (count (:lits d)) 0)) (ok (nth (:lits d) 0))
+      (rt/failure "InvalidType" (str "Type `" (show t) "`is not a literal type.")))))
+
+(defn- is-reference Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (v/bool-v (= (:kind (arg-type a 0)) "ref"))))
+
+(defn- name-of Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/->VStr (show (arg-type a 0)))))
+
+(defn- array-item Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [t (arg-type a 0) d (unalias t)]
+    (if (not (and (= (:kind d) "name") (= (:name d) "Array"))) (expect-err "Array" t)
+      (ok (tv (if (> (count (:args d)) 0) (nth (:args d) 0) (any-t)))))))
+
+(defn- base-type-of Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (tv (base (arg-type a 0)))))
+
+(defn- meta-chain Vec(v/Field) [t: &v/TypeV acc: Vec(v/Field)]
+  (let [ms (:meta t)
+        acc2 (loop [i 0 out acc]
+               (if (>= i (count ms)) out
+                 (let [f (nth ms i)]
+                   (recur (+ i 1) (if (> (count (v/obj-get out (:name (:key f)))) 0) out (conj out f))))))]
+    (if (and (alias? t) (> (count (:args t)) 0)) (meta-chain (nth (:args t) 0) acc2) acc2)))
+
+(defn- metadata-of Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/->VObj (meta-chain (arg-type a 0) []))))
+
+(defn- fn-type? Bool [d: &v/TypeV] (= (:kind d) "fn"))
+
+(defn- fn-params Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [t (arg-type a 0) d (unalias t)]
+    (if (not (fn-type? d)) (expect-err "Function" t)
+      (let [ps (:fields d)]
+        (ok (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                        (if (>= i (count ps)) acc
+                          (let [p (nth ps i)]
+                            (recur (+ i 1) (conj acc (v/->VObj [(v/field "paramType" (tv (:ty p)))
+                                                                 (v/field "name" (v/->VStr (if (= (:key p) "") (str "param_" i) (:key p))))
+                                                                 (v/field "optional" (v/bool-v (:optional p)))]))))))))))))
+
+(defn- fn-return Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [t (arg-type a 0) d (unalias t)]
+    (if (not (fn-type? d)) (expect-err "Function" t)
+      (ok (if (> (count (:args d)) 0) (tv (nth (:args d) 0)) (v/null-v))))))
+
+(defn- qname v/Val [name: Str uri: &Str]
+  (v/->VObj [(v/field "localName" (v/->VStr name)) (v/field "namespace" (if (= uri "") (v/null-v) (v/->VStr uri)))]))
+
+(defn- attr-types v/Val [as: &Vec(v/TypeField)]
+  (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+              (if (>= i (count as)) acc
+                (let [a (nth as i)]
+                  (recur (+ i 1) (conj acc (v/->VObj [(v/field "name" (qname (:key a) (:ns a)))
+                                                       (v/field "value" (tv (:ty a)))
+                                                       (v/field "required" (v/bool-v (not (:optional a))))]))))))))
+
+(defn- object-fields Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [t (arg-type a 0) d (unalias t) k (:kind d)]
+    (if (and (= k "name") (= (:name d) "Object")) (ok (v/->VArr []))
+      (if (not= k "obj") (expect-err "Object" t)
+        (let [fs (:fields d)]
+          (ok (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                          (if (>= i (count fs)) acc
+                            (let [f (nth fs i)]
+                              (recur (+ i 1)
+                                     (conj acc (v/->VObj [(v/field "key" (v/->VObj [(v/field "name" (qname (:key f) (:ns f))) (v/field "attributes" (attr-types (:attrs f)))]))
+                                                          (v/field "required" (v/bool-v (not (:optional f))))
+                                                          (v/field "repeated" (v/bool-v (:repeated f)))
+                                                          (v/field "value" (tv (:ty f)))])))))))))))))
+
+(defn- B rt/Builtin [name: Str f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] (rt/builtin name M [(rt/b1 "Type" f)]))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "isBooleanType" (is-name "Boolean")) (B "isNumberType" (is-name "Number")) (B "isDateType" (is-name "Date"))
+   (B "isDateTimeType" (is-name "DateTime")) (B "isLocalDateTimeType" (is-name "LocalDateTime")) (B "isTimeType" (is-name "Time"))
+   (B "isLocalTimeType" (is-name "LocalTime")) (B "isTimeZoneType" (is-name "TimeZone")) (B "isUriType" (is-name "Uri"))
+   (B "isNamespaceType" (is-name "Namespace")) (B "isRangeType" (is-name "Range")) (B "isPeriodType" (is-name "Period"))
+   (B "isBinaryType" (is-name "Binary")) (B "isNullType" (is-name "Null")) (B "isNothingType" (is-name "Nothing"))
+   (B "isAnyType" (is-name "Any")) (B "isTypeType" (is-name "Type")) (B "isStringType" (is-name "String"))
+   (B "isRegexType" (is-name "Regex")) (B "isKeyType" (is-name "Key"))
+   (B "isLiteralType" (is-kind "lit")) (B "isFunctionType" (is-kind "fn")) (B "literalValueOf" literal-value)
+   (B "isObjectType" (is-kind "obj")) (B "isArrayType" (is-kind "arr")) (B "isUnionType" (is-kind "union"))
+   (B "isIntersectionType" (is-kind "inter")) (B "unionItems" (items-of "union")) (B "isReferenceType" is-reference)
+   (B "nameOf" name-of) (B "intersectionItems" (items-of "inter")) (B "arrayItem" array-item) (B "baseTypeOf" base-type-of)
+   (B "metadataOf" metadata-of) (B "functionParamTypes" fn-params) (B "functionReturnType" fn-return) (B "objectFields" object-fields)])

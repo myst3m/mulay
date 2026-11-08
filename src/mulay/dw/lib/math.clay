@@ -1,0 +1,221 @@
+(ns mulay.dw.lib.math
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.lib.core_num :as cn] [mulay.lib.dec :as d] [mulay.lib.bigint :as bi] [clay.bigint :as big]))
+(target-when "wasm"
+(do
+(defn- f-asin Float [x: Float] (asin x))
+(defn- f-acos Float [x: Float] (acos x))
+(defn- f-atan Float [x: Float] (atan x)))
+(do
+(defextern c-asin asin)
+(defextern c-acos acos)
+(defextern c-atan atan)
+(defn- f-asin Float [x: Float] (unsafe (c-asin x)))
+(defn- f-acos Float [x: Float] (unsafe (c-acos x)))
+(defn- f-atan Float [x: Float] (unsafe (c-atan x)))))
+
+(def M "dw::util::Math")
+
+(def PI-LIT "3.14159265358979323846")
+(def E-LIT "2.7182818284590452354")
+
+(defn- nv v/Val [n: num/Num] (v/num-v n))
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- lit num/Num [s: Str] (let [[n e] (num/parse-lit s)] n))
+(defn- fin? Bool [f: Float] (and (= f f) (not (= f (* f 2.0))) ))
+
+(defn- float-or-null Values(v/Val dwe/DwErr) [f: Float]
+  (if (or (not (= f f)) (and (not (= f 0.0)) (= f (* f 2.0)))) (ok (v/null-v))
+    (let [[n e] (num/from-float f)] (if (= e "") (ok (nv n)) (ok (v/null-v))))))
+
+(defn- f1 Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [op: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (let [x (num/to-float (core/arg-num a 0))]
+      (float-or-null
+        (cond
+          (= op "sin") (sin x)
+          (= op "cos") (cos x)
+          (= op "tan") (tan x)
+          (= op "asin") (f-asin x)
+          (= op "acos") (f-acos x)
+          (= op "atan") (f-atan x)
+          (= op "logn") (log x)
+          :else (log10 x))))))
+
+(defn- div-or-fail Values(v/Val dwe/DwErr) [a: &num/Num b: &num/Num]
+  (let [[q e] (num/div a b)]
+    (if (= e "") (ok (nv q)) (rt/failure (rt/arith-kind e) e))))
+
+(defn- to-radians Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[q e] (num/div (core/arg-num a 0) (lit "180.0"))]
+    (if (not= e "") (rt/failure (rt/arith-kind e) e)
+      (core/arith 3 q (lit PI-LIT)))))
+
+(defn- to-degrees Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[x e] (core/arith-num 3 (core/arg-num a 0) (lit "180.0"))]
+    (if (not (dwe/ok? e)) (values (v/null-v) e) (div-or-fail x (lit PI-LIT)))))
+
+(defrecord Ctx [prec: Int mode: Int])
+
+(defn int-value Int [n: &num/Num]
+  (if (<= (d/scale (num/to-dec n)) -32) 0
+    (int-value-small n)))
+
+(defn- int-value-small Int [n: &num/Num]
+  (let [[b be] (d/to-big (num/to-dec n))
+        [r e] (bi/rem-big b (bi/from-int 4294967296))
+        [k e2] (bi/to-int r)
+        u (if (< k 0) (+ k 4294967296) k)]
+    (if (>= u 2147483648) (- u 4294967296) u)))
+
+(defn- ctx-of Values(Ctx dwe/DwErr) [a: &Vec(v/Val) i: Int]
+  (if (<= (count a) i) (values (->Ctx 34 d/HALF-EVEN) (dwe/ok))
+    (let [fs (core/arg-fields a i)
+          ps (v/obj-get fs "precision")
+          ms (v/obj-get fs "roundingMode")
+          [prec pe] (if (= (count ps) 0) (values 34 "")
+                      (match (v/unmeta (nth ps 0))
+                        (v/VNum n) (values (int-value n) "")
+                        (v/VInt n-i) (let [n (num/from-int n-i)] (values (int-value n) ""))
+                        _ (values 0 "precision")))
+          [mode me] (if (= (count ms) 0) (values d/HALF-EVEN "")
+                      (match (v/unmeta (nth ms 0))
+                        (v/VStr s) (d/mode-of-str s)
+                        _ (values 0 "roundingMode")))]
+      (cond
+        (not= pe "") (values (->Ctx 0 0) (dwe/err "InvalidArgs" "Expecting Type: `Number` at `precision`."))
+        (not= me "") (values (->Ctx 0 0) (dwe/err "InvalidArgs" "Expecting Type: `RoundingMode` at `roundingMode`."))
+        (< prec 0) (values (->Ctx 0 0) (dwe/err "InvalidArgs" "Invalid value for parameter: precision. Reason:\n\tprecision can't be negative"))
+        :else (values (->Ctx prec mode) (dwe/ok))))))
+
+(defn- lit-norm num/Num [x: &d/Dec]
+  (if (> (d/scale x) 0) (cn/norm x) (num/mk x)))
+
+(defn- dec-ret Values(v/Val dwe/DwErr) [x: &d/Dec e: &Str]
+  (if (= e "") (ok (nv (lit-norm x))) (rt/failure (rt/arith-kind e) e)))
+
+(defn- dec-op Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [op: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (let [[c ce] (ctx-of a 2)]
+      (if (not (dwe/ok? ce)) (values (v/null-v) ce)
+        (let [x (num/to-dec (core/arg-num a 0)) y (num/to-dec (core/arg-num a 1))
+              p (:prec c) m (:mode c)]
+          (cond
+            (= op "add") (let [[s se] (d/add x y) [r e] (if (= se "") (d/round-mc s p m) (values s se))] (dec-ret r e))
+            (= op "sub") (let [[s se] (d/sub x y) [r e] (if (= se "") (d/round-mc s p m) (values s se))] (dec-ret r e))
+            (= op "mul") (let [[r e] (d/round-mc (d/mul x y) p m)] (dec-ret r e))
+            :else (let [[r e] (dec-divide x y p m)] (dec-ret r e))))))))
+
+(defn- dec-divide Values(d/Dec Str) [x: &d/Dec y: &d/Dec p: Int m: Int]
+  (if (d/is-zero? y) (values (d/zero) "Division by zero")
+    (let [[r e] (d/div-mc x y p m)]
+      (if (= e "Rounding necessary") (values r "Division by zero") (values r e)))))
+
+(defn- dec-round Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[c ce] (ctx-of a 1)]
+    (if (not (dwe/ok? ce)) (values (v/null-v) ce)
+      (let [[r e] (d/round-mc (num/to-dec (core/arg-num a 0)) (:prec c) (:mode c))] (dec-ret r e)))))
+
+(defn- dec-pow Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[c ce] (ctx-of a 2)]
+    (if (not (dwe/ok? ce)) (values (v/null-v) ce)
+      (let [bn (core/arg-num a 0) yn (core/arg-num a 1)
+            [r e] (pow-ctx bn yn (:prec c) (:mode c))]
+        (if (or (= e "Underflow") (= e "Overflow"))
+          (rt/failure "ArithmeticException" (str "java.lang.ArithmeticException " e))
+          (dec-ret r e))))))
+
+(defn- int32? Bool [n: &num/Num]
+  (and (num/integer? n)
+       (let [[k e] (num/to-int n)] (and (= e "") (>= k d/INT32-MIN) (<= k d/INT32-MAX)))))
+
+(defn pow-ctx Values(d/Dec Str) [bn: &num/Num yn: &num/Num p: Int m: Int]
+  (let [x (num/to-dec bn)]
+    (if (int32? yn)
+      (let [[k e] (num/to-int yn)] (d/pow-mc x k p m))
+      (if (< (num/signum yn) 0)
+        (if (num/integer? yn) (values (d/zero) "Invalid operation")
+          (let [[r e] (pow-frac bn (num/neg yn) p m)]
+            (if (not= e "") (values r e) (dec-divide (d/from-int 1) r p m))))
+        (pow-frac bn yn p m)))))
+
+(defn- pow-frac Values(d/Dec Str) [bn: &num/Num yn: &num/Num p: Int m: Int]
+  (let [y (num/to-dec yn)
+        [ip ie] (d/floor-int y)
+        [k ke] (d/to-int-exact ip)]
+    (if (or (not= ie "") (not= ke "") (> k 99999999))
+      (values (d/zero) (str "Unable to resolve the pow of " (num/to-string bn) " ^ " (num/to-string yn)))
+      (let [[frac fe] (d/sub y ip)
+            f (prim/fpow (num/to-float bn) (d/to-float frac))
+            [ipow pe] (d/pow-exact (num/to-dec bn) k)]
+        (cond (not= pe "") (values (d/zero) pe)
+              (not (fin? f)) (values (d/zero) "Invalid value for parameter: precision. Reason:\n\tprecision can't be negative")
+              :else (let [[fd fe] (d/from-float f)] (d/round-mc (d/mul ipow fd) p m)))))))
+
+(defn isqrt big/BigInt [n: &big/BigInt]
+  (if (bi/is-zero? n) (bi/zero)
+    (let [x0 (bi/pow10 (+ (quot (bi/num-digits n) 2) 1))]
+      (loop [x x0]
+        (let [[q r e] (bi/divmod n x)
+              y (let [[h hr he] (bi/divmod (bi/add x q) (bi/from-int 2))] h)]
+          (if (>= (bi/cmp y x) 0) x (recur y)))))))
+
+(defn dec-sqrt Values(d/Dec Str) [x: &d/Dec p: Int m: Int]
+  (let [sg (d/signum x) pref (quot (d/scale x) 2)]
+    (cond
+      (< sg 0) (values (d/zero) "Attempted square root of negative BigDecimal")
+      (= sg 0) (values (d/of (bi/zero) pref) "")
+      :else
+      (let [u (d/unscaled x) s (d/scale x)
+            want (if (> p 0) (+ (* 2 p) 4) (+ (* 2 (bi/num-digits u)) 4))
+            e0 (let [k (- want (bi/num-digits u))] (if (< k 0) 0 k))
+            e (if (= (mod (+ e0 s) 2) 0) e0 (+ e0 1))
+            r (quot (+ e s) 2)
+            nn (bi/mul-pow10 u e)
+            q (isqrt nn)
+            exact (bi/eq? (bi/mul q q) nn)]
+        (if exact
+          (let [[rr re] (d/round-mc (d/of q r) p m)]
+            (if (not= re "") (values rr re)
+              (values (strip-toward (d/strip-trailing-zeros rr) rr pref) "")))
+          (if (or (= p 0) (= m d/UNNECESSARY)) (values (d/zero) "Computed square root not exact.")
+            (let [[rr re] (d/round-mc (d/of (bi/add-int (bi/mul-int q 10) 1) (+ r 1)) p m)]
+              (if (not= re "") (values rr re)
+                (values (strip-toward (d/strip-trailing-zeros rr) rr pref) "")))))))))
+
+(defn- strip-toward d/Dec [stripped: &d/Dec rr: &d/Dec pref: Int]
+  (if (>= (d/scale stripped) pref) stripped
+    (let [target (if (< (d/scale rr) pref) (d/scale rr) pref)
+          [z ze] (d/set-scale stripped target d/UNNECESSARY)]
+      z)))
+
+(defn- dec-sqrt-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[c ce] (ctx-of a 1)]
+    (if (not (dwe/ok? ce)) (values (v/null-v) ce)
+      (let [[r e] (dec-sqrt (num/to-dec (core/arg-num a 0)) (:prec c) (:mode c))] (dec-ret r e)))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+(defn- b3 rt/Overload [t: Str u: Str w: Str f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] (rt/overload [t u w] f))
+
+(defn builtins Vec(rt/Builtin) []
+  [(rt/constant "E" M (v/num-v (let [[n e] (num/parse-lit "2.7182818284590452354")] n)))
+   (rt/constant "PI" M (v/num-v (let [[n e] (num/parse-lit "3.14159265358979323846")] n)))
+   (rt/constant "DECIMAL_128_CONTEXT" M (v/->VObj [(v/field "precision" (v/int-v 34)) (v/field "roundingMode" (v/->VStr "HALF_EVEN"))]))
+   (rt/constant "UNLIMITED_CONTEXT" M (v/->VObj [(v/field "precision" (v/int-v 0)) (v/field "roundingMode" (v/->VStr "HALF_UP"))]))
+   (B "sin" [(rt/b1 "Number" (f1 "sin"))])
+   (B "cos" [(rt/b1 "Number" (f1 "cos"))])
+   (B "tan" [(rt/b1 "Number" (f1 "tan"))])
+   (B "asin" [(rt/b1 "Number" (f1 "asin"))])
+   (B "acos" [(rt/b1 "Number" (f1 "acos"))])
+   (B "atan" [(rt/b1 "Number" (f1 "atan"))])
+   (B "toRadians" [(rt/b1 "Number" to-radians)])
+   (B "toDegrees" [(rt/b1 "Number" to-degrees)])
+   (B "logn" [(rt/b1 "Number" (f1 "logn"))])
+   (B "log10" [(rt/b1 "Number" (f1 "log10"))])
+   (B "decimalAdd" [(rt/b2 "Number" "Number" (dec-op "add")) (b3 "Number" "Number" "Object" (dec-op "add"))])
+   (B "decimalSubtract" [(rt/b2 "Number" "Number" (dec-op "sub")) (b3 "Number" "Number" "Object" (dec-op "sub"))])
+   (B "decimalDivide" [(rt/b2 "Number" "Number" (dec-op "div")) (b3 "Number" "Number" "Object" (dec-op "div"))])
+   (B "decimalMultiply" [(rt/b2 "Number" "Number" (dec-op "mul")) (b3 "Number" "Number" "Object" (dec-op "mul"))])
+   (B "decimalPow" [(rt/b2 "Number" "Number" dec-pow) (b3 "Number" "Number" "Object" dec-pow)])
+   (B "decimalSqrt" [(rt/b1 "Number" dec-sqrt-fn) (rt/b2 "Number" "Object" dec-sqrt-fn)])
+   (B "decimalRound" [(rt/b1 "Number" dec-round) (rt/b2 "Number" "Object" dec-round)])])

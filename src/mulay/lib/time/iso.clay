@@ -1,0 +1,265 @@
+(ns mulay.lib.time.iso
+  (:require [mulay.lib.time.types :as t]
+            [mulay.lib.time.civil :as cv]
+            [mulay.lib.time.num :as n]
+            [mulay.lib.time.amount :as am]
+            [mulay.lib.time.local :as l]
+            [mulay.lib.time.tz :as tz]
+            [mulay.lib.time.zoned :as zd]))
+
+(defvariant Temporal
+  (TmDate d: t/LocalDate)
+  (TmTime tm: t/LocalTime)
+  (TmLdt x: t/LocalDateTime)
+  (TmOffTime o: t/OffsetTime)
+  (TmZdt z: t/ZonedDateTime)
+  (TmZone z: t/TimeZone)
+  (TmPeriod p: t/DwPeriod))
+
+(defn- p2 Str [k: Int] (n/pad-num k 2))
+
+(defn year-str Str [y: Int]
+  (let [a (if (< y 0) (- 0 y) y)]
+    (if (< a 1000) (str (if (< y 0) "-" "") (n/pad-num a 4))
+      (str (if (> y 9999) "+" "") y))))
+
+(defn date-str Str [d: &t/LocalDate]
+  (str (year-str (:year d)) "-" (p2 (:month d)) "-" (p2 (:day d))))
+
+(defn- nano-java Str [ns: Int]
+  (if (= (rem ns 1000000) 0) (n/pad-num (/ ns 1000000) 3)
+    (if (= (rem ns 1000) 0) (n/pad-num (/ ns 1000) 6) (n/pad-num ns 9))))
+
+(defn time-str Str [x: &t/LocalTime]
+  (let [s (:second x) ns (:nano x)]
+    (str (p2 (:hour x)) ":" (p2 (:minute x))
+         (if (or (> s 0) (> ns 0)) (str ":" (p2 s) (if (> ns 0) (str "." (nano-java ns)) "")) ""))))
+
+(defn ldt-str Str [x: &t/LocalDateTime]
+  (str (date-str (:date x)) "T" (time-str (:time x))))
+
+(defn ot-str Str [o: &t/OffsetTime]
+  (str (time-str (:time o)) (t/offset-id (:offset o))))
+
+(defn odt-str Str [z: &t/ZonedDateTime]
+  (str (ldt-str (:dt z)) (t/offset-id (:offset z))))
+
+(defn zdt-str Str [z: &t/ZonedDateTime]
+  (let [base (odt-str z)]
+    (match (:zone z)
+      (t/TzOffset o) (if (= o (:offset z)) base (str base "[" (t/offset-id o) "]"))
+      (t/TzRegion id) (str base "[" id "]"))))
+
+(defn zone-str Str [z: &t/TimeZone] (t/zone-id z))
+
+(defn instant-str Str [i: &t/Instant]
+  (let [x (l/ldt-of-epoch-second (:seconds i) 0 0)
+        tm (:time x)
+        ns (:nanos i)
+        frac (if (> ns 0)
+               (str "." (if (= (rem ns 1000000) 0) (n/pad-num (/ ns 1000000) 3)
+                          (if (= (rem ns 1000) 0) (n/pad-num (/ ns 1000) 6) (n/pad-num ns 9))))
+               "")]
+    (str (date-str (:date x)) "T" (p2 (:hour tm)) ":" (p2 (:minute tm)) ":"
+         (p2 (:second tm)) frac "Z")))
+
+(defn- dw-frac Str [ns: Int]
+  (if (= ns 0) ""
+    (let [s (n/pad-num ns 9)
+          e (loop [k 9] (if (= (nth s (- k 1)) 48) (recur (- k 1)) k))]
+      (str "." (subs s 0 e)))))
+
+(defn dw-date-str Str [d: &t/LocalDate] (date-str d))
+
+(defn dw-time-str Str [x: &t/LocalTime]
+  (str (p2 (:hour x)) ":" (p2 (:minute x)) ":" (p2 (:second x)) (dw-frac (:nano x))))
+
+(defn dw-ldt-str Str [x: &t/LocalDateTime]
+  (str (date-str (:date x)) "T" (dw-time-str (:time x))))
+
+(defn dw-ot-str Str [o: &t/OffsetTime]
+  (str (dw-time-str (:time o)) (t/offset-id (:offset o))))
+
+(defn dw-zdt-str Str [z: &t/ZonedDateTime with-zone: Bool]
+  (let [base (str (dw-ldt-str (:dt z)) (t/offset-id (:offset z)))]
+    (if (not with-zone) base
+      (match (:zone z)
+        (t/TzOffset o) base
+        (t/TzRegion id) (str base "[" id "]")))))
+
+(defn- perr Str [s: &Str i: Int] (str "Text '" s "' could not be parsed at index " i))
+(defn- unparsed Str [s: &Str i: Int] (str "Text '" s "' could not be parsed, unparsed text found at index " i))
+(defn- wrap-err Str [s: &Str e: &Str] (str "Text '" s "' could not be parsed: " e))
+
+(defn- scan-year Values(Int Int Bool) [s: &Str pos: Int]
+  (let [c (n/byte-at s pos)
+        neg (= c 45) plus (= c 43)
+        p0 (if (or neg plus) (+ pos 1) pos)
+        [v e ovf] (n/scan-digits s p0 10)
+        len (- e p0)]
+    (if (or (< len 4) ovf) (values 0 pos false)
+      (if (and plus (<= len 4)) (values 0 pos false)
+        (if (and (not neg) (not plus) (> len 4)) (values 0 pos false)
+          (if (and neg (= v 0)) (values 0 pos false)
+            (values (if neg (- 0 v) v) e true)))))))
+
+(defn- two Values(Int Bool) [s: &Str pos: Int]
+  (let [a (n/byte-at s pos) b (n/byte-at s (+ pos 1))]
+    (if (and (digit? a) (digit? b)) (values (+ (* (- a 48) 10) (- b 48)) true) (values 0 false))))
+
+(defn- lex-date Values(Int Int Int Int Int) [s: &Str pos: Int]
+  (let [[y e1 ok1] (scan-year s pos)]
+    (if (not ok1) (values 0 0 0 pos pos)
+      (if (not= (n/byte-at s e1) 45) (values 0 0 0 e1 e1)
+        (let [[m ok2] (two s (+ e1 1))]
+          (if (not ok2) (values 0 0 0 (+ e1 1) (+ e1 1))
+            (if (not= (n/byte-at s (+ e1 3)) 45) (values 0 0 0 (+ e1 3) (+ e1 3))
+              (let [[d ok3] (two s (+ e1 4))]
+                (if (not ok3) (values 0 0 0 (+ e1 4) (+ e1 4))
+                  (values y m d (+ e1 6) -1))))))))))
+
+(defn- lex-time Values(Int Int Int Int Int Int) [s: &Str pos: Int]
+  (let [[h ok1] (two s pos)]
+    (if (not ok1) (values 0 0 0 0 pos pos)
+      (if (not= (n/byte-at s (+ pos 2)) 58) (values 0 0 0 0 (+ pos 2) (+ pos 2))
+        (let [[mi ok2] (two s (+ pos 3))]
+          (if (not ok2) (values 0 0 0 0 (+ pos 3) (+ pos 3))
+            (if (not= (n/byte-at s (+ pos 5)) 58) (values h mi 0 0 (+ pos 5) -1)
+              (let [[sec ok3] (two s (+ pos 6))]
+                (if (not ok3) (values h mi 0 0 (+ pos 5) -1)
+                  (if (not= (n/byte-at s (+ pos 8)) 46) (values h mi sec 0 (+ pos 8) -1)
+                    (let [[fv fe fo] (n/scan-digits s (+ pos 9) 9)
+                          nd (- fe (+ pos 9))
+                          ns (loop [x fv k nd] (if (>= k 9) x (recur (* x 10) (+ k 1))))]
+                      (values h mi sec ns fe -1))))))))))))
+
+(defn- lex-offset Values(Int Int Int Str) [s: &Str pos: Int]
+  (let [c (n/byte-at s pos)]
+    (if (or (= c 90) (= c 122)) (values 0 (+ pos 1) -1 "")
+      (if (not (or (= c 43) (= c 45))) (values 0 pos pos "")
+        (let [[h ok1] (two s (+ pos 1))]
+          (if (not ok1) (values 0 pos pos "")
+            (let [[m e2] (if (= (n/byte-at s (+ pos 3)) 58)
+                           (let [[m ok] (two s (+ pos 4))] (if ok (values m (+ pos 6)) (values 0 (+ pos 3))))
+                           (values 0 (+ pos 3)))
+                  [x e3] (if (and (> e2 (+ pos 3)) (= (n/byte-at s e2) 58))
+                           (let [[x ok] (two s (+ e2 1))] (if ok (values x (+ e2 3)) (values 0 e2)))
+                           (values 0 e2))]
+              (if (or (> h 23) (> m 59) (> x 59))
+                (values 0 e3 -1 "Value out of range: Hour[0-23], Minute[0-59], Second[0-59]")
+                (let [tot (+ (* h 3600) (* m 60) x)]
+                  (if (> tot 64800)
+                    (values 0 e3 -1 (str "Zone offset not in valid range: -18:00 to +18:00"))
+                    (values (if (= c 45) (- 0 tot) tot) e3 -1 "")))))))))))
+
+(defn- check-end Str [s: &Str e: Int]
+  (if (= e (count s)) "" (unparsed s e)))
+
+(defn parse-date Values(t/LocalDate Str) [s: &Str]
+  (let [[y m d e fail] (lex-date s 0)]
+    (if (>= fail 0) (values (t/->LocalDate 1970 1 1) (perr s fail))
+      (let [ce (check-end s e)]
+        (if (not= ce "") (values (t/->LocalDate 1970 1 1) ce)
+          (let [[dt err] (l/of-date y m d)]
+            (values dt (if (= err "") "" (wrap-err s err)))))))))
+
+(defn parse-time Values(t/LocalTime Str) [s: &Str]
+  (let [[h mi sec ns e fail] (lex-time s 0)]
+    (if (>= fail 0) (values (t/->LocalTime 0 0 0 0) (perr s fail))
+      (let [ce (check-end s e)]
+        (if (not= ce "") (values (t/->LocalTime 0 0 0 0) ce)
+          (let [[tm err] (l/of-time h mi sec ns)]
+            (values tm (if (= err "") "" (wrap-err s err)))))))))
+
+(defn- lex-ldt Values(t/LocalDateTime Int Str) [s: &Str]
+  (let [z (t/->LocalDateTime (t/->LocalDate 1970 1 1) (t/->LocalTime 0 0 0 0))
+        [y m d e1 f1] (lex-date s 0)]
+    (if (>= f1 0) (values z 0 (perr s f1))
+      (let [c (n/byte-at s e1)]
+        (if (not (or (= c 84) (= c 116))) (values z 0 (perr s e1))
+          (let [[h mi sec ns e2 f2] (lex-time s (+ e1 1))]
+            (if (>= f2 0) (values z 0 (perr s f2))
+              (let [[x err] (l/of-ldt y m d h mi sec ns)]
+                (if (not= err "") (values z e2 (wrap-err s err))
+                  (values x e2 ""))))))))))
+
+(defn parse-ldt Values(t/LocalDateTime Str) [s: &Str]
+  (let [[x e err] (lex-ldt s)]
+    (if (not= err "") (values x err)
+      (values x (check-end s e)))))
+
+(defn parse-ot Values(t/OffsetTime Str) [s: &Str]
+  (let [z (t/->OffsetTime (t/->LocalTime 0 0 0 0) 0)
+        [h mi sec ns e fail] (lex-time s 0)]
+    (if (>= fail 0) (values z (perr s fail))
+      (let [[off e2 f2 oerr] (lex-offset s e)]
+        (if (>= f2 0) (values z (perr s f2))
+          (if (not= oerr "") (values z (wrap-err s oerr))
+            (let [ce (check-end s e2)]
+              (if (not= ce "") (values z ce)
+                (let [[tm err] (l/of-time h mi sec ns)]
+                  (values (t/->OffsetTime tm off) (if (= err "") "" (wrap-err s err))))))))))))
+
+(defn- lex-zone-bracket Values(t/TimeZone Int Bool Str) [s: &Str pos: Int]
+  (if (not= (n/byte-at s pos) 91) (values (t/utc) pos false "")
+    (let [close (loop [i (+ pos 1)] (if (and (< i (count s)) (not= (nth s i) 93)) (recur (+ i 1)) i))]
+      (if (>= close (count s)) (values (t/utc) pos false (perr s pos))
+        (let [[z e] (tz/zone-of-id (subs s (+ pos 1) close))]
+          (if (not= e "") (values z pos false (perr s (+ pos 1)))
+            (values z (+ close 1) true "")))))))
+
+(defn parse-zdt Values(t/ZonedDateTime Str) [s: &Str]
+  (let [dummy (t/->ZonedDateTime (t/->LocalDateTime (t/->LocalDate 1970 1 1) (t/->LocalTime 0 0 0 0)) 0 (t/utc))
+        [x e err] (lex-ldt s)]
+    (if (not= err "") (values dummy err)
+      (let [c (n/byte-at s e)
+            has-off (or (= c 90) (= c 122) (= c 43) (= c 45))
+            [off e2 f2 oerr] (if has-off (lex-offset s e) (values 0 e -1 ""))]
+        (if (>= f2 0) (values dummy (perr s f2))
+          (if (not= oerr "") (values dummy (wrap-err s oerr))
+            (let [[zone e3 has-zone zerr] (lex-zone-bracket s e2)]
+              (if (not= zerr "") (values dummy zerr)
+                (let [ce (check-end s e3)]
+                  (if (not= ce "") (values dummy ce)
+                    (if (and (not has-off) (not has-zone))
+                      (values dummy (str "Text '" s "' could not be parsed: Unable to obtain ZonedDateTime from TemporalAccessor"))
+                      (if has-off
+                        (if has-zone
+                          (values (zd/zdt-of-instant (l/ldt-to-epoch-second x off) (:nano (:time x)) zone) "")
+                          (values (zd/zdt-of-offset x off) ""))
+                        (values (zd/zdt-of-local x zone []) "")))))))))))))
+
+(defn parse-instant Values(t/Instant Str) [s: &Str]
+  (let [[z e] (parse-zdt s)]
+    (if (not= e "") (values (t/->Instant 0 0) e)
+      (match (:zone z)
+        (t/TzOffset o) (values (zd/zdt-instant z) "")
+        (t/TzRegion id) (values (zd/zdt-instant z) "")))))
+
+(defn parse-temporal Values(Temporal Str) [s: &Str]
+  (let [c0 (n/byte-at s 0)
+        c1 (n/byte-at s 1)
+        is-period (or (= c0 80) (= c0 112) (and (or (= c0 45) (= c0 43)) (or (= c1 80) (= c1 112))))
+        is-time (and (digit? c0) (digit? c1) (= (n/byte-at s 2) 58))]
+    (if is-period
+      (let [[p e] (am/parse-dw-period s)] (values (->TmPeriod p) e))
+      (if is-time
+        (let [[h mi sec ns e fail] (lex-time s 0)]
+          (if (and (< fail 0) (= e (count s)))
+            (let [[tm err] (parse-time s)] (values (->TmTime tm) err))
+            (let [[o err] (parse-ot s)] (values (->TmOffTime o) err))))
+        (if (or (= s "Z") (and (or (= c0 43) (= c0 45)) (digit? c1)
+                               (not (str-has-dash-after? s 1))))
+          (let [[z err] (tz/zone-of-id s)] (values (->TmZone z) err))
+          (let [[y m d e1 f1] (lex-date s 0)]
+            (if (and (< f1 0) (= e1 (count s)))
+              (let [[dt err] (parse-date s)] (values (->TmDate dt) err))
+              (let [[x e2 err2] (lex-ldt s)]
+                (if (and (= err2 "") (= e2 (count s)))
+                  (values (->TmLdt x) "")
+                  (if (not= err2 "")
+                    (values (->TmLdt x) err2)
+                    (let [[z err3] (parse-zdt s)] (values (->TmZdt z) err3))))))))))))
+
+(defn- str-has-dash-after? Bool [s: &Str from: Int]
+  (loop [i from] (if (>= i (count s)) false (if (= (nth s i) 45) true (recur (+ i 1))))))

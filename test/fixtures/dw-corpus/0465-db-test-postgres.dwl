@@ -1,0 +1,1 @@
+{productId: attributes.queryParams.productId, quantity: attributes.queryParams.quantity}

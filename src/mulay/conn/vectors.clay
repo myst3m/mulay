@@ -1,0 +1,729 @@
+(ns mulay.conn.vectors
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.fmt.registry :as reg] [mulay.dw.lib.core_misc :as dmisc]
+            [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.rt.engine :as eng]
+            [mulay.lib.xml :as xml] [mulay.lib.uni :as u] [mulay.lib.dec :as d] [mulay.lib.ieee :as ie] [mulay.lib.jhash :as jh]
+            [mulay.lib.fs :as fs] [mulay.lib.textsplit :as ts] [mulay.lib.regex :as re] [mulay.lib.time.tz :as tz] [mulay.lib.time.iso :as iso]
+            [mulay.lib.time.types :as tt] [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/ms-vectors")
+
+(defvariant J
+  (JNull)
+  (JBool b: Bool)
+  (JNum s: Str)
+  (JStr s: Str)
+  (JArr xs: Vec(J))
+  (JObj ks: Vec(Str) vs: Vec(J)))
+
+(defn- quote-into Str [out0: Str s: &Str]
+  (let [cps (u/cps s)
+        hx "0123456789abcdef"]
+    (loop [i 0 prev 0 out (str out0 "\"")]
+      (if (>= i (count cps)) (str out "\"")
+        (let [c (nth cps i)]
+          (recur (+ i 1) c
+                 (cond (or (= c 92) (= c 34)) (str out "\\" (chr c))
+                       (= c 47) (str out (if (= prev 60) "\\/" "/"))
+                       (= c 8) (str out "\\b") (= c 9) (str out "\\t") (= c 10) (str out "\\n") (= c 12) (str out "\\f") (= c 13) (str out "\\r")
+                       (or (< c 32) (and (>= c 0x80) (< c 0xA0)) (and (>= c 0x2000) (< c 0x2100)))
+                       (str out "\\u" (subs hx (bit-and (bit-shift-right c 12) 15) (+ (bit-and (bit-shift-right c 12) 15) 1))
+                            (subs hx (bit-and (bit-shift-right c 8) 15) (+ (bit-and (bit-shift-right c 8) 15) 1))
+                            (subs hx (bit-and (bit-shift-right c 4) 15) (+ (bit-and (bit-shift-right c 4) 15) 1))
+                            (subs hx (bit-and c 15) (+ (bit-and c 15) 1)))
+                       :else (str out (u/encode c)))))))))
+
+(defn- write-j Str [out: Str x: &J]
+  (match x
+    (JNull) (str out "null")
+    (JBool b) (str out (if b "true" "false"))
+    (JNum s) (str out s)
+    (JStr s) (quote-into out s)
+    (JArr xs) (let [o (loop [i 0 o (str out "[")] (if (>= i (count xs)) o (recur (+ i 1) (write-j (if (> i 0) (str o ",") o) (nth xs i)))))] (str o "]"))
+    (JObj ks vs) (let [o (loop [i 0 o (str out "{")]
+                           (if (>= i (count ks)) o
+                             (let [o1 (quote-into (if (> i 0) (str o ",") o) (nth ks i))]
+                               (recur (+ i 1) (write-j (str o1 ":") (nth vs i))))))]
+                   (str o "}"))))
+
+(defn- json-text Str [x: &J] (write-j "" x))
+
+(defn- strip-zeros Str [s: &Str]
+  (if (or (< (str/index-of s ".") 1) (str/includes? s "E") (str/includes? s "e")) (str s)
+    (let [e (loop [k (count s)] (if (and (> k 0) (= (nth s (- k 1)) 48)) (recur (- k 1)) k))
+          e2 (if (and (> e 0) (= (nth s (- e 1)) 46)) (- e 1) e)]
+      (subs s 0 e2))))
+
+(defn- jint J [n: Int] (->JNum (str n)))
+(defn- jdouble J [x: Float] (->JNum (strip-zeros (d/float->shortest-str x))))
+(defn- jfloat J [x: Float] (->JNum (strip-zeros (d/float32->shortest-str x))))
+
+(defn- jobj J [ks: Vec(Str) vs: Vec(J)] (jobj-cap ks vs 16))
+
+(defn- jobj-cap J [ks: Vec(Str) vs: Vec(J) cap: Int]
+  (let [order (jh/hashmap-order-with ks cap)]
+    (->JObj order (loop [i 0 acc: Vec(J) []]
+                    (if (>= i (count order)) acc
+                      (recur (+ i 1) (conj acc (let [k (loop [j 0] (if (= (nth ks j) (nth order i)) j (recur (+ j 1))))] (nth vs k)))))))))
+
+(defn- copy-cap Int [n: Int] (+ (quot (* n 4) 3) 1))
+
+(defn- failure conn/OpResult [id: &Str msg: &Str] (conn/fail-result (err/mk "MS-VECTORS" id msg)))
+
+(defn- ok-json conn/OpResult [x: &J attrs: v/Val]
+  (conn/ok-result (ev/tv-raw (json-text x) "application/json; charset=UTF-8") (ev/tv-val attrs ev/JAVA)))
+
+(defn- text-of Str [x: &v/Val] (match (v/unmeta x) (v/VStr s) (str s) _ (let [[t e] (drt/to-text x)] t)))
+
+(defrecord Ollama [base: Str timeout-ms: Int])
+
+(defn- conn-elem Vec(xml/XNode) [c: &conn/OpCall local: &Str]
+  (if (= (count (:config c)) 0) [] (conn/child-elem (:children (nth (:config c) 0)) local)))
+
+(defn- ollama Vec(Ollama) [c: &conn/OpCall]
+  (let [e (conn-elem c "ollama-connection")]
+    (if (= (count e) 0) []
+      (let [[t te] (parse-long (xml/attr (nth e 0) "" "totalTimeout" "60000"))]
+        [(->Ollama (str/trim (xml/attr (nth e 0) "" "baseUrl" "")) (if (= te "") t 60000))]))))
+
+(defn- embed-one Values(Vec(Float) Bool) [o: &Ollama model: &Str text: &Str]
+  (let [base (:base o)
+        body (json-text (->JObj ["model" "prompt"] [(->JStr model) (->JStr text)]))
+        hs: Vec(hm/Header) [(hm/->Header "Content-Type" "application/json") (hm/->Header "Accept" "application/json")]
+        req (assoc (http/request-opts (str base "/api/embeddings")) :method "POST" :headers hs :body body :max-redirects 0 :timeout-ms (:timeout-ms o))
+        [resp e] (http/request req)]
+    (if (or (not= e "") (not= (:status resp) 200)) (values [] false)
+      (let [[j je] (reg/read-fmt "application/json" [] (:body resp))]
+        (if (not= je "") (values [] false)
+          (match (v/unmeta j)
+            (v/VObj fs) (let [r (v/obj-get fs "embedding")]
+                          (if (= (count r) 0) (values [] false)
+                            (match (v/unmeta (nth r 0))
+                              (v/VArr xs) (values (loop [i 0 acc: Vec(Float) []]
+                                                    (if (>= i (count xs)) acc
+                                                      (recur (+ i 1) (conj acc (ie/to-float32 (num-of (nth xs i)))))))
+                                                  true)
+                              _ (values [] false))))
+            _ (values [] false)))))))
+
+(defn- floats-j Vec(J) [vs: &Vec(Float)] (loop [k 0 a: Vec(J) []] (if (>= k (count vs)) a (recur (+ k 1) (conj a (jfloat (nth vs k)))))))
+
+(defn- num-of Float [x: &v/Val]
+  (let [[f e] (parse-double (text-of x))] (if (= e "") f 0.0)))
+
+(defn- child-tv-or-payload Values(Vec(ev/TV) Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [[ts x] (conn/child-tv c local)]
+    (if (or (> (count x) 0) (> (count ts) 0)) (values ts x) (values [(:payload (:event c))] []))))
+
+(defn- child-val Values(Vec(v/Val) Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [[ts x] (child-tv-or-payload c local)]
+    (cond (> (count x) 0) (values [] x)
+          (= (count ts) 0) (values [] [])
+          :else (let [[val t2 e] (ev/value (nth ts 0))]
+                  (if (not= e "") (values [] [(err/mk "MULE" "EXPRESSION" e)]) (values [(v/unmeta val)] []))))))
+
+(defn- attrs-embedding v/Val [model: &Str dim: Int]
+  (v/->VObj [(v/field "otherAttributes" (v/->VObj [])) (v/field "embeddingModelDimension" (v/int-v dim))
+             (v/field "tokenUsage" (v/null-v)) (v/field "embeddingModelName" (v/->VStr model))]))
+
+(defn- embed-texts conn/OpResult [c: &conn/OpCall]
+  (let [os (ollama c)
+        [model mx] (conn/attr-str c "embeddingModelName" "")
+        [iv ix] (child-val c "inputs")
+        x (if (> (count mx) 0) mx ix)]
+    (cond
+      (> (count x) 0) (conn/fail-result (nth x 0))
+      (= (count os) 0) (failure "EMBEDDING_OPERATIONS_FAILURE" "Unsupported embedding connection (mulay supports ollama-connection)")
+      :else
+      (let [texts (if (= (count iv) 0) []
+                    (match (nth iv 0)
+                      (v/VArr xs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (text-of (nth xs i))))))
+                      (v/VNull) []
+                      _ [(text-of (nth iv 0))]))
+            [vecs ok] (loop [i 0 acc: Vec(Vec(Float)) []]
+                        (if (>= i (count texts)) (values acc true)
+                          (let [[e eok] (embed-one (nth os 0) model (nth texts i))]
+                            (if eok (recur (+ i 1) (conj acc e)) (values acc false)))))]
+        (cond
+          (not ok) (failure "EMBEDDING_OPERATIONS_FAILURE" "Failed to generate embeddings")
+          (= (count vecs) 0) (failure "EMBEDDING_OPERATIONS_FAILURE" "Index 0 out of bounds for length 0")
+          :else
+          (let [dim (count (nth vecs 0))
+                ej (->JArr (loop [i 0 acc: Vec(J) []]
+                             (if (>= i (count vecs)) acc
+                               (recur (+ i 1) (conj acc (->JArr (floats-j (nth vecs i))))))))
+                sj (->JArr (loop [i 0 acc: Vec(J) []]
+                             (if (>= i (count texts)) acc
+                               (recur (+ i 1) (conj acc (jobj ["metadata" "text"] [(jobj ["index"] [(jint i)]) (->JStr (nth texts i))]))))))]
+            (ok-json (jobj ["embeddings" "text-segments" "dimension"] [ej sj (jint dim)]) (attrs-embedding model dim))))))))
+
+(defn- int-param Values(Vec(Int) Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [[xs x] (conn/attr-val c name)]
+    (cond (> (count x) 0) (values [] x)
+          (= (count xs) 0) (values [0] [])
+          (v/null? (nth xs 0)) (values [] [])
+          :else (let [[n e] (parse-long (str/trim (text-of (nth xs 0))))] (if (= e "") (values [n] []) (values [] []))))))
+
+(defn- stream-param Values(Str Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [[ts x] (child-tv-or-payload c local)]
+    (cond (> (count x) 0) (values "" x)
+          (= (count ts) 0) (values "" [])
+          :else (let [[b e] (ev/bytes (nth ts 0))] (if (not= e "") (values "" [(err/mk "MULE" "EXPRESSION" e)]) (values b []))))))
+
+(defn- chunk-text conn/OpResult [c: &conn/OpCall]
+  (let [[mx x1] (int-param c "maxSegmentSizeInChar")
+        [ov x2] (int-param c "maxOverlapSizeInChars")
+        [text x3] (stream-param c "text")
+        x (if (> (count x1) 0) x1 (if (> (count x2) 0) x2 x3))]
+    (cond
+      (> (count x) 0) (conn/fail-result (nth x 0))
+      (or (= (count mx) 0) (= (count ov) 0)) (conn/fail-result (err/mk "MULE" "UNKNOWN" "Could not create parameter group"))
+      (<= (nth mx 0) 0) (conn/ok-result (ev/tv-raw text "application/json; charset=UTF-8") (ev/tv-null))
+      (= (str/trim text) "") (failure "TRANSFORM_OPERATIONS_FAILURE" "text cannot be null or blank")
+      :else
+      (let [[segs e] (ts/recursive text (nth mx 0) (nth ov 0))]
+        (if (not= e "") (failure "TRANSFORM_OPERATIONS_FAILURE" e)
+          (conn/ok-result (ev/tv-raw (json-text (->JArr (loop [i 0 acc: Vec(J) []] (if (>= i (count segs)) acc (recur (+ i 1) (conj acc (->JStr (nth segs i))))))))
+                                     "application/json; charset=UTF-8")
+                          (ev/tv-null)))))))
+
+(defn- parse-document conn/OpResult [c: &conn/OpCall]
+  (let [[text x] (stream-param c "document-binary")]
+    (if (> (count x) 0) (conn/fail-result (nth x 0))
+      (conn/ok-result (ev/tv-raw text "text/plain; charset=UTF-8")
+                      (ev/tv-val (v/->VObj [(v/field "documentParserName" (v/->VStr "Text document parse"))]) ev/JAVA)))))
+
+(defrecord MVal [kind: Int s: Str i: Int f: Float jt: Str])
+(defrecord Entry [id: Str vec: Vec(Float) text: Str keys: Vec(Str) vals: Vec(MVal)])
+
+(defn- mstr MVal [s: &Str] (->MVal 0 (str s) 0 0.0 "java.lang.String"))
+(defn- mint MVal [n: Int] (->MVal 1 "" n 0.0 (if (and (>= n -2147483648) (<= n 2147483647)) "java.lang.Integer" "java.lang.Long")))
+(defn- mlong MVal [n: Int] (->MVal 1 "" n 0.0 "java.lang.Long"))
+(defn- mdouble MVal [f: Float] (->MVal 2 "" 0 f "java.lang.Double"))
+
+(defn- store-dir Vec(Str) [c: &conn/OpCall]
+  (let [e (conn-elem c "ephemeral-file-connection")]
+    (if (= (count e) 0) [] [(str/trim (xml/attr (nth e 0) "" "workingDir" ""))])))
+
+(defn- store-path Str [dir: &Str name: &Str] (fs/join dir (str name ".store")))
+
+(defn- mval-of MVal [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VStr s) (mstr s)
+    (v/VInt n) (mint n)
+    (v/VNum n) (let [t (text-of x)] (if (or (str/includes? t ".") (str/includes? t "E") (str/includes? t "e"))
+                                       (let [[f e] (parse-double t)] (mdouble f))
+                                       (let [[n2 e] (parse-long t)] (mint n2))))
+    _ (mstr (text-of x))))
+
+(defn- entry-of Vec(Entry) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs)
+    (let [id (let [r (v/obj-get fs "id")] (if (= (count r) 0) "" (text-of (nth r 0))))
+          vec (let [r (v/obj-get fs "embedding")]
+                (if (= (count r) 0) []
+                  (match (v/unmeta (nth r 0))
+                    (v/VObj es) (let [vr (v/obj-get es "vector")]
+                                  (if (= (count vr) 0) []
+                                    (match (v/unmeta (nth vr 0))
+                                      (v/VArr xs) (loop [i 0 acc: Vec(Float) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (ie/to-float32 (num-of (nth xs i)))))))
+                                      _ [])))
+                    _ [])))
+          emb (let [r (v/obj-get fs "embedded")] (if (= (count r) 0) (v/null-v) (v/unmeta (nth r 0))))
+          [text ks vs] (match emb
+                         (v/VObj efs)
+                         (let [t (let [r (v/obj-get efs "text")] (if (= (count r) 0) "" (text-of (nth r 0))))
+                               mm (let [r (v/obj-get efs "metadata")]
+                                    (if (= (count r) 0) (v/null-v)
+                                      (match (v/unmeta (nth r 0))
+                                        (v/VObj ms) (let [r2 (v/obj-get ms "metadata")] (if (= (count r2) 0) (v/null-v) (v/unmeta (nth r2 0))))
+                                        _ (v/null-v))))]
+                           (match mm
+                             (v/VObj kv) (values t (loop [i 0 acc: Vec(Str) []] (if (>= i (count kv)) acc (recur (+ i 1) (conj acc (:name (:key (nth kv i)))))))
+                                                 (loop [i 0 acc: Vec(MVal) []] (if (>= i (count kv)) acc (recur (+ i 1) (conj acc (mval-of (:value (nth kv i))))))))
+                             _ (values t [] [])))
+                         _ (values "" [] []))]
+      [(->Entry id vec text ks vs)])
+    _ []))
+
+(defn- load-store Values(Vec(Entry) Str) [path: &Str]
+  (if (not (fs/exists? path)) (values [] "")
+    (let [[s e] (read-file path)]
+      (if (not= e "") (values [] e)
+        (let [[j je] (reg/read-fmt "application/json" [] s)]
+          (if (not= je "") (values [] je)
+            (match (v/unmeta j)
+              (v/VObj fs) (let [r (v/obj-get fs "entries")]
+                            (if (= (count r) 0) (values [] "")
+                              (match (v/unmeta (nth r 0))
+                                (v/VArr xs) (values (loop [i 0 acc: Vec(Entry) []] (if (>= i (count xs)) acc (recur (+ i 1) (let [es (entry-of (nth xs i))] (if (= (count es) 0) acc (conj acc (nth es 0)))))))
+                                                    "")
+                                _ (values [] ""))))
+              _ (values [] ""))))))))
+
+(defn- jackson-quote Str [out0: Str s: &Str]
+  (let [hx "0123456789abcdef"]
+    (loop [i 0 out (str out0 "\"")]
+      (if (>= i (count s)) (str out "\"")
+        (let [c (nth s i)]
+          (recur (+ i 1)
+                 (cond (= c 34) (str out "\\\"") (= c 92) (str out "\\\\")
+                       (= c 10) (str out "\\n") (= c 13) (str out "\\r") (= c 9) (str out "\\t") (= c 8) (str out "\\b") (= c 12) (str out "\\f")
+                       (< c 32) (str out "\\u00" (subs hx (quot c 16) (+ (quot c 16) 1)) (subs hx (mod c 16) (+ (mod c 16) 1)))
+                       :else (str out (subs s i (+ i 1))))))))))
+
+(defn- meta-order Vec(Int) [ks: &Vec(Str)] (order-with ks (copy-cap (count ks))))
+
+(defn- order-with Vec(Int) [ks: &Vec(Str) initial: Int]
+  (let [order (jh/hashmap-order-with ks initial)]
+    (loop [i 0 acc: Vec(Int) []]
+      (if (>= i (count order)) acc
+        (recur (+ i 1) (conj acc (loop [j 0] (if (= (nth ks j) (nth order i)) j (recur (+ j 1))))))))))
+
+(defn- mval-jackson Str [x: &MVal]
+  (cond (= (:kind x) 0) (jackson-quote "" (:s x)) (= (:kind x) 1) (str (:i x)) :else (d/float->shortest-str (:f x))))
+
+(defn- store-json Str [es: &Vec(Entry)]
+  (loop [i 0 out "{\"entries\":["]
+    (if (>= i (count es)) (str out "]}")
+      (let [e (nth es i)
+            o1 (jackson-quote (str out (if (> i 0) "," "") "{\"id\":") (:id e))
+            o2 (loop [k 0 o (str o1 ",\"embedding\":{\"vector\":[")] (if (>= k (count (:vec e))) (str o "]}") (recur (+ k 1) (str o (if (> k 0) "," "") (d/float32->shortest-str (nth (:vec e) k))))))
+            o3 (jackson-quote (str o2 ",\"embedded\":{\"text\":") (:text e))
+            ord (meta-order (:keys e))
+            o4 (loop [k 0 o (str o3 ",\"metadata\":{\"metadata\":{")]
+                 (if (>= k (count ord)) (str o "}}}}")
+                   (let [j (nth ord k)]
+                     (recur (+ k 1) (str (jackson-quote (str o (if (> k 0) "," "")) (nth (:keys e) j)) ":" (mval-jackson (nth (:vals e) j)))))))]
+        (recur (+ i 1) o4)))))
+
+(defn- save-store Str [path: &Str es: &Vec(Entry)]
+  (let [e (write-file path (store-json es))]
+    (if (= e "") "" (str "java.nio.file.NoSuchFileException: " path))))
+
+(defn- meta-j J [e: &Entry]
+  (let [ord (order-with (:keys e) (count (:keys e)))
+        ks (loop [k 0 acc: Vec(Str) []] (if (>= k (count ord)) acc (recur (+ k 1) (conj acc (nth (:keys e) (nth ord k))))))
+        vs (loop [k 0 acc: Vec(J) []]
+             (if (>= k (count ord)) acc
+               (recur (+ k 1) (conj acc (let [x (nth (:vals e) (nth ord k))]
+                                          (cond (= (:kind x) 0) (->JStr (:s x)) (= (:kind x) 1) (jint (:i x)) :else (jdouble (:f x))))))))]
+    (->JObj ks vs)))
+
+(defn- attrs-store v/Val [cnd: &Vec(Str) store: &Str] (attrs-store-ids cnd [] store))
+
+(defn- attrs-store-ids v/Val [cnd: &Vec(Str) ids: Vec(Str) store: &Str]
+  (v/->VObj [(v/field "metadataCondition" (if (= (count cnd) 0) (v/null-v) (v/->VStr (nth cnd 0))))
+             (v/field "otherAttributes" (v/->VObj []))
+             (v/field "ids" (if (= (count ids) 0) (v/null-v) (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count ids)) acc (recur (+ i 1) (conj acc (v/->VStr (nth ids i)))))))))
+             (v/field "storeName" (v/->VStr store))]))
+
+(defn- segments Values(Vec(Str) Vec(Vec(Str)) Vec(Vec(MVal)) Vec(Vec(Float)) Str) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs)
+    (let [missing (cond (= (count (v/obj-get fs "embeddings")) 0) "embeddings"
+                        (= (count (v/obj-get fs "dimension")) 0) "dimension"
+                        :else "")
+          ts (let [r (v/obj-get fs "text-segments")] (if (= (count r) 0) [] (match (v/unmeta (nth r 0)) (v/VArr xs) xs _ [])))
+          em (let [r (v/obj-get fs "embeddings")] (if (= (count r) 0) [] (match (v/unmeta (nth r 0)) (v/VArr xs) xs _ [])))
+          [texts mks mvs] (loop [i 0 a: Vec(Str) [] b: Vec(Vec(Str)) [] c: Vec(Vec(MVal)) []]
+                            (if (>= i (count ts)) (values a b c)
+                              (match (v/unmeta (nth ts i))
+                                (v/VObj sf) (let [t (let [r (v/obj-get sf "text")] (if (= (count r) 0) "" (text-of (nth r 0))))
+                                                  mm (let [r (v/obj-get sf "metadata")] (if (= (count r) 0) (v/null-v) (v/unmeta (nth r 0))))
+                                                  [ks vs] (match mm
+                                                            (v/VObj kv) (values (loop [k 0 acc: Vec(Str) []] (if (>= k (count kv)) acc (recur (+ k 1) (conj acc (:name (:key (nth kv k)))))))
+                                                                                (loop [k 0 acc: Vec(MVal) []] (if (>= k (count kv)) acc (recur (+ k 1) (conj acc (mval-of (:value (nth kv k))))))))
+                                                            _ (values [] []))]
+                                              (recur (+ i 1) (conj a t) (conj b ks) (conj c vs)))
+                                _ (recur (+ i 1) a b c))))
+          vecs (loop [i 0 acc: Vec(Vec(Float)) []]
+                 (if (>= i (count em)) acc
+                   (recur (+ i 1) (conj acc (match (v/unmeta (nth em i))
+                                              (v/VArr xs) (loop [k 0 a: Vec(Float) []] (if (>= k (count xs)) a (recur (+ k 1) (conj a (ie/to-float32 (num-of (nth xs k)))))))
+                                              _ [])))))]
+      (values texts mks mvs vecs (if (= missing "") "" (str "JSONObject[\"" missing "\"] not found."))))
+    _ (values [] [] [] [] "A JSONObject text must begin with '{' at 1 [character 2 line 1]")))
+
+(defvariant Filt
+  (FCmp key: Str op: Str val: MVal)
+  (FAnd a: Filt b: Filt)
+  (FOr a: Filt b: Filt))
+
+(def FIELD-RE (rx "([a-zA-Z_][a-zA-Z0-9_]*)"))
+(def OPERATOR-RE (rx "([=!><]+)"))
+(def CONTAINS-RE (rx "CONTAINS\\s*+\\(\\s*+([a-zA-Z_][a-zA-Z0-9_]*)\\s*+,\\s*+([^)]*+)\\s*+\\)"))
+(def NUMBER-RE (rx "^-?\\d+(\\.\\d+)?$"))
+
+(defn- rx re/Pattern [s: &Str] (let [[p e] (re/compile s 0)] p))
+
+(defn- find1 Vec(re/Match) [p: &re/Pattern s: &Str] (let [[ms e] (re/search p s 0)] ms))
+
+(defn- mval-str Str [x: &MVal]
+  (cond (= (:kind x) 0) (str (:s x)) (= (:kind x) 1) (str (:i x)) :else (d/float->shortest-str (:f x))))
+
+(defn- dec-of d/Dec [x: &MVal] (let [[dd e] (d/parse (mval-str x))] dd))
+
+(defn- mcmp Values(Int Str) [key: &Str a: &MVal b: &MVal]
+  (cond (and (> (:kind a) 0) (> (:kind b) 0)) (values (let [r (d/cmp (dec-of a) (dec-of b))] (cond (< r 0) -1 (> r 0) 1 :else 0)) "")
+        (and (= (:kind a) 0) (= (:kind b) 0)) (values (let [r (str-cmp (:s a) (:s b))] (cond (< r 0) -1 (> r 0) 1 :else 0)) "")
+        :else (values 0 (str "Type mismatch: actual value of metadata key \"" key "\" (" (mval-str a) ") has type " (:jt a)
+                             ", while comparison value (" (mval-str b) ") has type " (:jt b)))))
+
+(defn- str-cmp Int [a: &Str b: &Str]
+  (let [n (if (< (count a) (count b)) (count a) (count b))]
+    (loop [i 0] (if (>= i n) (- (count a) (count b)) (let [x (nth a i) y (nth b i)] (if (not= x y) (- x y) (recur (+ i 1))))))))
+
+(defn- filt-test Values(Bool Str) [f: &Filt e: &Entry]
+  (match f
+    (FAnd a b) (let [[x xe] (filt-test a e)] (if (or (not= xe "") (not x)) (values false xe) (filt-test b e)))
+    (FOr a b) (let [[x xe] (filt-test a e)] (if (or (not= xe "") x) (values x xe) (filt-test b e)))
+    (FCmp k op x)
+    (let [i (loop [j 0] (if (>= j (count (:keys e))) -1 (if (= (nth (:keys e) j) k) j (recur (+ j 1)))))]
+      (if (< i 0) (values (= op "!=") "")
+        (let [a (nth (:vals e) i)]
+          (if (= op "contains")
+            (if (= (:kind a) 0) (values (str/includes? (:s a) (:s x)) "")
+              (values false (str "Type mismatch: actual value of metadata key \"" k "\" (" (mval-str a) ") has type " (:jt a) ", while it is expected to be a string")))
+            (let [[c ce] (mcmp k a x)]
+              (if (not= ce "") (values false ce)
+                (values (cond (= op "=") (= c 0) (= op "!=") (not= c 0) (= op ">") (> c 0) (= op ">=") (>= c 0) (= op "<") (< c 0) :else (<= c 0)) "")))))))))
+
+(defn- check-parens Str [s: &Str]
+  (let [[depth bad] (loop [i 0 d 0 q 0]
+                      (if (>= i (count s)) (values d false)
+                        (let [c (nth s i)]
+                          (cond (and (= q 0) (or (= c 39) (= c 34))) (recur (+ i 1) d c)
+                                (and (> q 0) (= c q)) (recur (+ i 1) d 0)
+                                (> q 0) (recur (+ i 1) d q)
+                                (= c 40) (recur (+ i 1) (+ d 1) q)
+                                (= c 41) (if (= d 0) (values d true) (recur (+ i 1) (- d 1) q))
+                                :else (recur (+ i 1) d q)))))]
+    (cond bad (str "Mismatched parentheses in expression (extra closing): " s)
+          (> depth 0) (str "Mismatched parentheses in expression (extra opening): " s)
+          :else "")))
+
+(defn- wrapped? Bool [s: &Str]
+  (and (>= (count s) 2) (= (nth s 0) 40) (= (nth s (- (count s) 1)) 41)
+       (loop [i 0 d 0 q 0]
+         (if (>= i (count s)) false
+           (let [c (nth s i)]
+             (cond (and (= q 0) (or (= c 39) (= c 34))) (recur (+ i 1) d c)
+                   (and (> q 0) (= c q)) (recur (+ i 1) d 0)
+                   (> q 0) (recur (+ i 1) d q)
+                   (= c 40) (recur (+ i 1) (+ d 1) q)
+                   (= c 41) (if (= d 1) (= i (- (count s) 1)) (recur (+ i 1) (- d 1) q))
+                   :else (recur (+ i 1) d q)))))))
+
+(defn- strip-parens Str [s0: &Str]
+  (loop [s (str/trim s0)] (if (wrapped? s) (recur (str/trim (subs s 1 (- (count s) 1)))) s)))
+
+(defn- logical-at Int [s: &Str i: Int]
+  (let [ws (fn-ws (nth s i))]
+    (if (not ws) 0
+      (let [rest (str/upper-case (subs s (+ i 1) (if (< (+ i 5) (count s)) (+ i 5) (count s))))]
+        (cond (and (str/starts-with? rest "AND") (or (= (+ i 4) (count s)) (fn-ws (nth s (+ i 4))))) 3
+              (and (str/starts-with? rest "OR") (or (= (+ i 3) (count s)) (fn-ws (nth s (+ i 3))))) 2
+              :else 0)))))
+
+(defn- fn-ws Bool [c: Int] (or (= c 32) (= c 9) (= c 10) (= c 13)))
+
+(defn- split-top Values(Vec(Str) Str Bool) [s: &Str]
+  (loop [i 0 d 0 q 0 start 0 acc: Vec(Str) [] kind ""]
+    (if (>= i (count s))
+      (let [last (str/trim (subs s start (count s)))] (values (if (= last "") acc (conj acc last)) kind false))
+      (let [c (nth s i)]
+        (cond (and (= q 0) (or (= c 39) (= c 34))) (recur (+ i 1) d c start acc kind)
+              (and (> q 0) (= c q)) (recur (+ i 1) d 0 start acc kind)
+              (> q 0) (recur (+ i 1) d q start acc kind)
+              (= c 40) (recur (+ i 1) (+ d 1) q start acc kind)
+              (= c 41) (recur (+ i 1) (- d 1) q start acc kind)
+              (= d 0)
+              (let [n (logical-at s i)]
+                (if (= n 0) (recur (+ i 1) d q start acc kind)
+                  (let [k (if (= n 3) "AND" "OR")]
+                    (if (and (not= kind "") (not= kind k)) (values acc kind true)
+                      (let [tok (str/trim (subs s start i))
+                            nxt (+ i n)]
+                        (recur nxt d q nxt (if (= tok "") acc (conj acc tok)) k))))))
+              :else (recur (+ i 1) d q start acc kind))))))
+
+(defn- unquote Str [s: &Str]
+  (if (and (>= (count s) 2) (or (and (= (nth s 0) 39) (= (nth s (- (count s) 1)) 39)) (and (= (nth s 0) 34) (= (nth s (- (count s) 1)) 34))))
+    (subs s 1 (- (count s) 1)) (str s)))
+
+(defn- parse-value MVal [s: &Str]
+  (let [u (unquote s)]
+    (if (> (count (find1 NUMBER-RE u)) 0)
+      (if (str/includes? u ".") (let [[f e] (parse-double u)] (mdouble f)) (let [[n e] (parse-long u)] (mlong n)))
+      (mstr u))))
+
+(defn- parse-simple Values(Filt Str) [c: &Str]
+  (let [none (->FCmp "" "=" (mstr ""))
+        cm (find1 CONTAINS-RE c)]
+    (if (> (count cm) 0)
+      (values (->FCmp (re/group (nth cm 0) c 1) "contains" (mstr (unquote (str/trim (re/group (nth cm 0) c 2))))) "")
+      (let [fm (find1 FIELD-RE c)]
+        (if (= (count fm) 0) (values none (str "Invalid field name in condition: " c))
+          (let [om (find1 OPERATOR-RE c)]
+            (if (= (count om) 0) (values none (str "Invalid operator in condition: " c))
+              (let [op (re/group (nth om 0) c 1)
+                    v (str/trim (subs c (re/end (nth om 0) 0) (count c)))]
+                (cond (= v "") (values none (str "Missing value in condition: " c))
+                      (not (or (= op "=") (= op "!=") (= op ">") (= op ">=") (= op "<") (= op "<="))) (values none (str "Unsupported operator: " op))
+                      :else (values (->FCmp (re/group (nth fm 0) c 1) op (parse-value v)) ""))))))))))
+
+(defn- parse-filter Values(Vec(Filt) Str) [s0: &Str]
+  (let [s (str/trim s0)
+        pe (if (= s "") "Expression cannot be null or empty" (check-parens s))]
+    (if (not= pe "") (values [] pe)
+      (let [e (strip-parens s)
+            [toks kind mixed] (split-top e)]
+        (cond
+          mixed (values [] (str "Mixed AND/OR operations at the same level must be explicitly grouped with parentheses. Expression: " e))
+          (= kind "") (let [[f fe] (parse-simple e)] (if (not= fe "") (values [] fe) (values [f] "")))
+          :else
+          (loop [i 0 acc: Vec(Filt) []]
+            (if (>= i (count toks)) (values acc "")
+              (let [tok (nth toks i)
+                    [fs fe] (if (str/starts-with? tok "(") (parse-filter tok) (let [[f e2] (parse-simple tok)] (if (not= e2 "") (values [] e2) (values [f] ""))))]
+                (if (not= fe "") (values [] fe)
+                  (recur (+ i 1) (if (= (count acc) 0) fs [(if (= kind "AND") (->FAnd (nth acc 0) (nth fs 0)) (->FOr (nth acc 0) (nth fs 0)))])))))))))))
+
+(defn- store-name Values(Str Vec(err/MErr)) [c: &conn/OpCall] (conn/attr-str c "storeName" ""))
+
+(defn- store-add conn/OpResult [c: &conn/OpCall]
+  (let [dirs (store-dir c)
+        [name nx] (store-name c)
+        [iv ix] (child-val c "text-segments-and-embeddings")
+        x (if (> (count nx) 0) nx ix)]
+    (cond
+      (> (count x) 0) (conn/fail-result (nth x 0))
+      (= (count dirs) 0) (failure "STORE_OPERATIONS_FAILURE" "Unsupported store connection (mulay supports ephemeral-file-connection)")
+      :else
+      (let [[texts mks mvs vecs se] (segments (if (= (count iv) 0) (v/null-v) (nth iv 0)))
+            path (store-path (nth dirs 0) name)
+            [es le] (load-store path)
+            [extra-k extra-v] (metadata-entries c)
+            source (dmisc/uuid4)
+            [sec ns] (tz/now-instant-ns)
+            ms (+ (* sec 1000) (quot ns 1000000))
+            dt (iso/instant-str (tt/->Instant sec ns))
+            [es2 ids] (loop [i 0 acc es ids: Vec(Str) []]
+                        (if (or (>= i (count texts)) (>= i (count vecs))) (values acc ids)
+                          (let [id (dmisc/uuid4)
+                                [k1 v1] (put-all (nth mks i) (nth mvs i) ["source_id" "ingestion_timestamp" "ingestion_datetime"] [(mstr source) (mlong ms) (mstr dt)])
+                                [k2 v2] (put-all k1 v1 extra-k extra-v)]
+                            (recur (+ i 1) (conj acc (->Entry id (nth vecs i) (nth texts i) k2 v2)) (conj ids id)))))]
+        (cond
+          (not= se "") (failure "INVALID_PARAMETER" se)
+          (not= (count texts) (count vecs)) (failure "STORE_OPERATIONS_FAILURE" "The list of ids and embeddings and embedded must have the same size")
+          (not= le "") (failure "STORE_OPERATIONS_FAILURE" le)
+          :else
+          (let [we (save-store path es2)]
+            (if (not= we "") (failure "STORE_OPERATIONS_FAILURE" we)
+              (ok-json (jobj ["sourceId" "embeddingIds" "status"]
+                             [(->JStr source) (->JArr (loop [i 0 acc: Vec(J) []] (if (>= i (count ids)) acc (recur (+ i 1) (conj acc (->JStr (nth ids i))))))) (->JStr "updated")])
+                       (attrs-store [] name)))))))))
+
+(defn- put-all Values(Vec(Str) Vec(MVal)) [ks0: &Vec(Str) vs0: &Vec(MVal) ks: &Vec(Str) vs: &Vec(MVal)]
+  (loop [i 0 ka (subvec ks0 0 (count ks0)) va (subvec vs0 0 (count vs0))]
+    (if (>= i (count ks)) (values ka va)
+      (let [k (nth ks i)
+            j (loop [m 0] (if (>= m (count ka)) -1 (if (= (nth ka m) k) m (recur (+ m 1)))))]
+        (if (>= j 0) (recur (+ i 1) ka (assoc va j (nth vs i))) (recur (+ i 1) (conj ka k) (conj va (nth vs i))))))))
+
+(defn- metadata-entries Values(Vec(Str) Vec(MVal)) [c: &conn/OpCall]
+  (let [me (conn/child-elem (:children c) "metadata-entries")]
+    (if (= (count me) 0) (values [] [])
+      (let [ks (xml/child-elems (nth me 0))]
+        (loop [i 0 n 0 a: Vec(Str) [] b: Vec(MVal) []]
+          (if (>= i (count ks)) (values a b)
+            (let [e (nth ks i)]
+              (if (not= (xml/elem-local e) "metadata-entry") (recur (+ i 1) n a b)
+                (let [path (if (> (count (filter-local ks "metadata-entry")) 1) (str "metadata-entries/metadata-entry[" n "]") "metadata-entries/metadata-entry")
+                      kx (conn/param (:exprs c) (str path "@key"))
+                      vx (conn/param (:exprs c) (str path "@value"))
+                      k (expr-or-attr c kx (xml/attr e "" "key" ""))
+                      v (expr-or-attr c vx (xml/attr e "" "value" ""))]
+                  (recur (+ i 1) (+ n 1) (conj a k) (conj b (mstr v))))))))))))
+
+(defn- filter-local Vec(xml/XNode) [ks: &Vec(xml/XNode) local: &Str]
+  (loop [i 0 acc: Vec(xml/XNode) []] (if (>= i (count ks)) acc (recur (+ i 1) (if (= (xml/elem-local (nth ks i)) local) (conj acc (nth ks i)) acc)))))
+
+(defn- expr-or-attr Str [c: &conn/OpCall px: &Vec(m/PVal) lit: &Str]
+  (if (= (count px) 0) (str lit)
+    (let [[x e] ((:eval c) (nth px 0) (:event c))] (if (or (not= e "") (v/null? x)) "" (text-of x)))))
+
+(defrecord Hit [score: Float entry: Entry])
+
+(defn- cosine Float [a: &Vec(Float) b: &Vec(Float)]
+  (let [[dot na nb] (loop [i 0 dot 0.0 na 0.0 nb 0.0]
+                      (if (or (>= i (count a)) (>= i (count b))) (values dot na nb)
+                        (let [x (nth a i) y (nth b i)]
+                          (recur (+ i 1) (+ dot (ie/to-float32 (* x y))) (+ na (ie/to-float32 (* x x))) (+ nb (ie/to-float32 (* y y)))))))
+        den (* (sqrt na) (sqrt nb))
+        eps 9.99999993922529e-9]
+    (/ dot (if (> den eps) den eps))))
+
+(defn- heap-add Vec(Hit) [h0: Vec(Hit) x: &Hit]
+  (let [h (conj h0 x)]
+    (loop [k (- (count h) 1) hv h]
+      (if (= k 0) (assoc hv 0 x)
+        (let [p (quot (- k 1) 2) pe (nth hv p)]
+          (if (>= (:score x) (:score pe)) (assoc hv k x) (recur p (assoc hv k pe))))))))
+
+(defn- heap-poll Vec(Hit) [h: Vec(Hit)]
+  (let [n (- (count h) 1)
+        x (nth h n)
+        h1 (subvec h 0 n)]
+    (if (= n 0) h1
+      (let [half (quot n 2)]
+        (loop [k 0 hv h1]
+          (if (>= k half) (assoc hv k x)
+            (let [l (+ (* 2 k) 1) r (+ l 1)
+                  ch (if (and (< r n) (> (:score (nth hv l)) (:score (nth hv r)))) r l)
+                  cv (nth hv ch)]
+              (if (<= (:score x) (:score cv)) (assoc hv k x) (recur ch (assoc hv k cv))))))))))
+
+(defn- sort-asc Vec(Hit) [h: &Vec(Hit)]
+  (loop [i 0 acc: Vec(Hit) []]
+    (if (>= i (count h)) acc
+      (let [x (nth h i)
+            pos (loop [j (count acc)] (if (and (> j 0) (> (:score (nth acc (- j 1))) (:score x))) (recur (- j 1)) j))
+            acc2 (loop [j 0 a: Vec(Hit) []] (if (>= j (count acc)) (if (= pos (count acc)) (conj a x) a)
+                                             (recur (+ j 1) (if (= j pos) (conj (conj a x) (nth acc j)) (conj a (nth acc j))))))]
+        (recur (+ i 1) acc2)))))
+
+(defn- search Values(Vec(Hit) Str) [es: &Vec(Entry) q: &Vec(Float) max: Int min: Float filt: &Vec(Filt)]
+  (let [[h err] (loop [i 0 h: Vec(Hit) []]
+                  (if (>= i (count es)) (values h "")
+                    (let [e (nth es i)
+                          [pass fe] (if (= (count filt) 0) (values true "") (filt-test (nth filt 0) e))]
+                      (cond (not= fe "") (values h fe)
+                            (not pass) (recur (+ i 1) h)
+                            (not= (count (:vec e)) (count q))
+                            (values h (str "Length of vector a (" (count (:vec e)) ") must be equal to the length of vector b (" (count q) ")"))
+                            :else (let [s (/ (+ (cosine (:vec e) q) 1.0) 2.0)]
+                                    (if (< s min) (recur (+ i 1) h)
+                                      (let [h2 (heap-add h (->Hit s e))]
+                                        (recur (+ i 1) (if (> (count h2) max) (heap-poll h2) h2)))))))))
+        asc (sort-asc h)]
+    (values (loop [i (- (count asc) 1) acc: Vec(Hit) []] (if (< i 0) acc (recur (- i 1) (conj acc (nth asc i))))) err)))
+
+(defn- condition Values(Vec(Str) Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[ts tx] (conn/child-tv c "condition")]
+    (cond (> (count tx) 0) (values [] tx)
+          (= (count ts) 0) (values [] [])
+          :else (let [[val t2 e] (ev/value (nth ts 0))]
+                  (cond (not= e "") (values [] [(err/mk "MULE" "EXPRESSION" e)])
+                        (v/null? val) (values [] [])
+                        :else (values [(text-of val)] []))))))
+
+(defn- query conn/OpResult [c: &conn/OpCall]
+  (let [dirs (store-dir c)
+        [name nx] (store-name c)
+        [maxv mx] (conn/attr-str c "maxResults" "")
+        [minv minx] (conn/attr-str c "minScore" "")
+        [iv ix] (child-val c "text-segment-and-embedding")
+        [cnd cx] (condition c)
+        xs (loop [i 0 a: Vec(Vec(err/MErr)) [nx mx minx ix cx]] (if (>= i (count a)) [] (if (> (count (nth a i)) 0) (nth a i) (recur (+ i 1) a))))]
+    (cond
+      (> (count xs) 0) (conn/fail-result (nth xs 0))
+      (= (count dirs) 0) (failure "STORE_OPERATIONS_FAILURE" "Unsupported store connection (mulay supports ephemeral-file-connection)")
+      :else
+      (let [[texts mks mvs vecs se] (segments (if (= (count iv) 0) (v/null-v) (nth iv 0)))
+            [fl fe] (if (= (count cnd) 0) (values [] "") (parse-filter (nth cnd 0)))
+            [maxn me] (parse-long (str/trim maxv))
+            [minf mfe] (parse-double (str/trim minv))
+            [es le] (load-store (store-path (nth dirs 0) name))]
+        (cond
+          (not= se "") (failure "INVALID_PARAMETER" se)
+          (> (count texts) 1) (failure "INVALID_PARAMETER" (str "You must provide one text segment only. Received: " (count texts)))
+          (not= (count vecs) 1) (failure "INVALID_PARAMETER" (str "You must provide one embedding only. Received: " (count vecs)))
+          (not= fe "") (failure "STORE_OPERATIONS_FAILURE" (str "Error building metadata filter: " fe))
+          (<= maxn 0) (failure "STORE_OPERATIONS_FAILURE" (str "maxResults must be greater than zero, but is: " maxn))
+          (or (< minf 0.0) (> minf 1.0)) (failure "STORE_OPERATIONS_FAILURE" (str "minScore must be between 0.0 and 1.0, but is: " (d/float->shortest-str minf)))
+          (not= le "") (failure "STORE_OPERATIONS_FAILURE" le)
+          :else
+          (let [[hits he] (search es (nth vecs 0) maxn minf fl)
+                srcs (loop [i 0 acc: Vec(J) []]
+                       (if (>= i (count hits)) acc
+                         (let [h (nth hits i) e (:entry h)]
+                           (recur (+ i 1) (conj acc (jobj ["score" "metadata" "embeddingId" "text"] [(jdouble (:score h)) (meta-j e) (->JStr (:id e)) (->JStr (:text e))]))))))
+                resp (loop [i 0 out ""] (if (>= i (count hits)) out (recur (+ i 1) (str out (if (> i 0) "\n\n" "") (:text (:entry (nth hits i)))))))]
+            (if (not= he "") (failure "STORE_OPERATIONS_FAILURE" he)
+            (ok-json (if (= (count texts) 1)
+                       (jobj ["minScore" "question" "sources" "response" "maxResults" "storeName"]
+                             [(jdouble minf) (->JStr (nth texts 0)) (->JArr srcs) (->JStr resp) (jint maxn) (->JStr name)])
+                       (jobj ["minScore" "sources" "response" "maxResults" "storeName"]
+                             [(jdouble minf) (->JArr srcs) (->JStr resp) (jint maxn) (->JStr name)]))
+                     (attrs-store cnd name)))))))))
+
+(defn- store-remove conn/OpResult [c: &conn/OpCall]
+  (let [dirs (store-dir c)
+        [name nx] (store-name c)
+        [ids ix] (conn/attr-val c "ids")
+        [cnd cx] (condition c)
+        xs (if (> (count nx) 0) nx (if (> (count ix) 0) ix cx))]
+    (cond
+      (> (count xs) 0) (conn/fail-result (nth xs 0))
+      (= (count dirs) 0) (failure "STORE_OPERATIONS_FAILURE" "Unsupported store connection (mulay supports ephemeral-file-connection)")
+      :else
+      (let [path (store-path (nth dirs 0) name)
+            idl (if (= (count ids) 0) []
+                  (match (v/unmeta (nth ids 0))
+                    (v/VArr xs2) (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs2)) acc (recur (+ i 1) (conj acc (text-of (nth xs2 i))))))
+                    (v/VNull) []
+                    _ [(text-of (nth ids 0))]))
+            [fl fe] (if (= (count cnd) 0) (values [] "") (parse-filter (nth cnd 0)))
+            [es le] (load-store path)]
+        (cond
+          (not= fe "") (failure "STORE_OPERATIONS_FAILURE" (str "Error building metadata filter: " fe))
+          (not= le "") (failure "STORE_OPERATIONS_FAILURE" le)
+          (and (= (count idl) 0) (= (count cnd) 0))
+          (let [z (if (fs/exists? path) (fs/remove-tree path) "")] (ok-json (jobj ["status"] [(->JStr "deleted")]) (attrs-store [] name)))
+          :else
+          (let [[kept ke] (loop [i 0 acc: Vec(Entry) []]
+                            (if (>= i (count es)) (values acc "")
+                              (let [e (nth es i)
+                                    [gone ge] (if (> (count fl) 0) (filt-test (nth fl 0) e) (values (has-str? idl (:id e)) ""))]
+                                (if (not= ge "") (values acc ge) (recur (+ i 1) (if gone acc (conj acc e)))))))
+                we (if (not= ke "") "" (save-store path kept))]
+            (if (or (not= ke "") (not= we "")) (failure "STORE_OPERATIONS_FAILURE" (if (not= ke "") ke we))
+              (ok-json (jobj ["status"] [(->JStr "deleted")]) (attrs-store-ids cnd idl name)))))))))
+
+(defn- has-str? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (let [op (:op c)]
+    (cond
+      (= op "embedding-generate-from-text") (embed-texts c)
+      (= op "transform-chunk-text") (chunk-text c)
+      (= op "transform-parse-document") (parse-document c)
+      (= op "store-add") (store-add c)
+      (= op "query") (query c)
+      (= op "store-remove") (store-remove c)
+      (= op "query-all") (failure "STORE_UNSUPPORTED_OPERATION" "File iteration is not supported for this vector store.")
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported connector operation ms-vectors:" op))))))
+
+(def ERROR-PARENTS
+  [
+   "MS-VECTORS:INVALID_CONNECTION" "MULE:CONNECTIVITY"
+   "MS-VECTORS:INVALID_CONFIGURATION" "MULE:CONNECTIVITY"
+   "MS-VECTORS:CONNECTION_FAILED" "MULE:CONNECTIVITY"
+   "MS-VECTORS:AI_SERVICES_FAILURE" "MULE:CONNECTIVITY"
+   "MS-VECTORS:AI_SERVICES_RATE_LIMITING_ERROR" "MULE:CONNECTIVITY"
+   "MS-VECTORS:STORAGE_SERVICES_FAILURE" "MULE:CONNECTIVITY"
+   "MS-VECTORS:STORE_SERVICES_FAILURE" "MULE:CONNECTIVITY"
+   "MS-VECTORS:SERVICE_ERROR" "MULE:CONNECTIVITY"
+   "MS-VECTORS:NETWORK_ERROR" "MULE:CONNECTIVITY"
+   "MS-VECTORS:INVALID_PARAMETER" "MULE:VALIDATION"
+   "MS-VECTORS:TRANSFORM_DOCUMENT_PARSING_FAILURE" "MULE:VALIDATION"
+   "MS-VECTORS:UNSUPPORTED_MEDIA_TYPE" "MULE:VALIDATION"
+   "MS-VECTORS:INVALID_REQUEST" "MULE:VALIDATION"
+   "MS-VECTORS:STORE_NOT_FOUND" "MULE:VALIDATION"
+   "MS-VECTORS:INVALID_FILE_FORMAT" "MULE:VALIDATION"
+   "MS-VECTORS:SECURITY" "MULE:SECURITY"])
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "ms-vectors" NS (fn conn/OpResult [c: conn/OpCall] (run-op c))) :error-parents ERROR-PARENTS))

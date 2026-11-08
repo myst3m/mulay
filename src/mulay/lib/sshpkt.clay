@@ -1,0 +1,187 @@
+(ns mulay.lib.sshpkt (:require [clay.crypto :as cc] [clay.bytes :as bytes] [mulay.lib.hash :as hash] [mulay.lib.random :as rnd]))
+
+(def OK 0)
+(def NEED-MORE 1)
+(def BAD 2)
+
+(def MAX-PACKET 262144)
+
+(def K-NONE 0)
+(def K-CHACHA 1)
+(def K-CTR 2)
+(def K-CTR-ETM 3)
+(def K-GCM 4)
+
+(defrecord Dir [kind: Int aes: Vec(cc/AesKey) k1: Str k2: Str ctr: Str mac: Str mac-key: Str mac-len: Int seq: Int])
+
+(defn none-dir Dir [] (let [ks: Vec(cc/AesKey) []] (->Dir K-NONE ks "" "" "" "" "" 0 0)))
+
+(defn with-seq Dir [d: &Dir n: Int]
+  (->Dir (:kind d) (:aes d) (:k1 d) (:k2 d) (:ctr d) (:mac d) (:mac-key d) (:mac-len d) (bit-and n 0xffffffff)))
+
+(defn seq-of Int [d: &Dir] (:seq d))
+
+(defn- next-dir Dir [d: &Dir ctr: Str]
+  (->Dir (:kind d) (:aes d) (:k1 d) (:k2 d) ctr (:mac d) (:mac-key d) (:mac-len d) (bit-and (+ (:seq d) 1) 0xffffffff)))
+
+(defn- aes-dir Values(Dir Str) [kind: Int key: &Str iv: &Str mac: Str mac-key: &Str mac-len: Int]
+  (let [[k e] (cc/aes-key key)]
+    (if (not= e "") (values (none-dir) e)
+      (let [ks: Vec(cc/AesKey) [k]] (values (->Dir kind ks "" "" (str iv) mac (str mac-key) mac-len 0) "")))))
+
+(defn- ctr-key-len Int [cipher: &Str]
+  (cond (= cipher "aes128-ctr") 16 (= cipher "aes192-ctr") 24 (= cipher "aes256-ctr") 32 :else 0))
+
+(defn new-dir Values(Dir Str) [cipher: &Str mac: &Str key: &Str iv: &Str mac-key: &Str]
+  (cond
+    (= cipher "none") (values (none-dir) "")
+    (= cipher "chacha20-poly1305@openssh.com")
+    (if (not= (count key) 64) (values (none-dir) "chacha20-poly1305: the key is 64 bytes")
+      (let [ks: Vec(cc/AesKey) []] (values (->Dir K-CHACHA ks (subs key 32 64) (subs key 0 32) "" "" "" 16 0) "")))
+    (or (= cipher "aes128-gcm@openssh.com") (= cipher "aes256-gcm@openssh.com"))
+    (if (or (not= (count key) (if (= cipher "aes128-gcm@openssh.com") 16 32)) (not= (count iv) 12))
+      (values (none-dir) (str cipher ": wrong key or iv length"))
+      (aes-dir K-GCM key iv "" "" 16))
+    (> (ctr-key-len cipher) 0)
+    (let [etm (or (= mac "hmac-sha2-256-etm@openssh.com") (= mac "hmac-sha2-512-etm@openssh.com"))
+          name (cond (or (= mac "hmac-sha2-256") (= mac "hmac-sha2-256-etm@openssh.com")) "SHA256"
+                     (or (= mac "hmac-sha2-512") (= mac "hmac-sha2-512-etm@openssh.com")) "SHA512"
+                     :else "")]
+      (cond (= name "") (values (none-dir) (str "unsupported MAC: " mac))
+            (or (not= (count key) (ctr-key-len cipher)) (not= (count iv) 16)) (values (none-dir) (str cipher ": wrong key or iv length"))
+            :else (aes-dir (if etm K-CTR-ETM K-CTR) key iv name mac-key (if (= name "SHA256") 32 64))))
+    :else (values (none-dir) (str "unsupported cipher: " cipher))))
+
+(defn- bsize Int [kind: Int] (if (or (= kind K-CTR) (= kind K-CTR-ETM) (= kind K-GCM)) 16 8))
+(defn- aad-len Int [kind: Int] (if (or (= kind K-CHACHA) (= kind K-CTR-ETM) (= kind K-GCM)) 4 0))
+
+(defn pad-len Int [d: &Dir n: Int]
+  (let [kind (:kind d) bs (bsize kind)
+        p (- bs (mod (- (+ 5 n) (aad-len kind)) bs))]
+    (if (< p 4) (+ p bs) p)))
+
+(defn- ctr-add Str [ctr: &Str k: Int]
+  (let [hi (bytes/unpack ctr 0 8 true)
+        lo (bytes/unpack ctr 8 8 true)
+        nlo (+ lo k)
+        top (bit-shift-left 1 63)
+        carry (if (< (bit-xor nlo top) (bit-xor lo top)) 1 0)
+        a (bytes/pack (+ hi carry) 8 true)]
+    (str a (bytes/pack nlo 8 true))))
+
+(defn- gcm-next Str [iv: &Str] (let [h (subs iv 0 4)] (str h (bytes/pack (+ (bytes/unpack iv 4 8 true) 1) 8 true))))
+
+(defn- chacha-nonce Str [seq: Int] (str (chr 0) (chr 0) (chr 0) (chr 0) (bytes/pack seq 8 true)))
+
+(def ZEROS32: Str (loop [i 0 out ""] (if (>= i 32) out (recur (+ i 1) (str out (chr 0))))))
+
+(defn- poly-key Str [d: &Dir nonce: &Str] (let [[pk e] (cc/chacha20 (:k2 d) nonce 0 ZEROS32)] pk))
+
+(defn- mac-of Str [d: &Dir msg: &Str] (let [[m ok] (hash/hmac (:mac d) (:mac-key d) msg)] m))
+
+(defn- ct-eq Bool [a: &Str b: &Str]
+  (if (not= (count a) (count b)) false
+    (let [x (bytes/xor a b)]
+      (= (loop [i 0 acc 0] (if (>= i (count x)) acc (recur (+ i 1) (bit-or acc (nth x i))))) 0))))
+
+(defn seal-padded Values(Str Dir) [d: &Dir payload: &Str pad: &Str]
+  (let [kind (:kind d)
+        h (bytes/pack (+ 1 (+ (count payload) (count pad))) 4 true)
+        plain (str h (chr (count pad)) payload pad)
+        n (count plain)
+        seq (:seq d)]
+    (cond
+      (= kind K-NONE) (values plain (next-dir d ""))
+      (= kind K-CHACHA)
+      (let [nonce (chacha-nonce seq)
+            [elen e1] (cc/chacha20 (:k1 d) nonce 0 (subs plain 0 4))
+            [ebody e2] (cc/chacha20 (:k2 d) nonce 1 (subs plain 4 n))
+            enc (str elen ebody)
+            [tag e3] (cc/poly1305 (poly-key d nonce) enc)]
+        (values (str enc tag) (next-dir d "")))
+      (= kind K-CTR)
+      (let [m (mac-of d (str (bytes/pack seq 4 true) plain))
+            [enc e] (cc/aes-ctr (nth (:aes d) 0) (:ctr d) plain)]
+        (values (str enc m) (next-dir d (ctr-add (:ctr d) (quot n 16)))))
+      (= kind K-CTR-ETM)
+      (let [[enc e] (cc/aes-ctr (nth (:aes d) 0) (:ctr d) (subs plain 4 n))
+            head (subs plain 0 4)
+            m (mac-of d (str (bytes/pack seq 4 true) head enc))]
+        (values (str head enc m) (next-dir d (ctr-add (:ctr d) (quot (- n 4) 16)))))
+      :else
+      (let [head (subs plain 0 4)
+            [sealed e] (cc/aes-gcm-seal (nth (:aes d) 0) (:ctr d) head (subs plain 4 n))]
+        (values (str head sealed) (next-dir d (gcm-next (:ctr d))))))))
+
+(defn seal Values(Str Dir) [d: &Dir payload: &Str]
+  (let [[pad ok] (rnd/random-bytes (pad-len d (count payload)))] (seal-padded d payload pad)))
+
+(defn- failure Values(Int Str Int Dir Str) [d: &Dir why: Str] (values BAD "" 0 (with-seq d (:seq d)) why))
+(defn- more Values(Int Str Int Dir Str) [d: &Dir] (values NEED-MORE "" 0 (with-seq d (:seq d)) ""))
+
+(defn- len-ok Bool [kind: Int len: Int]
+  (and (>= len 5) (<= len MAX-PACKET) (= (mod (- (+ 4 len) (aad-len kind)) (bsize kind)) 0)))
+
+(defn- take-payload Values(Int Str Int Dir Str) [d: Dir body: &Str used: Int]
+  (let [n (count body) padlen (nth body 0)]
+    (if (or (< padlen 4) (>= padlen n)) (failure d "corrupted padding length")
+      (values OK (subs body 1 (- n padlen)) used d ""))))
+
+(defn unseal-at Values(Int Str Int Dir Str) [d: &Dir buf: &Str at: Int]
+  (let [kind (:kind d) seq (:seq d) have (- (count buf) at)]
+    (cond
+      (= kind K-NONE)
+      (if (< have 4) (more d)
+        (let [len (bytes/unpack buf at 4 true)]
+          (cond (not (len-ok kind len)) (failure d "bad packet length")
+                (< have (+ 4 len)) (more d)
+                :else (take-payload (next-dir d "") (subs buf (+ at 4) (+ at (+ 4 len))) (+ 4 len)))))
+      (= kind K-CHACHA)
+      (if (< have 4) (more d)
+        (let [nonce (chacha-nonce seq)
+              [lb e1] (cc/chacha20 (:k1 d) nonce 0 (subs buf (+ at 0) (+ at 4)))
+              len (bytes/unpack lb 0 4 true)
+              total (+ (+ 4 len) 16)]
+          (cond (not (len-ok kind len)) (failure d "bad packet length")
+                (< have total) (more d)
+                :else
+                (let [[tag e2] (cc/poly1305 (poly-key d nonce) (subs buf (+ at 0) (+ at (+ 4 len))))]
+                  (if (not (ct-eq tag (subs buf (+ at (+ 4 len)) (+ at total)))) (failure d "MAC mismatch")
+                    (let [[body e3] (cc/chacha20 (:k2 d) nonce 1 (subs buf (+ at 4) (+ at (+ 4 len))))]
+                      (take-payload (next-dir d "") body total)))))))
+      (= kind K-CTR)
+      (if (< have 16) (more d)
+        (let [k (nth (:aes d) 0)
+              [blk0 e1] (cc/aes-ctr k (:ctr d) (subs buf (+ at 0) (+ at 16)))
+              len (bytes/unpack blk0 0 4 true)
+              total (+ (+ 4 len) (:mac-len d))]
+          (cond (not (len-ok kind len)) (failure d "bad packet length")
+                (< have total) (more d)
+                :else
+                (let [[plain e2] (cc/aes-ctr k (:ctr d) (subs buf (+ at 0) (+ at (+ 4 len))))
+                      m (mac-of d (str (bytes/pack seq 4 true) plain))]
+                  (if (not (ct-eq m (subs buf (+ at (+ 4 len)) (+ at total)))) (failure d "MAC mismatch")
+                    (take-payload (next-dir d (ctr-add (:ctr d) (quot (+ 4 len) 16))) (subs plain 4 (+ 4 len)) total))))))
+      (= kind K-CTR-ETM)
+      (if (< have 4) (more d)
+        (let [len (bytes/unpack buf at 4 true)
+              total (+ (+ 4 len) (:mac-len d))]
+          (cond (not (len-ok kind len)) (failure d "bad packet length")
+                (< have total) (more d)
+                :else
+                (let [m (mac-of d (str (bytes/pack seq 4 true) (subs buf (+ at 0) (+ at (+ 4 len)))))]
+                  (if (not (ct-eq m (subs buf (+ at (+ 4 len)) (+ at total)))) (failure d "MAC mismatch")
+                    (let [[body e] (cc/aes-ctr (nth (:aes d) 0) (:ctr d) (subs buf (+ at 4) (+ at (+ 4 len))))]
+                      (take-payload (next-dir d (ctr-add (:ctr d) (quot len 16))) body total)))))))
+      :else
+      (if (< have 4) (more d)
+        (let [len (bytes/unpack buf at 4 true)
+              total (+ (+ 4 len) 16)]
+          (cond (not (len-ok kind len)) (failure d "bad packet length")
+                (< have total) (more d)
+                :else
+                (let [[body e] (cc/aes-gcm-open (nth (:aes d) 0) (:ctr d) (subs buf (+ at 0) (+ at 4)) (subs buf (+ at 4) (+ at total)))]
+                  (if (not= e "") (failure d "MAC mismatch")
+                    (take-payload (next-dir d (gcm-next (:ctr d))) body total)))))))))
+
+(defn unseal Values(Int Str Int Dir Str) [d: &Dir buf: &Str] (unseal-at d buf 0))

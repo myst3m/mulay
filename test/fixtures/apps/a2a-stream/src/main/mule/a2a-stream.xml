@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18170"/>
+    </http:listener-config>
+
+    <http:request-config name="Raw">
+        <http:request-connection host="localhost" port="18170"/>
+    </http:request-config>
+
+    <os:object-store name="Snap" persistent="false"/>
+    <os:object-store name="Routes" persistent="false"/>
+
+    <a2a:server-config name="Srv">
+        <a2a:connection listenerConfig="L" agentPath="/agent"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{"name": "Stream", "description": "Streaming agent", "url": "http://localhost:18170/agent", "version": "1.0.0",
+  "capabilities": {"streaming": true}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []}]]></a2a:json>
+        </a2a:agent-card>
+    </a2a:server-config>
+
+    <a2a:client-config name="Cl">
+        <a2a:client-connection serverUrl="http://localhost:18170/agent"/>
+    </a2a:client-config>
+
+    <flow name="auth"><a2a:authorization-listener config-ref="Srv"/><logger level="DEBUG" message="ok"/></flow>
+
+    <!-- 非ストリームの message/send (task-stream-listener には task-listener が要る) -->
+    <flow name="agent">
+        <a2a:task-listener config-ref="Srv"/>
+        <set-payload value='#[output application/json --- {kind: "message", role: "agent", messageId: "m-1", parts: [{kind: "text", text: "plain"}]}]'/>
+    </flow>
+
+    <!-- ストリーム: 最初の text で動きを変える -->
+    <flow name="stream">
+        <a2a:task-stream-listener config-ref="Srv"/>
+        <os:store key="stream-in" objectStore="Snap">
+            <os:value><![CDATA[#[output application/json --- {
+  payload: write(payload, "application/json") replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "<uuid>",
+  mime: payload.^mimeType,
+  rpc: attributes.jsonRpcMethod,
+  taskIdIsUuid: (attributes.taskId default "") matches /[0-9a-f-]{36}/
+}]]]></os:value>
+        </os:store>
+        <set-variable variableName="text" value="#[payload.message.parts[0].text default '']"/>
+        <set-variable variableName="tid" value="#[attributes.taskId]"/>
+        <set-variable variableName="cid" value="#[attributes.contextId]"/>
+        <choice>
+            <when expression="#[vars.text == 'fail']">
+                <raise-error type="APP:BOOM" description="stream failed"/>
+            </when>
+        </choice>
+        <a2a:update-task-status config-ref="Srv">
+            <a2a:status-content><![CDATA[#[output application/json --- {kind: "status-update", taskId: vars.tid, contextId: vars.cid, final: false, status: {state: "working", timestamp: "2026-01-02T03:04:05Z", message: {kind: "message", role: "agent", messageId: "m-w", parts: [{kind: "text", text: "working"}]}}}]]]></a2a:status-content>
+        </a2a:update-task-status>
+        <a2a:update-task-artifact config-ref="Srv">
+            <a2a:artifact-content><![CDATA[#[output application/json --- {kind: "artifact-update", taskId: vars.tid, contextId: vars.cid, artifact: {artifactId: "a1", parts: [{kind: "text", text: "chunk " ++ vars.text}]}, lastChunk: true}]]]></a2a:artifact-content>
+        </a2a:update-task-artifact>
+        <choice>
+            <when expression="#[vars.text != 'open']">
+                <a2a:update-task-status config-ref="Srv">
+                    <a2a:status-content><![CDATA[#[output application/json --- {kind: "status-update", taskId: vars.tid, contextId: vars.cid, final: true, status: {state: "completed", timestamp: "2026-01-02T03:04:06Z"}}]]]></a2a:status-content>
+                </a2a:update-task-status>
+            </when>
+        </choice>
+    </flow>
+
+    <sub-flow name="norm">
+        <set-payload value='#[output application/json --- {
+  status: vars.status,
+  ctype: vars.ctype,
+  body: vars.raw replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;" replace /20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;"
+}]'/>
+    </sub-flow>
+
+    <!-- 生の JSON-RPC (SSE なら終わるまで読む) -->
+    <flow name="rpc-raw">
+        <http:listener config-ref="L" path="/t/rpc" allowedMethods="POST"/>
+        <http:request config-ref="Raw" method="POST" path="/agent" outputMimeType="text/plain" responseTimeout="10000">
+            <http:body><![CDATA[#[output text/plain --- payload as String]]]></http:body>
+            <http:headers><![CDATA[#[{"Content-Type": "application/json"}]]]></http:headers>
+            <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+        </http:request>
+        <set-variable variableName="status" value="#[attributes.statusCode]"/>
+        <set-variable variableName="ctype" value="#[attributes.headers.'content-type']"/>
+        <set-variable variableName="raw" value="#[payload as String]"/>
+        <flow-ref name="norm"/>
+    </flow>
+
+    <flow name="stream-in">
+        <http:listener config-ref="L" path="/t/stream-in"/>
+        <os:retrieve key="stream-in" objectStore="Snap"/>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <!-- クライアントの send-stream-message。経路の実行は Routes にしまう。最初の task のイベントが events に入るかは
+         実 Mule でも実行ごとに変わる (受信の登録との競合) ので、task は外して見る -->
+    <flow name="client-stream">
+        <http:listener config-ref="L" path="/t/client-stream"/>
+        <os:clear objectStore="Routes"/>
+        <set-variable variableName="text" value="#[attributes.queryParams.text default 'go']"/>
+        <a2a:send-stream-message config-ref="Cl">
+            <a2a:stream-message><![CDATA[#[output application/json --- {message: {kind: "message", role: "user", messageId: "u-1", parts: [{kind: "text", text: vars.text}]}}]]]></a2a:stream-message>
+            <a2a:on-task-status-update>
+                <os:store key="#['status-' ++ (read(payload as String, 'application/json').result.status.state default 'x')]" objectStore="Routes">
+                    <os:value><![CDATA[#[output application/json --- {"type": typeOf(payload) as String, mime: payload.^mimeType, attrClass: attributes.^class, statusCode: attributes.statusCode, event: (payload as String) replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "<uuid>" replace /20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "<ts>"}]]]></os:value>
+                </os:store>
+            </a2a:on-task-status-update>
+            <a2a:on-task-artifact-update>
+                <os:store key="artifact" objectStore="Routes">
+                    <os:value><![CDATA[#[output application/json --- {"type": typeOf(payload) as String, mime: payload.^mimeType, event: (payload as String) replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "<uuid>"}]]]></os:value>
+                </os:store>
+            </a2a:on-task-artifact-update>
+        </a2a:send-stream-message>
+        <os:retrieve-all objectStore="Routes" target="routes"/>
+        <set-payload value='#[output application/json --- {
+  payloadType: typeOf(payload) as String,
+  mime: payload.^mimeType,
+  attrClass: attributes.^class,
+  attrs: write(attributes - "headers", "application/json"),
+  body: write({events: payload.events filter ($.kind != "task")}, "application/json") replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;" replace /20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;",
+  routes: (vars.routes pluck ((v, k) -> {key: k as String, value: read(v as String, "application/json")})) orderBy $.key
+}]'/>
+    </flow>
+</mule>

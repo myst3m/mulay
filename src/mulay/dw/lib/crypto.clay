@@ -1,0 +1,93 @@
+(ns mulay.dw.lib.crypto
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.lib.binaries :as bin] [mulay.lib.crypto :as lc]))
+
+(def M "dw::Crypto")
+
+(defn- lower-ascii Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)] (recur (+ i 1) (str out (chr (if (and (>= c 65) (<= c 90)) (+ c 32) c))))))))
+
+(defn- strip-oid Str [s: &Str] (if (and (>= (count s) 4) (= (subs s 0 4) "oid.")) (subs s 4 (count s)) (str s)))
+
+(defn- any-of? Bool [x: &Str xs: Vec(Str)]
+  (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) x) true (recur (+ i 1))))))
+
+(defn digest-name Str [java: &Str]
+  (let [n (strip-oid (lower-ascii java))]
+    (if (any-of? n ["md2" "1.2.840.113549.2.2"]) "MD2"
+      (if (any-of? n ["md5" "1.2.840.113549.2.5"]) "MD5"
+        (if (any-of? n ["sha-1" "sha" "sha1" "1.3.14.3.2.26"]) "SHA1"
+          (if (any-of? n ["sha-224" "sha224" "2.16.840.1.101.3.4.2.4"]) "SHA224"
+            (if (any-of? n ["sha-256" "sha256" "2.16.840.1.101.3.4.2.1"]) "SHA256"
+              (if (any-of? n ["sha-384" "sha384" "2.16.840.1.101.3.4.2.2"]) "SHA384"
+                (if (any-of? n ["sha-512" "sha512" "2.16.840.1.101.3.4.2.3"]) "SHA512"
+                  (if (any-of? n ["sha-512/224" "sha512/224" "2.16.840.1.101.3.4.2.5"]) "SHA512-224"
+                    (if (any-of? n ["sha-512/256" "sha512/256" "2.16.840.1.101.3.4.2.6"]) "SHA512-256"
+                      (if (any-of? n ["sha3-224" "2.16.840.1.101.3.4.2.7"]) "SHA3-224"
+                        (if (any-of? n ["sha3-256" "2.16.840.1.101.3.4.2.8"]) "SHA3-256"
+                          (if (any-of? n ["sha3-384" "2.16.840.1.101.3.4.2.9"]) "SHA3-384"
+                            (if (any-of? n ["sha3-512" "2.16.840.1.101.3.4.2.10"]) "SHA3-512"
+                              "")))))))))))))))
+
+(defn hmac-name Str [java: &Str]
+  (let [n (strip-oid (lower-ascii java))]
+    (if (any-of? n ["hmacmd5" "1.3.6.1.5.5.8.1.1"]) "MD5"
+      (if (any-of? n ["hmacsha1" "1.2.840.113549.2.7"]) "SHA1"
+        (if (any-of? n ["hmacsha224" "1.2.840.113549.2.8"]) "SHA224"
+          (if (any-of? n ["hmacsha256" "1.2.840.113549.2.9"]) "SHA256"
+            (if (any-of? n ["hmacsha384" "1.2.840.113549.2.10"]) "SHA384"
+              (if (any-of? n ["hmacsha512" "1.2.840.113549.2.11"]) "SHA512"
+                (if (any-of? n ["hmacsha512/224" "1.2.840.113549.2.12"]) "SHA512-224"
+                  (if (any-of? n ["hmacsha512/256" "1.2.840.113549.2.13"]) "SHA512-256"
+                    (if (any-of? n ["hmacsha3-224" "2.16.840.1.101.3.4.2.13"]) "SHA3-224"
+                      (if (any-of? n ["hmacsha3-256" "2.16.840.1.101.3.4.2.14"]) "SHA3-256"
+                        (if (any-of? n ["hmacsha3-384" "2.16.840.1.101.3.4.2.15"]) "SHA3-384"
+                          (if (any-of? n ["hmacsha3-512" "2.16.840.1.101.3.4.2.16"]) "SHA3-512"
+                            ""))))))))))))))
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- arg-bin Str [a: &Vec(v/Val) i: Int] (match (v/unmeta (nth a i)) (v/VBin b) b _ ""))
+(defn- alg-arg Str [a: &Vec(v/Val) i: Int default: Str] (if (> (count a) i) (core/arg-str a i) default))
+
+(defn- hash-bytes Values(Str dwe/DwErr) [data: &Str alg: &Str]
+  (let [o (digest-name alg)
+        [h good] (if (= o "") (values "" false) (lc/digest o data))]
+    (if good (values h (dwe/ok))
+      (values "" (dwe/err "AlgorithmNotAvailable" (str "Algorithm not available. Reason : `" alg " MessageDigest not available`"))))))
+
+(defn- hmac-bytes Values(Str dwe/DwErr) [key: &Str data: &Str alg: &Str]
+  (if (= (count key) 0) (values "" (dwe/err "IllegalHmacArguments" "Illegal HMAC arguments. Reason : `Empty key`"))
+    (let [o (hmac-name alg)
+          [h good] (if (= o "") (values "" false) (lc/hmac o key data))]
+      (if good (values h (dwe/ok))
+        (values "" (dwe/err "AlgorithmNotAvailable" (str "Algorithm not available. Reason : `Algorithm " alg " not available`")))))))
+
+(defn- hmac-binary Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[h e] (hmac-bytes (arg-bin a 0) (arg-bin a 1) (alg-arg a 2 "HmacSHA1"))]
+    (if (dwe/ok? e) (ok (v/->VBin h)) (values (v/null-v) e))))
+
+(defn- hmac-with Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[h e] (hmac-bytes (arg-bin a 0) (arg-bin a 1) (alg-arg a 2 "HmacSHA1"))]
+    (if (dwe/ok? e) (ok (v/->VStr (bin/hex-lower h))) (values (v/null-v) e))))
+
+(defn- hash-with Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[h e] (hash-bytes (arg-bin a 0) (alg-arg a 1 "SHA-1"))]
+    (if (dwe/ok? e) (ok (v/->VBin h)) (values (v/null-v) e))))
+
+(defn- md5-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[h e] (hash-bytes (arg-bin a 0) "MD5")] (if (dwe/ok? e) (ok (v/->VStr (bin/hex-lower h))) (values (v/null-v) e))))
+
+(defn- sha1-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[h e] (hash-bytes (arg-bin a 0) "SHA1")] (if (dwe/ok? e) (ok (v/->VStr (bin/hex-lower h))) (values (v/null-v) e))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+(defn- b3 rt/Overload [t: Str u: Str w: Str f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] (rt/overload [t u w] f))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "HMACBinary" [(b3 "Binary" "Binary" "String" hmac-binary) (rt/b2 "Binary" "Binary" hmac-binary)])
+   (B "hashWith" [(rt/b2 "Binary" "String" hash-with) (rt/b1 "Binary" hash-with)])
+   (B "HMACWith" [(b3 "Binary" "Binary" "String" hmac-with) (rt/b2 "Binary" "Binary" hmac-with)])
+   (B "MD5" [(rt/b1 "Binary" md5-fn)])
+   (B "SHA1" [(rt/b1 "Binary" sha1-fn)])])

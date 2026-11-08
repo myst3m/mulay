@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Salesforce Composite を本物の org (d30) に oauth-client-credentials-connection でつなぐ。Account の MulayComp* を作って消す。
+     ID と日時は実行ごとに変わるので、記録では値ではなく形と型を見る (scenario の mask) -->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:salesforce-composite="http://www.mulesoft.org/schema/mule/salesforce-composite"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/salesforce-composite http://www.mulesoft.org/schema/mule/salesforce-composite/current/mule-salesforce-composite.xsd">
+
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18491"/>
+    </http:listener-config>
+
+    <os:object-store name="Ids" persistent="false"/>
+
+    <salesforce-composite:composite-config name="Org">
+        <salesforce-composite:oauth-client-credentials-connection>
+            <salesforce-composite:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce-composite:oauth-client-credentials-connection>
+    </salesforce-composite:composite-config>
+
+    <sub-flow name="show">
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun tc(v) = v match {
+  case is Object -> {"class": v.^class default null, entries: v mapObject ((x, k) -> {(k): tc(x)})}
+  case is Array -> {"class": v.^class default null, items: v map tc($)}
+  else -> {"class": v.^class default null, value: v}
+}
+---
+{payload: tc(payload), statusCode: attributes.'status-code' default null}]]></ee:set-payload></ee:message></ee:transform>
+    </sub-flow>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload></ee:message></ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 前の実行の残りを消す (MulayComp* の Account) -->
+    <flow name="reset">
+        <http:listener config-ref="L" path="/reset"/>
+        <salesforce-composite:pre-query config-ref="Org" target="q">
+            <salesforce-composite:query>SELECT Id FROM Account WHERE Name LIKE 'MulayComp%'</salesforce-composite:query>
+        </salesforce-composite:pre-query>
+        <salesforce-composite:execute-composite-batch config-ref="Org">
+            <salesforce-composite:sub-requests>#[[vars.q]]</salesforce-composite:sub-requests>
+        </salesforce-composite:execute-composite-batch>
+        <set-variable variableName="ids" value="#[payload.results[0].result.records map $.Id]"/>
+        <choice>
+            <when expression="#[sizeOf(vars.ids) > 0]">
+                <salesforce-composite:delete-sobject-collections config-ref="Org" ids="#[vars.ids]"/>
+            </when>
+        </choice>
+        <set-payload value="#['ok']"/>
+    </flow>
+
+    <!-- tree: Account と子の Contact -->
+    <flow name="tree">
+        <http:listener config-ref="L" path="/tree"/>
+        <salesforce-composite:create-sobject-tree config-ref="Org" type="Account">
+            <salesforce-composite:s-objects>#[[{attributes: {'type': 'Account', referenceId: 'acc1'}, Name: 'MulayCompTree', Contacts: {records: [{attributes: {'type': 'Contact', referenceId: 'con1'}, LastName: 'MulayCompContact'}]}}]]</salesforce-composite:s-objects>
+        </salesforce-composite:create-sobject-tree>
+        <os:store key="tree" objectStore="Ids"><os:value>#[(payload.results filter ($.referenceId == 'acc1'))[0].id]</os:value></os:store>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="tree-bad">
+        <http:listener config-ref="L" path="/tree-bad"/>
+        <salesforce-composite:create-sobject-tree config-ref="Org" type="Account">
+            <salesforce-composite:s-objects>#[[{attributes: {'type': 'Account', referenceId: 'bad1'}, NoSuchField__c: 'x'}]]</salesforce-composite:s-objects>
+        </salesforce-composite:create-sobject-tree>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- batch: pre-* を並べ、結果を post-* で取り出す -->
+    <flow name="batch">
+        <http:listener config-ref="L" path="/batch"/>
+        <os:retrieve key="tree" objectStore="Ids" target="treeId"/>
+        <salesforce-composite:pre-create config-ref="Org" type="Account" target="c"><salesforce-composite:s-object>#[{Name: 'MulayCompBatch', NumberOfEmployees: 7}]</salesforce-composite:s-object></salesforce-composite:pre-create>
+        <salesforce-composite:pre-retrieve config-ref="Org" target="r"><salesforce-composite:retrieve-data>#[{Id: vars.treeId, Type: 'Account', Fields: ['Name', 'NumberOfEmployees']}]</salesforce-composite:retrieve-data></salesforce-composite:pre-retrieve>
+        <salesforce-composite:pre-query config-ref="Org" target="q">
+            <salesforce-composite:query>SELECT Name FROM Account WHERE Name = :n</salesforce-composite:query>
+            <salesforce-composite:parameters>#[{n: "'MulayCompTree'"}]</salesforce-composite:parameters>
+        </salesforce-composite:pre-query>
+        <salesforce-composite:pre-delete config-ref="Org" type="Account" id="001000000000000AAA" target="d"/>
+        <salesforce-composite:execute-composite-batch config-ref="Org">
+            <salesforce-composite:sub-requests>#[[vars.c, vars.r, vars.q, vars.d]]</salesforce-composite:sub-requests>
+        </salesforce-composite:execute-composite-batch>
+        <set-variable variableName="res" value="#[payload.results]"/>
+        <salesforce-composite:post-create config-ref="Org" target="created"><salesforce-composite:create-result>#[vars.res[0]]</salesforce-composite:create-result></salesforce-composite:post-create>
+        <salesforce-composite:post-retrieve config-ref="Org" type="Account" target="retrieved"><salesforce-composite:retrieve-data>#[vars.res[1]]</salesforce-composite:retrieve-data></salesforce-composite:post-retrieve>
+        <salesforce-composite:post-query config-ref="Org" target="queried">
+            <salesforce-composite:query>SELECT Name FROM Account</salesforce-composite:query>
+            <salesforce-composite:query-result>#[vars.res[2]]</salesforce-composite:query-result>
+        </salesforce-composite:post-query>
+        <salesforce-composite:post-delete config-ref="Org" target="deleted"><salesforce-composite:delete-result>#[vars.res[3]]</salesforce-composite:delete-result></salesforce-composite:post-delete>
+        <set-payload value="#[output application/java --- {batch: payload, created: vars.created, retrieved: vars.retrieved, queried: vars.queried, deleted: vars.deleted}]"/>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- composite request: 参照 (@{..}) と allOrNone -->
+    <flow name="composite">
+        <http:listener config-ref="L" path="/composite"/>
+        <salesforce-composite:execute-composite-request config-ref="Org">
+            <salesforce-composite:request-body>#[{allOrNone: attributes.queryParams.fail == '1', compositeRequest: [
+  {method: 'POST', url: '/services/data/v67.0/sobjects/Account', referenceId: 'newAcc', body: {Name: 'MulayCompRequest'}},
+  {method: 'GET', url: '/services/data/v67.0/sobjects/Account/@{newAcc.id}?fields=Name', referenceId: 'got'},
+  {method: 'POST', url: '/services/data/v67.0/sobjects/Account', referenceId: 'bad', body: (if (attributes.queryParams.fail == '1') {NoSuchField__c: 'x'} else {Name: 'MulayCompRequest2'})}
+]}]</salesforce-composite:request-body>
+        </salesforce-composite:execute-composite-request>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="graph">
+        <http:listener config-ref="L" path="/graph"/>
+        <salesforce-composite:execute-composite-graph config-ref="Org">
+            <salesforce-composite:graphs>#[[{graphId: 'g1', compositeRequest: [{method: 'POST', url: '/services/data/v67.0/sobjects/Account/', referenceId: 'ga', body: {Name: 'MulayCompGraph'}}]}]]</salesforce-composite:graphs>
+        </salesforce-composite:execute-composite-graph>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- sObject Collections -->
+    <flow name="coll-create">
+        <http:listener config-ref="L" path="/coll-create"/>
+        <salesforce-composite:create-sobject-collections config-ref="Org">
+            <salesforce-composite:request-body>#[{allOrNone: false, records: [{attributes: {'type': 'Account'}, Name: 'MulayCompColl1'}, {attributes: {'type': 'Account'}, Name: 'MulayCompColl2'}, {attributes: {'type': 'Account'}}]}]</salesforce-composite:request-body>
+        </salesforce-composite:create-sobject-collections>
+        <os:store key="coll" objectStore="Ids"><os:value>#[write((payload filter $.success) map $.id, 'application/json')]</os:value></os:store>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="coll-get">
+        <http:listener config-ref="L" path="/coll-get"/>
+        <os:retrieve key="coll" objectStore="Ids" target="ids"/>
+        <salesforce-composite:get-sobject-collections config-ref="Org" type="Account" ids="#[read(vars.ids, 'application/json') ++ ['001000000000000AAA']]" fields="#[['Name', 'NumberOfEmployees']]"/>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="coll-update">
+        <http:listener config-ref="L" path="/coll-update"/>
+        <os:retrieve key="coll" objectStore="Ids" target="ids"/>
+        <salesforce-composite:update-sobject-collections config-ref="Org">
+            <salesforce-composite:request-body>#[{allOrNone: false, records: (read(vars.ids, 'application/json') map {attributes: {'type': 'Account'}, id: $, NumberOfEmployees: 3})}]</salesforce-composite:request-body>
+        </salesforce-composite:update-sobject-collections>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="coll-delete">
+        <http:listener config-ref="L" path="/coll-delete"/>
+        <os:retrieve key="coll" objectStore="Ids" target="ids"/>
+        <salesforce-composite:delete-sobject-collections config-ref="Org" ids="#[read(vars.ids, 'application/json') ++ ['001000000000000AAA']]" allOrNone="false"/>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

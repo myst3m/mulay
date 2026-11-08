@@ -1,0 +1,119 @@
+(ns mulay.rt.error (:require [mulay.dw.val :as v] [mulay.mule.errtypes :as et] [clay.string :as str]))
+
+(defrecord DwX [msg: Str file: Str start: Int end: Int script: Str])
+
+(defrecord MErr
+  [ns: Str
+   id: Str
+   description: Str
+   detailed: Str
+   payload: Vec(v/Val)
+   attrs: Vec(v/Val)
+   cause: Str
+   also: Vec(Str)
+   elem: Str
+   dsl: Str
+   stack: Str
+   logged: Bool
+   kids: Vec(v/Val)
+   dx: Vec(DwX)])
+
+(defn mk MErr [ns: Str id: Str desc: Str] (->MErr ns id desc desc [] [] "" [] "" "" "" false [] []))
+
+(defn halt MErr [desc: Str] (assoc (mk "MULAY" "HALT" desc) :logged true))
+
+(defn halt? Bool [e: &MErr] (and (= (:ns e) "MULAY") (= (:id e) "HALT")))
+
+(defn at-elem MErr [e: MErr elem: &Str dsl: &Str stack: &Str]
+  (if (not= (:elem e) "") e
+    (->MErr (:ns e) (:id e) (:description e) (:detailed e) (:payload e) (:attrs e) (:cause e) (:also e) (str elem) (str dsl) (str stack) (:logged e) (:kids e) (:dx e))))
+
+(defn mark-logged MErr [e: MErr]
+  (->MErr (:ns e) (:id e) (:description e) (:detailed e) (:payload e) (:attrs e) (:cause e) (:also e) (:elem e) (:dsl e) (:stack e) true (:kids e) (:dx e)))
+
+(defn retype MErr [e: MErr t: &Str]
+  (let [i (str/index-of t ":")]
+    (->MErr (subs t 0 i) (subs t (+ i 1) (count t)) (:description e) (:detailed e) (:payload e) (:attrs e) (:cause e) (:also e) (:elem e) (:dsl e) (:stack e) (:logged e) (:kids e) (:dx e))))
+
+(defn with-payload MErr [e: MErr p: v/Val]
+  (->MErr (:ns e) (:id e) (:description e) (:detailed e) [p] (:attrs e) (:cause e) (:also e) (:elem e) (:dsl e) (:stack e) (:logged e) (:kids e) (:dx e)))
+
+(defn with-kids MErr [e: MErr ks: Vec(MErr)]
+  (let [vs (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (to-val (nth ks i))))))]
+    (->MErr (:ns e) (:id e) (:description e) (:detailed e) (:payload e) (:attrs e) (:cause e) (:also e) (:elem e) (:dsl e) (:stack e) (:logged e) vs (:dx e))))
+
+(defn exception-class Str [e: &MErr]
+  (let [t (type-str e)]
+    (cond (not= (:cause e) "") (str (:cause e))
+          (= t "MULE:EXPRESSION") "org.mule.runtime.core.api.expression.ExpressionRuntimeException"
+          (conn-class? (:ns e)) (conn-class (:ns e))
+          (= t "MULE:RETRY_EXHAUSTED") "org.mule.runtime.core.api.retry.policy.RetryPolicyExhaustedException"
+          (= t "MULE:COMPOSITE_ROUTING") "org.mule.runtime.core.privileged.routing.CompositeRoutingException"
+          :else "org.mule.runtime.api.exception.DefaultMuleException")))
+(defn type-str Str [e: &MErr] (str (:ns e) ":" (:id e)))
+
+(def PARENTS et/CORE-PARENTS)
+
+(def CONN-PARENTS: Atom(Vec(Str)) (atom (let [z: Vec(Str) []] z)))
+
+(defn set-conn-parents! Int [ps: Vec(Str)] (let [z (reset! CONN-PARENTS ps)] 0))
+
+(def CONN-CLASSES: Atom(Vec(Str)) (atom (let [z: Vec(Str) []] z)))
+
+(defn set-conn-classes! Int [cs: Vec(Str)] (let [z (reset! CONN-CLASSES cs)] 0))
+
+(defn- conn-class? Bool [ns: &Str] (let [[c found] (find-parent (deref CONN-CLASSES) ns)] found))
+
+(defn- conn-class Str [ns: &Str] (let [[c found] (find-parent (deref CONN-CLASSES) ns)] c))
+
+(defn- find-parent Values(Str Bool) [ps: &Vec(Str) t: &Str]
+  (loop [i 0]
+    (if (>= (+ i 1) (count ps)) (values "" false)
+      (if (= (nth ps i) t) (values (nth ps (+ i 1)) true) (recur (+ i 2))))))
+
+(defn- lookup-parent Values(Str Bool) [t: &Str]
+  (let [[p found] (find-parent PARENTS t)]
+    (if found (values p true) (let [cp (deref CONN-PARENTS)] (find-parent cp t)))))
+
+(defn known? Bool [t: &Str] (let [[p found] (lookup-parent t)] found))
+
+(defn parent Str [t: &Str]
+  (let [[p found] (lookup-parent t)]
+    (if found p (if (= t "MULE:ANY") "" "MULE:ANY"))))
+
+(defn norm-type Str [t: &Str]
+  (let [s (str/trim t)]
+    (if (< (str/index-of s ":") 0) (str "MULE:" s) s)))
+
+(defn- critical? Bool [t: &Str]
+  (loop [x (str t)]
+    (if (= x "") false (if (= x "MULE:CRITICAL") true (recur (parent x))))))
+
+(defn- type-matches? Bool [t: &Str spec: &Str]
+  (if (and (= spec "MULE:ANY") (critical? t)) false
+    (loop [x (str t)]
+      (if (= x "") false (if (= x spec) true (recur (parent x)))))))
+
+(defn matches? Bool [e: &MErr spec: &Str]
+  (or (type-matches? (type-str e) spec)
+      (let [as (:also e)]
+        (loop [i 0] (if (>= i (count as)) false (if (type-matches? (nth as i) spec) true (recur (+ i 1))))))))
+
+(defn to-val v/Val [e: &MErr]
+  (let [pt (parent (type-str e))
+        parent-v (if (= pt "") (v/null-v)
+                   (let [i (str/index-of pt ":")]
+                     (v/->VObj [(v/field "identifier" (v/->VStr (subs pt (+ i 1) (count pt))))
+                                (v/field "namespace" (v/->VStr (subs pt 0 i)))])))
+        et (v/->VObj [(v/field "identifier" (v/->VStr (:id e)))
+                      (v/field "namespace" (v/->VStr (:ns e)))
+                      (v/field "parentErrorType" parent-v)])
+        em (if (= (count (:payload e)) 0) (v/null-v)
+             (v/->VObj [(v/field "payload" (nth (:payload e) 0))
+                        (v/field "attributes" (if (= (count (:attrs e)) 0) (v/null-v) (nth (:attrs e) 0)))]))]
+    (v/->VObj [(v/field "description" (v/->VStr (:description e)))
+               (v/field "detailedDescription" (v/->VStr (:detailed e)))
+               (v/field "errorType" et)
+               (v/field "errorMessage" em)
+               (v/field "cause" (if (= (:cause e) "") (v/null-v) (v/->VStr (:cause e))))
+               (v/field "childErrors" (v/->VArr (:kids e)))])))

@@ -1,0 +1,1 @@
+attributes.queryParams.routeType default 'default'

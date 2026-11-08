@@ -1,0 +1,79 @@
+(ns mulay.dw.loc
+  (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.stdlib_locs :as sl] [mulay.lib.uni :as uni] [clay.string :as str]))
+
+(defn pos-v v/Val [idx: Int line: Int col: Int]
+  (v/->VObj [(v/field "index" (v/int-v idx)) (v/field "line" (v/int-v line)) (v/field "column" (v/int-v col))]))
+
+(defn loc-v v/Val [s0: v/Val s1: v/Val ls: Str text: Str src-id: Str]
+  (v/->VObj [(v/field "start" s0) (v/field "end" s1) (v/field "locationString" (v/->VStr (str ls))) (v/field "text" (v/->VStr (str text))) (v/field "sourceIdentifier" (v/->VStr (str src-id)))]))
+
+(defn unknown-loc v/Val [] (loc-v (pos-v 0 0 0) (pos-v 0 0 0) "Unknown location" "" "anonymous"))
+
+(defn- line-at Values(Int Int Int Int) [src: &Str i: Int]
+  (let [n (count src)
+        ls (loop [j i] (if (and (> j 0) (not= (nth src (- j 1)) 10)) (recur (- j 1)) j))
+        le (loop [j i] (if (and (< j n) (not= (nth src j) 10) (not= (nth src j) 13)) (recur (+ j 1)) j))
+        ln (loop [j 0 k 1] (if (>= j i) k (recur (+ j 1) (if (= (nth src j) 10) (+ k 1) k))))]
+    (values ln (+ 1 (u8/codepoint-count (subs src ls i))) ls le)))
+
+(defn script-loc v/Val [src: &Str s: Int e: Int src-id: &Str]
+  (if (or (< s 0) (> e (count src)) (> s e)) (unknown-loc)
+    (let [[l1 c1 ls1 le1] (line-at src s)
+          [l2 c2 ls2 le2] (line-at src e)
+          first-line (subs src ls1 le1)
+          lnum (str l1)
+          [ls text] (if (= l1 l2)
+                      (let [pad (loop [j 0 out ""] (if (>= j (+ (count lnum) 1 c1)) out (recur (+ j 1) (str out " "))))
+                            car (loop [j 0 out ""] (if (>= j (- c2 c1)) out (recur (+ j 1) (str out "^"))))]
+                        (values (str "\n" lnum "| " first-line "\n" pad car) (str/trim first-line)))
+                      (let [last-line (subs src ls2 le2)]
+                        (values (str "\n" lnum "| " first-line "\n...\n" last-line "\n") (str first-line "\n...\n" last-line))))]
+      (loc-v (pos-v (u8/codepoint-count (subs src 0 s)) l1 c1) (pos-v (u8/codepoint-count (subs src 0 e)) l2 c2) ls text (str src-id)))))
+
+(defn stdlib-loc v/Val [module: &Str name: &Str]
+  (let [key (str module " " name)
+        ls: Vec(Vec(Int)) (match (get sl/NATIVE-LOC key) (Some x) x (None) [])]
+    (if (or (not= (count ls) 1) (= (count (nth ls 0)) 0)) (unknown-loc)
+      (let [loc (nth ls 0)
+            line (match (get sl/NATIVE-TEXT key) (Some ts) (nth ts 0) (None) "")
+            lnum (str (nth loc 1))
+            pad (loop [j 0 out ""] (if (>= j (+ (count lnum) 1 (nth loc 2))) out (recur (+ j 1) (str out " "))))
+            car (loop [j 0 out ""] (if (>= j (- (nth loc 3) (nth loc 0))) out (recur (+ j 1) (str out "^"))))]
+        (loc-v (pos-v (nth loc 0) (nth loc 1) (nth loc 2)) (pos-v (nth loc 3) (nth loc 4) (nth loc 5))
+               (str "\n" lnum "| " line "\n" pad car) line (str module))))))
+
+(defn dw-kind Str [k: &Str]
+  (cond (or (= k "InvalidFunctionArgs") (= k "InvalidFunctionArgsNull")) "UnexpectedFunctionCallTypesException"
+        (str/ends-with? k "Exception") (str k)
+        :else (str k "Exception")))
+
+(defn err-excerpt Str [e: &dwe/DwErr srcs: &rt/Srcs]
+  (if (not= (:origin e) "") (str (:origin e))
+    (let [[l c x id] (rt/excerpt-in srcs (:sp e))] x)))
+
+(defn script-loc-in v/Val [srcs: &rt/Srcs s: Int e: Int]
+  (let [[text id base] (rt/seg-of srcs s)] (script-loc text (- s base) (- e base) id)))
+
+(defn err-loc v/Val [e: &dwe/DwErr srcs: &rt/Srcs]
+  (let [fs (:frames e)]
+    (if (and (not= (:origin e) "") (> (count fs) 0))
+      (let [[m ln col] (split-where (:where (nth fs 0)))]
+        (stdlib-loc m (:name (nth fs 0))))
+      (if (< (dwe/err-start e) 0) (unknown-loc)
+        (let [[text id base] (rt/seg-of srcs (dwe/err-start e))
+              [s0 e0] (rt/strip-parens text (- (dwe/err-start e) base) (- (dwe/err-end e) base))]
+          (script-loc text s0 e0 id))))))
+
+(defn stack-v v/Val [e: &dwe/DwErr srcs: &rt/Srcs]
+  (let [fs (dwe/stack-of e)]
+    (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                (if (>= i (count fs)) acc
+                  (let [f (nth fs i)
+                        where (if (not= (:where f) "") (:where f)
+                                (let [[ln col x id] (rt/excerpt-in srcs (:sp f))] (str id ":" ln ":" col)))]
+                    (recur (+ i 1) (conj acc (v/->VStr (str (rt/short-name (:name f)) " (" where ")"))))))))))
+
+(defn split-where Values(Str Str Str) [w: &Str]
+  (let [p2 (str/last-index-of w ":")
+        p1 (if (< p2 1) -1 (str/last-index-of (subs w 0 p2) ":"))]
+    (if (< p1 0) (values (str w) "" "") (values (subs w 0 p1) (subs w (+ p1 1) p2) (subs w (+ p2 1) (count w))))))

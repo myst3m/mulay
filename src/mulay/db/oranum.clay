@@ -1,0 +1,79 @@
+(ns mulay.db.oranum (:require [clay.string :as str]))
+
+(def MAX-DIGITS 20)
+
+(defn- pair2 Str [d: Int] (if (< d 10) (str "0" d) (str d)))
+
+(defn- zeros Str [n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out "0")))))
+
+(defn decode Values(Str Str) [b: &Str]
+  (let [n (count b)]
+    (cond
+      (= n 0) (values "" "empty NUMBER")
+      (and (= n 1) (= (nth b 0) 128)) (values "0" "")
+      (and (= n 1) (= (nth b 0) 0)) (values "-Infinity" "")
+      (and (= n 2) (= (nth b 0) 255) (= (nth b 1) 101)) (values "Infinity" "")
+      :else
+      (let [b0 (nth b 0)
+            pos (>= b0 128)
+            e (if pos (- b0 193) (- 62 b0))
+            end (if (and (not pos) (= (nth b (- n 1)) 102)) (- n 1) n)
+            digits (loop [i 1 out ""]
+                     (if (>= i end) out
+                       (let [x (nth b i)
+                             d (if pos (- x 1) (- 101 x))]
+                         (if (or (< d 0) (> d 99)) ""
+                           (recur (+ i 1) (str out (pair2 d)))))))]
+        (if (or (= digits "") (not= (count digits) (* 2 (- end 1)))) (values "" "bad NUMBER")
+          (let [point (* 2 (+ e 1))
+                nd (count digits)
+                [ip fp] (cond
+                          (<= point 0) (values "0" (str (zeros (- 0 point)) digits))
+                          (>= point nd) (values (str digits (zeros (- point nd))) "")
+                          :else (values (subs digits 0 point) (subs digits point nd)))
+                ip2 (loop [i 0] (if (and (< i (- (count ip) 1)) (= (nth ip i) 48)) (recur (+ i 1)) (subs ip i (count ip))))
+                fp2 (loop [k (count fp)] (if (and (> k 0) (= (nth fp (- k 1)) 48)) (recur (- k 1)) (subs fp 0 k)))
+                body (if (= fp2 "") ip2 (str ip2 "." fp2))]
+            (values (if pos body (str "-" body)) "")))))))
+
+(defn- carry Values(Vec(Int) Bool) [ds: Vec(Int)]
+  (loop [i (- (count ds) 1) v ds]
+    (if (< i 0) (values (loop [k 0 out: Vec(Int) [1]] (if (>= k (count v)) out (recur (+ k 1) (conj out (nth v k))))) true)
+      (let [d (+ (nth v i) 1)]
+        (if (< d 100) (values (assoc v i d) false)
+          (recur (- i 1) (assoc v i 0)))))))
+
+(defn encode Values(Str Str) [s0: &Str]
+  (let [neg (and (> (count s0) 0) (= (nth s0 0) 45))
+        s (if (or neg (and (> (count s0) 0) (= (nth s0 0) 43))) (subs s0 1 (count s0)) s0)
+        dot (str/index-of s ".")
+        ip (if (< dot 0) s (subs s 0 dot))
+        fp (if (< dot 0) "" (subs s (+ dot 1) (count s)))
+        ok (and (> (+ (count ip) (count fp)) 0)
+                (loop [i 0] (if (>= i (count ip)) true (if (digit? (nth ip i)) (recur (+ i 1)) false)))
+                (loop [i 0] (if (>= i (count fp)) true (if (digit? (nth fp i)) (recur (+ i 1)) false))))]
+    (if (not ok) (values "" (str "not a decimal: " s0))
+      (let [ipe (if (= (mod (count ip) 2) 1) (str "0" ip) ip)
+            fpe (if (= (mod (count fp) 2) 1) (str fp "0") fp)
+            all (str ipe fpe)
+            npairs-int (/ (count ipe) 2)
+            ds (loop [i 0 acc: Vec(Int) []]
+                 (if (>= i (count all)) acc
+                   (recur (+ i 2) (conj acc (+ (* 10 (- (nth all i) 48)) (- (nth all (+ i 1)) 48))))))
+            lead (loop [i 0] (if (and (< i (count ds)) (= (nth ds i) 0)) (recur (+ i 1)) i))]
+        (if (= lead (count ds)) (values (chr 128) "")
+          (let [e0 (- npairs-int 1 lead)
+                ds1 (subvec ds lead (count ds))
+                [ds2 e1] (if (<= (count ds1) MAX-DIGITS) (values ds1 e0)
+                           (let [head (subvec ds1 0 MAX-DIGITS)]
+                             (if (< (nth ds1 MAX-DIGITS) 50) (values head e0)
+                               (let [[c over] (carry head)]
+                                 (if over (values (subvec c 0 MAX-DIGITS) (+ e0 1)) (values c e0))))))
+                tail (loop [k (count ds2)] (if (and (> k 0) (= (nth ds2 (- k 1)) 0)) (recur (- k 1)) k))
+                ds3 (subvec ds2 0 tail)]
+            (if (or (> e1 62) (< e1 -65)) (values "" (str "NUMBER out of range: " s0))
+              (let [head (chr (if neg (- 62 e1) (+ 193 e1)))
+                    body (loop [i 0 out head]
+                           (if (>= i (count ds3)) out
+                             (recur (+ i 1) (str out (chr (if neg (- 101 (nth ds3 i)) (+ (nth ds3 i) 1)))))))]
+                (values (if (and neg (< (count ds3) MAX-DIGITS)) (str body (chr 102)) body) "")))))))))

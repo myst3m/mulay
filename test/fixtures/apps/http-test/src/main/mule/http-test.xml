@@ -1,0 +1,275 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="HTTP_Listener">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <http:request-config name="HTTP_Request_Self">
+        <http:request-connection host="localhost" port="${http.port}"/>
+    </http:request-config>
+
+    <!-- ==================== TARGET FLOWS ==================== -->
+
+    <!-- 1. GET /target/json - Returns JSON response -->
+    <flow name="target-json-flow">
+        <http:listener config-ref="HTTP_Listener" path="/target/json" allowedMethods="GET"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    message: "hello",
+    timestamp: now(),
+    method: attributes.method
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 2. POST /target/echo - Echoes back request body and headers -->
+    <flow name="target-echo-flow">
+        <http:listener config-ref="HTTP_Listener" path="/target/echo" allowedMethods="GET,POST,PUT,DELETE"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    body: payload,
+    headers: attributes.headers,
+    method: attributes.method,
+    queryParams: attributes.queryParams
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 3. GET /target/xml - Returns XML response -->
+    <flow name="target-xml-flow">
+        <http:listener config-ref="HTTP_Listener" path="/target/xml" allowedMethods="GET"/>
+        <set-payload value='&lt;root&gt;&lt;item id="1"&gt;Alpha&lt;/item&gt;&lt;item id="2"&gt;Beta&lt;/item&gt;&lt;/root>' mimeType="application/xml"/>
+    </flow>
+
+    <!-- 4. PUT /target/status/{code} - Returns specified HTTP status code -->
+    <flow name="target-status-flow">
+        <http:listener config-ref="HTTP_Listener" path="/target/status/{code}" allowedMethods="GET,PUT">
+            <http:response statusCode="#[attributes.uriParams.code]">
+                <http:headers><![CDATA[#[{"Content-Type": "application/json"}]]]></http:headers>
+            </http:response>
+        </http:listener>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: attributes.uriParams.code,
+    message: "Response with status " ++ attributes.uriParams.code
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 5. GET /target/slow - Slow response -->
+    <flow name="target-slow-flow">
+        <http:listener config-ref="HTTP_Listener" path="/target/slow" allowedMethods="GET"/>
+        <logger level="INFO" message="Starting slow response processing..."/>
+        <logger level="INFO" message="Still processing..."/>
+        <logger level="INFO" message="Almost done..."/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    delayed: true
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 6. GET /target/headers - Return all request headers -->
+    <flow name="target-headers-flow">
+        <http:listener config-ref="HTTP_Listener" path="/target/headers" allowedMethods="GET"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+attributes.headers]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ==================== TEST FLOWS ==================== -->
+
+    <!-- 7. GET /test/get - Make GET request to /target/json -->
+    <flow name="test-get-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/get" allowedMethods="GET"/>
+        <http:request config-ref="HTTP_Request_Self" method="GET" path="/target/json"/>
+    </flow>
+
+    <!-- 8. POST /test/post - Make POST request to /target/echo -->
+    <flow name="test-post-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/post" allowedMethods="POST"/>
+        <http:request config-ref="HTTP_Request_Self" method="POST" path="/target/echo"/>
+    </flow>
+
+    <!-- 9. GET /test/query-params - Make GET with query parameters -->
+    <flow name="test-query-params-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/query-params" allowedMethods="GET"/>
+        <http:request config-ref="HTTP_Request_Self" method="GET" path="/target/echo">
+            <http:query-params><![CDATA[#[{foo: "bar", baz: "123"}]]]></http:query-params>
+        </http:request>
+    </flow>
+
+    <!-- 10. GET /test/custom-headers - Make request with custom headers -->
+    <flow name="test-custom-headers-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/custom-headers" allowedMethods="GET"/>
+        <http:request config-ref="HTTP_Request_Self" method="GET" path="/target/headers">
+            <http:headers><![CDATA[#[{"X-Custom-One": "value-one", "X-Custom-Two": "value-two"}]]]></http:headers>
+        </http:request>
+    </flow>
+
+    <!-- 11. PUT /test/put - Make PUT request -->
+    <flow name="test-put-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/put" allowedMethods="PUT"/>
+        <http:request config-ref="HTTP_Request_Self" method="PUT" path="/target/echo"/>
+    </flow>
+
+    <!-- 12. DELETE /test/delete - Make DELETE request -->
+    <flow name="test-delete-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/delete" allowedMethods="DELETE"/>
+        <http:request config-ref="HTTP_Request_Self" method="DELETE" path="/target/echo"/>
+    </flow>
+
+    <!-- 13. GET /test/parse-json - Make request and parse JSON response -->
+    <flow name="test-parse-json-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/parse-json" allowedMethods="GET"/>
+        <http:request config-ref="HTTP_Request_Self" method="GET" path="/target/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    original: payload,
+    extracted: payload.message
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 14. GET /test/parse-xml - Make request and parse XML response -->
+    <flow name="test-parse-xml-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/parse-xml" allowedMethods="GET"/>
+        <http:request config-ref="HTTP_Request_Self" method="GET" path="/target/xml" outputMimeType="application/xml"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    root: payload.root,
+    firstItem: payload.root.item[0],
+    secondItem: payload.root.item[1]
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 15. GET /test/status-codes - Test various status codes -->
+    <flow name="test-status-codes-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/status-codes" allowedMethods="GET"/>
+        <scatter-gather>
+            <route>
+                <http:request config-ref="HTTP_Request_Self" method="GET" path="/target/status/200"/>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: attributes.statusCode,
+    body: payload
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </route>
+            <route>
+                <http:request config-ref="HTTP_Request_Self" method="GET" path="/target/status/201"/>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: attributes.statusCode,
+    body: payload
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </route>
+            <route>
+                <http:request config-ref="HTTP_Request_Self" method="GET" path="/target/status/204"/>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: attributes.statusCode,
+    body: payload
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </route>
+        </scatter-gather>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    results: payload map ((item) -> item.payload)
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 16. GET /test/error-handling - Test error response handling -->
+    <flow name="test-error-handling-flow">
+        <http:listener config-ref="HTTP_Listener" path="/test/error-handling" allowedMethods="GET"/>
+        <try>
+            <http:request config-ref="HTTP_Request_Self" method="GET" path="/target/status/404"/>
+            <error-handler>
+                <on-error-continue type="HTTP:NOT_FOUND">
+                    <ee:transform>
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    error: true,
+    status: 404,
+    description: error.description
+}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+</mule>

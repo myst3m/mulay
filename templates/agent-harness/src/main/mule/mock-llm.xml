@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  偽の OpenAI 互換の LLM と偽の注文システム (SOAP) (試すとき・テスト用)。筋書きは mock/llm.dwl と mock/orders.dwl。
+  LLM の偽物は既定では止めてある。使うときは mockLlm.state=started にして、llm.url を http://localhost:<port>/mock-llm/v1 に向ける
+  (テストのシナリオがそうしている。LLM を指定しないときは統計的なモデル stat.xml が答える)。
+  注文システムの偽物は mockOrders.state=stopped で止める (orders.url を本物に向けるとき)。
+  testHooks.state=started のときだけ動くテスト用の口: LLM へ送った要求を見る /mock-llm/last、A2A のプッシュ通知を受ける
+  /mock-hook、文書を全部消す DELETE /test/docs。どれも要求の中身が見えたり文書が消えたりするので、既定では止めてある。
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
+
+    <os:object-store name="MockLlmSeen" persistent="false"/>
+    <os:object-store name="MockHooks" persistent="false"/>
+
+    <flow name="mock-llm" initialState="${mockLlm.state}">
+        <http:listener config-ref="Http" path="/mock-llm/v1/chat/completions" allowedMethods="POST">
+            <http:response statusCode="#[vars.mockStatus default 200]"/>
+        </http:listener>
+        <os:store key="last" objectStore="MockLlmSeen">
+            <os:value>#[output application/json --- {authorization: attributes.headers.authorization default null, body: payload}]</os:value>
+        </os:store>
+        <choice>
+            <!-- 問いに "boom"、または要約の要求の捨てるメッセージに "failsum" があれば失敗する -->
+            <when expression="#[do { var d = read(payload.messages[-1].content default '{}', 'application/json') --- ((d.question default '') contains 'boom') or ((d.dropped != null) and (write(d.dropped, 'application/json') contains 'failsum')) }]">
+                <set-variable variableName="mockStatus" value="#[500]"/>
+                <set-payload value="#[output application/json --- {error: {message: 'mock failure'}}]"/>
+            </when>
+            <otherwise>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload resource="mock/llm.dwl"/>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- 偽の注文システム (SOAP。tools.xml の Orders。orders.url の既定) -->
+    <flow name="mock-orders" initialState="${mockOrders.state}">
+        <http:listener config-ref="Http" path="/mock-orders" allowedMethods="POST">
+            <http:response statusCode="#[vars.soap.status]"/>
+        </http:listener>
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="soap" resource="mock/orders.dwl"/>
+            </ee:variables>
+        </ee:transform>
+        <set-payload value="#[vars.soap.body]" mimeType="text/xml; charset=UTF-8"/>
+    </flow>
+
+    <!-- 文書を全部消す (テスト用。testHooks.state): 保存先のディレクトリと DocsIndex -->
+    <flow name="test-docs-reset" initialState="${testHooks.state}">
+        <http:listener config-ref="Http" path="/test/docs" allowedMethods="DELETE"/>
+        <try>
+            <file:delete config-ref="DocsDir" path="${docs.dir}"/>
+            <error-handler><on-error-continue><logger level="DEBUG" message="no docs to delete"/></on-error-continue></error-handler>
+        </try>
+        <os:clear objectStore="DocsIndex"/>
+        <set-payload value="deleted"/>
+    </flow>
+
+    <!-- 最後に LLM へ送られた要求 (エージェントが何を渡したかを見る) -->
+    <flow name="mock-llm-last" initialState="${testHooks.state}">
+        <http:listener config-ref="Http" path="/mock-llm/last" allowedMethods="GET"/>
+        <os:retrieve key="last" objectStore="MockLlmSeen">
+            <os:default-value>#[null]</os:default-value>
+        </os:retrieve>
+    </flow>
+
+    <!-- A2A のプッシュ通知を受ける口 (試すため)。/mock-hook/last は届くまで最大 5 秒待つ -->
+    <flow name="mock-hook" initialState="${testHooks.state}">
+        <http:listener config-ref="Http" path="/mock-hook" allowedMethods="POST"/>
+        <os:store key="last" objectStore="MockHooks">
+            <os:value>#[output application/json --- {token: attributes.headers.'x-a2a-notification-token' default null, body: payload}]</os:value>
+        </os:store>
+    </flow>
+    <flow name="mock-hook-last" initialState="${testHooks.state}">
+        <http:listener config-ref="Http" path="/mock-hook/last" allowedMethods="GET"/>
+        <try>
+            <until-successful maxRetries="50" millisBetweenRetries="100">
+                <os:contains key="last" objectStore="MockHooks" target="has"/>
+                <choice>
+                    <when expression="#[not vars.has]"><raise-error type="MOCK:WAIT" description="no notification yet"/></when>
+                </choice>
+            </until-successful>
+            <error-handler><on-error-continue><logger level="DEBUG" message="no notification"/></on-error-continue></error-handler>
+        </try>
+        <os:retrieve key="last" objectStore="MockHooks">
+            <os:default-value>#[null]</os:default-value>
+        </os:retrieve>
+        <try>
+            <os:remove key="last" objectStore="MockHooks"/>
+            <error-handler><on-error-continue><logger level="DEBUG" message="nothing to remove"/></on-error-continue></error-handler>
+        </try>
+    </flow>
+</mule>

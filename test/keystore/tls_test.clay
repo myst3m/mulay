@@ -1,0 +1,52 @@
+(ns tls-test (:require [mulay.conn.tls :as tls] [mulay.mule.load :as ld] [mulay.mule.model :as m] [mulay.lib.xml :as xml]))
+
+;; test/fixtures/apps/https-test の tls:context を読む
+
+(def APP "test/fixtures/apps/https-test")
+(def CERTS "test/fixtures/apps/https-test/certs/")
+
+(defn- file Str [name: &Str] (let [[s e] (read-file (str CERTS name))] s))
+
+;; 設定 name の子の接続要素 (listener-connection / request-connection)
+(defn- conn-of Vec(xml/XNode) [app: &m/App name: &Str]
+  (let [cs (:configs app)]
+    (loop [i 0]
+      (if (>= i (count cs)) []
+        (let [c (nth cs i)]
+          (if (= (:name c) name)
+            (let [ks (:children c)]
+              (loop [k 0] (if (>= k (count ks)) [] (if (xml/elem? (nth ks k)) [(nth ks k)] (recur (+ k 1))))))
+            (recur (+ i 1))))))))
+
+(defn- tls-of Values(Vec(tls/Tls) Str) [app: &m/App name: &Str]
+  (let [cn (conn-of app name)] (if (= (count cn) 0) (values [] "no connection") (tls/of-connection (:configs app) (:res app) (nth cn 0)))))
+
+(deftest listener-jks
+  (let [app (:app (ld/load-path APP (ld/default-opts)))
+        [t e] (tls-of app "HttpsJks")
+        k (nth (:key (nth t 0)) 0)]
+    (is (= e ""))
+    (is (= (:key-pem k) (file "server-key.pem")))
+    (is (= (:chain-pem k) (str (file "server.pem") (file "ca.pem"))))
+    (is (= (count (:trust (nth t 0))) 0))))
+
+(deftest listener-p12-and-mtls
+  (let [app (:app (ld/load-path APP (ld/default-opts)))
+        [t e] (tls-of app "HttpsP12")
+        [t2 e2] (tls-of app "HttpsMtls")
+        k (nth (:key (nth t 0)) 0)
+        tr (nth (:trust (nth t2 0)) 0)]
+    (is (= e ""))
+    (is (= (:p12 k) (file "server.p12")))
+    (is (= (:p12-pw k) "changeit"))
+    (is (= e2 ""))
+    (is (= (:p12 tr) (file "truststore.p12")))))
+
+(deftest request-trust
+  (let [app (:app (ld/load-path APP (ld/default-opts)))
+        [t1 e1] (tls-of app "ToJksTrusted")
+        [t2 e2] (tls-of app "ToJksInsecure")
+        [t3 e3] (tls-of app "ToJksDefault")]
+    (is (= (:ca-pem (nth (:trust (nth t1 0)) 0)) (file "ca.pem")))
+    (is (:insecure (nth (:trust (nth t2 0)) 0)))
+    (is (= (count t3) 0))))

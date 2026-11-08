@@ -1,0 +1,494 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <!-- 認証情報はリポジトリに入れない (scenario.scn の requires) -->
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="SF">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="setup">
+        <http:listener config-ref="HTTP" path="/setup" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Id FROM Account WHERE Name LIKE '" ++ (attributes.queryParams.name default "mulay oracle%") ++ "' ORDER BY Name"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <choice>
+            <when expression="#[sizeOf(vars.found) > 0]">
+                <salesforce:delete config-ref="SF">
+                    <salesforce:ids>#[vars.found map $.Id]</salesforce:ids>
+                </salesforce:delete>
+            </when>
+        </choice>
+        <set-payload value="clean"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="create">
+        <http:listener config-ref="HTTP" path="/create" allowedMethods="POST"/>
+        <salesforce:create config-ref="SF" type="Account">
+            <salesforce:records>#[payload]</salesforce:records>
+        </salesforce:create>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{id: payload.id, successful: payload.successful, keys: keysOf(payload) orderBy $, items: payload.items map ((it) -> {id: it.id, successful: it.successful, statusCode: it.statusCode, message: it.message, exceptionMessage: it.exception.message, exceptionKeys: keysOf(it.exception default {}) orderBy $, payload: it.payload})}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="create-attrs">
+        <http:listener config-ref="HTTP" path="/create/attrs" allowedMethods="POST"/>
+        <salesforce:create config-ref="SF" type="Account">
+            <salesforce:records>#[payload]</salesforce:records>
+        </salesforce:create>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadClass: payload.^class, attrs: attributes, itemKeys: keysOf(payload.items[0] default {}) orderBy $}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="query">
+        <http:listener config-ref="HTTP" path="/query" allowedMethods="GET"/>
+        <salesforce:query config-ref="SF">
+            <salesforce:salesforce-query>#[attributes.queryParams.q]</salesforce:salesforce-query>
+        </salesforce:query>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="query-meta">
+        <http:listener config-ref="HTTP" path="/query/meta" allowedMethods="GET"/>
+        <salesforce:query config-ref="SF">
+            <salesforce:salesforce-query>#[attributes.queryParams.q]</salesforce:salesforce-query>
+        </salesforce:query>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadClass: payload.^class, attrs: attributes, types: payload map ((r) -> r mapObject ((v, k) -> {(k): typeOf(v)})), created: (payload[0].CreatedDate default "") replace /[0-9]/ with "9"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="query-params">
+        <http:listener config-ref="HTTP" path="/query/params" allowedMethods="GET"/>
+        <salesforce:query config-ref="SF">
+            <salesforce:salesforce-query>SELECT Name FROM Account WHERE Name = ':n' OR Name LIKE ':p' ORDER BY Name</salesforce:salesforce-query>
+            <salesforce:parameters>#[{n: attributes.queryParams.n, p: attributes.queryParams.p}]</salesforce:parameters>
+        </salesforce:query>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="query-all">
+        <http:listener config-ref="HTTP" path="/query-all" allowedMethods="GET"/>
+        <salesforce:query-all config-ref="SF">
+            <salesforce:salesforce-query>#[attributes.queryParams.q]</salesforce:salesforce-query>
+        </salesforce:query-all>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="update">
+        <http:listener config-ref="HTTP" path="/update" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Id FROM Account WHERE Name LIKE '" ++ (attributes.queryParams.name default "mulay oracle%") ++ "' ORDER BY Name"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:update config-ref="SF" type="Account">
+            <salesforce:records>#[vars.found map ((r) -> {Id: r.Id} ++ payload)]</salesforce:records>
+        </salesforce:update>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{id: payload.id, successful: payload.successful, keys: keysOf(payload) orderBy $, items: payload.items map ((it) -> {id: it.id, successful: it.successful, statusCode: it.statusCode, message: it.message, exceptionMessage: it.exception.message, exceptionKeys: keysOf(it.exception default {}) orderBy $, payload: it.payload})}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="update-bad">
+        <http:listener config-ref="HTTP" path="/update/bad" allowedMethods="POST"/>
+        <salesforce:update config-ref="SF" type="Account">
+            <salesforce:records>#[[{Id: "001000000000000AAA", Name: "x"}]]</salesforce:records>
+        </salesforce:update>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{id: payload.id, successful: payload.successful, keys: keysOf(payload) orderBy $, items: payload.items map ((it) -> {id: it.id, successful: it.successful, statusCode: it.statusCode, message: it.message, exceptionMessage: it.exception.message, exceptionKeys: keysOf(it.exception default {}) orderBy $, payload: it.payload})}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="upsert">
+        <http:listener config-ref="HTTP" path="/upsert" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Id FROM Account WHERE Name LIKE '" ++ (attributes.queryParams.name default "mulay oracle%") ++ "' ORDER BY Name"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:upsert config-ref="SF" objectType="Account" externalIdFieldName="Id">
+            <salesforce:records>#[(vars.found map ((r) -> {Id: r.Id, Description: "upserted"})) ++ [{Name: "mulay oracle U"}]]</salesforce:records>
+        </salesforce:upsert>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{id: payload.id, successful: payload.successful, keys: keysOf(payload) orderBy $, items: payload.items map ((it) -> {id: it.id, successful: it.successful, statusCode: it.statusCode, message: it.message, exceptionMessage: it.exception.message, exceptionKeys: keysOf(it.exception default {}) orderBy $, payload: it.payload})}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="retrieve">
+        <http:listener config-ref="HTTP" path="/retrieve" allowedMethods="GET"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Id FROM Account WHERE Name LIKE '" ++ (attributes.queryParams.name default "mulay oracle%") ++ "' ORDER BY Name"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:retrieve config-ref="SF" type="Account">
+            <salesforce:retrieve-request>#[{ids: vars.found map $.Id, fields: ["Name", "Industry", "NumberOfEmployees"]}]</salesforce:retrieve-request>
+        </salesforce:retrieve>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="delete">
+        <http:listener config-ref="HTTP" path="/delete" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Id FROM Account WHERE Name LIKE '" ++ (attributes.queryParams.name default "mulay oracle%") ++ "' ORDER BY Name"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:delete config-ref="SF">
+            <salesforce:ids>#[vars.found map $.Id]</salesforce:ids>
+        </salesforce:delete>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{id: payload.id, successful: payload.successful, keys: keysOf(payload) orderBy $, items: payload.items map ((it) -> {id: it.id, successful: it.successful, statusCode: it.statusCode, message: it.message, exceptionMessage: it.exception.message, exceptionKeys: keysOf(it.exception default {}) orderBy $, payload: it.payload})}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="delete-bad">
+        <http:listener config-ref="HTTP" path="/delete/bad" allowedMethods="POST"/>
+        <salesforce:delete config-ref="SF">
+            <salesforce:ids>#[["001000000000000AAA"]]</salesforce:ids>
+        </salesforce:delete>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{id: payload.id, successful: payload.successful, keys: keysOf(payload) orderBy $, items: payload.items map ((it) -> {id: it.id, successful: it.successful, statusCode: it.statusCode, message: it.message, exceptionMessage: it.exception.message, exceptionKeys: keysOf(it.exception default {}) orderBy $, payload: it.payload})}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="describe">
+        <http:listener config-ref="HTTP" path="/describe" allowedMethods="GET"/>
+        <salesforce:describe-sobject config-ref="SF" type="#[attributes.queryParams['type']]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  payloadClass: payload.^class,
+  top: (payload - "fields" - "childRelationships" - "recordTypeInfos" - "supportedScopes" - "namedLayoutInfos" - "actionOverrides") orderBy $$,
+  keys: keysOf(payload) orderBy $,
+  fieldKeys: keysOf(payload.fields[0]) orderBy $,
+  counts: {fields: sizeOf(payload.fields) > 10, childRelationships: typeOf(payload.childRelationships), recordTypeInfos: typeOf(payload.recordTypeInfos)},
+  nameField: (payload.fields filter ($.name == "Name"))[0] orderBy $$,
+  idField: (payload.fields filter ($.name == "Id"))[0] orderBy $$,
+  industryField: ((payload.fields filter ($.name == "Industry"))[0] - "picklistValues") orderBy $$,
+  picklist0: (payload.fields filter ($.name == "Industry"))[0].picklistValues[0] orderBy $$,
+  child0: payload.childRelationships[0] orderBy $$,
+  recordType0: payload.recordTypeInfos[0] orderBy $$
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="describe-global">
+        <http:listener config-ref="HTTP" path="/describe-global" allowedMethods="GET"/>
+        <salesforce:describe-global config-ref="SF"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadClass: payload.^class, keys: keysOf(payload) orderBy $, many: sizeOf(payload.sobjects) > 100, account: ((payload.sobjects filter ($.name == "Account"))[0] mapObject ((v, k) -> {(k): typeOf(v)})) orderBy $$}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="user-info">
+        <http:listener config-ref="HTTP" path="/user-info" allowedMethods="GET"/>
+        <salesforce:get-user-info config-ref="SF"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadClass: payload.^class, types: (payload mapObject ((v, k) -> {("t_" ++ k): typeOf(v)})) orderBy $$}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="server-timestamp">
+        <http:listener config-ref="HTTP" path="/server-timestamp" allowedMethods="GET"/>
+        <salesforce:get-server-timestamp config-ref="SF"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadClass: payload.^class, "type": typeOf(payload), shape: (payload as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSS"}) replace /[0-9]/ with "9"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="get-updated">
+        <http:listener config-ref="HTTP" path="/get-updated" allowedMethods="GET"/>
+        <salesforce:get-updated config-ref="SF" objectType="Account" startDate="#[(now() - |PT2H|) as LocalDateTime]" endDate="#[now() as LocalDateTime]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadClass: payload.^class, types: (payload mapObject ((v, k) -> {("t_" ++ k): typeOf(v)})) orderBy $$}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="get-deleted">
+        <http:listener config-ref="HTTP" path="/get-deleted" allowedMethods="GET"/>
+        <salesforce:get-deleted config-ref="SF" objectType="Account" startDate="#[(now() - |PT2H|) as LocalDateTime]" endDate="#[now() as LocalDateTime]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadClass: payload.^class, types: payload mapObject ((v, k) -> {("t_" ++ k): typeOf(v)}), latest: (payload.latestDateCovered as String) replace /[0-9]/ with "9", recordTypes: (payload.deletedRecords default [])[0] mapObject ((v, k) -> {("t_" ++ k): typeOf(v)})}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="search">
+        <http:listener config-ref="HTTP" path="/search" allowedMethods="GET"/>
+        <salesforce:search config-ref="SF">
+            <salesforce:search-string>FIND {mulayoraclesearchnomatch} IN ALL FIELDS RETURNING Account(Id, Name)</salesforce:search-string>
+        </salesforce:search>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadClass: payload.^class, value: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bulk">
+        <http:listener config-ref="HTTP" path="/bulk" allowedMethods="POST"/>
+        <salesforce:create-job-bulk-api-v2 config-ref="SF" objectType="Account" operation="insert"/>
+        <set-variable variableName="job" value="#[payload]"/>
+        <salesforce:abort-job-bulk-api-v2 config-ref="SF" id="#[vars.job.id]"/>
+        <set-variable variableName="aborted" value="#[payload]"/>
+        <until-successful maxRetries="110" millisBetweenRetries="1000">
+            <salesforce:get-job-state-bulk-api-v2 config-ref="SF" id="#[vars.job.id]"/>
+            <choice>
+                <when expression="#[not (['JobComplete', 'Failed', 'Aborted'] contains payload.state)]">
+                    <raise-error type="APP:PENDING" description="#[payload.state]"/>
+                </when>
+            </choice>
+        </until-successful>
+        <salesforce:query config-ref="SF" target="inserted">
+            <salesforce:salesforce-query>SELECT Id FROM Account WHERE Name = 'mulay oracle bulk'</salesforce:salesforce-query>
+        </salesforce:query>
+        <choice>
+            <when expression="#[sizeOf(vars.inserted) > 0]">
+                <salesforce:delete config-ref="SF" target="ignored">
+                    <salesforce:ids>#[vars.inserted map $.Id]</salesforce:ids>
+                </salesforce:delete>
+            </when>
+        </choice>
+        <salesforce:delete-job-bulk-api-v2 config-ref="SF" id="#[vars.job.id]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{job: (vars.job mapObject ((v, k) -> {("t_" ++ k): typeOf(v)})) orderBy $$, created: (vars.job.createdDate as String) replace /[0-9]/ with "9", object: vars.job.object, operation: vars.job.operation, state: vars.job.state, abortedState: vars.aborted.state, deleted: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="seen">
+        <http:listener config-ref="HTTP" path="/seen" allowedMethods="GET"/>
+        <os:retrieve key="#[attributes.queryParams.key]">
+            <os:default-value>#[null]</os:default-value>
+        </os:retrieve>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+
+    <!-- 新しい Account を見つけたら ObjectStore にしまう (名前が mulay oracle L で始まるものだけ) -->
+    <flow name="new-account-listener">
+        <salesforce:new-object-listener config-ref="SF" objectType="Account">
+            <scheduling-strategy>
+                <fixed-frequency frequency="5000"/>
+            </scheduling-strategy>
+        </salesforce:new-object-listener>
+        <choice>
+            <when expression="#[(payload.Name default '') startsWith 'mulay oracle L']">
+                <os:store key="#['new:' ++ payload.Name]">
+                    <os:value>#[output application/json --- {keys: keysOf(payload), name: payload.Name, types: payload mapObject ((v, k) -> {(k): typeOf(v)}), billing: payload.BillingAddress, created: (payload.CreatedDate default "") replace /[0-9]/ with "9", attrs: attributes}]</os:value>
+                </os:store>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- 名前で引いた Account を消し、その ID を ObjectStore にしまう (deleted-object-listener が照らし合わせる) -->
+    <flow name="remove-tracked">
+        <http:listener config-ref="HTTP" path="/remove-tracked" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Id FROM Account WHERE Name = '" ++ attributes.queryParams.name ++ "'"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <os:store key="del-target">
+            <os:value>#[vars.found[0].Id]</os:value>
+        </os:store>
+        <salesforce:delete config-ref="SF" target="ignored">
+            <salesforce:ids>#[vars.found map $.Id]</salesforce:ids>
+        </salesforce:delete>
+        <set-payload value="removed"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 変更された Account (名前が mulay oracle M で始まるもの) -->
+    <flow name="modified-account-listener">
+        <salesforce:modified-object-listener config-ref="SF" objectType="Account">
+            <scheduling-strategy>
+                <fixed-frequency frequency="5000"/>
+            </scheduling-strategy>
+        </salesforce:modified-object-listener>
+        <choice>
+            <when expression="#[(payload.Name default '') startsWith 'mulay oracle M']">
+                <os:store key="#['modified:' ++ payload.Name]">
+                    <os:value>#[output application/json --- {class: payload.^class, keysCount: sizeOf(keysOf(payload)), name: payload.Name, industry: payload.Industry, modified: (payload.LastModifiedDate default "") replace /[0-9]/ with "9", attrs: attributes}]</os:value>
+                </os:store>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- 消された Account (remove-tracked がしまった ID のもの) -->
+    <flow name="deleted-account-listener">
+        <salesforce:deleted-object-listener config-ref="SF" objectType="Account">
+            <scheduling-strategy>
+                <fixed-frequency frequency="5000"/>
+            </scheduling-strategy>
+        </salesforce:deleted-object-listener>
+        <os:retrieve key="del-target" target="target">
+            <os:default-value>#[null]</os:default-value>
+        </os:retrieve>
+        <choice>
+            <when expression="#[vars.target != null and ((payload.id default payload.Id) default '') == vars.target]">
+                <os:store key="deleted:hit">
+                    <os:value>#[output application/json --- {class: payload.^class, keys: keysOf(payload), types: payload mapObject ((v, k) -> {(k): typeOf(v)}), deleted: ((payload.deletedDate default "") as String) replace /[0-9]/ with "9", attrs: attributes}]</os:value>
+                </os:store>
+            </when>
+        </choice>
+    </flow>
+</mule>

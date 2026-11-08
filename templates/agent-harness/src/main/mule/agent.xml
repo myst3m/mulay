@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  エージェントの本体。
+  POST /chat {"message": "...", "sessionId": "..."} (と A2A の message/send: a2a.xml) を受けて、LLM (Inference コネクタ) にツールの一覧と一緒に問い、
+  LLM がツールを選んだらそれを実行して結果を添えて問い直す。答えが返るか agent.maxSteps に達するまで繰り返す。
+  LLM を指定しない (llm.url が空の) ときは、LLM の代わりに統計的なモデル (stat.xml、stat/agent.dwl) が問いからツールを選んで答える。
+
+  Inference コネクタの tools-native-template は tool_calls を返すだけでツールを実行しない。また送れるメッセージは
+  role と content だけ (tool の役割のメッセージは送れない)。そのため、ツールの結果は data (JSON の文字列) の
+  toolResults に積んで次の呼び出しに渡す。
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+      xmlns:ms-inference="http://www.mulesoft.org/schema/mule/ms-inference"
+      xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd
+        http://www.mulesoft.org/schema/mule/ms-inference http://www.mulesoft.org/schema/mule/ms-inference/current/mule-ms-inference.xsd
+        http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="Http">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <!-- 会話の履歴 (sessionId ごとの [{role, content}]。save-history を参照) -->
+    <os:object-store name="Sessions" persistent="${store.persistent}" entryTtl="${store.ttlHours}" entryTtlUnit="HOURS"/>
+
+    <ms-inference:text-generation-config name="Llm">
+        <ms-inference:openai-compatible-connection apiKey="${llm.key}" openAICompatibleURL="${llm.url}" openAICompatibleModelName="${llm.model}"/>
+    </ms-inference:text-generation-config>
+
+    <mcp:client-config name="Tools" clientName="agent-harness" clientVersion="1.0.0">
+        <mcp:streamable-http-client-connection serverUrl="${mcp.url}" mcpEndpointPath="${mcp.path}"/>
+    </mcp:client-config>
+
+    <flow name="chat">
+        <http:listener config-ref="Http" path="/chat" allowedMethods="POST">
+            <http:response statusCode="#[vars.httpStatus default 200]"/>
+        </http:listener>
+        <!-- 入力の検査 (Validation モジュール)。all は全部を調べ、失敗をまとめて VALIDATION:MULTIPLE にする -->
+        <validation:all>
+            <validation:is-not-blank-string value="#[payload.message]" message="message is required"/>
+            <!-- sessionId は履歴の Object Store の鍵になるので、形を決めておく -->
+            <validation:matches-regex value="#[payload.sessionId default 'default']" regex="[A-Za-z0-9_.-]{1,64}"
+                                      message="sessionId must be 1 to 64 letters, digits, '_', '.' or '-'"/>
+        </validation:all>
+        <set-variable variableName="sid" value="#[payload.sessionId default 'default']"/>
+        <set-variable variableName="question" value="#[payload.message]"/>
+        <flow-ref name="converse"/>
+        <set-payload value="#[output application/json --- {sessionId: vars.sid, answer: vars.answer, steps: vars.steps}]"/>
+        <error-handler>
+            <!-- 入力の誤りは 400 (problems に検査ごとの説明) -->
+            <on-error-continue type="VALIDATION:VALIDATION">
+                <set-variable variableName="httpStatus" value="#[400]"/>
+                <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description, problems: (error.childErrors default []) map $.description}]"/>
+            </on-error-continue>
+            <on-error-continue>
+                <set-variable variableName="httpStatus" value="#[if (error.errorType.identifier == 'MAX_STEPS') 422 else 502]"/>
+                <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description, steps: vars.steps default []}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!--
+      会話 1 回分: vars.sid (履歴の鍵) と vars.question を受けて、vars.answer と vars.steps を置く。
+      HTTP (chat) と A2A (a2a.xml) の入口が共に使う。
+    -->
+    <sub-flow name="converse">
+        <!-- 入口に依らず、問いが空なら LLM に問わない (A2A では failed の Task になる) -->
+        <validation:is-not-blank-string value="#[vars.question]" message="the question is empty"/>
+        <!-- llm.provider: auto (既定) なら、llm.url が空のとき統計的なモデル (stat)、あれば OpenAI 互換の LLM (openai) -->
+        <set-variable variableName="provider" value="#[if (p('llm.provider') == 'auto') (if (isEmpty(p('llm.url'))) 'stat' else 'openai') else p('llm.provider')]"/>
+        <os:retrieve key="#[vars.sid]" objectStore="Sessions" target="history">
+            <os:default-value>#[[]]</os:default-value>
+        </os:retrieve>
+        <flow-ref name="tool-catalog"/>
+        <flow-ref name="agent-loop"/>
+        <flow-ref name="save-history"/>
+    </sub-flow>
+
+    <!--
+      会話の履歴を保存する。問いと答えを足し、新しい方から agent.historyMax 件、合わせて agent.historyMaxChars 文字に収まる分を残す
+      (メッセージ単位。問いを捨てて答えだけが先頭に残るなら、それも捨てる)。
+      agent.summarize=true なら、捨てる分を前の要約と一緒に LLM に要約させ、履歴の先頭に {role: "summary"} として置く
+      (agent.summaryMaxChars で切る。件数と文字数には数えない)。要約に失敗したら、前の要約のまま捨てるだけにする。
+    -->
+    <sub-flow name="save-history">
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="trim"><![CDATA[%dw 2.0
+output application/java
+var h = vars.history default []
+var all = (h filter ($.role != 'summary')) ++ [{role: 'user', content: vars.question}, {role: 'assistant', content: vars.answer}]
+var n = p('agent.historyMax') as Number
+var maxChars = p('agent.historyMaxChars') as Number
+// 新しい方から数えた各メッセージの文字数と、件数・文字数の上限に収まる数
+var sizes = all[-1 to 0] map sizeOf($.content default '')
+var fit = sizeOf((0 to sizeOf(sizes) - 1) filter ((i) -> i < n and sum(sizes[0 to i]) <= maxChars))
+var start0 = sizeOf(all) - fit
+var start = if (start0 < sizeOf(all) and all[start0].role == 'assistant') start0 + 1 else start0
+---
+{
+    keep: if (start >= sizeOf(all)) [] else all[start to -1],
+    dropped: if (start == 0) [] else all[0 to start - 1],
+    summary: (h filter ($.role == 'summary'))[0].content default null
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <choice>
+            <!-- 要約は LLM が要る。統計的なモデル (stat) では、捨てるメッセージは捨てるだけ (前の要約も無い) -->
+            <when expression="#[p('agent.summarize') == 'true' and vars.provider != 'stat' and not isEmpty(vars.trim.dropped)]">
+                <try>
+                    <ms-inference:agent-define-prompt-template config-ref="Llm">
+                        <ms-inference:template>#[p('agent.summaryPrompt')]</ms-inference:template>
+                        <ms-inference:instructions>#['The data is JSON: summary (the summary so far, or null) and dropped (older messages to fold into it). Write at most ' ++ p('agent.summaryMaxChars') ++ ' characters.']</ms-inference:instructions>
+                        <ms-inference:data>#[write({summary: vars.trim.summary, dropped: vars.trim.dropped}, 'application/json', {indent: false})]</ms-inference:data>
+                    </ms-inference:agent-define-prompt-template>
+                    <set-variable variableName="summary" value="#[output application/java --- do { var s = payload.response default '' var m = p('agent.summaryMaxChars') as Number --- if (sizeOf(s) > m) s[0 to m - 1] else s }]"/>
+                    <error-handler>
+                        <on-error-continue>
+                            <logger level="WARN" message="#['History summary failed; dropping ' ++ sizeOf(vars.trim.dropped) ++ ' message(s): ' ++ (error.description default '')]"/>
+                            <set-variable variableName="summary" value="#[vars.trim.summary]"/>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+            </when>
+            <when expression="#[p('agent.summarize') == 'true' and vars.provider != 'stat']">
+                <set-variable variableName="summary" value="#[vars.trim.summary]"/>
+            </when>
+            <otherwise>
+                <set-variable variableName="summary" value="#[null]"/>
+            </otherwise>
+        </choice>
+        <os:store key="#[vars.sid]" objectStore="Sessions">
+            <os:value>#[output application/java --- (if (isEmpty(vars.summary)) [] else [{role: 'summary', content: vars.summary}]) ++ vars.trim.keep]</os:value>
+        </os:store>
+    </sub-flow>
+
+    <!-- LLM に渡すツールの一覧: tools/local-tools.dwl (このアプリのフロー) と MCP サーバーの list-tools -->
+    <sub-flow name="tool-catalog">
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="localTools" resource="tools/local-tools.dwl"/>
+            </ee:variables>
+        </ee:transform>
+        <mcp:list-tools config-ref="Tools" target="mcpTools"/>
+        <set-variable variableName="mcpToolNames" value="#[vars.mcpTools map $.name]"/>
+        <set-variable variableName="tools" value="#[output application/json --- vars.localTools ++ (vars.mcpTools map {'type': 'function', 'function': {name: $.name, description: $.description, parameters: read($.inputSchema, 'application/json')}})]"/>
+    </sub-flow>
+
+    <sub-flow name="agent-loop">
+        <set-variable variableName="steps" value="#[[]]"/>
+        <set-variable variableName="answer" value="#[null]"/>
+        <!-- Mule に while は無いので、上限の回数だけ回して答えが出たら後は飛ばす -->
+        <foreach collection="#[1 to (p('agent.maxSteps') as Number)]">
+            <choice>
+                <when expression="#[vars.answer == null]">
+                    <flow-ref name="llm-step"/>
+                    <choice>
+                        <when expression="#[not isEmpty(payload.tools default [])]">
+                            <foreach collection="#[payload.tools]">
+                                <set-variable variableName="call" value="#[payload]"/>
+                                <flow-ref name="run-tool"/>
+                                <set-variable variableName="steps" value="#[output application/java --- vars.steps ++ [{tool: vars.call.function.name, arguments: vars.args, result: payload}]]"/>
+                                <!-- A2A のストリームなら進み具合を送る (それ以外では何もしない) -->
+                                <set-variable variableName="progress" value="#['called ' ++ vars.call.function.name]"/>
+                                <flow-ref name="a2a-progress"/>
+                            </foreach>
+                        </when>
+                        <otherwise>
+                            <set-variable variableName="answer" value="#[payload.response default '']"/>
+                        </otherwise>
+                    </choice>
+                </when>
+            </choice>
+        </foreach>
+        <choice>
+            <when expression="#[vars.answer == null]">
+                <raise-error type="AGENT:MAX_STEPS" description="#['No answer after ' ++ p('agent.maxSteps') ++ ' steps']"/>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!--
+      LLM に 1 回問う。payload は {response: 答え} か {tools: [tool_calls]} (Inference コネクタの tools-native-template の形)。
+      vars.provider が stat なら統計的なモデル (stat.xml の stat-step)、それ以外は OpenAI 互換の LLM (llm.*)。
+    -->
+    <sub-flow name="llm-step">
+        <choice>
+            <when expression="#[vars.provider == 'stat']">
+                <flow-ref name="stat-step"/>
+            </when>
+            <otherwise>
+                <ms-inference:tools-native-template config-ref="Llm">
+                    <ms-inference:template>#[p('agent.systemPrompt')]</ms-inference:template>
+                    <ms-inference:instructions>#[p('agent.instructions')]</ms-inference:instructions>
+                    <ms-inference:data>#[write({question: vars.question, history: vars.history, toolResults: vars.steps}, 'application/json', {indent: false})]</ms-inference:data>
+                    <ms-inference:tools>#[vars.tools]</ms-inference:tools>
+                </ms-inference:tools-native-template>
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <!--
+      ツールを 1 つ実行して、結果を文字列で payload に置く。MCP のツールは call-tool、それ以外は tool-<名前> のフロー。
+      ツールの失敗はエージェントを止めず、結果の文字列にして LLM に返す (LLM が別の手を考えられるように)。
+    -->
+    <sub-flow name="run-tool">
+        <set-variable variableName="args" value="#[read(vars.call.function.arguments default '{}', 'application/json')]"/>
+        <try>
+            <choice>
+                <when expression="#[vars.mcpToolNames contains vars.call.function.name]">
+                    <mcp:call-tool config-ref="Tools" toolName="#[vars.call.function.name]">
+                        <mcp:arguments>#[vars.args]</mcp:arguments>
+                    </mcp:call-tool>
+                    <set-payload value="#[((payload.contents default []) filter ($.'type' == 'text') map $.text) joinBy '\n']"/>
+                </when>
+                <when expression="#[(vars.localTools map $.function.name) contains vars.call.function.name]">
+                    <set-payload value="#[vars.args]"/>
+                    <flow-ref name="#['tool-' ++ vars.call.function.name]"/>
+                </when>
+                <otherwise>
+                    <set-payload value="#['error: unknown tool ' ++ vars.call.function.name]"/>
+                </otherwise>
+            </choice>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#['error: ' ++ (error.description default '')]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </sub-flow>
+</mule>

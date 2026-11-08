@@ -1,0 +1,537 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Database コネクタと MySQL (mysql-connector-j 9.2.0、サーバーは k0 の mulay-mysql、MySQL 8.4)。
+     値の Java の型、パラメータの送り方、生成キー、bulk、失敗の文言、ストアドプロシージャ、トランザクション、接続の失敗 -->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18480"/>
+    </http:listener-config>
+
+    <db:config name="My">
+        <db:generic-connection url="jdbc:mysql://localhost:13306/mulay" driverClassName="com.mysql.cj.jdbc.Driver" user="mulay" password="mulay"/>
+    </db:config>
+    <!-- my-sql-connection (URL は jdbc:mysql://host:port/database) -->
+    <db:config name="MyConn">
+        <db:my-sql-connection host="localhost" port="13306" user="mulay" password="mulay" database="mulay"/>
+    </db:config>
+    <db:config name="MySslRequired">
+        <db:generic-connection url="jdbc:mysql://localhost:13306/mulay?sslMode=REQUIRED" driverClassName="com.mysql.cj.jdbc.Driver" user="mulay" password="mulay"/>
+    </db:config>
+    <!-- 接続の失敗: パスワード、データベース、つながらない口 -->
+    <db:config name="MyBadPw">
+        <db:generic-connection url="jdbc:mysql://localhost:13306/mulay" driverClassName="com.mysql.cj.jdbc.Driver" user="mulay" password="wrong"/>
+    </db:config>
+    <db:config name="MyNoDb">
+        <db:generic-connection url="jdbc:mysql://localhost:13306/no_such_db" driverClassName="com.mysql.cj.jdbc.Driver" user="mulay" password="mulay"/>
+    </db:config>
+    <db:config name="MyDown">
+        <db:generic-connection url="jdbc:mysql://localhost:13399/mulay" driverClassName="com.mysql.cj.jdbc.Driver" user="mulay" password="mulay"/>
+    </db:config>
+    <db:config name="MyConnDown">
+        <db:my-sql-connection host="localhost" port="13399" user="mulay" password="mulay" database="mulay"/>
+    </db:config>
+
+    <sub-flow name="out">
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </sub-flow>
+
+    <!-- 値とその型 (DW の型と Java の class) -->
+    <sub-flow name="typed">
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map ((row) -> row mapObject ((v, k) -> {(k): {v: v, t: typeOf(v) as String, c: v.^class default null}}))]]></ee:set-payload></ee:message></ee:transform>
+    </sub-flow>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 表とプロシージャを作り直す (シナリオの最初に呼ぶ) -->
+    <flow name="reset">
+        <http:listener config-ref="L" path="/reset"/>
+        <db:execute-script config-ref="My">
+            <db:sql><![CDATA[DROP TABLE IF EXISTS person;
+DROP TABLE IF EXISTS types;
+DROP TABLE IF EXISTS bulk_t;
+CREATE TABLE person (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(40) NOT NULL, age INT, score DECIMAL(8,2), active BOOLEAN, born DATE, seen DATETIME(3), big BIGINT, raw VARBINARY(16), UNIQUE KEY person_name (name));
+INSERT INTO person (name, age, score, active, born, seen, big, raw) VALUES ('Ann', 30, 12.50, true, '1996-01-02', '2026-09-30 10:11:12.345', 9007199254740993, x'0102ff'), ('Bob', NULL, NULL, false, NULL, NULL, NULL, NULL), ('Cid', 41, 100, true, '1985-12-31', '2026-01-01 00:00:00', -5, x'');
+CREATE TABLE types (id INT PRIMARY KEY, t_tiny TINYINT, t_bool TINYINT(1), t_small SMALLINT, t_med MEDIUMINT, t_int INT, t_uint INT UNSIGNED, t_big BIGINT, t_ubig BIGINT UNSIGNED, t_dec DECIMAL(20,5), t_float FLOAT, t_double DOUBLE, t_bit1 BIT(1), t_bit8 BIT(8), t_date DATE, t_dt DATETIME, t_dt6 DATETIME(6), t_ts TIMESTAMP NULL, t_time TIME, t_year YEAR, t_char CHAR(5), t_vc VARCHAR(20), t_text TEXT, t_blob BLOB, t_vb VARBINARY(8), t_bin BINARY(3), t_json JSON, t_enum ENUM('a','b'), t_set SET('x','y'));
+INSERT INTO types VALUES (1, -5, 1, 300, 70000, -2147483648, 4294967295, 9223372036854775807, 18446744073709551615, 12345.67891, 1.5, 0.1, b'1', b'10100101', '2026-10-10', '2026-10-10 12:34:56', '2026-10-10 12:34:56.123456', '2026-10-10 12:34:56', '12:34:56', 2026, 'ab', 'héllo', 'テキスト', x'00ff', x'0102', x'0a0b0c', '{"a": [1, 2.5, "x"], "b": null}', 'b', 'x,y');
+INSERT INTO types (id) VALUES (2);
+CREATE TABLE bulk_t (id INT PRIMARY KEY, v VARCHAR(10) NOT NULL);
+DROP PROCEDURE IF EXISTS add_one;
+DROP PROCEDURE IF EXISTS info;
+DROP PROCEDURE IF EXISTS people;
+DROP PROCEDURE IF EXISTS two_sets;
+DROP PROCEDURE IF EXISTS touch_bob;
+DROP FUNCTION IF EXISTS twice]]></db:sql>
+        </db:execute-script>
+        <db:execute-ddl config-ref="My"><db:sql><![CDATA[CREATE PROCEDURE add_one(IN a INT, INOUT b INT) BEGIN SET b = a + 1; END]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="My"><db:sql><![CDATA[CREATE PROCEDURE info(IN n VARCHAR(20), OUT len INT, OUT up VARCHAR(20)) BEGIN SET len = CHAR_LENGTH(n); SET up = UPPER(n); END]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="My"><db:sql><![CDATA[CREATE PROCEDURE people() BEGIN SELECT id, name FROM person ORDER BY id; END]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="My"><db:sql><![CDATA[CREATE PROCEDURE two_sets() BEGIN SELECT 1 AS a; SELECT 'x' AS b; END]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="My"><db:sql><![CDATA[CREATE PROCEDURE touch_bob() BEGIN UPDATE person SET age = 7 WHERE name = 'Bob'; END]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="My"><db:sql><![CDATA[CREATE FUNCTION twice(x INT) RETURNS INT DETERMINISTIC NO SQL RETURN x * 2]]></db:sql></db:execute-ddl>
+        <set-payload value="#['ok']"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 接続 -->
+    <flow name="conn">
+        <http:listener config-ref="L" path="/conn/{cfg}"/>
+        <choice>
+            <when expression="#[attributes.uriParams.cfg == 'MyConn']"><db:select config-ref="MyConn"><db:sql>SELECT 1 AS one, DATABASE() AS db</db:sql></db:select></when>
+            <when expression="#[attributes.uriParams.cfg == 'MySslRequired']"><db:select config-ref="MySslRequired"><db:sql>SELECT 1 AS one</db:sql></db:select></when>
+            <when expression="#[attributes.uriParams.cfg == 'MyBadPw']"><db:select config-ref="MyBadPw"><db:sql>SELECT 1 AS one</db:sql></db:select></when>
+            <when expression="#[attributes.uriParams.cfg == 'MyNoDb']"><db:select config-ref="MyNoDb"><db:sql>SELECT 1 AS one</db:sql></db:select></when>
+            <when expression="#[attributes.uriParams.cfg == 'MyDown']"><db:select config-ref="MyDown"><db:sql>SELECT 1 AS one</db:sql></db:select></when>
+            <when expression="#[attributes.uriParams.cfg == 'MyConnDown']"><db:select config-ref="MyConnDown"><db:sql>SELECT 1 AS one</db:sql></db:select></when>
+            <otherwise><db:select config-ref="My"><db:sql>SELECT 1 AS one, DATABASE() AS db</db:sql></db:select></otherwise>
+        </choice>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- select -->
+    <flow name="select">
+        <http:listener config-ref="L" path="/select"/>
+        <db:select config-ref="My"><db:sql>SELECT * FROM person ORDER BY id</db:sql></db:select>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="select-types">
+        <http:listener config-ref="L" path="/select-types"/>
+        <db:select config-ref="My"><db:sql>SELECT * FROM person ORDER BY id</db:sql></db:select>
+        <flow-ref name="typed"/>
+    </flow>
+    <flow name="types">
+        <http:listener config-ref="L" path="/types"/>
+        <db:select config-ref="My"><db:sql>SELECT * FROM types ORDER BY id</db:sql></db:select>
+        <flow-ref name="typed"/>
+    </flow>
+    <!-- 式の列 (型は MySQL が式から決める) -->
+    <flow name="exprs">
+        <http:listener config-ref="L" path="/exprs"/>
+        <db:select config-ref="My"><db:sql><![CDATA[SELECT 1 AS i, 1 + 1.5 AS d, 2.5e0 AS f, 'x' AS s, NULL AS n, COUNT(*) AS cnt, SUM(age) AS total, AVG(age) AS mean, CAST('2026-01-02' AS DATE) AS dd, CAST(1 AS UNSIGNED) AS u, 10 DIV 3 AS q, TRUE AS b, CONCAT('a', NULL) AS cn FROM person]]></db:sql></db:select>
+        <flow-ref name="typed"/>
+    </flow>
+    <!-- 16MB を超える値 (パケットが 0xffffff ごとに続く) -->
+    <flow name="big">
+        <http:listener config-ref="L" path="/big"/>
+        <db:select config-ref="My"><db:sql>SELECT REPEAT('x', 17000000) AS big, 'after' AS tail</db:sql></db:select>
+        <set-payload value="#[output application/json --- {size: sizeOf(payload[0].big), tail: payload[0].tail}]"/>
+    </flow>
+    <flow name="select-max">
+        <http:listener config-ref="L" path="/select-max"/>
+        <db:select config-ref="My" maxRows="#[attributes.queryParams.n as Number]"><db:sql>SELECT id, name FROM person ORDER BY id</db:sql></db:select>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="select-param">
+        <http:listener config-ref="L" path="/select-param"/>
+        <db:select config-ref="My">
+            <db:sql>SELECT id, name FROM person WHERE age &gt; :min AND name &lt;&gt; :skip ORDER BY id</db:sql>
+            <db:input-parameters><![CDATA[#[{min: attributes.queryParams.min as Number, skip: 'nobody'}]]]></db:input-parameters>
+        </db:select>
+        <flow-ref name="out"/>
+    </flow>
+    <!-- パラメータの送り方 (値は SQL の文に埋め込まれる) と、返ってくる型 -->
+    <flow name="params">
+        <http:listener config-ref="L" path="/params"/>
+        <db:select config-ref="My">
+            <db:sql>SELECT :s AS s, :q AS q, :i AS i, :big AS big, :d AS d, :b AS b, :n AS n, :dt AS dt, :day AS day, :dz AS dz, :bin AS bin</db:sql>
+            <db:input-parameters><![CDATA[#[{s: 'héllo', q: "it's a \\ back\"slash", i: 42, big: 9007199254740993, d: 1.25, b: true, n: null, dt: |2026-10-10T01:02:03.5|, day: |2026-10-10|, dz: |2026-10-10T01:02:03Z|, bin: "AQID" as Binary {base: "64"}}]]]></db:input-parameters>
+        </db:select>
+        <flow-ref name="typed"/>
+    </flow>
+    <flow name="query-single">
+        <http:listener config-ref="L" path="/query-single"/>
+        <db:query-single config-ref="My"><db:sql>SELECT count(*) AS n, max(age) AS oldest FROM person</db:sql></db:query-single>
+        <flow-ref name="out"/>
+    </flow>
+
+    <!-- insert / update / delete -->
+    <flow name="insert">
+        <http:listener config-ref="L" path="/insert"/>
+        <db:insert config-ref="My" autoGenerateKeys="true">
+            <db:sql>INSERT INTO person (name, age) VALUES (:name, :age)</db:sql>
+            <db:input-parameters><![CDATA[#[{name: 'Dee', age: 22}]]]></db:input-parameters>
+        </db:insert>
+        <flow-ref name="out"/>
+    </flow>
+    <!-- 生成キーの型 -->
+    <flow name="insert-key-class">
+        <http:listener config-ref="L" path="/insert-key-class"/>
+        <db:insert config-ref="My" autoGenerateKeys="true">
+            <db:sql>INSERT INTO person (name) VALUES ('Kay')</db:sql>
+        </db:insert>
+        <set-payload value="#[output application/json --- {keys: payload.generatedKeys mapObject ((v, k) -> {(k): {t: typeOf(v) as String, c: v.^class default null}}), rows: payload.affectedRows, rowsClass: payload.affectedRows.^class default null}]"/>
+    </flow>
+    <flow name="insert-nokeys">
+        <http:listener config-ref="L" path="/insert-nokeys"/>
+        <db:insert config-ref="My">
+            <db:sql>INSERT INTO person (name) VALUES ('Eve')</db:sql>
+        </db:insert>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="insert-multi">
+        <http:listener config-ref="L" path="/insert-multi"/>
+        <db:insert config-ref="My" autoGenerateKeys="true">
+            <db:sql>INSERT INTO person (name) VALUES ('M1'), ('M2')</db:sql>
+        </db:insert>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="update">
+        <http:listener config-ref="L" path="/update"/>
+        <db:update config-ref="My"><db:sql>UPDATE person SET age = age + 1 WHERE age IS NOT NULL</db:sql></db:update>
+        <flow-ref name="out"/>
+    </flow>
+    <!-- 値が同じなら MySQL は変わった行に数えない (useAffectedRows=false なら見つかった行の数) -->
+    <flow name="update-same">
+        <http:listener config-ref="L" path="/update-same"/>
+        <db:update config-ref="My"><db:sql>UPDATE person SET active = active</db:sql></db:update>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="delete">
+        <http:listener config-ref="L" path="/delete"/>
+        <db:delete config-ref="My">
+            <db:sql>DELETE FROM person WHERE name = :n</db:sql>
+            <db:input-parameters><![CDATA[#[{n: attributes.queryParams.n default 'Dee'}]]]></db:input-parameters>
+        </db:delete>
+        <flow-ref name="out"/>
+    </flow>
+
+    <!-- bulk -->
+    <flow name="bulk-ok">
+        <http:listener config-ref="L" path="/bulk-ok"/>
+        <db:bulk-insert config-ref="My">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 1, v: 'a'}, {id: 2, v: 'b'}, {id: 3, v: 'c'}]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO bulk_t (id, v) VALUES (:id, :v)</db:sql>
+        </db:bulk-insert>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="bulk-upd">
+        <http:listener config-ref="L" path="/bulk-upd"/>
+        <db:bulk-update config-ref="My">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 1, v: 'A'}, {id: 9, v: 'Z'}]]]]></db:bulk-input-parameters>
+            <db:sql>UPDATE bulk_t SET v = :v WHERE id = :id</db:sql>
+        </db:bulk-update>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="bulk-dup">
+        <http:listener config-ref="L" path="/bulk-dup"/>
+        <db:bulk-insert config-ref="My">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 10, v: 'x'}, {id: 1, v: 'dup'}, {id: 11, v: 'y'}]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO bulk_t (id, v) VALUES (:id, :v)</db:sql>
+        </db:bulk-insert>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="bulk-null">
+        <http:listener config-ref="L" path="/bulk-null"/>
+        <db:bulk-insert config-ref="My">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 20, v: 'p'}, {id: 21, v: null}]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO bulk_t (id, v) VALUES (:id, :v)</db:sql>
+        </db:bulk-insert>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="bulk-del">
+        <http:listener config-ref="L" path="/bulk-del"/>
+        <db:bulk-delete config-ref="My">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 2}, {id: 3}, {id: 99}]]]]></db:bulk-input-parameters>
+            <db:sql>DELETE FROM bulk_t WHERE id = :id</db:sql>
+        </db:bulk-delete>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="bulk-rows">
+        <http:listener config-ref="L" path="/bulk-rows"/>
+        <db:select config-ref="My"><db:sql>SELECT * FROM bulk_t ORDER BY id</db:sql></db:select>
+        <flow-ref name="out"/>
+    </flow>
+
+    <!-- 失敗 -->
+    <flow name="err">
+        <http:listener config-ref="L" path="/err/{kind}"/>
+        <choice>
+            <when expression="#[attributes.uriParams.kind == 'syntax']"><db:select config-ref="My"><db:sql>SELEC 1</db:sql></db:select></when>
+            <when expression="#[attributes.uriParams.kind == 'table']"><db:select config-ref="My"><db:sql>SELECT * FROM nothing_here</db:sql></db:select></when>
+            <when expression="#[attributes.uriParams.kind == 'column']"><db:select config-ref="My"><db:sql>SELECT nope FROM person</db:sql></db:select></when>
+            <when expression="#[attributes.uriParams.kind == 'notnull']"><db:insert config-ref="My"><db:sql>INSERT INTO person (name) VALUES (NULL)</db:sql></db:insert></when>
+            <when expression="#[attributes.uriParams.kind == 'dup']"><db:insert config-ref="My"><db:sql>INSERT INTO person (name) VALUES ('Ann')</db:sql></db:insert></when>
+            <when expression="#[attributes.uriParams.kind == 'long']"><db:insert config-ref="My"><db:sql>INSERT INTO bulk_t (id, v) VALUES (500, 'abcdefghijklmnop')</db:sql></db:insert></when>
+            <when expression="#[attributes.uriParams.kind == 'type']"><db:select config-ref="My"><db:sql>SELECT * FROM person WHERE id = :x</db:sql><db:input-parameters>#[{y: 1}]</db:input-parameters></db:select></when>
+            <otherwise><db:update config-ref="My"><db:sql>UPDATE person SET age = 'abc' WHERE id = 1</db:sql></db:update></otherwise>
+        </choice>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- ストアドプロシージャ -->
+    <flow name="sp-out">
+        <http:listener config-ref="L" path="/sp-out"/>
+        <db:stored-procedure config-ref="My">
+            <db:sql><![CDATA[{call add_one(:a, :b)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{a: 41}]]]></db:input-parameters>
+            <db:output-parameters><db:output-parameter key="b" type="INTEGER"/></db:output-parameters>
+        </db:stored-procedure>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="sp-inout">
+        <http:listener config-ref="L" path="/sp-inout"/>
+        <db:stored-procedure config-ref="My">
+            <db:sql><![CDATA[{call  add_one(:a, :b)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{a: 1}]]]></db:input-parameters>
+            <db:in-out-parameters><db:in-out-parameter key="b" value="#[5]"/></db:in-out-parameters>
+        </db:stored-procedure>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="sp-multi">
+        <http:listener config-ref="L" path="/sp-multi"/>
+        <db:stored-procedure config-ref="My">
+            <db:sql><![CDATA[{call info(:n, :len, :up)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{n: 'abc'}]]]></db:input-parameters>
+            <db:output-parameters>
+                <db:output-parameter key="len" type="INTEGER"/>
+                <db:output-parameter key="up" type="VARCHAR"/>
+            </db:output-parameters>
+        </db:stored-procedure>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="sp-set">
+        <http:listener config-ref="L" path="/sp-set"/>
+        <db:stored-procedure config-ref="My"><db:sql><![CDATA[{call people()}]]></db:sql></db:stored-procedure>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="sp-two">
+        <http:listener config-ref="L" path="/sp-two"/>
+        <db:stored-procedure config-ref="My"><db:sql><![CDATA[{call two_sets()}]]></db:sql></db:stored-procedure>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="sp-none">
+        <http:listener config-ref="L" path="/sp-none"/>
+        <db:stored-procedure config-ref="My"><db:sql><![CDATA[{call touch_bob()}]]></db:sql></db:stored-procedure>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="sp-plain">
+        <http:listener config-ref="L" path="/sp-plain"/>
+        <db:stored-procedure config-ref="My"><db:sql>CALL people()</db:sql></db:stored-procedure>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="sp-func">
+        <http:listener config-ref="L" path="/sp-func"/>
+        <db:stored-procedure config-ref="My">
+            <db:sql><![CDATA[{:r = call twice(:x)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{x: 21}]]]></db:input-parameters>
+            <db:output-parameters><db:output-parameter key="r" type="INTEGER"/></db:output-parameters>
+        </db:stored-procedure>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="sp-missing">
+        <http:listener config-ref="L" path="/sp-missing"/>
+        <db:stored-procedure config-ref="My">
+            <db:sql><![CDATA[{call nothing_here(:a)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{a: 1}]]]></db:input-parameters>
+        </db:stored-procedure>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- select で CALL (結果セットを返すプロシージャ) -->
+    <flow name="select-call">
+        <http:listener config-ref="L" path="/select-call"/>
+        <db:select config-ref="My"><db:sql><![CDATA[{call people()}]]></db:sql></db:select>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- execute-script / execute-ddl -->
+    <flow name="script">
+        <http:listener config-ref="L" path="/script/{kind}"/>
+        <choice>
+            <when expression="#[attributes.uriParams.kind == 'ok']">
+                <db:execute-script config-ref="My"><db:sql><![CDATA[UPDATE person SET age = age WHERE 1 = 0;
+UPDATE person SET score = score WHERE id <= 2;
+SELECT name FROM person WHERE 1 = 0]]></db:sql></db:execute-script>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'table']">
+                <db:execute-script config-ref="My"><db:sql><![CDATA[UPDATE person SET age = age WHERE 1 = 0;
+SELECT * FROM nothing_here;
+UPDATE person SET age = age WHERE 1 = 0]]></db:sql></db:execute-script>
+            </when>
+            <when expression="#[attributes.uriParams.kind == 'notnull']">
+                <db:execute-script config-ref="My"><db:sql><![CDATA[UPDATE person SET age = age WHERE 1 = 0;
+INSERT INTO person (name) VALUES (NULL);
+UPDATE person SET age = age WHERE 1 = 0]]></db:sql></db:execute-script>
+            </when>
+            <otherwise>
+                <db:execute-ddl config-ref="My"><db:sql>CREATE TABLE IF NOT EXISTS ddl_t (x INT)</db:sql></db:execute-ddl>
+            </otherwise>
+        </choice>
+        <flow-ref name="out"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- トランザクション -->
+    <flow name="tx-ok">
+        <http:listener config-ref="L" path="/tx-ok"/>
+        <try transactionalAction="ALWAYS_BEGIN">
+            <db:insert config-ref="My"><db:sql>INSERT INTO person (name) VALUES ('T1')</db:sql></db:insert>
+            <db:insert config-ref="My"><db:sql>INSERT INTO person (name) VALUES ('T2')</db:sql></db:insert>
+        </try>
+        <db:select config-ref="My"><db:sql>SELECT name FROM person WHERE name LIKE 'T%' ORDER BY name</db:sql></db:select>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="tx-rollback">
+        <http:listener config-ref="L" path="/tx-rollback"/>
+        <try>
+            <try transactionalAction="ALWAYS_BEGIN">
+                <db:insert config-ref="My"><db:sql>INSERT INTO person (name) VALUES ('R1')</db:sql></db:insert>
+                <raise-error type="APP:FAIL" description="fail in tx"/>
+            </try>
+            <error-handler><on-error-continue><set-payload value="#['caught']"/></on-error-continue></error-handler>
+        </try>
+        <db:select config-ref="My"><db:sql>SELECT count(*) AS n FROM person WHERE name = 'R1'</db:sql></db:select>
+        <flow-ref name="out"/>
+    </flow>
+    <flow name="tx-sees-own">
+        <http:listener config-ref="L" path="/tx-sees-own"/>
+        <try transactionalAction="ALWAYS_BEGIN">
+            <db:insert config-ref="My"><db:sql>INSERT INTO person (name) VALUES ('S1')</db:sql></db:insert>
+            <db:select config-ref="My"><db:sql>SELECT name FROM person WHERE name = 'S1'</db:sql></db:select>
+            <set-variable variableName="inside" value="#[sizeOf(payload)]"/>
+            <raise-error type="APP:UNDO" description="undo"/>
+            <error-handler><on-error-continue><logger level="DEBUG" message="undo"/></on-error-continue></error-handler>
+        </try>
+        <db:select config-ref="My"><db:sql>SELECT count(*) AS n FROM person WHERE name = 'S1'</db:sql></db:select>
+        <set-payload value="#[output application/json --- {inside: vars.inside, after: payload[0].n}]"/>
+    </flow>
+
+    <!-- queryTimeout / queryTimeoutUnit: 打ち切った時の時間は 2.5 秒より速いか (fast / slow) だけを返す。SQL は 3 秒眠るので、打ち切らなければ slow。1.5 秒では検査用の MySQL までの往復が遅い時に slow になった -->
+    <db:config name="MyOne">
+        <db:generic-connection url="jdbc:mysql://localhost:13306/mulay" driverClassName="com.mysql.cj.jdbc.Driver" user="mulay" password="mulay">
+            <db:pooling-profile maxPoolSize="1"/>
+        </db:generic-connection>
+    </db:config>
+    <error-handler name="qt-report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 2500) 'fast' else 'slow'}]"/>
+        </on-error-continue>
+    </error-handler>
+    <flow name="qt-select">
+        <http:listener config-ref="L" path="/qt/select"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="My" queryTimeout="1"><db:sql>SELECT SLEEP(3) AS x</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-select-ok">
+        <http:listener config-ref="L" path="/qt/select-ok"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="My" queryTimeout="5"><db:sql>SELECT SLEEP(0.2) AS x</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-millis">
+        <http:listener config-ref="L" path="/qt/millis"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="My" queryTimeout="500" queryTimeoutUnit="MILLISECONDS"><db:sql>SELECT SLEEP(3) AS x</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-conn">
+        <http:listener config-ref="L" path="/qt/conn"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="MyConn" queryTimeout="1"><db:sql>SELECT SLEEP(3) AS x</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-reuse">
+        <http:listener config-ref="L" path="/qt/reuse"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <try>
+            <db:select config-ref="MyOne" queryTimeout="1"><db:sql>SELECT SLEEP(3) AS x</db:sql></db:select>
+            <error-handler><on-error-continue><set-variable variableName="first" value="#[error.description]"/></on-error-continue></error-handler>
+        </try>
+        <db:select config-ref="MyOne"><db:sql>SELECT 2 AS y</db:sql></db:select>
+        <set-payload value="#[output application/java --- {first: vars.first, second: payload}]"/>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-insert">
+        <http:listener config-ref="L" path="/qt/insert"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:execute-ddl config-ref="My"><db:sql>CREATE TABLE IF NOT EXISTS qt_t (x int)</db:sql></db:execute-ddl>
+        <db:insert config-ref="My" queryTimeout="1"><db:sql>INSERT INTO qt_t SELECT SLEEP(3)</db:sql></db:insert>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-script">
+        <http:listener config-ref="L" path="/qt/script"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:execute-script config-ref="My" queryTimeout="1"><db:sql>DO SLEEP(3)</db:sql></db:execute-script>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-proc">
+        <http:listener config-ref="L" path="/qt/proc"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:execute-ddl config-ref="My"><db:sql>CREATE PROCEDURE IF NOT EXISTS qt_p() BEGIN DO SLEEP(3); END</db:sql></db:execute-ddl>
+        <db:stored-procedure config-ref="My" queryTimeout="1"><db:sql>{call qt_p()}</db:sql></db:stored-procedure>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+
+
+    <!-- queryTimeout / queryTimeoutUnit: かかった時間は 1.5 秒より速いか (fast / slow) だけを返す -->
+    <error-handler name="qt2-report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        </on-error-continue>
+    </error-handler>
+    <flow name="qt2-bulk">
+        <http:listener config-ref="L" path="/qt2/bulk"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:execute-ddl config-ref="My"><db:sql>CREATE TABLE IF NOT EXISTS qt_b (x int)</db:sql></db:execute-ddl>
+        <db:delete config-ref="My"><db:sql>DELETE FROM qt_b</db:sql></db:delete>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <try>
+            <db:bulk-insert config-ref="My" queryTimeout="1"><db:bulk-input-parameters>#[[{x: 1}, {x: 2}]]</db:bulk-input-parameters><db:sql>INSERT INTO qt_b SELECT :x + SLEEP(0.8)</db:sql></db:bulk-insert>
+            <error-handler><on-error-continue><set-payload value="#[error.description]"/></on-error-continue></error-handler>
+        </try>
+        <set-variable variableName="ms" value="#[((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'}))]"/>
+        <set-variable variableName="bulk" value="#[payload]"/>
+        <db:select config-ref="My"><db:sql>SELECT x FROM qt_b ORDER BY x</db:sql></db:select>
+        <set-payload value="#[output application/java --- {bulk: vars.bulk, rows: payload.x, under1300: vars.ms &lt; 1300}]"/>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt2-report"/>
+    </flow>
+
+</mule>

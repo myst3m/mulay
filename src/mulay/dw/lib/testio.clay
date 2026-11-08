@@ -1,0 +1,74 @@
+(ns mulay.dw.lib.testio
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core] [mulay.dw.lib.runtime :as l-runtime]
+            [mulay.dw.fmt.registry :as reg] [mulay.lib.host :as host] [clay.string :as str]))
+
+(def M "dw::test::internal::Files")
+
+(def ROOTS (atom (let [z: Vec(Str) []] z)))
+
+(defn set-roots! Int [rs: Vec(Str)] (let [z (reset! ROOTS rs)] 0))
+
+(defn- prop-or Str [name: &Str default: Str]
+  (let [r (v/obj-get (l-runtime/props-fields) name)]
+    (if (= (count r) 0) default (match (v/unmeta (nth r 0)) (v/VStr s) (str s) _ default))))
+
+(defn- resources Str [] (prop-or "dwtestResources" "resources"))
+
+(defn- join Str [a: &Str b: &Str] (if (= a "") (str b) (if (str/ends-with? a "/") (str a b) (str a "/" b))))
+
+(defn- ext-of Str [name: &Str] (let [k (str/last-index-of name ".")] (if (<= k 0) "" (subs name k (count name)))))
+
+(defn- base-of Str [name: &Str] (let [k (str/last-index-of name ".")] (if (<= k 0) (str name) (subs name 0 k))))
+
+(defn- mime-of Str [name: &Str]
+  (let [e (ext-of name) ds (l-runtime/descriptors)]
+    (loop [i 0]
+      (if (>= i (count ds)) "text/plain"
+        (match (v/unmeta (nth ds i))
+          (v/VObj fs)
+          (let [xs (v/obj-get fs "extensions")
+                hit (if (= (count xs) 0) false (loop [k 0 ys (v/items (nth xs 0))] (if (>= k (count ys)) false (if (= (core/arg-str [(nth ys k)] 0) e) true (recur (+ k 1) ys)))))]
+            (if hit (core/arg-str (v/obj-get fs "defaultMimeType") 0) (recur (+ i 1))))
+          _ (recur (+ i 1)))))))
+
+(defn- dir? Bool [p: &Str] (let [[ns e] (host/file-list p)] (= e "")))
+
+(defn- read-file-as Values(v/Val dwe/DwErr) [path: &Str name: &Str]
+  (let [[t e] (host/file-read path)]
+    (if (not= e "") (rt/failure "FileNotFound" (str "Unable to read " path ": " e))
+      (let [[x re] (reg/read-fmt (mime-of name) [] t)]
+        (if (= re "") (rt/ret x) (rt/failure "ReaderException" re))))))
+
+(defn- dir-object Values(v/Val dwe/DwErr) [dir: &Str depth: Int]
+  (let [[names e] (host/file-list dir)]
+    (if (not= e "") (rt/failure "FileNotFound" (str "Unable to list " dir ": " e))
+      (let [sorted (sort names)]
+        (loop [i 0 acc: Vec(v/Field) []]
+          (if (>= i (count sorted)) (rt/ret (v/->VObj acc))
+            (let [n (nth sorted i) p (join dir n)]
+              (cond
+                (or (str/starts-with? n ".") (= (ext-of n) ".properties")) (recur (+ i 1) acc)
+                (and (dir? p) (< depth 16)) (let [[x xe] (dir-object p (+ depth 1))] (if (dwe/ok? xe) (recur (+ i 1) (conj acc (v/field (str n) x))) (values x xe)))
+                :else (let [[x xe] (read-file-as p n)] (if (dwe/ok? xe) (recur (+ i 1) (conj acc (v/field (base-of n) x))) (values x xe)))))))))))
+
+(defn- inputs-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (dir-object (join (join (resources) (core/arg-str a 0)) "inputs") 0))
+
+(defn- output-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [dir (join (resources) (core/arg-str a 0))
+        [names e] (host/file-list dir)
+        outs (if (not= e "") [] (loop [i 0 acc: Vec(Str) []] (if (>= i (count names)) acc (recur (+ i 1) (if (str/starts-with? (nth names i) "out.") (conj acc (nth names i)) acc)))))]
+    (if (= (count outs) 0) (rt/failure "FileNotFound" (str "No output file (out.*) in " dir))
+      (read-file-as (join dir (nth (sort outs) 0)) (nth (sort outs) 0)))))
+
+(defn- resource-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [p (core/arg-str a 0) rs: Vec(Str) (deref ROOTS)]
+    (loop [i 0]
+      (if (>= i (count rs)) (rt/ret (v/null-v))
+        (let [[t e] (host/file-read (join (nth rs i) p))]
+          (if (= e "") (rt/ret (v/->VStr t)) (recur (+ i 1))))))))
+
+(defn builtins Vec(rt/Builtin) []
+  [(rt/builtin "inputsOf" M [(rt/b1 "String" inputs-fn)])
+   (rt/builtin "outputOf" M [(rt/b1 "String" output-fn)])
+   (rt/builtin "resourceText" M [(rt/b1 "String" resource-fn)])])

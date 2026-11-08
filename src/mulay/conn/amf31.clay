@@ -1,0 +1,109 @@
+(ns mulay.conn.amf31
+  (:require [mulay.lib.yaml :as y] [clay.string :as str]))
+
+(def NUM-FACETS ["minimum" "maximum" "exclusiveMinimum" "exclusiveMaximum" "multipleOf"])
+(def STR-FACETS ["minLength" "maxLength" "pattern" "format"])
+(def ARR-FACETS ["items" "prefixItems" "minItems" "maxItems" "uniqueItems" "contains"])
+(def OBJ-FACETS ["properties" "patternProperties" "additionalProperties" "required" "minProperties" "maxProperties"])
+(def SUB-ONE ["additionalProperties" "items" "not" "if" "then" "else" "contains"])
+(def SUB-MANY ["allOf" "anyOf" "oneOf" "prefixItems"])
+(def SUB-MAP ["properties" "patternProperties" "$defs" "definitions"])
+
+(defn- in? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn- text Str [v: &y/YVal] (match v (y/YStr s) (str s) _ (y/scalar-text v)))
+
+(defn- facets-of Vec(Str) [t: &Str]
+  (cond (or (= t "integer") (= t "number")) NUM-FACETS
+        (= t "string") STR-FACETS
+        (= t "array") ARR-FACETS
+        (= t "object") OBJ-FACETS
+        :else []))
+
+(defn- moved? Bool [k: &Str] (or (in? NUM-FACETS k) (in? STR-FACETS k) (in? ARR-FACETS k) (in? OBJ-FACETS k)))
+
+(defn- int-digits Str [t: &Str]
+  (let [d (str/index-of t ".") e (let [a (str/index-of t "e") b (str/index-of t "E")] (if (>= a 0) a b))]
+    (cond (>= e 0) (str t) (>= d 0) (let [h (subs t 0 d)] (if (or (= h "") (= h "-")) (str h "0") h)) :else (str t))))
+
+(defn- strip-zeros Str [frac: &Str]
+  (let [k (loop [i (count frac)] (if (and (> i 1) (= (nth frac (- i 1)) 48)) (recur (- i 1)) i))] (subs frac 0 k)))
+
+(defn java-double Str [t: &Str]
+  (let [neg (str/starts-with? t "-")
+        u (if (or neg (str/starts-with? t "+")) (subs t 1 (count t)) (str t))
+        sign (if neg "-" "")]
+    (if (or (str/includes? u "e") (str/includes? u "E")) (str t)
+      (let [d (str/index-of u ".")
+            ip0 (if (< d 0) u (subs u 0 d))
+            ip (let [k (loop [i 0] (if (and (< i (- (count ip0) 1)) (= (nth ip0 i) 48)) (recur (+ i 1)) i))] (subs ip0 k (count ip0)))
+            fp (if (< d 0) "0" (let [f (subs u (+ d 1) (count u))] (if (= f "") "0" (strip-zeros f))))]
+        (if (>= (count ip) 8)
+          (str sign (subs ip 0 1) "." (strip-zeros (str (subs ip 1 (count ip)) (if (= fp "0") "" fp))) "E" (- (count ip) 1))
+          (str sign (if (= ip "") "0" ip) "." fp))))))
+
+(defn- num-as Str [t: &Str integer: Bool] (if integer (int-digits t) (java-double t)))
+
+(defn- retype-num y/YVal [v: &y/YVal integer: Bool]
+  (match v
+    (y/YInt t) (if integer (y/->YInt (str t)) (y/->YFloat (java-double t)))
+    (y/YFloat t) (if integer (y/->YInt (int-digits t)) (y/->YFloat (java-double t)))
+    _ v))
+
+(defn- type-name Str [s: &y/YVal] (let [[t f] (y/get-key s "type")] (if f (match t (y/YStr x) (str x) _ "") "")))
+
+(defn- sub-schemas y/YVal [k: &Str v: &y/YVal depth: Int]
+  (cond
+    (in? SUB-MAP k) (match v (y/YMap ks vs) (y/->YMap ks (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count vs)) acc (recur (+ i 1) (conj acc (normalize (nth vs i) (+ depth 1))))))) _ v)
+    (in? SUB-MANY k) (match v (y/YSeq xs) (y/->YSeq (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (normalize (nth xs i) (+ depth 1))))))) _ v)
+    (in? SUB-ONE k) (match v (y/YMap a b) (normalize v (+ depth 1)) _ v)
+    :else v))
+
+(defn- branch y/YVal [t: &y/YVal ks: &Vec(y/YVal) vs: &Vec(y/YVal) depth: Int]
+  (let [tn (text t) fs (facets-of tn)]
+    (loop [i 0 bk: Vec(y/YVal) [(y/->YStr "type")] bv: Vec(y/YVal) [(y/->YStr (str tn))]]
+      (if (>= i (count ks)) (normalize (y/->YMap bk bv) (+ depth 1))
+        (let [k (text (nth ks i))]
+          (recur (+ i 1) (if (in? fs k) (conj bk (nth ks i)) bk) (if (in? fs k) (conj bv (nth vs i)) bv)))))))
+
+(defn normalize y/YVal [s: &y/YVal depth: Int]
+  (if (> depth 64) s
+    (match s
+      (y/YMap ks vs)
+      (let [[t ht] (y/get-key s "type")
+            multi (match t (y/YSeq ts) (> (count ts) 1) _ false)]
+        (if multi
+          (let [ts (match t (y/YSeq xs) xs _ [])
+                any (y/->YSeq (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count ts)) acc (recur (+ i 1) (conj acc (branch (nth ts i) ks vs depth))))))]
+            (loop [i 0 ok: Vec(y/YVal) [] ov: Vec(y/YVal) []]
+              (if (>= i (count ks)) (y/->YMap ok ov)
+                (let [k (text (nth ks i))]
+                  (cond
+                    (= k "type") (recur (+ i 1) (conj ok (y/->YStr "anyOf")) (conj ov any))
+                    (moved? k) (recur (+ i 1) ok ov)
+                    (= k "const") (recur (+ i 1) (conj ok (y/->YStr "enum")) (conj ov (y/->YSeq [(nth vs i)])))
+                    :else (recur (+ i 1) (conj ok (nth ks i)) (conj ov (sub-schemas k (nth vs i) depth))))))))
+          (let [tn (match t (y/YSeq xs) (if (= (count xs) 1) (text (nth xs 0)) "") (y/YStr x) (str x) _ "")
+                integer (= tn "integer")]
+            (loop [i 0 ok: Vec(y/YVal) [] ov: Vec(y/YVal) []]
+              (if (>= i (count ks)) (y/->YMap ok ov)
+                (let [k (text (nth ks i)) v (nth vs i)]
+                  (cond
+                    (and (= k "type") (> (count tn) 0)) (recur (+ i 1) (conj ok (nth ks i)) (conj ov (y/->YStr (str tn))))
+                    (= k "const") (recur (+ i 1) (conj ok (y/->YStr "enum")) (conj ov (y/->YSeq [v])))
+                    (in? NUM-FACETS k) (recur (+ i 1) (conj ok (nth ks i)) (conj ov (retype-num v integer)))
+                    :else (recur (+ i 1) (conj ok (nth ks i)) (conj ov (sub-schemas k v depth))))))))))
+      _ s)))
+
+(defn normalize-doc y/YVal [d: &y/YVal]
+  (match d
+    (y/YMap ks vs)
+    (y/->YMap ks (loop [i 0 acc: Vec(y/YVal) []]
+                   (if (>= i (count ks)) acc
+                     (let [k (text (nth ks i)) v (nth vs i)]
+                       (recur (+ i 1) (conj acc (cond
+                                                  (= k "schema") (normalize v 0)
+                                                  (= k "schemas") (match v (y/YMap a b) (y/->YMap a (loop [j 0 o: Vec(y/YVal) []] (if (>= j (count b)) o (recur (+ j 1) (conj o (normalize (nth b j) 0)))))) _ v)
+                                                  :else (normalize-doc v))))))))
+    (y/YSeq xs) (y/->YSeq (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (normalize-doc (nth xs i)))))))
+    _ d))

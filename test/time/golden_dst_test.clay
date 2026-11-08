@@ -1,0 +1,61 @@
+(ns golden-dst-test
+  (:require [mulay.lib.numparse :as npz] [golden-dst-data :as g]
+            [mulay.lib.time.types :as t]
+            [mulay.lib.time.amount :as am]
+            [mulay.lib.time.local :as l]
+            [mulay.lib.time.tz :as tz]
+            [mulay.lib.time.zoned :as zd]
+            [mulay.lib.time.iso :as iso]
+            [clay.string :as str]))
+
+;; DST 境界の golden (tools/gen-time-golden.java): ofLocal のギャップ/オーバーラップ、ofInstant、
+;; 日付系と時間系の加算、ゾーン変換。America/New_York Europe/London Australia/Lord_Howe Asia/Tokyo ほか。
+
+(defn- zone t/TimeZone [s: &Str] (let [[z e] (tz/zone-of-id s)] z))
+(defn- zdt t/ZonedDateTime [s: &Str] (let [[z e] (iso/parse-zdt s)] z))
+(defn- ok-or Str [v: Str e: &Str] (if (= e "") v (str "ERR " e)))
+
+(defn- check-line Str [f: &Vec(Str)]
+  (let [k: Str (nth f 0)]
+    (case k
+      "oflocal" (let [z (zone (nth f 1))
+                      [x e] (iso/parse-ldt (nth f 2))
+                      r (zd/zdt-of-local x z [])]
+                  (str/join "\t" [k (nth f 1) (nth f 2) (iso/zdt-str r)
+                                  (iso/zdt-str (zd/zdt-with-earlier-offset r)) (iso/zdt-str (zd/zdt-with-later-offset r))]))
+      "plus" (let [z (zdt (nth f 1))
+                   [a e1] (zd/zdt-plus-period z (am/period 0 0 1))
+                   [b e2] (zd/zdt-plus-duration z (am/duration-of-hours 1))
+                   [c e3] (zd/zdt-plus-duration z (am/duration-of-minutes -30))
+                   [d e4] (zd/zdt-plus-period z (am/period 0 1 0))
+                   [x e5] (zd/zdt-minus-period z (am/period 0 0 1))
+                   [y e6] (zd/zdt-plus-duration z (am/duration-of-hours 24))]
+               (str/join "\t" [k (nth f 1) (ok-or (iso/zdt-str a) e1) (ok-or (iso/zdt-str b) e2) (ok-or (iso/zdt-str c) e3)
+                               (ok-or (iso/zdt-str d) e4) (ok-or (iso/zdt-str x) e5) (ok-or (iso/zdt-str y) e6)]))
+      "ofinstant" (let [z (zone (nth f 1))
+                        s (npz/int-or (nth f 2) 0)
+                        r (zd/zdt-of-instant s 0 z)
+                        rules (tz/rules-of z)]
+                    ;; 標準オフセットは TZif に無く推定なので、1947 年より前 (Europe/Paris 1945 など標準自体が
+                    ;; 揺れた時期) は比べない
+                    (str/join "\t" [k (nth f 1) (nth f 2) (iso/zdt-str r) (if (tz/dst-at? rules s) "true" "false")
+                                    (if (< s -700000000) (nth f 5) (str (tz/std-offset-at rules s)))]))
+      "same" (let [z (zdt (nth f 1))
+                   other (zone (nth f 2))]
+               (str/join "\t" [k (nth f 1) (nth f 2) (iso/zdt-str (zd/zdt-with-zone-same-instant z other))
+                               (iso/zdt-str (zd/zdt-with-zone-same-local z other))]))
+      (str "unknown kind " k))))
+
+(defn- run Int []
+  (let [cs (g/cases)]
+    (loop [i 0 bad 0]
+      (if (>= i (count cs)) bad
+        (let [want: Str (nth cs i)
+              got (check-line (str/split want "\t"))
+              ok (= got want)]
+          (if (and (not ok) (< bad 60)) (println (str "  want " want "\n  got  " got)) 0)
+          (recur (+ i 1) (if ok bad (+ bad 1))))))))
+
+(deftest golden-dst
+  (is (> (count (g/cases)) 6000))
+  (is (= (run) 0)))

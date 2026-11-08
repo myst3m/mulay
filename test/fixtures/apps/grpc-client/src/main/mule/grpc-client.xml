@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:grpc="http://www.mulesoft.org/schema/mule/grpc"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/grpc http://www.mulesoft.org/schema/mule/grpc/current/mule-grpc.xsd">
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18291"/>
+    </http:listener-config>
+
+    <!-- 相手は mule-oracle の gRPC のスタブ (%%% grpcserver 18290) -->
+    <grpc:client-config name="Cli">
+        <grpc:no-auth-connection host="localhost" port="18290">
+            <grpc:idl-definition>
+                <grpc:single-binary-protobuf protobufDescriptorFile="stub.desc"/>
+            </grpc:idl-definition>
+            <grpc:request-headers>
+                <grpc:request-header key="x-conn" value="c1"/>
+            </grpc:request-headers>
+            <grpc:connection-mode>
+                <grpc:plain-text/>
+            </grpc:connection-mode>
+        </grpc:no-auth-connection>
+    </grpc:client-config>
+    <grpc:client-config name="Down">
+        <grpc:no-auth-connection host="localhost" port="18298">
+            <grpc:idl-definition>
+                <grpc:single-binary-protobuf protobufDescriptorFile="stub.desc"/>
+            </grpc:idl-definition>
+            <grpc:connection-mode>
+                <grpc:plain-text/>
+            </grpc:connection-mode>
+        </grpc:no-auth-connection>
+    </grpc:client-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="c-echo">
+        <http:listener config-ref="L" path="/c/echo"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-echo-direct">
+        <http:listener config-ref="L" path="/c/echo-direct"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-meta">
+        <http:listener config-ref="L" path="/c/meta"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {t: typeOf(payload) as String, mediaType: payload.^mediaType default null, mimeType: payload.^mimeType default null, cls: payload.^class default null, raw: payload.^raw default null, enc: payload.^encoding default null, len: payload.^contentLength default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-headers">
+        <http:listener config-ref="L" path="/c/headers"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Headers">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+            <grpc:request-headers>
+                <grpc:request-header key="x-trace" value="op-1"/>
+                <grpc:request-header key="X-Upper" value="Up"/>
+            </grpc:request-headers>
+        </grpc:unary-call>
+        <set-payload value="#[output text/plain --- payload.message]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-fail">
+        <http:listener config-ref="L" path="/c/fail"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Fail">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-trailers-only">
+        <http:listener config-ref="L" path="/c/trailers-only"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/TrailersOnly">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-garbage">
+        <http:listener config-ref="L" path="/c/garbage"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Garbage">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-badproto">
+        <http:listener config-ref="L" path="/c/badproto"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/BadProto">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-badproto-direct">
+        <http:listener config-ref="L" path="/c/badproto-direct"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/BadProto">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-http503">
+        <http:listener config-ref="L" path="/c/http503"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Http503">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-nostatus">
+        <http:listener config-ref="L" path="/c/nostatus"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/NoStatus">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-empty">
+        <http:listener config-ref="L" path="/c/empty"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Empty">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-two">
+        <http:listener config-ref="L" path="/c/two"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Two">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-nope">
+        <http:listener config-ref="L" path="/c/nope"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Nope">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-missing">
+        <http:listener config-ref="L" path="/c/missing"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Missing">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-down">
+        <http:listener config-ref="L" path="/c/down"/>
+        <grpc:unary-call config-ref="Down" method="stub.S/Echo">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-raw-content">
+        <http:listener config-ref="L" path="/c/raw-content"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo">
+            <grpc:content><![CDATA[#['abc' as Binary]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-json-content">
+        <http:listener config-ref="L" path="/c/json-content"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo">
+            <grpc:content><![CDATA[#[output application/json --- {name: 'J'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-default-content">
+        <http:listener config-ref="L" path="/c/default-content"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo">
+            <grpc:content><![CDATA[#[payload]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-chain">
+        <http:listener config-ref="L" path="/c/chain"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo"/>
+        <set-payload value="#[output application/json --- {p: payload, attrs: attributes default null}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-var">
+        <http:listener config-ref="L" path="/c/var"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo" target="r">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {v: vars.r, mediaType: vars.r.^mediaType default null, p: payload}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-write">
+        <http:listener config-ref="L" path="/c/write"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Echo">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed', count: 3, tags: 'm', tags: 'n'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {j: write(payload, 'application/json', {indent: false})}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-bare">
+        <http:listener config-ref="L" path="/c/bare"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Bare">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload}]"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="c-odd">
+        <http:listener config-ref="L" path="/c/odd"/>
+        <grpc:unary-call config-ref="Cli" method="stub.S/Odd">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='stub.desc', messageType='stub.Req' --- {name: 'Zed'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload}]"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

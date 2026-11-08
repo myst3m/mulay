@@ -1,0 +1,57 @@
+(ns dwpath-test (:require [mulay.cli.dwpath :as dp] [mulay.lib.fs :as fs]))
+(defextern getpid getpid)
+
+(c-include "<unistd.h>")
+
+(defn- scratch Str [name: Str]
+  (let [d (str "/tmp/mulay-dwpath-test-" (unsafe (getpid)) "-" name)
+        z (fs/remove-tree d)
+        e (fs/mkdirs d)]
+    d))
+
+(deftest module-file-name
+  (is (= (dp/module-file "foo::Bar") "foo/Bar.dwl"))
+  (is (= (dp/module-file "a::b::C") "a/b/C.dwl")))
+
+(deftest roots-are-paths-then-script-dir-then-projects
+  (let [d (scratch "roots")
+        proj (fs/join d "svc")
+        z1 (fs/mkdirs (fs/join proj "src/main/resources"))
+        z2 (fs/mkdirs (fs/join proj "src/test/dw"))
+        other (fs/join d "other")
+        z3 (fs/mkdirs other)
+        res (fs/join proj "src/main/resources")
+        tdir (fs/join proj "src/test/dw")
+        r1 (dp/roots ["/x"] (fs/join tdir "t.dwl") other)
+        r2 (dp/roots [] "src/test/dw/t.dwl" proj)
+        r3 (dp/roots [] (fs/join other "t.dwl") proj)
+        r4 (dp/roots [] (fs/join res "t.dwl") other)
+        r5 (dp/roots [] (fs/join other "t.dwl") other)
+        z (fs/remove-tree d)]
+    (is (= r1 ["/x" tdir res]))
+    (is (= r2 [tdir res]))
+    (is (= r3 [other res]))
+    (is (= r4 [res]))
+    (is (= r5 [other]))
+    (is (= z ""))))
+
+(deftest loader-reads-the-first-root-that-has-the-module
+  (let [d (scratch "loader")
+        a (fs/join d "a")
+        b (fs/join d "b")
+        z1 (fs/mkdirs (fs/join a "foo"))
+        z2 (fs/mkdirs (fs/join b "foo"))
+        w1 (write-file (fs/join b "foo/Bar.dwl") "from b")
+        w2 (write-file (fs/join b "foo/Baz.dwl") "baz in b")
+        w3 (write-file (fs/join a "foo/Bar.dwl") "from a")
+        ld (dp/loader [a b])
+        [t1 f1] (ld "foo::Bar")
+        [t2 f2] (ld "foo::Baz")
+        [t3 f3] (ld "foo::Nope")
+        z (fs/remove-tree d)]
+    (is (= t1 "from a"))
+    (is f1)
+    (is (= t2 "baz in b"))
+    (is f2)
+    (is (not f3))
+    (is (= z ""))))

@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:salesforce-pub-sub="http://www.mulesoft.org/schema/mule/salesforce-pub-sub"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/salesforce-pub-sub http://www.mulesoft.org/schema/mule/salesforce-pub-sub/current/mule-salesforce-pub-sub.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="A">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${a.clientId}" clientSecret="${a.clientSecret}" tokenUrl="${a.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+    <salesforce:sfdc-config name="B">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${b.clientId}" clientSecret="${b.clientSecret}" tokenUrl="${b.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <salesforce-pub-sub:pubsub-config name="PA">
+        <salesforce-pub-sub:oauth-client-credentials-connection>
+            <salesforce-pub-sub:oauth-client-credentials clientId="${a.clientId}" clientSecret="${a.clientSecret}" tokenUrl="${a.tokenUrl}"/>
+        </salesforce-pub-sub:oauth-client-credentials-connection>
+    </salesforce-pub-sub:pubsub-config>
+    <salesforce-pub-sub:pubsub-config name="PB">
+        <salesforce-pub-sub:oauth-client-credentials-connection>
+            <salesforce-pub-sub:oauth-client-credentials clientId="${b.clientId}" clientSecret="${b.clientSecret}" tokenUrl="${b.tokenUrl}"/>
+        </salesforce-pub-sub:oauth-client-credentials-connection>
+    </salesforce-pub-sub:pubsub-config>
+
+    <!-- 処理し終えたイベントの replay ID (再起動したらその続きから読む) と、失敗したイベント -->
+    <os:object-store name="Replay" persistent="true"/>
+    <os:object-store name="Failed" persistent="true"/>
+    <os:object-store name="Stats" persistent="false"/>
+
+    <vm:config name="VM">
+        <vm:queues>
+            <vm:queue queueName="copyQ"/>
+        </vm:queues>
+    </vm:config>
+
+    <!-- ===== 差分: 相手の org のイベントを受けて当てる ===== -->
+
+    <flow name="a-to-b">
+        <salesforce-pub-sub:subscribe-channel-listener config-ref="PA" channelName="/event/SyncItemChange__e" eventBatchSize="${sync.batch}">
+            <salesforce-pub-sub:replay-option><salesforce-pub-sub:replay-id-from-object-store osName="Replay" osKey="a"/></salesforce-pub-sub:replay-option>
+        </salesforce-pub-sub:subscribe-channel-listener>
+        <set-variable variableName="replayId" value="#[payload.replayId]"/>
+        <set-variable variableName="e" value="#[payload.event]"/>
+        <flow-ref name="apply-to-b"/>
+        <os:store key="a" objectStore="Replay"><os:value>#[vars.replayId]</os:value></os:store>
+        <error-handler>
+            <on-error-continue>
+                <flow-ref name="keep-failed"/>
+                <os:store key="a" objectStore="Replay"><os:value>#[vars.replayId]</os:value></os:store>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="b-to-a">
+        <salesforce-pub-sub:subscribe-channel-listener config-ref="PB" channelName="/event/SyncItemChange__e" eventBatchSize="${sync.batch}">
+            <salesforce-pub-sub:replay-option><salesforce-pub-sub:replay-id-from-object-store osName="Replay" osKey="b"/></salesforce-pub-sub:replay-option>
+        </salesforce-pub-sub:subscribe-channel-listener>
+        <set-variable variableName="replayId" value="#[payload.replayId]"/>
+        <set-variable variableName="e" value="#[payload.event]"/>
+        <flow-ref name="apply-to-a"/>
+        <os:store key="b" objectStore="Replay"><os:value>#[vars.replayId]</os:value></os:store>
+        <error-handler>
+            <on-error-continue>
+                <flow-ref name="keep-failed"/>
+                <os:store key="b" objectStore="Replay"><os:value>#[vars.replayId]</os:value></os:store>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <sub-flow name="apply-to-b">
+        <salesforce:query config-ref="B" target="current">
+            <salesforce:salesforce-query>SELECT Id, Sync_Version__c FROM SyncItem__c WHERE Sync_Key__c = ':key'</salesforce:salesforce-query>
+            <salesforce:parameters>#[{key: vars.e.Sync_Key__c}]</salesforce:parameters>
+        </salesforce:query>
+        <set-variable variableName="current" value="#[vars.current[0] default null]"/>
+        <set-variable variableName="action" value="#[import * from orgsync::Sync --- decide(vars.e, vars.current)]"/>
+        <choice>
+            <when expression="#[vars.action == 'upsert']">
+                <salesforce:upsert config-ref="B" objectType="SyncItem__c" externalIdFieldName="Sync_Key__c">
+                    <salesforce:records>#[import * from orgsync::Sync --- [record(vars.e)]]</salesforce:records>
+                </salesforce:upsert>
+                <flow-ref name="check-saved"/>
+            </when>
+            <when expression="#[vars.action == 'delete']">
+                <salesforce:update config-ref="B" type="SyncItem__c">
+                    <salesforce:records>#[[{Id: vars.current.Id, Sync_Deleting__c: true, Sync_Version__c: vars.e.Version__c as Number}]]</salesforce:records>
+                </salesforce:update>
+                <salesforce:delete config-ref="B">
+                    <salesforce:ids>#[[vars.current.Id]]</salesforce:ids>
+                </salesforce:delete>
+            </when>
+        </choice>
+        <flow-ref name="count"/>
+    </sub-flow>
+
+    <sub-flow name="apply-to-a">
+        <salesforce:query config-ref="A" target="current">
+            <salesforce:salesforce-query>SELECT Id, Sync_Version__c FROM SyncItem__c WHERE Sync_Key__c = ':key'</salesforce:salesforce-query>
+            <salesforce:parameters>#[{key: vars.e.Sync_Key__c}]</salesforce:parameters>
+        </salesforce:query>
+        <set-variable variableName="current" value="#[vars.current[0] default null]"/>
+        <set-variable variableName="action" value="#[import * from orgsync::Sync --- decide(vars.e, vars.current)]"/>
+        <choice>
+            <when expression="#[vars.action == 'upsert']">
+                <salesforce:upsert config-ref="A" objectType="SyncItem__c" externalIdFieldName="Sync_Key__c">
+                    <salesforce:records>#[import * from orgsync::Sync --- [record(vars.e)]]</salesforce:records>
+                </salesforce:upsert>
+                <flow-ref name="check-saved"/>
+            </when>
+            <when expression="#[vars.action == 'delete']">
+                <salesforce:update config-ref="A" type="SyncItem__c">
+                    <salesforce:records>#[[{Id: vars.current.Id, Sync_Deleting__c: true, Sync_Version__c: vars.e.Version__c as Number}]]</salesforce:records>
+                </salesforce:update>
+                <salesforce:delete config-ref="A">
+                    <salesforce:ids>#[[vars.current.Id]]</salesforce:ids>
+                </salesforce:delete>
+            </when>
+        </choice>
+        <flow-ref name="count"/>
+    </sub-flow>
+
+    <sub-flow name="check-saved">
+        <choice>
+            <when expression="#[not (payload.successful default false)]">
+                <raise-error type="ORGSYNC:SAVE" description="#[write(payload.items map ((it) -> it.message), 'application/json')]"/>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <sub-flow name="count">
+        <os:retrieve key="#[vars.action]" objectStore="Stats" target="n"><os:default-value>#[0]</os:default-value></os:retrieve>
+        <os:store key="#[vars.action]" objectStore="Stats"><os:value>#[vars.n + 1]</os:value></os:store>
+    </sub-flow>
+
+    <sub-flow name="keep-failed">
+        <logger level="WARN" message="#['sync failed for ' ++ (vars.e.Sync_Key__c default '?') ++ ': ' ++ error.description]"/>
+        <os:store key="#[vars.e.Sync_Key__c default (uuid())]" objectStore="Failed">
+            <os:value>#[write({event: vars.e, error: error.description}, 'application/json')]</os:value>
+        </os:store>
+    </sub-flow>
+
+    <!-- ===== 初回コピー: キーの順に ${sync.copyChunk} 件ずつ読み、Bulk API 2.0 で相手に upsert する ===== -->
+
+    <flow name="initial-copy">
+        <http:listener config-ref="HTTP" path="/initial-copy" allowedMethods="POST"/>
+        <vm:publish config-ref="VM" queueName="copyQ"><vm:content>#[output application/java --- {after: "", copied: 0, jobs: []}]</vm:content></vm:publish>
+        <set-payload value="#[output application/json --- {started: true}]"/>
+    </flow>
+
+    <flow name="copy-chunk">
+        <vm:listener config-ref="VM" queueName="copyQ"/>
+        <set-variable variableName="state" value="#[payload]"/>
+        <salesforce:query config-ref="A" target="rows">
+            <salesforce:salesforce-query>#["SELECT Name, Phone__c, Amount__c, Status__c, Due__c, Sync_Key__c, Sync_Version__c FROM SyncItem__c WHERE Sync_Key__c > '" ++ vars.state.after ++ "' ORDER BY Sync_Key__c LIMIT " ++ p('sync.copyChunk')]</salesforce:salesforce-query>
+        </salesforce:query>
+        <choice>
+            <when expression="#[sizeOf(vars.rows) == 0]">
+                <os:store key="copy" objectStore="Stats"><os:value>#[write(vars.state, 'application/json')]</os:value></os:store>
+                <logger level="INFO" message="#['initial copy done: ' ++ (vars.state.copied as String) ++ ' record(s)']"/>
+            </when>
+            <otherwise>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+import * from orgsync::Sync
+output application/csv header=true
+---
+vars.rows map copied($)]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <salesforce:create-job-bulk-api-v2 config-ref="B" objectType="SyncItem__c" operation="upsert" externalIdFieldName="Sync_Key__c"/>
+                <set-variable variableName="next" value="#[output application/java --- {after: vars.rows[-1].Sync_Key__c, copied: vars.state.copied + sizeOf(vars.rows), jobs: vars.state.jobs + payload.id}]"/>
+                <os:store key="copy" objectStore="Stats"><os:value>#[write(vars.next, 'application/json')]</os:value></os:store>
+                <vm:publish config-ref="VM" queueName="copyQ"><vm:content>#[vars.next]</vm:content></vm:publish>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- ===== 突き合わせ: 両方の org の行を版で比べ、新しい方を相手に書く (イベントの取りこぼしを埋める) ===== -->
+
+    <flow name="reconcile-scheduled">
+        <scheduler>
+            <scheduling-strategy><fixed-frequency frequency="${sync.reconcileMinutes}" timeUnit="MINUTES" startDelay="${sync.reconcileMinutes}"/></scheduling-strategy>
+        </scheduler>
+        <flow-ref name="reconcile"/>
+    </flow>
+
+    <flow name="reconcile-now">
+        <http:listener config-ref="HTTP" path="/reconcile" allowedMethods="POST"/>
+        <flow-ref name="reconcile"/>
+        <set-payload value="#[output application/json --- vars.result]"/>
+    </flow>
+
+    <sub-flow name="reconcile">
+        <salesforce:query config-ref="A" target="ra">
+            <salesforce:salesforce-query>SELECT Name, Phone__c, Amount__c, Status__c, Due__c, Sync_Key__c, Sync_Version__c FROM SyncItem__c</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:query config-ref="B" target="rb">
+            <salesforce:salesforce-query>SELECT Name, Phone__c, Amount__c, Status__c, Due__c, Sync_Key__c, Sync_Version__c FROM SyncItem__c</salesforce:salesforce-query>
+        </salesforce:query>
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="plan"><![CDATA[%dw 2.0
+import * from orgsync::Sync
+output application/java
+var a = vars.ra groupBy $.Sync_Key__c
+var b = vars.rb groupBy $.Sync_Key__c
+---
+{
+  toB: (vars.ra filter ((r) -> b[r.Sync_Key__c] == null or version(r.Sync_Version__c) > version(b[r.Sync_Key__c][0].Sync_Version__c))) map copied($),
+  toA: (vars.rb filter ((r) -> a[r.Sync_Key__c] == null or version(r.Sync_Version__c) > version(a[r.Sync_Key__c][0].Sync_Version__c))) map copied($)
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <choice>
+            <when expression="#[sizeOf(vars.plan.toB) > 0]">
+                <salesforce:upsert config-ref="B" objectType="SyncItem__c" externalIdFieldName="Sync_Key__c">
+                    <salesforce:records>#[vars.plan.toB]</salesforce:records>
+                </salesforce:upsert>
+                <set-variable variableName="failedB" value="#[sizeOf(payload.items filter (not $.successful))]"/>
+            </when>
+        </choice>
+        <choice>
+            <when expression="#[sizeOf(vars.plan.toA) > 0]">
+                <salesforce:upsert config-ref="A" objectType="SyncItem__c" externalIdFieldName="Sync_Key__c">
+                    <salesforce:records>#[vars.plan.toA]</salesforce:records>
+                </salesforce:upsert>
+                <set-variable variableName="failedA" value="#[sizeOf(payload.items filter (not $.successful))]"/>
+            </when>
+        </choice>
+        <set-variable variableName="result" value="#[{a: sizeOf(vars.ra), b: sizeOf(vars.rb), fixedInB: sizeOf(vars.plan.toB) - (vars.failedB default 0), fixedInA: sizeOf(vars.plan.toA) - (vars.failedA default 0), failedInB: vars.failedB default 0, failedInA: vars.failedA default 0}]"/>
+        <logger level="INFO" message="#['reconcile: ' ++ write(vars.result, 'application/json', {indent: false})]"/>
+    </sub-flow>
+
+    <!-- ===== 状態 ===== -->
+
+    <flow name="status">
+        <http:listener config-ref="HTTP" path="/status" allowedMethods="GET"/>
+        <os:retrieve-all objectStore="Stats"/>
+        <set-variable variableName="stats" value="#[payload]"/>
+        <os:retrieve-all objectStore="Replay"/>
+        <set-variable variableName="replay" value="#[payload]"/>
+        <os:retrieve-all-keys objectStore="Failed"/>
+        <set-payload value="#[output application/json --- {counts: vars.stats - 'copy', copy: if (vars.stats.copy != null) read(vars.stats.copy, 'application/json') else null, replay: vars.replay, failed: payload}]"/>
+    </flow>
+</mule>

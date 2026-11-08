@@ -1,0 +1,21 @@
+;; canonical event text matching the Python/expat generator: adjacent text and
+;; CDATA merged, names as {uri}local, errors collapsed to ERR
+(defn- qn Str [q: &xml/QName] (if (= (:uri q) "") (str (:local q)) (str "{" (:uri q) "}" (:local q))))
+(defn canon Str [src: Str]
+  (let [[r0 e0] (xml/reader src (xml/default-opts))]
+    (if (not (= e0 "")) "ERR"
+      (loop [r r0 out "" buf ""]
+        (let [[r2 ev err] (xml/next-event r)
+              fl (if (= buf "") out (str out "T(" buf ")"))]
+          (if (not (= err "")) "ERR"
+            (match ev
+              (xml/XeText t) (recur r2 out (str buf t))
+              (xml/XeCData t) (recur r2 out (str buf t))
+              (xml/XeStart n as ns) (recur r2 (str fl "S(" (qn n)
+                                                  (loop [i 0 o ""] (if (>= i (count as)) o (recur (+ i 1) (str o " " (qn (:name (nth as i))) "=" (:value (nth as i))))))
+                                                  ")") "")
+              (xml/XeEnd n) (recur r2 (str fl "E(" (qn n) ")") "")
+              (xml/XeComment t) (recur r2 (str fl "!(" t ")") "")
+              (xml/XePI t d) (recur r2 (str fl "?(" t "," d ")") "")
+              (xml/XeEndDoc) fl
+              _ (recur r2 fl ""))))))))

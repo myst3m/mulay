@@ -1,0 +1,41 @@
+(ns event-test (:require [mulay.rt.event :as ev] [mulay.dw.val :as v]))
+
+;; DW が知らない mime の入力は Binary として読む (実 Mule 4.11.3: Content-Type: app/override の要求の payload も、
+;; Anypoint MQ の contentType が app/override の message も typeOf は Binary。test/fixtures/apps/anypoint-mq-ops の /typeof)
+
+(defn- bin-of Str [x: &v/Val] (match (v/unmeta x) (v/VBin b) (str "bin:" b) _ "other"))
+
+(deftest unknown-mime-reads-as-binary
+  (let [[x t e] (ev/value (ev/tv-raw "abc" "app/override"))
+        [y t2 e2] (ev/value (ev/tv-raw "abc" "application/x-foo; charset=ISO-8859-1"))
+        [z t3 e3] (ev/value (ev/tv-raw "{\"a\": 1}" "application/json"))]
+    (is (= e ""))
+    (is (= (bin-of x) "bin:abc"))
+    (is (= e2 ""))
+    (is (= (bin-of y) "bin:abc"))
+    (is (= e3 ""))
+    (is (= (bin-of z) "other"))))
+
+;; TypedValue に包まれた値 (gRPC の unary-call の結果)。外向きは */* の Java の値で、DW で読むときだけ中の mime で読む。
+;; 直列化できない (実 Mule 4.11.3: test/fixtures/apps/grpc-client の /c/echo-direct は 500 "Could not serialize object")
+(deftest typed-value-reads-with-the-inner-mime
+  (let [t (ev/tv-typed "{\"a\": 1}" "application/json")
+        [x t2 e] (ev/value t)
+        [b be] (ev/bytes t)
+        [w we] (ev/wire-bytes t)]
+    (is (= (:mime t) "*/*; charset=UTF-8"))
+    (is (= e ""))
+    (is (v/equal? (v/unmeta x) (v/->VObj [(v/field "a" (v/int-v 1))])))
+    (is (= (:state t2) ev/TYPED))
+    (is (= be "Could not serialize object"))
+    (is (= we "Could not serialize object"))))
+
+;; カーソルの失敗の型。props に無ければ DB:QUERY_EXECUTION、識別子が * なら失敗の文言の 1 行目 (NS:ID) から決める
+(defn- cerr Str [t: ev/TV msg: Str] (let [[n i d] (ev/cursor-error t msg)] (str n ":" i "|" d)))
+
+(deftest cursor-error-type
+  (is (= (cerr (ev/tv-cursor-typed "c1" "DB" "QUERY_EXECUTION") "boom") "DB:QUERY_EXECUTION|boom"))
+  (is (= (cerr (ev/tv-cursor "c0") "boom") "MULE:UNKNOWN|boom"))
+  (is (= (cerr (ev/tv-cursor-of "c2" ev/ANY "X" "MULE" "UNKNOWN") "boom") "MULE:UNKNOWN|boom"))
+  (is (= (cerr (ev/tv-cursor-of "c3" ev/ANY "X" "GRPC" "*") "GRPC:ABORTED\ngRPC operation failed\nMethod: m") "GRPC:ABORTED|gRPC operation failed\nMethod: m"))
+  (is (= (cerr (ev/tv-cursor-of "c4" ev/ANY "X" "GRPC" "*") "no type") "GRPC:UNKNOWN|no type")))

@@ -1,0 +1,216 @@
+(ns mulay.db.sqlite (:require [mulay.db.sql :as sql] [mulay.lib.host :as host] [mulay.db.sqlite_codes :as codes] [mulay.lib.sqlexec :as ex]
+                               [mulay.lib.sqlparse :as sp] [mulay.lib.sqlfile :as sf] [clay.string :as str]))
+
+(def PREPARE-FAILED "A problem occurred while trying to acquire a cached PreparedStatement in a background thread.")
+(def SQLITE-EXC "org.sqlite.SQLiteException")
+
+(defrecord Conn [key: Str file: Str work: Vec(ex/Db) cs: ex/ConnState res: ex/Res code: Int msg: Str])
+(defrecord State [dbs: Map(Str ex/Db) conns: Map(Str Conn) next: Int])
+
+(def STATE: Atom(State)
+  (atom (let [d: Map(Str ex/Db) {} c: Map(Str Conn) {}] (->State d c 1))))
+
+(defn- empty-res ex/Res [] (let [n: Vec(Str) [] r: Vec(Vec(sf/Val)) []] (ex/->Res n r false)))
+
+(defn- locate Values(Str Str) [url: &Str]
+  (let [q (str/index-of url "?")
+        base0 (if (>= q 0) (subs url 0 q) (str url))
+        query (if (>= q 0) (subs url (+ q 1) (count url)) "")
+        base (if (str/starts-with? base0 "file:") (subs base0 5 (count base0)) base0)
+        mem (or (= base "") (= base ":memory:") (str/includes? query "mode=memory"))
+        shared (str/includes? query "cache=shared")]
+    (cond (and mem shared) (values (str "mem:" base) "")
+          mem (values "" "")
+          :else (values (str "file:" base) base))))
+
+(defn- add-conn State [s: State key: Str file: Str db: Vec(ex/Db)]
+  (let [h (:next s)
+        k (if (= key "") (str "own:" h) key)
+        dbs (if (or (contains? (:dbs s) k) (= (count db) 0)) (:dbs s) (assoc (:dbs s) k (nth db 0)))
+        c (->Conn k file [] (ex/new-conn-state) (empty-res) 0 "")]
+    (->State dbs (assoc (:conns s) (str h) c) (+ h 1))))
+
+(defn open Values(Int sql/DbErr) [url: &Str]
+  (let [[key file] (locate url)
+        cur (deref STATE)
+        need (if (= key "") true (not (contains? (:dbs cur) key)))
+        [db err] (cond (not need) (values [] "")
+                       (= file "") (values [(ex/new-db 4096)] "")
+                       :else (let [[data re] (host/file-read file)]
+                               (if (or (not= re "") (= (count data) 0)) (values [(ex/new-db 4096)] "")
+                                 (let [[d de] (ex/open-db data)] (if (not= de "") (values [] de) (values [d] ""))))))]
+    (if (not= err "") (values 0 (sql/->DbErr (str "[SQLITE_NOTADB] File opened that is not a database file (" err ")") "" 26 SQLITE-EXC))
+      (let [s (swap! STATE add-conn key file db)] (values (- (:next s) 1) (sql/ok-err))))))
+
+(defn- drop-conn State [s: State h: Int]
+  (if (not (contains? (:conns s) (str h))) s
+    (let [k (:key (get! (:conns s) (str h)))
+          conns (dissoc (:conns s) (str h))
+          used (loop [ks (keys conns) i 0] (cond (>= i (count ks)) false (= (:key (get! conns (nth ks i))) k) true :else (recur ks (+ i 1))))]
+      (->State (if used (:dbs s) (dissoc (:dbs s) k)) conns (:next s)))))
+
+(defn close Int [h: Int] (let [s (swap! STATE drop-conn h)] 0))
+
+(defrecord Req [st: sp/Stmt params: Vec(sf/Val)])
+
+(defn- step State [s: State h: Int req: Req]
+  (if (not (contains? (:conns s) (str h))) s
+    (let [hk (str h)
+          nxt (:next s)
+          dbs0 (:dbs s)
+          conns0 (:conns s)
+          c (get! conns0 hk)
+          conns1 (dissoc conns0 hk)
+          key (:key c)
+          file (:file c)
+          cs (:cs c)
+          work (:work c)
+          was-tx (ex/in-tx? cs)
+          [db dbs1] (if was-tx (values (nth work 0) dbs0) (values (get! dbs0 key) (dissoc dbs0 key)))
+          names: Vec(Str) []
+          [db2 cs2 res code msg] (ex/exec-stmt db cs (:st req) (:params req) names (:params req))
+          now-tx (ex/in-tx? cs2)
+          rollback (match (:st req) (sp/SRollback) true _ false)
+          [dbs2 w2] (cond (and was-tx rollback) (values dbs1 [])
+                          (and was-tx now-tx) (values dbs1 [db2])
+                          now-tx (values (assoc dbs1 key (copy-db db2)) [db2])
+                          :else (values (assoc dbs1 key db2) []))
+          c2 (->Conn key file w2 cs2 res code msg)]
+      (->State dbs2 (assoc conns1 hk c2) nxt))))
+
+(defn- copy-db ex/Db [d: &ex/Db] (ex/->Db (:pager d) (:tables d) (:indexes d)))
+
+(defn- err-of sql/DbErr [code: Int msg: &Str]
+  (let [[nm ds] (match (get codes/CODES (str code)) (Some c) (values (nth c 0) (nth c 1))
+                  (None) (match (get codes/CODES (str (bit-and code 255))) (Some p) (values (nth p 0) (nth p 1))
+                    (None) (values "UNKNOWN_ERROR" "unknown error")))]
+    (sql/->DbErr (str "[" nm "] " ds " (" msg ")") "" code SQLITE-EXC)))
+
+(defn- cell->val sf/Val [x: &sql/Cell]
+  (match x
+    (sql/CNull) (sf/->VNull)
+    (sql/CInt n) (sf/->VInt n)
+    (sql/CLong n) (sf/->VInt n)
+    (sql/CDouble f) (sf/->VReal f)
+    (sql/CFloat d) (let [[f fe] (parse-double d)] (sf/->VReal f))
+    (sql/CDecimal d) (sf/->VText (str d))
+    (sql/CStr t) (sf/->VText (str t))
+    (sql/CBytes b) (sf/->VBlob (str b))
+    (sql/CBool b) (sf/->VInt (if b 1 0))
+    (sql/CDate d) (sf/->VText (str d))
+    (sql/CTimestamp d) (sf/->VText (str d))
+    (sql/CBigInt d) (sf/->VText (str d))
+    (sql/CLdt d) (sf/->VText (str d))
+    (sql/CTime d) (sf/->VText (str d))
+    (sql/CZoned d) (sf/->VText (str d))
+    (sql/CDatum c d z) (sf/->VBlob (str d))
+    (sql/CClob d) (sf/->VText (str d))))
+
+(defn- val->cell sql/Cell [v: &sf/Val]
+  (match v
+    (sf/VNull) (sql/->CNull)
+    (sf/VInt n) (if (and (>= n -2147483648) (<= n 2147483647)) (sql/->CInt n) (sql/->CLong n))
+    (sf/VReal f) (sql/->CDouble f)
+    (sf/VText t) (sql/->CStr (str t))
+    (sf/VBlob b) (sql/->CBytes (str b))))
+
+(defn- cells->vals Vec(sf/Val) [xs: &Vec(sql/Cell)] (loop [i 0 acc: Vec(sf/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (cell->val (nth xs i)))))))
+(defn- rows->cells Vec(Vec(sql/Cell)) [rows: &Vec(Vec(sf/Val)) from: Int to: Int]
+  (loop [i from acc: Vec(Vec(sql/Cell)) []]
+    (if (>= i to) acc
+      (recur (+ i 1) (conj acc (let [r (nth rows i)] (loop [k 0 a: Vec(sql/Cell) []] (if (>= k (count r)) a (recur (+ k 1) (conj a (val->cell (nth r k))))))))))))
+
+(defn- changed? Bool [c: &Conn] (and (= (:code c) 0) (not (:query (:res c))) (not (ex/in-tx? (:cs c)))))
+
+(defn- persist Int [c: &Conn]
+  (if (= (:file c) "") 0
+    (let [s (deref STATE)]
+      (if (not (contains? (:dbs s) (:key c))) 0
+        (let [e (host/file-write (:file c) (ex/db-bytes (get! (:dbs s) (:key c)) (:total (:cs c))))] 0)))))
+
+(defn- exec1 Values(Conn sql/DbErr Bool) [h: Int st: sp/Stmt params: Vec(sf/Val) save: Bool]
+  (let [s (swap! STATE step h (->Req st params))]
+    (if (not (contains? (:conns s) (str h)))
+      (values (->Conn "" "" [] (ex/new-conn-state) (empty-res) 0 "") (sql/->DbErr "[SQLITE_MISUSE] Library used incorrectly (bad connection)" "" 21 SQLITE-EXC) true)
+      (let [c (get! (:conns s) (str h))
+            z (if (and save (changed? c)) (persist c) 0)]
+        (values c (if (= (:code c) 0) (sql/ok-err) (err-of (:code c) (:msg c))) (:prep (:cs c)))))))
+
+(def STMT-MAX 256)
+(def STMTS: Atom(Map(Str sp/Stmt)) (atom (let [m: Map(Str sp/Stmt) {}] m)))
+
+(defn- remember Map(Str sp/Stmt) [m: Map(Str sp/Stmt) text: Str st: sp/Stmt]
+  (if (>= (count m) STMT-MAX) (let [e: Map(Str sp/Stmt) {}] (assoc e text st)) (assoc m text st)))
+
+(defn- parse Values(sp/Stmt sql/DbErr) [text: &Str]
+  (let [m (deref STMTS)]
+    (if (contains? m text) (values (get! m text) (sql/ok-err))
+      (let [[st e] (ex/prepare text)]
+        (if (= e "") (let [z (swap! STMTS remember (str text) (copy-stmt st))] (values st (sql/ok-err))) (values st (err-of 1 e)))))))
+
+(defn run Values(sql/Outcome sql/DbErr) [h: Int text: &Str params: &Vec(sql/Cell) want-keys: Bool]
+  (let [[st pe] (parse text)]
+    (if (not (sql/ok? pe)) (values (sql/->Outcome (sql/no-rows) 0 (sql/no-rows)) pe)
+      (let [[c e prep] (exec1 h st (cells->vals params) true)
+            res (:res c)
+            rows (sql/->Rows (:names res) (rows->cells (:rows res) 0 (count (:rows res))))
+            k (:last-rowid (:cs c))
+            keys (if (and want-keys (sql/ok? e))
+                   (sql/->Rows ["last_insert_rowid()"] [[(if (and (>= k -2147483648) (<= k 2147483647)) (sql/->CInt k) (sql/->CLong k))]])
+                   (sql/no-rows))]
+        (values (sql/->Outcome rows (if (> (count (:names res)) 0) -1 (:changes (:cs c))) keys) e)))))
+
+(defn run-batch Values(Vec(Int) sql/DbErr) [h: Int text: &Str rows: &Vec(Vec(sql/Cell))]
+  (if (= (count rows) 0) (values [] (sql/ok-err))
+    (let [[st pe] (parse text)]
+      (if (not (sql/ok? pe)) (values [] (sql/->DbErr PREPARE-FAILED "" (:code pe) ""))
+        (loop [i 0 acc: Vec(Int) []]
+          (if (>= i (count rows)) (values acc (sql/ok-err))
+            (let [[c e prep] (exec1 h (copy-stmt st) (cells->vals (nth rows i)) false)
+                  last (or (not (sql/ok? e)) (= i (- (count rows) 1)))
+                  z (if (and last (file-conn? h)) (persist-h h) 0)]
+              (cond (and (not (sql/ok? e)) prep (= i 0)) (values [] (sql/->DbErr PREPARE-FAILED "" (:code e) ""))
+                    (not (sql/ok? e)) (values acc e)
+                    :else (recur (+ i 1) (conj acc (:changes (:cs c))))))))))))
+
+(defn- file-conn? Bool [h: Int] (let [s (deref STATE)] (and (contains? (:conns s) (str h)) (not= (:file (get! (:conns s) (str h))) ""))))
+
+(defn- persist-h Int [h: Int]
+  (let [s (deref STATE)]
+    (if (not (contains? (:conns s) (str h))) 0
+      (let [c (get! (:conns s) (str h))] (if (ex/in-tx? (:cs c)) 0 (persist c))))))
+
+(defn- copy-stmt sp/Stmt [st: &sp/Stmt]
+  (match st
+    (sp/SInsert t cols src d cf) (sp/->SInsert (str t) cols src d (str cf))
+    (sp/SUpdate t cols vals w cf) (sp/->SUpdate (str t) cols vals w (str cf))
+    (sp/SDelete t w) (sp/->SDelete (str t) w)
+    (sp/SSelect q) (sp/->SSelect q)
+    (sp/SCreateTable n i c k w s) (sp/->SCreateTable (str n) i c k w (str s))
+    (sp/SCreateIndex n t u i c w s) (sp/->SCreateIndex (str n) (str t) u i c w (str s))
+    (sp/SDrop k n i) (sp/->SDrop (str k) (str n) i)
+    (sp/SBegin) (sp/->SBegin)
+    (sp/SCommit) (sp/->SCommit)
+    (sp/SRollback) (sp/->SRollback)
+    (sp/SEmpty) (sp/->SEmpty)))
+
+(defrecord Query [h: Int names: Vec(Str) rows: Vec(Vec(sf/Val)) pos: Atom(Int)])
+
+(defn open-query Values(Query sql/DbErr) [h: Int text: &Str params: &Vec(sql/Cell)]
+  (let [[st pe] (parse text)
+        none: Vec(Vec(sf/Val)) []]
+    (if (not (sql/ok? pe)) (values (->Query h [] none (atom 0)) pe)
+      (let [[c e prep] (exec1 h st (cells->vals params) true)]
+        (if (not (sql/ok? e)) (values (->Query h [] none (atom 0)) e)
+          (values (->Query h (:names (:res c)) (:rows (:res c)) (atom 0)) (sql/ok-err)))))))
+
+(defn fetch Values(Vec(Vec(sql/Cell)) Bool sql/DbErr) [q: &Query n: Int]
+  (let [from (deref (:pos q))
+        to (min (count (:rows q)) (+ from n))
+        z (reset! (:pos q) to)]
+    (values (rows->cells (:rows q) from to) (>= to (count (:rows q))) (sql/ok-err))))
+
+(defn close-query Int [q: &Query] 0)
+
+(defn batch-err sql/DbErr [i: Int sqltext: &Str e: &sql/DbErr]
+  (sql/->DbErr (str "batch entry " i ": " (:msg e)) (:state e) (:code e) "java.sql.BatchUpdateException"))

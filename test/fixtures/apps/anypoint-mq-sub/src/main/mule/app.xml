@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <!-- 認証情報はリポジトリに入れない (scenario.scn の requires と note) -->
+    <configuration-properties file="mq-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <anypoint-mq:config name="MQ">
+        <anypoint-mq:connection url="${mq.url}" clientId="${mq.clientId}" clientSecret="${mq.clientSecret}"/>
+    </anypoint-mq:config>
+
+    <!-- subscriber のフローが受けたものを、HTTP の側へ渡す -->
+    <vm:config name="VM">
+        <vm:queues>
+            <vm:queue queueName="auto"/>
+            <vm:queue queueName="imm"/>
+            <vm:queue queueName="man"/>
+        </vm:queues>
+    </vm:config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <sub-flow name="seen">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{q: attributes.destination, id: attributes.messageId, n: attributes.deliveryCount, body: payload, mime: payload.^mimeType,
+ token: attributes.ackToken != null, act: attributes.properties.act, class: attributes.^class,
+ ct: attributes.contentType, hdr: attributes.headers.deliveryCount, corrIsId: correlationId == attributes.messageId}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- AUTO (既定)、prefetch (既定)。act: ok は成功、fail は失敗 (nack して再配信、2 回で mulay-test-dlq へ)、
+         continue は失敗を on-error-continue で扱う (成功と同じく ack) -->
+    <flow name="auto-sub" maxConcurrency="1">
+        <anypoint-mq:subscriber config-ref="MQ" destination="mulay-test-redeliver"/>
+        <set-variable variableName="act" value="#[attributes.properties.act default 'ok']"/>
+        <flow-ref name="seen"/>
+        <vm:publish config-ref="VM" queueName="auto"/>
+        <choice>
+            <when expression="#[vars.act == 'fail']">
+                <raise-error type="APP:BOOM" description="auto fails"/>
+            </when>
+            <when expression="#[vars.act == 'continue']">
+                <try>
+                    <raise-error type="APP:SOFT" description="handled"/>
+                    <error-handler>
+                        <on-error-continue>
+                            <logger level="DEBUG" message="handled"/>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+                <raise-error type="APP:CONT" description="continued"/>
+            </when>
+        </choice>
+        <error-handler>
+            <on-error-continue type="APP:CONT">
+                <logger level="DEBUG" message="continue"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- IMMEDIATE (受けたときに ack)。失敗しても再配信されない -->
+    <flow name="imm-sub" maxConcurrency="1">
+        <anypoint-mq:subscriber config-ref="MQ" destination="mulay-test-xq1" acknowledgementMode="IMMEDIATE">
+            <anypoint-mq:subscriber-type>
+                <anypoint-mq:prefetch maxLocalMessages="5"/>
+            </anypoint-mq:subscriber-type>
+        </anypoint-mq:subscriber>
+        <set-variable variableName="act" value="#[attributes.properties.act default 'ok']"/>
+        <flow-ref name="seen"/>
+        <vm:publish config-ref="VM" queueName="imm"/>
+        <choice>
+            <when expression="#[vars.act == 'fail']">
+                <raise-error type="APP:BOOM" description="immediate fails"/>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- MANUAL、polling。acknowledgementTimeout 3 秒 (ack も nack もしなければ 3 秒後に再配信)。
+         act: ok は ack、nack1 は 1 回目に nack、ignore1 は 1 回目に何もしない、fail は 1 回目に失敗 (ack しない) -->
+    <flow name="man-sub" maxConcurrency="1">
+        <anypoint-mq:subscriber config-ref="MQ" destination="mulay-test-xq2" acknowledgementMode="MANUAL"
+                                acknowledgementTimeout="3" acknowledgementTimeoutUnit="SECONDS">
+            <anypoint-mq:subscriber-type>
+                <anypoint-mq:polling fetchSize="5">
+                    <scheduling-strategy>
+                        <fixed-frequency frequency="500"/>
+                    </scheduling-strategy>
+                </anypoint-mq:polling>
+            </anypoint-mq:subscriber-type>
+        </anypoint-mq:subscriber>
+        <set-variable variableName="act" value="#[attributes.properties.act default 'ok']"/>
+        <set-variable variableName="token" value="#[attributes.ackToken]"/>
+        <set-variable variableName="first" value="#[attributes.deliveryCount == 1]"/>
+        <flow-ref name="seen"/>
+        <vm:publish config-ref="VM" queueName="man"/>
+        <choice>
+            <when expression="#[vars.first and vars.act == 'nack1']">
+                <anypoint-mq:nack config-ref="MQ" ackToken="#[vars.token]"/>
+            </when>
+            <when expression="#[vars.first and vars.act == 'ignore1']">
+                <logger level="DEBUG" message="ignored"/>
+            </when>
+            <when expression="#[vars.first and vars.act == 'fail']">
+                <raise-error type="APP:BOOM" description="manual fails"/>
+            </when>
+            <otherwise>
+                <anypoint-mq:ack config-ref="MQ" ackToken="#[vars.token]"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- 前の実行の残りを空にする: DLQ と、subscriber が流した分 -->
+    <flow name="drain">
+        <http:listener config-ref="HTTP" path="/drain"/>
+        <set-variable variableName="done" value="#[false]"/>
+        <foreach collection="#[1 to 20]">
+            <choice>
+                <when expression="#[not vars.done]">
+                    <try>
+                        <anypoint-mq:consume config-ref="MQ" destination="mulay-test-dlq" pollingTime="1000"/>
+                        <error-handler>
+                            <on-error-continue>
+                                <set-variable variableName="done" value="#[true]"/>
+                            </on-error-continue>
+                        </error-handler>
+                    </try>
+                </when>
+            </choice>
+        </foreach>
+        <foreach collection="#[['auto', 'imm', 'man']]">
+            <set-variable variableName="vq" value="#[payload]"/>
+            <set-variable variableName="done" value="#[false]"/>
+            <foreach collection="#[1 to 20]">
+                <choice>
+                    <when expression="#[not vars.done]">
+                        <try>
+                            <vm:consume config-ref="VM" queueName="#[vars.vq]" timeout="200" timeoutUnit="MILLISECONDS"/>
+                            <error-handler>
+                                <on-error-continue>
+                                    <set-variable variableName="done" value="#[true]"/>
+                                </on-error-continue>
+                            </error-handler>
+                        </try>
+                    </when>
+                </choice>
+            </foreach>
+        </foreach>
+        <set-payload value="drained"/>
+    </flow>
+
+    <!-- 送る: to=redeliver なら mulay-test-redeliver、x なら交換 mulay-test-x (xq1 と xq2 に届く) -->
+    <flow name="send">
+        <http:listener config-ref="HTTP" path="/send"/>
+        <set-payload value="#['body of ' ++ attributes.queryParams.id]" mimeType="text/plain"/>
+        <anypoint-mq:publish config-ref="MQ" destination="#[if (attributes.queryParams.to == 'x') 'mulay-test-x' else 'mulay-test-redeliver']"
+                             messageId="#[attributes.queryParams.id]">
+            <anypoint-mq:properties><![CDATA[#[{act: attributes.queryParams.act default 'ok'}]]]></anypoint-mq:properties>
+        </anypoint-mq:publish>
+        <set-payload value="#[attributes.messageId]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- subscriber が受けた次の 1 件 (sub = auto / imm / man)。来なければ VM:EMPTY_QUEUE -->
+    <flow name="next">
+        <http:listener config-ref="HTTP" path="/next"/>
+        <vm:consume config-ref="VM" queueName="#[attributes.queryParams.sub]" timeout="#[attributes.queryParams.wait default '30']" timeoutUnit="SECONDS"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- DLQ から 1 件 -->
+    <flow name="dlq">
+        <http:listener config-ref="HTTP" path="/dlq"/>
+        <anypoint-mq:consume config-ref="MQ" destination="mulay-test-dlq" pollingTime="#[attributes.queryParams.poll default '15000']"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{id: attributes.messageId, n: attributes.deliveryCount, body: payload, mime: payload.^mimeType, props: attributes.properties}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

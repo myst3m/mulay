@@ -1,0 +1,74 @@
+(ns mulay.dw.fmt.props
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [clay.string :as str]))
+
+(defn get-prop Vec(v/Val) [fs: &Vec(v/Field) k: &Str] (v/obj-get fs k))
+
+(defn has? Bool [fs: &Vec(v/Field) k: &Str] (> (count (v/obj-get fs k)) 0))
+
+(defn- type-err Str [k: &Str want: &Str x: &v/Val]
+  (str "Option `" k "` expects '" want "' but was '" (v/type-name (v/unmeta x)) "'"))
+
+(defn pstr Values(Str Str) [fs: &Vec(v/Field) k: &Str default: Str]
+  (let [r (v/obj-get fs k)]
+    (if (= (count r) 0) (values default "")
+      (match (v/unmeta (nth r 0))
+        (v/VStr s) (values s "")
+        (v/VNull) (values default "")
+        (v/VKey q) (values (:name q) "")
+        _ (values default (type-err k "String" (nth r 0)))))))
+
+(defn pbool Values(Bool Str) [fs: &Vec(v/Field) k: &Str default: Bool]
+  (let [r (v/obj-get fs k)]
+    (if (= (count r) 0) (values default "")
+      (match (v/unmeta (nth r 0))
+        (v/VBool b) (values b "")
+        (v/VStr s) (if (= (str/lower-case s) "true") (values true "")
+                     (if (= (str/lower-case s) "false") (values false "")
+                       (values default (type-err k "Boolean" (nth r 0)))))
+        (v/VNull) (values default "")
+        _ (values default (type-err k "Boolean" (nth r 0)))))))
+
+(defn pint Values(Int Str) [fs: &Vec(v/Field) k: &Str default: Int]
+  (let [r (v/obj-get fs k)]
+    (if (= (count r) 0) (values default "")
+      (match (v/unmeta (nth r 0))
+        (v/VNum n) (let [[i e] (num/to-int n)] (if (= e "") (values i "") (values default (type-err k "Number" (nth r 0)))))
+        (v/VInt n-i) (let [n (num/from-int n-i)] (let [[i e] (num/to-int n)] (if (= e "") (values i "") (values default (type-err k "Number" (nth r 0))))))
+        (v/VStr s) (let [[n e] (num/parse-lit (str/trim s))]
+                     (if (not= e "") (values default (type-err k "Number" (nth r 0)))
+                       (let [[i e2] (num/to-int n)] (if (= e2 "") (values i "") (values default (type-err k "Number" (nth r 0)))))))
+        (v/VNull) (values default "")
+        _ (values default (type-err k "Number" (nth r 0)))))))
+
+(defn num-err Str [fs: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get fs k)]
+    (if (= (count r) 0) ""
+      (match (v/unmeta (nth r 0))
+        (v/VNum n) ""
+        (v/VInt n) ""
+        (v/VStr s) (let [[n e] (num/parse-lit (str/trim s))] (if (= e "") "" (type-err k "Number" (nth r 0))))
+        (v/VNull) ""
+        _ (type-err k "Number" (nth r 0))))))
+
+(defn either-err Str [a: Str b: &Str] (if (not= a "") a (str b)))
+
+(defn split-meta Values(v/Val Vec(v/Field)) [x: &v/Val]
+  (loop [cur x acc: Vec(v/Field) []]
+    (match cur
+      (v/VMeta y m) (recur y (loop [a acc i 0] (if (>= i (count m)) a (recur (conj a (nth m i)) (+ i 1)))))
+      _ (values cur acc))))
+
+(defn meta-get Vec(v/Val) [x: &v/Val k: &Str]
+  (match x
+    (v/VMeta y m) (let [r (v/obj-get m k)] (if (> (count r) 0) r (meta-get y k)))
+    _ []))
+
+(defn meta-true? Bool [x: &v/Val k: &Str]
+  (let [r (meta-get x k)]
+    (if (= (count r) 0) false (match (v/unmeta (nth r 0)) (v/VBool b) b (v/VStr s) (= s "true") _ false))))
+
+(defn with-meta v/Val [x: v/Val m: Vec(v/Field)]
+  (if (= (count m) 0) x (v/->VMeta x m)))
+
+(defn reader-meta Vec(v/Field) [mime: &Str]
+  [(v/field "encoding" (v/->VStr "UTF-8")) (v/field "mediaType" (v/->VStr (str mime)))])

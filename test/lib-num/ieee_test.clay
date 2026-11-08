@@ -1,0 +1,71 @@
+(ns ieee-test (:require [mulay.lib.ieee :as ie] [mulay.lib.dec :as d]))
+
+;; 期待値は Java 17 の Float.toString / Double.toString (Float.floatToRawIntBits のビット列から)
+
+(defn- f32 Str [b: Int] (d/float32->shortest-str (ie/bits->float32 b)))
+(defn- f64 Str [b: Int] (d/float->shortest-str (ie/bits->double b)))
+
+(deftest float32
+  (is (= (f32 1036831949) "0.1"))
+  (is (= (f32 1069547520) "1.5"))
+  (is (= (f32 1077936128) "3.0"))
+  (is (= (f32 1) "1.4E-45"))
+  (is (= (f32 2139095039) "3.4028235E38"))
+  (is (= (f32 1259902592) "1.0E7"))
+  (is (= (f32 1206984805) "123456.79"))
+  (is (= (f32 981668463) "0.001"))
+  (is (= (f32 1266679808) "1.6777216E7"))
+  (is (= (f32 3223322624) "-2.5"))
+  (is (= (f32 981668462) "9.999999E-4"))
+  (is (= (f32 925353388) "1.0E-5"))
+  (is (= (f32 1050253722) "0.3"))
+  ;; Java 17 は "1.17549435E-38" (最短でない)。mulay は Java 19 以降と同じ最短 (docs/compat/deviations.md)
+  (is (= (f32 8388608) "1.1754944E-38"))
+  (is (= (f32 2139095040) "Infinity"))
+  (is (= (f32 2143289344) "NaN"))
+  (is (= (f32 2147483648) "-0.0")))
+
+(deftest float64
+  (is (= (f64 4591870180066957722) "0.1"))
+  (is (= (f64 1) "4.9E-324"))
+  (is (= (f64 4612248968380809216) "2.25"))
+  (is (= (f64 -128383115725867620) "-1.0E300")))
+
+;; double->bits は bits->double の逆 (Java の Double.doubleToLongBits: NaN は 0x7ff8000000000000 にそろえる)。
+;; 以前の Java 直列化の実装は ±Inf で 2 で割り続けて止まらず、非正規化数を 0 にしていた。
+(defn- d2b Int [s: Str] (ie/double->bits (let [[x e] (d/parse s)] (d/to-float x))))
+(defn- rt64 Bool [b: Int] (= (ie/double->bits (ie/bits->double b)) b))
+
+(deftest double-to-bits
+  (is (= (d2b "0.1") 4591870180066957722))
+  (is (= (d2b "1.5") 4609434218613702656))
+  (is (= (d2b "-2.5") -4610560118520545280))
+  (is (= (d2b "0") 0))
+  (is (= (d2b "1E+400") 9218868437227405312))
+  (is (= (d2b "-1E+400") -4503599627370496))
+  (is (= (ie/double->bits (- (ie/bits->double 9218868437227405312) (ie/bits->double 9218868437227405312))) 9221120237041090560))
+  (is (rt64 1))
+  (is (rt64 4503599627370495))
+  (is (rt64 4503599627370496))
+  (is (rt64 9218868437227405311))
+  (is (rt64 -9223372036854775807))
+  (is (rt64 4591870180066957722)))
+
+(deftest to-float32-like-java
+  ;; (float) x を double にした値 (JDK 17 で確かめたもの)
+  (is (= (ie/to-float32 0.1) 0.10000000149011612))
+  (is (= (ie/to-float32 1.0) 1.0))
+  (is (= (ie/to-float32 -2.5) -2.5))
+  (is (= (ie/to-float32 3.4028235e38) 3.4028234663852886e38))
+  (is (= (ie/to-float32 1.0e-45) 1.401298464324817e-45))
+  (is (= (ie/to-float32 0.7777777777777778) 0.7777777910232544))
+  (is (= (ie/to-float32 1.00000005960464477539) 1.0))
+  (is (= (ie/to-float32 1.0000001192092896) 1.0000001192092896))
+  (is (= (ie/to-float32 1.0e-50) 0.0)))
+
+(deftest float32-bits-like-java
+  (let [nan (- (* 1e308 10.0) (* 1e308 10.0))
+        xs: Vec(Float) [0.25 0.1 -2.5 1e-45 3.4028234663852886e38 1e39 (* -1.0 0.0) nan 1.1754943508222875e-38 5.8774717541114375e-39 123456.789 -1e-40 0.0]
+        want: Vec(Int) [1048576000 1036831949 3223322624 1 2139095039 2139095040 2147483648 2143289344 8388608 4194304 1206984805 2147555010 0]
+        got (loop [i 0 acc: Vec(Int) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (ie/float32->bits (nth xs i))))))]
+    (is (= got want))))

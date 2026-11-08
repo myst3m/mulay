@@ -1,0 +1,152 @@
+(ns mulay.lib.zip
+  (:require [clay.core]
+            [mulay.lib.inflate :as inflate]))
+
+(defrecord ZipEntry [name: Str method: Int flags: Int crc: Int csize: Int usize: Int offset: Int dir: Bool])
+
+(defrecord ZipIn [name: Str data: Str compress: Bool])
+
+(defn zip-in ZipIn [name: Str data: Str] (->ZipIn name data true))
+
+(defn- u16 Int [d: &Str p: Int] (+ (nth d p) (* 256 (nth d (+ p 1)))))
+(defn- u32 Int [d: &Str p: Int] (+ (u16 d p) (* 65536 (u16 d (+ p 2)))))
+(defn- u64 Int [d: &Str p: Int] (+ (u32 d p) (bit-shift-left (u32 d (+ p 4)) 32)))
+
+(defn- sig? Bool [d: &Str p: Int a: Int b: Int]
+  (and (>= p 0) (<= p (- (count d) 4))
+       (= (nth d p) 80) (= (nth d (+ p 1)) 75) (= (nth d (+ p 2)) a) (= (nth d (+ p 3)) b)))
+
+(defn- find-eocd Int [d: &Str]
+  (let [lo (let [x (- (count d) 65557)] (if (< x 0) 0 x))]
+    (loop [p (- (count d) 22)]
+      (if (< p lo) -1 (if (sig? d p 5 6) p (recur (- p 1)))))))
+
+(defn- zip64-extra Values(Int Int Int) [d: &Str x0: Int xlen: Int usize: Int csize: Int off: Int]
+  (loop [x x0]
+    (if (> (+ x 4) (+ x0 xlen)) (values usize csize off)
+      (let [id (u16 d x) sz (u16 d (+ x 2))]
+        (if (and (= id 1) (<= (+ x (+ 4 sz)) (+ x0 xlen)) (<= (* 8 (+ (if (= usize 4294967295) 1 0) (if (= csize 4294967295) 1 0) (if (= off 4294967295) 1 0))) sz))
+          (let [q (+ x 4)
+                [u q2] (if (= usize 4294967295) (values (u64 d q) (+ q 8)) (values usize q))
+                [c q3] (if (= csize 4294967295) (values (u64 d q2) (+ q2 8)) (values csize q2))
+                o (if (= off 4294967295) (u64 d q3) off)]
+            (values u c o))
+          (recur (+ x (+ 4 sz))))))))
+
+(defn entries Values(Vec(ZipEntry) Str) [d: &Str]
+  (let [eocd (find-eocd d)]
+    (if (< eocd 0) (let [z: Vec(ZipEntry) []] (values z "not a ZIP archive (no end of central directory)"))
+      (let [n16 (u16 d (+ eocd 10))
+            off32 (u32 d (+ eocd 16))
+            loc (- eocd 20)
+            z64 (and (or (= n16 65535) (= off32 4294967295)) (sig? d loc 6 7))
+            rec64 (if z64 (u64 d (+ loc 8)) -1)
+            [total cdoff err0] (cond
+                                 (and z64 (sig? d rec64 6 6) (<= rec64 (- (count d) 56))) (values (u64 d (+ rec64 32)) (u64 d (+ rec64 48)) "")
+                                 z64 (values 0 0 "ZIP64 end of central directory record not found")
+                                 :else (values n16 off32 ""))]
+        (if (not (= err0 "")) (let [z: Vec(ZipEntry) []] (values z err0))
+          (loop [i 0 p cdoff acc: Vec(ZipEntry) []]
+            (cond
+              (>= i total) (values acc "")
+              (or (not (sig? d p 1 2)) (> (+ p 46) (count d))) (values acc (str "bad central directory entry " i))
+              (> (+ p (+ 46 (+ (u16 d (+ p 28)) (+ (u16 d (+ p 30)) (u16 d (+ p 32)))))) (count d))
+              (values acc (str "central directory entry " i " runs past the end of the archive"))
+              :else
+              (let [flags (u16 d (+ p 8))
+                    method (u16 d (+ p 10))
+                    crc (u32 d (+ p 16))
+                    csize (u32 d (+ p 20))
+                    usize (u32 d (+ p 24))
+                    nlen (u16 d (+ p 28))
+                    xlen (u16 d (+ p 30))
+                    clen (u16 d (+ p 32))
+                    lho (u32 d (+ p 42))
+                    name (subs d (+ p 46) (+ p (+ 46 nlen)))
+                    [u c o] (zip64-extra d (+ p (+ 46 nlen)) xlen usize csize lho)
+                    dir (and (> nlen 0) (= (nth name (- nlen 1)) 47))]
+                (recur (+ i 1) (+ p (+ 46 (+ nlen (+ xlen clen))))
+                       (conj acc (->ZipEntry name method flags crc c u o dir)))))))))))
+
+(defn find-entry Values(ZipEntry Bool) [es: &Vec(ZipEntry) name: &Str]
+  (loop [i 0]
+    (if (>= i (count es)) (values (->ZipEntry "" 0 0 0 0 0 0 false) false)
+      (let [e (nth es i)] (if (= (:name e) name) (values e true) (recur (+ i 1)))))))
+
+(defn read-entry-limit Values(Str Str) [d: &Str e: &ZipEntry limit: Int]
+  (let [p (:offset e)]
+    (cond
+      (or (not (sig? d p 3 4)) (> (+ p 30) (count d))) (values "" (str "bad local header for " (:name e)))
+      (= (bit-and (:flags e) 1) 1) (values "" (str "encrypted entry is not supported: " (:name e)))
+      :else
+      (let [ds (+ p (+ 30 (+ (u16 d (+ p 26)) (u16 d (+ p 28)))))
+            m (:method e)
+            [out err] (cond
+                        (or (< (:csize e) 0) (> (:csize e) (- (count d) ds))) (values "" "entry data runs past the end of the archive")
+                        (> (:usize e) limit) (values "" "entry exceeds the size limit")
+                        (= m 0) (values (subs d ds (+ ds (:csize e))) "")
+                        (= m 8) (let [[o end err] (inflate/inflate-limit d ds limit)] (values o err))
+                        :else (values "" (str "unsupported compression method " m)))]
+        (cond
+          (not (= err "")) (values "" (str (:name e) ": " err))
+          (not (= (count out) (:usize e))) (values "" (str (:name e) ": size mismatch"))
+          (not (= (inflate/crc32 out) (:crc e))) (values "" (str (:name e) ": CRC-32 mismatch"))
+          :else (values out ""))))))
+
+(defn read-entry Values(Str Str) [d: &Str e: &ZipEntry] (read-entry-limit d e 4611686018427387904))
+
+(defn extract Values(Str Str) [d: &Str name: &Str]
+  (let [[es err] (entries d)]
+    (if (not (= err "")) (values "" err)
+      (let [[e found] (find-entry es name)]
+        (if found (read-entry d e) (values "" (str "no entry named " name)))))))
+
+(defn names Values(Vec(Str) Str) [d: &Str]
+  (let [[es err] (entries d)]
+    (values (loop [i 0 acc: Vec(Str) []] (if (>= i (count es)) acc (recur (+ i 1) (conj acc (:name (nth es i)))))) err)))
+
+(defn- le16 Str [v: Int] (str (chr (bit-and v 255)) (chr (bit-and (bit-shift-right v 8) 255))))
+(defn- le32 Str [v: Int] (str (le16 (bit-and v 65535)) (le16 (bit-and (bit-shift-right v 16) 65535))))
+(defn- le64 Str [v: Int] (str (le32 (bit-and v 4294967295)) (le32 (bit-shift-right v 32))))
+
+(defn- s32 Int [big: Bool v: Int] (if big 4294967295 v))
+
+(def DOS-DATE 33)
+(def DOS-TIME 0)
+
+(defn write Values(Str Str) [es: &Vec(ZipIn)]
+  (let [n (count es)
+        [body cd] (loop [i 0 body "" cd ""]
+                    (if (>= i n) (values body cd)
+                      (let [e (nth es i)
+                            data (:data e)
+                            crc (inflate/crc32 data)
+                            dir (and (> (count (:name e)) 0) (= (nth (:name e) (- (count (:name e)) 1)) 47))
+                            packed (if (and (:compress e) (not dir) (> (count data) 0)) (inflate/deflate data) "")
+                            use8 (and (> (count packed) 0) (< (count packed) (count data)))
+                            payload (if use8 packed data)
+                            method (if use8 8 0)
+                            off (count body)
+                            big (or (>= off 4294967295) (>= (count data) 4294967295) (>= (count payload) 4294967295))
+                            x64 (if big (str (le16 1) (le16 24) (le64 (count data)) (le64 (count payload)) (le64 off)) "")
+                            ver (if big 45 20)
+                            local (str "PK" (chr 3) (chr 4) (le16 ver) (le16 2048) (le16 method) (le16 DOS-TIME) (le16 DOS-DATE)
+                                       (le32 crc) (le32 (s32 big (count payload))) (le32 (s32 big (count data)))
+                                       (le16 (count (:name e))) (le16 (count x64)) (:name e) x64)
+                            central (str "PK" (chr 1) (chr 2) (le16 (+ 768 ver)) (le16 ver) (le16 2048) (le16 method)
+                                         (le16 DOS-TIME) (le16 DOS-DATE) (le32 crc) (le32 (s32 big (count payload))) (le32 (s32 big (count data)))
+                                         (le16 (count (:name e))) (le16 (count x64)) (le16 0) (le16 0) (le16 0)
+                                         (le32 (if dir 1106051088 2175008768)) (le32 (s32 big off)) (:name e) x64)]
+                        (recur (+ i 1) (str body local payload) (str cd central)))))
+        cdoff (count body)
+        cdsize (count cd)
+        z64 (or (>= n 65535) (>= cdoff 4294967295) (>= cdsize 4294967295))
+        tail64 (if z64
+                 (str "PK" (chr 6) (chr 6) (le64 44) (le16 813) (le16 45) (le32 0) (le32 0)
+                      (le64 n) (le64 n) (le64 cdsize) (le64 cdoff)
+                      "PK" (chr 6) (chr 7) (le32 0) (le64 (+ cdoff cdsize)) (le32 1))
+                 "")
+        eocd (str "PK" (chr 5) (chr 6) (le16 0) (le16 0)
+                  (le16 (if z64 65535 n)) (le16 (if z64 65535 n))
+                  (le32 (if z64 4294967295 cdsize)) (le32 (if z64 4294967295 cdoff)) (le16 0))]
+    (values (str body cd tail64 eocd) "")))

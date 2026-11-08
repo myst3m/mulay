@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:sftp="http://www.mulesoft.org/schema/mule/sftp"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/sftp http://www.mulesoft.org/schema/mule/sftp/current/mule-sftp.xsd">
+    <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18574"/></http:listener-config>
+    <sftp:config name="S"><sftp:connection host="localhost" port="2222" username="mulay" password="mulay" workingDir="/upload/rename-dots"/></sftp:config>
+    <flow name="setup">
+        <http:listener config-ref="L" path="/setup" allowedMethods="POST"/>
+        <sftp:write config-ref="S" path="inbox/x.txt" createParentDirectories="true"><sftp:content>x</sftp:content></sftp:write>
+        <sftp:write config-ref="S" path="important.txt"><sftp:content>keep</sftp:content></sftp:write>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="rename">
+        <http:listener config-ref="L" path="/rename" allowedMethods="POST"/>
+        <sftp:rename config-ref="S" path="inbox/x.txt" to="#[attributes.queryParams.to default '']" overwrite="true"/>
+        <set-payload value="ok"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {&quot;type&quot;: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="names">
+        <http:listener config-ref="L" path="/names"/>
+        <sftp:list config-ref="S" directoryPath="/upload/rename-dots" recursive="true"/>
+        <set-payload value="#[output application/json --- (payload map $.attributes.path) orderBy $]"/>
+    </flow>
+    <flow name="cleanup">
+        <http:listener config-ref="L" path="/cleanup" allowedMethods="POST"/>
+        <sftp:delete config-ref="S" path="/upload/rename-dots"/>
+        <set-payload value="ok"/>
+    </flow>
+</mule>

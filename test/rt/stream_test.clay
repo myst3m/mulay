@@ -1,0 +1,302 @@
+(ns stream-test (:require [mulay.rt.stream :as s] [mulay.rt.event :as ev] [mulay.dw.val :as v] [mulay.dw.err :as dwe]))
+
+;; 1..total の行を返す偽のデータ源。closed は閉じた回数 (壊れていれば 100 を足す)
+(defn- source s/Source [total: Int pos: Atom(Int) closed: Atom(Int)]
+  (s/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int]
+                (let [from (deref pos)
+                      to (if (> (+ from n) total) total (+ from n))
+                      rows (loop [i from acc: Vec(v/Val) []] (if (>= i to) acc (recur (+ i 1) (conj acc (v/int-v (+ i 1))))))
+                      z (reset! pos to)]
+                  (values rows (>= to total) "")))
+              (fn Int [broken: Bool] (swap! closed (fn Int [k: Int] (+ k (if broken 101 1)))))
+              true))
+
+(deftest take-in-blocks
+  (let [pos (atom 0) closed (atom 0)
+        z0 (s/enter "o1")
+        id (s/open "o1" (source 10 pos closed))
+        f0 (s/fresh? id)
+        [r1 d1 e1] (s/take-vals id 4)
+        f1 (s/fresh? id)
+        [r2 d2 e2] (s/take-vals id 4)
+        [r3 d3 e3] (s/take-vals id 4)
+        c3 (deref closed)
+        [r4 d4 e4] (s/take-vals id 4)
+        [a ae] (s/all id)
+        z1 (s/leave "o1")]
+    (is f0)
+    (is (not f1))
+    (is (= (count r1) 4))
+    (is (not d1))
+    (is (= (count r2) 4))
+    (is (= (count r3) 2))
+    (is d3)
+    (is (= c3 1))
+    (is (= (count r4) 0))
+    (is d4)
+    (is (= ae "The stream was already consumed by a foreach or a batch job"))
+    (is (= (deref closed) 1))))
+
+(deftest all-keeps-rows
+  (let [pos (atom 0) closed (atom 0)
+        z0 (s/enter "o2")
+        id (s/open "o2" (source 2500 pos closed))
+        [a1 e1] (s/all id)
+        [a2 e2] (s/all id)
+        z1 (s/leave "o2")]
+    (is (= (count a1) 2500))
+    (is (= (count a2) 2500))
+    (is (= e1 ""))
+    (is (= (deref closed) 1))))
+
+;; 最後の leave で未読のカーソルは読み切って閉じ (接続を返す)、登録から消す。入れ子の enter では閉じない
+(deftest leave-closes
+  (let [pos (atom 0) closed (atom 0)
+        pos2 (atom 0) closed2 (atom 0)
+        z0 (s/enter "o3")
+        z1 (s/enter "o3")
+        id (s/open "o3" (source 5 pos closed))
+        id2 (s/open "o3" (source 5 pos2 closed2))
+        [r d e] (s/take-vals id2 2)
+        z2 (s/leave "o3")
+        c-inner (deref closed)
+        z3 (s/leave "o3")
+        [a ae] (s/all id)]
+    (is (= c-inner 0))
+    (is (= (deref closed) 1))
+    (is (= (deref closed2) 1))
+    (is (= (deref pos) 5))
+    (is (= (count a) 0))
+    (is (= ae "The stream is closed"))))
+
+;; drain でない未読のカーソルは、最後の leave で読まずに閉じる
+(deftest leave-no-drain
+  (let [pos (atom 0) closed (atom 0)
+        src0 (source 5 pos closed)
+        src (s/->Source (:next src0) (:close src0) false)
+        z0 (s/enter "o4")
+        id (s/open "o4" src)
+        z1 (s/leave "o4")
+        [r d e] (s/take-vals id 2)]
+    (is (= (deref pos) 0))
+    (is (= (deref closed) 1))
+    (is (= (count r) 0))
+    (is (= e "The stream is closed"))))
+
+;; 読み終えたカーソルは Source を捨てる (閉包が掴んでいる値を解放する)
+(deftest spent-drops-source
+  (let [big (atom 0)
+        src (s/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (let [z (swap! big (fn Int [k: Int] (+ k 1)))] (values [] true "")))
+                        (fn Int [broken: Bool] 0) false)
+        z0 (s/enter "o5")
+        id (s/open "o5" src)
+        [r1 d1 e1] (s/take-vals id 10)
+        [r2 d2 e2] (s/take-vals id 10)
+        z1 (s/leave "o5")]
+    (is d1)
+    (is (= (deref big) 1))
+    (is (= (count r2) 0))))
+
+;; 最後の leave で、読み終えたカーソル (all で持っている行も) を登録から消す。要求の後も行を持ち続けない
+(deftest leave-forgets
+  (let [pos (atom 0) closed (atom 0)
+        n0 (s/live)
+        z0 (s/enter "o6")
+        id (s/open "o6" (source 3000 pos closed))
+        [a1 e1] (s/all id)
+        n1 (s/live)
+        z1 (s/leave "o6")
+        n2 (s/live)
+        [a2 e2] (s/all id)]
+    (is (= (count a1) 3000))
+    (is (= n1 (+ n0 1)))
+    (is (= n2 n0))
+    (is (= e2 "The stream is closed"))))
+
+;; 断片 "a" "b" "c" を 1 つずつ返す偽の本文
+(defn- text-source s/Source [pos: Atom(Int)]
+  (s/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int]
+                (let [i (deref pos)
+                      z (reset! pos (+ i 1))]
+                  (values [(v/->VStr (nth ["a" "b" "c"] i))] (>= i 2) "")))
+              (fn Int [broken: Bool] 0)
+              false))
+
+;; PIPE は全部届くのを待って読み、何度でも読める
+(deftest pipe-reads-whole-and-repeatably
+  (let [pos (atom 0)
+        z0 (s/enter "p1")
+        id (s/open "p1" (text-source pos))
+        t (ev/tv-pipe id "text/plain")
+        [b1 e1] (ev/bytes t)
+        [b2 e2] (ev/bytes t)
+        [x t2 e3] (ev/value t)
+        st (ev/settle t)
+        z1 (s/leave "p1")]
+    (is (= b1 "abc"))
+    (is (= b2 "abc"))
+    (is (= e1 ""))
+    (is (= (:state st) ev/RAW))
+    (is (= (:raw st) "abc"))))
+
+(defn- pages s/Source [sizes: Vec(Int) calls: Atom(Int)]
+  (let [mk (fn Vec(v/Val) [p: Int] (let [base (loop [i 0 b 0] (if (>= i p) b (recur (+ i 1) (+ b (nth sizes i)))))]
+                                       (loop [i 0 acc: Vec(v/Val) []] (if (>= i (nth sizes p)) acc (recur (+ i 1) (conj acc (v/int-v (+ base i 1))))))))
+        nxt (fn Str [p: Int] (if (>= (+ p 1) (count sizes)) "" (str (+ p 1))))]
+    (s/paged (mk 0) (nxt 0)
+             (fn Values(Vec(v/Val) Str Str) [loc: Str]
+               (let [[p e] (parse-long loc)
+                     z (swap! calls (fn Int [k: Int] (+ k 1)))]
+                 (if (= p 9) (values [] "" "page 9 failed") (values (mk p) (nxt p) ""))))
+             (fn Int [broken: Bool] 0))))
+
+(defn- ints Vec(Int) [rows: &Vec(v/Val)]
+  (loop [i 0 acc: Vec(Int) []] (if (>= i (count rows)) acc (recur (+ i 1) (conj acc (match (v/unmeta (nth rows i)) (v/VInt k) k _ -1))))))
+
+(deftest paged-one-at-a-time-across-pages
+  (let [calls (atom 0)
+        src (pages [3 0 2] calls)
+        [r1 d1 e1] ((:next src) 1)
+        [r2 d2 e2] ((:next src) 1)
+        [r3 d3 e3] ((:next src) 1)
+        c3 (deref calls)
+        [r4 d4 e4] ((:next src) 1)
+        c4 (deref calls)
+        [r5 d5 e5] ((:next src) 1)]
+    (is (= (ints r1) [1]))
+    (is (not d1))
+    (is (= (ints r3) [3]))
+    (is (not d3))
+    (is (= c3 0))
+    (is (= (ints r4) [4]))
+    (is (= c4 2))
+    (is (= (ints r5) [5]))
+    (is d5)
+    (is (= e5 ""))))
+
+(deftest paged-take-spans-pages-and-reports-errors
+  (let [calls (atom 0)
+        [a da ea] ((:next (pages [2 2 2] calls)) 5)
+        [b db eb] ((:next (pages [2 2 2] calls)) 10)
+        [c dc ec] ((:next (pages [1 1 1 1 1 1 1 1 1 1] calls)) 20)]
+    (is (= (ints a) [1 2 3 4 5]))
+    (is (not da))
+    (is (= (ints b) [1 2 3 4 5 6]))
+    (is db)
+    (is (= ec "page 9 failed"))))
+
+;; 読み直せるデータ源: fork のたびに頭から読む読み手を開く。元を閉じた時だけ base の close が走る
+(defn- again s/Source [total: Int closed: Atom(Int) base: Bool]
+  (let [pos (atom 0) c closed]
+    (s/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int]
+                  (let [from (deref pos)
+                        to (if (> (+ from n) total) total (+ from n))
+                        rows (loop [i from acc: Vec(v/Val) []] (if (>= i to) acc (recur (+ i 1) (conj acc (v/int-v (+ i 1))))))
+                        z (reset! pos to)]
+                    (values rows (>= to total) "")))
+                (fn Int [broken: Bool] (if base (swap! c (fn Int [k: Int] (+ k 1))) 0))
+                false)))
+
+(deftest repeatable-streams-fork-readers
+  (let [closed (atom 0)
+        z0 (s/enter "o2")
+        id (s/open-repeatable "o2" (fn s/Source [base: Bool] (again 5 closed base)))
+        f1 (s/fork id)
+        [a ae] (s/all f1)
+        d1 (s/discard f1)
+        f2 (s/fork id)
+        [r1 x1 y1] (s/take-vals f2 3)
+        [r2 x2 y2] (s/take-vals f2 3)
+        d2 (s/discard f2)
+        fresh (s/fresh? id)
+        rep (s/repeatable? id)
+        live1 (s/live)
+        c1 (deref closed)
+        z1 (s/leave "o2")
+        live2 (s/live)
+        c2 (deref closed)]
+    (is (= (count a) 5))
+    (is (not= f1 id))
+    (is (= (count r1) 3))
+    (is (= (count r2) 2))
+    (is x2)
+    (is fresh)
+    (is rep)
+    (is (= live1 1))
+    (is (= c1 0))
+    (is (= live2 0))
+    (is (= c2 1))
+    (is (not (s/repeatable? id)))))
+
+(deftest fork-of-a-plain-stream-is-itself
+  (let [pos (atom 0) closed (atom 0)
+        z0 (s/enter "o3")
+        id (s/open "o3" (source 3 pos closed))
+        f (s/fork id)
+        z1 (s/leave "o3")]
+    (is (= f id))))
+
+(defn- text-src s/Source [text: Str piece: Int closed: Atom(Int) base: Bool]
+  (let [pos (atom 0)]
+    (s/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int]
+                  (let [from (deref pos)
+                        to (if (> (+ from piece) (count text)) (count text) (+ from piece))
+                        z (reset! pos to)]
+                    (values (if (> to from) [(v/->VStr (subs text from to))] []) (>= to (count text)) "")))
+                (fn Int [broken: Bool] (if base (swap! closed (fn Int [k: Int] (+ k 1))) 0))
+                false)))
+
+(defn- json-text Str [n: Int]
+  (loop [i 1 out "["] (if (> i n) (str out "]") (recur (+ i 1) (str out (if (= i 1) "" ",") "{\"id\": " i "}")))))
+
+(defn- pull Values(Int Bool dwe/DwErr) [it: Fn(Int Values(v/Val Bool dwe/DwErr)) limit: Int]
+  (loop [n 0]
+    (if (>= n limit) (values n false (dwe/ok))
+      (let [[x done e] (it 0)] (cond (not (dwe/ok? e)) (values n true e) done (values n true e) :else (recur (+ n 1)))))))
+
+(deftest json-pipe-reads-as-a-lazy-sequence
+  (let [closed (atom 0)
+        text (json-text 3000)
+        z0 (s/enter "o4")
+        id (s/open-repeatable "o4" (fn s/Source [base: Bool] (text-src text 1000 closed base)))
+        t (ev/->TV (v/null-v) "application/json" [] id ev/PIPE true)
+        [q lazy] (ev/pipe-seq t "payload")
+        [n1 d1 e1] (match q (v/VSeq sq) (pull ((:open sq) 0) 100000) _ (values -1 false (dwe/ok)))
+        [n2 d2 e2] (match q (v/VSeq sq) (pull ((:open sq) 0) 1) _ (values -1 false (dwe/ok)))
+        live1 (s/live)
+        z1 (s/leave "o4")
+        live2 (s/live)]
+    (is lazy)
+    (is (= n1 3000))
+    (is d1)
+    (is (dwe/ok? e1))
+    (is (= n2 1))
+    (is (not d2))
+    (is (> live1 1))
+    (is (= live2 0))
+    (is (= (deref closed) 1))))
+
+(deftest json-pipe-error-is-an-input-error
+  (let [closed (atom 0)
+        z0 (s/enter "o5")
+        id (s/open-repeatable "o5" (fn s/Source [base: Bool] (text-src "[{\"id\": 1}, {\"id\": tru" 4 closed base)))
+        t (ev/->TV (v/null-v) "text/json" [] id ev/PIPE true)
+        [q lazy] (ev/pipe-seq t "payload")
+        [n d e] (match q (v/VSeq sq) (pull ((:open sq) 0) 10) _ (values -1 false (dwe/ok)))
+        z1 (s/leave "o5")]
+    (is lazy)
+    (is (= n 1))
+    (is (dwe/input? e))
+    (is (= (s/live) 0))))
+
+(deftest non-array-json-pipe-is-not-lazy
+  (let [closed (atom 0)
+        z0 (s/enter "o6")
+        id (s/open-repeatable "o6" (fn s/Source [base: Bool] (text-src "{\"a\": [1]}" 3 closed base)))
+        t (ev/->TV (v/null-v) "application/json" [] id ev/PIPE true)
+        [q lazy] (ev/pipe-seq t "payload")
+        t2 (ev/->TV (v/null-v) "application/json; charset=UTF-16" [] id ev/PIPE true)
+        [q2 lazy2] (ev/pipe-seq t2 "payload")
+        z1 (s/leave "o6")]
+    (is (not lazy))
+    (is (not lazy2))))

@@ -1,0 +1,1427 @@
+(ns mulay.dw.eval
+  (:require [mulay.dw.ast :as ast] [mulay.dw.val :as v] [mulay.dw.num :as num]
+            [mulay.dw.rir :as r] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.sel :as sel]
+            [mulay.dw.coerce :as co] [mulay.lib.regex :as rx] [mulay.lib.bigint :as bi]
+            [mulay.dw.lib.core_coll :as cc]))
+
+(defrecord Frame [slots: Vec(v/Val) caps: Vec(v/Val)])
+
+(defrecord C [run: Fn(&Ctx &Frame Int Values(v/Val dwe/DwErr)) sp: ast/Span])
+(defrecord T [run: Fn(&Ctx &Frame Int Values(v/Val dwe/DwErr Int Frame))])
+
+(defrecord CFn [name: Str nparams: Int nslots: Int pnames: Str defaults: Vec(Vec(C)) body: T ptypes: Vec(v/TypeV) alts: Vec(Int) consts: Vec(Vec(v/Val)) reads: Vec(Bool) sp: ast/Span])
+(defrecord CGlobal [body: C nslots: Int])
+(defrecord CProg [fns: Vec(CFn) globals: Vec(CGlobal) body: C nslots: Int srcs: rt/Srcs
+                  runner: Fn(Str v/Val v/Val v/Val Bool Values(v/Val dwe/DwErr)) pure: Vec(Bool)])
+
+(defn no-runner Values(v/Val dwe/DwErr) [file: Str fs: v/Val readers: v/Val vals: v/Val write: Bool]
+  (rt/failure "UnsupportedOperation" "dw::Runtime::run is not available here"))
+
+(defrecord Ctx [code: CProg builtins: Vec(rt/Builtin) inputs: Vec(v/Val) globals: Vec(v/Val) lazy: Bool
+                wrap: Option(Fn(Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) v/FnV v/Val))])
+
+(defrecord CElem [value: C cond: Vec(C)])
+(defvariant CKey
+  (CKName ns: Vec(C) name: Str plain: v/Key)
+  (CKExpr ns: Vec(C) e: C))
+(defrecord CAttr [ns: Vec(C) name: Str value: C cond: Vec(C) spread: Bool])
+(defvariant CEntry
+  (CEKV key: CKey attrs: Vec(CAttr) value: C cond: Vec(C))
+  (CESpread e: C cond: Vec(C)))
+(defvariant CSel
+  (CSKey name: Str)
+  (CSMulti name: Str)
+  (CSDesc name: Str)
+  (CSDescMulti name: Str)
+  (CSQName kind: Int ns: C name: Str)
+  (CSAttr name: Str)
+  (CSAllAttrs)
+  (CSKV name: Str)
+  (CSDescKV name: Str)
+  (CSAllKV)
+  (CSNs)
+  (CSMeta name: Str)
+  (CSDyn e: C)
+  (CSQDyn ns: Vec(C) e: C)
+  (CSRange from: C to: C)
+  (CSFilter pred: C)
+  (CSAttrDyn e: C))
+(defvariant CPat
+  (CPLit value: C)
+  (CPGuard cond: C)
+  (CPType ty: v/TypeV)
+  (CPRegex re: C)
+  (CPArr head: Int tail: Int)
+  (CPObj key: Int value: Int tail: Int)
+  (CPElse))
+(defrecord CCase [bind: Int pat: CPat body: C])
+(defrecord CUpd [bind: Int idx: Int path: Vec(CSel) cond: Vec(C) body: C upsert: Bool sp: ast/Span])
+
+(def NO-FRAME (->Frame [] []))
+
+(defn nul v/Val [] (v/null-v))
+(defn okv Values(v/Val dwe/DwErr) [x: v/Val] (values x (dwe/ok)))
+(defn failv Values(v/Val dwe/DwErr) [kind: Str msg: Str sp: &ast/Span] (values (v/null-v) (dwe/at (dwe/err kind msg) sp)))
+(target-when "wasm" (def MAX-STACK 1000) (def MAX-STACK 3000))
+
+(defn so Values(v/Val dwe/DwErr) [sp: &ast/Span] (failv "StackOverflow" (str "Stack Overflow. Max stack is " MAX-STACK) sp))
+(defn no-var Values(v/Val dwe/DwErr) [name: &Str sp: &ast/Span] (failv "InvalidVariableName" (str "There is no variable named '" name "'") sp))
+(defn default-catches? Bool [e: &dwe/DwErr] (or (= (:kind e) "CoercionException") (= (:kind e) "InvalidFunctionArgsNull")))
+(defn run Values(v/Val dwe/DwErr) [x: &C c: &Ctx f: &Frame depth: Int] ((:run x) c f depth))
+
+(defn env-of rt/Env [c: &Ctx depth: Int] (rt/->Env (->dyn c) depth HOOKS (:lazy c)))
+
+(def HOOKS: rt/Hooks
+  (rt/->Hooks (fn Values(v/Val dwe/DwErr) [cx: Dyn d: Int f: v/FnV args: Vec(v/Val)] (let [c: Ctx (dyn->rec cx)] (call-fnv c f args (+ d 1) false)))
+              (fn Int [cx: Dyn m: Str n: Str] (let [c: Ctx (dyn->rec cx)] (find-builtin (:builtins c) m n)))
+              (fn Values(Vec(v/Val) dwe/DwErr) [cx: Dyn d: Int f: v/FnV i: Int] (let [c: Ctx (dyn->rec cx)] (param-default-of c f i (+ d 1))))
+              (fn rt/Srcs [cx: Dyn] (let [c: Ctx (dyn->rec cx)] (:srcs (:code c))))
+              (fn Values(v/Val dwe/DwErr) [cx: Dyn file: Str fs: v/Val rd: v/Val vs: v/Val w: Bool]
+                (let [c: Ctx (dyn->rec cx)
+                      c1 c
+                      [vw ve] (v/whole-deep vs)]
+                  (if (not (dwe/ok? ve)) (values (v/null-v) ve)
+                    ((:runner (:code c)) file fs rd (export-val (fn v/Val [g: v/FnV] (plain-export c1 g)) vw) w))))
+              (fn Values(v/Val dwe/DwErr) [x: v/Val target: Str] (co/coerce x (v/->TypeV "name" target [] [] [] [])))
+              (fn Bool [cx: Dyn d: Int] (let [c: Ctx (dyn->rec cx)] (def-pure? c d)))
+              (fn Fn(Vec(v/Val) Values(v/Val dwe/DwErr)) [cx: Dyn d: Int f: v/FnV na: Int] (let [c: Ctx (dyn->rec cx)] (prep-fnv c f na (+ d 1))))
+              (fn Fn(v/Val v/Val Values(v/Val dwe/DwErr)) [cx: Dyn d: Int f: v/FnV] (let [c: Ctx (dyn->rec cx)] (prep-fnv2 c f (+ d 1))))
+              (fn Fn(v/Val Int Values(v/Val dwe/DwErr)) [cx: Dyn d: Int f: v/FnV] (let [c: Ctx (dyn->rec cx)] (prep-ix c f (+ d 1))))
+              (fn Vec(Int) [cx: Dyn f: v/FnV] (let [c: Ctx (dyn->rec cx)] (fn-span c f)))))
+
+(defn- fill-slots Vec(v/Val) [args: Vec(v/Val) np: Int tail: &Vec(v/Val) ns: Int]
+  (let [base (if (> (count args) np) (subvec args 0 np) args)
+        b2 (loop [acc base k 0] (if (>= k (count tail)) acc (recur (conj acc (nth tail k)) (+ k 1))))]
+    (loop [acc b2 k (count b2)] (if (>= k ns) acc (recur (conj acc (v/null-v)) (+ k 1))))))
+
+(defn- const-tail Vec(Vec(v/Val)) [fd: &CFn na: Int]
+  (let [np (:nparams fd)]
+    (cond (>= na np) [[]]
+          (and (> (count (nth (:defaults fd) 0)) 0) (not (lambda-name? (:name fd)))) []
+          :else (loop [k na acc: Vec(v/Val) []]
+                  (if (>= k np) [acc]
+                    (let [cv (nth (:consts fd) k)] (if (= (count cv) 0) [] (recur (+ k 1) (conj acc (nth cv 0))))))))))
+
+(defn prep-fnv2 Fn(v/Val v/Val Values(v/Val dwe/DwErr)) [c: &Ctx fv: &v/FnV depth: Int]
+  (let [d (:def fv) c1 c fv1 fv
+        tails (if (or (< d 0) (> (count (:alts (nth (:fns (:code c)) d))) 0)) [] (const-tail (nth (:fns (:code c)) d) 2))
+        fd (if (< d 0) (->CFn "" 0 0 "" [] (->T (fn Values(v/Val dwe/DwErr Int Frame) [c0: &Ctx f0: &Frame d0: Int] (values (nul) (dwe/ok) -1 NO-FRAME))) [] [] [] [] (dwe/no-span)) (nth (:fns (:code c)) d))
+        np (:nparams fd) ns (:nslots fd) caps (:caps fv)
+        tail: Vec(v/Val) (if (= (count tails) 0) [] (nth tails 0))]
+    (cond
+      (= (count tails) 0) (fn Values(v/Val dwe/DwErr) [a: v/Val b: v/Val] (call-fnv c1 fv1 [a b] depth false))
+      (and (= np 2) (= ns 2)) (fn Values(v/Val dwe/DwErr) [a: v/Val b: v/Val] (run-def c1 d (->Frame [a b] caps) depth (dwe/no-span)))
+      (and (= np 3) (= ns 3) (= (count tail) 1)) (let [t0 (nth tail 0)] (fn Values(v/Val dwe/DwErr) [a: v/Val b: v/Val] (run-def c1 d (->Frame [a b t0] caps) depth (dwe/no-span))))
+      (and (= np 1) (= ns 1)) (fn Values(v/Val dwe/DwErr) [a: v/Val b: v/Val] (run-def c1 d (->Frame [a] caps) depth (dwe/no-span)))
+      :else (fn Values(v/Val dwe/DwErr) [a: v/Val b: v/Val] (run-def c1 d (->Frame (fill-slots [a b] np tail ns) caps) depth (dwe/no-span))))))
+
+(defn prep-ix Fn(v/Val Int Values(v/Val dwe/DwErr)) [c: &Ctx fv: &v/FnV depth: Int]
+  (let [d (:def fv)
+        g (prep-fnv2 c fv depth)
+        uses (or (< d 0) (> (count (:alts (nth (:fns (:code c)) d))) 0)
+                 (let [rs (:reads (nth (:fns (:code c)) d))] (or (< (count rs) 2) (nth rs 1))))]
+    (if uses (fn Values(v/Val dwe/DwErr) [a: v/Val i: Int] (g a (v/int-v i)))
+      (fn Values(v/Val dwe/DwErr) [a: v/Val i: Int] (g a (nul))))))
+
+(defn prep-fnv Fn(Vec(v/Val) Values(v/Val dwe/DwErr)) [c: &Ctx fv: &v/FnV na: Int depth: Int]
+  (let [d (:def fv) c1 c fv1 fv
+        tails (if (or (< d 0) (> (count (:alts (nth (:fns (:code c)) d))) 0)) [] (const-tail (nth (:fns (:code c)) d) na))]
+    (if (= (count tails) 0)
+      (fn Values(v/Val dwe/DwErr) [args: Vec(v/Val)] (call-fnv c1 fv1 args depth false))
+      (let [fd (nth (:fns (:code c)) d) np (:nparams fd) ns (:nslots fd) caps (:caps fv) tail (nth tails 0)]
+        (fn Values(v/Val dwe/DwErr) [args: Vec(v/Val)] (run-def c1 d (->Frame (fill-slots args np tail ns) caps) depth (dwe/no-span)))))))
+
+(defn- def-pure? Bool [c: &Ctx d: Int]
+  (if (< d 0)
+    (let [id (- -1 d) bs (:builtins c)] (and (< id (count bs)) (not (rt/impure-builtin? (nth bs id)))))
+    (let [ps (:pure (:code c))] (and (< d (count ps)) (nth ps d)))))
+
+(defn- param-default-of Values(Vec(v/Val) dwe/DwErr) [c: &Ctx f: &v/FnV i: Int depth: Int]
+  (if (< (:def f) 0) (values [] (dwe/ok))
+    (let [fd (nth (:fns (:code c)) (:def f))
+          ds (:defaults fd)]
+      (if (or (>= i (count ds)) (= (count (nth ds i)) 0) (dollar-fd? fd)) (values [] (dwe/ok))
+        (let [fr (->Frame (nslots-vec (:nslots fd)) (:caps f))
+              [x e] (run (nth (nth ds i) 0) c fr depth)]
+          (values [x] e))))))
+
+(defn- dollar-fd? Bool [fd: &CFn] (and (= (:name fd) "<anonymous>") (= (:nparams fd) 3)))
+
+(defn find-builtin Int [bs: &Vec(rt/Builtin) m: &Str n: &Str]
+  (loop [i 0] (if (>= i (count bs)) -1 (if (and (= (:name (nth bs i)) n) (= (:module (nth bs i)) m)) i (recur (+ i 1))))))
+
+(defn truthy Values(Bool dwe/DwErr) [x: &v/Val sp: &ast/Span]
+  (match (v/unmeta x)
+    (v/VBool b) (values b (dwe/ok))
+    _ (values false (dwe/at (dwe/err "CoercionException" (str "Cannot coerce " (v/type-name (v/unmeta x)) " to Boolean")) sp))))
+
+(defn if-cond Values(Bool dwe/DwErr) [x: &v/Val sp: &ast/Span]
+  (match (v/unmeta x)
+    (v/VBool b) (values b (dwe/ok))
+    _ (values false (dwe/at (dwe/err "InvalidCondition" (str "Invalid if condition type. Expecting type `Boolean` but got `" (describe-val (v/unmeta x)) "`")) sp))))
+
+(defn describe-val Str [x: &v/Val]
+  (match x
+    (v/VStr s) (str "String(\"" s "\")")
+    (v/VNum n) (str "Number(" (num/to-string n) ")")
+    (v/VInt n) (str "Number(" n ")")
+    (v/VBool b) (str "Boolean(" (if b "true" "false") ")")
+    (v/VNull) "Null"
+    _ (v/type-name x)))
+
+(defn- num-op Values(v/Val Bool dwe/DwErr) [op: Int x: &v/Val y: &v/Val]
+  (if (= op 11) (cat-op x y) (arith-op op x y)))
+
+(defn- cat-op Values(v/Val Bool dwe/DwErr) [x: &v/Val y: &v/Val]
+  (match x
+    (v/VStr a)
+    (match y
+      (v/VStr b) (values (v/->VStr (str a b)) true (dwe/ok))
+      (v/VInt i) (values (v/->VStr (str a i)) true (dwe/ok))
+      (v/VNum n) (let [t (num/to-string n)] (values (v/->VStr (str a t)) true (dwe/ok)))
+      _ (values (nul) false (dwe/ok)))
+    _ (values (nul) false (dwe/ok))))
+
+(defn- arith-op Values(v/Val Bool dwe/DwErr) [op: Int x: &v/Val y: &v/Val]
+  (match x
+    (v/VInt a)
+    (match y
+      (v/VInt b)
+      (cond
+        (= op 1) (if (bi/add-ov? a b) (num-op-n op (num/from-int a) (num/from-int b)) (values (v/int-v (+ a b)) true (dwe/ok)))
+        (= op 2) (if (bi/sub-ov? a b) (num-op-n op (num/from-int a) (num/from-int b)) (values (v/int-v (- a b)) true (dwe/ok)))
+        (= op 3) (if (bi/mul-ov? a b) (num-op-n op (num/from-int a) (num/from-int b)) (values (v/int-v (* a b)) true (dwe/ok)))
+        (= op 4) (if (or (= b 0) (= b -1)) (num-op-n op (num/from-int a) (num/from-int b)) (values (v/int-v (rem a b)) true (dwe/ok)))
+        (= op 5) (values (v/bool-v (= a b)) true (dwe/ok))
+        (= op 6) (values (v/bool-v (not= a b)) true (dwe/ok))
+        (= op 7) (values (v/bool-v (< a b)) true (dwe/ok))
+        (= op 8) (values (v/bool-v (> a b)) true (dwe/ok))
+        (= op 9) (values (v/bool-v (<= a b)) true (dwe/ok))
+        :else (values (v/bool-v (>= a b)) true (dwe/ok)))
+      (v/VNum b) (num-op-n op (num/from-int a) b)
+      _ (values (nul) false (dwe/ok)))
+    (v/VNum a)
+    (match y
+      (v/VNum b) (num-op-n op a b)
+      (v/VInt b) (num-op-n op a (num/from-int b))
+      _ (values (nul) false (dwe/ok)))
+    _ (values (nul) false (dwe/ok))))
+
+(defn- num-op-n Values(v/Val Bool dwe/DwErr) [op: Int a: &num/Num b: &num/Num]
+  (cond
+    (or (= op 1) (= op 2) (= op 3))
+    (let [[r e] (cond (= op 1) (num/add a b) (= op 2) (num/sub a b) :else (num/mul a b))]
+      (if (= e "") (values (v/num-v r) true (dwe/ok)) (values (nul) true (dwe/err "ArithmeticException" (num/op-error op a b e)))))
+    (= op 4) (let [[q e] (num/rem-num a b)]
+               (if (= e "") (values (v/num-v q) true (dwe/ok)) (values (nul) true (dwe/err (rt/arith-kind e) e))))
+    (= op 5) (values (v/bool-v (num/eq? a b)) true (dwe/ok))
+    (= op 6) (values (v/bool-v (not (num/eq? a b))) true (dwe/ok))
+    :else (let [k (num/cmp a b)]
+            (values (v/bool-v (cond (= op 7) (< k 0) (= op 8) (> k 0) (= op 9) (<= k 0) :else (>= k 0))) true (dwe/ok)))))
+
+(defn whole-if Values(v/Val dwe/DwErr) [c: &Ctx x: &v/Val]
+  (if (and (:lazy c) (v/has-seq? x)) (v/whole-deep x) (values x (dwe/ok))))
+
+(defn num-op-vals Values(v/Val dwe/DwErr) [c: &Ctx op: Int id: Int x0: &v/Val y0: &v/Val depth: Int sp: &ast/Span]
+  (match x0
+    (v/VInt a) (match y0
+                 (v/VInt b) (cond
+                              (= op 1) (if (bi/add-ov? a b) (num-op-slow c op id x0 y0 depth sp) (okv (v/int-v (+ a b))))
+                              (= op 2) (if (bi/sub-ov? a b) (num-op-slow c op id x0 y0 depth sp) (okv (v/int-v (- a b))))
+                              (= op 3) (if (bi/mul-ov? a b) (num-op-slow c op id x0 y0 depth sp) (okv (v/int-v (* a b))))
+                              (= op 5) (okv (v/bool-v (= a b)))
+                              (= op 6) (okv (v/bool-v (not= a b)))
+                              (= op 7) (okv (v/bool-v (< a b)))
+                              (= op 8) (okv (v/bool-v (> a b)))
+                              (= op 9) (okv (v/bool-v (<= a b)))
+                              (= op 10) (okv (v/bool-v (>= a b)))
+                              :else (num-op-slow c op id x0 y0 depth sp))
+                 _ (num-op-slow c op id x0 y0 depth sp))
+    _ (num-op-slow c op id x0 y0 depth sp)))
+
+(defn- num-op-slow Values(v/Val dwe/DwErr) [c: &Ctx op: Int id: Int x0: &v/Val y0: &v/Val depth: Int sp: &ast/Span]
+  (let [[x xe] (if (or (= op 5) (= op 6)) (whole-if c x0) (values x0 (dwe/ok)))
+        [y ye] (if (or (= op 5) (= op 6)) (whole-if c y0) (values y0 (dwe/ok)))
+        [z done ze] (num-op op x y)]
+    (cond (not (dwe/ok? xe)) (values (nul) (dwe/at xe sp))
+          (not (dwe/ok? ye)) (values (nul) (dwe/at ye sp))
+          :else
+    (if done (values z (dwe/at ze sp))
+     (if (= op 5) (okv (v/bool-v (v/equal? x y)))
+     (if (= op 6) (okv (v/bool-v (not (v/equal? x y))))
+      (let [[w e] (rt/invoke (env-of c depth) (nth (:builtins c) id) [x y])]
+        (values w (dwe/at e sp)))))))))
+
+(defn cx C [p: &r/Prog n: &r/R]
+  (let [sp (:sp n)]
+    (match (:x n)
+      (r/RConst x) (let [x2 x] (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int] (if (> depth MAX-STACK) (so sp) (okv x2))) sp))
+      (r/RSlot i) (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int] (if (> depth MAX-STACK) (so sp) (okv (nth (:slots f) i)))) sp)
+      (r/RCap i) (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int] (if (> depth MAX-STACK) (so sp) (okv (nth (:caps f) i)))) sp)
+      (r/RGlob i) (let [name (r/glob-name p i)]
+                    (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                           (if (> depth MAX-STACK) (so sp) (if (< i (count (:globals c))) (okv (nth (:globals c) i)) (no-var name sp))))
+                         sp))
+      (r/RInput i) (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int] (if (> depth MAX-STACK) (so sp) (okv (nth (:inputs c) i)))) sp)
+      (r/RNumOp op id l rr) (cx-num-op p op id l rr sp)
+      (r/RBuiltinRef id) (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                (if (> depth MAX-STACK) (so sp) (okv (v/->VFn (v/->FnV (- -1 id) [] (->None) -1)))))
+                              sp)
+      (r/RInterp parts) (let [ps (cxs p parts)]
+                          (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int] (if (> depth MAX-STACK) (so sp) (ev-interp c f ps depth))) sp))
+      (r/RArr elems) (let [es (cx-elems p elems)]
+                       (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int] (if (> depth MAX-STACK) (so sp) (ev-arr c f es depth))) sp))
+      (r/RObj entries) (let [es (cx-entries p entries)]
+                         (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int] (if (> depth MAX-STACK) (so sp) (ev-obj c f es depth))) sp))
+      (r/RCallB id args) (if (fold-shape? args) (cx-fold p id args sp) (let [as (cxs p args)]
+                           (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                  (if (> depth MAX-STACK) (so sp)
+                                    (let [[xs e] (run-all c f as depth)]
+                                      (if (dwe/ok? e)
+                                        (let [[x e2] (rt/invoke (env-of c depth) (nth (:builtins c) id) xs)] (values x (dwe/at e2 sp)))
+                                        (values (nul) e)))))
+                                sp)))
+      (r/RCallG d args) (let [as (cxs p args)]
+                          (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                 (if (> depth MAX-STACK) (so sp)
+                                   (let [[xs e] (run-all c f as depth)]
+                                     (if (dwe/ok? e) (call-def c d [] xs (+ depth 1) sp true) (values (nul) e)))))
+                               sp))
+      (r/RCall fe args) (let [fc (cx p fe) as (cxs p args) fsp (:sp fe)]
+                          (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                 (if (> depth MAX-STACK) (so sp)
+                                   (let [[fx e] (run fc c f depth)]
+                                     (if (not (dwe/ok? e)) (values fx e)
+                                       (let [[xs e2] (run-all c f as depth)]
+                                         (if (dwe/ok? e2) (call-val-at c fx xs (+ depth 1) sp fsp) (values (nul) e2)))))))
+                               sp))
+      (r/RClosure d caps) (let [cs (cxs p caps)
+                                fd (nth (:fns p) d)
+                                np (count (:params fd))]
+                            (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                   (if (> depth MAX-STACK) (so sp)
+                                     (let [[xs e] (run-all c f cs depth)]
+                                       (if (dwe/ok? e) (okv (v/->VFn (v/->FnV d xs (->None) np))) (values (nul) e)))))
+                                 sp))
+      (r/RSibling d) (let [fd (nth (:fns p) d)
+                           np (count (:params fd))]
+                       (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                              (if (> depth MAX-STACK) (so sp) (okv (v/->VFn (v/->FnV d (:caps f) (->None) np)))))
+                            sp))
+      (r/RSel t s) (cx-sel p t s sp)
+      (r/RExists t) (cx-exists p t sp)
+      (r/RAssert t) (cx-assert p t sp)
+      (r/RIf cnd th el) (let [cc (cx p cnd) tc (cx p th) ec (cx p el) csp (:sp cnd)]
+                          (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                 (if (> depth MAX-STACK) (so sp)
+                                   (let [[x e] (run cc c f depth)]
+                                     (if (not (dwe/ok? e)) (values x e)
+                                       (let [[b e2] (if-cond x csp)]
+                                         (if (not (dwe/ok? e2)) (values (nul) e2)
+                                           (if b (run tc c f depth) (run ec c f depth))))))))
+                               sp))
+      (r/RAnd l rr) (let [lc (cx p l) rc (cx p rr)]
+                      (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                             (if (> depth MAX-STACK) (so sp)
+                               (let [[x e] (run lc c f depth)]
+                                 (if (not (dwe/ok? e)) (values x e)
+                                   (let [[b e2] (truthy x (:sp lc))]
+                                     (if (not (dwe/ok? e2)) (values (nul) e2)
+                                       (if b (let [[y e3] (run rc c f depth)]
+                                               (if (not (dwe/ok? e3)) (values y e3)
+                                                 (let [[b2 e4] (truthy y (:sp rc))] (values (v/bool-v b2) e4))))
+                                         (okv (v/bool-v false)))))))))
+                           sp))
+      (r/ROr l rr) (let [lc (cx p l) rc (cx p rr)]
+                     (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                            (if (> depth MAX-STACK) (so sp)
+                              (let [[x e] (run lc c f depth)]
+                                (if (not (dwe/ok? e)) (values x e)
+                                  (let [[b e2] (truthy x (:sp lc))]
+                                    (if (not (dwe/ok? e2)) (values (nul) e2)
+                                      (if b (okv (v/bool-v true))
+                                        (let [[y e3] (run rc c f depth)]
+                                          (if (not (dwe/ok? e3)) (values y e3)
+                                            (let [[b2 e4] (truthy y (:sp rc))] (values (v/bool-v b2) e4)))))))))))
+                          sp))
+      (r/RNot x0) (let [xc (cx p x0)]
+                    (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                           (if (> depth MAX-STACK) (so sp)
+                             (let [[x e] (run xc c f depth)]
+                               (if (not (dwe/ok? e)) (values x e)
+                                 (let [[b e2] (truthy x (:sp xc))] (values (v/bool-v (not b)) e2))))))
+                         sp))
+      (r/RDefault x0 fb) (let [xc (cx p x0) fc (cx p fb)]
+                           (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                  (if (> depth MAX-STACK) (so sp)
+                                    (let [[x e] (run xc c f depth)]
+                                      (if (not (dwe/ok? e)) (if (default-catches? e) (run fc c f depth) (values x e))
+                                        (if (v/null? x) (run fc c f depth) (okv x))))))
+                                sp))
+      (r/RMatch t slot cases) (let [tc (cx p t) cs (cx-cases p cases)]
+                                (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                       (if (> depth MAX-STACK) (so sp)
+                                         (let [[x e] (run tc c f depth)]
+                                           (if (not (dwe/ok? e)) (values x e) (ev-match c f x cs depth sp)))))
+                                     sp))
+      (r/RAs x0 ty) (let [xc (cx p x0) t (:t ty)]
+                      (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                             (if (> depth MAX-STACK) (so sp)
+                               (let [[x0 e] (run xc c f depth)
+                                     [x we] (if (dwe/ok? e) (whole-if c x0) (values x0 e))]
+                                 (if (not (dwe/ok? we)) (values x0 (dwe/at we sp))
+                                   (let [[y e2] (co/coerce x t)] (values y (dwe/at e2 sp)))))))
+                           sp))
+      (r/RIs x0 ty) (let [xc (cx p x0) t (:t ty)]
+                      (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                             (if (> depth MAX-STACK) (so sp)
+                               (let [[x0 e] (run xc c f depth)
+                                     [x we] (if (dwe/ok? e) (whole-if c x0) (values x0 e))]
+                                 (if (not (dwe/ok? we)) (values x0 (dwe/at we sp)) (okv (v/bool-v (co/is-type? x t)))))))
+                           sp))
+      (r/RMetaSet x0 sch) (let [xc (cx p x0) mc (cx p sch)]
+                            (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                   (if (> depth MAX-STACK) (so sp)
+                                     (let [[x e] (run xc c f depth)]
+                                       (if (not (dwe/ok? e)) (values x e)
+                                         (let [[m e2] (run mc c f depth)]
+                                           (if (not (dwe/ok? e2)) (values m e2)
+                                             (match (v/unmeta m)
+                                               (v/VObj fs) (okv (v/->VMeta x fs))
+                                               (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (okv (v/->VMeta x fs)) (values (nul) fe)))
+                                               _ (failv "InvalidMetadata" "Metadata must be an Object" sp))))))))
+                                 sp))
+      (r/RLet slot x0 body) (let [xc (cx p x0) bc (cx p body)]
+                              (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                     (if (> depth MAX-STACK) (so sp)
+                                       (let [[x e] (run xc c f depth)]
+                                         (if (not (dwe/ok? e)) (values x e)
+                                           (run bc c (->Frame (assoc (:slots f) slot x) (:caps f)) depth)))))
+                                   sp))
+      (r/RUpdate t slot cases) (let [tc (cx p t) us (cx-upds p cases)]
+                                 (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                                        (if (> depth MAX-STACK) (so sp)
+                                          (let [[x e] (run tc c f depth)]
+                                            (if (not (dwe/ok? e)) (values x e)
+                                              (loop [i 0 cur x]
+                                                (if (>= i (count us)) (okv cur)
+                                                  (let [[y e2] (upd-at c f cur (nth us i) 0 -1 depth)]
+                                                    (if (dwe/ok? e2) (recur (+ i 1) y) (values y (dwe/at e2 sp))))))))))
+                                      sp))
+      (r/RTypeV ty) (let [t (:t ty)]
+                      (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int] (if (> depth MAX-STACK) (so sp) (okv (v/->VType t)))) sp))
+      (r/RFail msg) (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                           (if (> depth MAX-STACK) (so sp) (failv "CompilationException" msg sp)))
+                         sp)
+      (r/RNoVar name) (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                             (if (> depth MAX-STACK) (so sp) (no-var name sp)))
+                           sp))))
+
+(defn- cxs Vec(C) [p: &r/Prog ns: &Vec(r/R)]
+  (loop [i 0 acc: Vec(C) []] (if (>= i (count ns)) acc (recur (+ i 1) (conj acc (cx p (nth ns i)))))))
+
+(defn- operand Values(Int Int v/Val) [n: &r/R]
+  (match (:x n)
+    (r/RSlot i) (values 1 i (nul))
+    (r/RConst x) (values 2 0 x)
+    _ (values 0 0 (nul))))
+
+(defn- cx-num-op C [p: &r/Prog op: Int id: Int l: &r/R rr: &r/R sp: ast/Span]
+  (let [[lk li lx] (operand l) [rk ri rx] (operand rr)]
+    (cond
+      (and (= lk 1) (= rk 2))
+      (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+             (if (> depth MAX-STACK) (so sp) (num-op-vals c op id (nth (:slots f) li) rx depth sp)))
+           sp)
+      (and (= lk 1) (= rk 1))
+      (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+             (if (> depth MAX-STACK) (so sp) (num-op-vals c op id (nth (:slots f) li) (nth (:slots f) ri) depth sp)))
+           sp)
+      (= rk 2)
+      (let [lc (cx p l)]
+        (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+               (if (> depth MAX-STACK) (so sp)
+                 (let [[x e] (run lc c f depth)]
+                   (if (not (dwe/ok? e)) (values x e) (num-op-vals c op id x rx depth sp)))))
+             sp))
+      (= rk 1)
+      (let [lc (cx p l)]
+        (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+               (if (> depth MAX-STACK) (so sp)
+                 (let [[x e] (run lc c f depth)]
+                   (if (not (dwe/ok? e)) (values x e) (num-op-vals c op id x (nth (:slots f) ri) depth sp)))))
+             sp))
+      :else
+      (let [lc (cx p l) rc (cx p rr)]
+        (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+               (if (> depth MAX-STACK) (so sp)
+                 (let [[x e] (run lc c f depth)]
+                   (if (not (dwe/ok? e)) (values x e)
+                     (let [[y e2] (run rc c f depth)]
+                       (if (not (dwe/ok? e2)) (values y e2) (num-op-vals c op id x y depth sp)))))))
+             sp)))))
+
+(defn- fold-shape? Bool [args: &Vec(r/R)]
+  (and (= (count args) 1)
+       (match (:x (nth args 0)) (r/RCallB id2 as2) (= (count as2) 2) _ false)))
+
+(defn- cx-fold C [p: &r/Prog id: Int args: &Vec(r/R) sp: ast/Span]
+  (let [inner (nth args 0)
+        isp (:sp inner)
+        [id2 iargs] (match (:x inner) (r/RCallB i2 as2) (values i2 as2) _ (values 0 []))
+        ic (cx p inner)
+        srcc (cx p (nth iargs 0))
+        fnc (cx p (nth iargs 1))]
+    (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+           (if (> depth MAX-STACK) (so sp)
+             (let [outer (nth (:builtins c) id)
+                   prod (nth (:builtins c) id2)]
+               (if (or (= (:fold outer) 0) (= (:pipe prod) 0))
+                 (let [[x e] (run ic c f depth)]
+                   (if (not (dwe/ok? e)) (values (nul) e) (call-b c outer [x] depth sp)))
+                 (let [[sv se] (run srcc c f depth)]
+                   (if (not (dwe/ok? se)) (values (nul) se)
+                     (let [[fv fe] (run fnc c f depth)]
+                       (if (not (dwe/ok? fe)) (values (nul) fe)
+                         (run-fold c outer prod sv fv depth sp isp)))))))))
+         sp)))
+
+(defn- call-b Values(v/Val dwe/DwErr) [c: &Ctx b: &rt/Builtin xs: Vec(v/Val) depth: Int sp: &ast/Span]
+  (let [[x e] (rt/invoke (env-of c depth) b xs)] (values x (dwe/at e sp))))
+
+(defn- run-fold Values(v/Val dwe/DwErr) [c: &Ctx outer: &rt/Builtin prod: &rt/Builtin sv: v/Val fv: v/Val depth: Int sp: &ast/Span isp: &ast/Span]
+  (let [arr (match (v/unmeta sv) (v/VArr q) true (v/VRange a b) true _ false)]
+    (match (v/unmeta fv)
+      (v/VFn fnv)
+      (if (not arr) (generic-fold c outer prod sv fv depth sp isp)
+        (let [env (env-of c depth)
+              [y e who] (cc/fold-run env (:fold outer) (:pipe prod) sv fnv)]
+          (cond
+            (= who 0) (values y e)
+            (= who 1) (values (nul) (dwe/at (rt/native-frame e prod (rt/exact-index prod [(rt/val-tag sv) 10])) isp))
+            :else (values y (dwe/at (rt/native-frame e outer (rt/exact-index outer [5])) sp)))))
+      _ (generic-fold c outer prod sv fv depth sp isp))))
+
+(defn- generic-fold Values(v/Val dwe/DwErr) [c: &Ctx outer: &rt/Builtin prod: &rt/Builtin sv: v/Val fv: v/Val depth: Int sp: &ast/Span isp: &ast/Span]
+  (let [[x e] (call-b c prod [sv fv] depth isp)]
+    (if (not (dwe/ok? e)) (values (nul) e) (call-b c outer [x] depth sp))))
+
+(defn- cx-elems Vec(CElem) [p: &r/Prog es: &Vec(r/RElem)]
+  (loop [i 0 acc: Vec(CElem) []]
+    (if (>= i (count es)) acc
+      (let [el (nth es i)] (recur (+ i 1) (conj acc (->CElem (cx p (:value el)) (cxs p (:cond el)))))))))
+
+(defn- cx-key CKey [p: &r/Prog k: &r/RKey]
+  (match k
+    (r/RKName nsx name) (->CKName (cxs p nsx) name (v/simple-key name))
+    (r/RKExpr nsx x0) (->CKExpr (cxs p nsx) (cx p x0))))
+
+(defn- cx-attrs Vec(CAttr) [p: &r/Prog as: &Vec(r/RAttr)]
+  (loop [i 0 acc: Vec(CAttr) []]
+    (if (>= i (count as)) acc
+      (let [a (nth as i)]
+        (recur (+ i 1) (conj acc (->CAttr (cxs p (:ns a)) (:name a) (cx p (:value a)) (cxs p (:cond a)) (:spread a))))))))
+
+(defn- cx-entries Vec(CEntry) [p: &r/Prog es: &Vec(r/REntry)]
+  (loop [i 0 acc: Vec(CEntry) []]
+    (if (>= i (count es)) acc
+      (recur (+ i 1)
+             (conj acc (match (nth es i)
+                         (r/REKV k attrs x0 cnd) (->CEKV (cx-key p k) (cx-attrs p attrs) (cx p x0) (cxs p cnd))
+                         (r/RESpread x0 cnd) (->CESpread (cx p x0) (cxs p cnd))))))))
+
+(defn- cx-selk CSel [p: &r/Prog s: &r/RSelK]
+  (match s
+    (r/SKey ns name) (if (= (count ns) 0) (->CSKey name) (->CSQName 0 (cx p (nth ns 0)) name))
+    (r/SMulti ns name) (if (= (count ns) 0) (->CSMulti name) (->CSQName 1 (cx p (nth ns 0)) name))
+    (r/SDesc ns name) (if (= (count ns) 0) (->CSDesc name) (->CSQName 2 (cx p (nth ns 0)) name))
+    (r/SDescMulti ns name) (if (= (count ns) 0) (->CSDescMulti name) (->CSQName 3 (cx p (nth ns 0)) name))
+    (r/SAttr name) (->CSAttr name)
+    (r/SAllAttrs) (->CSAllAttrs)
+    (r/SKV name) (->CSKV name)
+    (r/SDescKV name) (->CSDescKV name)
+    (r/SAllKV) (->CSAllKV)
+    (r/SNs) (->CSNs)
+    (r/SMeta name) (->CSMeta name)
+    (r/SDyn ke) (->CSDyn (cx p ke))
+    (r/SQDyn nsx ke) (->CSQDyn (cxs p nsx) (cx p ke))
+    (r/SRange a b) (->CSRange (cx p a) (cx p b))
+    (r/SFilter pe) (->CSFilter (cx p pe))
+    (r/SAttrDyn ke) (->CSAttrDyn (cx p ke))))
+
+(defn- cx-cases Vec(CCase) [p: &r/Prog cs: &Vec(r/RCase)]
+  (loop [i 0 acc: Vec(CCase) []]
+    (if (>= i (count cs)) acc
+      (let [k (nth cs i)
+            pat (match (:pat k)
+                  (r/PLitR x) (->CPLit (cx p x))
+                  (r/PGuardR x) (->CPGuard (cx p x))
+                  (r/PTypeR ty) (->CPType (:t ty))
+                  (r/PRegexR x) (->CPRegex (cx p x))
+                  (r/PArrR h t) (->CPArr h t)
+                  (r/PObjR kk vs t) (->CPObj kk vs t)
+                  (r/PElseR) (->CPElse))]
+        (recur (+ i 1) (conj acc (->CCase (:bind k) pat (cx p (:body k)))))))))
+
+(defn- cx-upds Vec(CUpd) [p: &r/Prog us: &Vec(r/RUpd)]
+  (loop [i 0 acc: Vec(CUpd) []]
+    (if (>= i (count us)) acc
+      (let [u (nth us i)
+            path (loop [j 0 ps: Vec(CSel) []]
+                   (if (>= j (count (:path u))) ps (recur (+ j 1) (conj ps (cx-selk p (nth (:path u) j))))))]
+        (recur (+ i 1) (conj acc (->CUpd (:bind u) (:idx u) path (cxs p (:cond u)) (cx p (:body u))
+                                         (:upsert u) (:sp u))))))))
+
+(defn run-all Values(Vec(v/Val) dwe/DwErr) [c: &Ctx f: &Frame xs: &Vec(C) depth: Int]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count xs)) (values acc (dwe/ok))
+      (let [[x e] (run (nth xs i) c f depth)]
+        (if (dwe/ok? e) (recur (+ i 1) (conj acc x)) (values acc e))))))
+
+(defn append-fail dwe/DwErr [left: v/Val right: v/Val sp: ast/Span]
+  (let [[args se] (rt/whole-args [left right])]
+    (dwe/at (dwe/err (rt/call-types-kind args) (rt/unexpected-types-msg "Append" args [(rt/->Sig ["String" "String"] [] [] false)])) sp)))
+
+(defn- ev-interp Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame parts: &Vec(C) depth: Int]
+  (if (= (count parts) 0) (okv (v/->VStr ""))
+    (let [p0 (nth parts 0)
+          [x0 e0] (run p0 c f depth)]
+      (cond
+        (not (dwe/ok? e0)) (values x0 e0)
+        (= (count parts) 1) (let [[s e2] (rt/to-text x0)] (if (dwe/ok? e2) (okv (v/->VStr s)) (values (nul) (dwe/at e2 (:sp p0)))))
+        :else
+        (let [[s0 se0] (rt/to-text x0)]
+          (loop [i 1 out s0 raw true]
+            (if (>= i (count parts)) (okv (v/->VStr out))
+              (let [pc (nth parts i)
+                    [x e] (run pc c f depth)]
+                (if (not (dwe/ok? e)) (values x e)
+                  (let [[s e2] (rt/to-text x)]
+                    (if (and (dwe/ok? e2) (or (not raw) (dwe/ok? se0)))
+                      (recur (+ i 1) (str out s) false)
+                      (values (nul) (append-fail (if raw (copy x0) (v/->VStr (str out))) x (:sp pc))))))))))))))
+
+(defn- cond-ok Values(Bool dwe/DwErr) [c: &Ctx f: &Frame cnd: &Vec(C) depth: Int]
+  (if (= (count cnd) 0) (values true (dwe/ok))
+    (let [[x e] (run (nth cnd 0) c f depth)]
+      (if (dwe/ok? e) (truthy x (:sp (nth cnd 0))) (values false e)))))
+
+(defn- ev-arr Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame elems: &Vec(CElem) depth: Int]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count elems)) (okv (v/->VArr acc))
+      (let [el (nth elems i)
+            [b e] (cond-ok c f (:cond el) depth)]
+        (if (not (dwe/ok? e)) (values (nul) e)
+          (if (not b) (recur (+ i 1) acc)
+            (let [[x e2] (run (:value el) c f depth)]
+              (if (dwe/ok? e2) (recur (+ i 1) (conj acc x)) (values x e2)))))))))
+
+(defn- ev-ns Values(Vec(v/Ns) dwe/DwErr) [c: &Ctx f: &Frame nsx: &Vec(C) depth: Int]
+  (if (= (count nsx) 0) (values [] (dwe/ok))
+    (let [[x e] (run (nth nsx 0) c f depth)]
+      (if (not (dwe/ok? e)) (values [] e)
+        (match (v/unmeta x)
+          (v/VNsV n) (values [n] (dwe/ok))
+          _ (values [] (dwe/at (dwe/err "InvalidNamespace" "Not a namespace") (:sp (nth nsx 0)))))))))
+
+(defn- ev-key Values(v/Key dwe/DwErr) [c: &Ctx f: &Frame k: &CKey attrs: &Vec(CAttr) depth: Int]
+  (let [[as ae] (ev-attrs c f attrs depth)]
+    (if (not (dwe/ok? ae)) (values (v/simple-key "") ae)
+      (match k
+        (CKName nsx name pk) (if (and (= (count nsx) 0) (= (count as) 0)) (values pk (dwe/ok))
+                               (let [[ns e] (ev-ns c f nsx depth)] (values (v/->Key ns name as) e)))
+        (CKExpr nsx x0) (let [[ns e] (ev-ns c f nsx depth)]
+                          (if (not (dwe/ok? e)) (values (v/simple-key "") e)
+                            (let [[x e2] (run x0 c f depth)]
+                              (if (not (dwe/ok? e2)) (values (v/simple-key "") e2)
+                                (key-of x ns as (> (count attrs) 0) (:sp x0))))))))))
+
+(defn key-of Values(v/Key dwe/DwErr) [x: &v/Val ns: &Vec(v/Ns) as: &Vec(v/Attr) has-attrs: Bool sp: &ast/Span]
+  (match (v/unmeta x)
+    (v/VKey kk) (values (v/->Key (if (= (count ns) 0) (:ns kk) ns) (:name kk) (if has-attrs as (:attrs kk))) (dwe/ok))
+    _ (let [[s e3] (rt/to-text x)] (values (v/->Key ns s as) (dwe/at e3 sp)))))
+
+(defn- ev-attrs Values(Vec(v/Attr) dwe/DwErr) [c: &Ctx f: &Frame attrs: &Vec(CAttr) depth: Int]
+  (if (= (count attrs) 0) (values [] (dwe/ok))
+    (loop [i 0 acc: Vec(v/Attr) []]
+      (if (>= i (count attrs)) (values acc (dwe/ok))
+        (let [a (nth attrs i)
+              [b e] (cond-ok c f (:cond a) depth)]
+          (if (not (dwe/ok? e)) (values acc e)
+            (if (not b) (recur (+ i 1) acc)
+              (let [[ns e1] (ev-ns c f (:ns a) depth)
+                    [x e2] (run (:value a) c f depth)]
+                (cond
+                  (not (dwe/ok? e1)) (values acc e1)
+                  (not (dwe/ok? e2)) (values acc e2)
+                  (:spread a) (let [[a2 se] (spread-attrs acc x)] (if (dwe/ok? se) (recur (+ i 1) a2) (values a2 se)))
+                  :else (recur (+ i 1) (conj acc (v/->Attr ns (:name a) x))))))))))))
+
+(defn- spread-attrs Values(Vec(v/Attr) dwe/DwErr) [acc: Vec(v/Attr) x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) (values (loop [i 0 a acc]
+                          (if (>= i (count fs)) a
+                            (let [k (:key (nth fs i))]
+                              (recur (+ i 1) (conj a (v/->Attr (:ns k) (:name k) (:value (nth fs i))))))))
+                        (dwe/ok))
+    (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (spread-attrs acc (v/->VObj fs)) (values acc fe)))
+    _ (values acc (dwe/ok))))
+
+(defn spread-fields Values(Vec(v/Field) dwe/DwErr) [acc: Vec(v/Field) x: &v/Val sp: &ast/Span]
+  (match (v/unmeta x)
+    (v/VObj fs) (values (loop [a acc i 0] (if (>= i (count fs)) a (recur (conj a (nth fs i)) (+ i 1)))) (dwe/ok))
+    (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (spread-fields acc (v/->VObj fs) sp) (values acc fe)))
+    (v/VArr xs) (loop [a acc i 0]
+                  (if (>= i (count xs)) (values a (dwe/ok))
+                    (let [[a2 e] (spread-fields a (nth xs i) sp)]
+                      (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e)))))
+    (v/VSeq q) (let [[xs se] (v/seq-vec q)] (if (dwe/ok? se) (spread-fields acc (v/->VArr xs) sp) (values acc se)))
+    (v/VNull) (values acc (dwe/ok))
+    _ (values acc (dwe/at (dwe/err "InvalidObject" (str "Cannot spread " (v/type-name (v/unmeta x)) " into an Object")) sp))))
+
+(defvariant- OPart
+  (OPFields fs: Vec(v/Field))
+  (OPSeq q: v/Seq sp: ast/Span))
+
+(defn- ev-obj Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame entries: &Vec(CEntry) depth: Int]
+  (loop [i 0 acc: Vec(v/Field) [] parts: Vec(OPart) []]
+    (if (>= i (count entries))
+      (okv (if (= (count parts) 0) (v/->VObj acc) (v/->VOSeq (parts-fseq (conj parts (->OPFields acc))))))
+      (match (nth entries i)
+        (CEKV k attrs x0 cnd) (let [[b e] (cond-ok c f cnd depth)]
+                                (if (not (dwe/ok? e)) (values (nul) e)
+                                  (if (not b) (recur (+ i 1) acc parts)
+                                    (let [[key ke] (ev-key c f k attrs depth)]
+                                      (if (not (dwe/ok? ke)) (values (nul) ke)
+                                        (let [[x xe] (run x0 c f depth)]
+                                          (if (dwe/ok? xe) (recur (+ i 1) (conj acc (v/->Field key x)) parts) (values x xe))))))))
+        (CESpread x0 cnd) (let [[b e] (cond-ok c f cnd depth)]
+                            (if (not (dwe/ok? e)) (values (nul) e)
+                              (if (not b) (recur (+ i 1) acc parts)
+                                (let [[x xe] (run x0 c f depth)]
+                                  (if (not (dwe/ok? xe)) (values x xe)
+                                    (match (v/unmeta x)
+                                      (v/VSeq q) (recur (+ i 1) [] (conj (conj parts (->OPFields acc)) (->OPSeq q (:sp x0))))
+                                      _ (let [[acc2 se] (spread-fields acc x (:sp x0))]
+                                          (if (dwe/ok? se) (recur (+ i 1) acc2 parts) (values (nul) se)))))))))))))
+
+(defn- parts-fseq v/FSeq [parts: Vec(OPart)]
+  (let [ps parts]
+    (v/->FSeq (fn Fn(Int Values(v/Field Bool dwe/DwErr)) [k: Int] (parts-reader ps)))))
+
+(defn- parts-reader Fn(Int Values(v/Field Bool dwe/DwErr)) [parts: Vec(OPart)]
+  (let [ps parts
+        pi (atom 0)
+        buf: Atom(Vec(v/Field)) (atom [])
+        bi (atom 0)
+        cur: Atom(Vec(Fn(Int Values(v/Val Bool dwe/DwErr)))) (atom [])]
+    (fn Values(v/Field Bool dwe/DwErr) [k: Int]
+      (loop []
+        (let [b (deref buf) i (deref bi)]
+          (cond
+            (< i (count b)) (let [z (reset! bi (+ i 1))] (values (nth b i) false (dwe/ok)))
+            (>= (deref pi) (count ps)) (values v/NO-FIELD true (dwe/ok))
+            :else
+            (match (nth ps (deref pi))
+              (OPFields fs) (let [z1 (reset! buf fs) z2 (reset! bi 0) z3 (swap! pi (fn Int [n: Int] (+ n 1)))] (recur))
+              (OPSeq q sp) (let [nx: Vec(Fn(Int Values(v/Val Bool dwe/DwErr))) (deref cur)
+                                 z0 (if (= (count nx) 0) (reset! cur [((:open q) 0)]) nx)
+                                 [x done e] ((nth (deref cur) 0) 0)]
+                             (cond (not (dwe/ok? e)) (values v/NO-FIELD true e)
+                                   done (let [z1 (reset! cur []) z2 (reset! buf []) z3 (reset! bi 0) z4 (swap! pi (fn Int [n: Int] (+ n 1)))] (recur))
+                                   :else (let [[fs se] (spread-fields [] x sp)]
+                                           (if (not (dwe/ok? se)) (values v/NO-FIELD true se)
+                                             (let [z1 (reset! buf fs) z2 (reset! bi 0)] (recur)))))))))))))
+
+(defn- sel-has-ns? Bool [s: &r/RSelK] (match s (r/SKey ns name) (> (count ns) 0) _ false))
+
+(defn- cx-sel C [p: &r/Prog t: &r/R s: &r/RSelK sp: ast/Span]
+  (let [tc (cx p t)]
+    (match (if (sel-has-ns? s) (r/->SAllKV) s)
+      (r/SKey ns name)
+      (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+             (if (> depth MAX-STACK) (so sp)
+               (let [[x e] (run tc c f depth)]
+                 (if (not (dwe/ok? e)) (values x e)
+                   (let [[y e2] (sel/key-sel x name)] (values y (dwe/at e2 sp)))))))
+           sp)
+      _ (let [sc (cx-selk p s)]
+          (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+                 (if (> depth MAX-STACK) (so sp)
+                   (let [[x e] (run tc c f depth)]
+                     (if (not (dwe/ok? e)) (values x e) (ev-sel c f x sc depth sp)))))
+               sp)))))
+
+(defn- lit-match? Bool [x: &v/Val y: &v/Val]
+  (match (v/unmeta x)
+    (v/VKey k) (match (v/unmeta y) (v/VStr s) (= (:name k) s) _ (v/equal? x y))
+    _ (v/equal? x y)))
+
+(defn- ev-sel Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame x: &v/Val s: &CSel depth: Int sp: &ast/Span]
+  (let [[y e] (ev-sel-raw c f x s depth sp)] (values y (dwe/at e sp))))
+
+(defn- ev-sel-raw Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame x: &v/Val s: &CSel depth: Int sp: &ast/Span]
+  (match s
+    (CSKey name) (sel/key-sel x name)
+    (CSMulti name) (sel/multi-sel x name)
+    (CSDesc name) (sel/desc-sel x name false)
+    (CSDescMulti name) (sel/desc-sel x name true)
+    (CSQName kind nc name) (let [[nv ne] (run nc c f depth)]
+                             (if (not (dwe/ok? ne)) (values (nul) ne)
+                               (match (v/unmeta nv)
+                                 (v/VNsV n) (sel/qname-sel x kind (:uri n) name)
+                                 (v/VStr u) (sel/qname-sel x kind u name)
+                                 _ (sel/qname-sel x kind "" name))))
+    (CSAttr name) (sel/attr-sel x name)
+    (CSAllAttrs) (sel/all-attrs-sel x)
+    (CSKV name) (sel/kv-sel x name)
+    (CSDescKV name) (sel/desc-kv-sel x name)
+    (CSAllKV) (match (v/unmeta x) (v/VObj fs) (rt/ret (v/unmeta x)) (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (rt/ret (v/->VObj fs)) (values (nul) fe))) _ (rt/ret (v/null-v)))
+    (CSNs) (sel/ns-sel x)
+    (CSMeta name) (sel/meta-sel x name)
+    (CSQDyn nsc ke) (let [[k e] (run ke c f depth)]
+                      (if (not (dwe/ok? e)) (values (nul) e)
+                        (let [[nm te] (rt/to-text k)]
+                          (if (not (dwe/ok? te)) (values (nul) te)
+                            (if (= (count nsc) 0) (sel/key-sel x nm)
+                              (let [[nv ne] (run (nth nsc 0) c f depth)]
+                                (if (not (dwe/ok? ne)) (values (nul) ne)
+                                  (match (v/unmeta nv)
+                                    (v/VNsV n) (sel/qname-sel x 0 (:uri n) nm)
+                                    _ (sel/qname-sel x 0 "" nm)))))))))
+    (CSDyn ke) (let [[k e] (run ke c f depth)]
+                 (if (not (dwe/ok? e)) (values k e)
+                   (match (v/unmeta k)
+                     (v/VInt i) (sel/index-sel x i)
+                     (v/VNum n) (let [[i ie] (num/to-int n)]
+                                  (if (= ie "") (sel/index-sel x i) (rt/failure "InvalidSelector" "Index must be an integer")))
+                     (v/VStr s2) (sel/key-sel x s2)
+                     (v/VKey kk) (sel/key-sel x (:name kk))
+                     (v/VRange a b) (sel/range-sel x a b)
+                     _ (rt/failure "InvalidSelector" (str "Cannot select with " (v/type-name (v/unmeta k)))))))
+    (CSRange a0 b0) (let [[a e] (run a0 c f depth)]
+                      (if (not (dwe/ok? e)) (values a e)
+                        (let [[b e2] (run b0 c f depth)]
+                          (if (not (dwe/ok? e2)) (values b e2)
+                            (let [[ia ea] (num-arg a) [ib eb] (num-arg b)]
+                              (if (and (= ea "") (= eb "")) (sel/range-sel x ia ib) (rt/failure "InvalidSelector" "Range bounds must be integers")))))))
+    (CSFilter pe) (let [[pv e] (run pe c f depth)]
+                    (if (not (dwe/ok? e)) (values pv e) (filter-sel c x pv depth sp)))
+    (CSAttrDyn ke) (let [[k e] (run ke c f depth)]
+                     (if (not (dwe/ok? e)) (values k e)
+                       (let [[s2 e2] (rt/to-text k)] (if (dwe/ok? e2) (sel/attr-sel x s2) (values (nul) e2)))))))
+
+(defn- num-arg Values(Int Str) [x: &v/Val]
+  (match (v/unmeta x) (v/VInt i) (values i "") (v/VNum n) (num/to-int n) _ (values 0 "not a number")))
+
+(defn- filter-sel Values(v/Val dwe/DwErr) [c: &Ctx x: &v/Val p: &v/Val depth: Int sp: &ast/Span]
+  (match (v/unmeta x)
+    (v/VNull) (okv (nul))
+    (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (filter-sel c (v/->VObj fs) p depth sp) (values (nul) fe)))
+    (v/VSeq q) (let [[xs xe] (v/seq-vec q)] (if (dwe/ok? xe) (filter-sel c (v/->VArr xs) p depth sp) (values (nul) xe)))
+    (v/VObj fs) (loop [i 0 acc: Vec(v/Field) []]
+                  (if (>= i (count fs)) (okv (v/->VObj acc))
+                    (let [[b e] (call-val c p [(:value (nth fs i)) (v/->VKey (:key (nth fs i)))] (+ depth 1) sp)]
+                      (if (not (dwe/ok? e)) (values b e)
+                        (let [[t e2] (truthy b sp)]
+                          (if (not (dwe/ok? e2)) (values (nul) e2)
+                            (recur (+ i 1) (if t (conj acc (nth fs i)) acc))))))))
+    _ (let [xs (v/items (v/unmeta x))]
+        (loop [i 0 acc: Vec(v/Val) []]
+          (if (>= i (count xs)) (okv (v/->VArr acc))
+            (let [[b e] (call-val c p [(nth xs i) (v/int-v i)] (+ depth 1) sp)]
+              (if (not (dwe/ok? e)) (values b e)
+                (let [[t e2] (truthy b sp)]
+                  (if (not (dwe/ok? e2)) (values (nul) e2)
+                    (recur (+ i 1) (if t (conj acc (nth xs i)) acc)))))))))))
+
+(defn- cx-exists C [p: &r/Prog t: &r/R sp: ast/Span]
+  (match (:x t)
+    (r/RSel base s)
+    (let [bc (cx p base) sc (cx-selk p s) tsp (:sp t)]
+      (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+             (if (> depth MAX-STACK) (so sp)
+               (let [[x e] (run bc c f depth)]
+                 (if (not (dwe/ok? e)) (values x e)
+                   (match sc
+                     (CSKey name) (let [[b ke] (key-present x name)] (if (dwe/input? ke) (values (nul) ke) (okv (v/bool-v (and (dwe/ok? ke) b)))))
+                     _ (let [[y e2] (ev-sel c f x sc depth tsp)] (exists-of y e2)))))))
+           sp))
+    _ (let [tc (cx p t)]
+        (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+               (if (> depth MAX-STACK) (so sp)
+                 (let [[y e] (run tc c f depth)] (exists-of y e))))
+             sp))))
+
+(defn- exists-of Values(v/Val dwe/DwErr) [y: &v/Val e: &dwe/DwErr]
+  (if (dwe/input? e) (values (nul) e) (okv (v/bool-v (and (dwe/ok? e) (not (v/null? y)))))))
+
+(defn- key-present Values(Bool dwe/DwErr) [x: &v/Val name: &Str]
+  (match (v/unmeta x)
+    (v/VObj fs) (values (> (count (v/obj-get fs name)) 0) (dwe/ok))
+    (v/VOSeq q) (let [nx ((:open q) 0)]
+                  (loop []
+                    (let [[f done e] (nx 0)]
+                      (cond (not (dwe/ok? e)) (values false e)
+                            done (values false (dwe/ok))
+                            (= (:name (:key f)) name) (values true (dwe/ok))
+                            :else (recur)))))
+    (v/VArr xs) (loop [i 0]
+                  (if (>= i (count xs)) (values false (dwe/ok))
+                    (let [[b e] (key-present (nth xs i) name)]
+                      (cond (not (dwe/ok? e)) (values false e) b (values true e) :else (recur (+ i 1))))))
+    _ (values false (dwe/ok))))
+
+(defn- cx-assert C [p: &r/Prog t: &r/R sp: ast/Span]
+  (match (:x t)
+    (r/RSel base s)
+    (let [bc (cx p base) sc (cx-selk p s) tsp (:sp t)]
+      (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+             (if (> depth MAX-STACK) (so sp)
+               (let [[x e] (run bc c f depth)]
+                 (if (not (dwe/ok? e)) (values x e)
+                   (match sc
+                     (CSKey name) (let [[w we] (whole-if c x)
+                                        [b ke] (if (dwe/ok? we) (key-present w name) (values false we))]
+                                    (cond (not (dwe/ok? ke)) (values x (dwe/at ke tsp))
+                                          b (ev-sel c f w sc depth tsp)
+                                          :else (failv "KeyNotFound" (str "There is no key named '" name "'") tsp)))
+                     _ (ev-sel c f x sc depth tsp))))))
+           sp))
+    _ (let [tc (cx p t)]
+        (->C (fn Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame depth: Int]
+               (if (> depth MAX-STACK) (so sp) (run tc c f depth)))
+             sp))))
+
+(defn- upd-leaf Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame x: v/Val u: &CUpd index: Int depth: Int]
+  (let [s1 (assoc (:slots f) (:bind u) x)
+        s2 (if (>= (:idx u) 0) (assoc s1 (:idx u) (v/int-v index)) s1)
+        f2 (->Frame s2 (:caps f))
+        [ok e] (cond-ok c f2 (:cond u) depth)]
+    (if (not (dwe/ok? e)) (values x e)
+      (if ok (run (:body u) c f2 depth) (okv x)))))
+
+(defn- upd-at Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame x: v/Val u: &CUpd i: Int index: Int depth: Int]
+  (let [path (:path u)]
+    (if (>= i (count path)) (upd-leaf c f x u index depth)
+      (let [last (= (+ i 1) (count path))]
+        (match (nth path i)
+          (CSKey name) (upd-key c f x u i name false last depth)
+          (CSMulti name) (upd-key c f x u i name true last depth)
+          (CSAttr name) (okv x)
+          (CSDyn ke) (let [[k e] (run ke c f depth)]
+                       (if (not (dwe/ok? e)) (values x e)
+                         (match (v/unmeta k)
+                           (v/VInt ix) (upd-index c f x u i ix depth)
+                           (v/VNum n) (let [[ix ie] (num/to-int n)] (upd-index c f x u i ix depth))
+                           (v/VStr s2) (upd-key c f x u i s2 false last depth)
+                           _ (okv x))))
+          _ (okv x))))))
+
+(defn- upd-key Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame x: v/Val u: &CUpd i: Int name: &Str all: Bool last: Bool depth: Int]
+  (match (v/unmeta x)
+    (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (upd-key c f (v/->VObj fs) u i name all last depth) (values x fe)))
+    (v/VObj fs)
+    (let [path (:path u)
+          attr-next (and (< (+ i 1) (count path)) (match (nth path (+ i 1)) (CSAttr a) true _ false))
+          [out hit e] (loop [k 0 acc: Vec(v/Field) [] hit false]
+                        (if (>= k (count fs)) (values acc hit (dwe/ok))
+                          (let [fl (nth fs k)]
+                            (if (and (= (:name (:key fl)) name) (or all (not hit)))
+                              (if attr-next
+                                (let [[nk e2] (upd-attr c f (:key fl) u (+ i 1) depth)]
+                                  (if (dwe/ok? e2) (recur (+ k 1) (conj acc (v/->Field nk (:value fl))) true) (values acc hit e2)))
+                                (let [[nv e2] (upd-at c f (:value fl) u (+ i 1) k depth)]
+                                  (if (dwe/ok? e2) (recur (+ k 1) (conj acc (v/->Field (:key fl) nv)) true) (values acc hit e2))))
+                              (recur (+ k 1) (conj acc fl) hit)))))]
+      (if (not (dwe/ok? e)) (values x e)
+        (if (and (not hit) (:upsert u) last)
+          (let [[nv e2] (upd-leaf c f (v/null-v) u (count fs) depth)]
+            (if (dwe/ok? e2) (okv (v/->VObj (conj out (v/field name nv)))) (values x e2)))
+          (okv (v/->VObj out)))))
+    (v/VNull) (if (and (:upsert u) last)
+                (let [[nv e2] (upd-leaf c f (v/null-v) u 0 depth)]
+                  (if (dwe/ok? e2) (okv (v/->VObj [(v/field name nv)])) (values x e2)))
+                (okv x))
+    _ (okv x)))
+
+(defn- upd-attr Values(v/Key dwe/DwErr) [c: &Ctx f: &Frame k: &v/Key u: &CUpd i: Int depth: Int]
+  (let [name (match (nth (:path u) i) (CSAttr a) a _ "")
+        as (:attrs k)]
+    (loop [j 0 acc: Vec(v/Attr) [] hit false]
+      (if (>= j (count as))
+        (if (or hit (not (:upsert u))) (values (v/->Key (:ns k) (:name k) acc) (dwe/ok))
+          (let [[nv e] (upd-leaf c f (v/null-v) u 0 depth)]
+            (values (v/->Key (:ns k) (:name k) (conj acc (v/->Attr [] name nv))) e)))
+        (let [a (nth as j)]
+          (if (= (:name a) name)
+            (let [[nv e] (upd-leaf c f (:value a) u j depth)]
+              (if (dwe/ok? e) (recur (+ j 1) (conj acc (v/->Attr (:ns a) name nv)) true) (values k e)))
+            (recur (+ j 1) (conj acc a) hit)))))))
+
+(defn- upd-index Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame x: v/Val u: &CUpd i: Int ix: Int depth: Int]
+  (match (v/unmeta x)
+    (v/VArr xs) (let [n (count xs) j (if (< ix 0) (+ n ix) ix)]
+                  (if (or (< j 0) (>= j n)) (okv x)
+                    (let [[nv e] (upd-at c f (nth xs j) u (+ i 1) j depth)]
+                      (if (dwe/ok? e) (okv (v/->VArr (assoc xs j nv))) (values x e)))))
+    (v/VSeq q) (let [[xs se] (v/seq-vec q)] (if (dwe/ok? se) (upd-index c f (v/->VArr xs) u i ix depth) (values x se)))
+    _ (okv x)))
+
+(defn- ev-match Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame x0: &v/Val cases: &Vec(CCase) depth: Int sp: &ast/Span]
+  (let [[x we] (whole-if c x0)]
+    (if (not (dwe/ok? we)) (values (nul) (dwe/at we sp)) (ev-match-cases c f x cases depth sp))))
+
+(defn- ev-match-cases Values(v/Val dwe/DwErr) [c: &Ctx f: &Frame x: &v/Val cases: &Vec(CCase) depth: Int sp: &ast/Span]
+  (loop [i 0]
+    (if (>= i (count cases)) (failv "MatchException" (str "Unable to match: " (v/type-name (v/unmeta x))) sp)
+      (let [cs (nth cases i)
+            bind (:bind cs)
+            f1 (if (>= bind 0) (->Frame (assoc (:slots f) bind x) (:caps f)) (->Frame (:slots f) (:caps f)))
+            [ok f2 e] (try-pat c f1 x (:pat cs) bind depth)]
+        (if (not (dwe/ok? e)) (values (nul) e)
+          (if ok (run (:body cs) c f2 depth) (recur (+ i 1))))))))
+
+(defn- try-pat Values(Bool Frame dwe/DwErr) [c: &Ctx f: Frame x: &v/Val p: &CPat bind: Int depth: Int]
+  (match p
+    (CPElse) (values true f (dwe/ok))
+    (CPLit lit) (let [[y e] (run lit c f depth)] (values (and (dwe/ok? e) (lit-match? x y)) f e))
+    (CPGuard cnd) (let [[y e] (run cnd c f depth)]
+                    (if (not (dwe/ok? e)) (values false f e)
+                      (let [[b e2] (truthy y (:sp cnd))] (values b f e2))))
+    (CPType ty) (values (co/is-type? x ty) f (dwe/ok))
+    (CPRegex rxc) (let [[y e] (run rxc c f depth)]
+                    (if (not (dwe/ok? e)) (values false f e)
+                      (match (v/unmeta x)
+                        (v/VStr s) (let [[m me] (regex-groups y s)]
+                                     (if (not (dwe/ok? me)) (values false f me)
+                                       (if (= (count m) 0) (values false f (dwe/ok))
+                                         (values true (if (>= bind 0) (->Frame (assoc (:slots f) bind (nth m 0)) (:caps f)) f) (dwe/ok)))))
+                        _ (values false f (dwe/ok)))))
+    (CPArr h t) (match (v/unmeta x)
+                  (v/VArr xs) (if (= (count xs) 0) (values false f (dwe/ok))
+                                (values true (->Frame (assoc (assoc (:slots f) h (nth xs 0)) t (v/->VArr (subvec xs 1 (count xs)))) (:caps f)) (dwe/ok)))
+                  _ (values false f (dwe/ok)))
+    (CPObj k vs t) (match (v/unmeta x)
+                     (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (try-pat c f (v/->VObj fs) p bind depth) (values false f fe)))
+                     (v/VObj fs) (if (= (count fs) 0) (values false f (dwe/ok))
+                                   (let [f0 (nth fs 0)]
+                                     (values true (->Frame (assoc (assoc (assoc (:slots f) k (v/->VKey (:key f0))) vs (:value f0)) t (v/->VObj (subvec fs 1 (count fs)))) (:caps f)) (dwe/ok))))
+                     _ (values false f (dwe/ok)))))
+
+(defn compile-regex Values(rx/Pattern dwe/DwErr) [re: &v/Val]
+  (match (v/unmeta re)
+    (v/VRegex src fl) (let [flags (loop [i 0 f 0]
+                                    (if (>= i (count fl)) f
+                                      (recur (+ i 1) (case (nth fl i) 105 (bit-or f rx/CASE-INSENSITIVE) 109 (bit-or f rx/MULTILINE)
+                                                       115 (bit-or f rx/DOTALL) 120 (bit-or f rx/COMMENTS) f))))
+                            [p e] (rx/compile src flags)]
+                        (values p (if (= e "") (dwe/ok) (dwe/err "InvalidRegex" e))))
+    (v/VStr src) (let [[p e] (rx/compile src 0)] (values p (if (= e "") (dwe/ok) (dwe/err "InvalidRegex" e))))
+    _ (let [[p e] (rx/compile "" 0)] (values p (dwe/err "InvalidRegex" "Expected a Regex")))))
+
+(defn- regex-groups Values(Vec(v/Val) dwe/DwErr) [re: &v/Val s: &Str]
+  (let [[p ce] (compile-regex re)]
+    (if (not (dwe/ok? ce)) (values [] ce)
+      (let [[ms me] (rx/match-full p s)]
+        (if (not= me "") (values [] (dwe/err "InvalidRegex" me))
+          (if (= (count ms) 0) (values [] (dwe/ok))
+            (let [m (nth ms 0)
+                  n (rx/groups m)
+                  gs (loop [g 0 acc: Vec(v/Val) []]
+                       (if (> g n) acc
+                         (recur (+ g 1) (conj acc (if (rx/group-matched? m g) (v/->VStr (rx/group m s g)) (v/null-v))))))]
+              (values [(v/->VArr gs)] (dwe/ok)))))))))
+
+(defn call-fnv Values(v/Val dwe/DwErr) [c: &Ctx fv: &v/FnV args: Vec(v/Val) depth: Int check: Bool]
+  (match (:host fv)
+    (Some h) (call-host c h (:arity fv) args depth)
+    (None)
+    (let [d (:def fv)]
+      (if (< d 0)
+        (let [caps (:caps fv)
+              full (if (= (count caps) 0) args (loop [acc caps i 0] (if (>= i (count args)) acc (recur (conj acc (nth args i)) (+ i 1)))))]
+          (rt/invoke (env-of c depth) (nth (:builtins c) (- -1 d)) full))
+        (let [np (:nparams (nth (:fns (:code c)) d))
+              args2 (if (> (count args) np) (subvec args 0 np) args)]
+          (call-def c d (:caps fv) args2 depth (dwe/no-span) check))))))
+
+(defn- fn-span Vec(Int) [c: &Ctx f: &v/FnV]
+  (match (:host f)
+    (Some h) []
+    (None) (let [d (:def f)]
+             (if (or (< d 0) (>= d (count (:fns (:code c))))) []
+               (let [sp (:sp (nth (:fns (:code c)) d))] (if (< (:start sp) 0) [] [(:start sp) (:end sp)]))))))
+
+(defn invoker Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) [c: &Ctx]
+  (let [c1 c] (fn Values(v/Val dwe/DwErr) [g: v/FnV args: Vec(v/Val) depth: Int] (call-fnv c1 g args depth true))))
+
+(defn export-fn v/Val [c: &Ctx g: &v/FnV]
+  (match (:host g)
+    (Some h) (v/->VFn g)
+    (None) (match (:wrap c)
+             (Some w) (w (invoker c) g)
+             (None) (plain-host (invoker c) (:srcs (:code c)) g))))
+
+(defn plain-export v/Val [c: &Ctx g: &v/FnV] (plain-host (invoker c) (:srcs (:code c)) g))
+
+(defn- host-pnames Str [ps: &Vec(Str)]
+  (loop [i 0 out ""] (if (>= i (count ps)) out (recur (+ i 1) (str out (if (> i 0) ", " "") (nth ps i))))))
+
+(defn- host-args Vec(Vec(v/Val)) [args: &Vec(v/Val) ts: &Vec(v/TypeV)]
+  (loop [j 0 acc: Vec(v/Val) []]
+    (if (>= j (count args)) [acc]
+      (let [x (nth args j) t (nth ts j)]
+        (if (co/is-type? x t) (recur (+ j 1) (conj acc x))
+          (let [[y e] (co/coerce x t)]
+            (if (and (dwe/ok? e) (co/is-type? y t)) (recur (+ j 1) (conj acc y)) [])))))))
+
+(defn- call-host Values(v/Val dwe/DwErr) [c: &Ctx h: &v/Host arity: Int args0: Vec(v/Val) depth: Int]
+  (let [np (count (:params h))
+        na (count args0)
+        c1 c
+        exp (v/->Caller (fn v/Val [g: v/FnV] (export-fn c1 g)) (fn v/Val [g: v/FnV] (plain-export c1 g)))]
+    (cond
+      (< arity 0) ((:call h) exp args0 depth)
+      (> na np) (values (nul) (dwe/err "InvalidArgs" (str "Too many arguments (" na ") for function with parameters (" (host-pnames (:params h)) ").")))
+      (< na np) (values (nul) (dwe/err "InvalidArgs" (str "Not enough arguments (" na ") for function with parameters (" (host-pnames (:params h)) ").")))
+      :else
+      (let [[args we] (if (:lazy c) (rt/whole-args args0) (values args0 (dwe/ok)))]
+        (if (not (dwe/ok? we)) (values (nul) we)
+          (let [cargs (host-args args (:ptypes h))]
+            (if (= (count cargs) 0)
+              (values (nul) (dwe/err (rt/call-types-kind args) (rt/unexpected-types-msg (:name h) args [(co/params-sig (:ptypes h))])))
+              ((:call h) exp (nth cargs 0) depth))))))))
+
+(def NO-WRAP: Option(Fn(Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) v/FnV v/Val)) (->None))
+
+(defn- plain-host v/Val [inv: Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) srcs: rt/Srcs g: v/FnV]
+  (match (:host g)
+    (Some h) (v/->VFn g)
+    (None)
+    (v/->VFn (v/->FnV -1 [] (->Some (v/->Host "" [] []
+                                              (fn Values(v/Val dwe/DwErr) [caller: v/Caller args: Vec(v/Val) depth: Int]
+                                                (let [[ws we] (whole-each args)]
+                                                  (if (not (dwe/ok? we)) (values (nul) we)
+                                                    (let [[y e] (inv g (export-args (:plain caller) ws) depth)
+                                                          [y2 ye] (if (dwe/ok? e) (v/whole-deep y) (values y e))]
+                                                      (if (dwe/ok? ye) (values (export-val (fn v/Val [r: v/FnV] (plain-host inv srcs r)) y2) ye)
+                                                        (values y2 (plain-rehome ye srcs)))))))))
+                      -1))))
+
+(defn- whole-each Values(Vec(v/Val) dwe/DwErr) [xs: &Vec(v/Val)]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count xs)) (values acc (dwe/ok))
+      (let [[w e] (v/whole-deep (nth xs i))] (if (dwe/ok? e) (recur (+ i 1) (conj acc w)) (values acc e))))))
+
+(defn- plain-rehome dwe/DwErr [e: dwe/DwErr srcs: &rt/Srcs]
+  (if (not= (:origin e) "") e
+    (let [fs (dwe/stack-of e)
+          shown (loop [i 0 acc: Vec(dwe/StackF) []]
+                  (if (>= i (count fs)) acc
+                    (let [fr (nth fs i)]
+                      (recur (+ i 1) (cond (not= (:where fr) "") (conj acc fr)
+                                           (dwe/unset? (:sp fr)) acc
+                                           :else (let [[ln col x id] (rt/excerpt-in srcs (:sp fr))]
+                                                   (conj acc (dwe/->StackF (:name fr) (:sp fr) (str id ":" ln ":" col)))))))))
+          [ln col x id] (rt/excerpt-in srcs (:sp e))
+          fr0 (if (> (count shown) 0) shown [(dwe/->StackF "main" (:sp e) (str id ":" ln ":" col))])]
+      (dwe/->DwErr (:kind e) (:msg e) (:sp e) fr0 (dwe/no-span) x))))
+
+(defn export-val v/Val [exp: &Fn(v/FnV v/Val) x0: &v/Val]
+  (if (has-fn? x0) (export-walk exp x0) x0))
+
+(defn- has-fn? Bool [x: &v/Val]
+  (match x
+    (v/VMeta y m) (has-fn? y)
+    (v/VFn f) true
+    (v/VArr xs) (loop [i 0] (if (>= i (count xs)) false (if (has-fn? (nth xs i)) true (recur (+ i 1)))))
+    (v/VObj fs) (loop [i 0] (if (>= i (count fs)) false (if (has-fn? (:value (nth fs i))) true (recur (+ i 1)))))
+    _ false))
+
+(defn- export-walk v/Val [exp: &Fn(v/FnV v/Val) x0: &v/Val]
+  (match x0
+    (v/VMeta y m) (v/->VMeta (export-val exp y) m)
+    (v/VFn f) (exp f)
+    (v/VArr xs) (v/->VArr (export-args exp xs))
+    (v/VObj fs) (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                            (if (>= i (count fs)) acc
+                              (let [f (nth fs i)] (recur (+ i 1) (conj acc (v/->Field (:key f) (export-val exp (:value f)))))))))
+    _ x0))
+
+(defn- export-args Vec(v/Val) [exp: &Fn(v/FnV v/Val) xs: &Vec(v/Val)]
+  (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (export-val exp (nth xs i)))))))
+
+(defn call-sp ast/Span [fv: &v/FnV sp: &ast/Span fsp: &ast/Span] (match (:host fv) (Some h) fsp (None) sp))
+
+(defn call-val-at Values(v/Val dwe/DwErr) [c: &Ctx fx: &v/Val args: Vec(v/Val) depth: Int sp: &ast/Span fsp: &ast/Span]
+  (match (v/unmeta fx)
+    (v/VFn fv) (let [[y e] (call-fnv c fv args depth true)] (values y (dwe/at e (call-sp fv sp fsp))))
+    _ (call-val c fx args depth sp)))
+
+(defn call-val Values(v/Val dwe/DwErr) [c: &Ctx fx: &v/Val args: Vec(v/Val) depth: Int sp: &ast/Span]
+  (match (v/unmeta fx)
+    (v/VFn fv) (let [[y e] (call-fnv c fv args depth true)] (values y (dwe/at e sp)))
+    (v/VNull) (okv (v/null-v))
+    _ (failv "InvalidCall" (str "Cannot call a value of type " (v/type-name (v/unmeta fx)) " as a function") sp)))
+
+(defn bind-args Values(Frame dwe/DwErr) [c: &Ctx fd: &CFn caps: Vec(v/Val) args: Vec(v/Val) depth: Int]
+  (let [np (:nparams fd)
+        na (count args)]
+    (cond
+      (> na np)
+      (values (->Frame [] caps) (dwe/err "InvalidArgs" (str "Too many arguments (" na ") for function with parameters (" (:pnames fd) ").")))
+      (and (< na np) (> (count (nth (:defaults fd) 0)) 0) (not (lambda-name? (:name fd))))
+      (bind-right c fd caps args depth)
+      :else
+      (let [base (loop [acc args k na] (if (>= k (:nslots fd)) acc (recur (conj acc (v/null-v)) (+ k 1))))]
+        (loop [fr (->Frame base caps) k na]
+          (if (>= k np) (values fr (dwe/ok))
+            (let [dv (nth (:defaults fd) k)]
+              (if (= (count dv) 0)
+                (values fr (dwe/err "InvalidArgs" (str "Not enough arguments (" na ") for function with parameters (" (:pnames fd) ").")))
+                (let [[x e] (run (nth dv 0) c fr depth)]
+                  (if (dwe/ok? e) (recur (->Frame (assoc (:slots fr) k x) (:caps fr)) (+ k 1))
+                    (values fr e)))))))))))
+
+(defn- lambda-name? Bool [n: &Str] (and (> (count n) 0) (= (nth n 0) 60)))
+
+(defn- bind-right Values(Frame dwe/DwErr) [c: &Ctx fd: &CFn caps: Vec(v/Val) args: Vec(v/Val) depth: Int]
+  (let [np (:nparams fd)
+        na (count args)
+        off (- np na)
+        base (loop [acc: Vec(v/Val) [] k 0]
+               (if (>= k (:nslots fd)) acc
+                 (recur (conj acc (if (and (>= k off) (< k np)) (nth args (- k off)) (v/null-v))) (+ k 1))))]
+    (loop [fr (->Frame base caps) k 0]
+      (if (>= k off) (values fr (dwe/ok))
+        (let [dv (nth (:defaults fd) k)]
+          (if (= (count dv) 0)
+            (values fr (dwe/err "InvalidArgs" (str "Not enough arguments (" na ") for function with parameters (" (:pnames fd) ").")))
+            (let [[x e] (run (nth dv 0) c fr depth)]
+              (if (dwe/ok? e) (recur (->Frame (assoc (:slots fr) k x) (:caps fr)) (+ k 1))
+                (values fr e)))))))))
+
+(defn pick-def Int [c: &Ctx d: Int args: &Vec(v/Val)]
+  (let [alts (:alts (nth (:fns (:code c)) d))]
+    (if (= (count alts) 0) d
+      (loop [i 0]
+        (if (>= i (count alts)) d
+          (let [k (nth alts i)]
+            (if (types-ok? c k args) k (recur (+ i 1)))))))))
+
+(defn- arity-ok? Bool [c: &Ctx k: Int na: Int]
+  (let [fd (nth (:fns (:code c)) k) np (:nparams fd)]
+    (and (<= na np)
+         (loop [j na] (if (>= j np) true (if (> (count (nth (:defaults fd) j)) 0) (recur (+ j 1)) false))))))
+
+(defn- types-ok? Bool [c: &Ctx k: Int args: &Vec(v/Val)]
+  (let [fd (nth (:fns (:code c)) k) na (count args)]
+    (and (arity-ok? c k na)
+         (loop [j 0] (if (>= j na) true (if (co/is-type? (nth args j) (nth (:ptypes fd) j)) (recur (+ j 1)) false))))))
+
+(defn- coerce-args Vec(Vec(v/Val)) [c: &Ctx k: Int args: &Vec(v/Val)]
+  (let [ts (:ptypes (nth (:fns (:code c)) k))]
+    (loop [j 0 acc: Vec(v/Val) []]
+      (if (>= j (count args)) [acc]
+        (let [x (nth args j) t (nth ts j)]
+          (if (co/is-type? x t) (recur (+ j 1) (conj acc x))
+            (let [[y e] (co/coerce x t)]
+              (if (and (dwe/ok? e) (co/is-type? y t)) (recur (+ j 1) (conj acc y)) []))))))))
+
+(defn- any-typed? Bool [fd: &CFn]
+  (let [ts (:ptypes fd)] (loop [j 0] (if (>= j (count ts)) true (if (= (:kind (nth ts j)) "any") (recur (+ j 1)) false)))))
+
+(defn- display-name Str [n: &Str] (if (lambda-name? n) "AnonymousFunction" (rt/short-name n)))
+
+(defn- select-def Values(Int Vec(v/Val) dwe/DwErr) [c: &Ctx d: Int args: Vec(v/Val)]
+  (let [fd0 (nth (:fns (:code c)) d)
+        alts (if (= (count (:alts fd0)) 0) [d] (:alts fd0))
+        na (count args)]
+    (if (and (= (count alts) 1) (any-typed? fd0)) (values d args (dwe/ok))
+      (let [[wargs we] (if (:lazy c) (rt/whole-args args) (values args (dwe/ok)))]
+        (if (not (dwe/ok? we)) (values d args we) (select-typed c d fd0 alts na wargs))))))
+
+(defn- select-typed Values(Int Vec(v/Val) dwe/DwErr) [c: &Ctx d: Int fd0: &CFn alts: &Vec(Int) na: Int args: Vec(v/Val)]
+      (let [fit (loop [i 0 acc: Vec(Int) []] (if (>= i (count alts)) acc (recur (+ i 1) (if (arity-ok? c (nth alts i) na) (conj acc i) acc))))]
+        (if (= (count fit) 0) (values d args (dwe/ok))
+          (let [exact (loop [i 0] (if (>= i (count fit)) -1 (if (types-ok? c (nth alts (nth fit i)) args) (nth alts (nth fit i)) (recur (+ i 1)))))]
+            (if (>= exact 0) (values exact args (dwe/ok))
+              (let [sigs (loop [i 0 acc: Vec(rt/Sig) []] (if (>= i (count alts)) acc (recur (+ i 1) (conj acc (co/params-sig (:ptypes (nth (:fns (:code c)) (nth alts i))))))))
+                    order (rt/weight-order sigs fit (rt/val-tags args))
+                    [k cargs] (loop [i 0]
+                                (if (>= i (count order)) (values -1 args)
+                                  (let [kk (nth alts (nth order i)) cs (coerce-args c kk args)]
+                                    (if (> (count cs) 0) (values kk (nth cs 0)) (recur (+ i 1))))))]
+                (if (>= k 0) (values k cargs (dwe/ok))
+                  (values d args (dwe/err (rt/call-types-kind args) (rt/unexpected-types-msg (display-name (:name fd0)) args sigs))))))))))
+
+(defn bind-pick Values(Int Frame dwe/DwErr) [c: &Ctx d0: Int caps: Vec(v/Val) args: Vec(v/Val) depth: Int]
+  (let [[d args2 se] (select-def c d0 args)]
+    (if (not (dwe/ok? se)) (values d (->Frame [] caps) se)
+      (let [[fr e] (bind-args c (nth (:fns (:code c)) d) caps args2 depth)]
+        (values d fr e)))))
+
+(defn- bind-loose Values(Int Frame dwe/DwErr) [c: &Ctx d0: Int caps: Vec(v/Val) args: Vec(v/Val) depth: Int]
+  (let [d (pick-def c d0 args)
+        [fr e] (bind-args c (nth (:fns (:code c)) d) caps args depth)]
+    (values d fr e)))
+
+(def HOPS 64)
+
+(defn call-def Values(v/Val dwe/DwErr) [c: &Ctx d00: Int caps0: Vec(v/Val) args0: Vec(v/Val) depth: Int sp: &ast/Span check: Bool]
+  (let [[d0 fr0 be] (if check (bind-pick c d00 caps0 args0 depth) (bind-loose c d00 caps0 args0 depth))]
+    (if (not (dwe/ok? be)) (values (nul) (dwe/at be sp)) (run-def c d0 fr0 depth sp))))
+
+(defn run-def Values(v/Val dwe/DwErr) [c: &Ctx d0: Int fr0: Frame depth: Int sp: &ast/Span]
+  (let [[x e nd nf] ((:run (:body (nth (:fns (:code c)) d0))) c fr0 depth)]
+    (cond
+      (>= nd 0) (if (< 0 HOPS) (run-hops c nd nf 1 [d0] [e] depth sp) (run-hops c nd nf 0 [] [] depth sp))
+      (dwe/ok? e) (values x e)
+      :else (values x (unwind c e d0 0 [] [] sp)))))
+
+(defn- run-hops Values(v/Val dwe/DwErr) [c: &Ctx d1: Int fr1: Frame n1: Int hd1: Vec(Int) hm1: Vec(dwe/DwErr) depth: Int sp: &ast/Span]
+      (loop [d d1 fr fr1 n n1 hd hd1 hm hm1]
+        (let [[x e nd nf] ((:run (:body (nth (:fns (:code c)) d))) c fr depth)]
+          (cond
+            (>= nd 0) (if (< n HOPS) (recur nd nf (+ n 1) (conj hd d) (conj hm e)) (recur nd nf n hd hm))
+            (dwe/ok? e) (values x e)
+            :else (values x (unwind c e d n hd hm sp))))))
+
+(defn- unwind dwe/DwErr [c: &Ctx e0: dwe/DwErr d: Int n: Int hd: &Vec(Int) hm: &Vec(dwe/DwErr) sp: &ast/Span]
+  (loop [e e0 cur d k (- n 1)]
+    (let [call-sp (if (>= k 0) (:sp (nth hm k)) sp)
+          nm (:name (nth (:fns (:code c)) cur))
+          e2 (if (lambda-name? nm) e (dwe/exit-frame e nm call-sp))]
+      (if (< k 0) e2 (recur e2 (nth hd k) (- k 1))))))
+
+(defn tx T [p: &r/Prog n: &r/R]
+  (let [sp (:sp n)]
+    (match (:x n)
+      (r/RIf cnd th el)
+      (let [cc (cx p cnd) tt (tx p th) te (tx p el) csp (:sp cnd)]
+        (->T (fn Values(v/Val dwe/DwErr Int Frame) [c: &Ctx f: &Frame depth: Int]
+               (let [[x e] (run cc c f depth)]
+                 (if (not (dwe/ok? e)) (values x e -1 NO-FRAME)
+                   (let [[b e2] (if-cond x csp)]
+                     (if (not (dwe/ok? e2)) (values (nul) e2 -1 NO-FRAME)
+                       (if b ((:run tt) c f depth) ((:run te) c f depth)))))))))
+      (r/RLet slot x0 body)
+      (let [xc (cx p x0) tb (tx p body)]
+        (->T (fn Values(v/Val dwe/DwErr Int Frame) [c: &Ctx f: &Frame depth: Int]
+               (let [[x e] (run xc c f depth)]
+                 (if (not (dwe/ok? e)) (values x e -1 NO-FRAME)
+                   ((:run tb) c (->Frame (assoc (:slots f) slot x) (:caps f)) depth))))))
+      (r/RCallG d args)
+      (let [as (cxs p args) tm (dwe/tail-mark sp)]
+        (->T (fn Values(v/Val dwe/DwErr Int Frame) [c: &Ctx f: &Frame depth: Int]
+               (let [[xs e] (run-all c f as depth)]
+                 (if (not (dwe/ok? e)) (values (nul) e -1 NO-FRAME)
+                   (let [[d2 nf be] (bind-pick c d [] xs depth)]
+                     (if (dwe/ok? be) (values (nul) tm d2 nf)
+                       (values (nul) (dwe/at be sp) -1 NO-FRAME))))))))
+      (r/RCall fe args)
+      (let [fc (cx p fe) as (cxs p args) tm (dwe/tail-mark sp) fsp (:sp fe)]
+        (->T (fn Values(v/Val dwe/DwErr Int Frame) [c: &Ctx f: &Frame depth: Int]
+               (let [[fx e] (run fc c f depth)]
+                 (if (not (dwe/ok? e)) (values fx e -1 NO-FRAME)
+                   (let [[xs e2] (run-all c f as depth)]
+                     (if (not (dwe/ok? e2)) (values (nul) e2 -1 NO-FRAME)
+                       (match (v/unmeta fx)
+                         (v/VFn fv) (if (< (:def fv) 0)
+                                      (let [[y ye] (call-fnv c fv xs (+ depth 1) true)] (values y (dwe/at ye (call-sp fv sp fsp)) -1 NO-FRAME))
+                                      (let [[d2 nf be] (bind-pick c (:def fv) (:caps fv) xs depth)]
+                                        (if (dwe/ok? be) (values (nul) tm d2 nf)
+                                          (values (nul) (dwe/at be sp) -1 NO-FRAME))))
+                         _ (let [[y ye] (call-val c fx xs (+ depth 1) sp)] (values y ye -1 NO-FRAME))))))))))
+      _ (tx-plain p n))))
+
+(defn- tx-plain T [p: &r/Prog n: &r/R]
+  (let [xc (cx p n)]
+    (->T (fn Values(v/Val dwe/DwErr Int Frame) [c: &Ctx f: &Frame depth: Int]
+           (let [[x e] (run xc c f (+ depth 1))] (values x e -1 NO-FRAME))))))
+
+(defn- tx-body T [p: &r/Prog n: &r/R]
+  (match (:x n)
+    (r/RCallG d args) (tx-plain p n)
+    (r/RCall fe args) (tx-plain p n)
+    _ (tx p n)))
+
+(defn- param-names Str [fd: &r/FnDef]
+  (let [ps (:params fd)]
+    (loop [i 0 out ""] (if (>= i (count ps)) out (recur (+ i 1) (str out (if (= i 0) "" ", ") (:name (nth ps i))))))))
+
+(defn- param-types Vec(v/TypeV) [fd: &r/FnDef]
+  (let [ps (:params fd)]
+    (loop [i 0 acc: Vec(v/TypeV) []]
+      (if (>= i (count ps)) acc
+        (let [ts (:ty (nth ps i))]
+          (recur (+ i 1) (conj acc (if (= (count ts) 0) (v/->TypeV "any" "" [] [] [] []) (:t (nth ts 0))))))))))
+
+(defn- reads-slot? Bool [n: &r/R k: Int]
+  (match (:x n)
+    (r/RSlot i) (= i k)
+    _ (let [ks (r/kids n)] (loop [i 0] (if (>= i (count ks)) false (if (reads-slot? (nth ks i) k) true (recur (+ i 1))))))))
+
+(defn- param-reads Vec(Bool) [fd: &r/FnDef]
+  (let [ps (:params fd)]
+    (loop [k 0 acc: Vec(Bool) []]
+      (if (>= k (count ps)) acc
+        (recur (+ k 1)
+               (conj acc (or (reads-slot? (:body fd) k)
+                             (loop [j 0] (if (>= j (count ps)) false
+                                           (let [d (:default (nth ps j))]
+                                             (if (and (> (count d) 0) (reads-slot? (nth d 0) k)) true (recur (+ j 1)))))))))))))
+
+(defn- const-defaults Vec(Vec(v/Val)) [ps: &Vec(r/Param)]
+  (loop [k 0 acc: Vec(Vec(v/Val)) []]
+    (if (>= k (count ps)) acc
+      (let [d (:default (nth ps k))]
+        (recur (+ k 1) (conj acc (if (= (count d) 0) [] (match (:x (nth d 0)) (r/RConst x) [x] _ []))))))))
+
+(defn compile-prog CProg [p: &r/Prog]
+  (let [fns (loop [i 0 acc: Vec(CFn) []]
+              (if (>= i (count (:fns p))) acc
+                (let [fd (nth (:fns p) i)
+                      ps (:params fd)
+                      ds (loop [k 0 a: Vec(Vec(C)) []] (if (>= k (count ps)) a (recur (+ k 1) (conj a (cxs p (:default (nth ps k)))))))]
+                  (recur (+ i 1) (conj acc (->CFn (:name fd) (count ps) (:nslots fd) (param-names fd) ds (tx-body p (:body fd))
+                                                  (param-types fd) (:alts fd) (const-defaults ps) (param-reads fd)
+                                                  (if (lambda-name? (:name fd)) (:sp fd) (:sp (:body fd)))))))))
+        gs (loop [i 0 acc: Vec(CGlobal) []]
+             (if (>= i (count (:globals p))) acc
+               (let [g (nth (:globals p) i)] (recur (+ i 1) (conj acc (->CGlobal (cx p (:body g)) (:nslots g)))))))]
+    (->CProg fns gs (cx p (:body p)) (:nslots p) (rt/no-srcs) no-runner [])))
+
+(defn run-code Values(v/Val dwe/DwErr) [cp: &CProg builtins: Vec(rt/Builtin) inputs: Vec(v/Val)]
+  (let [[x e c] (run-code-w cp builtins inputs NO-WRAP)] (values x e)))
+
+(defn run-code-w Values(v/Val dwe/DwErr Ctx) [cp: &CProg builtins: Vec(rt/Builtin) inputs: Vec(v/Val)
+                                             wrap: Option(Fn(Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) v/FnV v/Val))]
+  (let [[c ge] (prep-ctx-w cp builtins inputs wrap)]
+    (if (not (dwe/ok? ge)) (values (v/null-v) ge c) (let [[x e] (run-body c)] (values x e c)))))
+
+(defn prep-ctx Values(Ctx dwe/DwErr) [cp: &CProg builtins: Vec(rt/Builtin) inputs: Vec(v/Val)]
+  (prep-ctx-w cp builtins inputs NO-WRAP))
+
+(defn prep-ctx-w Values(Ctx dwe/DwErr) [cp: &CProg builtins: Vec(rt/Builtin) inputs: Vec(v/Val)
+                                       wrap: Option(Fn(Fn(v/FnV Vec(v/Val) Int Values(v/Val dwe/DwErr)) v/FnV v/Val))]
+  (let [ng (count (:globals cp))
+        lazy (or v/LAZY-ALL (loop [i 0] (if (>= i (count inputs)) false (if (v/has-seq? (nth inputs i)) true (recur (+ i 1))))))
+        [globals ge] (loop [gs: Vec(v/Val) [] gi 0]
+                       (if (>= gi ng) (values gs (dwe/ok))
+                         (let [g (nth (:globals cp) gi)
+                               c (->Ctx cp builtins inputs gs lazy wrap)
+                               fr (->Frame (nslots-vec (:nslots g)) [])
+                               [x e] (run (:body g) c fr 0)]
+                           (if (dwe/ok? e) (recur (conj gs x) (+ gi 1)) (values gs e)))))]
+    (values (->Ctx cp builtins inputs globals lazy wrap) ge)))
+
+(defn run-body Values(v/Val dwe/DwErr) [c: &Ctx]
+  (run (:body (:code c)) c (->Frame (nslots-vec (:nslots (:code c))) []) 0))
+
+(defn run-prog Values(v/Val dwe/DwErr) [p: r/Prog builtins: Vec(rt/Builtin) inputs: Vec(v/Val)]
+  (run-code (compile-prog p) builtins inputs))
+
+(defn nslots-vec Vec(v/Val) [n: Int]
+  (loop [acc: Vec(v/Val) [] i 0] (if (>= i n) acc (recur (conj acc (v/null-v)) (+ i 1)))))

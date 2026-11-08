@@ -1,0 +1,82 @@
+(ns mulay.dw.lib.mime (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+                                [clay.string :as str]))
+
+(def M "dw::module::Mime")
+
+(defn- sv v/Val [s: Str] (v/->VStr s))
+
+(defn show-arg Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VNull) "Null"
+    (v/VStr s) (str "\"" s "\"")
+    (v/VNum n) (num/to-string n)
+    (v/VInt n-i) (let [n (num/from-int n-i)] (num/to-string n))
+    (v/VBool b) (if b "true" "false")
+    _ (v/type-name (v/unmeta x))))
+
+(defn type-err Values(v/Val dwe/DwErr) [want: Str x: &v/Val dash: Bool]
+  (rt/failure "TypeMismatch" (str (if dash "- " "") "Expecting Type: `" want "`, but got: `" (show-arg x) "`.")))
+
+(defn parse-mime Values(Str Str Vec(v/Field) Str) [s: &Str]
+  (let [parts: Vec(Str) (str/split (str s) ";")
+        head (str/trim (nth parts 0))
+        sl (str/index-of head "/")]
+    (if (< sl 0) (values "" "" [] (str "Unable to find a sub type in `" s "`."))
+      (let [ps (loop [i 1 acc: Vec(v/Field) []]
+                 (if (>= i (count parts)) acc
+                   (let [pp (nth parts i) eq (str/index-of pp "=")]
+                     (if (< eq 0) (recur (+ i 1) acc)
+                       (recur (+ i 1) (conj acc (v/field (str/trim (subs pp 0 eq)) (sv (str/replace (subs pp (+ eq 1) (count pp)) "\"" "")))))))))]
+        (values (str/lower-case (str/trim (subs head 0 sl))) (str/lower-case (str/trim (subs head (+ sl 1) (count head)))) ps "")))))
+
+(defn- from-string Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (match (v/unmeta (nth a 0))
+    (v/VStr s) (let [[t st ps e] (parse-mime s)]
+                 (if (not= e "")
+                   (rt/ret (v/->VObj [(v/field "success" (v/bool-v false)) (v/field "error" (v/->VObj [(v/field "message" (sv e))]))]))
+                   (rt/ret (v/->VObj [(v/field "success" (v/bool-v true))
+                                      (v/field "result" (v/->VObj [(v/field "type" (sv t)) (v/field "subtype" (sv st)) (v/field "parameters" (v/->VObj ps))]))]))))
+    _ (type-err "String" (nth a 0) false)))
+
+(defn mime-parts Values(Str Str Vec(v/Field) Str) [x: &v/Val dash: Bool]
+  (match (v/unmeta x)
+    (v/VObj fs) (let [t (v/obj-get fs "type") st (v/obj-get fs "subtype") ps (v/obj-get fs "parameters")]
+                  (if (= (count t) 0) (values "" "" [] (str (if dash "- " "") "Missing required property: `type` required by `MimeType`."))
+                    (if (= (count st) 0) (values "" "" [] (str (if dash "- " "") "Missing required property: `subtype` required by `MimeType`."))
+                      (if (= (count ps) 0) (values "" "" [] (str (if dash "- " "") "Missing required property: `parameters` required by `MimeType`."))
+                        (values (core/arg-str t 0) (core/arg-str st 0) (match (v/unmeta (nth ps 0)) (v/VObj q) q _ []) "")))))
+    _ (values "" "" [] (str (if dash "- " "") "Expecting Type: `MimeType`, but got: `" (show-arg x) "`."))))
+
+(defn- token-char? Bool [c: Int]
+  (and (> c 32) (< c 127) (not (or (= c 40) (= c 41) (= c 60) (= c 62) (= c 64) (= c 44) (= c 59) (= c 58) (= c 92)
+                                   (= c 34) (= c 47) (= c 91) (= c 93) (= c 63) (= c 61)))))
+
+(defn mime-text Str [t: &Str st: &Str ps: &Vec(v/Field)]
+  (loop [i 0 out (str t "/" st)]
+    (if (>= i (count ps)) out
+      (let [f (nth ps i)
+            x (match (v/unmeta (:value f)) (v/VStr s) s (v/VNum n) (num/to-string n) (v/VInt n-i) (let [n (num/from-int n-i)] (num/to-string n)) _ "")
+            plain (and (> (count x) 0) (loop [k 0] (if (>= k (count x)) true (if (token-char? (nth x k)) (recur (+ k 1)) false))))]
+        (recur (+ i 1) (str out ";" (:name (:key f)) "=" (if plain x (str "\"" x "\""))))))))
+
+(defn- to-string Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[t st ps e] (mime-parts (nth a 0) false)]
+    (if (not= e "") (rt/failure "TypeMismatch" e) (rt/ret (sv (mime-text t st ps))))))
+
+(defn- part-match? Bool [base: &Str other: &Str]
+  (or (= base "*") (= base other)
+      (and (str/starts-with? base "*+") (str/ends-with? other (subs base 1 (count base))))))
+
+(defn- is-handled-by Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[t1 s1 p1 e1] (mime-parts (nth a 0) true)
+        [t2 s2 p2 e2] (mime-parts (nth a 1) true)]
+    (if (not= e1 "") (rt/failure "TypeMismatch" e1)
+      (if (not= e2 "") (rt/failure "TypeMismatch" e2)
+        (rt/ret (v/bool-v (and (part-match? t1 t2) (part-match? s1 s2))))))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "fromString" [(rt/b1 "Any" from-string)])
+   (B "toString" [(rt/b1 "Any" to-string)])
+   (B "isHandledBy" [(rt/b2 "Any" "Any" is-handled-by)])])

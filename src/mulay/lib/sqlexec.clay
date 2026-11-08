@@ -1,0 +1,1607 @@
+(ns mulay.lib.sqlexec (:require [mulay.lib.sqlfile :as sf] [mulay.lib.sqlparse :as sp] [mulay.lib.sqlnum :as num]
+                               [mulay.lib.sqlval :as sv] [mulay.lib.sqlfunc :as fn] [mulay.lib.sqlbtree :as bt] [clay.string :as str]))
+
+(defrecord Scope [quals: Vec(Str) names: Vec(Str) vals: Vec(sf/Val) affs: Vec(Int) colls: Vec(Str) hidden: Vec(Bool) labels: Vec(Str)])
+
+(defrecord Rel [names: Vec(Str) rows: Vec(Vec(sf/Val))])
+(defrecord NamedRel [name: Str rel: Rel])
+
+(defrecord Env [params: Vec(sf/Val) names: Vec(Str) named: Vec(sf/Val) scopes: Vec(Scope) group: Vec(Scope) grouped: Bool
+                db: Vec(Db) rels: Vec(NamedRel) conn: Vec(Int)])
+
+(defn empty-env Env []
+  (let [ps: Vec(sf/Val) [] ns: Vec(Str) [] sc: Vec(Scope) [] dbs: Vec(Db) [] rs: Vec(NamedRel) []] (->Env ps ns ps sc sc false dbs rs [])))
+
+(defn- null Values(sf/Val Str) [] (values (sf/->VNull) ""))
+(defn- ok Values(sf/Val Str) [x: sf/Val] (values x ""))
+
+(defn expr-affinity Int [n: &sp/Node env: &Env]
+  (match (:ex n)
+    (sp/ECast e t) (sv/affinity-of-type t)
+    (sp/ECollate e c) (expr-affinity e env)
+    (sp/ECol t name dq) (let [[sc i] (lookup env t name)] (if (< sc 0) sv/AFF-NONE (nth (:affs (nth (:scopes env) sc)) i)))
+    _ sv/AFF-NONE))
+
+(defn- expr-coll Str [n: &sp/Node env: &Env]
+  (match (:ex n)
+    (sp/ECollate e c) (str c)
+    (sp/ECol t name dq) (let [[sc i] (lookup env t name)] (if (< sc 0) "" (str (nth (:colls (nth (:scopes env) sc)) i))))
+    _ ""))
+(defn- explicit-coll Str [n: &sp/Node] (match (:ex n) (sp/ECollate e c) (str c) _ ""))
+(defn- binary-coll Str [a: &sp/Node b: &sp/Node env: &Env]
+  (let [xa (explicit-coll a) xb (explicit-coll b) ca (expr-coll a env) cb (expr-coll b env)]
+    (cond (not= xa "") xa (not= xb "") xb (not= ca "") ca (not= cb "") cb :else "BINARY")))
+
+(defn lookup Values(Int Int) [env: &Env table: &Str name: &Str]
+  (let [ln (str/lower-case name) lt (str/lower-case table)]
+    (loop [s (- (count (:scopes env)) 1)]
+      (if (< s 0) (values -1 0)
+        (let [sc (nth (:scopes env) s)
+              [hit n] (loop [i 0 hit -1 n 0]
+                        (if (>= i (count (:names sc))) (values hit n)
+                          (if (and (= (str/lower-case (nth (:names sc) i)) ln) (or (= lt "") (= (str/lower-case (nth (:quals sc) i)) lt)))
+                            (recur (+ i 1) (if (< hit 0) i hit) (+ n 1))
+                            (recur (+ i 1) hit n))))]
+          (cond (= n 0) (recur (- s 1))
+                (and (> n 1) (= lt "") (ambiguous? sc ln)) (values -2 0)
+                :else (values s hit)))))))
+
+(defn- ambiguous? Bool [sc: &Scope ln: &Str]
+  (loop [i 0 q ""]
+    (if (>= i (count (:names sc))) false
+      (if (and (= (str/lower-case (nth (:names sc) i)) ln) (not (nth (:hidden sc) i)))
+        (if (and (not= q "") (not= q (str/lower-case (nth (:quals sc) i)))) true (recur (+ i 1) (str/lower-case (nth (:quals sc) i))))
+        (recur (+ i 1) q)))))
+
+(defn- lit-int Values(sf/Val Str) [text: &Str neg: Bool]
+  (let [[v c] (num/dec-or-hex text)
+        hex (and (> (count text) 1) (or (str/starts-with? text "0x") (str/starts-with? text "0X")))]
+    (cond
+      (or (and (= c 3) (not neg)) (= c 2) (and neg (= v num/I64-MIN)))
+      (if hex (values (sf/->VNull) (str "hex literal too big: " (if neg "-" "") text))
+        (let [[x k] (num/atof text)] (ok (sf/->VReal (if neg (* -1.0 x) x)))))
+      neg (ok (sf/->VInt (if (= c 3) num/I64-MIN (- 0 v))))
+      :else (ok (sf/->VInt v)))))
+
+(defn- lit-real sf/Val [text: &Str neg: Bool] (let [[x k] (num/atof text)] (sf/->VReal (if neg (* -1.0 x) x))))
+
+(defn eval-expr Values(sf/Val Str) [n: &sp/Node env: &Env]
+  (match (:ex n)
+    (sp/ELit v) (ok (copy v))
+    (sp/ETrue b) (ok (sv/bool-val b))
+    (sp/EInt t) (lit-int t false)
+    (sp/EReal t) (ok (lit-real t false))
+    (sp/EParam i name) (param env i name)
+    (sp/ECol t name dq) (eval-col t name dq env)
+    (sp/EUn op e) (eval-unary op e env)
+    (sp/EBin op a b) (eval-binary op a b env)
+    (sp/ECast e t) (let [[v err] (eval-expr e env)] (if (not= err "") (values v err) (ok (sv/cast-to v (sv/affinity-of-type t)))))
+    (sp/ECollate e c) (eval-expr e env)
+    (sp/EIsNull e neg) (let [[v err] (eval-expr e env)] (if (not= err "") (values v err) (ok (sv/bool-val (not= (sv/null? v) neg)))))
+    (sp/EBetween e lo hi neg) (eval-between e lo hi neg env)
+    (sp/EIn e items neg) (eval-in e items neg env)
+    (sp/ECase base ws ts el) (eval-case base ws ts el env)
+    (sp/ELike op e pat esc neg) (eval-like op e pat esc neg env)
+    (sp/EFn name args star dist) (eval-call name args star dist env)
+    (sp/ESubq q) (eval-subq q env)
+    (sp/EExists q) (eval-exists q env)
+    (sp/EInSub e q neg) (eval-in-sub e q neg env)))
+
+(defn- eval-col Values(sf/Val Str) [t: &Str name: &Str dq: Bool env: &Env]
+  (let [[sc i] (lookup env t name)]
+    (cond (>= sc 0) (ok (copy (nth (:vals (nth (:scopes env) sc)) i)))
+          (= sc -2) (values (sf/->VNull) (str "ambiguous column name: " (if (= t "") name (str t "." name))))
+          (and dq (= t "")) (ok (sf/->VText (str name)))
+          :else (values (sf/->VNull) (str "no such column: " (if (= t "") name (str t "." name)))))))
+
+(defn- param Values(sf/Val Str) [env: &Env i: Int name: &Str]
+  (if (= name "")
+    (if (and (>= i 1) (<= i (count (:params env)))) (ok (copy (nth (:params env) (- i 1)))) (null))
+    (loop [k 0] (cond (>= k (count (:names env))) (null)
+                      (= (nth (:names env) k) name) (ok (copy (nth (:named env) k)))
+                      :else (recur (+ k 1))))))
+
+(defn- eval-unary Values(sf/Val Str) [op: &Str e: &sp/Node env: &Env]
+  (cond
+    (= op "-")
+    (match (:ex e)
+      (sp/EInt t) (lit-int t true)
+      (sp/EReal t) (ok (lit-real t true))
+      _ (let [[v err] (eval-expr e env)] (if (not= err "") (values v err) (ok (sv/arith "-" (sf/->VInt 0) v)))))
+    (= op "+") (eval-expr e env)
+    :else
+    (let [[v err] (eval-expr e env)]
+      (cond (not= err "") (values v err)
+            (sv/null? v) (null)
+            (= op "~") (ok (sf/->VInt (bit-not (sv/to-int v))))
+            :else (ok (sv/bool-val (= (sv/truthy v) 0)))))))
+
+(defn- bool-lit? Bool [n: &sp/Node] (match (:ex n) (sp/ETrue b) true _ false))
+
+(defn- eval-binary Values(sf/Val Str) [op: &Str a: &sp/Node b: &sp/Node env: &Env]
+  (let [[x e1] (eval-expr a env)]
+    (if (not= e1 "") (values x e1)
+      (let [[y e2] (eval-expr b env)]
+        (cond
+          (not= e2 "") (values y e2)
+          (= op "AND") (let [p (sv/truthy x) q (sv/truthy y)]
+                         (ok (cond (or (= p 0) (= q 0)) (sf/->VInt 0) (or (< p 0) (< q 0)) (sf/->VNull) :else (sf/->VInt 1))))
+          (= op "OR") (let [p (sv/truthy x) q (sv/truthy y)]
+                        (ok (cond (or (= p 1) (= q 1)) (sf/->VInt 1) (or (< p 0) (< q 0)) (sf/->VNull) :else (sf/->VInt 0))))
+          (or (= op "+") (= op "-") (= op "*") (= op "/") (= op "%")) (ok (sv/arith op x y))
+          (or (= op "&") (= op "|") (= op "<<") (= op ">>")) (ok (sv/bitop op x y))
+          (= op "||") (ok (sv/concat-v x y))
+          (and (or (= op "IS") (= op "IS NOT")) (bool-lit? b))
+          (let [want (sv/to-int y) t (sv/truthy x) hit (if (= want 1) (= t 1) (= t 0))]
+            (ok (sv/bool-val (if (= op "IS") hit (not hit)))))
+          (or (= op "IS") (= op "IS NOT"))
+          (let [aff (sv/cmp-affinity (expr-affinity a env) (expr-affinity b env))
+                [c cn] (sv/cmp-values x y aff (binary-coll a b env))
+                eq (cond (and (sv/null? x) (sv/null? y)) true (or (sv/null? x) (sv/null? y)) false :else (= c 0))]
+            (ok (sv/bool-val (if (= op "IS") eq (not eq)))))
+          (or (= op "->") (= op "->>")) (values (sf/->VNull) "unsupported: JSON operators")
+          :else
+          (let [[c cn] (sv/cmp-values x y (sv/cmp-affinity (expr-affinity a env) (expr-affinity b env)) (binary-coll a b env))]
+            (if cn (null)
+              (ok (sv/bool-val (cond (= op "=") (= c 0) (= op "!=") (not= c 0) (= op "<") (< c 0) (= op "<=") (<= c 0)
+                                  (= op ">") (> c 0) :else (>= c 0)))))))))))
+
+(defn- eval-between Values(sf/Val Str) [e: &sp/Node lo: &sp/Node hi: &sp/Node neg: Bool env: &Env]
+  (let [[x e1] (eval-expr e env) [l e2] (eval-expr lo env) [h e3] (eval-expr hi env)]
+    (cond (not= e1 "") (values x e1) (not= e2 "") (values l e2) (not= e3 "") (values h e3)
+          :else
+          (let [[c1 n1] (sv/cmp-values x l (sv/cmp-affinity (expr-affinity e env) (expr-affinity lo env)) (binary-coll e lo env))
+                [c2 n2] (sv/cmp-values x h (sv/cmp-affinity (expr-affinity e env) (expr-affinity hi env)) (binary-coll e hi env))
+                p (if n1 -1 (if (>= c1 0) 1 0))
+                q (if n2 -1 (if (<= c2 0) 1 0))
+                r (cond (or (= p 0) (= q 0)) 0 (or (< p 0) (< q 0)) -1 :else 1)]
+            (ok (cond (< r 0) (sf/->VNull) neg (sv/bool-val (= r 0)) :else (sv/bool-val (= r 1))))))))
+
+(defn- eval-in Values(sf/Val Str) [e: &sp/Node items: &Vec(sp/Node) neg: Bool env: &Env]
+  (let [[x e1] (eval-expr e env)]
+    (cond
+      (not= e1 "") (values x e1)
+      (= (count items) 0) (ok (sv/bool-val neg))
+      (sv/null? x) (null)
+      :else
+      (loop [i 0 saw-null false]
+        (if (>= i (count items)) (if saw-null (null) (ok (sv/bool-val neg)))
+          (let [it (nth items i)
+                [y e2] (eval-expr it env)]
+            (cond (not= e2 "") (values y e2)
+                  (sv/null? y) (recur (+ i 1) true)
+                  (= (let [[c cn] (sv/cmp-values x y (sv/cmp-affinity (expr-affinity e env) (expr-affinity it env)) (binary-coll e it env))] c) 0) (ok (sv/bool-val (not neg)))
+                  :else (recur (+ i 1) saw-null))))))))
+
+(defn- eval-case Values(sf/Val Str) [base: &Vec(sp/Node) ws: &Vec(sp/Node) ts: &Vec(sp/Node) el: &Vec(sp/Node) env: &Env]
+  (let [[b e0] (if (> (count base) 0) (eval-expr (nth base 0) env) (null))]
+    (if (not= e0 "") (values b e0)
+      (loop [i 0]
+        (if (>= i (count ws)) (if (> (count el) 0) (eval-expr (nth el 0) env) (null))
+          (let [[w e1] (eval-expr (nth ws i) env)]
+            (if (not= e1 "") (values w e1)
+              (let [hit (if (> (count base) 0)
+                          (let [[c cn] (sv/cmp-values b w (sv/cmp-affinity (expr-affinity (nth base 0) env) (expr-affinity (nth ws i) env)) (binary-coll (nth base 0) (nth ws i) env))]
+                            (and (not cn) (= c 0)))
+                          (= (sv/truthy w) 1))]
+                (if hit (eval-expr (nth ts i) env) (recur (+ i 1)))))))))))
+
+(defn- eval-like Values(sf/Val Str) [op: &Str e: &sp/Node pat: &sp/Node esc: &Vec(sp/Node) neg: Bool env: &Env]
+  (let [[x e1] (eval-expr e env) [p e2] (eval-expr pat env)
+        [c e3] (if (> (count esc) 0) (eval-expr (nth esc 0) env) (values (sf/->VNull) ""))]
+    (cond (not= e1 "") (values x e1) (not= e2 "") (values p e2) (not= e3 "") (values c e3)
+          :else
+          (let [args (if (> (count esc) 0) [p x c] [p x])
+                [r err] (fn/call (str/lower-case op) args "BINARY")]
+            (cond (not= err "") (values r err)
+                  (sv/null? r) (null)
+                  neg (ok (sv/bool-val (= (sv/to-int r) 0)))
+                  :else (ok r))))))
+
+(def AGGREGATES ["count" "sum" "total" "avg" "group_concat" "string_agg" "max" "min"])
+
+(defn- conn-fn? Bool [name: &Str] (or (= name "changes") (= name "total_changes") (= name "last_insert_rowid")))
+
+(defn aggregate-call? Bool [name: &Str n: Int star: Bool]
+  (or (and (member? name AGGREGATES) (or star (= n 1) (and (= n 2) (or (= name "group_concat") (= name "string_agg")))))
+      (and (= name "count") (= n 0))))
+
+(defn- member? Bool [x: &Str xs: &Vec(Str)] (loop [i 0] (cond (>= i (count xs)) false (= (nth xs i) x) true :else (recur (+ i 1)))))
+
+(defn- args-coll Str [args: &Vec(sp/Node)]
+  (loop [i 0] (if (>= i (count args)) "BINARY" (let [c (explicit-coll (nth args i))] (if (not= c "") c (recur (+ i 1)))))))
+
+(defn- eval-call Values(sf/Val Str) [name0: &Str args: &Vec(sp/Node) star: Bool dist: Bool env: &Env]
+  (let [name (str/lower-case name0)
+        n (count args)
+        ar (fn/arity-ok? name n)]
+    (cond
+      (and (conn-fn? name) (= n 0) (= (count (:conn env)) 3))
+      (ok (sf/->VInt (nth (:conn env) (cond (= name "changes") 0 (= name "total_changes") 1 :else 2))))
+      (aggregate-call? name n star)
+      (if (:grouped env) (agg-compute name args star dist env)
+        (values (sf/->VNull) (str "misuse of aggregate function " name0 "()")))
+      star (values (sf/->VNull) (str "wrong number of arguments to function " name0 "()"))
+      (< ar 0) (values (sf/->VNull) (str "no such function: " name0))
+      (= ar 0) (values (sf/->VNull) (str "wrong number of arguments to function " name0 "()"))
+      dist (values (sf/->VNull) (str "DISTINCT aggregates must have exactly one argument"))
+      (= name "likelihood")
+      (match (:ex (nth args 1))
+        (sp/EReal t) (let [[p k] (num/atof t)] (if (or (< p 0.0) (> p 1.0)) (values (sf/->VNull) "second argument to likelihood() must be a constant between 0.0 and 1.0") (eval-expr (nth args 0) env)))
+        _ (values (sf/->VNull) "second argument to likelihood() must be a constant between 0.0 and 1.0"))
+      (or (= name "coalesce") (= name "ifnull"))
+      (loop [i 0] (if (>= i n) (null) (let [[x e] (eval-expr (nth args i) env)] (cond (not= e "") (values x e) (sv/null? x) (recur (+ i 1)) :else (ok x)))))
+      (= name "iif")
+      (let [[c e] (eval-expr (nth args 0) env)]
+        (cond (not= e "") (values c e) (= (sv/truthy c) 1) (eval-expr (nth args 1) env) (= n 3) (eval-expr (nth args 2) env) :else (null)))
+      :else
+      (let [[vals err] (loop [i 0 acc: Vec(sf/Val) []]
+                         (if (>= i n) (values acc "")
+                           (let [[x e] (eval-expr (nth args i) env)] (if (not= e "") (values acc e) (recur (+ i 1) (conj acc x))))))]
+        (if (not= err "") (values (sf/->VNull) err) (fn/call name vals (args-coll args)))))))
+
+(defn- with-row Env [env: &Env row: &Scope]
+  (let [sc (:scopes env)
+        base (loop [i 0 acc: Vec(Scope) []] (if (>= i (- (count sc) 1)) acc (recur (+ i 1) (conj acc (nth sc i)))))]
+    (assoc (copy-env env) :scopes (conj base (copy-scope row)) :grouped false)))
+
+(defn- copy-env Env [e: &Env]
+  (->Env (:params e) (:names e) (:named e) (:scopes e) (:group e) (:grouped e) (:db e) (:rels e) (:conn e)))
+(defn- copy-scope Scope [s: &Scope] (->Scope (:quals s) (:names s) (:vals s) (:affs s) (:colls s) (:hidden s) (:labels s)))
+
+(defrecord Sum [rsum: Float rerr: Float isum: Int cnt: Int approx: Bool ovrfl: Bool])
+
+(defn- kbn Sum [p: &Sum r: Float]
+  (let [s (:rsum p) t (+ s r)
+        err (if (> (abs-f s) (abs-f r)) (+ (:rerr p) (+ (- s t) r)) (+ (:rerr p) (+ (- r t) s)))]
+    (->Sum t err (:isum p) (:cnt p) (:approx p) (:ovrfl p))))
+(defn- abs-f Float [x: Float] (if (< x 0.0) (- 0.0 x) x))
+(defn- kbn-int Sum [p: &Sum v: Int]
+  (if (or (<= v -4503599627370496) (>= v 4503599627370496))
+    (let [sm (rem v 16384) big (- v sm)] (kbn (kbn p (float big)) (float sm)))
+    (kbn p (float v))))
+(defn- kbn-init Sum [p: &Sum v: Int]
+  (if (or (<= v -4503599627370496) (>= v 4503599627370496))
+    (let [sm (rem v 16384)] (->Sum (float (- v sm)) (float sm) (:isum p) (:cnt p) true (:ovrfl p)))
+    (->Sum (float v) 0.0 (:isum p) (:cnt p) true (:ovrfl p))))
+(defn- overflow? Bool [x: Float] (or (not= x x) (> (abs-f x) 1.7976931348623157e308)))
+
+(defn- sum-step Sum [p: &Sum x: &sf/Val]
+  (let [t (sv/numeric-type x)]
+    (if (sv/null? t) (->Sum (:rsum p) (:rerr p) (:isum p) (:cnt p) (:approx p) (:ovrfl p))
+      (let [p1 (->Sum (:rsum p) (:rerr p) (:isum p) (+ (:cnt p) 1) (:approx p) (:ovrfl p))]
+        (if (not (:approx p1))
+          (if (not (sv/vint? t)) (kbn (kbn-init p1 (:isum p1)) (sv/to-real t))
+            (let [v (sv/to-int t) s (+ (:isum p1) v)
+                  ovf (or (and (>= v 0) (>= (:isum p1) 0) (< s 0)) (and (< v 0) (< (:isum p1) 0) (>= s 0)))]
+              (if (not ovf) (assoc p1 :isum s) (kbn-int (assoc (kbn-init p1 (:isum p1)) :ovrfl true) v))))
+          (if (sv/vint? t) (kbn-int p1 (sv/to-int t)) (kbn (assoc p1 :ovrfl false) (sv/to-real t))))))))
+
+(defn- agg-compute Values(sf/Val Str) [name: &Str args: &Vec(sp/Node) star: Bool dist: Bool env: &Env]
+  (let [rows (:group env)
+        [vals err] (loop [i 0 acc: Vec(Vec(sf/Val)) []]
+                     (if (>= i (count rows)) (values acc "")
+                       (if (or star (= (count args) 0)) (recur (+ i 1) (conj acc [(sf/->VInt 1)]))
+                         (let [e2 (with-row env (nth rows i))
+                               [xs e] (loop [k 0 a: Vec(sf/Val) []] (if (>= k (count args)) (values a "")
+                                                                         (let [[x ex] (eval-expr (nth args k) e2)] (if (not= ex "") (values a ex) (recur (+ k 1) (conj a x))))))]
+                           (if (not= e "") (values acc e) (recur (+ i 1) (conj acc xs)))))))
+        coll (if (> (count args) 0) (let [c (explicit-coll (nth args 0))] (if (= c "") (let [e2 (if (> (count rows) 0) (with-row env (nth rows 0)) (copy-env env))] (let [c2 (expr-coll (nth args 0) e2)] (if (= c2 "") "BINARY" c2))) c)) "BINARY")
+        vs (if dist (loop [i 0 acc: Vec(Vec(sf/Val)) []]
+                      (if (>= i (count vals)) acc
+                        (let [x (nth (nth vals i) 0)
+                              seen (loop [k 0] (cond (>= k (count acc)) false (= (sv/compare-vals (nth (nth acc k) 0) x coll) 0) true :else (recur (+ k 1))))]
+                          (recur (+ i 1) (if (or seen (sv/null? x)) acc (conj acc (nth vals i)))))))
+             vals)]
+    (if (not= err "") (values (sf/->VNull) err)
+      (cond
+        (= name "count") (ok (sf/->VInt (loop [i 0 n 0] (if (>= i (count vs)) n (recur (+ i 1) (if (sv/null? (nth (nth vs i) 0)) n (+ n 1)))))))
+        (or (= name "sum") (= name "total") (= name "avg"))
+        (let [p (loop [i 0 p (->Sum 0.0 0.0 0 0 false false)] (if (>= i (count vs)) p (recur (+ i 1) (sum-step p (nth (nth vs i) 0)))))
+              r (if (:approx p) (if (overflow? (:rerr p)) (:rsum p) (+ (:rsum p) (:rerr p))) (float (:isum p)))]
+          (cond (= name "total") (ok (sf/->VReal r))
+                (= (:cnt p) 0) (null)
+                (= name "avg") (ok (sf/->VReal (/ r (float (:cnt p)))))
+                (and (:approx p) (:ovrfl p)) (values (sf/->VNull) "integer overflow")
+                (:approx p) (ok (sf/->VReal r))
+                :else (ok (sf/->VInt (:isum p)))))
+        (or (= name "max") (= name "min"))
+        (ok (loop [i 0 best: Vec(sf/Val) []]
+              (if (>= i (count vs)) (if (= (count best) 0) (sf/->VNull) (copy (nth best 0)))
+                (let [x (nth (nth vs i) 0)]
+                  (cond (sv/null? x) (recur (+ i 1) best)
+                        (= (count best) 0) (recur (+ i 1) [x])
+                        :else (let [c (sv/compare-vals (nth best 0) x coll)]
+                                (recur (+ i 1) (if (if (= name "max") (< c 0) (> c 0)) [x] best))))))))
+        :else
+        (let [sepv (if (> (count args) 1) (if (> (count vs) 0) (nth (nth vs 0) 1) (sf/->VText ",")) (sf/->VText ","))
+              [out any] (loop [i 0 out "" any false]
+                          (if (>= i (count vs)) (values out any)
+                            (let [x (nth (nth vs i) 0)]
+                              (if (sv/null? x) (recur (+ i 1) out any)
+                                (let [t (sv/to-text x)
+                                      sep (if (> (count args) 1) (sv/to-text (nth (nth vs i) 1)) ",")]
+                                  (recur (+ i 1) (if any (str out sep t) (str out t)) true))))))]
+          (if any (ok (sf/->VText out)) (null)))))))
+
+(defrecord Col [name: Str type: Str aff: Int coll: Str notnull: Bool pk: Bool dflt: Vec(sp/Node) unique: Bool])
+(defrecord Table [name: Str root: Int cols: Vec(Col) ipk: Int autoinc: Bool checks: Vec(sp/Node) check-labels: Vec(Str) sql: Str])
+(defrecord Index [name: Str table: Str root: Int cols: Vec(Int) colls: Vec(Str) desc: Vec(Bool) unique: Bool cons: Str sql: Str])
+(defrecord Db [pager: bt/Pager tables: Vec(Table) indexes: Vec(Index)])
+
+(def EMPTY-PAGER: bt/Pager (bt/new-pager 512 0))
+
+(defn new-db Db [page-size: Int] (->Db (bt/new-pager page-size 0) [] []))
+
+(defn- find-table Int [db: &Db name: &Str]
+  (let [ln (str/lower-case name)] (loop [i 0] (cond (>= i (count (:tables db))) -1 (= (str/lower-case (:name (nth (:tables db) i))) ln) i :else (recur (+ i 1))))))
+(defn- find-index Int [db: &Db name: &Str]
+  (let [ln (str/lower-case name)] (loop [i 0] (cond (>= i (count (:indexes db))) -1 (= (str/lower-case (:name (nth (:indexes db) i))) ln) i :else (recur (+ i 1))))))
+(defn- col-index Int [t: &Table name: &Str]
+  (let [ln (str/lower-case name)] (loop [i 0] (cond (>= i (count (:cols t))) -1 (= (str/lower-case (:name (nth (:cols t) i))) ln) i :else (recur (+ i 1))))))
+(defn- rowid-name? Bool [n: &Str] (let [l (str/lower-case n)] (or (= l "rowid") (= l "oid") (= l "_rowid_"))))
+
+(defn- table-of Table [name: &Str cols: &Vec(sp/ColDef) cons: &Vec(sp/TableCons) root: Int sql: &Str]
+  (let [tpk (loop [i 0] (cond (>= i (count cons)) [] (= (:kind (nth cons i)) "PRIMARY KEY") (:cols (nth cons i)) :else (recur (+ i 1))))
+        cs (loop [i 0 acc: Vec(Col) []]
+             (if (>= i (count cols)) acc
+               (let [c (nth cols i)
+                     pk (or (:pk c) (member? (str/lower-case (:name c)) (lower-strs tpk)))]
+                 (recur (+ i 1) (conj acc (->Col (:name c) (:type c) (sv/affinity-of-type (:type c)) (if (= (:coll c) "") "BINARY" (:coll c))
+                                                  (:notnull c) pk (:dflt c) (:unique c)))))))
+        npk (loop [i 0 n 0] (if (>= i (count cs)) n (recur (+ i 1) (if (:pk (nth cs i)) (+ n 1) n))))
+        ipk (loop [i 0] (cond (or (not= npk 1) (>= i (count cols))) -1
+                              (and (:pk (nth cs i)) (= (str/upper-case (:type (nth cols i))) "INTEGER") (not (:desc (nth cols i)))) i
+                              :else (recur (+ i 1))))
+        autoinc (loop [i 0] (cond (>= i (count cols)) false (:autoinc (nth cols i)) true :else (recur (+ i 1))))
+        checks (loop [i 0 acc sp/NONE]
+                 (if (>= i (count cols)) (loop [k 0 a acc] (if (>= k (count cons)) a (recur (+ k 1) (if (= (:kind (nth cons k)) "CHECK") (conj a (nth (:check (nth cons k)) 0)) a))))
+                   (recur (+ i 1) (let [ck (:check (nth cols i))] (loop [k 0 a acc] (if (>= k (count ck)) a (recur (+ k 1) (conj a (nth ck k)))))))))
+        labels (loop [i 0 acc: Vec(Str) []]
+                 (if (>= i (count cols)) (loop [k 0 a acc] (if (>= k (count cons)) a (recur (+ k 1) (if (= (:kind (nth cons k)) "CHECK") (conj a (:label (nth cons k))) a))))
+                   (recur (+ i 1) (let [ck (:check-labels (nth cols i))] (loop [k 0 a acc] (if (>= k (count ck)) a (recur (+ k 1) (conj a (nth ck k)))))))))]
+    (->Table (str name) root cs ipk autoinc checks labels (str sql))))
+
+(defn- lower-strs Vec(Str) [xs: &Vec(Str)] (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (str/lower-case (nth xs i)))))))
+
+(defn- load-schema Values(Db Str) [p: bt/Pager]
+  (let [rows (loop [c (bt/cur-first p 1) acc: Vec(Vec(sf/Val)) []]
+               (if (not (bt/valid? c)) acc (let [[vs ok] (sf/decode-record (bt/cur-payload p c))] (recur (bt/cur-next p c) (conj acc vs)))))
+        db0 (->Db p [] [])]
+    (loop [i 0 db db0]
+      (if (>= i (count rows)) (values db "")
+        (if (< (count (nth rows i)) 5) (values db "malformed database schema")
+        (let [r (nth rows i)
+              ty (sv/to-text (nth r 0)) name (sv/to-text (nth r 1)) tbl (sv/to-text (nth r 2)) root (sv/to-int (nth r 3)) sql (sv/to-text (nth r 4))]
+          (cond
+            (= ty "table")
+            (let [[st e] (sp/parse sql)]
+              (match st
+                (sp/SCreateTable n ine cols cons wr s) (recur (+ i 1) (assoc db :tables (conj (:tables db) (table-of name cols cons root sql))))
+                _ (values db (str "malformed database schema (" name ")"))))
+            (and (= ty "index") (str/starts-with? name "sqlite_autoindex_"))
+            (recur (+ i 1) (add-autoindex db name tbl root))
+            (= ty "index")
+            (let [[st e] (sp/parse sql)]
+              (match st
+                (sp/SCreateIndex n t u ine cols w s)
+                (let [ti (find-table db t)]
+                  (if (< ti 0) (values db (str "malformed database schema (" name ")"))
+                    (recur (+ i 1) (assoc db :indexes (conj (:indexes db) (index-of (nth (:tables db) ti) name cols u "" root sql))))))
+                _ (values db (str "malformed database schema (" name ")"))))
+            :else (recur (+ i 1) db))))))))
+
+(defn- add-autoindex Db [db: Db name: &Str tbl: &Str root: Int]
+  (let [ti (find-table db tbl)]
+    (if (< ti 0) db
+      (let [specs (unique-specs (nth (:tables db) ti))
+            from (+ (count "sqlite_autoindex_") (+ (count tbl) 1))
+            [n e] (if (> from (count name)) (values 0 "short") (parse-long (subs name from (count name))))
+            k (- n 1)]
+        (if (or (not= e "") (< k 0) (>= k (count specs))) db
+          (let [sp1 (nth specs k) t (nth (:tables db) ti)
+                cols (:cols sp1)]
+            (assoc db :indexes (conj (:indexes db) (->Index (str name) (:name t) root cols (idx-colls t cols) (bools (count cols)) true (:cons sp1) "")))))))))
+
+(defrecord Spec [cols: Vec(Int) cons: Str])
+
+(defn- unique-specs Vec(Spec) [t: &Table]
+  (let [pkcols (loop [i 0 acc: Vec(Int) []] (if (>= i (count (:cols t))) acc (recur (+ i 1) (if (:pk (nth (:cols t) i)) (conj acc i) acc))))
+        a0 (if (and (> (count pkcols) 0) (< (:ipk t) 0)) [(->Spec pkcols "pk")] (let [e: Vec(Spec) []] e))]
+    (loop [i 0 acc a0] (if (>= i (count (:cols t))) acc (recur (+ i 1) (if (:unique (nth (:cols t) i)) (conj acc (->Spec [i] "unique")) acc))))))
+
+(defn- bools Vec(Bool) [n: Int] (loop [i 0 acc: Vec(Bool) []] (if (>= i n) acc (recur (+ i 1) (conj acc false)))))
+(defn- idx-colls Vec(Str) [t: &Table cols: &Vec(Int)]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i (count cols)) acc (recur (+ i 1) (conj acc (let [c (nth cols i)] (if (< c 0) "BINARY" (:coll (nth (:cols t) c)))))))))
+
+(defn- index-of Index [t: &Table name: &Str cols: &Vec(sp/IdxCol) unique: Bool cons: &Str root: Int sql: &Str]
+  (let [cis (loop [i 0 acc: Vec(Int) []]
+              (if (>= i (count cols)) acc
+                (let [n (match (:ex (:e (nth cols i))) (sp/ECol tt nm d) (str nm) _ "")]
+                  (recur (+ i 1) (conj acc (if (rowid-name? n) -1 (col-index t n)))))))
+        colls (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count cols)) acc
+                  (recur (+ i 1) (conj acc (let [c (:coll (nth cols i)) ci (nth cis i)] (cond (not= c "") (str/upper-case c) (< ci 0) "BINARY" :else (:coll (nth (:cols t) ci))))))))
+        desc (loop [i 0 acc: Vec(Bool) []] (if (>= i (count cols)) acc (recur (+ i 1) (conj acc (:desc (nth cols i))))))]
+    (->Index (str name) (:name t) root cis colls desc unique (str cons) (str sql))))
+
+(defn- row-vals Vec(sf/Val) [t: &Table rowid: Int payload: &Str]
+  (let [[vs ok] (sf/decode-record payload)]
+    (loop [i 0 acc: Vec(sf/Val) []]
+      (if (>= i (count (:cols t))) acc
+        (let [c (nth (:cols t) i)
+              v (cond (= i (:ipk t)) (sf/->VInt rowid)
+                      (< i (count vs)) (let [x (nth vs i)] (if (and (= (:aff c) sv/AFF-REAL) (sv/vint? x)) (sf/->VReal (float (sv/to-int x))) (copy x)))
+                      :else (default-val c))]
+          (recur (+ i 1) (conj acc v)))))))
+
+(defn- default-val sf/Val [c: &Col]
+  (if (= (count (:dflt c)) 0) (sf/->VNull)
+    (let [[v e] (eval-expr (nth (:dflt c) 0) (empty-env))] (sv/apply-affinity v (:aff c)))))
+
+(defn- table-scope Scope [t: &Table qual: &Str rowid: Int vals: &Vec(sf/Val)]
+  (let [n (count (:cols t))
+        quals (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (recur (+ i 1) (conj acc (str qual)))))
+        names (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (recur (+ i 1) (conj acc (:name (nth (:cols t) i))))))
+        affs (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc (:aff (nth (:cols t) i))))))
+        colls (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (recur (+ i 1) (conj acc (:coll (nth (:cols t) i))))))
+        hidden (bools n)
+        sc (->Scope quals names (copy-vals vals) affs colls hidden (copy-strs names))
+        rl (if (>= (:ipk t) 0) (:name (nth (:cols t) (:ipk t))) "")]
+    (loop [k 0 s sc]
+      (if (>= k 3) s
+        (let [rn (nth ["rowid" "oid" "_rowid_"] k)]
+          (if (>= (col-index t rn) 0) (recur (+ k 1) s)
+            (recur (+ k 1) (->Scope (conj (:quals s) (str qual)) (conj (:names s) rn) (conj (:vals s) (sf/->VInt rowid))
+                                    (conj (:affs s) sv/AFF-INTEGER) (conj (:colls s) "BINARY") (conj (:hidden s) true) (conj (:labels s) (str rl))))))))))
+
+(defn- copy-vals Vec(sf/Val) [vs: &Vec(sf/Val)] (loop [i 0 acc: Vec(sf/Val) []] (if (>= i (count vs)) acc (recur (+ i 1) (conj acc (copy (nth vs i)))))))
+
+(defn- rel-scope Scope [names: &Vec(Str) qual: &Str vals: &Vec(sf/Val)]
+  (let [n (count names)]
+    (->Scope (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (recur (+ i 1) (conj acc (str qual)))))
+             (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (recur (+ i 1) (conj acc (nth names i)))))
+             (copy-vals vals)
+             (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc sv/AFF-NONE))))
+             (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (recur (+ i 1) (conj acc ""))))
+             (bools n)
+             (copy-strs names))))
+
+(defn- join-scope Scope [a: &Scope b: &Scope]
+  (->Scope (cat-str (:quals a) (:quals b)) (cat-str (:names a) (:names b)) (cat-val (:vals a) (:vals b))
+           (cat-int (:affs a) (:affs b)) (cat-str (:colls a) (:colls b)) (cat-bool (:hidden a) (:hidden b)) (cat-str (:labels a) (:labels b))))
+
+(defn- cat-str Vec(Str) [a: &Vec(Str) b: &Vec(Str)] (loop [i 0 acc: Vec(Str) (loop [k 0 x: Vec(Str) []] (if (>= k (count a)) x (recur (+ k 1) (conj x (nth a k)))))] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+(defn- cat-val Vec(sf/Val) [a: &Vec(sf/Val) b: &Vec(sf/Val)] (loop [i 0 acc (copy-vals a)] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (copy (nth b i)))))))
+(defn- cat-int Vec(Int) [a: &Vec(Int) b: &Vec(Int)] (loop [i 0 acc: Vec(Int) (loop [k 0 x: Vec(Int) []] (if (>= k (count a)) x (recur (+ k 1) (conj x (nth a k)))))] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+(defn- cat-bool Vec(Bool) [a: &Vec(Bool) b: &Vec(Bool)] (loop [i 0 acc: Vec(Bool) (loop [k 0 x: Vec(Bool) []] (if (>= k (count a)) x (recur (+ k 1) (conj x (nth a k)))))] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- with-vals Scope [tmpl: &Scope vals: Vec(sf/Val)]
+  (->Scope (:quals tmpl) (:names tmpl) vals (:affs tmpl) (:colls tmpl) (:hidden tmpl) (:labels tmpl)))
+
+(defn- table-row Scope [tmpl: &Scope rid: Int vals: Vec(sf/Val)]
+  (let [extra (- (count (:names tmpl)) (count vals))]
+    (with-vals tmpl (loop [k 0 v vals] (if (>= k extra) v (recur (+ k 1) (conj v (sf/->VInt rid))))))))
+
+(defn- null-scope Scope [s: &Scope]
+  (->Scope (:quals s) (:names s) (loop [i 0 acc: Vec(sf/Val) []] (if (>= i (count (:vals s))) acc (recur (+ i 1) (conj acc (sf/->VNull))))) (:affs s) (:colls s) (:hidden s) (:labels s)))
+
+(defn- empty-rel Rel [] (let [ns: Vec(Str) [] rs: Vec(Vec(sf/Val)) []] (->Rel ns rs)))
+
+(defn- env-db Values(Db Bool) [env: &Env] (if (> (count (:db env)) 0) (values (copy-db (nth (:db env) 0)) true) (values (new-db 512) false)))
+(defn- copy-db Db [d: &Db] (->Db (:pager d) (:tables d) (:indexes d)))
+
+(defn run-select Values(Rel Str) [q: &sp/Select env0: &Env]
+  (let [[env e0] (loop [i 0 env (copy-env env0)]
+                   (if (>= i (count (:ctes q))) (values env "")
+                     (let [c (nth (:ctes q) i)
+                           [r e] (if (:recursive q) (run-cte c env) (run-select (:q c) env))]
+                       (if (not= e "") (values env e)
+                         (recur (+ i 1) (assoc env :rels (conj (:rels env) (->NamedRel (:name c) (rename-rel r (:cols c))))))))))]
+    (if (not= e0 "") (values (empty-rel) e0)
+      (let [cores (:cores q)]
+        (if (and (= (count cores) 1) (= (count (:order q)) 0) (= (count (:limit q)) 0))
+          (run-core (nth cores 0) sp/NONE env)
+          (let [[r e] (if (= (count cores) 1) (run-core (nth cores 0) (order-exprs q) env) (run-compound q env))]
+            (if (not= e "") (values r e) (finish-select q r env))))))))
+
+(defn- order-exprs Vec(sp/Node) [q: &sp/Select] (loop [i 0 acc sp/NONE] (if (>= i (count (:order q))) acc (recur (+ i 1) (conj acc (:e (nth (:order q) i)))))))
+
+(defn- rename-rel Rel [r: Rel names: &Vec(Str)] (if (= (count names) 0) r (->Rel (copy-strs names) (:rows r))))
+(defn- copy-strs Vec(Str) [xs: &Vec(Str)] (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (nth xs i))))))
+
+(defn- run-cte Values(Rel Str) [c: &sp/Cte env: &Env]
+  (let [q (:q c)
+        name (:name c)
+        self-ref (loop [i 1] (cond (>= i (count (:cores q))) false (refers? (nth (:cores q) i) name) true :else (recur (+ i 1))))]
+    (if (or (< (count (:cores q)) 2) (not self-ref)) (run-select q env)
+      (let [[anchor e] (run-core (nth (:cores q) 0) sp/NONE env)
+            all-union (loop [i 0] (cond (>= i (count (:ops q))) true (= (nth (:ops q) i) "UNION ALL") (recur (+ i 1)) (= (nth (:ops q) i) "UNION") (recur (+ i 1)) :else false))
+            dedupe (loop [i 0] (cond (>= i (count (:ops q))) false (= (nth (:ops q) i) "UNION") true :else (recur (+ i 1))))
+            names (if (> (count (:cols c)) 0) (copy-strs (:cols c)) (:names anchor))]
+        (cond
+          (not= e "") (values anchor e)
+          (not all-union) (values anchor "unsupported: recursive WITH with INTERSECT or EXCEPT")
+          :else
+          (loop [queue (:rows anchor) qi 0 out: Vec(Vec(sf/Val)) [] steps 0]
+            (cond
+              (>= qi (count queue)) (finish-rows q (->Rel names (if dedupe (distinct-rows out) out)) env)
+              (> steps 10000000) (values (empty-rel) "recursion limit")
+              :else
+              (let [row (nth queue qi)
+                    seen (and dedupe (contains-row? out row))
+                    env2 (assoc (copy-env env) :rels (conj (:rels env) (->NamedRel name (->Rel names [row]))))
+                    [more e2] (loop [k 1 acc: Vec(Vec(sf/Val)) []]
+                                (if (>= k (count (:cores q))) (values acc "")
+                                  (let [[r e3] (run-core (nth (:cores q) k) sp/NONE env2)]
+                                    (if (not= e3 "") (values acc e3) (recur (+ k 1) (append-rows acc (:rows r)))))))]
+                (cond (not= e2 "") (values (empty-rel) e2)
+                      seen (recur queue (+ qi 1) out (+ steps 1))
+                      :else (recur (append-rows queue more) (+ qi 1) (conj out row) (+ steps 1)))))))))))
+
+(defn- finish-rows Values(Rel Str) [q: &sp/Select r: Rel env: &Env]
+  (if (and (= (count (:order q)) 0) (= (count (:limit q)) 0)) (values r "") (finish-select q (->Rel (:names r) (:rows r)) env)))
+
+(defn- append-rows Vec(Vec(sf/Val)) [a: Vec(Vec(sf/Val)) b: &Vec(Vec(sf/Val))] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (copy-vals (nth b i)))))))
+
+(defn- same-row? Bool [a: &Vec(sf/Val) b: &Vec(sf/Val)]
+  (and (= (count a) (count b))
+       (loop [i 0] (cond (>= i (count a)) true
+                         (and (sv/null? (nth a i)) (sv/null? (nth b i))) (recur (+ i 1))
+                         (or (sv/null? (nth a i)) (sv/null? (nth b i))) false
+                         (= (sv/compare-vals (nth a i) (nth b i) "BINARY") 0) (recur (+ i 1))
+                         :else false))))
+(defn- contains-row? Bool [rows: &Vec(Vec(sf/Val)) r: &Vec(sf/Val)] (loop [i 0] (cond (>= i (count rows)) false (same-row? (nth rows i) r) true :else (recur (+ i 1)))))
+(defn- distinct-rows Vec(Vec(sf/Val)) [rows: &Vec(Vec(sf/Val))]
+  (loop [i 0 acc: Vec(Vec(sf/Val)) []] (if (>= i (count rows)) acc (recur (+ i 1) (if (contains-row? acc (nth rows i)) acc (conj acc (copy-vals (nth rows i))))))))
+
+(defn- refers? Bool [c: &sp/Core name: &Str] (loop [i 0] (cond (>= i (count (:from c))) false (from-refers? (nth (:from c) i) name) true :else (recur (+ i 1)))))
+(defn- from-refers? Bool [f: &sp/FromN name: &Str]
+  (match (:f f)
+    (sp/FTable n a) (= (str/lower-case n) (str/lower-case name))
+    (sp/FSub q a) false
+    (sp/FJoin l r k on us nat) (or (from-refers? l name) (from-refers? r name))))
+
+(defn- run-compound Values(Rel Str) [q: &sp/Select env: &Env]
+  (let [[fst e] (run-core (nth (:cores q) 0) sp/NONE env)]
+    (if (not= e "") (values fst e)
+      (loop [i 1 acc (:rows fst)]
+        (if (>= i (count (:cores q))) (values (->Rel (:names fst) acc) "")
+          (let [[r e2] (run-core (nth (:cores q) i) sp/NONE env)
+                op (nth (:ops q) (- i 1))]
+            (cond
+              (not= e2 "") (values r e2)
+              (not= (count (:names r)) (count (:names fst)))
+              (values r (str "SELECTs to the left and right of " op " do not have the same number of result columns"))
+              (= op "UNION ALL") (recur (+ i 1) (append-rows acc (:rows r)))
+              (= op "UNION") (recur (+ i 1) (distinct-rows (append-rows acc (:rows r))))
+              (= op "INTERSECT") (recur (+ i 1) (distinct-rows (loop [k 0 a: Vec(Vec(sf/Val)) []] (if (>= k (count acc)) a (recur (+ k 1) (if (contains-row? (:rows r) (nth acc k)) (conj a (copy-vals (nth acc k))) a))))))
+              :else (recur (+ i 1) (distinct-rows (loop [k 0 a: Vec(Vec(sf/Val)) []] (if (>= k (count acc)) a (recur (+ k 1) (if (contains-row? (:rows r) (nth acc k)) a (conj a (copy-vals (nth acc k))))))))))))))))
+
+(defn- finish-select Values(Rel Str) [q: &sp/Select r: Rel env: &Env]
+  (let [nres (count (:names r))
+        single (= (count (:cores q)) 1)
+        terms (:order q)
+        [keys ke] (if single (values [] "") (compound-keys terms (:names r)))
+        rows (:rows r)
+        sorted (if (= (count terms) 0) rows
+                 (sort-rows rows terms (if single (order-key-positions nres (count terms)) keys)))
+        out (loop [i 0 acc: Vec(Vec(sf/Val)) []]
+              (if (>= i (count sorted)) acc
+                (recur (+ i 1) (conj acc (let [row (nth sorted i)] (loop [k 0 a: Vec(sf/Val) []] (if (>= k nres) a (recur (+ k 1) (conj a (copy (nth row k)))))))))))
+        [lim le] (limit-val (:limit q) env -1)
+        [off oe] (limit-val (:offset q) env 0)]
+    (cond (not= ke "") (values r ke)
+          (not= le "") (values r le)
+          (not= oe "") (values r oe)
+          :else
+          (let [from (max 0 off)
+                to (if (< lim 0) (count out) (min (count out) (+ from lim)))]
+            (values (->Rel (:names r) (loop [i from acc: Vec(Vec(sf/Val)) []] (if (>= i to) acc (recur (+ i 1) (conj acc (copy-vals (nth out i))))))) "")))))
+
+(defn- order-key-positions Vec(Int) [nres: Int n: Int] (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc (+ nres i))))))
+
+(defn- compound-keys Values(Vec(Int) Str) [terms: &Vec(sp/OrderTerm) names: &Vec(Str)]
+  (loop [i 0 acc: Vec(Int) []]
+    (if (>= i (count terms)) (values acc "")
+      (let [t (nth terms i)
+            k (match (:ex (:e t))
+                (sp/EInt txt) (let [[n e] (parse-long txt)] (if (and (= e "") (>= n 1) (<= n (count names))) (- n 1) -2))
+                (sp/ECol tb nm d) (loop [j 0] (cond (>= j (count names)) -1 (= (str/lower-case (nth names j)) (str/lower-case nm)) j :else (recur (+ j 1))))
+                _ -1)]
+        (cond (= k -2) (values acc (str (ordinal (+ i 1)) " ORDER BY term out of range - should be between 1 and " (count names)))
+              (< k 0) (values acc (str (ordinal (+ i 1)) " ORDER BY term does not match any column in the result set"))
+              :else
+          (recur (+ i 1) (conj acc k)))))))
+
+(defn- limit-val Values(Int Str) [xs: &Vec(sp/Node) env: &Env dflt: Int]
+  (if (= (count xs) 0) (values dflt "")
+    (let [[v e] (eval-expr (nth xs 0) env)
+          n (sv/numeric-type v)]
+      (cond (not= e "") (values dflt e)
+            (sv/vint? n) (values (sv/to-int n) "")
+            :else (values dflt "datatype mismatch")))))
+
+(defn- order-range-err Str [extra: &Vec(sp/Node) oc: &Vec(OutCol)]
+  (loop [i 0]
+    (if (>= i (count extra)) ""
+      (match (:ex (nth extra i))
+        (sp/EInt t) (let [[n e] (parse-long t)]
+                      (if (or (not= e "") (< n 1) (> n (count oc)))
+                        (str (ordinal (+ i 1)) " ORDER BY term out of range - should be between 1 and " (count oc))
+                        (recur (+ i 1))))
+        _ (recur (+ i 1))))))
+
+(defn- ordinal Str [n: Int] (str n (cond (and (>= (mod n 100) 11) (<= (mod n 100) 13)) "th" (= (mod n 10) 1) "st" (= (mod n 10) 2) "nd" (= (mod n 10) 3) "rd" :else "th")))
+
+(defn- sort-rows Vec(Vec(sf/Val)) [rows: &Vec(Vec(sf/Val)) terms: &Vec(sp/OrderTerm) keys: &Vec(Int)]
+  (let [n (count rows)]
+    (if (<= n 1) (loop [i 0 acc: Vec(Vec(sf/Val)) []] (if (>= i n) acc (recur (+ i 1) (conj acc (copy-vals (nth rows i))))))
+      (let [mid (quot n 2)
+            left (sort-rows (slice-rows rows 0 mid) terms keys)
+            right (sort-rows (slice-rows rows mid n) terms keys)]
+        (loop [i 0 j 0 acc: Vec(Vec(sf/Val)) []]
+          (cond (and (>= i (count left)) (>= j (count right))) acc
+                (>= i (count left)) (recur i (+ j 1) (conj acc (copy-vals (nth right j))))
+                (>= j (count right)) (recur (+ i 1) j (conj acc (copy-vals (nth left i))))
+                (<= (row-cmp (nth left i) (nth right j) terms keys) 0) (recur (+ i 1) j (conj acc (copy-vals (nth left i))))
+                :else (recur i (+ j 1) (conj acc (copy-vals (nth right j))))))))))
+
+(defn- slice-rows Vec(Vec(sf/Val)) [rows: &Vec(Vec(sf/Val)) a: Int b: Int] (loop [i a acc: Vec(Vec(sf/Val)) []] (if (>= i b) acc (recur (+ i 1) (conj acc (copy-vals (nth rows i)))))))
+
+(defn- row-cmp Int [a: &Vec(sf/Val) b: &Vec(sf/Val) terms: &Vec(sp/OrderTerm) keys: &Vec(Int)]
+  (loop [i 0]
+    (if (>= i (count keys)) 0
+      (let [t (nth terms i) x (nth a (nth keys i)) y (nth b (nth keys i))
+            nx (sv/null? x) ny (sv/null? y)
+            nulls-first (cond (= (:nulls t) 1) true (= (:nulls t) 2) false :else (not (:desc t)))
+            c (cond (and nx ny) 0
+                    nx (if nulls-first -1 1)
+                    ny (if nulls-first 1 -1)
+                    :else (let [c0 (sv/compare-vals x y (if (= (:coll t) "") "BINARY" (:coll t)))] (if (:desc t) (- 0 c0) c0)))]
+        (if (not= c 0) c (recur (+ i 1)))))))
+
+(defn- empty-scope Scope [] (let [s: Vec(Str) [] v: Vec(sf/Val) [] a: Vec(Int) [] b: Vec(Bool) []] (->Scope s s v a s b s)))
+
+(defn- push-row Env [env: &Env row: &Scope] (assoc (copy-env env) :scopes (conj (:scopes env) (copy-scope row)) :grouped false))
+
+(defn- from-rows Values(Scope Vec(Scope) Str) [f: &sp/FromN env: &Env w: &Vec(sp/Node)]
+  (match (:f f)
+    (sp/FTable name alias)
+    (let [qual (if (= alias "") name alias)
+          ri (find-rel env name)
+          ln (str/lower-case name)]
+      (cond
+        (and (< ri 0) (or (= ln "sqlite_schema") (= ln "sqlite_master")))
+        (let [[db has] (env-db env)
+              p (:pager db)
+              names ["type" "name" "tbl_name" "rootpage" "sql"]
+              rows (loop [c (bt/cur-first p 1) acc: Vec(Scope) []]
+                     (if (not (bt/valid? c)) acc
+                       (let [[vs ok] (sf/decode-record (bt/cur-payload p c))] (recur (bt/cur-next p c) (conj acc (rel-scope names qual vs))))))]
+          (values (rel-scope names qual (null-vals 5)) rows ""))
+        (>= ri 0)
+        (let [r (:rel (nth (:rels env) ri))
+              tmpl (rel-scope (:names r) qual (null-vals (count (:names r))))]
+          (values (copy-scope tmpl)
+                  (loop [i 0 acc: Vec(Scope) []] (if (>= i (count (:rows r))) acc (recur (+ i 1) (conj acc (with-vals tmpl (copy-vals (nth (:rows r) i)))))))
+                  ""))
+        :else
+        (let [[db has] (env-db env)
+              ti (find-table db name)]
+          (if (< ti 0) (values (empty-scope) [] (str "no such table: " name))
+            (let [t (nth (:tables db) ti)
+                  p (:pager db)
+                  tmpl (table-scope t qual 0 (null-vals (count (:cols t))))
+                  [via rids] (index-probe db t qual w env)
+                  rows (if via
+                         (loop [i 0 acc: Vec(Scope) []]
+                           (if (>= i (count rids)) acc
+                             (let [rid (nth rids i) [pl found] (bt/table-find p (:root t) rid)]
+                               (recur (+ i 1) (if found (conj acc (table-row tmpl rid (row-vals t rid pl))) acc)))))
+                         (loop [c (bt/cur-first p (:root t)) acc: Vec(Scope) []]
+                           (if (not (bt/valid? c)) acc
+                             (let [rid (bt/cur-rowid p c)]
+                               (recur (bt/cur-next p c) (conj acc (table-row tmpl rid (row-vals t rid (bt/cur-payload p c)))))))))]
+              (values tmpl rows ""))))))
+    (sp/FSub q alias)
+    (let [[r e] (run-select q env)
+          tmpl (rel-scope (:names r) alias (null-vals (count (:names r))))]
+      (values (copy-scope tmpl)
+              (loop [i 0 acc: Vec(Scope) []] (if (>= i (count (:rows r))) acc (recur (+ i 1) (conj acc (with-vals tmpl (copy-vals (nth (:rows r) i)))))))
+              e))
+    (sp/FJoin l r kind on using natural)
+    (let [[lt lrows e1] (from-rows l env sp/NONE)
+          [rt rrows e2] (if (= e1 "") (from-rows r env sp/NONE) (values (empty-scope) [] e1))
+          us (if natural (common-names lt rt) (copy-strs using))
+          tmpl (hide-using (join-scope lt rt) (count (:names lt)) us)]
+      (if (not= e2 "") (values tmpl [] e2)
+        (loop [i 0 acc: Vec(Scope) []]
+          (if (>= i (count lrows)) (values tmpl acc "")
+            (let [lrow (nth lrows i)
+                  [matched err] (loop [k 0 m: Vec(Scope) []]
+                                  (if (>= k (count rrows)) (values m "")
+                                    (let [comb (hide-using (join-scope lrow (nth rrows k)) (count (:names lrow)) us)
+                                          [ok e] (join-match comb on us (count (:names lrow)) env)]
+                                      (cond (not= e "") (values m e) ok (recur (+ k 1) (conj m comb)) :else (recur (+ k 1) m)))))]
+              (cond (not= err "") (values tmpl acc err)
+                    (and (= (count matched) 0) (= kind "LEFT"))
+                    (recur (+ i 1) (conj acc (hide-using (join-scope lrow (null-scope rt)) (count (:names lrow)) us)))
+                    :else (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count matched)) a (recur (+ k 1) (conj a (copy-scope (nth matched k)))))))))))))))
+
+(defn- null-vals Vec(sf/Val) [n: Int] (loop [i 0 acc: Vec(sf/Val) []] (if (>= i n) acc (recur (+ i 1) (conj acc (sf/->VNull))))))
+
+(defn- find-rel Int [env: &Env name: &Str]
+  (let [ln (str/lower-case name)] (loop [i (- (count (:rels env)) 1)] (cond (< i 0) -1 (= (str/lower-case (:name (nth (:rels env) i))) ln) i :else (recur (- i 1))))))
+
+(defn- common-names Vec(Str) [a: &Scope b: &Scope]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count (:names a))) acc
+      (let [n (nth (:names a) i)
+            hit (and (not (nth (:hidden a) i)) (loop [k 0] (cond (>= k (count (:names b))) false (and (not (nth (:hidden b) k)) (= (str/lower-case (nth (:names b) k)) (str/lower-case n))) true :else (recur (+ k 1)))))]
+        (recur (+ i 1) (if hit (conj acc (str n)) acc))))))
+
+(defn- hide-using Scope [s: Scope from: Int us: &Vec(Str)]
+  (if (= (count us) 0) s
+    (let [h (loop [i 0 acc: Vec(Bool) []]
+              (if (>= i (count (:names s))) acc
+                (recur (+ i 1) (conj acc (or (nth (:hidden s) i)
+                                             (and (>= i from) (loop [k 0] (cond (>= k (count us)) false (= (str/lower-case (nth us k)) (str/lower-case (nth (:names s) i))) true :else (recur (+ k 1))))))))))]
+      (assoc s :hidden h))))
+
+(defn- join-match Values(Bool Str) [comb: &Scope on: &Vec(sp/Node) us: &Vec(Str) nleft: Int env: &Env]
+  (let [ok-using (loop [k 0]
+                   (if (>= k (count us)) true
+                     (let [ln (str/lower-case (nth us k))
+                           li (loop [i 0] (cond (>= i nleft) -1 (= (str/lower-case (nth (:names comb) i)) ln) i :else (recur (+ i 1))))
+                           ri (loop [i nleft] (cond (>= i (count (:names comb))) -1 (= (str/lower-case (nth (:names comb) i)) ln) i :else (recur (+ i 1))))]
+                       (if (or (< li 0) (< ri 0)) false
+                         (let [x (nth (:vals comb) li) y (nth (:vals comb) ri)]
+                           (if (or (sv/null? x) (sv/null? y) (not= (sv/compare-vals x y "BINARY") 0)) false (recur (+ k 1))))))))]
+    (if (not ok-using) (values false "")
+      (if (= (count on) 0) (values true "")
+        (let [[v e] (eval-expr (nth on 0) (push-row env comb))] (values (= (sv/truthy v) 1) e))))))
+
+(defn- has-agg? Bool [n: &sp/Node]
+  (match (:ex n)
+    (sp/EFn name args star dist) (or (aggregate-call? (str/lower-case name) (count args) star) (any-agg? args))
+    (sp/EUn op e) (has-agg? e)
+    (sp/EBin op a b) (or (has-agg? a) (has-agg? b))
+    (sp/ECast e t) (has-agg? e)
+    (sp/ECollate e c) (has-agg? e)
+    (sp/EIsNull e neg) (has-agg? e)
+    (sp/EBetween e lo hi neg) (or (has-agg? e) (has-agg? lo) (has-agg? hi))
+    (sp/EIn e items neg) (or (has-agg? e) (any-agg? items))
+    (sp/ECase base ws ts el) (or (any-agg? base) (any-agg? ws) (any-agg? ts) (any-agg? el))
+    (sp/ELike op e pat esc neg) (or (has-agg? e) (has-agg? pat) (any-agg? esc))
+    (sp/EInSub e q neg) (has-agg? e)
+    _ false))
+(defn- any-agg? Bool [xs: &Vec(sp/Node)] (loop [i 0] (cond (>= i (count xs)) false (has-agg? (nth xs i)) true :else (recur (+ i 1)))))
+
+(defrecord OutCol [e: Vec(sp/Node) idx: Int name: Str])
+
+(defn- out-cols Values(Vec(OutCol) Str) [cols: &Vec(sp/ResultCol) tmpl: &Scope env: &Env]
+  (loop [i 0 acc: Vec(OutCol) []]
+    (if (>= i (count cols)) (values acc "")
+      (let [rc (nth cols i)]
+        (if (:star rc)
+          (let [lt (str/lower-case (:table rc))
+                xs (loop [k 0 a acc]
+                     (if (>= k (count (:names tmpl))) a
+                       (recur (+ k 1) (if (and (not (nth (:hidden tmpl) k)) (or (= lt "") (= (str/lower-case (nth (:quals tmpl) k)) lt)))
+                                        (conj a (->OutCol sp/NONE k (str (nth (:names tmpl) k)))) a))))]
+            (cond (and (= (count (:names tmpl)) 0) (= lt "")) (values acc "no tables specified")
+                  (and (not= lt "") (= (count xs) (count acc))) (values acc (str "no such table: " (:table rc)))
+                  :else (recur (+ i 1) xs)))
+          (let [x (nth (:e rc) 0)
+                name (cond (not= (:alias rc) "") (str (:alias rc))
+                           :else (match (:ex x)
+                                   (sp/ECol t n d) (let [env2 (push-row env tmpl) [sc k] (lookup env2 t n)]
+                                                     (if (= sc (- (count (:scopes env2)) 1))
+                                                       (let [lb (nth (:labels tmpl) k)] (if (= lb "") (str n) (str lb)))
+                                                       (str n)))
+                                   _ (str (:text rc))))]
+            (recur (+ i 1) (conj acc (->OutCol [x] -1 name)))))))))
+
+(defn- out-names Vec(Str) [oc: &Vec(OutCol)] (loop [i 0 acc: Vec(Str) []] (if (>= i (count oc)) acc (recur (+ i 1) (conj acc (:name (nth oc i)))))))
+
+(defn- out-vals Values(Vec(sf/Val) Str) [oc: &Vec(OutCol) extra: &Vec(sp/Node) env: &Env row: &Scope]
+  (let [[vs e] (loop [i 0 acc: Vec(sf/Val) []]
+                 (if (>= i (count oc)) (values acc "")
+                   (let [c (nth oc i)]
+                     (if (= (count (:e c)) 0) (recur (+ i 1) (conj acc (copy (nth (:vals row) (:idx c)))))
+                       (let [[v ex] (eval-expr (nth (:e c) 0) env)] (if (not= ex "") (values acc ex) (recur (+ i 1) (conj acc v))))))))]
+    (if (not= e "") (values vs e)
+      (loop [i 0 acc vs]
+        (if (>= i (count extra)) (values acc "")
+          (let [x (nth extra i)
+                k (order-ref x oc)]
+            (if (>= k 0) (recur (+ i 1) (conj acc (copy (nth vs k))))
+              (let [[v ex] (eval-expr x env)] (if (not= ex "") (values acc ex) (recur (+ i 1) (conj acc v)))))))))))
+
+(defn- order-ref Int [x: &sp/Node oc: &Vec(OutCol)]
+  (match (:ex x)
+    (sp/EInt t) (let [[n e] (parse-long t)] (if (and (= e "") (>= n 1) (<= n (count oc))) (- n 1) -1))
+    (sp/ECol t n d) (if (not= t "") -1 (loop [i 0] (cond (>= i (count oc)) -1
+                                                       (and (> (count (:e (nth oc i))) 0) (= (str/lower-case (:name (nth oc i))) (str/lower-case n))
+                                                            (not (same-col? (nth (:e (nth oc i)) 0) n))) i
+                                                       :else (recur (+ i 1)))))
+    _ -1))
+(defn- same-col? Bool [e: &sp/Node n: &Str] (match (:ex e) (sp/ECol t m d) (= (str/lower-case m) (str/lower-case n)) _ false))
+
+(defn- run-core Values(Rel Str) [c: &sp/Core extra: &Vec(sp/Node) env: &Env]
+  (if (:is-values c) (run-values c env)
+    (let [[tmpl rows e] (if (> (count (:from c)) 0) (from-rows (nth (:from c) 0) env (:where c)) (values (empty-scope) [(empty-scope)] ""))]
+      (if (not= e "") (values (empty-rel) e)
+        (let [[oc0 oe] (out-cols (:cols c) tmpl env)
+              re (order-range-err extra oc0)
+              env2 (push-row env tmpl)
+              c2 (sp/->Core (:distinct c) (:cols c) (:from c) (subst-all (:where c) oc0 env2) (subst-all (:group c) oc0 env2) (subst-all (:having c) oc0 env2) (:values c) (:is-values c))
+              extra (subst-all extra oc0 env2)
+              oc oc0
+              ve (if (= re "") (validate-core c2 extra tmpl env) re)
+              c c2]
+          (cond
+            (not= oe "") (values (empty-rel) oe)
+            (not= ve "") (values (empty-rel) ve)
+            :else
+            (let [[kept we] (loop [i 0 acc: Vec(Scope) []]
+                              (if (>= i (count rows)) (values acc "")
+                                (if (= (count (:where c)) 0) (recur (+ i 1) (conj acc (copy-scope (nth rows i))))
+                                  (let [[v x] (eval-expr (nth (:where c) 0) (push-row env (nth rows i)))]
+                                    (cond (not= x "") (values acc x) (= (sv/truthy v) 1) (recur (+ i 1) (conj acc (copy-scope (nth rows i)))) :else (recur (+ i 1) acc))))))
+                  agg (or (> (count (:group c)) 0) (> (count (:having c)) 0) (out-agg? oc) (any-agg? extra))]
+              (cond
+                (not= we "") (values (empty-rel) we)
+                agg (run-groups c oc extra tmpl kept env)
+                :else
+                (let [[out err] (loop [i 0 acc: Vec(Vec(sf/Val)) []]
+                                  (if (>= i (count kept)) (values acc "")
+                                    (let [row (nth kept i) [vs x] (out-vals oc extra (push-row env row) row)]
+                                      (if (not= x "") (values acc x) (recur (+ i 1) (conj acc vs))))))]
+                  (if (not= err "") (values (empty-rel) err)
+                    (values (->Rel (out-names oc) (if (:distinct c) (distinct-prefix out (count oc)) out)) "")))))))))))
+
+(defn- out-agg? Bool [oc: &Vec(OutCol)] (loop [i 0] (cond (>= i (count oc)) false (and (> (count (:e (nth oc i))) 0) (has-agg? (nth (:e (nth oc i)) 0))) true :else (recur (+ i 1)))))
+
+(defn- distinct-prefix Vec(Vec(sf/Val)) [rows: &Vec(Vec(sf/Val)) n: Int]
+  (loop [i 0 acc: Vec(Vec(sf/Val)) []]
+    (if (>= i (count rows)) acc
+      (let [r (nth rows i)
+            dup (loop [k 0] (cond (>= k (count acc)) false (same-row? (take-n (nth acc k) n) (take-n r n)) true :else (recur (+ k 1))))]
+        (recur (+ i 1) (if dup acc (conj acc (copy-vals r))))))))
+(defn- take-n Vec(sf/Val) [r: &Vec(sf/Val) n: Int] (loop [i 0 acc: Vec(sf/Val) []] (if (>= i (min n (count r))) acc (recur (+ i 1) (conj acc (copy (nth r i)))))))
+
+(defn- run-values Values(Rel Str) [c: &sp/Core env: &Env]
+  (let [n (if (> (count (:values c)) 0) (count (nth (:values c) 0)) 0)
+        names (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (recur (+ i 1) (conj acc (str "column" (+ i 1))))))]
+    (loop [i 0 acc: Vec(Vec(sf/Val)) []]
+      (if (>= i (count (:values c))) (values (->Rel names acc) "")
+        (let [row (nth (:values c) i)]
+          (if (not= (count row) n) (values (empty-rel) "all VALUES must have the same number of terms")
+            (let [[vs e] (loop [k 0 a: Vec(sf/Val) []] (if (>= k n) (values a "") (let [[v x] (eval-expr (nth row k) env)] (if (not= x "") (values a x) (recur (+ k 1) (conj a v))))))]
+              (if (not= e "") (values (empty-rel) e) (recur (+ i 1) (conj acc vs))))))))))
+
+(defn- run-groups Values(Rel Str) [c: &sp/Core oc: &Vec(OutCol) extra: &Vec(sp/Node) tmpl: &Scope rows: &Vec(Scope) env: &Env]
+  (let [ng (count (:group c))
+        [keys ke] (loop [i 0 acc: Vec(Vec(sf/Val)) []]
+                    (if (>= i (count rows)) (values acc "")
+                      (let [env2 (push-row env (nth rows i))
+                            [ks x] (loop [k 0 a: Vec(sf/Val) []] (if (>= k ng) (values a "") (let [[v ex] (eval-expr (group-expr (nth (:group c) k) oc) env2)] (if (not= ex "") (values a ex) (recur (+ k 1) (conj a v))))))]
+                        (if (not= x "") (values acc x) (recur (+ i 1) (conj acc ks))))))
+        mm (minmax-spec oc)
+        order (if (= ng 0) (iota (count rows)) (sort-idx keys (group-colls c env tmpl)))
+        groups (if (= ng 0) [(iota (count rows))]
+                 (loop [i 0 acc: Vec(Vec(Int)) [] cur: Vec(Int) []]
+                   (if (>= i (count order)) (if (> (count cur) 0) (conj acc cur) acc)
+                     (let [r (nth order i)]
+                       (if (or (= (count cur) 0) (same-key? (nth keys (nth cur 0)) (nth keys r) (group-colls c env tmpl)))
+                         (recur (+ i 1) acc (conj cur r))
+                         (recur (+ i 1) (conj acc cur) [r]))))))]
+    (if (not= ke "") (values (empty-rel) ke)
+      (let [[out err] (loop [g 0 acc: Vec(Vec(sf/Val)) []]
+                        (if (>= g (count groups)) (values acc "")
+                          (let [idx (nth groups g)
+                                grows (loop [k 0 a: Vec(Scope) []] (if (>= k (count idx)) a (recur (+ k 1) (conj a (copy-scope (nth rows (nth idx k)))))))
+                                rep (if (> (count idx) 0) (copy-scope (nth rows (nth idx (bare-row mm idx rows env)))) (null-scope tmpl))
+                                genv (assoc (push-row env rep) :group grows :grouped true)
+                                [keep he] (if (= (count (:having c)) 0) (values true "")
+                                            (let [[v x] (eval-expr (nth (:having c) 0) genv)] (values (= (sv/truthy v) 1) x)))]
+                            (cond (not= he "") (values acc he)
+                                  (not keep) (recur (+ g 1) acc)
+                                  :else (let [[vs x] (out-vals oc extra genv rep)] (if (not= x "") (values acc x) (recur (+ g 1) (conj acc vs))))))))]
+        (if (not= err "") (values (empty-rel) err)
+          (values (->Rel (out-names oc) (if (:distinct c) (distinct-prefix out (count oc)) out)) ""))))))
+
+(defn- minmax-spec Vec(sp/Node) [oc: &Vec(OutCol)]
+  (let [found (loop [i 0 acc sp/NONE] (if (>= i (count oc)) acc (recur (+ i 1) (if (> (count (:e (nth oc i))) 0) (collect-minmax (nth (:e (nth oc i)) 0) acc) acc))))]
+    (if (= (count found) 1) found sp/NONE)))
+
+(defn- collect-minmax Vec(sp/Node) [n: &sp/Node acc: Vec(sp/Node)]
+  (match (:ex n)
+    (sp/EFn name args star dist)
+    (let [ln (str/lower-case name)]
+      (if (and (or (= ln "min") (= ln "max")) (= (count args) 1)) (conj acc (copy-node n))
+        (loop [i 0 a acc] (if (>= i (count args)) a (recur (+ i 1) (collect-minmax (nth args i) a))))))
+    (sp/EUn op e) (collect-minmax e acc)
+    (sp/EBin op a b) (collect-minmax b (collect-minmax a acc))
+    (sp/ECast e t) (collect-minmax e acc)
+    (sp/ECollate e c) (collect-minmax e acc)
+    _ acc))
+
+(defn- bare-row Int [mm: &Vec(sp/Node) idx: &Vec(Int) rows: &Vec(Scope) env: &Env]
+  (if (= (count mm) 0) 0
+    (match (:ex (nth mm 0))
+      (sp/EFn name args star dist)
+      (let [mx (= (str/lower-case name) "max")
+            coll (let [c (expr-coll (nth args 0) (push-row env (nth rows (nth idx 0))))] (if (= c "") "BINARY" c))]
+        (loop [k 0 best -1 bv: Vec(sf/Val) []]
+          (if (>= k (count idx)) (max best 0)
+            (let [[v e] (eval-expr (nth args 0) (push-row env (nth rows (nth idx k))))]
+              (cond (or (not= e "") (sv/null? v)) (recur (+ k 1) best bv)
+                    (< best 0) (recur (+ k 1) k [v])
+                    (let [c (sv/compare-vals (nth bv 0) v coll)] (if mx (< c 0) (> c 0))) (recur (+ k 1) k [v])
+                    :else (recur (+ k 1) best bv))))))
+      _ 0)))
+
+(defn- group-expr sp/Node [x: &sp/Node oc: &Vec(OutCol)]
+  (let [k (order-ref x oc)] (if (and (>= k 0) (> (count (:e (nth oc k))) 0)) (copy-node (nth (:e (nth oc k)) 0)) (copy-node x))))
+(defn- copy-node sp/Node [n: &sp/Node] (sp/node (:ex n)))
+
+(defn- group-colls Vec(Str) [c: &sp/Core env: &Env tmpl: &Scope]
+  (let [env2 (push-row env tmpl)]
+    (loop [i 0 acc: Vec(Str) []] (if (>= i (count (:group c))) acc (recur (+ i 1) (conj acc (let [x (explicit-coll (nth (:group c) i))] (if (= x "") (let [y (expr-coll (nth (:group c) i) env2)] (if (= y "") "BINARY" y)) x))))))))
+
+(defn- iota Vec(Int) [n: Int] (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc i)))))
+
+(defn- key-cmp Int [a: &Vec(sf/Val) b: &Vec(sf/Val) colls: &Vec(Str)]
+  (loop [i 0] (if (>= i (count a)) 0 (let [c (sv/compare-vals (nth a i) (nth b i) (nth colls i))] (if (not= c 0) c (recur (+ i 1)))))))
+(defn- same-key? Bool [a: &Vec(sf/Val) b: &Vec(sf/Val) colls: &Vec(Str)] (= (key-cmp a b colls) 0))
+
+(defn- sort-idx Vec(Int) [keys: &Vec(Vec(sf/Val)) colls: &Vec(Str)]
+  (sort-idx-range keys colls (iota (count keys))))
+(defn- sort-idx-range Vec(Int) [keys: &Vec(Vec(sf/Val)) colls: &Vec(Str) ix: Vec(Int)]
+  (let [n (count ix)]
+    (if (<= n 1) ix
+      (let [mid (quot n 2)
+            left (sort-idx-range keys colls (loop [i 0 a: Vec(Int) []] (if (>= i mid) a (recur (+ i 1) (conj a (nth ix i))))))
+            right (sort-idx-range keys colls (loop [i mid a: Vec(Int) []] (if (>= i n) a (recur (+ i 1) (conj a (nth ix i))))))]
+        (loop [i 0 j 0 acc: Vec(Int) []]
+          (cond (and (>= i (count left)) (>= j (count right))) acc
+                (>= i (count left)) (recur i (+ j 1) (conj acc (nth right j)))
+                (>= j (count right)) (recur (+ i 1) j (conj acc (nth left i)))
+                (<= (key-cmp (nth keys (nth left i)) (nth keys (nth right j)) colls) 0) (recur (+ i 1) j (conj acc (nth left i)))
+                :else (recur i (+ j 1) (conj acc (nth right j)))))))))
+
+(defn- validate-core Str [c: &sp/Core extra: &Vec(sp/Node) tmpl: &Scope env: &Env]
+  (let [env2 (push-row env tmpl)
+        all (loop [i 0 acc sp/NONE] (if (>= i (count (:cols c))) acc (recur (+ i 1) (if (:star (nth (:cols c) i)) acc (conj acc (nth (:e (nth (:cols c) i)) 0))))))
+        e1 (check-all all env2 1)
+        e2 (if (= e1 "") (check-all (:where c) env2 0) e1)
+        e3 (if (= e2 "") (check-all (:group c) env2 3) e2)
+        e4 (if (= e3 "") (check-all (:having c) env2 1) e3)]
+    (if (= e4 "") (check-all extra env2 1) e4)))
+
+(defn- check-all Str [xs: &Vec(sp/Node) env: &Env mode: Int]
+  (loop [i 0] (if (>= i (count xs)) "" (let [e (check-expr (nth xs i) env mode)] (if (not= e "") e (recur (+ i 1)))))))
+
+(defn- check-expr Str [n: &sp/Node env: &Env mode: Int]
+  (match (:ex n)
+    (sp/ECol t name dq) (let [[sc i] (lookup env t name)]
+                          (cond (>= sc 0) "" (= sc -2) (str "ambiguous column name: " (if (= t "") name (str t "." name)))
+                                (and dq (= t "")) "" :else (str "no such column: " (if (= t "") name (str t "." name)))))
+    (sp/EFn name args star dist)
+    (let [ln (str/lower-case name) agg (aggregate-call? ln (count args) star)]
+      (cond (and agg (= mode 0)) (str "misuse of aggregate: " name "()")
+            (and agg (= mode 2)) (str "misuse of aggregate function " name "()")
+            (and agg (= mode 3)) "aggregate functions are not allowed in the GROUP BY clause"
+            agg (check-all args env 2)
+            (and (conn-fn? ln) (= (count args) 0)) ""
+            (< (fn/arity-ok? ln (count args)) 0) (str "no such function: " name)
+            (= (fn/arity-ok? ln (count args)) 0) (str "wrong number of arguments to function " name "()")
+            :else (check-all args env mode)))
+    (sp/EUn op e) (check-expr e env mode)
+    (sp/EBin op a b) (let [x (check-expr a env mode)] (if (not= x "") x (check-expr b env mode)))
+    (sp/ECast e t) (check-expr e env mode)
+    (sp/ECollate e c) (check-expr e env mode)
+    (sp/EIsNull e neg) (check-expr e env mode)
+    (sp/EBetween e lo hi neg) (let [x (check-expr e env mode) y (if (= x "") (check-expr lo env mode) x)] (if (= y "") (check-expr hi env mode) y))
+    (sp/EIn e items neg) (let [x (check-expr e env mode)] (if (not= x "") x (check-all items env mode)))
+    (sp/ECase base ws ts el) (let [x (check-all base env mode) y (if (= x "") (check-all ws env mode) x) z (if (= y "") (check-all ts env mode) y)] (if (= z "") (check-all el env mode) z))
+    (sp/ELike op e pat esc neg) (let [x (check-expr e env mode) y (if (= x "") (check-expr pat env mode) x)] (if (= y "") (check-all esc env mode) y))
+    (sp/EInSub e q neg) (check-expr e env mode)
+    _ ""))
+
+(defn- subst-alias sp/Node [n: &sp/Node oc: &Vec(OutCol) env: &Env]
+  (match (:ex n)
+    (sp/ECol t name dq)
+    (let [[sc i] (lookup env t name)
+          k (if (and (= t "") (= sc -1)) (loop [j 0] (cond (>= j (count oc)) -1 (and (> (count (:e (nth oc j))) 0) (= (str/lower-case (:name (nth oc j))) (str/lower-case name))) j :else (recur (+ j 1)))) -1)]
+      (if (>= k 0) (copy-node (nth (:e (nth oc k)) 0)) (copy-node n)))
+    (sp/EUn op e) (sp/node (sp/->EUn (str op) (subst-alias e oc env)))
+    (sp/EBin op a b) (sp/node (sp/->EBin (str op) (subst-alias a oc env) (subst-alias b oc env)))
+    (sp/EFn name args star dist) (sp/node (sp/->EFn (str name) (subst-all args oc env) star dist))
+    (sp/ECast e t) (sp/node (sp/->ECast (subst-alias e oc env) (str t)))
+    (sp/ECollate e c) (sp/node (sp/->ECollate (subst-alias e oc env) (str c)))
+    (sp/EIsNull e neg) (sp/node (sp/->EIsNull (subst-alias e oc env) neg))
+    (sp/EBetween e lo hi neg) (sp/node (sp/->EBetween (subst-alias e oc env) (subst-alias lo oc env) (subst-alias hi oc env) neg))
+    (sp/EIn e items neg) (sp/node (sp/->EIn (subst-alias e oc env) (subst-all items oc env) neg))
+    (sp/ECase base ws ts el) (sp/node (sp/->ECase (subst-all base oc env) (subst-all ws oc env) (subst-all ts oc env) (subst-all el oc env)))
+    (sp/ELike op e pat esc neg) (sp/node (sp/->ELike (str op) (subst-alias e oc env) (subst-alias pat oc env) (subst-all esc oc env) neg))
+    (sp/EInSub e q neg) (sp/node (sp/->EInSub (subst-alias e oc env) (copy-select q) neg))
+    _ (copy-node n)))
+(defn- subst-all Vec(sp/Node) [xs: &Vec(sp/Node) oc: &Vec(OutCol) env: &Env]
+  (loop [i 0 acc sp/NONE] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (subst-alias (nth xs i) oc env))))))
+(defn- copy-select sp/Select [q: &sp/Select] (sp/->Select (:ctes q) (:recursive q) (:cores q) (:ops q) (:order q) (:limit q) (:offset q)))
+
+(defn- eval-subq Values(sf/Val Str) [q: &sp/Select env: &Env]
+  (let [[r e] (run-select q (assoc (copy-env env) :grouped false))]
+    (cond (not= e "") (values (sf/->VNull) e)
+          (= (count (:rows r)) 0) (null)
+          :else (ok (copy (nth (nth (:rows r) 0) 0))))))
+
+(defn- eval-exists Values(sf/Val Str) [q: &sp/Select env: &Env]
+  (let [[r e] (run-select q (assoc (copy-env env) :grouped false))] (if (not= e "") (values (sf/->VNull) e) (ok (sv/bool-val (> (count (:rows r)) 0))))))
+
+(defn- eval-in-sub Values(sf/Val Str) [e: &sp/Node q: &sp/Select neg: Bool env: &Env]
+  (let [[x e1] (eval-expr e env)
+        [r e2] (if (= e1 "") (run-select q (assoc (copy-env env) :grouped false)) (values (empty-rel) e1))]
+    (cond (not= e2 "") (values (sf/->VNull) e2)
+          (= (count (:rows r)) 0) (ok (sv/bool-val neg))
+          (sv/null? x) (null)
+          :else
+          (loop [i 0 saw-null false]
+            (if (>= i (count (:rows r))) (if saw-null (null) (ok (sv/bool-val neg)))
+              (let [y (nth (nth (:rows r) i) 0)]
+                (cond (sv/null? y) (recur (+ i 1) true)
+                      (let [[c cn] (sv/cmp-values x y (sv/cmp-affinity (expr-affinity e env) sv/AFF-NONE) (let [cl (expr-coll e env)] (if (= cl "") "BINARY" cl)))] (= c 0))
+                      (ok (sv/bool-val (not neg)))
+                      :else (recur (+ i 1) saw-null))))))))
+
+(def SQLITE-ERROR 1)
+(def SQLITE-TOOBIG 18)
+(def SQLITE-MISMATCH 20)
+(def SQLITE-CONSTRAINT-CHECK 275)
+(def SQLITE-CONSTRAINT-NOTNULL 1299)
+(def SQLITE-CONSTRAINT-PRIMARYKEY 1555)
+(def SQLITE-CONSTRAINT-UNIQUE 2067)
+
+(defrecord ConnState [changes: Int total: Int last-rowid: Int tx: Vec(Db) prep: Bool])
+(defrecord Res [names: Vec(Str) rows: Vec(Vec(sf/Val)) query: Bool])
+
+(defn new-conn-state ConnState [] (let [t: Vec(Db) []] (->ConnState 0 0 0 t false)))
+(defn in-tx? Bool [cs: &ConnState] (> (count (:tx cs)) 0))
+
+(defn- no-res Res [] (->Res [] [] false))
+(defn- code-of Int [msg: &Str] (cond (= msg "string or blob too big") SQLITE-TOOBIG (= msg "datatype mismatch") SQLITE-MISMATCH :else SQLITE-ERROR))
+
+(defn open-db Values(Db Str) [data: Str]
+  (let [[p e] (bt/from-bytes data)] (if (not= e "") (values (new-db 4096) e) (load-schema p))))
+
+(defn db-bytes Str [db: &Db change: Int] (bt/to-bytes (:pager db) change))
+
+(defn prepare Values(sp/Stmt Str) [sql: &Str] (sp/parse sql))
+
+(defn- stmt-env Env [db: &Db cs: &ConnState params: &Vec(sf/Val) names: &Vec(Str) named: &Vec(sf/Val)]
+  (let [sc: Vec(Scope) [] rs: Vec(NamedRel) []]
+    (->Env (copy-vals params) (copy-strs names) (copy-vals named) sc sc false [(copy-db db)] rs [(:changes cs) (:total cs) (:last-rowid cs)])))
+
+(defn exec-stmt Values(Db ConnState Res Int Str) [db: Db cs: ConnState st: &sp/Stmt params: &Vec(sf/Val) names: &Vec(Str) named: &Vec(sf/Val)]
+  (if (simple-insert? st) (exec-simple-insert db cs st params names named)
+    (exec-general db cs st params names named)))
+
+(defn- simple-insert? Bool [st: &sp/Stmt]
+  (match st
+    (sp/SInsert t cols src dflt conflict)
+    (and (not dflt) (= (count (:cores src)) 1) (= (count (:ctes src)) 0) (= (count (:order src)) 0) (= (count (:limit src)) 0)
+         (let [c (nth (:cores src) 0)]
+           (and (:is-values c) (= (count (:values c)) 1) (not (any-subq? (nth (:values c) 0))))))
+    _ false))
+
+(defn- any-subq? Bool [xs: &Vec(sp/Node)] (loop [i 0] (cond (>= i (count xs)) false (has-subq? (nth xs i)) true :else (recur (+ i 1)))))
+(defn- has-subq? Bool [n: &sp/Node]
+  (match (:ex n)
+    (sp/ESubq q) true
+    (sp/EExists q) true
+    (sp/EInSub e q neg) true
+    (sp/EUn op e) (has-subq? e)
+    (sp/EBin op a b) (or (has-subq? a) (has-subq? b))
+    (sp/EFn name args star dist) (any-subq? args)
+    (sp/ECast e t) (has-subq? e)
+    (sp/ECollate e c) (has-subq? e)
+    (sp/EIsNull e neg) (has-subq? e)
+    (sp/EBetween e lo hi neg) (or (has-subq? e) (has-subq? lo) (has-subq? hi))
+    (sp/EIn e items neg) (or (has-subq? e) (any-subq? items))
+    (sp/ECase base ws ts el) (or (any-subq? base) (any-subq? ws) (any-subq? ts) (any-subq? el))
+    (sp/ELike op e pat esc neg) (or (has-subq? e) (has-subq? pat) (any-subq? esc))
+    _ false))
+
+(defn- exec-simple-insert Values(Db ConnState Res Int Str) [db: Db cs: ConnState st: &sp/Stmt params: &Vec(sf/Val) names: &Vec(Str) named: &Vec(sf/Val)]
+  (let [sc: Vec(Scope) [] rs: Vec(NamedRel) [] nodb: Vec(Db) []
+        env (->Env (copy-vals params) (copy-strs names) (copy-vals named) sc sc false nodb rs [(:changes cs) (:total cs) (:last-rowid cs)])]
+    (match st
+      (sp/SInsert t cols src dflt conflict)
+      (let [[d n last code msg] (exec-insert db t cols src dflt conflict env)]
+        (if (not= code 0) (values d (if (< n 0) (assoc cs :prep true) (assoc cs :changes 0 :prep false)) (no-res) code (str msg))
+          (values d (assoc cs :prep false :changes n :total (+ (:total cs) n) :last-rowid (match last (Some r) r (None) (:last-rowid cs))) (no-res) 0 "")))
+      _ (values db cs (no-res) SQLITE-ERROR "not an insert"))))
+
+(defn- exec-general Values(Db ConnState Res Int Str) [db: Db cs: ConnState st: &sp/Stmt params: &Vec(sf/Val) names: &Vec(Str) named: &Vec(sf/Val)]
+  (let [env (stmt-env db cs params names named)]
+    (match st
+      (sp/SSelect q)
+      (let [[r e] (run-select q env)]
+        (if (not= e "") (values db (assoc cs :prep (prepare-msg? e)) (no-res) (code-of e) e) (values db (assoc cs :prep false) (->Res (:names r) (:rows r) true) 0 "")))
+      (sp/SInsert t cols src dflt conflict) (let [[d n last code msg] (exec-insert (copy-db db) t cols src dflt conflict env)] (wrap-dml d n last code msg db cs))
+      (sp/SUpdate t cols vals w conflict) (let [[d n last code msg] (exec-update (copy-db db) t cols vals w conflict env)] (wrap-dml d n last code msg db cs))
+      (sp/SDelete t w) (let [[d n last code msg] (exec-delete (copy-db db) t w env)] (wrap-dml d n last code msg db cs))
+      (sp/SCreateTable name ine cols cons wr sql) (let [[d code msg] (create-table (copy-db db) name ine cols cons wr sql)] (wrap-ddl d code msg db cs))
+      (sp/SCreateIndex name t u ine cols w sql) (let [[d code msg] (create-index (copy-db db) name t u ine cols w sql)] (wrap-ddl d code msg db cs))
+      (sp/SDrop kind name ie) (let [[d code msg] (drop-object (copy-db db) kind name ie)] (wrap-ddl d code msg db cs))
+      (sp/SBegin) (if (in-tx? cs) (values db cs (no-res) SQLITE-ERROR "cannot start a transaction within a transaction")
+                    (values db (assoc cs :tx [(copy-db db)]) (no-res) 0 ""))
+      (sp/SCommit) (if (in-tx? cs) (values db (assoc cs :tx (let [t: Vec(Db) []] t)) (no-res) 0 "")
+                     (values db cs (no-res) SQLITE-ERROR "cannot commit - no transaction is active"))
+      (sp/SRollback) (if (in-tx? cs) (values (copy-db (nth (:tx cs) 0)) (assoc cs :tx (let [t: Vec(Db) []] t)) (no-res) 0 "")
+                       (values db cs (no-res) SQLITE-ERROR "cannot rollback - no transaction is active"))
+      (sp/SEmpty) (values db cs (no-res) 0 ""))))
+
+(defn- wrap-dml Values(Db ConnState Res Int Str) [db: Db n: Int last: Option(Int) code: Int msg: &Str db0: Db cs: ConnState]
+  (if (not= code 0) (values db0 (if (< n 0) (assoc cs :prep true) (assoc cs :changes 0 :prep false)) (no-res) code (str msg))
+    (values db (assoc cs :prep false :changes n :total (+ (:total cs) n) :last-rowid (match last (Some r) r (None) (:last-rowid cs))) (no-res) 0 "")))
+
+(defn- wrap-ddl Values(Db ConnState Res Int Str) [db: Db code: Int msg: &Str db0: Db cs: ConnState]
+  (if (not= code 0) (values db0 (assoc cs :prep (not= code SQLITE-CONSTRAINT-UNIQUE)) (no-res) code (str msg)) (values db (assoc cs :prep false) (no-res) 0 "")))
+
+(defn- prepare-msg? Bool [m: &Str]
+  (or (str/starts-with? m "no such ") (str/starts-with? m "ambiguous ") (str/starts-with? m "misuse ") (str/starts-with? m "wrong number")
+      (str/includes? m "ORDER BY term") (str/includes? m "do not have the same number") (str/starts-with? m "aggregate functions")
+      (str/starts-with? m "unsupported")))
+
+(defn- schema-insert Db [db: Db row: &Vec(sf/Val)]
+  (let [p (:pager db)
+        [mx ok] (bt/table-max p 1)
+        db2 (assoc db :pager (bt/table-insert (bt/new-pager 512 0) 1 1 ""))]
+    (assoc db2 :pager (bt/table-insert p 1 (+ mx 1) (sf/encode-record row)))))
+
+(defn- schema-delete Db [db: Db name: &Str by-table: Bool]
+  (let [p0 (:pager db)
+        ln (str/lower-case name)
+        victims (loop [c (bt/cur-first p0 1) acc: Vec(Int) []]
+                  (if (not (bt/valid? c)) acc
+                    (let [[vs ok] (sf/decode-record (bt/cur-payload p0 c))
+                          hit (or (= (str/lower-case (sv/to-text (nth vs 1))) ln) (and by-table (= (str/lower-case (sv/to-text (nth vs 2))) ln)))]
+                      (recur (bt/cur-next p0 c) (if hit (conj acc (bt/cur-rowid p0 c)) acc)))))
+        p1 (loop [i 0 p p0] (if (>= i (count victims)) p (let [[p2 ok] (bt/table-delete p 1 (nth victims i))] (recur (+ i 1) p2))))]
+    (assoc db :pager p1)))
+
+(defn- bump Db [db: Db] (let [p (:pager db) db2 (assoc db :pager (bt/new-pager 512 0))] (assoc db2 :pager (bt/bump-schema p))))
+
+(defn- set-pager Db [db: Db p: bt/Pager] (assoc db :pager p))
+
+(defn- create-table Values(Db Int Str) [db0: Db name: &Str ine: Bool cols: &Vec(sp/ColDef) cons: &Vec(sp/TableCons) wr: Bool sql: &Str]
+  (cond
+    (>= (find-table db0 name) 0) (if ine (values db0 0 "") (values db0 SQLITE-ERROR (str "table " name " already exists")))
+    (>= (find-index db0 name) 0) (values db0 SQLITE-ERROR (str "there is already an index named " name))
+    (str/starts-with? (str/lower-case name) "sqlite_") (values db0 SQLITE-ERROR (str "object name reserved for internal use: " name))
+    wr (values db0 SQLITE-ERROR "unsupported: WITHOUT ROWID")
+    :else
+    (let [[p1 root] (bt/create-tree (:pager db0) true)
+          t (table-of name cols cons root sql)
+          db1 (schema-insert (set-pager db0 p1) [(sf/->VText "table") (sf/->VText (str name)) (sf/->VText (str name)) (sf/->VInt root) (sf/->VText (str sql))])
+          db2 (assoc db1 :tables (conj (:tables db1) t))
+          specs (unique-specs t)
+          db3 (loop [i 0 d db2]
+                (if (>= i (count specs)) d
+                  (let [[p2 iroot] (bt/create-tree (:pager d) false)
+                        iname (str "sqlite_autoindex_" name "_" (+ i 1))
+                        sp1 (nth specs i)
+                        d2 (schema-insert (set-pager d p2) [(sf/->VText "index") (sf/->VText iname) (sf/->VText (str name)) (sf/->VInt iroot) (sf/->VNull)])]
+                    (recur (+ i 1) (assoc d2 :indexes (conj (:indexes d2) (->Index iname (str name) iroot (:cols sp1) (idx-colls t (:cols sp1)) (bools (count (:cols sp1))) true (:cons sp1) "")))))))
+          db4 (if (and (:autoinc t) (< (find-table db3 "sqlite_sequence") 0))
+                (let [[p3 sroot] (bt/create-tree (:pager db3) true)
+                      sq "CREATE TABLE sqlite_sequence(name,seq)"
+                      [st e] (sp/parse sq)
+                      d (schema-insert (set-pager db3 p3) [(sf/->VText "table") (sf/->VText "sqlite_sequence") (sf/->VText "sqlite_sequence") (sf/->VInt sroot) (sf/->VText sq)])]
+                  (match st
+                    (sp/SCreateTable n i2 cs2 cn2 w2 s2) (assoc d :tables (conj (:tables d) (table-of "sqlite_sequence" cs2 cn2 sroot sq)))
+                    _ d))
+                db3)]
+      (values (bump db4) 0 ""))))
+
+(defn- drop-object Values(Db Int Str) [db0: Db kind: &Str name: &Str ie: Bool]
+  (cond
+    (= kind "TABLE")
+    (let [ti (find-table db0 name)]
+      (cond
+        (< ti 0) (if ie (values db0 0 "") (values db0 SQLITE-ERROR (str "no such table: " name)))
+        (str/starts-with? (str/lower-case name) "sqlite_") (values db0 SQLITE-ERROR (str "table " name " may not be dropped"))
+        :else
+        (let [t (nth (:tables db0) ti)
+              ln (str/lower-case name)
+              p1 (bt/drop-tree (:pager db0) (:root t))
+              p2 (loop [i 0 p p1] (if (>= i (count (:indexes db0))) p (let [ix (nth (:indexes db0) i)] (recur (+ i 1) (if (= (str/lower-case (:table ix)) ln) (bt/drop-tree p (:root ix)) p)))))
+              db1 (schema-delete (set-pager db0 p2) name true)
+              db2 (assoc db1 :tables (loop [i 0 acc: Vec(Table) []] (if (>= i (count (:tables db1))) acc (recur (+ i 1) (if (= i ti) acc (conj acc (nth (:tables db1) i)))))))
+              db3 (assoc db2 :indexes (loop [i 0 acc: Vec(Index) []] (if (>= i (count (:indexes db2))) acc (recur (+ i 1) (let [ix (nth (:indexes db2) i)] (if (= (str/lower-case (:table ix)) ln) acc (conj acc ix)))))))
+              db4 (seq-delete db3 name)]
+          (values (bump db4) 0 ""))))
+    (= kind "INDEX")
+    (let [ii (find-index db0 name)]
+      (cond
+        (< ii 0) (if ie (values db0 0 "") (values db0 SQLITE-ERROR (str "no such index: " name)))
+        (not= (:cons (nth (:indexes db0) ii)) "") (values db0 SQLITE-ERROR "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped")
+        :else
+        (let [ix (nth (:indexes db0) ii)
+              db1 (schema-delete (set-pager db0 (bt/drop-tree (:pager db0) (:root ix))) name false)
+              db2 (assoc db1 :indexes (loop [i 0 acc: Vec(Index) []] (if (>= i (count (:indexes db1))) acc (recur (+ i 1) (if (= i ii) acc (conj acc (nth (:indexes db1) i)))))))]
+          (values (bump db2) 0 ""))))
+    :else (if ie (values db0 0 "") (values db0 SQLITE-ERROR (str "no such " (str/lower-case kind) ": " name)))))
+
+(defn- create-index Values(Db Int Str) [db0: Db name: &Str table: &Str unique: Bool ine: Bool cols: &Vec(sp/IdxCol) w: &Vec(sp/Node) sql: &Str]
+  (let [ti (find-table db0 table)]
+    (cond
+      (>= (find-index db0 name) 0) (if ine (values db0 0 "") (values db0 SQLITE-ERROR (str "index " name " already exists")))
+      (>= (find-table db0 name) 0) (values db0 SQLITE-ERROR (str "there is already a table named " name))
+      (< ti 0) (values db0 SQLITE-ERROR (str "no such table: main." table))
+      (> (count w) 0) (values db0 SQLITE-ERROR "unsupported: partial index")
+      :else
+      (let [t (nth (:tables db0) ti)
+            bad (loop [i 0] (cond (>= i (count cols)) ""
+                                  (match (:ex (:e (nth cols i))) (sp/ECol tt n d) (and (< (col-index t n) 0) (not (rowid-name? n))) _ true)
+                                  (match (:ex (:e (nth cols i))) (sp/ECol tt n d) (str "no such column: " n) _ "unsupported: index on expression")
+                                  :else (recur (+ i 1))))]
+        (if (not= bad "") (values db0 SQLITE-ERROR bad)
+          (let [[p1 root] (bt/create-tree (:pager db0) false)
+                ix (index-of t name cols unique "" root sql)
+                db1 (schema-insert (set-pager db0 p1) [(sf/->VText "index") (sf/->VText (str name)) (sf/->VText (:name t)) (sf/->VInt root) (sf/->VText (str sql))])
+                [p2 err] (loop [c (bt/cur-first (:pager db1) (:root t)) p (:pager db1)]
+                           (if (not (bt/valid? c)) (values p "")
+                             (let [rid (bt/cur-rowid (:pager db1) c)
+                                   vals (row-vals t rid (bt/cur-payload (:pager db1) c))
+                                   key (index-key ix rid vals)
+                                   dup (and unique (unique-hit? p ix key []))]
+                               (if dup (values p (unique-msg t ix))
+                                 (recur (bt/cur-next (:pager db1) c) (bt/index-insert p root key (key-cmp-of ix)))))))]
+            (if (not= err "") (values db0 SQLITE-CONSTRAINT-UNIQUE err)
+              (values (bump (assoc (set-pager db1 p2) :indexes (conj (:indexes db1) ix))) 0 ""))))))))
+
+(defn- index-key Str [ix: &Index rowid: Int vals: &Vec(sf/Val)]
+  (let [ks (loop [i 0 acc: Vec(sf/Val) []]
+             (if (>= i (count (:cols ix))) acc
+               (let [c (nth (:cols ix) i)] (recur (+ i 1) (conj acc (if (< c 0) (sf/->VInt rowid) (copy (nth vals c))))))))]
+    (sf/encode-record (conj ks (sf/->VInt rowid)))))
+
+(defn- cmp-index Int [a: Str b: Str] 0)
+(defn- key-cmp-of bt/KeyCmp [ix: &Index] (bt/->KeyCmp (index-comparer ix)))
+
+(defn- index-comparer Fn(Str Int Str Int) [ix: &Index]
+  (let [colls (:colls ix) desc (:desc ix)]
+    (fn Int [a: Str ao: Int b: Str] (sv/record-compare-at a ao b colls desc))))
+
+(defn- unique-hit? Bool [p: &bt/Pager ix: &Index key: &Str skip: &Vec(Int)]
+  (let [[vs ok] (sf/decode-record key)
+        n (count (:cols ix))
+        has-null (loop [i 0] (cond (>= i n) false (sv/null? (nth vs i)) true :else (recur (+ i 1))))]
+    (if has-null false
+      (let [prefix (sf/encode-record (loop [i 0 acc: Vec(sf/Val) []] (if (>= i n) acc (recur (+ i 1) (conj acc (copy (nth vs i)))))))
+            kc (key-cmp-of ix)
+            c (bt/seek-ge p (:root ix) prefix kc)]
+        (loop [c c]
+          (if (not (bt/valid? c)) false
+            (let [k (bt/cur-payload p c)]
+              (if (not= ((:f kc) k 0 prefix) 0) false
+                (let [[kv ok2] (sf/decode-record k) rid (sv/to-int (nth kv n))]
+                  (if (skip? skip rid) (recur (bt/cur-next p c)) true))))))))))
+
+(defn- skip? Bool [skip: &Vec(Int) rid: Int] (loop [i 0] (cond (>= i (count skip)) false (= (nth skip i) rid) true :else (recur (+ i 1)))))
+
+(defn- unique-msg Str [t: &Table ix: &Index]
+  (str "UNIQUE constraint failed: "
+       (loop [i 0 out ""] (if (>= i (count (:cols ix))) out
+                            (let [c (nth (:cols ix) i) nm (if (< c 0) "rowid" (:name (nth (:cols t) c)))]
+                              (recur (+ i 1) (if (= i 0) (str (:name t) "." nm) (str out ", " (:name t) "." nm))))))))
+
+(defn- table-indexes Vec(Index) [db: &Db t: &Table]
+  (let [ln (str/lower-case (:name t))] (loop [i 0 acc: Vec(Index) []] (if (>= i (count (:indexes db))) acc (recur (+ i 1) (let [ix (nth (:indexes db) i)] (if (= (str/lower-case (:table ix)) ln) (conj acc ix) acc)))))))
+
+(defn- row-conflict Values(Int Str Bool) [p: &bt/Pager db: &Db t: &Table rowid: Int vals: &Vec(sf/Val) conflict: &Str env: &Env old: Option(Int)]
+  (let [nn (loop [i 0] (cond (>= i (count (:cols t))) -1 (and (:notnull (nth (:cols t) i)) (sv/null? (nth vals i)) (not= i (:ipk t))) i :else (recur (+ i 1))))
+        ck (if (< nn 0) (check-row t rowid vals env) "")]
+    (cond
+      (and (>= nn 0) (= conflict "IGNORE")) (values -1 "" false)
+      (>= nn 0) (values SQLITE-CONSTRAINT-NOTNULL (str "NOT NULL constraint failed: " (:name t) "." (:name (nth (:cols t) nn))) false)
+      (and (not= ck "") (= conflict "IGNORE")) (values -1 "" false)
+      (not= ck "") (values SQLITE-CONSTRAINT-CHECK ck false)
+      :else
+      (let [[cur found] (bt/table-find p (:root t) rowid)
+            [exists skip] (match old (Some o) (values (and found (not= rowid o)) [rowid o]) (None) (values found [rowid]))
+            ixs (table-indexes db t)
+            clash (loop [i 0] (cond (>= i (count ixs)) -1
+                                    (and (:unique (nth ixs i)) (unique-hit? p (nth ixs i) (index-key (nth ixs i) rowid vals) skip)) i
+                                    :else (recur (+ i 1))))]
+        (cond
+          (and (or exists (>= clash 0)) (= conflict "IGNORE")) (values -1 "" false)
+          (and exists (not= conflict "REPLACE"))
+          (values SQLITE-CONSTRAINT-PRIMARYKEY (str "UNIQUE constraint failed: " (:name t) "." (if (>= (:ipk t) 0) (:name (nth (:cols t) (:ipk t))) "rowid")) false)
+          (and (>= clash 0) (not= conflict "REPLACE"))
+          (let [ix (nth ixs clash)] (values (if (= (:cons ix) "pk") SQLITE-CONSTRAINT-PRIMARYKEY SQLITE-CONSTRAINT-UNIQUE) (unique-msg t ix) false))
+          :else (values 0 "" exists))))))
+
+(defn- put-row bt/Pager [p0: bt/Pager db: &Db t: &Table rowid: Int vals: &Vec(sf/Val) conflict: &Str old: Option(Int) exists: Bool]
+  (let [ixs (table-indexes db t)
+        p00 (match old (Some o) (remove-row p0 db t o) (None) p0)
+        p1 (if exists (remove-row p00 db t rowid) p00)
+        p2 (loop [i 0 p p1]
+             (if (>= i (count ixs)) p
+               (let [ix (nth ixs i) others (if (and (:unique ix) (= conflict "REPLACE")) (unique-rowids p ix (index-key ix rowid vals) rowid) [])]
+                 (recur (+ i 1) (loop [k 0 q p] (if (>= k (count others)) q (recur (+ k 1) (remove-row q db t (nth others k)))))))))
+        rec (sf/encode-record (loop [i 0 acc: Vec(sf/Val) []] (if (>= i (count vals)) acc (recur (+ i 1) (conj acc (if (= i (:ipk t)) (sf/->VNull) (copy (nth vals i))))))))
+        p3 (bt/table-insert p2 (:root t) rowid rec)]
+    (loop [i 0 p p3] (if (>= i (count ixs)) p (let [ix (nth ixs i)] (recur (+ i 1) (bt/index-insert p (:root ix) (index-key ix rowid vals) (key-cmp-of ix))))))))
+
+(defn- write-row Values(bt/Pager Int Str) [p0: bt/Pager db: &Db t: &Table rowid: Int vals: &Vec(sf/Val) conflict: &Str env: &Env]
+  (let [[code msg exists] (row-conflict p0 db t rowid vals conflict env (->None))]
+    (if (not= code 0) (values p0 code msg) (values (put-row p0 db t rowid vals conflict (->None) exists) 0 ""))))
+
+(defn- unique-rowids Vec(Int) [p: &bt/Pager ix: &Index key: &Str self: Int]
+  (if (not (:unique ix)) []
+    (let [[vs ok] (sf/decode-record key) n (count (:cols ix))
+          has-null (loop [i 0] (cond (>= i n) false (sv/null? (nth vs i)) true :else (recur (+ i 1))))]
+      (if has-null []
+        (let [prefix (sf/encode-record (loop [i 0 acc: Vec(sf/Val) []] (if (>= i n) acc (recur (+ i 1) (conj acc (copy (nth vs i)))))))
+              kc (key-cmp-of ix)]
+          (loop [c (bt/seek-ge p (:root ix) prefix kc) acc: Vec(Int) []]
+            (if (not (bt/valid? c)) acc
+              (let [k (bt/cur-payload p c)]
+                (if (not= ((:f kc) k 0 prefix) 0) acc
+                  (let [[kv ok2] (sf/decode-record k) rid (sv/to-int (nth kv n))]
+                    (recur (bt/cur-next p c) (if (= rid self) acc (conj acc rid)))))))))))))
+
+(defn- remove-row bt/Pager [p0: bt/Pager db: &Db t: &Table rowid: Int]
+  (let [[old found] (bt/table-find p0 (:root t) rowid)]
+    (if (not found) p0
+      (let [vals (row-vals t rowid old)
+            ixs (table-indexes db t)
+            p1 (loop [i 0 p p0] (if (>= i (count ixs)) p (let [ix (nth ixs i) [p2 ok] (bt/index-delete p (:root ix) (index-key ix rowid vals) (key-cmp-of ix))] (recur (+ i 1) p2))))
+            [p3 ok] (bt/table-delete p1 (:root t) rowid)]
+        p3))))
+
+(defn- check-row Str [t: &Table rowid: Int vals: &Vec(sf/Val) env: &Env]
+  (if (= (count (:checks t)) 0) ""
+  (let [env2 (push-row env (table-scope t (:name t) rowid vals))]
+    (loop [i 0]
+      (if (>= i (count (:checks t))) ""
+        (let [[v e] (eval-expr (nth (:checks t) i) env2)]
+          (cond (not= e "") e
+                (= (sv/truthy v) 0) (str "CHECK constraint failed: " (nth (:check-labels t) i))
+                :else (recur (+ i 1)))))))))
+
+(defn- new-rowid Values(Int Str) [p: &bt/Pager db: &Db t: &Table]
+  (let [[mx ok] (bt/table-max p (:root t))
+        seq (if (:autoinc t) (seq-value p db (:name t)) 0)
+        base (max (if ok mx 0) seq)]
+    (if (>= base num/I64-MAX) (values 0 "database or disk is full") (values (+ base 1) ""))))
+
+(defn- seq-value Int [p: &bt/Pager db: &Db name: &Str]
+  (let [si (find-table db "sqlite_sequence")]
+    (if (< si 0) 0
+      (let [st (nth (:tables db) si) ln (str/lower-case name)]
+        (loop [c (bt/cur-first p (:root st))]
+          (if (not (bt/valid? c)) 0
+            (let [[vs ok] (sf/decode-record (bt/cur-payload p c))]
+              (if (= (str/lower-case (sv/to-text (nth vs 0))) ln) (sv/to-int (nth vs 1)) (recur (bt/cur-next p c))))))))))
+
+(defn- seq-update bt/Pager [p: bt/Pager db: &Db name: &Str rowid: Int]
+  (let [si (find-table db "sqlite_sequence")]
+    (if (< si 0) p
+      (let [st (nth (:tables db) si) ln (str/lower-case name)
+            [hit seqv] (loop [c (bt/cur-first p (:root st))]
+                         (if (not (bt/valid? c)) (values -1 0)
+                           (let [[vs ok] (sf/decode-record (bt/cur-payload p c))]
+                             (if (= (str/lower-case (sv/to-text (nth vs 0))) ln) (values (bt/cur-rowid p c) (sv/to-int (nth vs 1))) (recur (bt/cur-next p c))))))]
+        (cond (and (>= hit 0) (>= seqv rowid)) p
+              (>= hit 0) (bt/table-insert p (:root st) hit (sf/encode-record [(sf/->VText (str name)) (sf/->VInt rowid)]))
+              :else (let [[mx ok] (bt/table-max p (:root st))] (bt/table-insert p (:root st) (+ (if ok mx 0) 1) (sf/encode-record [(sf/->VText (str name)) (sf/->VInt rowid)]))))))))
+
+(defn- seq-delete Db [db: Db name: &Str]
+  (let [si (find-table db "sqlite_sequence")]
+    (if (< si 0) db
+      (let [st (nth (:tables db) si) ln (str/lower-case name) p (:pager db)
+            hit (loop [c (bt/cur-first p (:root st))]
+                  (if (not (bt/valid? c)) -1
+                    (let [[vs ok] (sf/decode-record (bt/cur-payload p c))] (if (= (str/lower-case (sv/to-text (nth vs 0))) ln) (bt/cur-rowid p c) (recur (bt/cur-next p c))))))]
+        (if (< hit 0) db (let [[p2 ok] (bt/table-delete p (:root st) hit)] (set-pager db p2)))))))
+
+(defn- exec-insert Values(Db Int Option(Int) Int Str) [db0: Db name: &Str cols: &Vec(Str) src: &sp/Select dflt: Bool conflict: &Str env: &Env]
+  (let [ti (find-table db0 name)]
+    (if (< ti 0) (values db0 -1 (->None) SQLITE-ERROR (str "no such table: " name))
+      (let [t (nth (:tables db0) ti)
+            ncol (count (:cols t))
+            [targets te] (if (= (count cols) 0) (values (iota ncol) "")
+                           (loop [i 0 acc: Vec(Int) []]
+                             (if (>= i (count cols)) (values acc "")
+                               (let [k (col-index t (nth cols i))]
+                                 (cond (>= k 0) (recur (+ i 1) (conj acc k))
+                                       (rowid-name? (nth cols i)) (recur (+ i 1) (conj acc -1))
+                                       :else (values acc (str "table " name " has no column named " (nth cols i))))))))
+            [rel re] (cond (not= te "") (values (empty-rel) te)
+                           dflt (values (->Rel [] [[]]) "")
+                           :else (run-select src env))]
+        (cond
+          (not= re "") (values db0 -1 (->None) (code-of re) re)
+          (and (> (count (:rows rel)) 0) (not dflt) (not= (count (nth (:rows rel) 0)) (count targets)))
+          (values db0 -1 (->None) SQLITE-ERROR
+                  (if (= (count cols) 0) (str "table " name " has " ncol " columns but " (count (nth (:rows rel) 0)) " values were supplied")
+                    (str (count (nth (:rows rel) 0)) " values for " (count targets) " columns")))
+          :else
+          (let [pg0 (:pager db0) db1 (assoc db0 :pager EMPTY-PAGER)]
+          (loop [i 0 p pg0 n 0 last: Option(Int) (->None)]
+            (if (>= i (count (:rows rel))) (values (set-pager db1 p) n last 0 "")
+              (let [src-row (nth (:rows rel) i)
+                    [vals0 rid0] (loop [k 0 vs (loop [c 0 a: Vec(sf/Val) []] (if (>= c ncol) a (recur (+ c 1) (conj a (default-val (nth (:cols t) c)))))) rid (sf/->VNull)]
+                                   (if (or dflt (>= k (count targets))) (values vs rid)
+                                     (let [c (nth targets k) x (nth src-row k)]
+                                       (if (< c 0) (recur (+ k 1) vs (copy x))
+                                         (recur (+ k 1) (assoc vs c (sv/apply-affinity x (:aff (nth (:cols t) c)))) rid)))))
+                    ridv (if (and (>= (:ipk t) 0) (not (sv/null? (nth vals0 (:ipk t))))) (copy (nth vals0 (:ipk t))) rid0)
+                    ridn (sv/apply-affinity ridv sv/AFF-INTEGER)
+                    [rowid rerr] (cond (sv/null? ridn) (new-rowid p db1 t)
+                                       (sv/vint? ridn) (values (sv/to-int ridn) "")
+                                       :else (values 0 "datatype mismatch"))
+                    vals (if (>= (:ipk t) 0) (assoc vals0 (:ipk t) (sf/->VInt rowid)) vals0)]
+                (if (not= rerr "") (values (set-pager db1 p) 0 (->None) (if (= rerr "datatype mismatch") SQLITE-MISMATCH SQLITE-ERROR) rerr)
+                  (let [[p2 code msg] (write-row p db1 t rowid vals conflict env)]
+                    (cond (> code 0) (values (set-pager db1 p2) 0 (->None) code msg)
+                          (< code 0) (recur (+ i 1) p2 n last)
+                          :else (recur (+ i 1) (if (:autoinc t) (seq-update p2 db1 name rowid) p2) (+ n 1) (->Some rowid))))))))))))))
+
+(defrecord Hit [rowid: Int vals: Vec(sf/Val)])
+
+(defn- matching-rows Values(Vec(Hit) Str) [db: &Db t: &Table w: &Vec(sp/Node) env: &Env]
+  (let [p (:pager db)
+        tmpl (table-scope t (:name t) 0 (null-vals (count (:cols t))))
+        [via rids] (index-probe db t (:name t) w env)]
+  (if via (match-rids p t tmpl rids w env)
+  (loop [c (bt/cur-first p (:root t)) acc: Vec(Hit) []]
+    (if (not (bt/valid? c)) (values acc "")
+      (let [rid (bt/cur-rowid p c) vals (row-vals t rid (bt/cur-payload p c))]
+        (if (= (count w) 0) (recur (bt/cur-next p c) (conj acc (->Hit rid vals)))
+          (let [[v e] (eval-expr (nth w 0) (push-row env (table-row tmpl rid (copy-vals vals))))]
+            (cond (not= e "") (values acc e)
+                  (= (sv/truthy v) 1) (recur (bt/cur-next p c) (conj acc (->Hit rid vals)))
+                  :else (recur (bt/cur-next p c) acc))))))))))
+
+(defn- match-rids Values(Vec(Hit) Str) [p: &bt/Pager t: &Table tmpl: &Scope rids: &Vec(Int) w: &Vec(sp/Node) env: &Env]
+  (loop [i 0 acc: Vec(Hit) []]
+    (if (>= i (count rids)) (values acc "")
+      (let [rid (nth rids i) [pl found] (bt/table-find p (:root t) rid)]
+        (if (not found) (recur (+ i 1) acc)
+          (let [vals (row-vals t rid pl)
+                [v e] (eval-expr (nth w 0) (push-row env (table-row tmpl rid (copy-vals vals))))]
+            (cond (not= e "") (values acc e)
+                  (= (sv/truthy v) 1) (recur (+ i 1) (conj acc (->Hit rid vals)))
+                  :else (recur (+ i 1) acc))))))))
+
+(defn- exec-delete Values(Db Int Option(Int) Int Str) [db0: Db name: &Str w: &Vec(sp/Node) env: &Env]
+  (let [ti (find-table db0 name)]
+    (if (< ti 0) (values db0 -1 (->None) SQLITE-ERROR (str "no such table: " name))
+      (let [t (nth (:tables db0) ti)
+            ve (check-all w (push-row env (table-scope t (:name t) 0 (null-vals (count (:cols t))))) 0)
+            [hits e] (if (= ve "") (matching-rows db0 t w env) (values [] ve))]
+        (if (not= e "") (values db0 (if (= ve "") 0 -1) (->None) (code-of e) e)
+          (let [p (loop [i 0 p (:pager db0)] (if (>= i (count hits)) p (recur (+ i 1) (remove-row p db0 t (:rowid (nth hits i))))))]
+            (values (set-pager db0 p) (count hits) (->None) 0 "")))))))
+
+(defn- exec-update Values(Db Int Option(Int) Int Str) [db0: Db name: &Str cols: &Vec(Str) exprs: &Vec(sp/Node) w: &Vec(sp/Node) conflict: &Str env: &Env]
+  (let [ti (find-table db0 name)]
+    (if (< ti 0) (values db0 -1 (->None) SQLITE-ERROR (str "no such table: " name))
+      (let [t (nth (:tables db0) ti)
+            [targets te] (loop [i 0 acc: Vec(Int) []]
+                           (if (>= i (count cols)) (values acc "")
+                             (let [k (col-index t (nth cols i))]
+                               (cond (>= k 0) (recur (+ i 1) (conj acc k))
+                                     (rowid-name? (nth cols i)) (recur (+ i 1) (conj acc -1))
+                                     :else (values acc (str "no such column: " (nth cols i)))))))
+            tenv (push-row env (table-scope t (:name t) 0 (null-vals (count (:cols t)))))
+            ve (if (= te "") (let [x (check-all w tenv 0)] (if (= x "") (check-all exprs tenv 0) x)) te)
+            [hits e] (if (= ve "") (matching-rows db0 t w env) (values [] ve))]
+        (if (not= e "") (values db0 (if (= ve "") 0 -1) (->None) (code-of e) e)
+          (loop [i 0 p (:pager db0) n 0]
+            (if (>= i (count hits)) (values (set-pager db0 p) n (->None) 0 "")
+              (let [h (nth hits i)
+                    env2 (push-row env (table-scope t (:name t) (:rowid h) (:vals h)))
+                    [nv nrid err] (loop [k 0 vs (copy-vals (:vals h)) rid (:rowid h)]
+                                    (if (>= k (count targets)) (values vs rid "")
+                                      (let [[x ex] (eval-expr (nth exprs k) env2) c (nth targets k)]
+                                        (cond (not= ex "") (values vs rid ex)
+                                              (or (< c 0) (= c (:ipk t)))
+                                              (let [r (sv/apply-affinity x sv/AFF-INTEGER)]
+                                                (cond (sv/vint? r) (recur (+ k 1) (if (>= (:ipk t) 0) (assoc vs (:ipk t) (sf/->VInt (sv/to-int r))) vs) (sv/to-int r))
+                                                      (sv/null? r) (recur (+ k 1) vs rid)
+                                                      :else (values vs rid "datatype mismatch")))
+                                              :else (recur (+ k 1) (assoc vs c (sv/apply-affinity x (:aff (nth (:cols t) c)))) rid)))))]
+                (if (not= err "") (values db0 0 (->None) (if (= err "datatype mismatch") SQLITE-MISMATCH (code-of err)) err)
+                  (let [[code msg exists] (row-conflict p db0 t nrid nv conflict env (->Some (:rowid h)))]
+                    (cond (> code 0) (values db0 0 (->None) code msg)
+                          (< code 0) (recur (+ i 1) p n)
+                          :else (recur (+ i 1) (put-row p db0 t nrid nv conflict (->Some (:rowid h)) exists) (+ n 1)))))))))))))
+
+(defn- index-probe Values(Bool Vec(Int)) [db: &Db t: &Table qual: &Str w: &Vec(sp/Node) env: &Env]
+  (if (= (count w) 0) (values false [])
+    (let [terms (conjuncts (nth w 0) sp/NONE)]
+      (loop [i 0]
+        (if (>= i (count terms)) (values false [])
+          (let [[ok rids] (probe-term db t qual (nth terms i) env)]
+            (if ok (values true rids) (recur (+ i 1)))))))))
+
+(defn- conjuncts Vec(sp/Node) [n: &sp/Node acc: Vec(sp/Node)]
+  (match (:ex n)
+    (sp/EBin op a b) (if (= op "AND") (conjuncts b (conjuncts a acc)) (conj acc (copy-node n)))
+    _ (conj acc (copy-node n))))
+
+(defn- free-expr? Bool [n: &sp/Node]
+  (match (:ex n)
+    (sp/ELit v) true
+    (sp/EInt t) true
+    (sp/EReal t) true
+    (sp/EParam i nm) true
+    (sp/EUn op e) (and (not= op "NOT") (free-expr? e))
+    (sp/EBin op a b) (and (free-expr? a) (free-expr? b) (not (member? op ["=" "!=" "<" "<=" ">" ">=" "AND" "OR" "IS" "IS NOT"])))
+    _ false))
+
+(defn- probe-term Values(Bool Vec(Int)) [db: &Db t: &Table qual: &Str term: &sp/Node env: &Env]
+  (match (:ex term)
+    (sp/EBin op a b)
+    (if (not= op "=") (values false [])
+      (let [[col x] (cond (and (col-of? a t qual) (free-expr? b)) (values (col-name a) b)
+                          (and (col-of? b t qual) (free-expr? a)) (values (col-name b) a)
+                          :else (values "" a))]
+        (if (= col "") (values false [])
+          (let [ci (col-index t col)
+                is-rowid (or (= ci (:ipk t)) (and (< ci 0) (rowid-name? col)))
+                [v e] (eval-expr x env)]
+            (cond
+              (not= e "") (values false [])
+              is-rowid
+              (let [r (sv/apply-affinity v sv/AFF-INTEGER)]
+                (cond (sv/null? r) (values true [])
+                      (sv/vint? r) (values true [(sv/to-int r)])
+                      :else (values false [])))
+              (< ci 0) (values false [])
+              :else
+              (let [c (nth (:cols t) ci)
+                    ix (first-index db t ci (:coll c))]
+                (if (< ix 0) (values false [])
+                  (let [key-v (sv/apply-affinity v (:aff c))]
+                    (if (sv/null? key-v) (values true [])
+                      (values true (index-rowids (:pager db) (nth (:indexes db) ix) key-v)))))))))))
+    _ (values false [])))
+
+(defn- col-of? Bool [n: &sp/Node t: &Table qual: &Str]
+  (match (:ex n)
+    (sp/ECol tb name dq) (and (or (= tb "") (= (str/lower-case tb) (str/lower-case qual)))
+                              (or (>= (col-index t name) 0) (rowid-name? name)))
+    _ false))
+(defn- col-name Str [n: &sp/Node] (match (:ex n) (sp/ECol tb name dq) (str name) _ ""))
+
+(defn- first-index Int [db: &Db t: &Table ci: Int coll: &Str]
+  (let [ln (str/lower-case (:name t))]
+    (loop [i 0]
+      (if (>= i (count (:indexes db))) -1
+        (let [ix (nth (:indexes db) i)]
+          (if (and (= (str/lower-case (:table ix)) ln) (> (count (:cols ix)) 0) (= (nth (:cols ix) 0) ci)
+                   (= (upper-case-coll (nth (:colls ix) 0)) (upper-case-coll coll)))
+            i (recur (+ i 1))))))))
+(defn- upper-case-coll Str [c: &Str] (if (= c "") "BINARY" (str/upper-case c)))
+
+(defn- index-rowids Vec(Int) [p: &bt/Pager ix: &Index v: sf/Val]
+  (let [probe (sf/encode-record [v])
+        kc (key-cmp-of ix)
+        n (count (:cols ix))]
+    (loop [c (bt/seek-ge p (:root ix) probe kc) acc: Vec(Int) []]
+      (if (not (bt/valid? c)) acc
+        (let [k (bt/cur-payload p c)]
+          (if (not= ((:f kc) k 0 probe) 0) acc
+            (let [[kv ok] (sf/decode-record k)]
+              (recur (bt/cur-next p c) (if (> (count kv) n) (conj acc (sv/to-int (nth kv n))) acc)))))))))

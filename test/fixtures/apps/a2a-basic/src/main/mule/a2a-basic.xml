@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18162"/>
+    </http:listener-config>
+
+    <http:request-config name="Raw">
+        <http:request-connection host="localhost" port="18162"/>
+    </http:request-config>
+
+    <os:object-store name="Snap" persistent="false"/>
+
+    <!-- エージェント (サーバー)。カードは JSON で書く -->
+    <a2a:server-config name="Srv">
+        <a2a:connection listenerConfig="L" agentPath="/agent"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{
+  "name": "Mulay Echo Agent",
+  "description": "Echoes the text it receives.",
+  "url": "http://localhost:18162/agent",
+  "version": "1.0.0",
+  "protocolVersion": "0.3.0",
+  "capabilities": {"streaming": false, "pushNotifications": false, "stateTransitionHistory": false},
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [{"id": "echo", "name": "Echo", "description": "Echoes text", "tags": ["echo"]}],
+  "provider": {"organization": "mulay", "url": "https://example.com"}
+}]]></a2a:json>
+        </a2a:agent-card>
+    </a2a:server-config>
+
+    <a2a:client-config name="Cl">
+        <a2a:client-connection serverUrl="http://localhost:18162/agent"/>
+    </a2a:client-config>
+
+    <!-- 受け取ったメッセージの最初の text で応答を変える -->
+    <flow name="agent">
+        <a2a:task-listener config-ref="Srv"/>
+        <os:store key="last" objectStore="Snap">
+            <os:value><![CDATA[#[output application/json --- {
+  payload: payload,
+  payloadType: typeOf(payload) as String,
+  mime: payload.^mimeType,
+  attrClass: attributes.^class,
+  attrKeys: keysOf(attributes) map ($ as String) orderBy $,
+  method: attributes.method,
+  taskIdIsUuid: (attributes.taskId default "") matches /[0-9a-f-]{36}/,
+  contextIdIsUuid: (attributes.contextId default "") matches /[0-9a-f-]{36}/,
+  headerKeys: keysOf(attributes.headers default {}) map ($ as String) orderBy $,
+  attrs: write((attributes - "headers") orderBy ((v, k) -> k as String), "application/json") replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "<uuid>" replace /:[0-9]{4,5}"/ with ':<port>"',
+  ctype: attributes.headers."content-type"
+}]]]></os:value>
+        </os:store>
+        <set-variable variableName="text" value="#[payload.message.parts[0].text default '']"/>
+        <choice>
+            <when expression="#[vars.text == 'fail']">
+                <raise-error type="APP:BOOM" description="the agent failed"/>
+            </when>
+            <when expression="#[vars.text == 'task']">
+                <set-payload value='#[output application/json --- {kind: "task", id: attributes.taskId, contextId: attributes.contextId, status: {state: "completed", message: {kind: "message", role: "agent", messageId: "m-reply", parts: [{kind: "text", text: "done"}]}}, artifacts: [{artifactId: "a1", name: "result", parts: [{kind: "text", text: "artifact text"}]}]}]'/>
+            </when>
+            <when expression="#[vars.text == 'badid']">
+                <set-payload value='#[output application/json --- {kind: "task", id: "not-the-task", contextId: attributes.contextId, status: {state: "completed"}}]'/>
+            </when>
+            <when expression="#[vars.text == 'notjson']">
+                <set-payload value="plain text, not an event"/>
+            </when>
+            <otherwise>
+                <set-payload value='#[output application/json --- {kind: "message", role: "agent", messageId: "m-echo", parts: [{kind: "text", text: "echo: " ++ vars.text}]}]'/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <sub-flow name="uuid-free">
+        <set-payload value='#[output application/json --- {status: attributes.statusCode, contentType: attributes.headers."content-type", body: (payload as String default "") replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;" replace /[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;"}]'/>
+    </sub-flow>
+
+    <!-- 生の HTTP でエージェントを叩く -->
+    <flow name="card-raw">
+        <http:listener config-ref="L" path="/t/card-raw"/>
+        <http:request config-ref="Raw" method="GET" path="/agent/.well-known/agent-card.json" outputMimeType="text/plain">
+            <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+        </http:request>
+        <flow-ref name="uuid-free"/>
+    </flow>
+
+    <flow name="rpc-raw">
+        <http:listener config-ref="L" path="/t/rpc" allowedMethods="POST"/>
+        <http:request config-ref="Raw" method="POST" path="/agent" outputMimeType="text/plain">
+            <http:body><![CDATA[#[payload as String]]]></http:body>
+            <http:headers><![CDATA[#[{"Content-Type": "application/json"}]]]></http:headers>
+            <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+        </http:request>
+        <flow-ref name="uuid-free"/>
+    </flow>
+
+    <flow name="last">
+        <http:listener config-ref="L" path="/t/last"/>
+        <os:retrieve key="last" objectStore="Snap"/>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <!-- クライアントの操作 -->
+    <flow name="client-card">
+        <http:listener config-ref="L" path="/t/client-card"/>
+        <a2a:get-card config-ref="Cl"/>
+        <set-payload value='#[output application/json --- {payload: payload, "type": typeOf(payload) as String, mime: payload.^mimeType, attrClass: attributes.^class, attrs: attributes update { case h at .headers -&gt; h filterObject ((v, k) -&gt; (k as String) != "date") }}]'/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="client-send">
+        <http:listener config-ref="L" path="/t/client-send"/>
+        <set-variable variableName="text" value="#[attributes.queryParams.text default 'hello']"/>
+        <a2a:send-message config-ref="Cl">
+            <a2a:message><![CDATA[#[output application/json --- {message: {kind: "message", role: "user", messageId: "m-1", parts: [{kind: "text", text: vars.text}]}}]]]></a2a:message>
+        </a2a:send-message>
+        <set-payload value='#[output application/json --- {
+  "type": typeOf(payload) as String, mime: payload.^mimeType, attrClass: attributes.^class,
+  body: write(payload, "application/json") replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;" replace /[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;",
+  attrs: write(attributes update { case h at .headers -&gt; h filterObject ((v, k) -&gt; (k as String) != "date") }, "application/json") replace /"content-length": "[0-9]+"/ with "\"content-length\": \"&lt;n&gt;\"" replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;" replace /[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;"}]'/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value='#[output application/json --- {error: error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;" replace /[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;"}]'/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>

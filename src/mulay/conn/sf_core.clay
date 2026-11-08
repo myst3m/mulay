@@ -1,0 +1,562 @@
+(ns mulay.conn.sf_core
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as drt] [mulay.dw.fmt.registry :as reg] [mulay.mule.model :as m]
+            [mulay.rt.error :as err] [mulay.lib.xml :as xml] [mulay.lib.jhash :as jh]
+            [mulay.lib.numparse :as npz] [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]
+            [mulay.rt.conn :as conn] [mulay.rt.event :as ev]
+            [mulay.lib.time.types :as tt] [mulay.lib.time.zoned :as zt] [mulay.lib.time.iso :as iso]
+            [mulay.lib.keystore :as ks] [mulay.lib.crypto :as crypto] [clay.base64 :as b64]))
+
+(def NS "http://www.mulesoft.org/schema/mule/salesforce")
+(def XSI "http://www.w3.org/2001/XMLSchema-instance")
+(def API "65.0")
+
+(defn sferr err/MErr [id: Str desc: Str] (err/mk "SALESFORCE" id desc))
+
+(defrecord Auth [kind: Str url: Str client-id: Str client-secret: Str username: Str password: Str api: Str store: Str alias: Str aud: Str])
+(defrecord Session [token: Str instance: Str])
+
+(defn elem-by Vec(xml/XNode) [ns: &Vec(xml/XNode) local: &Str]
+  (loop [i 0] (if (>= i (count ns)) [] (if (and (xml/elem? (nth ns i)) (= (xml/elem-local (nth ns i)) local)) [(nth ns i)] (recur (+ i 1))))))
+
+(defn at Str [n: &xml/XNode k: &Str default: Str] (xml/attr n "" k default))
+
+(defn auth-of Values(Auth Str) [cfg: &m/Config]
+  (let [ch (:children cfg)
+        cc (elem-by ch "oauth-client-credentials-connection")
+        up (elem-by ch "oauth-user-pass-connection")
+        bc (elem-by ch "basic-connection")
+        jw (elem-by ch "jwt-connection")
+        oc (elem-by ch "config-with-oauth-connection")]
+    (cond
+      (> (count cc) 0)
+      (let [c (nth cc 0)
+            inner (elem-by (xml/child-elems c) "oauth-client-credentials")
+            src (if (> (count inner) 0) (nth inner 0) c)]
+        (values (->Auth "cc" (at src "tokenUrl" "") (at src "clientId" "") (at src "clientSecret" "") "" "" (at c "apiVersion" API) "" "" "") ""))
+      (> (count up) 0)
+      (let [c (nth up 0)]
+        (values (->Auth "password" (at c "tokenEndpoint" "https://login.salesforce.com/services/oauth2/token")
+                        (at c "consumerKey" "") (at c "consumerSecret" "") (at c "username" "")
+                        (str (at c "password" "") (at c "securityToken" "")) (at c "apiVersion" API) "" "" "") ""))
+      (> (count bc) 0)
+      (let [c (nth bc 0)
+            u (at c "url" "")]
+        (values (->Auth "basic" (if (= u "") (str "https://login.salesforce.com/services/Soap/u/" API) u) "" ""
+                        (at c "username" "") (str (at c "password" "") (at c "securityToken" "")) API "" "" "") ""))
+      (> (count jw) 0)
+      (let [c (nth jw 0)]
+        (values (->Auth "jwt" (at c "tokenEndpoint" "https://login.salesforce.com/services/oauth2/token") (at c "consumerKey" "") ""
+                        (at c "principal" "") (at c "storePassword" "") (at c "apiVersion" API)
+                        (at c "keyStore" "") (at c "certificateAlias" "") (at c "audienceUrl" "https://login.salesforce.com")) ""))
+      (> (count oc) 0)
+      (let [k (code-of cfg) c (nth k 0)]
+        (values (->Auth "code" (:token-url c) (:client-id c) (:client-secret c) (:owner c) "" API "" "" "") ""))
+      :else (values (->Auth "" "" "" "" "" "" API "" "" "")
+                    (str "salesforce:sfdc-config '" (:name cfg) "': unsupported connection (use oauth-client-credentials-connection, oauth-user-pass-connection, basic-connection, jwt-connection or config-with-oauth-connection)")))))
+
+(defrecord Code [client-id: Str client-secret: Str authorize-url: Str token-url: Str scopes: Str owner: Str
+                 listener: Str callback-path: Str authorize-path: Str callback-url: Str])
+
+(defn code-of Vec(Code) [cfg: &m/Config]
+  (let [oc (elem-by (:children cfg) "config-with-oauth-connection")]
+    (if (= (count oc) 0) []
+      (let [c (nth oc 0)
+            ac (elem-by (xml/child-elems c) "oauth-authorization-code")
+            cb (elem-by (xml/child-elems c) "oauth-callback-config")
+            a (if (> (count ac) 0) (nth ac 0) c)
+            b (if (> (count cb) 0) (nth cb 0) c)]
+        [(->Code (at a "consumerKey" "") (at a "consumerSecret" "")
+                 (at a "authorizationUrl" "https://login.salesforce.com/services/oauth2/authorize")
+                 (at a "accessTokenUrl" "https://login.salesforce.com/services/oauth2/token")
+                 (at a "scopes" "") (at a "resourceOwnerId" "")
+                 (at b "listenerConfig" "") (at b "callbackPath" "") (at b "authorizePath" "") (at b "externalCallbackUrl" ""))]))))
+
+(def CODE-TOKENS (atom (let [m: Map(Str Vec(Str)) {}] m)))
+
+(defn- code-key Str [cfg-name: &Str owner: &Str] (str cfg-name "|" owner))
+
+(defn code-store! Int [cfg-name: &Str owner: &Str tok: Vec(Str)]
+  (let [k (code-key cfg-name owner) z (swap! CODE-TOKENS (fn Map(Str Vec(Str)) [m: Map(Str Vec(Str))] (assoc m k tok)))] 0))
+
+(defn code-forget! Int [cfg-name: &Str owner: &Str]
+  (let [k (code-key cfg-name owner) z (swap! CODE-TOKENS (fn Map(Str Vec(Str)) [m: Map(Str Vec(Str))] (dissoc m k)))] 0))
+
+(defn- code-token Vec(Vec(Str)) [cfg-name: &Str owner: &Str]
+  (let [m (deref CODE-TOKENS) k (code-key cfg-name owner)] (if (contains? m k) [(get! m k)] [])))
+
+(def CODE-VERIFIERS (atom (let [m: Map(Str Str) {}] m)))
+
+(defn pkce-challenge Str [verifier: &Str]
+  (let [[d ok] (crypto/digest "SHA256" verifier)] (b64url d)))
+
+(defn code-pkce-begin Values(Str Bool) [cfg-name: &Str owner: &Str]
+  (let [[r ok] (crypto/random-bytes 32)]
+    (if (not ok) (values "" false)
+      (let [v (b64url r)
+            k (code-key cfg-name owner)
+            z (swap! CODE-VERIFIERS (fn Map(Str Str) [m: Map(Str Str)] (assoc m k v)))]
+        (values (pkce-challenge v) true)))))
+
+(defn- code-pkce-take Str [cfg-name: &Str owner: &Str]
+  (let [k (code-key cfg-name owner)
+        m (deref CODE-VERIFIERS)
+        v (if (contains? m k) (get! m k) "")
+        z (if (= v "") m (swap! CODE-VERIFIERS (fn Map(Str Str) [m2: Map(Str Str)] (dissoc m2 k))))]
+    v))
+
+(defn code-authorize-url Str [k: &Code owner: &Str challenge: &Str]
+  (str (:authorize-url k) (if (>= (str/index-of (:authorize-url k) "?") 0) "&" "?")
+       "response_type=code&client_id=" (form-enc (:client-id k))
+       (if (= (:scopes k) "") "" (str "&scope=" (str/replace (form-enc (:scopes k)) "%20" "+")))
+       "&redirect_uri=" (form-enc (:callback-url k))
+       (if (= owner "") "" (str "&state=" (form-enc owner)))
+       (if (= challenge "") "" (str "&code_challenge=" challenge "&code_challenge_method=S256"))))
+
+(defn- code-grant Values(Vec(Str) Str) [k: &Code form: &Str]
+  (let [[st body e] (send "POST" (:token-url k) [(hpair "Content-Type" "application/x-www-form-urlencoded") (hpair "Accept" "application/json")] form)
+        none: Vec(Str) []]
+    (cond (not= e "") (values none e)
+          (not= st 200) (values none (str "Invalid status code: " st ", response body: " body))
+          :else (let [j (json-val body)] (values [(vfield j "access_token") (vfield j "instance_url") (vfield j "refresh_token")] "")))))
+
+(defn code-callback Values(Int Str) [cfg-name: &Str k: &Code code: &Str state: &Str err: &Str]
+  (if (or (not= err "") (= code "")) (values 500 (str "Failed to retrieve access token: " (if (= err "") "no authorization code" err)))
+    (let [verifier (code-pkce-take cfg-name state)
+          [tok e] (code-grant k (str "grant_type=authorization_code&code=" (form-enc code) "&client_id=" (form-enc (:client-id k))
+                                     "&client_secret=" (form-enc (:client-secret k)) "&redirect_uri=" (form-enc (:callback-url k))
+                                     (if (= verifier "") "" (str "&code_verifier=" verifier))))]
+      (if (not= e "") (values 500 (str "Failed to retrieve access token: " e))
+        (let [z (code-store! cfg-name state tok)] (values 200 "Successfully retrieved access token!"))))))
+
+(defn- code-session Values(Session Str) [cfg: &m/Config fresh: Bool]
+  (let [k (nth (code-of cfg) 0)
+        owner (:owner k)
+        nm (:name cfg)
+        t (code-token nm owner)]
+    (cond
+      (= (count t) 0) (values (->Session "" "") (str "OAuth authorization dance not yet performed for resourceOwnerId " (if (= owner "") "null" owner)))
+      (and fresh (not= (nth (nth t 0) 2) ""))
+      (let [old (nth t 0)
+            [tok e] (code-grant k (str "grant_type=refresh_token&refresh_token=" (form-enc (nth old 2)) "&client_id=" (form-enc (:client-id k))
+                                       "&client_secret=" (form-enc (:client-secret k))))]
+        (if (not= e "") (values (->Session "" "") e)
+          (let [kept [(nth tok 0) (if (= (nth tok 1) "") (nth old 1) (nth tok 1)) (if (= (nth tok 2) "") (nth old 2) (nth tok 2))]
+                z (code-store! nm owner kept)]
+            (values (->Session (nth kept 0) (nth kept 1)) ""))))
+      :else (values (->Session (nth (nth t 0) 0) (nth (nth t 0) 1)) ""))))
+
+(defn hpair hm/Header [n: Str x: Str] (hm/->Header n x))
+
+(defn send Values(Int Str Str) [method: &Str url: &Str headers: Vec(hm/Header) body: &Str]
+  (let [[resp e] (http/request (assoc (http/request-opts (str url)) :method (str method) :headers headers :body (str body) :timeout-ms 120000))]
+    (if (not= e "") (values -1 "" e) (values (:status resp) (:body resp) ""))))
+
+(defn form-enc Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (if (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 45) (= c 46) (= c 95) (= c 126))
+                 (str out (subs s i (+ i 1)))
+                 (str out "%" (subs "0123456789ABCDEF" (quot c 16) (+ (quot c 16) 1)) (subs "0123456789ABCDEF" (mod c 16) (+ (mod c 16) 1)))))))))
+
+(defn json-val v/Val [s: &Str] (let [[x e] (reg/read-fmt "application/json" [] s)] (if (= e "") (v/unmeta x) (v/null-v))))
+
+(defn vfield Str [x: &v/Val k: &Str]
+  (match x (v/VObj fs) (let [r (v/obj-get fs k)] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) (str s) (v/VNull) "" _ (let [[t e] (drt/to-text (nth r 0))] t)))) _ ""))
+
+(defn instance-of Str [url: &Str]
+  (let [k (str/index-of url "://")
+        e (if (< k 0) -1 (str/index-of-after url "/" (+ k 3)))]
+    (if (< e 0) (str url) (subs url 0 e))))
+
+(defn token-login Values(Session Str) [url: &Str form: &Str]
+  (let [[st body e] (send "POST" url [(hpair "Content-Type" "application/x-www-form-urlencoded") (hpair "Accept" "application/json")] form)]
+    (cond (not= e "") (values (->Session "" "") e)
+          (not= st 200) (let [j (json-val body)] (values (->Session "" "") (let [d (vfield j "error_description")] (if (= d "") (str "HTTP " st ": " body) (str (vfield j "error") ": " d)))))
+          :else (let [j (json-val body)] (values (->Session (vfield j "access_token") (vfield j "instance_url")) "")))))
+
+(defn escape-param Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1) (cond (or (= c 92) (= c 34) (= c 39) (= c 95) (= c 37)) (str out "\\" (subs s i (+ i 1)))
+                             (= c 10) (str out "\\n") (= c 13) (str out "\\r") (= c 8) (str out "\\b")
+                             (= c 9) (str out "\\t") (= c 12) (str out "\\f")
+                             :else (str out (subs s i (+ i 1)))))))))
+
+(defn xml-esc Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1) (cond (= c 38) (str out "&amp;") (= c 60) (str out "&lt;") (= c 62) (str out "&gt;") (= c 34) (str out "&quot;") (= c 39) (str out "&apos;")
+                             :else (str out (subs s i (+ i 1)))))))))
+
+(defn login Values(Session Str) [a: &Auth key-der: &Str]
+  (let [k (:kind a)]
+    (cond
+      (= k "jwt") (jwt-login a key-der)
+      (= k "cc") (token-login (:url a) (str "grant_type=client_credentials&client_id=" (form-enc (:client-id a)) "&client_secret=" (form-enc (:client-secret a))))
+      (= k "password") (token-login (:url a) (str "grant_type=password&client_id=" (form-enc (:client-id a)) "&client_secret=" (form-enc (:client-secret a))
+                                                      "&username=" (form-enc (:username a)) "&password=" (form-enc (:password a))))
+      :else
+      (let [env (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?><soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:urn=\"urn:partner.soap.sforce.com\"><soapenv:Body><urn:login><urn:username>"
+                     (xml-esc (:username a)) "</urn:username><urn:password>" (xml-esc (:password a)) "</urn:password></urn:login></soapenv:Body></soapenv:Envelope>")
+            [st body e] (send "POST" (:url a) [(hpair "Content-Type" "text/xml; charset=UTF-8") (hpair "SOAPAction" "login")] env)]
+        (if (not= e "") (values (->Session "" "") e)
+          (let [[doc pe] (xml/parse body)]
+            (if (not= pe "") (values (->Session "" "") pe)
+              (let [f (find-desc (xml/doc-root doc) "Fault")]
+                (if (> (count f) 0) (values (->Session "" "") (text-of (nth f 0) "faultstring"))
+                  (let [sid (find-desc (xml/doc-root doc) "sessionId") su (find-desc (xml/doc-root doc) "serverUrl")]
+                    (values (->Session (if (> (count sid) 0) (xml/text-content (nth sid 0)) "") (if (> (count su) 0) (instance-of (xml/text-content (nth su 0))) "")) "")))))))))))
+
+(defn- warming-key Str [nm: &Str] (str "warming:" nm))
+
+(defn- warming? Bool [cache: &Atom nm: &Str]
+  (let [mm: Map (dyn->map (deref cache))] (contains? mm (warming-key nm))))
+
+(defn warm-mark! Int [cache: &Atom nm: &Str]
+  (let [k (warming-key nm)
+        z (swap! cache (fn Dyn [old: Dyn] (let [m2: Map (dyn->map old)] (->dyn (assoc m2 k (->dyn true))))))]
+    0))
+
+(defn warm Int [cache: Atom cfg: m/Config]
+  (let [[s e] (session-in cache cfg false)
+        k (warming-key (:name cfg))
+        z (swap! cache (fn Dyn [old: Dyn] (let [m2: Map (dyn->map old)] (->dyn (dissoc m2 k)))))]
+    0))
+
+(defn session Values(Session Str) [cache: &Atom cfg: &m/Config fresh: Bool]
+  (let [deadline (+ (quot (mono-us) 1000) 15000)
+        z (loop [] (if (and (warming? cache (:name cfg)) (< (quot (mono-us) 1000) deadline)) (let [w (sleep-ms 10)] (recur)) 0))]
+    (session-in cache cfg fresh)))
+
+(defn- session-in Values(Session Str) [cache: &Atom cfg: &m/Config fresh: Bool]
+  (let [nm (:name cfg)
+        mm: Map (dyn->map (deref cache))]
+    (cond
+     (> (count (code-of cfg)) 0) (code-session cfg fresh)
+     (and (not fresh) (contains? mm nm)) (let [s: Session (dyn->rec (get! mm nm))] (values s ""))
+     :else
+      (let [[a ae] (auth-of cfg)]
+        (if (not= ae "") (values (->Session "" "") ae)
+          (let [je (if (and (= (:kind a) "jwt") (= (jwt-key cache nm) "")) (jwt-err cache nm) "")
+                [s e] (if (not= je "") (values (->Session "" "") je) (login a (jwt-key cache nm)))]
+            (if (not= e "") (values s e)
+              (let [z (swap! cache (fn Dyn [old: Dyn] (let [m2: Map (dyn->map old)] (->dyn (assoc m2 nm (->dyn s))))))]
+                (values s "")))))))))
+
+(defn jwt-key Str [cache: &Atom nm: &Str]
+  (let [mm: Map (dyn->map (deref cache)) k (str "jwtkey:" nm)] (if (contains? mm k) (dyn->str (get! mm k)) "")))
+
+(defn- jwt-err Str [cache: &Atom nm: &Str]
+  (let [mm: Map (dyn->map (deref cache)) k (str "jwterr:" nm)] (if (contains? mm k) (dyn->str (get! mm k)) "")))
+
+(defn- b64url Str [s: Str]
+  (let [e (b64/encode s)]
+    (loop [i 0 out ""]
+      (if (>= i (count e)) out
+        (let [c (nth e i)]
+          (recur (+ i 1) (cond (= c 43) (str out "-") (= c 47) (str out "_") (= c 61) out :else (str out (subs e i (+ i 1))))))))))
+
+(defn- json-str Str [s: &Str]
+  (let [[j e] (reg/write-fmt "application/json" [] (v/->VStr (str s)))] j))
+
+(defn- jwt-login Values(Session Str) [a: &Auth key-der: &Str]
+  (if (= key-der "") (values (->Session "" "") "No private key for the JWT (keyStore)")
+    (let [claims (str "{\"iss\":" (json-str (:client-id a)) ",\"sub\":" (json-str (:username a)) ",\"aud\":" (json-str (:aud a))
+                      ",\"exp\":" (+ (quot (epoch-ms) 1000) 300) "}")
+          signing (str (b64url "{\"alg\":\"RS256\"}") "." (b64url claims))
+          [sig ok] (crypto/sign "SHA256" key-der signing)]
+      (if (not ok) (values (->Session "" "") "Unable to sign the JWT with the key of keyStore")
+        (let [form (str "grant_type=" (form-enc "urn:ietf:params:oauth:grant-type:jwt-bearer") "&assertion=" signing "." (b64url sig))
+              [st body e] (send "POST" (:url a) [(hpair "Content-Type" "application/x-www-form-urlencoded") (hpair "Accept" "application/json")] form)]
+          (cond (not= e "") (values (->Session "" "") e)
+                (not= st 200) (values (->Session "" "") (str "Invalid status code: " st ", response body: " body))
+                :else (let [j (json-val body)] (values (->Session (vfield j "access_token") (vfield j "instance_url")) ""))))))))
+
+(defn session-err err/MErr [msg: &Str]
+  (sferr (if (str/starts-with? msg "Invalid status code: ") "INVALID_INPUT" "CONNECTIVITY") msg))
+
+(defn load-jwt-key Int [cache: &Atom cfg: &m/Config res: &Fn(Str Values(Str Bool))]
+  (let [[a ae] (auth-of cfg)]
+    (if (or (not= ae "") (not= (:kind a) "jwt")) 0
+      (let [nm (:name cfg)
+            [bytes ok] (res (:store a))
+            [der err] (cond
+                        (not ok) (values "" (str "Resource " (:store a) " could not be found"))
+                        (str/starts-with? bytes (str (chr 254) (chr 237) (chr 254) (chr 237))) (jks-key bytes a)
+                        :else (let [[k e] (crypto/pkcs12-key bytes (:password a))] (values k (if (= e "") "" "Failed signing payload"))))]
+        (let [z (swap! cache (fn Dyn [old: Dyn] (let [m2: Map (dyn->map old)]
+                                                  (->dyn (if (= err "") (assoc m2 (str "jwtkey:" nm) (->dyn der)) (assoc m2 (str "jwterr:" nm) (->dyn err)))))))]
+          0)))))
+
+(defn- jks-key Values(Str Str) [bytes: &Str a: &Auth]
+  (let [[kst ke] (ks/read-jks bytes (:password a) "")
+        keys (:keys kst)
+        hit (loop [i 0] (if (>= i (count keys)) -1 (if (or (= (:alias a) "") (= (:alias (nth keys i)) (:alias a))) i (recur (+ i 1)))))]
+    (if (or (not= ke "") (< hit 0)) (values "" "Failed signing payload")
+      (values (pem-der (:key-pem (nth keys hit))) ""))))
+
+(defn- pem-der Str [pem: &Str]
+  (let [lines (str/split pem "\n")
+        body (loop [i 0 out ""] (if (>= i (count lines)) out
+                                  (let [l (str/trim (nth lines i))] (recur (+ i 1) (if (or (= l "") (str/starts-with? l "-----")) out (str out l))))))]
+    (let [[der e] (b64/decode body)] der)))
+
+(defn api-of Str [cfg: &m/Config] (let [[a e] (auth-of cfg)] (:api a)))
+
+(defn find-desc Vec(xml/XNode) [n: &xml/XNode local: &Str]
+  (if (and (xml/elem? n) (= (xml/elem-local n) local)) [n]
+    (let [cs (xml/child-elems n)]
+      (loop [i 0] (if (>= i (count cs)) [] (let [r (find-desc (nth cs i) local)] (if (> (count r) 0) r (recur (+ i 1)))))))))
+
+(defn kids Vec(xml/XNode) [n: &xml/XNode local: &Str]
+  (let [cs (xml/child-elems n)] (loop [i 0 acc: Vec(xml/XNode) []] (if (>= i (count cs)) acc (recur (+ i 1) (if (= (xml/elem-local (nth cs i)) local) (conj acc (nth cs i)) acc))))))
+
+(defn kid Vec(xml/XNode) [n: &xml/XNode local: &Str] (let [r (kids n local)] (if (= (count r) 0) [] [(nth r 0)])))
+
+(defn xnil? Bool [n: &xml/XNode] (= (xml/attr n XSI "nil" "") "true"))
+
+(defn text-of Str [n: &xml/XNode local: &Str] (let [r (kid n local)] (if (= (count r) 0) "" (xml/text-content (nth r 0)))))
+
+(defn sval v/Val [n: &xml/XNode local: &Str]
+  (let [r (kid n local)] (if (or (= (count r) 0) (xnil? (nth r 0))) (v/null-v) (v/->VStr (xml/text-content (nth r 0))))))
+
+(defn bval v/Val [n: &xml/XNode local: &Str] (v/bool-v (= (text-of n local) "true")))
+
+(defn ival v/Val [n: &xml/XNode local: &Str] (v/int-v (npz/int-or (text-of n local) 0)))
+
+(defn texts v/Val [n: &xml/XNode local: &Str]
+  (let [r (kids n local)] (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count r)) acc (recur (+ i 1) (conj acc (v/->VStr (xml/text-content (nth r i))))))))))
+
+(defn obj-in v/Val [names: &Vec(Str) vals: &Vec(v/Val)]
+  (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count names)) acc (recur (+ i 1) (conj acc (v/field (nth names i) (nth vals i))))))))
+
+(defn hashmap-obj v/Val [fs: &Vec(v/Field)]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (:name (:key (nth fs i)))))))
+        order (jh/hashmap-order names)]
+    (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                (if (>= i (count order)) acc
+                  (let [k (nth order i)
+                        x (loop [j (- (count fs) 1)] (if (< j 0) (v/null-v) (if (= (:name (:key (nth fs j))) k) (:value (nth fs j)) (recur (- j 1)))))]
+                    (recur (+ i 1) (conj acc (v/field k x)))))))))
+
+(defn sobject-val v/Val [n: &xml/XNode]
+  (let [cs (xml/child-elems n)]
+    (hashmap-obj (loop [i 0 acc: Vec(v/Field) []]
+                   (if (>= i (count cs)) acc
+                     (let [c (nth cs i)] (recur (+ i 1) (conj acc (v/field (xml/elem-local c) (field-val c))))))))))
+
+(defn field-val v/Val [c: &xml/XNode]
+  (cond
+    (xnil? c) (v/null-v)
+    (= (count (xml/child-elems c)) 0) (v/->VMeta (v/->VStr (xml/text-content c)) [(v/field "class" (v/->VStr "java.lang.String"))])
+    :else
+    (let [t (xml/attr c XSI "type" "")]
+      (cond (str/ends-with? t "sObject") (sobject-val c)
+            (str/ends-with? t "QueryResult") (records-of c)
+            :else (sobject-val c)))))
+
+(defn records-of v/Val [qr: &xml/XNode]
+  (let [rs (kids qr "records")] (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count rs)) acc (recur (+ i 1) (conj acc (sobject-val (nth rs i)))))))))
+
+(defn field-text Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VStr s) (str s)
+    (v/VBool b) (if b "true" "false")
+    _ (let [[t e] (drt/to-text x)] t)))
+
+(defn- name-char? Bool [c: Int first: Bool]
+  (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 95)
+      (and (not first) (or (and (>= c 48) (<= c 57)) (= c 45) (= c 46)))))
+
+(defn- field-name? Bool [k: &Str]
+  (and (> (count k) 0) (loop [i 0] (if (>= i (count k)) true (if (name-char? (nth k i) (= i 0)) (recur (+ i 1)) false)))))
+
+(defn records-err Vec(err/MErr) [recs: &Vec(v/Val)]
+  (loop [i 0]
+    (if (>= i (count recs)) []
+      (let [fs (match (v/unmeta (nth recs i)) (v/VObj xs) xs _ [])
+            bad (loop [j 0] (if (>= j (count fs)) -1 (if (field-name? (:name (:key (nth fs j)))) (recur (+ j 1)) j)))]
+        (if (>= bad 0) [(sferr "INVALID_INPUT" (str "Invalid field name: '" (:name (:key (nth fs bad))) "'"))]
+          (recur (+ i 1)))))))
+
+(defn xsd-type Str [x0: &v/Val]
+  (let [x (v/unmeta x0)
+        t (match x
+            (v/VStr s) "string"
+            (v/VBool b) "boolean"
+            (v/VInt i) (if (and (>= i -2147483648) (<= i 2147483647)) "int" "long")
+            (v/VNum n) (if (num/integer? n)
+                         (let [[k e] (num/to-int n)] (cond (not= e "") "integer" (and (>= k -2147483648) (<= k 2147483647)) "int" :else "long"))
+                         "double")
+            (v/VDate d) "date"
+            (v/VDateTime z) "dateTime"
+            (v/VLocalDateTime z) "dateTime"
+            (v/VTime t) "time"
+            (v/VLocalTime t) "time"
+            _ "")]
+    (if (= t "") "" (str " xsi:type=\"xsd:" t "\""))))
+
+(defn sobject-xml Str [out: Str tag: &Str type: &Str rec: &v/Val send-null: Bool]
+  (let [fs (match (v/unmeta rec) (v/VObj xs) xs _ [])
+        o0 (str out "<urn:" tag ">" (if (= type "") "" (str "<urn1:type>" (xml-esc type) "</urn1:type>")))
+        [o1 nulls] (loop [i 0 o o0 ns: Vec(Str) []]
+                     (if (>= i (count fs)) (values o ns)
+                       (let [k (:name (:key (nth fs i))) x (v/unmeta (:value (nth fs i)))]
+                         (match x
+                           (v/VNull) (recur (+ i 1) o (conj ns k))
+                           (v/VArr xs) (recur (+ i 1) (loop [j 0 oo o] (if (>= j (count xs)) oo (recur (+ j 1) (str oo "<urn1:" k (xsd-type (nth xs j)) ">" (xml-esc (field-text (nth xs j))) "</urn1:" k ">")))) ns)
+                           _ (recur (+ i 1) (str o "<urn1:" k (xsd-type x) ">" (xml-esc (field-text x)) "</urn1:" k ">") ns)))))
+        o2 (if send-null (loop [i 0 o o1] (if (>= i (count nulls)) o (recur (+ i 1) (str o "<urn1:fieldsToNull>" (xml-esc (nth nulls i)) "</urn1:fieldsToNull>")))) o1)]
+    (str o2 "</urn:" tag ">")))
+
+(defn fault-type Str [code: &Str]
+  (let [c (if (str/includes? code ":") (subs code (+ (str/index-of code ":") 1) (count code)) (str code))]
+    (cond (= c "INVALID_SESSION_ID") "INVALID_SESSION"
+          (or (= c "REQUEST_LIMIT_EXCEEDED") (= c "EXCEEDED_ID_LIMIT") (= c "EXCEEDED_MAX_SIZE_REQUEST")) "LIMIT_EXCEEDED"
+          (= c "INSUFFICIENT_ACCESS") "INSUFFICIENT_PERMISSIONS"
+          (= c "API_DISABLED_FOR_ORG") "CONNECTIVITY"
+          :else "INVALID_INPUT")))
+
+(def BULK1-CODES ["ClientInputError" "ExceededQuota" "InvalidBatch" "InvalidJob" "InvalidJobState" "InvalidOperation" "InvalidSessionId"
+                  "InvalidUrl" "InvalidXML" "Timeout" "InvalidVersion" "UnsupportedContentType" "InvalidEntity"])
+
+(def BULK1-TYPES ["INVALID_INPUT" "LIMIT_EXCEEDED" "INVALID_INPUT" "INVALID_INPUT" "INVALID_INPUT" "INVALID_INPUT" "CONNECTIVITY"
+                  "INVALID_INPUT" "INVALID_INPUT" "TIMEOUT" "INVALID_INPUT" "INVALID_INPUT" "INVALID_INPUT"])
+
+(defn bulk1-fault err/MErr [code: &Str msg: &Str]
+  (let [i (loop [k 0] (if (>= k (count BULK1-CODES)) -1 (if (= (nth BULK1-CODES k) code) k (recur (+ k 1)))))]
+    (cond (< i 0) (err/mk "MULE" "UNKNOWN" (str "No enum constant org.mule.extension.salesforce.internal.model.exception.handling.BulkApiV1ErrorMappingType." code))
+          (= code "InvalidSessionId") (sferr "CONNECTIVITY" msg)
+          :else (sferr (nth BULK1-TYPES i) code))))
+
+(defn envelope Str [token: &Str hdr: &Str body: &Str]
+  (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?><soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:urn=\"urn:partner.soap.sforce.com\" xmlns:urn1=\"urn:sobject.partner.soap.sforce.com\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">"
+       "<soapenv:Header><urn:SessionHeader><urn:sessionId>" (xml-esc token) "</urn:sessionId></urn:SessionHeader>" hdr "</soapenv:Header><soapenv:Body>" body "</soapenv:Body></soapenv:Envelope>"))
+
+(defn soap-once Values(Vec(xml/XNode) Str Str) [s: &Session api: &Str hdr: &Str body: &Str]
+  (let [[st rb e] (send "POST" (str (:instance s) "/services/Soap/u/" api) [(hpair "Content-Type" "text/xml; charset=UTF-8") (hpair "SOAPAction" "\"\"")] (envelope (:token s) hdr body))]
+    (if (not= e "") (values [] "CONNECTIVITY" e)
+      (let [[doc pe] (xml/parse rb)]
+        (if (not= pe "") (values [] "CONNECTIVITY" (str "HTTP " st ": " pe))
+          (let [root (xml/doc-root doc)
+                f (find-desc root "Fault")]
+            (if (> (count f) 0)
+              (let [fx (nth f 0)
+                    code (text-of fx "faultcode")
+                    msg (let [m (find-desc fx "exceptionMessage")] (if (> (count m) 0) (xml/text-content (nth m 0)) (text-of fx "faultstring")))]
+                (values [] (fault-type code) msg))
+              (let [b (find-desc root "Body")]
+                (if (= (count b) 0) (values [] "CONNECTIVITY" "no SOAP body")
+                  (let [cs (xml/child-elems (nth b 0))] (if (= (count cs) 0) (values [] "CONNECTIVITY" "empty SOAP body") (values [(nth cs 0)] "" ""))))))))))))
+
+(defn soap-h Values(xml/XNode Vec(err/MErr)) [cache: &Atom cfg: &m/Config hdr: &Str body: &Str]
+  (let [[s se] (session cache cfg false)]
+    (if (not= se "") (values (xml/->XnText "") [(session-err se)])
+      (let [api (api-of cfg)
+            [r t e] (soap-once s api hdr body)]
+        (cond
+          (= t "") (values (nth r 0) [])
+          (= t "INVALID_SESSION")
+          (let [[s2 se2] (session cache cfg true)]
+            (if (not= se2 "") (values (xml/->XnText "") [(session-err se2)])
+              (let [[r2 t2 e2] (soap-once s2 api hdr body)]
+                (if (= t2 "") (values (nth r2 0) []) (values (xml/->XnText "") [(sferr t2 e2)])))))
+          :else (values (xml/->XnText "") [(sferr t e)]))))))
+
+(defn soap Values(xml/XNode Vec(err/MErr)) [cache: &Atom cfg: &m/Config body: &Str] (soap-h cache cfg "" body))
+
+(defn rest-call Values(Int Str Vec(err/MErr)) [cache: &Atom cfg: &m/Config method: &Str path: &Str ct: &Str body: &Str]
+  (let [[s se] (session cache cfg false)]
+    (if (not= se "") (values 0 "" [(session-err se)])
+      (let [url (str (:instance s) "/services/data/v" (api-of cfg) path)
+            [st rb e] (send method url (rest-headers (:token s) ct) body)]
+        (cond
+          (not= e "") (values 0 "" [(sferr "CONNECTIVITY" e)])
+          (= st 401)
+          (let [[s2 se2] (session cache cfg true)]
+            (if (not= se2 "") (values 0 "" [(session-err se2)])
+              (let [[st2 rb2 e2] (send method url (rest-headers (:token s2) ct) body)]
+                (if (not= e2 "") (values 0 "" [(sferr "CONNECTIVITY" e2)]) (rest-result st2 rb2)))))
+          :else (rest-result st rb))))))
+
+(defn send-full Values(Int Str Vec(hm/Header) Str) [method: &Str url: &Str headers: Vec(hm/Header) body: &Str]
+  (let [[resp e] (http/request (assoc (http/request-opts (str url)) :method (str method) :headers headers :body (str body) :timeout-ms 120000))
+        none: Vec(hm/Header) []]
+    (if (not= e "") (values -1 "" none e) (values (:status resp) (:body resp) (:headers resp) ""))))
+
+(defn- rest-url Str [s: &Session cfg: &m/Config path: &Str]
+  (if (str/starts-with? path "/services/") (str (:instance s) path)
+    (str (:instance s) "/services/data/v" (api-of cfg) path)))
+
+(defn rest-raw Values(Int Str Vec(hm/Header) Vec(err/MErr)) [cache: &Atom cfg: &m/Config method: &Str path: &Str ct: &Str body: &Str xh: &Vec(hm/Header)]
+  (let [[s se] (session cache cfg false)
+        none: Vec(hm/Header) []]
+    (if (not= se "") (values 0 "" none [(session-err se)])
+      (let [[st rb hs e] (send-full method (rest-url s cfg path) (rest-headers-x (:token s) ct xh) body)]
+        (cond
+          (not= e "") (values 0 "" none [(sferr "CONNECTIVITY" e)])
+          (= st 401)
+          (let [[s2 se2] (session cache cfg true)]
+            (if (not= se2 "") (values 0 "" none [(session-err se2)])
+              (let [[st2 rb2 hs2 e2] (send-full method (rest-url s2 cfg path) (rest-headers-x (:token s2) ct xh) body)]
+                (if (not= e2 "") (values 0 "" none [(sferr "CONNECTIVITY" e2)]) (values st2 rb2 hs2 [])))))
+          :else (values st rb hs []))))))
+
+(defn rest-headers Vec(hm/Header) [tok: &Str ct: &Str]
+  (let [h0: Vec(hm/Header) [(hpair "Authorization" (str "Bearer " tok)) (hpair "Accept" "application/json")]]
+    (if (= ct "") h0 (conj h0 (hpair "Content-Type" (str ct))))))
+
+(defn- put-header Vec(hm/Header) [hs: Vec(hm/Header) h: &hm/Header]
+  (let [n (count hs)
+        at (loop [i 0] (if (>= i n) -1 (if (= (:hd-name (nth hs i)) (:hd-name h)) i (recur (+ i 1)))))]
+    (if (< at 0) (conj hs h) (assoc hs at h))))
+
+(defn- rest-headers-x Vec(hm/Header) [tok: &Str ct: &Str xh: &Vec(hm/Header)]
+  (loop [i 0 a (rest-headers tok ct)] (if (>= i (count xh)) a (recur (+ i 1) (put-header a (nth xh i))))))
+
+(defn rest-result Values(Int Str Vec(err/MErr)) [st: Int body: &Str]
+  (if (and (>= st 200) (< st 300)) (values st (str body) [])
+    (let [j (json-val body)
+          msg (match j (v/VArr xs) (if (> (count xs) 0) (vfield (nth xs 0) "message") (str body)) _ (str body))
+          code (match j (v/VArr xs) (if (> (count xs) 0) (vfield (nth xs 0) "errorCode") "") _ "")]
+      (values st "" [(sferr (if (= st 404) "NOT_FOUND" (fault-type code)) (if (= msg "") (str "HTTP " st) msg))]))))
+
+(defn json-map v/Val [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) (hashmap-obj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (v/field (:name (:key (nth fs i))) (json-map (:value (nth fs i)))))))))
+    (v/VArr xs) (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (json-map (nth xs i)))))))
+    _ (v/unmeta x)))
+
+(def ERROR-KEYS ["duplicateResult" "message" "fields" "statusCode"])
+
+(defn java conn/OpResult [x: v/Val] (conn/ok-result (ev/tv-val x ev/JAVA) (ev/tv-null)))
+
+(defn child-val-src Values(v/Val Str Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [p (conn/param (:exprs c) local)]
+    (if (> (count p) 0)
+      (let [[x e] ((:eval c) (nth p 0) (:event c))
+            src (match (nth p 0) (m/PExpr t cmp es) (:expr es) (m/PLit s) (str s))]
+        (if (not= e "") (values (v/null-v) src [(err/mk "MULE" "EXPRESSION" e)]) (values x src [])))
+      (let [[t x] (conn/child-tv c local)]
+        (cond (> (count x) 0) (values (v/null-v) "" x)
+              (> (count t) 0) (let [[pv pt pe] (ev/value (nth t 0))] (values pv "" (if (= pe "") [] [(err/mk "MULE" "EXPRESSION" pe)])))
+              :else (let [[pv pt pe] (ev/value (:payload (:event c)))]
+                      (values pv "payload" (if (= pe "") [] [(err/mk "MULE" "EXPRESSION" pe)]))))))))
+
+(defn child-val Values(v/Val Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [[x src e] (child-val-src c local)] (values (v/unmeta x) e)))
+
+(defn errors-val v/Val [r: &xml/XNode]
+  (let [es (kids r "errors")]
+    (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                (if (>= i (count es)) acc
+                  (let [e (nth es i)] (recur (+ i 1) (conj acc (obj-in ERROR-KEYS [(v/null-v) (sval e "message") (texts e "fields") (sval e "statusCode")])))))))))
+
+(defn ldt-utc v/Val [s: &Str]
+  (if (= s "") (v/null-v)
+    (let [[z e] (iso/parse-zdt s)]
+      (if (not= e "") (v/null-v) (v/->VLocalDateTime (zt/zdt-ldt (zt/zdt-with-zone-same-instant z (tt/utc))))))))

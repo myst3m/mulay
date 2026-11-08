@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18154"/>
+    </http:listener-config>
+
+    <!-- 接続は 1 本だけ。空くのを 300 ms 待って、空かなければ失敗 -->
+    <db:config name="One">
+        <db:generic-connection url="jdbc:postgresql://localhost:15432/mulay" driverClassName="org.postgresql.Driver" user="mulay" password="mulay">
+            <db:pooling-profile maxPoolSize="1" minPoolSize="0" maxWait="300" maxWaitUnit="MILLISECONDS"/>
+        </db:generic-connection>
+    </db:config>
+
+
+    <sub-flow name="report">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- 2 本の経路が同時に 1 秒かかる select をする。1 本は接続を待ちきれずに失敗する -->
+    <flow name="exhaust">
+        <http:listener config-ref="L" path="/exhaust"/>
+        <scatter-gather>
+            <route>
+                <try>
+                    <db:select config-ref="One"><db:sql>select 'ok' as r from pg_sleep(1)</db:sql></db:select>
+                    <set-payload value="#[{'type': 'ok', description: payload[0].r}]"/>
+                    <error-handler><on-error-continue><flow-ref name="report"/></on-error-continue></error-handler>
+                </try>
+            </route>
+            <route>
+                <try>
+                    <db:select config-ref="One"><db:sql>select 'ok' as r from pg_sleep(1)</db:sql></db:select>
+                    <set-payload value="#[{'type': 'ok', description: payload[0].r}]"/>
+                    <error-handler><on-error-continue><flow-ref name="report"/></on-error-continue></error-handler>
+                </try>
+            </route>
+        </scatter-gather>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(payload pluck $.payload) orderBy $."type"]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+
+    <!-- 結果を読み切ってから次を使う -->
+    <flow name="seq-consumed">
+        <http:listener config-ref="L" path="/seq-consumed"/>
+        <db:select config-ref="One"><db:sql>select 1 as n</db:sql></db:select>
+        <set-payload value="#[output application/json --- payload]"/>
+        <db:select config-ref="One"><db:sql>select 2 as n</db:sql></db:select>
+        <set-payload value="#[output application/json --- payload]"/>
+        <db:select config-ref="One"><db:sql>select 3 as n</db:sql></db:select>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+
+    <!-- query-single は結果を読み切る -->
+    <flow name="seq-single">
+        <http:listener config-ref="L" path="/seq-single"/>
+        <db:query-single config-ref="One"><db:sql>select 1 as n</db:sql></db:query-single>
+        <db:query-single config-ref="One"><db:sql>select 2 as n</db:sql></db:query-single>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <!-- 前の要求の後なら空いている -->
+    <flow name="after">
+        <http:listener config-ref="L" path="/after"/>
+        <db:query-single config-ref="One"><db:sql>select 9 as n</db:sql></db:query-single>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+</mule>

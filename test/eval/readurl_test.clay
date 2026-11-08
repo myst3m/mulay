@@ -1,0 +1,32 @@
+(ns readurl-test (:require [mulay.dw.lib.core_io :as io] [mulay.dw.urls :as urls] [mulay.lib.res :as res]))
+
+;; readUrl の classpath:// はアプリの資源 (登録した ResSet) から読む。作業ディレクトリは見ない。
+(deftest classpath-from-app-resources
+  (let [z (urls/set-classpath! (res/res-mem ["a/b.txt"] ["hello"]))
+        [t e] (urls/load-url "classpath://a/b.txt")
+        [t2 e2] (urls/load-url "classpath:///a/b.txt")
+        [t3 e3] (urls/load-url "classpath://CLAUDE.md")
+        [t4 e4] (urls/load-url "classpath://../x")
+        z2 (urls/clear-classpath!)]
+    (is (= t "hello"))
+    (is (= e ""))
+    (is (= t2 "hello"))
+    (is (= e3 "Unable to find resource 'CLAUDE.md'."))
+    (is (= e4 "Unable to find resource '../x'."))))
+
+;; 通常のファイルでないもの (/dev/zero、FIFO) は開かない (中身を全部読むので、止まるかメモリを使い切って落ちた)
+(deftest non-regular-files
+  (let [[t e] (urls/load-url "/dev/zero")
+        [t2 e2] (urls/load-url "file:///dev/zero")
+        [t3 e3] (urls/load-url "classpath:///dev/zero")]
+    (is (= e "Unable to find resource '/dev/zero'."))
+    (is (= e2 "Unable to find resource 'file:///dev/zero'."))
+    (is (= e3 "Unable to find resource 'dev/zero'."))))
+
+;; classpath を登録していないとき (mulay dw) も、classpath:// は作業ディレクトリの外へ出ない
+(deftest classpath-without-app-stays-inside
+  (let [z (urls/clear-classpath!)
+        [t e] (urls/load-url "classpath://../../../../../../etc/hostname")
+        [t2 e2] (urls/load-url "classpath://a/../../etc/hostname")]
+    (is (= e "Unable to find resource '../../../../../../etc/hostname'."))
+    (is (= e2 "Unable to find resource 'a/../../etc/hostname'."))))

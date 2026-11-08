@@ -1,0 +1,319 @@
+(ns mulay.dw.fmt.registry
+  (:require [mulay.dw.fmt.out :as fo] [mulay.dw.err :as dwe] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.lib.binaries :as bin] [mulay.dw.fmt.props :as p] [mulay.dw.fmt.json :as json] [mulay.dw.fmt.xml :as xml]
+            [mulay.dw.fmt.dw :as dwf] [mulay.dw.fmt.csv :as csv] [mulay.dw.fmt.text :as text] [mulay.dw.fmt.ndjson :as ndjson] [mulay.dw.fmt.eventstream :as es]
+            [mulay.dw.fmt.yaml :as yaml] [mulay.dw.fmt.multipart :as mp] [mulay.dw.fmt.dwread :as dwr] [mulay.dw.fmt.protobuf :as pbf] [mulay.lib.uni :as uni] [clay.string :as str]))
+
+(defn norm-mime Str [m: &Str]
+  (let [i (str/index-of m ";")
+        base (str/lower-case (str/trim (if (< i 0) (str m) (subs m 0 i))))]
+    (case base
+      "json" "application/json"
+      "xml" "application/xml"
+      "csv" "application/csv"
+      "dw" "application/dw"
+      "text" "text/plain"
+      "yaml" "application/yaml"
+      "java" "application/java"
+      "urlencoded" "application/x-www-form-urlencoded"
+      "multipart" "multipart/form-data"
+      "binary" "application/octet-stream"
+      "ndjson" "application/x-ndjson"
+      "properties" "text/x-java-properties"
+      base)))
+
+(defn mime-params Vec(v/Field) [m: &Str]
+  (let [parts: Vec(Str) (str/split m ";")]
+    (loop [i 1 acc: Vec(v/Field) []]
+      (if (>= i (count parts)) acc
+        (let [pp (str/trim (nth parts i)) eq (str/index-of pp "=")]
+          (if (< eq 0) (recur (+ i 1) acc)
+            (let [k (str/trim (subs pp 0 eq))
+                  v0 (str/trim (subs pp (+ eq 1) (count pp)))
+                  vv (if (and (>= (count v0) 2) (= (nth v0 0) 34) (= (nth v0 (- (count v0) 1)) 34)) (subs v0 1 (- (count v0) 1)) v0)]
+              (recur (+ i 1) (conj acc (v/field k (v/->VStr vv)))))))))))
+
+(defn format-id Str [m0: &Str]
+  (let [m (norm-mime m0)
+        sub (let [i (str/index-of m "/")] (if (< i 0) "" (subs m (+ i 1) (count m))))]
+    (cond
+      (or (= sub "json") (str/ends-with? sub "+json")) "json"
+      (or (= sub "xml") (str/ends-with? sub "+xml")) "xml"
+      (= sub "csv") "csv"
+      (or (= m "application/octet-stream") (= m "application/x-binary")) "binary"
+      (= m "text/plain") "text"
+      (= m "application/x-www-form-urlencoded") "urlencoded"
+      (str/starts-with? m "multipart/") "multipart"
+      (or (= sub "x-java-properties") (= sub "properties")) "properties"
+      (= sub "java") "java"
+      (= sub "dw") "dw"
+      (or (= m "application/yaml") (= m "text/yaml") (= m "application/x-yaml") (= m "text/x-yaml")) "yaml"
+      (or (= m "application/x-ndjson") (= m "application/x-ldjson")) "ndjson"
+      (= m "application/avro") "avro"
+      (= m "application/dwb") "dwb"
+      (or (= m "application/xlsx") (= m "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) "excel"
+      (= sub "flatfile") "flatfile"
+      (or (= m "application/protobuf") (= m "application/x-protobuf")) "protobuf"
+      (= m "text/event-stream") "eventstream"
+      :else "")))
+
+(defrecord FmtProps [id: Str reader: Vec(Str) writer: Vec(Str)])
+
+(def FORMAT-PROPS
+  [(->FmtProps "avro" ["schemaUrl"] ["schemaUrl" "bufferSize" "deferred"])
+   (->FmtProps "json" ["streaming"] ["writeAttributes" "indent" "encoding" "bufferSize" "skipNullOn" "deferred" "duplicateKeyAsArray"])
+   (->FmtProps "xml" ["supportDtd" "streaming" "maxEntityCount" "optimizeFor" "indexedReader" "maxAttributeSize" "nullValueOn" "collectionPath" "externalEntities"] ["writeDeclaration" "indent" "doubleQuoteInDeclaration" "encoding" "escapeGT" "defaultNamespace" "bufferSize" "inlineCloseOn" "onInvalidChar" "writeNilOnNull" "escapeCR" "skipNullOn" "writeDeclaredNamespaces" "deferred"])
+   (->FmtProps "csv" ["streaming" "separator" "quote" "escape" "bodyStartLineNumber" "ignoreEmptyLine" "header" "headerLineNumber"] ["separator" "encoding" "quote" "escape" "lineSeparator" "bufferSize" "bodyStartLineNumber" "ignoreEmptyLine" "header" "quoteHeader" "headerLineNumber" "quoteValues" "deferred"])
+   (->FmtProps "binary" [] ["bufferSize" "deferred"])
+   (->FmtProps "text" [] ["encoding" "bufferSize" "deferred"])
+   (->FmtProps "urlencoded" [] ["encoding" "bufferSize" "deferred"])
+   (->FmtProps "multipart" ["boundary" "defaultContentType"] ["boundary" "bufferSize" "deferred"])
+   (->FmtProps "properties" [] ["encoding" "bufferSize" "deferred"])
+   (->FmtProps "dwb" ["indexedReader"] ["bufferSize" "deferred" "writeIndex"])
+   (->FmtProps "excel" ["zipBombCheck" "streaming" "tableLimit" "maxEntrySize" "minInflateRatio" "ignoreEmptyLine" "header" "tableOffset"] ["zipBombCheck" "maxEntrySize" "minInflateRatio" "bufferSize" "ignoreEmptyLine" "header" "tableOffset" "deferred"])
+   (->FmtProps "flatfile" ["allowLenientWithBinaryNotEndElement" "zonedDecimalStrict" "structureIdent" "schemaPath" "missingValues" "segmentIdent" "recordParsing" "enforceRequires" "notTruncateDependingOnSubjectNotPresent" "useMissCharAsDefaultForFill" "substituteCharacterAsMissingValue" "truncateDependingOn" "retainEmptyStringFieldsOnParsing"] ["zonedDecimalStrict" "structureIdent" "schemaPath" "missingValues" "segmentIdent" "fillRedefinesByMaxLength" "encoding" "trimValues" "enforceRequires" "recordTerminator" "notTruncateDependingOnSubjectNotPresent" "useMissCharAsDefaultForFill" "truncateDependingOn" "bufferSize" "deferred"])
+   (->FmtProps "java" [] ["duplicateKeyAsArray" "writeAttributes"])
+   (->FmtProps "protobuf" ["bufferSize" "deferred" "descriptorUrl" "messageType"] ["bufferSize" "deferred" "descriptorUrl" "messageType"])
+   (->FmtProps "dw" ["privileges" "onlyData" "externalResources" "javaModule"] ["indent" "ignoreSchema" "onlyData" "maxCollectionSize" "bufferSize" "deferred"])
+   (->FmtProps "yaml" ["maxEntityCount"] ["writeDeclaration" "encoding" "bufferSize" "skipNullOn" "deferred"])
+   (->FmtProps "eventstream" [] ["bufferSize" "deferred"])
+   (->FmtProps "ndjson" ["ignoreEmptyLine" "skipInvalid"] ["writeAttributes" "encoding" "bufferSize" "skipNullOn" "deferred"])])
+
+(def SUPPORTED "Supported content types are: `application/avro`, `application/json`, `application/xml`, `application/csv`, `application/octet-stream`, `text/plain`, `application/x-www-form-urlencoded`, `multipart/form-data`, `text/x-java-properties`, `application/dwb`, `application/xlsx`, `application/flatfile`, `application/java`, `application/protobuf`, `application/dw`, `application/yaml`, `text/event-stream`, `application/x-ndjson`, `text/event-stream`, `application/x-ndjson`")
+
+(defn- valid-props Vec(Str) [id: &Str col: Int]
+  (loop [i 0]
+    (if (>= i (count FORMAT-PROPS)) []
+      (let [row (nth FORMAT-PROPS i)] (if (= (:id row) id) (if (= col 1) (:reader row) (:writer row)) (recur (+ i 1)))))))
+
+(def OPT-TYPES [["schemaUrl" "String"] ["bufferSize" "Number"] ["deferred" "Boolean"] ["streaming" "Boolean"] ["writeAttributes" "Boolean"] ["encoding" "String"] ["skipNullOn" "String"] ["duplicateKeyAsArray" "Boolean"] ["supportDtd" "Boolean"] ["maxEntityCount" "Number"] ["optimizeFor" "String"] ["indexedReader" "Boolean"] ["maxAttributeSize" "Number"] ["nullValueOn" "String"] ["collectionPath" "String"] ["externalEntities" "Boolean"] ["writeDeclaration" "Boolean"] ["doubleQuoteInDeclaration" "Boolean"] ["escapeGT" "Boolean"] ["defaultNamespace" "String"] ["inlineCloseOn" "String"] ["onInvalidChar" "String"] ["writeNilOnNull" "Boolean"] ["escapeCR" "Boolean"] ["writeDeclaredNamespaces" "String"] ["separator" "String"] ["quote" "String"] ["escape" "String"] ["bodyStartLineNumber" "Number"] ["ignoreEmptyLine" "Boolean"] ["header" "Boolean"] ["headerLineNumber" "Number"] ["lineSeparator" "String"] ["quoteHeader" "Boolean"] ["quoteValues" "Boolean"] ["boundary" "String"] ["defaultContentType" "String"] ["writeIndex" "Boolean"] ["zipBombCheck" "Boolean"] ["tableLimit" "String"] ["maxEntrySize" "Number"] ["minInflateRatio" "Number"] ["tableOffset" "String"] ["allowLenientWithBinaryNotEndElement" "Boolean"] ["zonedDecimalStrict" "Boolean"] ["structureIdent" "String"] ["schemaPath" "String"] ["missingValues" "String"] ["segmentIdent" "String"] ["recordParsing" "String"] ["enforceRequires" "Boolean"] ["notTruncateDependingOnSubjectNotPresent" "Boolean"] ["useMissCharAsDefaultForFill" "Boolean"] ["substituteCharacterAsMissingValue" "Boolean"] ["truncateDependingOn" "Boolean"] ["retainEmptyStringFieldsOnParsing" "Boolean"] ["fillRedefinesByMaxLength" "Boolean"] ["trimValues" "Boolean"] ["recordTerminator" "String"] ["descriptorUrl" "String"] ["messageType" "String"] ["privileges" "String"] ["onlyData" "Boolean"] ["externalResources" "Boolean"] ["javaModule" "Boolean"] ["ignoreSchema" "Boolean"] ["maxCollectionSize" "Number"] ["skipInvalid" "Boolean"]])
+
+(defn- opt-type Str [id: &Str k: &Str]
+  (if (= k "indent") (if (= id "dw") "String" "Boolean")
+    (loop [i 0] (if (>= i (count OPT-TYPES)) "" (if (= (nth (nth OPT-TYPES i) 0) k) (nth (nth OPT-TYPES i) 1) (recur (+ i 1)))))))
+
+(defn- buffer-size-err Str [fs: &Vec(v/Field)]
+  (let [r (v/obj-get fs "bufferSize")]
+    (if (= (count r) 0) ""
+      (let [n8 (num/from-int 8)
+            low (fn Str [n: &num/Num] (if (< (num/cmp n n8) 0) (str "Number " (num/to-string n) " is out of valid range. Min Value: 8 ") ""))]
+        (match (v/unmeta (nth r 0))
+          (v/VNum n) (low n)
+          (v/VInt i) (low (num/from-int i))
+          (v/VStr s) (let [[n e] (num/parse-lit (str/trim s))] (if (= e "") (low n) ""))
+          _ "")))))
+
+(defn- charset-err Str [id: &Str props: &Vec(v/Field) writer: Bool]
+  (let [r (v/obj-get props "encoding")]
+    (if (or (not writer) (= (count r) 0)) ""
+      (match (v/unmeta (nth r 0))
+        (v/VStr s) (if (not= (bin/charset-id s) "") ""
+                     (if (= id "ndjson") (str "java.nio.charset.UnsupportedCharsetException - " s) (str "Charset " s " is not supported")))
+        _ ""))))
+
+(defn- writer-charset Str [props: &Vec(v/Field)]
+  (let [r (v/obj-get props "encoding")]
+    (if (= (count r) 0) ""
+      (match (v/unmeta (nth r 0)) (v/VStr s) (bin/charset-id s) _ ""))))
+
+(defn- lenient-val Values(v/Val Str) [t: &Str x: &v/Val]
+  (let [y (v/unmeta x)]
+    (cond
+      (v/null? y) (values x "")
+      (= t "Boolean") (match y
+                        (v/VBool b) (values x "")
+                        (v/VStr s) (values (v/bool-v (= (str/lower-case s) "true")) "")
+                        _ (values (v/bool-v false) ""))
+      (= t "String") (match y
+                       (v/VStr s) (values x "")
+                       (v/VNum n) (values (v/->VStr (num/to-string n)) "")
+                       (v/VInt i) (values (v/->VStr (num/to-string (num/from-int i))) "")
+                       (v/VBool b) (values (v/->VStr (if b "true" "false")) "")
+                       (v/VKey q) (values (v/->VStr (:name q)) "")
+                       _ (values x ""))
+      (= t "Number") (match y
+                       (v/VStr s) (let [[n e] (num/parse-lit (str/trim s))]
+                                    (if (= e "") (values (v/->VNum n) "") (values x (str "For input string: \"" s "\""))))
+                       _ (values x ""))
+      :else (values x ""))))
+
+(defn- lenient Values(Vec(v/Field) Str) [id: &Str props: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(v/Field) [] err ""]
+    (if (>= i (count props)) (values acc err)
+      (let [f (nth props i)
+            t (opt-type id (:name (:key f)))
+            [x e] (lenient-val t (:value f))]
+        (recur (+ i 1) (conj acc (v/->Field (:key f) x)) (if (= err "") e err))))))
+
+(defn- tail-checks Str [id: &Str props: &Vec(v/Field) writer: Bool strict: Bool]
+  (let [te (if strict (type-errors id props)
+             (let [[ps e] (lenient id props)] (if (not= e "") e "")))]
+    (if (not= te "") te
+      (let [[lp le] (lenient id props)
+            b (buffer-size-err lp)]
+        (if (not= b "") b (charset-err id lp writer))))))
+
+(defn- strict-type-ok? Bool [t: &Str x: &v/Val]
+  (let [y (v/unmeta x)]
+    (cond (= t "Boolean") (match y (v/VBool b) true _ false)
+          (= t "String") (match y (v/VStr s) true _ false)
+          (= t "Number") (match y (v/VNum n) true (v/VInt n) true _ false)
+          :else true)))
+
+(defn- type-errors Str [id: &Str props: &Vec(v/Field)]
+  (loop [i 0]
+    (if (>= i (count props)) ""
+      (let [k (:name (:key (nth props i)))
+            t (opt-type id k)
+            x (:value (nth props i))]
+        (if (strict-type-ok? t x) (recur (+ i 1))
+          (str "Option `" k "` expects '" t "' but was '" (v/type-name (v/unmeta x)) "'"))))))
+
+(defn validate Str [mime: &Str props: &Vec(v/Field) writer: Bool] (validate-with mime props writer false))
+
+(defn validate-strict Str [mime: &Str props: &Vec(v/Field) writer: Bool] (validate-with mime props writer true))
+
+(defn- validate-with Str [mime: &Str props: &Vec(v/Field) writer: Bool strict: Bool]
+  (let [id (format-id mime)]
+    (if (= id "") (str "Unknown content type `" (norm-mime mime) "`. " SUPPORTED)
+      (let [ok (valid-props id (if writer 2 1))]
+        (loop [i 0]
+          (if (>= i (count props)) (tail-checks id props writer strict)
+            (let [k (:name (:key (nth props i)))
+                  found (loop [j 0] (if (>= j (count ok)) false (if (= (nth ok j) k) true (recur (+ j 1)))))]
+              (if found (recur (+ i 1))
+                (str "Option `" k "` is not valid."
+                     (if (= (count ok) 0) ""
+                       (str " Valid options are: " (loop [j 0 acc ""] (if (>= j (count ok)) acc (recur (+ j 1) (str acc (if (> j 0) ", " "") "`" (nth ok j) "`")))))))))))))))
+
+(defn binary-format? Bool [m: &Str]
+  (let [id (format-id m)] (or (= id "binary") (= id "multipart") (= id "excel") (= id "avro") (= id "protobuf") (= id "dwb"))))
+
+(defn- merge-props Vec(v/Field) [a: Vec(v/Field) b: &Vec(v/Field)]
+  (loop [acc a i 0] (if (>= i (count b)) acc (recur (conj acc (nth b i)) (+ i 1)))))
+
+(defn- known-params Vec(v/Field) [mime: &Str writer: Bool]
+  (let [ps (mime-params mime) ok (valid-props (format-id mime) (if writer 2 1))]
+    (loop [i 0 acc: Vec(v/Field) []]
+      (if (>= i (count ps)) acc
+        (let [k (:name (:key (nth ps i)))
+              found (loop [j 0] (if (>= j (count ok)) false (if (= (nth ok j) k) true (recur (+ j 1)))))]
+          (recur (+ i 1) (if found (conj acc (nth ps i)) acc)))))))
+
+(defn reader-props Values(Vec(v/Field) Str) [mime: &Str props0: &Vec(v/Field)]
+  (let [ve (validate mime props0 false)]
+    (if (not= ve "") (values [] ve)
+      (lenient (format-id (norm-mime mime)) (merge-props (known-params mime false) props0)))))
+
+(defn read-fmt Values(v/Val Str) [mime: &Str props0: &Vec(v/Field) text: &Str] (read-named mime props0 text "payload"))
+
+(defn read-named Values(v/Val Str) [mime: &Str props0: &Vec(v/Field) text: &Str name: &Str]
+  (let [ve (validate mime props0 false)]
+    (if (not= ve "") (values (v/null-v) ve)
+      (read-valid-named mime props0 text name))))
+
+(defn read-valid Values(v/Val Str) [mime: &Str props0: &Vec(v/Field) text: &Str] (read-valid-named mime props0 text "root"))
+
+(defn read-valid-named Values(v/Val Str) [mime: &Str props0: &Vec(v/Field) text: &Str name: &Str]
+  (let [m (norm-mime mime)
+        id (format-id m)
+        [props pe] (lenient id (merge-props (known-params mime false) props0))]
+    (case id
+      "json" (let [[x e] (json/read-named text name)] (values (if (= e "") (v/->VMeta x (p/reader-meta m)) x) e))
+      "xml" (xml/read-named text props m name)
+      "csv" (csv/read text props m)
+      "text" (values (v/->VMeta (v/->VStr (uni/valid-prefix text)) (p/reader-meta m)) "")
+      "binary" (values (v/->VMeta (v/->VBin (str text)) (p/reader-meta m)) "")
+      "java" (values (v/->VMeta (v/->VBin (str text)) (p/reader-meta m)) "")
+      "urlencoded" (text/read-urlencoded text m)
+      "properties" (text/read-properties text m)
+      "ndjson" (ndjson/read text props m)
+      "eventstream" (es/read text m)
+      "yaml" (yaml/read-named text props m name)
+      "multipart" (mp/read text props m part-reader)
+      "dw" (dwr/read text m)
+      "protobuf" (let [[x e] (pbf/read text props)]
+                   (values x (if (or (= e "") (= name "root")) e (str e "\nTrace:\n  at main (Unknown), while reading `" name "` as ProtoBuf.\nTrace:\n  at main (Unknown)"))))
+      (values (v/null-v) (str "The format `" id "` is not supported by mulay yet (reading " m ")")))))
+
+(def- PART-DENIED ["supportdtd" "externalentities" "descriptorurl"])
+
+(defn- part-mime Str [mime: &Str]
+  (let [segs: Vec(Str) (str/split mime ";")]
+    (loop [i 1 out (str (nth segs 0))]
+      (if (>= i (count segs)) out
+        (let [sg (nth segs i) eq (str/index-of sg "=")
+              k (str/lower-case (str/trim (if (< eq 0) sg (subs sg 0 eq))))
+              denied (loop [j 0] (if (>= j (count PART-DENIED)) false (if (= (nth PART-DENIED j) k) true (recur (+ j 1)))))]
+          (recur (+ i 1) (if denied out (str out ";" sg))))))))
+
+(defn- part-reader Values(v/Val Str) [mime0: Str text: Str depth: Int]
+  (cond
+    (= (format-id mime0) "") (values (v/->VBin text) "")
+    (= (format-id mime0) "multipart") (mp/read-at text (merge-props (known-params mime0 false) []) (norm-mime mime0) part-reader (+ depth 1))
+    :else (read-valid (part-mime mime0) [] text)))
+
+(defn- part-writer Values(Str Str) [mime: Str x: v/Val]
+  (let [id (format-id mime)]
+    (if (= id "") (text/write-binary x)
+      (let [[t e] (write-valid mime (if (= id "xml") [(v/field "writeDeclaration" (v/bool-v false))] []) x)]
+        (values t (if (dwe/ok? e) "" (:msg e)))))))
+
+(defn write-fmt Values(Str dwe/DwErr) [mime: &Str props0: &Vec(v/Field) x: &v/Val]
+  (let [ve (validate mime props0 true)]
+    (if (not= ve "") (values "" (fo/writer-err ve))
+      (write-valid mime props0 x))))
+
+(defn write-script-output Values(Str dwe/DwErr) [mime: &Str props0: &Vec(v/Field) nss: &Vec(v/Ns) x: &v/Val]
+  (write-script-output-to mime props0 nss x (fo/whole)))
+
+(defn write-script-output-to Values(Str dwe/DwErr) [mime: &Str props0: &Vec(v/Field) nss: &Vec(v/Ns) x: &v/Val snk: &fo/Sink]
+  (let [ve (validate-strict mime props0 true)
+        id (format-id (norm-mime mime))]
+    (cond (not= ve "") (values "" (fo/writer-err ve))
+          (and (= id "dw") (> (count nss) 0)) (whole-then x (fn Values(Str Str) [y: v/Val] (dwf/write-ns y (merge-props (known-params mime true) props0) nss)))
+          (= id "xml") (xml/write-ns-to x (merge-props (known-params mime true) props0) nss snk)
+          :else (write-valid-to mime props0 x snk))))
+
+(defn- whole-then Values(Str dwe/DwErr) [x: &v/Val w: Fn(v/Val Values(Str Str))]
+  (let [[y e] (v/whole-deep x)]
+    (if (not (dwe/ok? e)) (values "" e)
+      (let [[t we] (w y)] (values t (if (= we "") (dwe/ok) (fo/writer-err we)))))))
+
+(defn json-opts json/Opts [mime: &Str props0: &Vec(v/Field)]
+  (json-opts-of (merge-props (known-params mime true) props0)))
+
+(defn- json-opts-of json/Opts [props: &Vec(v/Field)]
+  (let [[ind e1] (p/pbool props "indent" true)
+        [sk e2] (p/pstr props "skipNullOn" "")
+        [wa e3] (p/pbool props "writeAttributes" false)
+        [da e4] (p/pbool props "duplicateKeyAsArray" false)]
+    (json/opts-full ind sk wa da)))
+
+(defn write-valid Values(Str dwe/DwErr) [mime: &Str props0: &Vec(v/Field) x: &v/Val]
+  (write-valid-to mime props0 x (fo/whole)))
+
+(defn write-valid-to Values(Str dwe/DwErr) [mime: &Str props0: &Vec(v/Field) x: &v/Val snk: &fo/Sink]
+  (let [m (norm-mime mime)
+        id (format-id m)
+        [props pe] (lenient id (merge-props (known-params mime true) props0))]
+    (case id
+      "json" (json/write-to x (json-opts-of props) snk)
+      "ndjson" (ndjson/write-to x props snk)
+      "xml" (xml/write-to x props snk)
+      "dw" (whole-then x (fn Values(Str Str) [y: v/Val] (dwf/write y props)))
+      "csv" (whole-then x (fn Values(Str Str) [y: v/Val] (csv/write y props)))
+      "text" (whole-then x (fn Values(Str Str) [y: v/Val] (text/write-text y)))
+      "binary" (whole-then x (fn Values(Str Str) [y: v/Val] (text/write-binary y)))
+      "urlencoded" (whole-then x (fn Values(Str Str) [y: v/Val] (text/write-urlencoded y (writer-charset props0))))
+      "properties" (whole-then x (fn Values(Str Str) [y: v/Val] (text/write-properties y)))
+      "java" (whole-then x (fn Values(Str Str) [y: v/Val] (text/write-java y)))
+      "eventstream" (whole-then x (fn Values(Str Str) [y: v/Val] (es/write y)))
+      "yaml" (whole-then x (fn Values(Str Str) [y: v/Val] (yaml/write y props)))
+      "multipart" (whole-then x (fn Values(Str Str) [y: v/Val] (mp/write y props (str/ends-with? (norm-mime mime) "/form-data") part-writer)))
+      "protobuf" (whole-then x (fn Values(Str Str) [y: v/Val] (pbf/write y props)))
+      (values "" (fo/writer-err (str "The format `" id "` is not supported by mulay yet (writing " m ")"))))))
+
+(defn streams? Bool [mime: &Str nss: &Vec(v/Ns)]
+  (let [id (format-id (norm-mime mime))] (or (= id "json") (= id "ndjson") (= id "xml"))))
+
+(defn json-like? Bool [m: &Str] (or (= m "application/json") (str/ends-with? m "+json")))

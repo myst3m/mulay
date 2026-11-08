@@ -1,0 +1,37 @@
+(ns mulay.dw.lib.mule (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]))
+
+(def M "dw::Mule")
+
+(def PROPS (atom (->dyn {"" ""})))
+
+(defn set-properties! Int [names: &Vec(Str) vals: &Vec(Str)]
+  (let [m (loop [i 0 acc: Map(Str Dyn) {}] (if (>= i (count names)) acc (recur (+ i 1) (assoc acc (nth names i) (->dyn (nth vals i))))))
+        z (reset! PROPS (->dyn m))]
+    0))
+
+(defn- p-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [name (core/arg-str a 0)
+        m: Map (dyn->map (deref PROPS))]
+    (rt/ret (if (and (contains? m name) (not= name "")) (v/->VStr (dyn->str (get! m name))) (v/null-v)))))
+
+(defn- caused-by Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [want (core/arg-str a 1)
+        et (match (v/unmeta (nth a 0))
+             (v/VObj fs) (let [r (v/obj-get fs "errorType")] (if (= (count r) 0) (v/null-v) (nth r 0)))
+             _ (v/null-v))]
+    (rt/ret (v/bool-v (type-chain-has? et want)))))
+
+(defn- type-chain-has? Bool [et: &v/Val want: &Str]
+  (match (v/unmeta et)
+    (v/VObj fs) (let [id (let [r (v/obj-get fs "identifier")] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) s _ "")))
+                      ns (let [r (v/obj-get fs "namespace")] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) s _ "")))
+                      full (str ns ":" id)
+                      w (if (< (count want) 1) "" (str want))]
+                  (if (or (= full w) (= (str "MULE:" w) full) (and (= w "ANY") true) (= w "MULE:ANY")) true
+                    (let [pr (v/obj-get fs "parentErrorType")]
+                      (if (= (count pr) 0) false (type-chain-has? (nth pr 0) want)))))
+    _ false))
+
+(defn builtins Vec(rt/Builtin) []
+  [(rt/builtin "p" M [(rt/b1 "String" p-fn)])
+   (rt/builtin "causedBy" M [(rt/b2 "Object" "String" caused-by)])])

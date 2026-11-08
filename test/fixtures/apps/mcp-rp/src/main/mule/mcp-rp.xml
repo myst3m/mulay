@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18211"/>
+    </http:listener-config>
+
+    <mcp:server-config name="Srv" serverName="RP" serverVersion="1.0.0">
+        <mcp:streamable-http-server-connection listenerConfig="L" mcpEndpointPath="/mcp" responseContentType="JSON"/>
+    </mcp:server-config>
+
+    <mcp:server-config name="SrvR1" serverName="R1" serverVersion="1.0.0">
+        <mcp:streamable-http-server-connection listenerConfig="L" mcpEndpointPath="/r1" responseContentType="JSON"/>
+    </mcp:server-config>
+    <mcp:server-config name="SrvP1" serverName="P1" serverVersion="1.0.0">
+        <mcp:streamable-http-server-connection listenerConfig="L" mcpEndpointPath="/p1" responseContentType="JSON"/>
+    </mcp:server-config>
+
+    <flow name="greeting">
+        <mcp:resource-listener config-ref="Srv" name="greeting" uri="mule://greeting" resourceMimeType="text/plain">
+            <mcp:description>A static greeting</mcp:description>
+            <mcp:resource-listener-content>
+                <mcp:text-resource text="hello"/>
+            </mcp:resource-listener-content>
+        </mcp:resource-listener>
+        <logger level="INFO" message="greeting read"/>
+    </flow>
+
+    <flow name="info">
+        <mcp:resource-listener config-ref="Srv" name="info" uri="mule://info" resourceMimeType="application/json">
+            <mcp:description>Request details</mcp:description>
+            <mcp:resource-listener-content>
+                <mcp:text-resource text="#[write(payload, 'application/json') ++ ' ' ++ (typeOf(payload) as String) ++ ' ' ++ (attributes.requestId as String) ++ ' ' ++ (sizeOf(attributes.sessionId default '') as String)]"/>
+            </mcp:resource-listener-content>
+        </mcp:resource-listener>
+        <logger level="INFO" message="info read"/>
+    </flow>
+
+    <flow name="review">
+        <mcp:prompt-listener config-ref="Srv" name="review" title="Code review">
+            <mcp:description>Review some code</mcp:description>
+            <mcp:prompt-arguments>
+                <mcp:prompt-argument name="code" description="The code" required="true"/>
+                <mcp:prompt-argument name="lang"/>
+            </mcp:prompt-arguments>
+            <mcp:messages>
+                <mcp:text-prompt-message-content role="USER" text="#[&apos;Review &apos; ++ (payload.arguments.code default &apos;?&apos;)]"/>
+            </mcp:messages>
+        </mcp:prompt-listener>
+        <logger level="INFO" message="review"/>
+    </flow>
+
+    <flow name="blob">
+        <mcp:resource-listener config-ref="Srv" name="blob" uri="mule://blob" resourceMimeType="application/octet-stream">
+            <mcp:description>A blob</mcp:description>
+            <mcp:resource-listener-content>
+                <mcp:blob-resource blob="#[payload.requestedUri]"/>
+            </mcp:resource-listener-content>
+        </mcp:resource-listener>
+        <logger level="INFO" message="blob"/>
+    </flow>
+
+    <flow name="boom">
+        <mcp:resource-listener config-ref="Srv" name="boom" uri="mule://boom" resourceMimeType="text/plain">
+            <mcp:description>Fails</mcp:description>
+            <mcp:resource-listener-content>
+                <mcp:text-resource text="unreachable"/>
+            </mcp:resource-listener-content>
+        </mcp:resource-listener>
+        <raise-error type="APP:BOOM" description="resource boom"/>
+    </flow>
+
+    <flow name="rich">
+        <mcp:prompt-listener config-ref="Srv" name="rich">
+            <mcp:messages>
+                <mcp:text-prompt-message-content role="ASSISTANT" text="first"/>
+                <mcp:text-prompt-message-content text="second"/>
+                <mcp:image-prompt-message-content mimeType="image/png">
+                    <mcp:image-data>
+                        <mcp:inline-image-data imageData="#['aGk=']"/>
+                    </mcp:image-data>
+                </mcp:image-prompt-message-content>
+                <mcp:resource-link-prompt-message-content uri="mule://greeting" name="greeting" description="d" mimeType="text/plain" size="5"/>
+                <mcp:embedded-resource-prompt-message-content uri="mule://e" mimeType="text/plain">
+                    <mcp:resource-content>
+                        <mcp:text-embedded-resource text="emb"/>
+                    </mcp:resource-content>
+                </mcp:embedded-resource-prompt-message-content>
+            </mcp:messages>
+        </mcp:prompt-listener>
+        <logger level="INFO" message="rich"/>
+    </flow>
+
+    <flow name="pboom">
+        <mcp:prompt-listener config-ref="Srv" name="pboom">
+            <mcp:messages>
+                <mcp:text-prompt-message-content text="unreachable"/>
+            </mcp:messages>
+        </mcp:prompt-listener>
+        <raise-error type="APP:PBOOM" description="prompt boom"/>
+    </flow>
+
+    <flow name="only-resource">
+        <mcp:resource-listener config-ref="SrvR1" name="only" uri="mule://only" resourceMimeType="text/markdown">
+            <mcp:description>The only one</mcp:description>
+            <mcp:resource-listener-content>
+                <mcp:text-resource text="# only"/>
+            </mcp:resource-listener-content>
+        </mcp:resource-listener>
+        <logger level="INFO" message="only"/>
+    </flow>
+
+    <flow name="only-prompt">
+        <mcp:prompt-listener config-ref="SrvP1" name="plain">
+            <mcp:messages>
+                <mcp:text-prompt-message-content text="plain"/>
+            </mcp:messages>
+        </mcp:prompt-listener>
+        <logger level="INFO" message="plain"/>
+    </flow>
+</mule>

@@ -1,0 +1,402 @@
+(ns mulay.lib.ssh (:require [clay.net :as net] [clay.async :as async] [clay.crypto :as cc] [clay.bytes :as bytes] [clay.string :as str]
+                            [mulay.lib.sshwire :as w] [mulay.lib.sshpkt :as p] [mulay.lib.sshkex :as kx] [mulay.lib.sshkey :as hk]
+                            [mulay.lib.random :as rnd]))
+
+(def CANNOT-REACH 1)
+(def HANDSHAKE 3)
+
+(def VERSION "SSH-2.0-mulay_1.0")
+
+(def MSG-DISCONNECT 1)
+(def MSG-IGNORE 2)
+(def MSG-UNIMPLEMENTED 3)
+(def MSG-DEBUG 4)
+(def MSG-SERVICE-REQUEST 5)
+(def MSG-SERVICE-ACCEPT 6)
+(def MSG-EXT-INFO 7)
+(def MSG-KEXINIT 20)
+(def MSG-NEWKEYS 21)
+(def MSG-KEX-ECDH-INIT 30)
+(def MSG-KEX-ECDH-REPLY 31)
+(def MSG-USERAUTH-REQUEST 50)
+(def MSG-USERAUTH-FAILURE 51)
+(def MSG-USERAUTH-SUCCESS 52)
+(def MSG-USERAUTH-BANNER 53)
+(def MSG-USERAUTH-PASSWD-CHANGEREQ 60)
+(def MSG-GLOBAL-REQUEST 80)
+(def MSG-REQUEST-FAILURE 82)
+(def MSG-CHANNEL-OPEN 90)
+(def MSG-CHANNEL-OPEN-CONFIRMATION 91)
+(def MSG-CHANNEL-OPEN-FAILURE 92)
+(def MSG-CHANNEL-WINDOW-ADJUST 93)
+(def MSG-CHANNEL-DATA 94)
+(def MSG-CHANNEL-EXTENDED-DATA 95)
+(def MSG-CHANNEL-EOF 96)
+(def MSG-CHANNEL-CLOSE 97)
+(def MSG-CHANNEL-REQUEST 98)
+(def MSG-CHANNEL-SUCCESS 99)
+(def MSG-CHANNEL-FAILURE 100)
+
+(def LOCAL-WINDOW 4194304)
+(def LOCAL-MAX-PACKET 32768)
+(def REKEY-BYTES 1073741824)
+(def READ-CHUNK 262144)
+
+(defrecord Conn [sock: net/Sock timeout: Int lists: Vec(Vec(Str)) rbuf: Str rpos: Int tx: p/Dir rx: p/Dir vs: Str session-id: Str hostkey: Str
+                 hostkey-alg: Str strict: Bool held: Vec(Str) kex-bytes: Int
+                 ch-open: Bool ch-remote: Int ch-rwin: Int ch-rmax: Int ch-used: Int ch-in: Str ch-eof: Bool ch-closed: Bool])
+
+(defn host-key Str [c: &Conn] (:hostkey c))
+
+(defn no-conn Conn [] (new-conn (net/no-sock) 0 []))
+
+(defn- new-conn Conn [sk: net/Sock timeout: Int lists: Vec(Vec(Str))]
+  (let [held: Vec(Str) []]
+    (->Conn sk timeout lists "" 0 (p/none-dir) (p/none-dir) "" "" "" "" false held 0 false 0 0 0 0 "" false false)))
+
+(defn- arm Int [timeout: Int]
+  (if (= timeout 0) -1
+    (let [now (quot (mono-us) 1000)
+          old (async/deadline-in timeout)]
+      (if (and (> old 0) (< old (+ now timeout))) (let [z (async/deadline-at old)] old) old))))
+
+(defn- disarm Int [old: Int] (if (< old 0) 0 (async/deadline-at old)))
+
+(defn- read-more Values(Conn Str) [c: Conn]
+  (let [old (arm (:timeout c))
+        [d e] (net/read (:sock c) READ-CHUNK)
+        z (disarm old)]
+    (cond (not= e "") (values c (str e))
+          (= (count d) 0) (values c "connection closed by the server")
+          :else
+          (let [rpos (:rpos c)
+                rb (:rbuf c)
+                c2 (assoc c :rbuf "" :rpos 0)
+                nb (if (= rpos 0) (str rb d) (let [rest (subs rb rpos (count rb))] (str rest d)))]
+            (values (assoc c2 :rbuf nb) "")))))
+
+(defn- write-sock Str [c: &Conn data: &Str]
+  (let [old (arm (:timeout c)) e (net/write (:sock c) data) z (disarm old)] e))
+
+(defn- send-packet Values(Conn Str) [c: Conn payload: &Str]
+  (let [[x d] (p/seal (:tx c) payload)
+        e (write-sock c x)]
+    (values (assoc c :tx d :kex-bytes (+ (:kex-bytes c) (count x))) e)))
+
+(defn- recv-packet Values(Conn Str Str) [c0: Conn]
+  (loop [c c0]
+    (let [[st pl n d why] (p/unseal-at (:rx c) (:rbuf c) (:rpos c))]
+      (cond (= st p/OK) (values (assoc c :rx d :rpos (+ (:rpos c) n) :kex-bytes (+ (:kex-bytes c) n)) pl "")
+            (= st p/BAD) (values c "" why)
+            :else (let [[c2 e] (read-more c)] (if (not= e "") (values c2 "" e) (recur c2)))))))
+
+(defn- msg-type Int [pl: &Str] (if (= (count pl) 0) -1 (nth pl 0)))
+
+(defn- read-version Values(Conn Str Str) [c0: Conn]
+  (loop [c c0 lines 0]
+    (let [rb (:rbuf c) nl (str/index-of-after rb "\n" (:rpos c))]
+      (cond
+        (and (< nl 0) (> (- (count rb) (:rpos c)) 8192)) (values c "" "version line is too long")
+        (< nl 0) (let [[c2 e] (read-more c)] (if (not= e "") (values c2 "" e) (recur c2 lines)))
+        :else
+        (let [end (if (and (> nl (:rpos c)) (= (nth rb (- nl 1)) 13)) (- nl 1) nl)
+              line (subs rb (:rpos c) end)
+              c2 (assoc c :rpos (+ nl 1))]
+          (cond (or (str/starts-with? line "SSH-2.0-") (str/starts-with? line "SSH-1.99-")) (values c2 line "")
+                (str/starts-with? line "SSH-") (values c2 "" (str "unsupported protocol version: " line))
+                (> lines 50) (values c2 "" "no SSH version line from the server")
+                :else (recur c2 (+ lines 1))))))))
+
+(defn- aes-fast? Bool [] (cc/cpu-path? "aes"))
+
+(defn- my-kexinit Str [c: &Conn]
+  (let [[cookie ok] (rnd/random-bytes 16)]
+    (kx/kexinit-payload (kx/->Kexinit cookie (:lists c) false))))
+
+(defn- narrow Vec(Vec(Str)) [hostkeys: &Vec(Str) kex: &Str enc: &Str mac: &Str]
+  (let [l (kx/client-lists (aes-fast?))
+        all-hk (nth l 1)
+        first-hk (loop [i 0 acc: Vec(Str) []]
+                   (if (>= i (count all-hk)) acc (recur (+ i 1) (if (has? hostkeys (nth all-hk i)) (conj acc (nth all-hk i)) acc))))
+        hk (loop [i 0 acc first-hk]
+             (if (>= i (count all-hk)) acc (recur (+ i 1) (if (has? first-hk (nth all-hk i)) acc (conj acc (nth all-hk i))))))
+        k (if (= kex "") (nth l 0) [(str kex) "kex-strict-c-v00@openssh.com"])
+        e (if (= enc "") (nth l 2) [(str enc)])
+        m (if (= mac "") (nth l 4) [(str mac)])]
+    [k hk e e m m (nth l 6) (nth l 7) (nth l 8) (nth l 9)]))
+
+(defn- has? Bool [xs: &Vec(Str) x: &Str] (loop [i 0] (cond (>= i (count xs)) false (= (nth xs i) x) true :else (recur (+ i 1)))))
+
+(defn- dir-of Values(p/Dir Str) [hname: &Str enc: &Str mac: &Str k: &Str h: &Str sid: &Str iv-l: &Str key-l: &Str mac-l: &Str]
+  (let [iv (kx/derive hname k h iv-l sid (kx/iv-len enc))
+        key (kx/derive hname k h key-l sid (kx/key-len enc))
+        mk (if (= mac "") "" (kx/derive hname k h mac-l sid (kx/mac-key-len mac)))]
+    (p/new-dir enc mac key iv mk)))
+
+(defn- dh? Bool [kex: &Str] (not= (kx/dh-prime kex) ""))
+
+(defn- cmp-be Int [a: &Str b: &Str]
+  (let [ia (loop [i 0] (if (and (< i (count a)) (= (nth a i) 0)) (recur (+ i 1)) i))
+        ib (loop [i 0] (if (and (< i (count b)) (= (nth b i) 0)) (recur (+ i 1)) i))
+        la (- (count a) ia) lb (- (count b) ib)]
+    (if (not= la lb) (- la lb)
+      (loop [i 0] (cond (>= i la) 0 (not= (nth a (+ ia i)) (nth b (+ ib i))) (- (nth a (+ ia i)) (nth b (+ ib i))) :else (recur (+ i 1)))))))
+
+(defn- kex-start Values(Str Str Str Str) [kex: &Str]
+  (if (dh? kex)
+    (let [[x ok] (rnd/random-bytes 128)
+          [e err] (cc/modexp (str (chr 2)) x (kx/dh-prime kex))]
+      (values x e (str (w/byte MSG-KEX-ECDH-INIT) (w/mpint e)) err))
+    (let [[x ok] (rnd/random-bytes 32)
+          [q err] (cc/x25519-base x)]
+      (values x q (str (w/byte MSG-KEX-ECDH-INIT) (w/string q)) err))))
+
+(defn- kex-reply Values(Str Str Str Str Str) [c: &Conn kex: &Str x: &Str mine: &Str ic: &Str is: &Str rep: &Str]
+  (let [[ks p1 o1] (w/get-string rep 1)]
+    (if (dh? kex)
+      (let [p (kx/dh-prime kex)
+            [f p2 o2] (w/get-mpint rep p1)
+            [sig p3 o3] (w/get-string rep p2)]
+        (cond
+          (or (not= (msg-type rep) MSG-KEX-ECDH-REPLY) (not (and o1 o2 o3))) (values "" "" "" "" "malformed KEXDH_REPLY")
+          (or (<= (cmp-be f (str (chr 1))) 0) (>= (cmp-be f (dh-pm1 p)) 0)) (values "" "" "" "" "the server's DH value is out of range")
+          :else
+          (let [[k ke] (cc/modexp f x p)]
+            (if (not= ke "") (values "" "" "" "" (str "key exchange failed: " ke))
+              (values ks k (kx/exchange-hash-dh (kx/kex-hash kex) VERSION (:vs c) ic is ks mine f k) sig "")))))
+      (let [[qs p2 o2] (w/get-string rep p1)
+            [sig p3 o3] (w/get-string rep p2)
+            [k ke] (cc/x25519 x qs)]
+        (cond
+          (or (not= (msg-type rep) MSG-KEX-ECDH-REPLY) (not (and o1 o2 o3))) (values "" "" "" "" "malformed KEX_ECDH_REPLY")
+          (not= ke "") (values "" "" "" "" (str "key exchange failed: " ke))
+          :else (values ks k (kx/exchange-hash "SHA256" VERSION (:vs c) ic is ks mine qs k) sig ""))))))
+
+(defn- dh-pm1 Str [p: &Str] (let [n (count p) h (subs p 0 (- n 1))] (str h (chr (- (nth p (- n 1)) 1)))))
+
+(defn- finish-kex Values(Conn Str) [c0: Conn ic: &Str is: &Str first: Bool]
+  (let [[skex ok] (kx/parse-kexinit is)
+        [mine-k ok2] (kx/parse-kexinit ic)
+        [a nerr] (kx/negotiate mine-k skex)]
+    (cond
+      (not ok) (values c0 "malformed KEXINIT from the server")
+      (not= nerr "") (values c0 nerr)
+      (and (not first) (not= (:hostkey a) (:hostkey-alg c0))) (values c0 "host key algorithm changed during re-key")
+      :else
+      (let [[x mine init se] (kex-start (:kex a))
+            [c1 e1] (if (= se "") (send-packet c0 init) (values c0 se))
+            guess-wrong (and (:first-follows skex)
+                             (or (not= (nth (nth (:lists skex) 0) 0) (:kex a)) (not= (nth (nth (:lists skex) 1) 0) (:hostkey a))))]
+        (if (not= e1 "") (values c1 e1)
+          (let [[c2 rep e2] (recv-kex c1 (if first (:strict a) (:strict c1)) first guess-wrong)]
+            (if (not= e2 "") (values c2 e2)
+              (let [[ks k h sig re] (kex-reply c2 (:kex a) x mine ic is rep)]
+                (cond
+                  (not= re "") (values c2 re)
+                  (and (not first) (not= ks (:hostkey c2))) (values c2 "host key changed during re-key")
+                  :else
+                  (let [verr (hk/verify-signature (:hostkey a) ks sig h)]
+                    (if (not= verr "") (values c2 verr)
+                      (switch-keys (if first (assoc c2 :hostkey ks) c2) a k h first))))))))))))
+
+(defn- recv-kex Values(Conn Str Str) [c0: Conn strict: Bool first: Bool skip-one: Bool]
+  (loop [c c0 skip skip-one]
+    (let [[c2 pl e] (recv-packet c)]
+      (cond (not= e "") (values c2 "" e)
+            (= (msg-type pl) MSG-DISCONNECT) (values c2 "" (disconnect-reason pl))
+            (and (>= (msg-type pl) 30) (<= (msg-type pl) 49) skip) (recur c2 false)
+            (or (= (msg-type pl) MSG-NEWKEYS) (and (>= (msg-type pl) 30) (<= (msg-type pl) 49))) (values c2 pl "")
+            (and strict first) (values c2 "" (str "unexpected message " (msg-type pl) " during strict key exchange"))
+            (or (= (msg-type pl) MSG-IGNORE) (= (msg-type pl) MSG-DEBUG) (= (msg-type pl) MSG-UNIMPLEMENTED)) (recur c2 skip)
+            :else (values c2 "" (str "unexpected message " (msg-type pl) " during key exchange"))))))
+
+(defn- switch-keys Values(Conn Str) [c0: Conn a: &kx/Agreed k: &Str h: &Str first: Bool]
+  (let [strict (if first (:strict a) (:strict c0))
+        sid (if first h (:session-id c0))
+        hn (kx/kex-hash (:kex a))
+        [tx e1] (dir-of hn (:enc-cs a) (:mac-cs a) k h sid "A" "C" "E")
+        [rx e2] (dir-of hn (:enc-sc a) (:mac-sc a) k h sid "B" "D" "F")]
+    (if (or (not= e1 "") (not= e2 "")) (values c0 (str e1 e2))
+      (let [[c1 se] (send-packet c0 (w/byte MSG-NEWKEYS))
+            c2 (assoc c1 :tx (if strict tx (p/with-seq tx (p/seq-of (:tx c1)))))]
+        (if (not= se "") (values c2 se)
+          (let [[c3 pl e] (recv-kex c2 strict first false)]
+            (cond (not= e "") (values c3 e)
+                  (not= (msg-type pl) MSG-NEWKEYS) (values c3 (str "expected NEWKEYS, got message " (msg-type pl)))
+                  :else
+                  (values (assoc c3 :rx (if strict rx (p/with-seq rx (p/seq-of (:rx c3))))
+                                 :strict strict :session-id sid :kex-bytes 0 :hostkey-alg (:hostkey a))
+                          ""))))))))
+
+(defn- disconnect-reason Str [pl: &Str]
+  (let [[code p1 o1] (w/get-u32 pl 1) [desc p2 o2] (w/get-string pl p1)]
+    (str "disconnected by the server: " (if o2 desc (str "code " code)))))
+
+(defn rekey Values(Conn Str) [c0: Conn]
+  (let [ic (my-kexinit c0)
+        [c1 e] (send-packet c0 ic)]
+    (if (not= e "") (values c1 e)
+      (loop [c c1]
+        (let [[c2 pl e2] (recv-packet c)]
+          (cond (not= e2 "") (values c2 e2)
+                (= (msg-type pl) MSG-KEXINIT) (finish-kex c2 ic pl false)
+                (= (msg-type pl) MSG-DISCONNECT) (values c2 (disconnect-reason pl))
+                :else (recur (assoc c2 :held (conj (:held c2) pl)))))))))
+
+(defn- answer-kex Values(Conn Str) [c0: Conn is: &Str]
+  (let [ic (my-kexinit c0) [c1 e] (send-packet c0 ic)]
+    (if (not= e "") (values c1 e) (finish-kex c1 ic is false))))
+
+(defn- next-packet Values(Conn Str Str) [c0: Conn]
+  (if (= (count (:held c0)) 0) (recv-packet c0)
+    (let [hs (:held c0) pl (nth hs 0)
+          rest (loop [i 1 acc: Vec(Str) []] (if (>= i (count hs)) acc (recur (+ i 1) (conj acc (nth hs i)))))]
+      (values (assoc c0 :held rest) pl ""))))
+
+(defn- recv Values(Conn Str Str) [c0: Conn]
+  (loop [c c0]
+    (let [[c2 pl e] (next-packet c) t (msg-type pl)]
+      (cond (not= e "") (values c2 "" e)
+            (= t MSG-DISCONNECT) (values c2 "" (disconnect-reason pl))
+            (or (= t MSG-IGNORE) (= t MSG-DEBUG) (= t MSG-UNIMPLEMENTED) (= t MSG-EXT-INFO)) (recur c2)
+            (= t MSG-GLOBAL-REQUEST)
+            (let [[name p1 o1] (w/get-string pl 1) [want p2 o2] (w/get-bool pl p1)]
+              (if (and o2 want)
+                (let [[c3 se] (send-packet c2 (w/byte MSG-REQUEST-FAILURE))] (if (not= se "") (values c3 "" se) (recur c3)))
+                (recur c2)))
+            (= t MSG-KEXINIT) (let [[c3 ke] (answer-kex c2 pl)] (if (not= ke "") (values c3 "" ke) (recur c3)))
+            :else (values c2 pl "")))))
+
+(defn- send Values(Conn Str) [c0: Conn payload: &Str]
+  (if (< (:kex-bytes c0) REKEY-BYTES) (send-packet c0 payload)
+    (let [[c1 e] (rekey c0)] (if (not= e "") (values c1 e) (send-packet c1 payload)))))
+
+(defn connect Values(Conn Int Str) [host: &Str port: Int timeout-ms: Int] (connect-with host port timeout-ms [] "" "" ""))
+
+(defn connect-with Values(Conn Int Str) [host: &Str port: Int timeout-ms: Int hostkeys: &Vec(Str) kex: &Str enc: &Str mac: &Str]
+  (let [old (arm timeout-ms)
+        [sk ce] (net/connect host port)
+        z (disarm old)
+        lists (narrow hostkeys kex enc mac)]
+    (if (not= ce "") (values (new-conn (net/no-sock) timeout-ms lists) CANNOT-REACH (str ce))
+      (let [c0 (new-conn sk timeout-ms lists)
+            ve (write-sock c0 (str VERSION "\r\n"))
+            ic (my-kexinit c0)
+            [c1 se] (if (= ve "") (send-packet c0 ic) (values c0 ve))
+            [c2 vs e2] (if (= se "") (read-version c1) (values c1 "" se))]
+        (if (not= e2 "") (fail-conn c2 e2)
+          (let [[c3 is e3] (recv-packet (assoc c2 :vs vs))]
+            (cond (not= e3 "") (fail-conn c3 e3)
+                  (= (msg-type is) MSG-DISCONNECT) (fail-conn c3 (disconnect-reason is))
+                  (not= (msg-type is) MSG-KEXINIT) (fail-conn c3 (str "expected KEXINIT, got message " (msg-type is)))
+                  :else (let [[c4 ke] (finish-kex c3 ic is true)]
+                          (if (not= ke "") (fail-conn c4 ke) (values c4 0 ""))))))))))
+
+(defn- fail-conn Values(Conn Int Str) [c: Conn why: &Str]
+  (let [z (net/close (:sock c))] (values c HANDSHAKE (str why))))
+
+(defn close Int [c: Conn]
+  (let [[c1 e1] (if (and (:ch-open c) (not (:ch-closed c)))
+                  (send-packet c (str (w/byte MSG-CHANNEL-CLOSE) (w/u32 (:ch-remote c))))
+                  (values c ""))
+        [c2 e2] (send-packet c1 (str (w/byte MSG-DISCONNECT) (w/u32 11) (w/string "bye") (w/string "")))]
+    (net/close (:sock c2))))
+
+(defn auth-password Values(Conn Str) [c0: Conn user: &Str password: &Str]
+  (let [[c1 e1] (send c0 (str (w/byte MSG-SERVICE-REQUEST) (w/string "ssh-userauth")))
+        [c2 pl e2] (if (= e1 "") (recv c1) (values c1 "" e1))]
+    (cond (not= e2 "") (values c2 e2)
+          (not= (msg-type pl) MSG-SERVICE-ACCEPT) (values c2 (str "ssh-userauth was not accepted (message " (msg-type pl) ")"))
+          :else
+          (let [[c3 e3] (send c2 (str (w/byte MSG-USERAUTH-REQUEST) (w/string user) (w/string "ssh-connection") (w/string "password")
+                                      (w/flag false) (w/string password)))]
+            (if (not= e3 "") (values c3 e3)
+              (loop [c c3]
+                (let [[c4 r e4] (recv c) t (msg-type r)]
+                  (cond (not= e4 "") (values c4 e4)
+                        (= t MSG-USERAUTH-BANNER) (recur c4)
+                        (= t MSG-USERAUTH-SUCCESS) (values c4 "")
+                        (= t MSG-USERAUTH-FAILURE) (values c4 "Authentication failed (username/password)")
+                        (= t MSG-USERAUTH-PASSWD-CHANGEREQ) (values c4 "the server asks for a password change")
+                        :else (values c4 (str "unexpected message " t " during authentication"))))))))))
+
+(defn- chan-msg Str [c: &Conn t: Int] (str (w/byte t) (w/u32 (:ch-remote c))))
+
+(defn- chan-handle Values(Conn Str Str) [c0: Conn pl: &Str]
+  (let [t (msg-type pl)]
+    (cond
+      (= t MSG-CHANNEL-WINDOW-ADJUST)
+      (let [[n p1 o1] (w/get-u32 pl 5)] (values (assoc c0 :ch-rwin (bit-and (+ (:ch-rwin c0) n) 0xffffffff)) "" ""))
+      (or (= t MSG-CHANNEL-DATA) (= t MSG-CHANNEL-EXTENDED-DATA))
+      (let [[d p1 o1] (w/get-string pl (if (= t MSG-CHANNEL-DATA) 5 9))
+            used (+ (:ch-used c0) (count d))]
+        (cond (not o1) (values c0 "" "malformed channel data")
+              (> used LOCAL-WINDOW) (values c0 "" "the server sent more than the channel window")
+              (>= used (quot LOCAL-WINDOW 2))
+              (let [[c1 e] (send c0 (str (chan-msg c0 MSG-CHANNEL-WINDOW-ADJUST) (w/u32 used)))]
+                (values (assoc c1 :ch-used 0) (if (= t MSG-CHANNEL-DATA) d "") e))
+              :else (values (assoc c0 :ch-used used) (if (= t MSG-CHANNEL-DATA) d "") "")))
+      (= t MSG-CHANNEL-EOF) (values (assoc c0 :ch-eof true) "" "")
+      (= t MSG-CHANNEL-CLOSE)
+      (let [[c1 e] (if (:ch-closed c0) (values c0 "") (send c0 (chan-msg c0 MSG-CHANNEL-CLOSE)))]
+        (values (assoc c1 :ch-closed true :ch-open false) "" "channel closed"))
+      (= t MSG-CHANNEL-REQUEST)
+      (let [[name p1 o1] (w/get-string pl 5) [want p2 o2] (w/get-bool pl p1)]
+        (if (and o2 want) (let [[c1 e] (send c0 (chan-msg c0 MSG-CHANNEL-FAILURE))] (values c1 "" e)) (values c0 "" "")))
+      (or (= t MSG-CHANNEL-SUCCESS) (= t MSG-CHANNEL-FAILURE)) (values c0 "" "")
+      :else (values c0 "" (str "unexpected message " t " on the channel")))))
+
+(defn open-subsystem Values(Conn Str) [c0: Conn name: &Str]
+  (let [[c1 e1] (send c0 (str (w/byte MSG-CHANNEL-OPEN) (w/string "session") (w/u32 0) (w/u32 LOCAL-WINDOW) (w/u32 LOCAL-MAX-PACKET)))
+        [c2 pl e2] (if (= e1 "") (recv c1) (values c1 "" e1))
+        t (msg-type pl)]
+    (cond (not= e2 "") (values c2 e2)
+          (= t MSG-CHANNEL-OPEN-FAILURE)
+          (let [[code p1 o1] (w/get-u32 pl 5) [desc p2 o2] (w/get-string pl p1)] (values c2 (str "channel open failed: " desc)))
+          (not= t MSG-CHANNEL-OPEN-CONFIRMATION) (values c2 (str "unexpected message " t " opening the channel"))
+          :else
+          (let [[mine p1 o1] (w/get-u32 pl 1) [remote p2 o2] (w/get-u32 pl p1)
+                [win p3 o3] (w/get-u32 pl p2) [maxp p4 o4] (w/get-u32 pl p3)]
+            (if (or (not (and o1 o2 o3 o4)) (= maxp 0)) (values c2 "malformed CHANNEL_OPEN_CONFIRMATION")
+              (let [c3 (assoc c2 :ch-open true :ch-remote remote :ch-rwin win :ch-rmax maxp :ch-used 0 :ch-in "" :ch-eof false :ch-closed false)
+                    [c4 e4] (send c3 (str (chan-msg c3 MSG-CHANNEL-REQUEST) (w/string "subsystem") (w/flag true) (w/string name)))]
+                (if (not= e4 "") (values c4 e4) (wait-request c4 name))))))))
+
+(defn- wait-request Values(Conn Str) [c0: Conn name: &Str]
+  (loop [c c0]
+    (let [[c1 pl e] (recv c) t (msg-type pl)]
+      (cond (not= e "") (values c1 e)
+            (= t MSG-CHANNEL-SUCCESS) (values c1 "")
+            (= t MSG-CHANNEL-FAILURE) (values c1 (str "the server refused the " name " subsystem"))
+            :else (let [[c2 d e2] (chan-handle c1 pl)]
+                    (if (not= e2 "") (values c2 e2) (let [in (:ch-in c2) c3 (assoc c2 :ch-in "")] (recur (assoc c3 :ch-in (str in d))))))))))
+
+(defn chan-recv Values(Conn Str Str) [c0: Conn]
+  (if (> (count (:ch-in c0)) 0)
+    (let [d (:ch-in c0)] (values (assoc c0 :ch-in "") d ""))
+    (loop [c c0]
+      (if (:ch-closed c) (values c "" "channel closed")
+        (let [[c1 pl e] (recv c)]
+          (if (not= e "") (values c1 "" e)
+            (let [[c2 d e2] (chan-handle c1 pl)]
+              (cond (not= e2 "") (values c2 "" e2)
+                    (> (count d) 0) (values c2 d "")
+                    :else (recur c2)))))))))
+
+(defn chan-send Values(Conn Str) [c0: Conn data: &Str]
+  (loop [c c0 off 0]
+    (cond
+      (>= off (count data)) (values c "")
+      (:ch-closed c) (values c "channel closed")
+      (<= (:ch-rmax c) 0) (values c "the server's maximum packet size is 0")
+      (= (:ch-rwin c) 0)
+      (let [[c1 pl e] (recv c)]
+        (if (not= e "") (values c1 e)
+          (let [[c2 d e2] (chan-handle c1 pl)]
+            (if (not= e2 "") (values c2 e2)
+              (let [in (:ch-in c2) c3 (assoc c2 :ch-in "")] (recur (assoc c3 :ch-in (str in d)) off))))))
+      :else
+      (let [n (min (min (- (count data) off) (:ch-rwin c)) (:ch-rmax c))
+            part (subs data off (+ off n))
+            [c1 e] (send c (str (chan-msg c MSG-CHANNEL-DATA) (w/string part)))]
+        (if (not= e "") (values c1 e) (recur (assoc c1 :ch-rwin (- (:ch-rwin c1) n)) (+ off n)))))))

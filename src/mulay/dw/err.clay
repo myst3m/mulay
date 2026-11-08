@@ -1,0 +1,36 @@
+(ns mulay.dw.err (:require [mulay.dw.ast :as ast]))
+
+(defrecord StackF [name: Str sp: ast/Span where: Str])
+
+(defrecord DwErr [kind: Str msg: Str sp: ast/Span frames: Vec(StackF) pend: ast/Span origin: Str])
+
+(def NO-SPAN (ast/->Span -1 -1))
+(def OK (->DwErr "" "" (ast/->Span -1 -1) [] (ast/->Span -1 -1) ""))
+(defn no-span ast/Span [] NO-SPAN)
+(defn ok DwErr [] OK)
+(defn ok? Bool [e: &DwErr] (= (count (:kind e)) 0))
+(defn err DwErr [kind: Str msg: Str] (->DwErr kind msg (no-span) [] (no-span) ""))
+
+(def INPUT-KIND "mulay::InputReader")
+(defn input-err DwErr [msg: Str] (err INPUT-KIND msg))
+(defn input? Bool [e: &DwErr] (= (:kind e) INPUT-KIND))
+
+(defn tail-mark DwErr [sp: &ast/Span] (->DwErr "" "" sp [] (no-span) ""))
+
+(defn unset? Bool [sp: &ast/Span] (< (:start sp) 0))
+
+(defn at DwErr [e: DwErr sp: &ast/Span]
+  (if (or (ok? e) (not (or (unset? (:sp e)) (unset? (:pend e))))) e
+    (->DwErr (:kind e) (:msg e) (if (unset? (:sp e)) sp (:sp e)) (:frames e)
+             (if (unset? (:pend e)) sp (:pend e)) (:origin e))))
+
+(defn exit-frame DwErr [e: DwErr name: &Str call-sp: &ast/Span]
+  (if (ok? e) e
+    (->DwErr (:kind e) (:msg e) (:sp e) (conj (:frames e) (->StackF (str name) (:pend e) "")) call-sp
+             (:origin e))))
+
+(defn err-start Int [e: &DwErr] (:start (:sp e)))
+
+(defn err-end Int [e: &DwErr] (:end (:sp e)))
+
+(defn stack-of Vec(StackF) [e: &DwErr] (conj (:frames e) (->StackF "main" (:pend e) "")))

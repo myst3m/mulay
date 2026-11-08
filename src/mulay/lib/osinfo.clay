@@ -1,0 +1,66 @@
+(ns mulay.lib.osinfo)
+
+(target-when "wasm"
+(do
+(defn uname-release Str [] "wasm")
+(defn uname-machine Str [] "wasm32")
+(defn uname-nodename Str [] "browser")
+(defn pid Int [] 1)
+(defn user-name Str [] "user")
+(defn user-home Str [] "/"))
+(do
+(defextern malloc malloc)
+(defextern utsname-bytes (c/sizeof "struct utsname"))
+(defextern c-uname uname)
+(defextern free free)
+(defextern utsname-release-at (c/offsetof "struct utsname" "release"))
+(defextern utsname-machine-at (c/offsetof "struct utsname" "machine"))
+(defextern utsname-nodename-at (c/offsetof "struct utsname" "nodename"))
+(defextern getpid getpid)
+(defextern c-getpwuid getpwuid)
+(defextern geteuid geteuid)
+(defextern passwd-pw-name-at (c/offsetof "struct passwd" "pw_name"))
+(defextern passwd-pw-dir-at (c/offsetof "struct passwd" "pw_dir"))
+
+(c-include "<sys/utsname.h>")
+(c-include "<pwd.h>")
+(c-include "<unistd.h>")
+
+(defn- ^:unsafe cstr-at Str [a: Int]
+  (loop [n 0] (if (= (prim/mem-read8 (prim/int->addr (+ a n))) 0) (prim/mem-str (prim/int->addr a) n) (recur (+ n 1)))))
+
+(defn- ^:unsafe uname-buf Int []
+  (match (malloc (utsname-bytes))
+    (Some b) (if (= (c-uname b) 0) (prim/addr->int b) (let [z (free b)] 0))
+    (None) 0))
+
+(defn uname-release Str []
+  (unsafe (let [u (uname-buf)]
+            (if (= u 0) "?" (let [s (cstr-at (+ u (utsname-release-at))) z (free (prim/int->addr u))] s)))))
+
+(defn uname-machine Str []
+  (unsafe (let [u (uname-buf)]
+            (if (= u 0) "?" (let [s (cstr-at (+ u (utsname-machine-at))) z (free (prim/int->addr u))] s)))))
+
+(defn uname-nodename Str []
+  (unsafe (let [u (uname-buf)]
+            (if (= u 0) "?" (let [s (cstr-at (+ u (utsname-nodename-at))) z (free (prim/int->addr u))] s)))))
+
+(defn pid Int [] (unsafe (getpid)))
+
+
+(defn- ^:unsafe passwd Int [] (match (c-getpwuid (geteuid)) (Some a) (prim/addr->int a) (None) 0))
+
+(defn- ^:unsafe str-ptr Str [p: Int] (if (= p 0) "?" (cstr-at p)))
+
+(defn user-name Str []
+  (unsafe (let [pw (passwd)] (if (= pw 0) "?" (str-ptr (prim/mem-read64 (prim/int->addr (+ pw (passwd-pw-name-at)))))))))
+
+(defn user-home Str []
+  (unsafe (let [pw (passwd)] (if (= pw 0) "?" (str-ptr (prim/mem-read64 (prim/int->addr (+ pw (passwd-pw-dir-at)))))))))))
+
+(defn java-arch Str []
+  (let [m (uname-machine)]
+    (cond (= m "x86_64") "amd64"
+          (or (= m "i386") (= m "i486") (= m "i586") (= m "i686")) "x86"
+          :else m)))

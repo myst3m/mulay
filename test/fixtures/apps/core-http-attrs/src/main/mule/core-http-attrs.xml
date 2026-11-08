@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18165"/>
+    </http:listener-config>
+
+    <http:request-config name="R">
+        <http:request-connection host="localhost" port="18165"/>
+    </http:request-config>
+
+    <!-- HttpRequestAttributes のキーの並び (keysOf と write) -->
+    <flow name="req-attrs">
+        <http:listener config-ref="L" path="/a/{id}"/>
+        <set-payload value='#[output application/json --- {
+  keys: keysOf(attributes - "localAddress") map ($ as String),
+  written: write(attributes - "localAddress", "application/json") replace /:[0-9]{4,5}"/ with ":&lt;port&gt;\"",
+  local: attributes.localAddress replace /:[0-9]{4,5}/ with ":&lt;port&gt;",
+  java: write(attributes, "application/java") replace /:[0-9]{4,5}/ with ":&lt;port&gt;",
+  mapped: (attributes - "localAddress") mapObject ((v, k) -> {(k): typeOf(v) as String})
+}]'/>
+    </flow>
+
+    <flow name="echo">
+        <http:listener config-ref="L" path="/echo">
+            <http:response statusCode="200"/>
+        </http:listener>
+        <set-payload value="hi"/>
+    </flow>
+
+    <!-- HttpResponseAttributes のキーの並び (/echo は statusCode を書く。書かないと実 Mule の listener は理由句を送らない) -->
+    <flow name="resp-attrs">
+        <http:listener config-ref="L" path="/b"/>
+        <http:request config-ref="R" method="GET" path="/echo"/>
+        <set-payload value='#[output application/json --- {
+  keys: keysOf(attributes) map ($ as String),
+  written: write(attributes - "headers", "application/json"),
+  class: attributes.^class,
+  java: write(attributes, "application/java") replace /:[0-9]{4,5}/ with ":&lt;port&gt;" replace /\n *(date|Date)=[^\n]*/ with ""
+}]'/>
+    </flow>
+    <!-- 理由句: http:response の statusCode / reasonPhrase の有無と、エラーの応答 -->
+    <flow name="r-none">
+        <http:listener config-ref="L" path="/r/none"/>
+        <set-payload value="x"/>
+    </flow>
+    <flow name="r-status">
+        <http:listener config-ref="L" path="/r/status">
+            <http:response statusCode="#[(attributes.queryParams.s default '200') as Number]"/>
+        </http:listener>
+        <set-payload value="x"/>
+    </flow>
+    <flow name="r-reason">
+        <http:listener config-ref="L" path="/r/reason">
+            <http:response reasonPhrase="Custom Thing"/>
+        </http:listener>
+        <set-payload value="x"/>
+    </flow>
+    <flow name="r-error">
+        <http:listener config-ref="L" path="/r/error"/>
+        <raise-error type="APP:X" description="boom"/>
+    </flow>
+    <flow name="r-error-status">
+        <http:listener config-ref="L" path="/r/error-status">
+            <http:error-response statusCode="503"/>
+        </http:listener>
+        <raise-error type="APP:X" description="boom"/>
+    </flow>
+    <flow name="r-error-reason">
+        <http:listener config-ref="L" path="/r/error-reason">
+            <http:error-response statusCode="418" reasonPhrase="Short And Stout"/>
+        </http:listener>
+        <raise-error type="APP:X" description="boom"/>
+    </flow>
+    <flow name="reasons">
+        <http:listener config-ref="L" path="/reasons"/>
+        <foreach collection='#[["/r/none", "/r/status", "/r/status?s=201", "/r/status?s=299", "/r/status?s=404", "/r/reason", "/r/error", "/r/error-status", "/r/error-reason"]]'>
+            <http:request config-ref="R" method="GET" path="#[payload]">
+                <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+            </http:request>
+            <set-variable variableName="acc" value="#[(vars.acc default []) ++ [{status: attributes.statusCode, reason: attributes.reasonPhrase}]]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- vars.acc]"/>
+    </flow>
+
+    <!-- listener の outputMimeType / outputEncoding: 受け取った本文の DataType を付け替える -->
+    <flow name="out-text">
+        <http:listener config-ref="L" path="/out-text" outputMimeType="text/plain"/>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, enc: payload.^encoding, 'type': typeOf(payload), value: payload}]"/>
+    </flow>
+    <flow name="out-json">
+        <http:listener config-ref="L" path="/out-json" outputMimeType="application/json"/>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, enc: payload.^encoding, 'type': typeOf(payload), value: payload}]"/>
+    </flow>
+    <flow name="out-enc">
+        <http:listener config-ref="L" path="/out-enc" outputMimeType="text/plain" outputEncoding="ISO-8859-1"/>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, enc: payload.^encoding, value: payload}]"/>
+    </flow>
+    <flow name="out-cs">
+        <http:listener config-ref="L" path="/out-cs" outputMimeType="text/plain; charset=UTF-16"/>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, enc: payload.^encoding}]"/>
+    </flow>
+    <flow name="out-raw">
+        <http:listener config-ref="L" path="/out-raw" outputMimeType="text/plain"/>
+        <logger level="DEBUG" message="out-raw"/>
+    </flow>
+
+    <!-- 状態コードごとの応答の Connection ヘッダー (実 Mule の listener は 5xx などで接続を閉じる) -->
+    <flow name="conn-close">
+        <http:listener config-ref="L" path="/conn-close"/>
+        <foreach collection="#[[200, 201, 400, 404, 408, 411, 413, 414, 417, 500, 501, 502, 503, 504, 505]]">
+            <http:request config-ref="R" method="GET" path="/r/status">
+                <http:query-params>#[{s: payload as String}]</http:query-params>
+                <http:response-validator>
+                    <http:success-status-code-validator values="100..599"/>
+                </http:response-validator>
+            </http:request>
+            <set-variable variableName="acc" value="#[(vars.acc default []) ++ [{status: attributes.statusCode, connection: attributes.headers.connection default null}]]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- vars.acc]"/>
+    </flow>
+</mule>

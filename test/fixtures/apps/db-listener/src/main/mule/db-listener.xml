@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18541"/>
+    </http:listener-config>
+
+    <db:config name="Pg">
+        <db:generic-connection url="jdbc:postgresql://localhost:15432/mulay" driverClassName="org.postgresql.Driver" user="mulay" password="mulay"/>
+    </db:config>
+
+    <!-- l1: watermark (ts) と id。行は 1 件ずつ、payload は列の名前から値への Map -->
+    <flow name="l1">
+        <db:listener config-ref="Pg" table="li_rows" watermarkColumn="ts" idColumn="id">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </db:listener>
+        <db:insert config-ref="Pg">
+            <db:sql>INSERT INTO li_seen (src, row_id, info) VALUES ('l1', :id, :info)</db:sql>
+            <db:input-parameters>#[{id: payload.id, info: write({keys: keysOf(payload) map ($ as String), types: payload mapObject ((v, k) -> {(k): typeOf(v)}), row: payload, attrs: typeOf(attributes)}, "application/json")}]</db:input-parameters>
+        </db:insert>
+    </flow>
+
+    <!-- l2: 列の名前を大文字で書く -->
+    <flow name="l2">
+        <db:listener config-ref="Pg" table="li_rows2" watermarkColumn="TS" idColumn="ID">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </db:listener>
+        <db:insert config-ref="Pg">
+            <db:sql>INSERT INTO li_seen (src, row_id, info) VALUES ('l2', :id, :info)</db:sql>
+            <db:input-parameters>#[{id: payload.id, info: write(payload, "application/json")}]</db:input-parameters>
+        </db:insert>
+    </flow>
+
+    <!-- l3: 起動の時点で無い表。表ができたら読む -->
+    <flow name="l3">
+        <db:listener config-ref="Pg" table="li_later" watermarkColumn="ts">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </db:listener>
+        <db:insert config-ref="Pg">
+            <db:sql>INSERT INTO li_seen (src, row_id, info) VALUES ('l3', :id, :info)</db:sql>
+            <db:input-parameters>#[{id: payload.id, info: write(payload, "application/json")}]</db:input-parameters>
+        </db:insert>
+    </flow>
+
+    <flow name="add">
+        <http:listener config-ref="HTTP" path="/add" allowedMethods="POST"/>
+        <db:insert config-ref="Pg">
+            <db:sql>#['INSERT INTO ' ++ attributes.queryParams.table ++ ' (id, ts, name) VALUES (:id, :ts, :name)']</db:sql>
+            <db:input-parameters>#[{id: attributes.queryParams.id as Number, ts: attributes.queryParams.ts as Number, name: attributes.queryParams.name}]</db:input-parameters>
+        </db:insert>
+        <set-payload value="added"/>
+    </flow>
+
+    <flow name="later">
+        <http:listener config-ref="HTTP" path="/later" allowedMethods="POST"/>
+        <db:execute-ddl config-ref="Pg">
+            <db:sql>CREATE TABLE li_later (id INT PRIMARY KEY, ts INT, name TEXT)</db:sql>
+        </db:execute-ddl>
+        <db:insert config-ref="Pg">
+            <db:sql>INSERT INTO li_later (id, ts, name) VALUES (1, 100, 'late')</db:sql>
+        </db:insert>
+        <set-payload value="created"/>
+    </flow>
+
+    <flow name="dump">
+        <http:listener config-ref="HTTP" path="/dump"/>
+        <db:select config-ref="Pg">
+            <db:sql>SELECT src, row_id, COUNT(*) AS n, MIN(info) AS info FROM li_seen GROUP BY src, row_id ORDER BY src, row_id</db:sql>
+        </db:select>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map ((r) -> {src: r.src, id: r.row_id, n: if (r.n == 1) 1 else "many", info: read(r.info, "application/json")})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>

@@ -1,0 +1,668 @@
+(ns mulay.app.run
+  (:require [mulay.conn.tls :as tls] [clay.tls :as ctls] [mulay.lib.numparse :as npz] [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.fmt.registry :as reg] [mulay.dw.num :as num]
+            [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.engine :as en]
+            [mulay.rt.log :as log] [mulay.rt.conn :as conn] [mulay.conn.http :as h] [mulay.conn.http_req :as hr] [mulay.conn.httpmsg :as hx]
+            [mulay.lib.xml :as xml] [mulay.lib.html :as html] [mulay.lib.juri :as juri] [mulay.rt.cron :as cron] [mulay.rt.stream :as stream] [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]
+            [mulay.rt.ops :as ops] [mulay.rt.meter :as mt] [mulay.rt.trace :as tr] [mulay.lib.otlp :as o] [mulay.app.otel :as ot] [mulay.app.ammetric :as am] [mulay.lib.signals :as sig] [clay.sys :as sys] [mulay.app.exchange :as ex] [mulay.lib.spool :as spool] [mulay.rt.bodies :as bodies] [mulay.rt.persist :as ps] [mulay.lib.fs :as fs]))
+
+(c-flags "-DCLAY_PARALLEL")
+
+(defrecord Route [port: Int base: Str path: Str full: Str methods: Vec(Str) flow: Int src: m/Source srv: http/ServerOpts scheme: Str
+                  mount: Vec(conn/Mount)])
+
+(defn- listener-config Values(Int Str http/ServerOpts Str) [app: &m/App name: &Str]
+  (let [cs (:configs app)
+        i (loop [k 0] (if (>= k (count cs)) -1 (if (= (:name (nth cs k)) name) k (recur (+ k 1)))))
+        m0 (http/default-server-opts)]
+    (if (< i 0) (values 0 "" m0 (str "Listener config '" name "' not found"))
+      (let [cfg (nth cs i)
+            base (conn/param-lit (:params cfg) "basePath" "")
+            cn (loop [k 0] (if (>= k (count (:children cfg))) []
+                             (let [n (nth (:children cfg) k)]
+                               (if (and (xml/elem? n) (= (xml/elem-local n) "listener-connection")) [n] (recur (+ k 1))))))
+            port (if (= (count cn) 0) 8081 (npz/int-or (xml/attr (nth cn 0) "" "port" "8081") 0))
+            host (if (= (count cn) 0) "" (bind-host (xml/attr (nth cn 0) "" "host" "")))
+            https (and (> (count cn) 0) (= (str/lower-case (xml/attr (nth cn 0) "" "protocol" "HTTP")) "https"))
+            [t te] (if (= (count cn) 0) (values [] "") (tls/of-connection (:configs app) (:res app) (nth cn 0)))
+            [so se] (cond (not https) (values (ctls/default-server-config) "")
+                          (= (count t) 0) (values (ctls/default-server-config) "KeyStore must be configured for server side SSL")
+                          :else (h/listener-tls (nth t 0)))]
+        (cond
+          (not= te "") (values port base m0 te)
+          (not= se "") (values port base m0 (str "Listener config '" name "': " se))
+          :else (let [h2 (http2? cn)
+                      so2 (if (and https h2) (assoc so :alpn ["h2" "http/1.1"]) so)]
+                  (values port base (assoc (assoc (assoc (assoc m0 :port port) :host host) :tls so2) :h2c (and (not https) h2)) "")))))))
+
+(defn- http2? Bool [cn: &Vec(xml/XNode)]
+  (if (= (count cn) 0) false
+    (let [ps (conn/child-elem (xml/elem-children (nth cn 0)) "protocol-support")
+          h2 (if (= (count ps) 0) [] (conn/child-elem (xml/elem-children (nth ps 0)) "http2-support"))]
+      (and (> (count h2) 0) (= (str/lower-case (str/trim (xml/attr (nth h2 0) "" "enable" "false"))) "true")))))
+
+(defn- bind-host Str [h: Str] (if (= (str/lower-case h) "localhost") "127.0.0.1" h))
+
+(defn- host-conflicts Vec(Str) [rs: &Vec(Route)]
+  (loop [i 0 errs: Vec(Str) []]
+    (if (>= i (count rs)) errs
+      (let [r (nth rs i)
+            h (:host (:srv r))
+            j (loop [k 0] (if (>= k i) -1
+                            (if (and (= (:port (nth rs k)) (:port r)) (not= (:host (:srv (nth rs k))) h)) k (recur (+ k 1)))))]
+        (recur (+ i 1) (if (< j 0) errs
+                         (conj errs (str "Listener configs on port " (:port r) " bind different hosts ('"
+                                         (:host (:srv (nth rs j))) "' and '" h "'): mulay listens once per port"))))))))
+
+(defn routes Values(Vec(Route) Vec(Str)) [app: &m/App cs: &Vec(conn/Connector)]
+  (let [fs (:flows app)]
+    (loop [i 0 acc: Vec(Route) [] errs: Vec(Str) []]
+      (if (>= i (count fs))
+        (let [[cr ce] (mount-routes app cs)
+              all (cat-routes acc cr)]
+          (values all (cat-strs (cat-strs errs ce) (host-conflicts all))))
+        (let [f (nth fs i) srcs (:source f)]
+          (if (= (count srcs) 0) (recur (+ i 1) acc errs)
+            (match (nth srcs 0)
+              (m/SrcHttpListener cref path methods rs rh rb es eh eb rr er sm om oe loc)
+              (let [[port base srv ce0] (listener-config app cref)
+                    ce (if (= (count (conn/find-config (:configs app) "http:listener-config" cref)) 0)
+                         (str "[" (:file loc) ":" (:line loc) "]: Referenced component '" cref "' must be one of stereotypes [HTTP:LISTENER_CONFIG].")
+                         ce0)]
+                (if (not= ce "") (recur (+ i 1) acc (conj errs ce))
+                  (recur (+ i 1) (conj acc (->Route port base path (hx/join-path base path) methods i (nth srcs 0) srv
+                                                    (if (= (:alpn (:tls srv)) []) "http" "https") [])) errs)))
+              _ (recur (+ i 1) acc errs))))))))
+
+(defn- mount-routes Values(Vec(Route) Vec(Str)) [app: &m/App cs: &Vec(conn/Connector)]
+  (loop [i 0 acc: Vec(Route) [] errs: Vec(Str) []]
+    (if (>= i (count cs)) (values acc errs)
+      (let [[ms me] ((:mounts (nth cs i)) app)
+            [acc2 errs2] (loop [k 0 a acc e (cat-strs errs me) seen: Vec(Str) []]
+                           (if (>= k (count ms)) (values a e)
+                             (let [mt (nth ms k)
+                                   [port base srv ce] (listener-config app (:listener mt))
+                                   b (if (:base mt) base "")
+                                   src (m/->SrcConnector (:name (nth cs i)) "" (:listener mt) [] [] [] [] (m/->Loc "" 0 "" "" "" []))
+                                   scheme (if (= (:alpn (:tls srv)) []) "http" "https")]
+                               (if (not= ce "") (if (has-str? seen ce) (recur (+ k 1) a e seen) (recur (+ k 1) a (conj e ce) (conj seen ce)))
+                                 (recur (+ k 1) (conj a (->Route port b (:path mt) (hx/join-path b (:path mt)) (:methods mt) -1 src srv scheme [mt])) e seen)))))]
+        (recur (+ i 1) acc2 errs2)))))
+
+(defn- cat-routes Vec(Route) [a: Vec(Route) b: Vec(Route)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+(defn- cat-strs Vec(Str) [a: Vec(Str) b: Vec(Str)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn ports Vec(Int) [rs: &Vec(Route)]
+  (loop [i 0 acc: Vec(Int) []]
+    (if (>= i (count rs)) acc
+      (let [p (:port (nth rs i))
+            dup (loop [k 0] (if (>= k (count acc)) false (if (= (nth acc k) p) true (recur (+ k 1)))))]
+        (recur (+ i 1) (if dup acc (conj acc p)))))))
+
+(defn- specificity Int [p: &Str]
+  (let [n (count p)]
+    (loop [i 0 s 0] (if (>= i n) s (recur (+ i 1) (+ s (case (nth p i) 42 -100 123 -10 0)))))))
+
+(defrecord Hit [route: Int params: Vec(v/Field) method-ok: Bool])
+
+(defn find-route Vec(Hit) [rs: &Vec(Route) port: Int path: &Str method: &Str]
+  (let [any-port (or (< port 0) (not (loop [i 0] (if (>= i (count rs)) false (if (= (:port (nth rs i)) port) true (recur (+ i 1)))))))]
+    (loop [i 0 best: Vec(Hit) [] best-s -1000000]
+      (if (>= i (count rs)) best
+        (let [r (nth rs i)
+              [ok ps] (hr/match-path (:full r) path)]
+          (if (or (not ok) (and (not any-port) (not= (:port r) port))) (recur (+ i 1) best best-s)
+            (let [mok (or (= (count (:methods r)) 0)
+                          (loop [k 0] (if (>= k (count (:methods r))) false (if (= (str/upper-case (nth (:methods r) k)) method) true (recur (+ k 1))))))
+                  s (+ (specificity (:full r)) (if mok 1000 0))]
+              (if (> s best-s) (recur (+ i 1) [(->Hit i ps mok)] s) (recur (+ i 1) best best-s)))))))))
+
+(defn- error-resp hm/Response [status: Int body: Str] (with-close status (hx/ct-resp status "text/plain; charset=UTF-8" body)))
+
+(def CLOSE-STATUSES [400 408 411 413 414 417 500 501 503 505])
+
+(defn- with-close hm/Response [st: Int r: hm/Response]
+  (if (loop [i 0] (if (>= i (count CLOSE-STATUSES)) false (if (= (nth CLOSE-STATUSES i) st) true (recur (+ i 1)))))
+    (assoc r :close true) r))
+
+(def CHUNK 16384)
+
+(def INLINE-CHUNKED 1048576)
+
+(defn- write-chunks Int [sk: &hm/Sink body: &Str]
+  (let [w (loop [i 0] (if (>= i (count body)) ""
+                        (let [j (if (> (+ i CHUNK) (count body)) (count body) (+ i CHUNK))
+                              e (hm/sink-write sk (subs body i j))]
+                          (if (not= e "") e (recur j)))))
+        c (hm/sink-close sk)]
+    0))
+
+(defn- chunked-resp hm/Response [st: Int hs: Vec(hm/Header) body: Str reason: Str]
+  (let [[resp sk] (hm/stream-response st hs)
+        z (if (<= (count body) INLINE-CHUNKED) (write-chunks sk body)
+            (ops/spawn-bg (fn Int [k: Int] (write-chunks sk body))))]
+    (assoc resp :reason reason)))
+
+(defn- piped-resp hm/Response [st: Int hs: Vec(hm/Header) id: Str reason: Str]
+  (let [[resp sk] (hm/stream-response st hs)
+        owner (str "pipe-" id)
+        z1 (stream/enter owner)
+        z2 (stream/adopt id owner)
+        z3 (ops/spawn-bg (fn Int [k: Int]
+                           (with-cleanup
+                             (fn Int []
+                               (let [w (loop [e ""]
+                                         (let [[rows done err] (stream/take-vals id 1)
+                                               we (loop [i 0] (if (>= i (count rows)) ""
+                                                                (match (nth rows i)
+                                                                  (v/VStr x) (let [e2 (hm/sink-write sk x)] (if (not= e2 "") e2 (recur (+ i 1))))
+                                                                  _ (recur (+ i 1)))))]
+                                           (if (or done (not= we "") (not= err "")) we (recur ""))))]
+                                 0))
+                             (fn Int [] (let [c (hm/sink-close sk)] (stream/leave owner))))))]
+    (assoc resp :reason reason)))
+
+(defn- respond hm/Response [c: &en/Ctx src: &m/Source e: ev/Event x: Vec(err/MErr)]
+  (let [r (ex/reply c src e x)
+        st (:status r)]
+    (cond
+      (not= (:err r) "") (error-resp 500 (:err r))
+      (:piped r) (with-close st (piped-resp st (:headers r) (:raw (:bt r)) (:reason r)))
+      (ex/chunk-body? (:mode r) (:stream (:bt r)) st (count (:body r))) (with-close st (chunked-resp st (:headers r) (:body r) (:reason r)))
+      :else (with-close st (assoc (hm/response st (:headers r) (:body r) false) :reason (:reason r))))))
+
+(defn- listener-ip Str [rs: &Vec(Route) port: Int]
+  (loop [i 0]
+    (cond (>= i (count rs)) "0.0.0.0"
+          (= (:port (nth rs i)) port) (let [h (:host (:srv (nth rs i)))] (if (= h "") "0.0.0.0" (str h)))
+          :else (recur (+ i 1)))))
+
+(defn- target-error Str [rs: &Vec(Route) req: &hm/Request]
+  (let [uri (:uri req)
+        port (:local-port req)]
+    (juri/message (if (str/starts-with? uri "http") (str uri) (str "http://" (listener-ip rs port) ":" port uri)))))
+
+(defn mount-host conn/Host [c: &en/Ctx]
+  (let [c1 c]
+    (conn/->Host (fn Values(ev/Event Vec(err/MErr)) [fi: Int e0: ev/Event]
+                   (let [f (nth (:flows (:app c1)) fi)
+                         t0 (mono-us)
+                         [e x] (en/run-flow-top c1 f e0)
+                         z (record-run (:name f) t0 x)]
+                     (values e x)))
+                 (fn Values(v/Val ev/Event Vec(err/MErr)) [p: m/PVal e: ev/Event] (en/eval-val c1 p e))
+                 (fn Values(ev/TV ev/Event Vec(err/MErr)) [p: m/PVal e: ev/Event] (en/eval-pval c1 p e))
+                 (fn Values(ev/TV ev/Event Vec(err/MErr)) [p: m/PVal e: ev/Event] (en/eval-string-pval c1 p e)))))
+
+(defn handle hm/Response [c: &en/Ctx rs: &Vec(Route) req: &hm/Request] (handle-in c (mount-host c) rs req))
+
+(defn- handle-in hm/Response [c: &en/Ctx hs: &conn/Host rs: &Vec(Route) req0: &hm/Request]
+  (match (:body-in req0)
+    (hm/Streaming sk) (cond
+                        (mount-streamed? (mount-stream-paths rs (:local-port req0)) req0) (handle-whole c hs rs req0 [])
+                        (unrouted? rs req0) (let [r (handle-whole c hs rs req0 [])] (if (= (:version req0) "HTTP/2") r (assoc r :close true)))
+                        :else
+                        (let [n (swap! SPOOL-SEQ (fn Int [x: Int] (+ x 1)))
+                              sp0 (spool/new (fs/join (ps/spool-dir (:app c)) (str "body-" n)) bodies/IN-MEMORY)
+                              [sp err status] (drain-body req0 sp0 (prop-int (:app c) "mulay.http.maxRequestBody" 0) BODY-IDLE-MS
+                                                          (ps/spool-dir (:app c)) (prop-int (:app c) "mulay.http.spoolMinFree" -1))
+                              req1 (assoc req0 :body-in (hm/->NoStream))]
+                          (cond (not= err "") (let [z (spool/delete sp)] (assoc (hx/text-resp status err) :close true))
+                                (spool/in-memory? sp) (handle-whole c hs rs (assoc req1 :body (:mem sp)) [])
+                                :else (let [tmp (str "spool-" n)]
+                                        (stream/owned tmp (fn hm/Response [] (let [id (bodies/open tmp sp)] (handle-whole c hs rs req1 [id]))))))))
+    _ (handle-whole c hs rs req0 [])))
+
+(defn- unrouted? Bool [rs: &Vec(Route) req: &hm/Request]
+  (let [uri0 (:uri req)]
+    (if (not= (target-error rs req) "") true
+      (let [uri (if (hx/origin-form? uri0) (str uri0) (hx/origin-target uri0))
+            q (str/index-of uri "?")
+            path (hx/url-decode-path (if (< q 0) uri (subs uri 0 q)))
+            hits (find-route rs (:local-port req) path (:method req))]
+        (or (= (count hits) 0) (not (:method-ok (nth hits 0))))))))
+
+(def BODY-IDLE-MS 30000)
+(def SPOOL-SEQ (atom 0))
+
+(def GIB 1073741824)
+
+(defn- disk-low? Bool [dir: &Str reserve: Int]
+  (if (= reserve 0) false
+    (let [[avail total e] (fs/disk-space dir)
+          need (if (> reserve 0) reserve (if (< (quot total 10) GIB) (quot total 10) GIB))]
+      (and (= e "") (< avail need)))))
+
+(defn- drain-body Values(spool/Spool Str Int) [req: &hm/Request sp0: spool/Spool cap: Int idle-ms: Int dir: &Str reserve: Int]
+  (loop [sp sp0 last (quot (mono-us) 1000)]
+    (let [[p done why] (hm/body-next req)
+          [sp2 we] (if (= (count p) 0) (values sp "") (spool/add sp p))
+          now (quot (mono-us) 1000)]
+      (cond (not= we "") (values sp2 we 500)
+            (and (> cap 0) (> (spool/size sp2) cap)) (values sp2 (str "The request body is over " cap " bytes (mulay.http.maxRequestBody)") 413)
+            (and (> (count p) 0) (not (spool/in-memory? sp2)) (disk-low? dir reserve))
+            (values sp2 "Not enough free disk space to receive the request body (mulay.http.spoolMinFree)" 503)
+            done (if (= why "") (values sp2 "" 0) (values sp2 (str "The request body ended early: " why) 400))
+            (> (count p) 0) (recur sp2 now)
+            (> (- now last) idle-ms) (values sp2 (str "No request body arrived for " idle-ms " ms") 408)
+            :else (recur sp2 last)))))
+
+(defn- handle-whole hm/Response [c: &en/Ctx hs: &conn/Host rs: &Vec(Route) req: &hm/Request body: Vec(Str)]
+  (let [bad (target-error rs req)]
+    (cond (not= bad "") (assoc (hx/mule-resp 400 [] (str "HTTP request parsing failed with error: \"" bad "\"") "") :close true)
+          (hx/origin-form? (:uri req)) (handle-origin c hs rs req body)
+          :else (let [r2 (assoc req :uri (hx/origin-target (:uri req)))] (handle-origin c hs rs r2 body)))))
+
+(defn- handle-origin hm/Response [c: &en/Ctx hs: &conn/Host rs: &Vec(Route) req: &hm/Request body: Vec(Str)]
+  (if (= (ops/state) ops/DRAINING)
+    (hx/text-resp 503 "Service is shutting down")
+    (let [c1 c hs1 hs rs1 rs r1 req b1 body] (ops/tracked (fn hm/Response [] (handle-app c1 hs1 rs1 r1 b1))))))
+
+(defn- rtf-resp hm/Response [status: Int reason: Str body: Str]
+  (hx/mule-resp status [(hm/->Header "Content-Type" "text/plain")] body reason))
+
+(def RID (atom 0))
+
+(defn admin-resp hm/Response [uri: &Str path: &Str health-app: &Str]
+  (cond
+    (and (not= health-app "") (= path (str "/mule/healthcheck/applications/" health-app "/ready")))
+    (let [s (ops/state)]
+      (cond (= s ops/READY) (hx/mule-resp 200 [] "" "OK")
+            (= s ops/DRAINING) (rtf-resp 409 "Conflict" "Not ready. Status: STOPPED")
+            :else (rtf-resp 409 "Conflict" "Not ready. Status: CREATED")))
+    (and (not= health-app "") (str/starts-with? path "/mule/healthcheck/applications/") (str/ends-with? path "/ready"))
+    (rtf-resp 404 "Not Found" "")
+    (= path "/__/health") (let [[st body] (ops/health-body)] (hx/ct-resp st "application/json" body))
+    (= path "/__/ready") (if (ops/ready?) (hx/text-resp 200 "ready") (hx/text-resp 503 "not ready"))
+    (= path "/__/metrics")
+    (if (str/includes? uri "format=json")
+      (hx/ct-resp 200 "application/json" (ops/metrics-json))
+      (hx/ct-resp 200 "text/plain; version=0.0.4; charset=utf-8" (ops/metrics-text)))
+    :else (hx/text-resp 404 (str "No listener for endpoint: " (html/escape-html4-latin1 path)))))
+
+(defn- record-run Int [flow: &Str t0: Int x: &Vec(err/MErr)]
+  (ops/record flow (- (mono-us) t0) (if (= (count x) 0) "" (str (:ns (nth x 0)) ":" (:id (nth x 0))))))
+
+(defn- handle-app hm/Response [c: &en/Ctx hs: &conn/Host rs: &Vec(Route) req: &hm/Request body: &Vec(Str)]
+  (let [method (:method req)
+        uri (:uri req)
+        q (str/index-of uri "?")
+        raw-path (if (< q 0) (str uri) (subs uri 0 q))
+        path (hx/url-decode-path raw-path)
+        lport (:local-port req)
+        hits (find-route rs lport path method)]
+    (if (= (count hits) 0) (hx/text-resp 404 (str "No listener for endpoint: " (html/escape-html4-latin1 raw-path)))
+      (let [hit (nth hits 0)
+            r (nth rs (:route hit))]
+        (cond
+          (not (:method-ok hit)) (hx/text-resp 405 (str "Method not allowed for endpoint: " (html/escape-html4-latin1 raw-path)))
+          (> (count (:mount r)) 0) ((:handle (nth (:mount r) 0)) hs (conn/->At (:port r) (:base r) (:scheme r)) req)
+          :else
+          (let [ct (hm/header req "content-type" "")
+                remote (let [a (:remote-addr req)] (if (= a "") "127.0.0.1:0" a))
+                f (nth (:flows (:app c)) (:flow r))
+                xcid (str/trim (hm/header req "x-correlation-id" ""))
+                e0 (ev/with-rid (ex/request-event method uri (:headers req) (:body req) ct (:path r) (:base r) (:params hit) (:port r) remote
+                                                  (:scheme r) (:client-cert req) (:version req) (:src r) (if (= xcid "") (conn/corr-id (:flow r)) xcid) (:name f))
+                                (str "req-" (swap! RID (fn Int [n: Int] (+ n 1)))))
+                t0 (mono-us)
+                owner (:rid e0)]
+            (stream/owned owner
+                          (fn hm/Response []
+                            (let [e1 (if (= (count body) 0) e0
+                                       (let [id (nth body 0) z (stream/adopt id owner) p (:payload e0)]
+                                         (ev/with-payload e0 (ev/->TV (v/null-v) (:mime p) (:props p) (str id) ev/PIPE false))))
+                                  zm (mt/flow-dispatched (:name f))
+                                  [sp e1t] (if (tr/on?) (tr/start-root e1 (str (str/upper-case method) " " (:full r)) o/SERVER (:name f)
+                                                                       (hm/header req "traceparent" "") (hm/header req "tracestate" "")
+                                                                       (server-span-attrs r req method))
+                                             (values tr/DEAD e1))
+                                  [e x] (en/run-flow-body c f e1t)
+                                  z (record-run (:name f) t0 x)
+                                  resp (respond c (:src r) e x)
+                                  zt (if (:live sp) (end-server-span sp e x (:status resp)) 0)
+                                  za (if (am/on?) (am/record! (:name f) (hm/header req "host" "") remote (:scheme r) (:base r) path (> (count x) 0)
+                                                              (quot (- (mono-us) t0) 1000)) 0)]
+                              resp)))))))))
+
+(defn- listen-host Str [r: &Route]
+  (let [h (:host (:srv r))] (cond (= h "") "0.0.0.0" (= (str/lower-case h) "localhost") "127.0.0.1" :else (str h))))
+
+(defn- server-span-attrs Vec(o/Attr) [r: &Route req: &hm/Request method: &Str]
+  (let [v (:version req)
+        k (str/index-of v "/")
+        ua (hm/header-of (:headers req) "user-agent")
+        base [(o/attr "http.method" (str/upper-case method)) (o/attr "http.flavor" (if (< k 0) (str v) (subs v (+ k 1) (count v))))
+              (o/attr "http.target" (:full r)) (o/attr "net.host.name" (listen-host r)) (o/attr "net.host.port" (str (:port r)))
+              (o/attr "http.scheme" (:scheme r)) (o/attr "http.route" (:full r))]]
+    (match ua (Some u) (conj base (o/attr "http.user_agent" u)) (None) base)))
+
+(defn- end-server-span Int [sp: &tr/Open e: &ev/Event x: &Vec(err/MErr) status: Int]
+  (let [z1 (tr/add-attr! e "http.status_code" (str status))
+        z2 (tr/add-attr! e "status.override" (if (= status 500) "ERROR" "UNSET"))]
+    (tr/finish sp e x)))
+
+(defn- mount-stream-paths Vec(Route) [rs: &Vec(Route) port: Int]
+  (loop [i 0 acc: Vec(Route) []]
+    (if (>= i (count rs)) acc
+      (let [r (nth rs i)]
+        (recur (+ i 1) (if (and (= (:port r) port) (> (count (:mount r)) 0) (:stream (nth (:mount r) 0))) (conj acc r) acc))))))
+
+(defn- mount-streamed? Bool [rs: &Vec(Route) q: &hm/Request]
+  (let [u (:uri q) k (str/index-of u "?") pth (if (< k 0) (str u) (subs u 0 k))]
+    (loop [i 0]
+      (if (>= i (count rs)) false
+        (let [r (nth rs i)
+              mok (or (= (count (:methods r)) 0)
+                      (loop [j 0] (if (>= j (count (:methods r))) false (if (= (str/upper-case (nth (:methods r) j)) (:method q)) true (recur (+ j 1))))))]
+          (if (and mok (= (:full r) pth)) true (recur (+ i 1))))))))
+
+(defn- body-streamed? Bool [q: &hm/Request]
+  (match (hm/header q "content-length")
+    (Some cl) (let [[n e] (parse-long (str/trim cl))] (or (not= e "") (> n bodies/IN-MEMORY)))
+    (None) (let [m (:method q)] (not (or (= m "GET") (= m "HEAD") (= m "OPTIONS") (= m "DELETE") (= m "TRACE"))))))
+
+(defn- port-opts http/ServerOpts [rs: &Vec(Route) port: Int]
+  (let [o (loop [i 0] (if (>= i (count rs)) (assoc (http/default-server-opts) :port port)
+                        (if (= (:port (nth rs i)) port) (:srv (nth rs i)) (recur (+ i 1)))))
+        mp (mount-stream-paths rs port)
+        o2 (assoc o :body-stream? (fn Bool [q: hm/Request] (or (body-streamed? q) (and (> (count mp) 0) (mount-streamed? mp q)))))]
+    (assoc o2 :server (http/new-server))))
+
+(defn- serve-port Int [c: &en/Ctx rs: &Vec(Route) o: http/ServerOpts]
+  (let [c1 c rs1 rs hs (mount-host c)
+        [rc e] (http/run-server (fn hm/Response [req: hm/Request] (handle-in c1 hs rs1 req)) o)]
+    (if (= e "") rc 1)))
+
+(defn- start-listeners Vec(Future(Int)) [c: en/Ctx rs: Vec(Route) os: &Vec(http/ServerOpts)]
+  (loop [i 0 acc: Vec(Future(Int)) []]
+    (if (>= i (count os)) acc
+      (let [c1 c rs1 rs]
+        (recur (+ i 1) (conj acc (future (fn Int [x: http/ServerOpts] (serve-port c1 rs1 x)) (nth os i))))))))
+
+(defn- wait-listeners Str [os: &Vec(http/ServerOpts) timeout-ms: Int]
+  (loop [i 0]
+    (if (>= i (count os)) ""
+      (let [o (nth os i)
+            [p e] (http/wait-listening (:server o) timeout-ms)]
+        (if (not= e "") (str "listener on port " (:port o) ": " e) (recur (+ i 1)))))))
+
+(defn- join-futures Int [fs: &Vec(Future(Int))]
+  (loop [i 0 r 0] (if (>= i (count fs)) r (recur (+ i 1) (+ r (deref (nth fs i)))))))
+
+(defn- scheduled-flows Vec(Int) [app: &m/App]
+  (let [fs (:flows app)]
+    (loop [i 0 acc: Vec(Int) []]
+      (if (>= i (count fs)) acc
+        (let [srcs (:source (nth fs i))]
+          (recur (+ i 1) (if (and (> (count srcs) 0) (match (nth srcs 0) (m/SrcScheduler f d c z dis l) true _ false)) (conj acc i) acc)))))))
+
+(defn- run-scheduler Int [c: &en/Ctx fi: Int]
+  (let [f (nth (:flows (:app c)) fi)]
+    (match (nth (:source f) 0)
+      (m/SrcScheduler freq delay expr zone dis loc)
+      (let [[cr ce] (if (= expr "") (values (let [[x e] (cron/parse "0 0 0 1 1 ? 2099")] x) "") (cron/parse expr))]
+        (if (not= ce "") (do (eprintln (str "mulay: flow '" (:name f) "': " ce)) 1)
+          (let [z0 (if (and (= expr "") (> delay 0)) (sleep-ms delay) 0)]
+            (loop [k 0]
+              (let [wait (if (= expr "") (if (= k 0) 0 freq)
+                           (let [nx (cron/next-fire-ms cr (epoch-ms) zone)] (if (< nx 0) -1 (max 0 (- nx (epoch-ms))))))]
+                (if (< wait 0) 0
+                  (let [z1 (if (> wait 0) (sleep-ms wait) 0)
+                        e0 (ev/new-event (ev/tv-null) (ev/tv-null) (conn/corr-id fi) (:name f))
+                        t0 (mono-us)
+                        x (if (= (ops/state) ops/DRAINING) [] (en/run-flow-done c f e0))
+                        z2 (record-run (:name f) t0 x)]
+                    (recur (+ k 1)))))))))
+      _ 0)))
+
+(defn- polled-flows Values(Vec(Int) Vec(Int) Vec(Str)) [app: &m/App cs: &Vec(conn/Connector)]
+  (let [fs (:flows app)]
+    (loop [i 0 fis: Vec(Int) [] cis: Vec(Int) [] errs: Vec(Str) []]
+      (if (>= i (count fs)) (values fis cis errs)
+        (let [srcs (:source (nth fs i))]
+          (if (= (count srcs) 0) (recur (+ i 1) fis cis errs)
+            (match (nth srcs 0)
+              (m/SrcConnector cn nm cref ps ch _ex sch loc)
+              (if (routed? cs cn nm) (recur (+ i 1) fis cis errs)
+              (let [k (loop [j 0] (if (>= j (count cs)) -1
+                                    (let [x (nth cs j)]
+                                      (if (and (= (:name x) cn) (has-str? (:sources x) nm)) j (recur (+ j 1))))))]
+                (if (< k 0) (recur (+ i 1) fis cis (conj errs (str "flow '" (:name (nth fs i)) "': unsupported source <" cn ":" nm ">")))
+                  (recur (+ i 1) (conj fis i) (conj cis k) errs))))
+              _ (recur (+ i 1) fis cis errs))))))))
+
+(defn- routed? Bool [cs: &Vec(conn/Connector) cn: &Str nm: &Str]
+  (loop [j 0] (cond (>= j (count cs)) false
+                    (and (= (:name (nth cs j)) cn) (has-str? (:routed (nth cs j)) nm)) true
+                    :else (recur (+ j 1)))))
+
+(defn- init-conns Vec(Str) [cs: &Vec(conn/Connector) app: &m/App]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count cs)) acc
+      (let [es ((:init (nth cs i)) app)]
+        (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count es)) a (recur (+ k 1) (conj a (nth es k))))))))))
+
+(defn- has-str? Bool [xs: &Vec(Str) s: &Str]
+  (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn- dispatch-to Values(Bool Str) [c: &en/Ctx fi: Int p: ev/TV a: ev/TV]
+  (let [f (nth (:flows (:app c)) fi)
+        e0 (ev/new-event p a (conn/corr-id fi) (:name f))
+        t0 (mono-us)
+        c1 c
+        x (ops/tracked (fn Vec(err/MErr) [] (en/run-flow-done c1 f e0)))
+        z3 (record-run (:name f) t0 x)]
+    (if (= (count x) 0) (values true "") (values false (:description (nth x 0))))))
+
+(defn- run-in Values(ev/Event Vec(err/MErr)) [c: &en/Ctx fi: Int p: ev/TV a: ev/TV corr: Str tx: Str]
+  (let [f (nth (:flows (:app c)) fi)
+        e00 (ev/new-event p a (if (= corr "") (conn/corr-id fi) corr) (:name f))
+        e0 (if (= tx "") e00 (ev/with-tx e00 tx))
+        t0 (mono-us)
+        c1 c
+        [e x] (ops/tracked (fn Values(ev/Event Vec(err/MErr)) []
+                             (ops/on-fail (fn Values(ev/Event Vec(err/MErr)) []
+                                            (let [[e x0] (en/run-flow-top c1 f e0)
+                                                  te (if (= tx "") "" (en/end-tx c1 tx (= (count x0) 0)))]
+                                              (values e (if (or (> (count x0) 0) (= te "")) x0 [(err/mk "MULE" "UNKNOWN" te)]))))
+                                          (fn Int [] (if (= tx "") 0 (let [z (en/end-tx c1 tx false)] 0))))))
+        z3 (record-run (:name f) t0 x)]
+    (values (if (= tx "") e (ev/with-tx e "")) x)))
+
+(defn- run-poller Int [c: &en/Ctx fi: Int conn-i: Int]
+  (let [app (:app c)
+        f (nth (:flows app) fi)
+        cn (nth (:conns c) conn-i)]
+    (match (nth (:source f) 0)
+      (m/SrcConnector cname nm cref ps ch _ex sch loc)
+      (let [push (and (= (count sch) 0) (has-str? (:push cn) nm))
+            sd (if (= (count sch) 0) (m/->Sched (if push 0 60000) 0 "" "") (nth sch 0))
+            expr (:cron sd)
+            [cr ce] (if (= expr "") (values (let [[x e] (cron/parse "0 0 0 1 1 ? 2099")] x) "") (cron/parse expr))]
+        (if (not= ce "") (do (eprintln (str "mulay: flow '" (:name f) "': " ce)) 1)
+          (let [cc c
+                z: Map {}
+                call (conn/->SrcCall nm (:name f) (en/find-config c cref) ps ch (:configs app) (atom (->dyn z))
+                                     (fn Values(Bool Str) [p: ev/TV a: ev/TV] (dispatch-to cc fi p a))
+                                     (fn Values(ev/Event Vec(err/MErr)) [p: ev/TV a: ev/TV corr: Str tx: Str] (run-in cc fi p a corr tx))
+                                     (:res app))
+                z0 (if (and (= expr "") (> (:start-delay-ms sd) 0)) (sleep-ms (:start-delay-ms sd)) 0)]
+            (loop [k 0]
+              (let [wait (if (= expr "") (if (= k 0) 0 (:frequency-ms sd))
+                           (let [nx (cron/next-fire-ms cr (epoch-ms) (:tz sd))] (if (< nx 0) -1 (max 0 (- nx (epoch-ms))))))]
+                (if (< wait 0) 0
+                  (let [z1 (if (> wait 0) (sleep-ms wait) 0)
+                        [n pe] ((:poll cn) call)
+                        z2 (if (= pe "") 0
+                             (log/emit log/ERROR (:log-level c) "mulay" (str "mulay.source." cname) (str "flow '" (:name f) "': " pe)))]
+                    (recur (+ k 1)))))))))
+      _ 0)))
+
+(defn- consumers Int [c: &en/Ctx fi: Int ci: Int]
+  (let [f (nth (:flows (:app c)) fi)
+        cn (nth (:conns c) ci)]
+    (match (nth (:source f) 0)
+      (m/SrcConnector cname nm cref ps ch _ex sch loc)
+      (if (not (has-str? (:push cn) nm)) 1
+        (let [[n e] (parse-long (str/trim (conn/param-lit ps "numberOfConsumers" (str (:consumers cn)))))] (if (and (= e "") (> n 0)) n 1)))
+      _ 1)))
+
+(defn- start-pollers Vec(Future(Int)) [c: &en/Ctx fis: &Vec(Int) cis: &Vec(Int)]
+  (loop [i 0 acc: Vec(Future(Int)) []]
+    (if (>= i (count fis)) acc
+      (let [cc c
+            ci (nth cis i)
+            n (consumers c (nth fis i) ci)
+            acc2 (loop [k 0 a acc]
+                   (if (>= k n) a
+                     (recur (+ k 1) (conj a (future (fn Int [fi: Int] (run-poller cc fi ci)) (nth fis i))))))]
+        (recur (+ i 1) acc2)))))
+
+(defn- start-schedulers Vec(Future(Int)) [c: &en/Ctx fis: &Vec(Int)]
+  (loop [i 0 acc: Vec(Future(Int)) []]
+    (if (>= i (count fis)) acc
+      (let [cc c
+            f (future (fn Int [fi: Int] (run-scheduler cc fi)) (nth fis i))]
+        (recur (+ i 1) (conj acc f))))))
+
+(defrecord Server [ctx: en/Ctx routes: Vec(Route) ports: Vec(Int) sched: Vec(Int) polled: Vec(Int) poll-conns: Vec(Int)
+                   log-level: Int err: Str otel: ot/Exporter inv: ot/Inventory tracer: ot/Tracer])
+
+(defn- live-app m/App [app: m/App]
+  (let [fs (:flows app)
+        fs2 (loop [i 0 acc: Vec(m/Flow) []]
+              (if (>= i (count fs)) acc
+                (let [f (nth fs i)]
+                  (recur (+ i 1) (conj acc (if (= (:initial-state f) "stopped") (assoc f :source (let [z: Vec(m/Source) []] z)) f))))))]
+    (assoc app :flows fs2)))
+
+(defn prepare Server [app0: m/App log-level: Int cs: Vec(conn/Connector)]
+  (let [zp (err/set-conn-parents! (conn/error-parents cs))
+        zc (err/set-conn-classes! (conn/error-classes cs))
+        app (live-app app0)
+        [rs errs] (routes app cs)
+        sched (scheduled-flows app)
+        [pf pc perrs] (polled-flows app cs)
+        ierrs (init-conns cs app)
+        ps (ports rs)
+        [ox oerr] (ot/configure app0)
+        [tx terr] (ot/configure-tracer app0)
+        serrs (cat-strs errs perrs)
+        err (cond (not= oerr "") oerr
+                  (not= terr "") terr
+                  (> (count serrs) 0) (str/join "\n" serrs)
+                  (> (count ierrs) 0) (str/join "\n" ierrs)
+                  (and (= (count rs) 0) (= (count sched) 0) (= (count pf) 0)) "the application has no source (http:listener, scheduler or a connector listener)"
+                  :else "")]
+    (->Server (en/new-ctx app cs log-level) rs ps sched pf pc log-level err ox (ot/inventory app0) tx)))
+
+(defn serve Int [s: &Server]
+  (if (not= (:err s) "") (do (eprintln (str "mulay: " (:err s))) 1)
+    (let [c (:ctx s) rs (:routes s) sched (:sched s) log-level (:log-level s)
+          zse (sys/block-signals [(sys/->SigTerm) (sys/->SigInt)])
+          zfree (sys/free-os-memory)
+          ztr (ot/start-tracer (:tracer s) log-level)
+          zsp (if (= (count rs) 0) "" (ps/clear-spools (:app c)))
+          admin (prop-int (:app c) "mulay.admin.port" 0)
+          os (port-opts-all rs (:ports s))
+          aos (if (> admin 0) [(assoc (assoc (http/default-server-opts) :port admin) :server (http/new-server))] [])
+          svs (servers-of (cat-opts os aos))
+          cw c
+          zw (future-detach (future (fn Int [x: Int] (watch-signals cw x svs)) log-level))
+          fa: Vec(Future(Int)) (if (> admin 0) [(future (fn Int [o: http/ServerOpts] (serve-admin o (:app cw))) (nth aos 0))] [])
+          ls (if (= (count rs) 0) [] (start-listeners c rs os))
+          we (if (= (count rs) 0) "" (wait-listeners os 30000))
+          zl (if (and (> (count rs) 0) (= we "")) (log/emit log/INFO log-level "mulay" "mulay.app" (str "Listening on port(s) " (str/join ", " (port-strs (:ports s))) " (" (count rs) " endpoints)")) 0)
+          fs0 (if (not= we "") fa (cat-futures fa (start-schedulers c sched)))
+          fs (if (not= we "") fs0 (cat-futures fs0 (start-pollers c (:polled s) (:poll-conns s))))
+          z0 (if (and (= we "") (> (count sched) 0)) (log/emit log/INFO log-level "mulay" "mulay.app" (str "Started " (count sched) " scheduler(s)")) 0)
+          z1 (if (and (= we "") (> (count (:polled s)) 0)) (log/emit log/INFO log-level "mulay" "mulay.app" (str "Started " (count (:polled s)) " connector source(s)")) 0)]
+      (if (= (count rs) 0)
+        (let [z2 (ops/set-state ops/READY)
+              z3 (ot/start (:otel s) (:app c) (:inv s) log-level)
+              z4 (am/start (:app c) log-level)]
+          (join-futures fs))
+        (if (not= we "") (do (eprintln (str "mulay: " we)) 1)
+            (let [z2 (ops/set-state ops/READY)
+                  z3 (ot/start (:otel s) (:app c) (:inv s) log-level)
+                  z4 (am/start (:app c) log-level)
+                  r (join-futures ls)]
+              (if (= (ops/state) ops/DRAINING) (loop [] (let [z (sleep-ms 100)] (recur))) r)))))))
+
+(defrecord Live [servers: Vec(http/Server) futs: Vec(Future(Int)) err: Str])
+
+(defn- gated Vec(Route) [rs: &Vec(Route) fs: &Vec(m/Flow) names: &Vec(Str)]
+  (loop [i 0 acc: Vec(Route) []]
+    (if (>= i (count rs)) acc
+      (let [r (nth rs i)
+            nm (:name (nth fs (:flow r)))
+            hit (loop [k 0] (if (>= k (count names)) false (if (= (nth names k) nm) true (recur (+ k 1)))))]
+        (recur (+ i 1) (if hit (conj acc r) acc))))))
+
+(defn- serve-gated Int [c: &en/Ctx rs: &Vec(Route) gate: &Atom(Vec(Str)) o: http/ServerOpts]
+  (let [c1 c rs1 rs g gate hs (mount-host c)
+        [rc e] (http/run-server (fn hm/Response [req: hm/Request] (handle-in c1 hs (gated rs1 (:flows (:app c1)) (deref g)) req)) o)]
+    (if (= e "") rc 1)))
+
+(defn start-flows Live [s: &Server c: &en/Ctx gate: &Atom(Vec(Str))]
+  (let [rs (:routes s)
+        os (port-opts-all rs (ports rs))
+        ls (loop [i 0 acc: Vec(Future(Int)) []]
+             (if (>= i (count os)) acc
+               (let [c1 c rs1 rs g gate]
+                 (recur (+ i 1) (conj acc (future (fn Int [x: http/ServerOpts] (serve-gated c1 rs1 g x)) (nth os i)))))))
+        we (wait-listeners os 10000)]
+    (->Live (servers-of os) ls we)))
+
+(defn stop-flows Int [l: &Live]
+  (let [z (loop [i 0] (if (>= i (count (:servers l))) 0 (let [b (http/stop (nth (:servers l) i) 1000)] (recur (+ i 1)))))]
+    (join-futures (:futs l))))
+
+(defn- port-opts-all Vec(http/ServerOpts) [rs: &Vec(Route) ps: &Vec(Int)]
+  (loop [i 0 acc: Vec(http/ServerOpts) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (port-opts rs (nth ps i)))))))
+
+(defn- cat-opts Vec(http/ServerOpts) [a: Vec(http/ServerOpts) b: &Vec(http/ServerOpts)]
+  (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- servers-of Vec(http/Server) [os: &Vec(http/ServerOpts)]
+  (loop [i 0 acc: Vec(http/Server) []] (if (>= i (count os)) acc (recur (+ i 1) (conj acc (:server (nth os i)))))))
+
+(defn- prop-int Int [app: &m/App key: &Str default: Int]
+  (let [ps (:properties app)]
+    (loop [i 0]
+      (if (>= i (count ps)) default
+        (if (= (:name (nth ps i)) key)
+          (match (:v (nth ps i)) (m/PLit s) (let [[n e] (parse-long (str/trim s))] (if (= e "") n default)) _ default)
+          (recur (+ i 1)))))))
+
+(defn- watch-signals Int [c: &en/Ctx log-level: Int svs: &Vec(http/Server)]
+  (let [s (match (sys/wait-signal [(sys/->SigTerm) (sys/->SigInt)])
+            (sys/Caught g) (match g (sys/SigTerm) 15 (sys/SigInt) 2 _ 1)
+            _ 0)
+        timeout (prop-int (:app c) "mulay.shutdown.timeout" 5000)
+        z0 (ops/set-state ops/DRAINING)
+        z1 (log/emit log/INFO log-level "mulay" "mulay.app" (str "Stopping (signal " s "), waiting for " (ops/in-flight) " request(s) in flight"))
+        z3 (loop [i 0] (if (>= i (count svs)) 0 (let [b (http/stop (nth svs i) timeout)] (recur (+ i 1)))))
+        deadline (+ (quot (mono-us) 1000) timeout)
+        left (loop [] (let [n (ops/in-flight)] (if (or (<= n 0) (>= (quot (mono-us) 1000) deadline)) n (let [z (sleep-ms 10)] (recur)))))
+        z2 (if (> left 0)
+             (log/emit log/WARN log-level "mulay" "mulay.app" (str "Stopped with " left " request(s) still in flight after " timeout " ms"))
+             (log/emit log/INFO log-level "mulay" "mulay.app" "Stopped"))
+        z4 (ot/shutdown)
+        z4t (ot/shutdown-tracer)
+        z5 (am/shutdown)]
+    (sig/exit-process 0)))
+
+(defn- serve-admin Int [o: http/ServerOpts app: &m/App]
+  (let [name (conn/prop-lit app "mulay.health.app" (:name app))
+        [rc e] (http/run-server (fn hm/Response [req: hm/Request]
+                                  (let [uri (hx/origin-target (:uri req))
+                                        q (str/index-of uri "?")]
+                                    (admin-resp uri (if (< q 0) (str uri) (subs uri 0 q)) name)))
+                                o)]
+    (if (= e "") rc (do (eprintln (str "mulay: admin port " (:port o) ": " e)) 1))))
+
+(defn- cat-futures Vec(Future(Int)) [a: Vec(Future(Int)) b: Vec(Future(Int))]
+  (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- port-strs Vec(Str) [ps: &Vec(Int)] (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (str (nth ps i)))))))

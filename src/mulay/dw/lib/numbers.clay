@@ -1,0 +1,93 @@
+(ns mulay.dw.lib.numbers
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.lib.math :as math] [mulay.lib.dec :as d] [mulay.lib.bigint :as bi] [clay.bigint :as big] [clay.string :as str]))
+
+(def M "dw::core::Numbers")
+
+(def DIGITS "0123456789abcdefghijklmnopqrstuvwxyz")
+
+(def DIGITS-PER-INT [0 0 30 19 15 13 11 11 10 9 9 8 8 8 8 7 7 7 7 7 7 7 6 6 6 6 6 6 6 6 6 6 6 6 6 6 5])
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+
+(defn- digit-of Int [c: Int radix: Int]
+  (let [x (cond
+            (and (>= c 48) (<= c 57)) (- c 48)
+            (and (>= c 97) (<= c 122)) (+ (- c 97) 10)
+            (and (>= c 65) (<= c 90)) (+ (- c 65) 10)
+            :else -1)]
+    (if (< x radix) x -1)))
+
+(defn- big-radix-str Str [b: &big/BigInt radix: Int]
+  (if (bi/is-zero? b) "0"
+    (let [neg (< (bi/sign b) 0)
+          ds (loop [x (bi/abs-big b) acc: Vec(Int) []]
+               (if (bi/is-zero? x) acc
+                 (let [[q r] (bi/divmod-small x radix)] (recur q (conj acc r)))))
+          s (loop [i (- (count ds) 1) out (if neg "-" "")]
+              (if (< i 0) out (let [k (nth ds i)] (recur (- i 1) (str out (subs DIGITS k (+ k 1)))))))]
+      s)))
+
+(defn to-radix Values(v/Val dwe/DwErr) [n: &num/Num r: Int]
+  (let [x (num/to-dec n)]
+    (if (not (d/integer? x)) (rt/failure "ArithmeticException" "Rounding necessary")
+      (let [[b be] (d/to-big x)]
+        (if (not= be "") (rt/failure "ArithmeticException" be)
+          (ok (v/->VStr (big-radix-str b (if (or (< r 2) (> r 36)) 10 r)))))))))
+
+(defn- nfe Values(v/Val dwe/DwErr) [msg: Str] (rt/failure "NumberFormatException" msg))
+
+(defn- for-input Str [s: &Str radix: Int]
+  (str "For input string: \"" s "\"" (if (= radix 10) "" (str " under radix " radix))))
+
+(defn from-radix Values(v/Val dwe/DwErr) [s: &Str radix: Int]
+  (let [n (count s)]
+    (cond
+      (or (< radix 2) (> radix 36)) (nfe "Radix out of range")
+      (= n 0) (nfe "Zero length BigInteger")
+      :else
+      (let [minus (str/index-of s "-") plus (str/index-of s "+")
+            [neg cursor serr] (cond
+                                (>= minus 0) (if (or (> minus 0) (>= plus 0)) (values false 0 "Illegal embedded sign character") (values true 1 ""))
+                                (>= plus 0) (if (> plus 0) (values false 0 "Illegal embedded sign character") (values false 1 ""))
+                                :else (values false 0 ""))]
+        (cond
+          (not= serr "") (nfe serr)
+          (= cursor n) (nfe "Zero length BigInteger")
+          :else
+          (let [c1 (loop [i cursor] (if (and (< i n) (= (digit-of (nth s i) radix) 0)) (recur (+ i 1)) i))]
+            (if (= c1 n) (ok (v/int-v 0))
+              (let [nd (- n c1)
+                    per (nth DIGITS-PER-INT radix)
+                    g0 (let [m (mod nd per)] (if (= m 0) per m))
+                    bad (loop [st c1 len g0]
+                          (if (>= st n) ""
+                            (let [e (+ st len)
+                                  okg (loop [i st] (if (>= i e) true (if (< (digit-of (nth s i) radix) 0) false (recur (+ i 1)))))]
+                              (if okg (recur e per) (subs s st e)))))]
+                (if (not= bad "") (nfe (for-input bad radix))
+                  (let [mag (loop [i c1 acc (bi/zero)]
+                              (if (>= i n) acc
+                                (recur (+ i 1) (bi/add-int (bi/mul-int acc radix) (digit-of (nth s i) radix)))))
+                        b (if neg (bi/neg mag) mag)]
+                    (ok (v/num-v (num/mk (d/from-big b))))))))))))))
+
+(defn- to-hex Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (to-radix (core/arg-num a 0) 16))
+(defn- to-bin Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (to-radix (core/arg-num a 0) 2))
+(defn- from-hex Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (from-radix (core/arg-str a 0) 16))
+(defn- from-bin Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (from-radix (core/arg-str a 0) 2))
+(defn- to-radix-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (to-radix (core/arg-num a 0) (math/int-value (core/arg-num a 1))))
+(defn- from-radix-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (from-radix (core/arg-str a 0) (math/int-value (core/arg-num a 1))))
+(defn- null-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/null-v)))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "toHex" [(rt/b1 "Number" to-hex) (rt/b1 "Null" null-fn)])
+   (B "toBinary" [(rt/b1 "Number" to-bin) (rt/b1 "Null" null-fn)])
+   (B "fromHex" [(rt/b1 "String" from-hex) (rt/b1 "Null" null-fn)])
+   (B "fromBinary" [(rt/b1 "String" from-bin) (rt/b1 "Null" null-fn)])
+   (B "fromRadixNumber" [(rt/b2 "String" "Number" from-radix-fn)])
+   (B "toRadixNumber" [(rt/b2 "Number" "Number" to-radix-fn)])])

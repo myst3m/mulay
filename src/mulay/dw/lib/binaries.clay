@@ -1,0 +1,299 @@
+(ns mulay.dw.lib.binaries
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.lib.uni :as uni] [clay.charset :as ccs] [clay.string :as str]))
+
+(def M "dw::core::Binaries")
+
+(defn- hex-with Str [b: &Str digits: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count b)) out
+      (let [x (nth b i) hi (bit-shift-right x 4) lo (bit-and x 15)]
+        (recur (+ i 1) (str out (subs digits hi (+ hi 1)) (subs digits lo (+ lo 1))))))))
+
+(defn hex-upper Str [b: &Str] (hex-with b "0123456789ABCDEF"))
+(defn hex-lower Str [b: &Str] (hex-with b "0123456789abcdef"))
+
+(defn- hex-val Int [c: Int]
+  (if (and (>= c 48) (<= c 57)) (- c 48)
+    (if (and (>= c 65) (<= c 70)) (- c 55)
+      (if (and (>= c 97) (<= c 102)) (- c 87) -1))))
+
+(defn hex-decode Values(Str Str) [s: &Str]
+  (if (not= (mod (count s) 2) 0) (values "" (str "hexBinary needs to be even-length: " s))
+    (loop [i 0 out ""]
+      (if (>= i (count s)) (values out "")
+        (let [h (hex-val (nth s i)) l (hex-val (nth s (+ i 1)))]
+          (if (or (< h 0) (< l 0)) (values "" (str "contains illegal character for hexBinary: " s))
+            (recur (+ i 2) (str out (chr (+ (* h 16) l))))))))))
+
+(def B64 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(defn b64-encode Str [b: &Str]
+  (let [n (count b)]
+    (loop [i 0 out ""]
+      (if (>= i n) out
+        (let [b0 (nth b i)
+              b1 (if (< (+ i 1) n) (nth b (+ i 1)) 0)
+              b2 (if (< (+ i 2) n) (nth b (+ i 2)) 0)
+              w (bit-or (bit-shift-left b0 16) (bit-or (bit-shift-left b1 8) b2))
+              c0 (bit-and (bit-shift-right w 18) 63) c1 (bit-and (bit-shift-right w 12) 63)
+              c2 (bit-and (bit-shift-right w 6) 63) c3 (bit-and w 63)
+              o1 (str out (subs B64 c0 (+ c0 1)) (subs B64 c1 (+ c1 1)))
+              o2 (if (< (+ i 1) n) (str o1 (subs B64 c2 (+ c2 1))) (str o1 "="))
+              o3 (if (< (+ i 2) n) (str o2 (subs B64 c3 (+ c3 1))) (str o2 "="))]
+          (recur (+ i 3) o3))))))
+
+(defn- b64-val Int [c: Int]
+  (if (and (>= c 65) (<= c 90)) (- c 65)
+    (if (and (>= c 97) (<= c 122)) (- c 71)
+      (if (and (>= c 48) (<= c 57)) (+ c 4)
+        (if (= c 43) 62 (if (= c 47) 63 -1))))))
+
+(defn- b64-space? Bool [c: Int] (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 12) (= c 11)))
+
+(defn- b64-input Str [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 out ""]
+      (if (>= i n) out
+        (let [b (nth s i)]
+          (if (< b 0x80) (recur (+ i 1) (if (b64-space? b) out (str out (chr b))))
+            (let [[cp j] (uni/decode-at s i)]
+              (recur j (str out (chr (if (<= cp 255) cp 63)))))))))))
+
+(defn b64-decode Values(Str Str) [s0: &Str]
+  (let [s (b64-input s0) n (count s)]
+    (if (= n 0) (values "" "")
+      (if (< n 2) (values "" "Input byte[] should at least have 2 bytes for base64 bytes")
+        (let [[out bits shift sp e]
+              (loop [sp 0 out "" bits 0 shift 18]
+                (if (>= sp n) (values out bits shift sp "")
+                  (let [c (nth s sp) d (b64-val c)]
+                    (if (= c 61)
+                      (if (or (= shift 18) (and (= shift 6) (or (= (+ sp 1) n) (not= (nth s (+ sp 1)) 61))))
+                        (values out bits shift sp "Input byte array has wrong 4-byte ending unit")
+                        (values out bits shift (if (= shift 6) (+ sp 2) (+ sp 1)) ""))
+                      (if (< d 0) (values out bits shift sp (str "Illegal base64 character " (hex-lower-int c)))
+                        (let [b2 (bit-or bits (bit-shift-left d shift))]
+                          (if (= shift 0)
+                            (recur (+ sp 1) (str out (chr (bit-and (bit-shift-right b2 16) 255)) (chr (bit-and (bit-shift-right b2 8) 255)) (chr (bit-and b2 255))) 0 18)
+                            (recur (+ sp 1) out b2 (- shift 6)))))))))]
+          (if (not= e "") (values "" e)
+            (if (= shift 12) (values "" "Last unit does not have enough valid bits")
+              (let [o2 (if (= shift 6) (str out (chr (bit-and (bit-shift-right bits 16) 255)))
+                         (if (= shift 0) (str out (chr (bit-and (bit-shift-right bits 16) 255)) (chr (bit-and (bit-shift-right bits 8) 255))) out))]
+                (if (< sp n) (values "" (str "Input byte array has incorrect ending byte at " sp))
+                  (values o2 ""))))))))))
+
+(defn- hex-lower-int Str [c: Int]
+  (let [d "0123456789abcdef"]
+    (if (< c 16) (subs d c (+ c 1))
+      (str (subs d (bit-shift-right c 4) (+ (bit-shift-right c 4) 1)) (subs d (bit-and c 15) (+ (bit-and c 15) 1))))))
+
+(defn- lower-ascii Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)] (recur (+ i 1) (str out (chr (if (and (>= c 65) (<= c 90)) (+ c 32) c))))))))
+
+(defn- any-of? Bool [x: &Str xs: Vec(Str)]
+  (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) x) true (recur (+ i 1))))))
+
+(defn charset-id Str [name: &Str]
+  (let [n (lower-ascii name)]
+    (if (any-of? n ["utf-8" "utf8" "unicode-1-1-utf-8"]) "UTF-8"
+      (if (any-of? n ["us-ascii" "ascii" "iso646-us" "us" "646" "cp367" "csascii" "default" "iso-ir-6"
+                      "ansi_x3.4-1968" "ansi_x3.4-1986" "iso_646.irv:1991" "ibm367" "iso_646.irv:1983" "ansi_x3.4-1968"]) "US-ASCII"
+        (if (any-of? n ["iso-8859-1" "iso8859_1" "iso8859-1" "iso_8859-1" "iso_8859_1" "latin1" "l1" "ibm819" "cp819"
+                        "csisolatin1" "819" "ibm-819" "iso_8859-1:1987" "iso-ir-100" "8859_1"]) "ISO-8859-1"
+          (if (any-of? n ["utf-16" "utf_16" "utf16" "unicode" "unicodebig"]) "UTF-16"
+            (if (any-of? n ["utf-16be" "utf_16be" "iso-10646-ucs-2" "x-utf-16be" "unicodebigunmarked"]) "UTF-16BE"
+              (if (any-of? n ["utf-16le" "utf_16le" "x-utf-16le" "unicodelittleunmarked"]) "UTF-16LE"
+                (if (any-of? n ["utf-32" "utf_32" "utf32"]) "UTF-32"
+                  (if (any-of? n ["utf-32be" "utf_32be" "x-utf-32be"]) "UTF-32BE"
+                    (if (any-of? n ["utf-32le" "utf_32le" "x-utf-32le"]) "UTF-32LE"
+                      (if (any-of? n ["windows-1252" "cp1252" "cp5348" "ibm-1252" "ibm1252"]) "windows-1252"
+                        (match (ccs/canonical-name n) (Some c) c (None) "")))))))))))))
+
+(defn- own-charset? Bool [cs: &Str]
+  (any-of? cs ["UTF-8" "US-ASCII" "ISO-8859-1" "UTF-16" "UTF-16BE" "UTF-16LE" "UTF-32" "UTF-32BE" "UTF-32LE" "windows-1252"]))
+
+(def CP1252-HI [0x20AC 0 0x201A 0x0192 0x201E 0x2026 0x2020 0x2021 0x02C6 0x2030 0x0160 0x2039 0x0152 0 0x017D 0
+                0 0x2018 0x2019 0x201C 0x201D 0x2022 0x2013 0x2014 0x02DC 0x2122 0x0161 0x203A 0x0153 0 0x017E 0x0178])
+
+(defn- cp1252-byte Int [cp: Int]
+  (if (or (< cp 0x80) (and (>= cp 0xA0) (<= cp 0xFF))) cp
+    (loop [i 0] (if (>= i 32) -1 (if (= (nth CP1252-HI i) cp) (+ 0x80 i) (recur (+ i 1)))))))
+
+(defn- u16 Str [x: Int be: Bool]
+  (if be (str (chr (bit-and (bit-shift-right x 8) 255)) (chr (bit-and x 255)))
+    (str (chr (bit-and x 255)) (chr (bit-and (bit-shift-right x 8) 255)))))
+
+(defn- u32 Str [x: Int be: Bool]
+  (if be (str (u16 (bit-shift-right x 16) true) (u16 (bit-and x 0xFFFF) true))
+    (str (u16 (bit-and x 0xFFFF) false) (u16 (bit-shift-right x 16) false))))
+
+(defn cs-encode Str [s: &Str cs: &Str]
+  (cond
+    (= cs "UTF-8") (uni/sanitize (str s))
+    (not (own-charset? cs)) (let [[b e] (ccs/encode s cs)] (if (= e "") b (uni/sanitize (str s))))
+    :else
+    (let [cps (uni/cps s)
+          be (or (= cs "UTF-16") (= cs "UTF-16BE") (= cs "UTF-32") (= cs "UTF-32BE"))
+          head (if (= (count cps) 0) "" (if (= cs "UTF-16") (u16 0xFEFF true) ""))]
+      (loop [i 0 out head]
+        (if (>= i (count cps)) out
+          (let [c (nth cps i)]
+            (recur (+ i 1)
+                   (if (= cs "US-ASCII") (str out (chr (if (< c 0x80) c 63)))
+                     (if (= cs "ISO-8859-1") (str out (chr (if (<= c 0xFF) c 63)))
+                       (if (= cs "windows-1252") (let [b (cp1252-byte c)] (str out (chr (if (< b 0) 63 b))))
+                         (if (or (= cs "UTF-32") (= cs "UTF-32BE") (= cs "UTF-32LE")) (str out (u32 c be))
+                           (if (< c 0x10000) (str out (u16 c be))
+                             (let [d (- c 0x10000)]
+                               (str out (u16 (+ 0xD800 (bit-shift-right d 10)) be) (u16 (+ 0xDC00 (bit-and d 0x3FF)) be)))))))))))))))
+
+(defn cs-decode Values(Str Str Int) [b: &Str cs: &Str strict: Bool]
+  (if (not (own-charset? cs)) (table-decode b cs strict)
+  (if (= cs "UTF-8") (utf8-decode b strict)
+    (if (or (= cs "US-ASCII") (= cs "ISO-8859-1") (= cs "windows-1252")) (byte-decode b cs strict)
+      (if (or (= cs "UTF-32") (= cs "UTF-32BE") (= cs "UTF-32LE")) (utf32-decode b cs strict)
+        (utf16-decode b cs strict))))))
+
+(defn- table-decode Values(Str Str Int) [b: &Str cs: &Str strict: Bool]
+  (if (not strict) (let [[s e] (ccs/decode b cs false)] (values s "" 0))
+    (let [[chk e] (ccs/check b cs)]
+      (match chk
+        (ccs/Malformed off len) (values "" "Malformed" len)
+        (ccs/Unmappable off len) (values "" "Unmappable" len)
+        _ (let [[s e2] (ccs/decode b cs false)] (values s "" 0))))))
+
+(defn- rep Str [] (uni/encode 0xFFFD))
+
+(defn- utf8-decode Values(Str Str Int) [b: &Str strict: Bool]
+  (if (uni/valid? b) (values (str b) "" 0)
+    (if (not strict) (values (uni/sanitize (str b)) "" 0)
+      (let [n (count b)]
+        (loop [i 0]
+          (if (>= i n) (values (str b) "" 0)
+            (if (< (nth b i) 0x80) (recur (+ i 1))
+              (let [[c j] (uni/decode-at b i)]
+                (if (and (= c 0xFFFD) (not (and (= (- j i) 3) (= (nth b i) 0xEF))))
+                  (values "" "Malformed" (- j i))
+                  (recur j))))))))))
+
+(defn- byte-decode Values(Str Str Int) [b: &Str cs: &Str strict: Bool]
+  (loop [i 0 out ""]
+    (if (>= i (count b)) (values out "" 0)
+      (let [x (nth b i)
+            cp (if (< x 0x80) x
+                 (if (= cs "US-ASCII") -1
+                   (if (= cs "ISO-8859-1") x
+                     (if (< x 0xA0) (let [m (nth CP1252-HI (- x 0x80))] (if (= m 0) -2 m)) x))))]
+        (if (< cp 0)
+          (if strict (values "" (if (= cp -1) "Malformed" "Unmappable") 1)
+            (recur (+ i 1) (str out (rep))))
+          (recur (+ i 1) (str out (uni/encode cp))))))))
+
+(defn- rd16 Int [b: &Str i: Int be: Bool]
+  (if be (+ (* (nth b i) 256) (nth b (+ i 1))) (+ (* (nth b (+ i 1)) 256) (nth b i))))
+
+(defn- utf16-decode Values(Str Str Int) [b: &Str cs: &Str strict: Bool]
+  (let [n (count b)
+        bom-be (and (= cs "UTF-16") (>= n 2) (= (nth b 0) 0xFE) (= (nth b 1) 0xFF))
+        bom-le (and (= cs "UTF-16") (>= n 2) (= (nth b 0) 0xFF) (= (nth b 1) 0xFE))
+        be (if bom-le false (not= cs "UTF-16LE"))
+        start (if (or bom-be bom-le) 2 0)]
+    (loop [i start out ""]
+      (if (>= i n) (values out "" 0)
+        (if (= (+ i 1) n)
+          (if strict (values "" "Malformed" 1) (values (str out (rep)) "" 0))
+          (let [u (rd16 b i be)]
+            (if (and (>= u 0xD800) (<= u 0xDBFF))
+              (let [has (<= (+ i 4) n) w (if has (rd16 b (+ i 2) be) 0)]
+                (if (and has (>= w 0xDC00) (<= w 0xDFFF))
+                  (recur (+ i 4) (str out (uni/encode (+ 0x10000 (+ (* (- u 0xD800) 1024) (- w 0xDC00))))))
+                  (if strict (values "" "Malformed" (if has 4 2)) (recur (+ i 2) (str out (rep))))))
+              (if (and (>= u 0xDC00) (<= u 0xDFFF))
+                (if strict (values "" "Malformed" 2) (recur (+ i 2) (str out (rep))))
+                (recur (+ i 2) (str out (uni/encode u)))))))))))
+
+(defn- rd32 Int [b: &Str i: Int be: Bool]
+  (if be (+ (* (rd16 b i true) 65536) (rd16 b (+ i 2) true)) (+ (* (rd16 b (+ i 2) false) 65536) (rd16 b i false))))
+
+(defn- utf32-decode Values(Str Str Int) [b: &Str cs: &Str strict: Bool]
+  (let [n (count b)
+        bom-be (and (= cs "UTF-32") (>= n 4) (= (rd16 b 0 true) 0) (= (rd16 b 2 true) 0xFEFF))
+        bom-le (and (= cs "UTF-32") (>= n 4) (= (rd16 b 0 true) 0xFFFE) (= (rd16 b 2 true) 0))
+        be (if bom-le false (not= cs "UTF-32LE"))
+        start (if (or bom-be bom-le) 4 0)]
+    (loop [i start out ""]
+      (if (>= i n) (values out "" 0)
+        (if (> (+ i 4) n)
+          (if strict (values "" "Malformed" (- n i)) (values (str out (rep)) "" 0))
+          (let [u (rd32 b i be)]
+            (if (or (> u 0x10FFFF) (and (>= u 0xD800) (<= u 0xDFFF)))
+              (if strict (values "" "Malformed" 4) (recur (+ i 4) (str out (rep))))
+              (recur (+ i 4) (str out (uni/encode u))))))))))
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- arg-bin Str [a: &Vec(v/Val) i: Int] (match (v/unmeta (nth a i)) (v/VBin b) b _ ""))
+(defn- base16 Vec(v/Field) [] [(v/field "base" (v/->VStr "16"))])
+
+(defn- to-hex Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (v/->VMeta (v/->VStr (hex-upper (arg-bin a 0))) (base16))))
+
+(defn- from-hex Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[b e] (hex-decode (core/arg-str a 0))]
+    (if (= e "") (ok (v/->VMeta (v/->VBin b) (base16)))
+      (rt/failure "InvalidHexStringContent" (str "Unable to transform String to hex binary. Reason : `" e "`")))))
+
+(defn- to-base64 Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/->VStr (b64-encode (arg-bin a 0)))))
+
+(defn- from-base64 Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[b e] (b64-decode (core/arg-str a 0))]
+    (if (= e "") (ok (v/->VBin b))
+      (rt/failure "InvalidBase64Content" (str "Unable to transform String to Base 64 Binary. Reason : `" e "`")))))
+
+(defn split-lines Vec(v/Val) [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 start 0 acc: Vec(v/Val) []]
+      (if (>= i n) (if (> n start) (conj acc (v/->VStr (subs s start n))) acc)
+        (let [c (nth s i)]
+          (if (= c 10) (recur (+ i 1) (+ i 1) (conj acc (v/->VStr (subs s start i))))
+            (if (= c 13)
+              (let [j (if (and (< (+ i 1) n) (= (nth s (+ i 1)) 10)) (+ i 2) (+ i 1))]
+                (recur j j (conj acc (v/->VStr (subs s start i)))))
+              (recur (+ i 1) start acc))))))))
+
+(defn- read-lines Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [name (core/arg-str a 1) cs (charset-id name)]
+    (if (= cs "") (rt/failure "ReadLinesException" (str "Exception while reading lines. Caused by: Unsupported Charset: `" name "`."))
+      (let [[s kind len] (cs-decode (arg-bin a 0) cs true)]
+        (if (not= kind "")
+          (rt/failure "ReadLinesException" (str "java.nio.charset." kind "InputException - Input length = " len))
+          (ok (v/->VArr (split-lines s))))))))
+
+(defn- write-lines Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [name (core/arg-str a 1) cs (charset-id name)]
+    (if (= cs "") (rt/failure "UnsupportedCharset" name)
+      (let [xs (core/arg-items a 0) nl (cs-encode "\n" cs)]
+        (loop [i 0 out ""]
+          (if (>= i (count xs)) (ok (v/->VBin out))
+            (let [[t e] (rt/to-text (nth xs i))]
+              (if (not (dwe/ok? e)) (values (v/null-v) e)
+                (recur (+ i 1) (str out (cs-encode t cs) nl))))))))))
+
+(defn- concat-bb Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [x (arg-bin a 0)] (ok (v/->VBin (str x (arg-bin a 1))))))
+(defn- first-arg Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (nth a 0)))
+(defn- second-arg Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (nth a 1)))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "toHex" [(rt/b1 "Binary" to-hex)])
+   (B "fromHex" [(rt/b1 "String" from-hex)])
+   (B "toBase64" [(rt/b1 "Binary" to-base64)])
+   (B "fromBase64" [(rt/b1 "String" from-base64)])
+   (B "readLinesWith" [(rt/b2 "Binary" "String" read-lines)])
+   (B "writeLinesWith" [(rt/b2 "Array" "String" write-lines)])
+   (B "concatWith" [(rt/b2 "Binary" "Binary" concat-bb) (rt/b2 "Binary" "Null" first-arg) (rt/b2 "Null" "Binary" second-arg)])])

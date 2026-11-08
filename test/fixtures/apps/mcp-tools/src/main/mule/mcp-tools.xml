@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18210"/>
+    </http:listener-config>
+
+    <mcp:server-config name="Srv" serverName="Tools" serverVersion="1.2.3">
+        <mcp:streamable-http-server-connection listenerConfig="L" mcpEndpointPath="/mcp" responseContentType="JSON"/>
+    </mcp:server-config>
+    <mcp:server-config name="SrvSse" serverName="ToolsSse" serverVersion="0.0.1">
+        <mcp:streamable-http-server-connection listenerConfig="L" mcpEndpointPath="/mcp-sse"/>
+    </mcp:server-config>
+
+    <flow name="add">
+        <mcp:tool-listener config-ref="Srv" name="add">
+            <mcp:description>Adds two numbers</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="#[(payload.a + payload.b) as String]"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="add called"/>
+    </flow>
+
+    <!-- text は String の引数: DW の String の結果はそのまま (JSON の payload でも、出力の mime を推論して書き直さない)。
+         #[payload] (JSON のオブジェクト) は実 Mule でも Java の writer の失敗 (スタックトレース) になるので、試験に入れない -->
+    <flow name="json-text">
+        <mcp:tool-listener config-ref="Srv" name="json-text">
+            <mcp:description>Writes a JSON payload as text</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"id":{"type":"string"}}}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="#[write(payload, 'application/json', {indent: false})]"/>
+                <mcp:text-tool-response-content text="#['id=' ++ payload.id]"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <set-payload value="#[output application/json --- {id: payload.id default 'none', n: 1}]"/>
+    </flow>
+
+    <flow name="echo">
+        <mcp:tool-listener config-ref="Srv" name="echo">
+            <mcp:description>Echoes the arguments</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"text":{"type":"string"},"n":{"type":"integer"}}}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="#[write(payload, 'application/json') ++ ' ' ++ (typeOf(payload) as String) ++ ' ' ++ (attributes.requestId as String) ++ ' ' ++ (sizeOf(attributes.sessionId default '') as String)]"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="echo called"/>
+    </flow>
+
+    <flow name="fail-default">
+        <mcp:tool-listener config-ref="Srv" name="fail-default">
+            <mcp:description>Raises an error without error responses</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="unreachable"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <raise-error type="APP:BOOM" description="kaboom"/>
+    </flow>
+
+    <flow name="fail-custom">
+        <mcp:tool-listener config-ref="Srv" name="fail-custom">
+            <mcp:description>Raises an error with custom error responses</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="unreachable"/>
+            </mcp:responses>
+            <mcp:on-error-responses>
+                <mcp:text-tool-response-content text="#['custom: ' ++ error.description ++ ' / ' ++ error.errorType.identifier]"/>
+                <mcp:text-tool-response-content text="second"/>
+            </mcp:on-error-responses>
+        </mcp:tool-listener>
+        <raise-error type="APP:BOOM" description="kaboom"/>
+    </flow>
+
+    <flow name="multi">
+        <mcp:tool-listener config-ref="Srv" name="multi">
+            <mcp:description>Returns every kind of content</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="hello">
+                    <mcp:audience>
+                        <mcp:audience-item value="USER"/>
+                        <mcp:audience-item value="ASSISTANT"/>
+                    </mcp:audience>
+                </mcp:text-tool-response-content>
+                <mcp:image-tool-response-content data="#[payload.img]" mimeType="image/png"/>
+                <mcp:text-resource-tool-response-content uri="file:///a.txt" text="resource text"/>
+                <mcp:blob-resource-tool-response-content blob="#[payload.img]" uri="file:///b.bin" mimeType="application/octet-stream"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <set-payload value="#[{img: 'abc' as Binary}]"/>
+    </flow>
+
+    <flow name="attrs">
+        <mcp:tool-listener config-ref="Srv" name="attrs">
+            <mcp:description>Dumps the request attributes</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="#[write({a: attributes, ac: attributes.^class, pc: payload.^class, pm: payload.^mediaType, am: attributes.^mediaType}, 'application/json')]"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="attrs called"/>
+    </flow>
+
+    <flow name="strict">
+        <mcp:tool-listener config-ref="Srv" name="strict">
+            <mcp:description>Strict schema</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"s":{"type":"string","minLength":2,"maxLength":4,"pattern":"^[a-z]+$"},"n":{"type":"integer","minimum":1,"maximum":10},"e":{"enum":["a","b"]},"arr":{"type":"array","items":{"type":"string"},"minItems":1},"o":{"type":"object","properties":{"k":{"type":"boolean"}},"required":["k"]}},"required":["s"],"additionalProperties":false}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="ok"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="strict called"/>
+    </flow>
+
+    <flow name="sse-add">
+        <mcp:tool-listener config-ref="SrvSse" name="add">
+            <mcp:description>Adds two numbers</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}]]></mcp:parameters-schema>
+            <mcp:responses>
+                <mcp:text-tool-response-content text="#[(payload.a + payload.b) as String]"/>
+            </mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="sse-add called"/>
+    </flow>
+</mule>

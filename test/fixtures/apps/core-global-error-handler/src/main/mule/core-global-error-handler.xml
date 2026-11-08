@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18123"/>
+    </http:listener-config>
+
+    <!-- ハンドラを持たないフローは、この大域ハンドラを使う -->
+    <configuration defaultErrorHandler-ref="global-handler"/>
+
+    <error-handler name="global-handler">
+        <on-error-continue type="APP:RECOVERABLE">
+            <set-payload value="#[output application/json --- {handledBy: 'global-continue', errorType: error.errorType.identifier, description: error.description}]"/>
+        </on-error-continue>
+        <on-error-propagate type="ANY">
+            <set-variable variableName="globalPropagateRan" value="#[true]"/>
+            <set-payload value="#[output application/json --- {handledBy: 'global-propagate'}]"/>
+        </on-error-propagate>
+    </error-handler>
+
+    <!-- 名前付きのハンドラを ref で使う -->
+    <error-handler name="shared-handler">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {handledBy: 'shared-by-ref', errorType: error.errorType.identifier}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="uses-global">
+        <http:listener config-ref="L" path="/global/{kind}"/>
+        <choice>
+            <when expression="#[attributes.uriParams.kind == 'recoverable']">
+                <raise-error type="APP:RECOVERABLE" description="recover me"/>
+            </when>
+            <otherwise>
+                <raise-error type="APP:FATAL" description="fatal failure"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <flow name="uses-ref">
+        <http:listener config-ref="L" path="/ref"/>
+        <raise-error type="APP:FATAL" description="fatal failure"/>
+        <error-handler ref="shared-handler"/>
+    </flow>
+
+    <!-- 自分のハンドラがあり、当たらないとき: 大域ハンドラには行かない? -->
+    <flow name="own-no-match">
+        <http:listener config-ref="L" path="/own-no-match"/>
+        <raise-error type="APP:RECOVERABLE" description="own handler does not match"/>
+        <error-handler>
+            <on-error-continue type="APP:FATAL">
+                <set-payload value="own handler"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- try の中は大域ハンドラではなく、try のハンドラ → 無ければフロー → 大域 -->
+    <flow name="try-inside">
+        <http:listener config-ref="L" path="/try-inside"/>
+        <try>
+            <raise-error type="APP:RECOVERABLE" description="inside try without handler"/>
+        </try>
+        <set-payload value="after try (not reached?)"/>
+    </flow>
+
+    <!-- flow-ref で呼んだハンドラ無しのフロー: 呼ばれた側でも大域ハンドラが動くか -->
+    <flow name="callee-no-handler">
+        <raise-error type="APP:RECOVERABLE" description="callee failed"/>
+    </flow>
+    <flow name="caller">
+        <http:listener config-ref="L" path="/caller"/>
+        <flow-ref name="callee-no-handler"/>
+        <set-payload value="#[output application/json --- {callerContinued: true, payload: payload}]"/>
+    </flow>
+
+</mule>

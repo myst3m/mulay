@@ -1,0 +1,77 @@
+;; tools/gen-sqlfile-golden.py で作った (手で直さない)。fixtures/*.db は Python の sqlite3 (SQLite 3.53.4) が書いたもの。
+;; 中身を dump (行は rowid と値を | でつなぎ、値は N / I:10 進 / R:double のビット / T:16 進 / B:16 進) にして SHA-256 で比べる
+(ns file-test (:require [mulay.lib.sqlfile :as sf] [mulay.lib.hash :as hash] [mulay.lib.ieee :as ieee] [mulay.dw.lib.binaries :as bin]))
+
+(defn- enc Str [v: &sf/Val]
+  (match v
+    (sf/VNull) "N"
+    (sf/VInt n) (str "I:" n)
+    (sf/VReal x) (let [h (bin/hex-lower (bytes-be (ieee/double->bits x)))] (str "R:" h))
+    (sf/VText s) (str "T:" (bin/hex-lower s))
+    (sf/VBlob s) (str "B:" (bin/hex-lower s))))
+
+(defn- bytes-be Str [n: Int] (loop [i 0 out ""] (if (>= i 8) out (recur (+ i 1) (str out (chr (bit-and (unsigned-bit-shift-right n (* 8 (- 7 i))) 255)))))))
+
+(defn- vals-str Str [vs: &Vec(sf/Val)]
+  (loop [i 0 out ""] (if (>= i (count vs)) out (let [e (enc (nth vs i))] (recur (+ i 1) (if (= i 0) e (str out "|" e)))))))
+
+(defn- rows-dump Str [rows: &Vec(sf/Row)]
+  (loop [i 0 out ""]
+    (if (>= i (count rows)) out
+      (let [r (nth rows i) line (str (:rowid r) (if (> (count (:vals r)) 0) "|" "") (vals-str (:vals r)))]
+        (recur (+ i 1) (if (= i 0) line (str out "\n" line)))))))
+
+(defn- keys-dump Str [ks: &Vec(Vec(sf/Val))]
+  (loop [i 0 out ""] (if (>= i (count ks)) out (let [line (vals-str (nth ks i))] (recur (+ i 1) (if (= i 0) line (str out "\n" line)))))))
+
+(defn- sha Str [s: &Str] (bin/hex-lower (hash/sha256 s)))
+
+(defn- db sf/Db [name: Str] (let [[d e] (read-file (str "test/sqlfile/fixtures/" name)) [x e2] (sf/open-bytes d)] x))
+
+(defn- table Str [name: Str root: Int] (let [[rows e] (sf/table-rows (db name) root)] (if (= e "") (sha (rows-dump rows)) e)))
+(defn- table-n Int [name: Str root: Int] (let [[rows e] (sf/table-rows (db name) root)] (count rows)))
+(defn- index Str [name: Str root: Int] (let [[ks e] (sf/index-keys (db name) root)] (if (= e "") (sha (keys-dump ks)) e)))
+
+;; rowid の表: 格納型の全部 (整数の各幅、0 と 1 の定数、double、空の TEXT と BLOB)、内部のページのある表、overflow の連なり
+;; (ページ 512 バイトと 64 KB)
+(deftest tables
+  (is (= (table "types.db" 2) "33502dedb1f940160ed58095151ec4c17df4e3ce9bee3013f77b1915a248b749"))
+  (is (= (table-n "types.db" 2) 25))
+  (is (= (table "many.db" 2) "fc41b7a83aaa99f87a3a6d5829ec7e0f43980b6e02f7d5c06f915ab9c33dd8e9"))
+  (is (= (table-n "many.db" 2) 1500))
+  (is (= (table "big.db" 2) "14b5344231f8d614ca407cdf2e87235ea8643a73a797075d7241879fd60be98d"))
+  (is (= (table-n "big.db" 2) 4))
+  (is (= (table "big64k.db" 2) "14b5344231f8d614ca407cdf2e87235ea8643a73a797075d7241879fd60be98d"))
+  (is (= (table-n "big64k.db" 2) 4))
+  )
+
+;; 索引 (内部のページのセルもキーを持つ) と WITHOUT ROWID の表
+(deftest indexes
+  (is (= (index "many.db" 3) "27f13e5a88d9752bbf9efe08c14df7e3fe1189d63cd6b1c1d63a10153f462bc0"))
+  (is (= (index "big.db" 3) "d39e97ebe46b4e425e02bf1df38299305ace689abe8e0f1d2b6171e218c9585e"))
+  (is (= (index "worowid.db" 2) "6adcef8a30a0635685a65f4cf19cc0d168b797c68e78ba45ba3a39b64a0940f1")))
+
+;; sqlite_schema の行
+(deftest schema
+  (let [[rows e] (sf/schema (db "many.db"))
+        s (loop [i 0 out ""] (if (>= i (count rows)) out
+            (let [r (nth rows i) line (str (:type r) "|" (:name r) "|" (:tbl-name r) "|" (:root r) "|" (:sql r))]
+              (recur (+ i 1) (if (= i 0) line (str out "\n" line))))))]
+    (is (= e ""))
+    (is (= (sha s) "f2166014801160ce52975e17b6fed47306f5e1fee3bc3649c517fa71a4961166"))))
+
+;; varint と record の書き出し: 読み戻すと同じ (9 バイトの varint、負の数、各幅の整数、空の TEXT と BLOB、長いヘッダ)
+(defn- vround Bool [n: Int] (let [b (sf/put-varint n) [v p ok] (sf/get-varint b 0)] (and ok (= v n) (= p (count b)))))
+(defn- rround Bool [vals: Vec(sf/Val)]
+  (let [b (sf/encode-record vals) [back ok] (sf/decode-record b)] (and ok (= (keys-dump [back]) (keys-dump [vals])))))
+
+(deftest write-varint-record
+  (is (vround 0)) (is (vround 127)) (is (vround 128)) (is (vround 16383)) (is (vround 16384)) (is (vround 2097151))
+  (is (vround 72057594037927935)) (is (vround 72057594037927936)) (is (vround -1)) (is (vround (- -9223372036854775807 1)))
+  (is (vround 9223372036854775807))
+  (is (= (count (sf/put-varint 72057594037927935)) 8))
+  (is (= (count (sf/put-varint -1)) 9))
+  (is (rround [(sf/->VNull) (sf/->VInt 0) (sf/->VInt 1) (sf/->VInt -1) (sf/->VInt 300) (sf/->VInt 70000) (sf/->VInt 3000000000)
+               (sf/->VInt 300000000000000) (sf/->VInt 9223372036854775807) (sf/->VReal 1.5) (sf/->VText "") (sf/->VBlob "") (sf/->VText "abc")]))
+  (is (rround (loop [i 0 acc: Vec(sf/Val) []] (if (>= i 200) acc (recur (+ i 1) (conj acc (sf/->VText "x")))))))
+  (is (= (sf/encode-record [(sf/->VInt 1) (sf/->VText "a")]) (str (chr 3) (chr 9) (chr 15) "a"))))

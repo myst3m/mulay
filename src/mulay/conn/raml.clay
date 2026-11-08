@@ -1,0 +1,388 @@
+(ns mulay.conn.raml
+  (:require [mulay.lib.yaml :as y] [mulay.conn.apispec :as sp] [mulay.lib.jsonschema :as js] [clay.string :as str]))
+
+(defn- key y/YVal [m: &y/YVal k: &Str] (sp/key m k))
+(defn- has? Bool [m: &y/YVal k: &Str] (sp/has? m k))
+(defn- text Str [x: &y/YVal] (match x (y/YTagged t v) (y/scalar-text v) _ (y/scalar-text x)))
+(defn- keys-of Vec(Str) [m: &y/YVal] (sp/map-keys m))
+
+(defn- ymap y/YVal [ks: &Vec(Str) vs: &Vec(y/YVal)]
+  (y/->YMap (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (y/->YStr (nth ks i)))))) (copy-vals vs)))
+
+(defn- copy-vals Vec(y/YVal) [vs: &Vec(y/YVal)] (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count vs)) acc (recur (+ i 1) (conj acc (nth vs i))))))
+
+(defn- empty-map y/YVal [] (y/->YMap [] []))
+
+(defn- yset y/YVal [m: &y/YVal k: &Str v: y/YVal]
+  (match m
+    (y/YMap ks vs) (let [i (loop [j 0] (if (>= j (count ks)) -1 (if (= (text (nth ks j)) k) j (recur (+ j 1)))))]
+                     (if (< i 0) (y/->YMap (conj (copy-vals ks) (y/->YStr (str k))) (conj (copy-vals vs) v))
+                       (y/->YMap (copy-vals ks) (assoc (copy-vals vs) i v))))
+    _ (ymap [(str k)] [v])))
+
+(defn- ydel y/YVal [m: &y/YVal k: &Str]
+  (match m
+    (y/YMap ks vs) (loop [i 0 aks: Vec(y/YVal) [] avs: Vec(y/YVal) []]
+                     (if (>= i (count ks)) (y/->YMap aks avs)
+                       (if (= (text (nth ks i)) k) (recur (+ i 1) aks avs) (recur (+ i 1) (conj aks (nth ks i)) (conj avs (nth vs i))))))
+    _ m))
+
+(defn- dir-of Str [p: &Str] (let [k (str/last-index-of p "/")] (if (< k 0) "" (subs p 0 k))))
+
+(defn- join-path Str [dir: &Str rel: &Str]
+  (let [raw (if (or (= dir "") (str/starts-with? rel "/")) (str rel) (str dir "/" rel))
+        parts: Vec(Str) (str/split raw "/")
+        out (loop [i 0 acc: Vec(Str) []]
+              (if (>= i (count parts)) acc
+                (let [x (nth parts i)]
+                  (cond (or (= x "") (= x ".")) (recur (+ i 1) acc)
+                        (= x "..") (recur (+ i 1) (if (> (count acc) 0) (drop-tail acc) acc))
+                        :else (recur (+ i 1) (conj acc x))))))]
+    (str/join "/" out)))
+
+(defn- drop-tail Vec(Str) [v: &Vec(Str)] (loop [i 0 acc: Vec(Str) []] (if (>= i (- (count v) 1)) acc (recur (+ i 1) (conj acc (nth v i))))))
+
+(defn- yaml-opts y/YOpts [] (y/->YOpts 400 1000000 true -1))
+
+(defn- load-doc Values(y/YVal Str) [path: &Str res: &Fn(Str Values(Str Bool)) depth: Int]
+  (let [[src found] (res path)]
+    (cond
+      (not found) (values (y/->YNull) (str "RAML: included file '" path "' not found"))
+      (> depth 32) (values (y/->YNull) (str "RAML: includes nested too deeply at '" path "'"))
+      (str/ends-with? path ".json")
+      (let [[v e] (y/parse src)] (if (not= e "") (values (y/->YNull) (str "RAML: " path ": " e)) (values (y/->YTagged "!json" v) "")))
+      (or (str/ends-with? path ".raml") (str/ends-with? path ".yaml") (str/ends-with? path ".yml"))
+      (let [[docs e] (y/parse-all-with src (yaml-opts))]
+        (if (not= e "") (values (y/->YNull) (str "RAML: " path ": " e))
+          (resolve-inc (if (= (count docs) 0) (y/->YNull) (nth docs 0)) (dir-of path) res (+ depth 1))))
+      :else (values (y/->YStr src) ""))))
+
+(defn- resolve-inc Values(y/YVal Str) [x: &y/YVal dir: &Str res: &Fn(Str Values(Str Bool)) depth: Int]
+  (match x
+    (y/YTagged t v) (if (= t "!include") (load-doc (join-path dir (text v)) res depth) (values v ""))
+    (y/YMap ks vs) (loop [i 0 acc: Vec(y/YVal) []]
+                     (if (>= i (count vs)) (values (y/->YMap (copy-vals ks) acc) "")
+                       (let [[r e] (resolve-inc (nth vs i) dir res depth)]
+                         (if (not= e "") (values (y/->YNull) e) (recur (+ i 1) (conj acc r))))))
+    (y/YSeq xs) (loop [i 0 acc: Vec(y/YVal) []]
+                  (if (>= i (count xs)) (values (y/->YSeq acc) "")
+                    (let [[r e] (resolve-inc (nth xs i) dir res depth)]
+                      (if (not= e "") (values (y/->YNull) e) (recur (+ i 1) (conj acc r))))))
+    _ (values x "")))
+
+(defrecord Ctx [types: y/YVal traits: y/YVal rtypes: y/YVal media: Vec(Str) v08: Bool errs: Atom])
+
+(defn- add-prefixed y/YVal [acc: y/YVal m: &y/YVal prefix: &Str]
+  (let [ks (keys-of m)] (loop [i 0 a acc] (if (>= i (count ks)) a (recur (+ i 1) (yset a (str prefix (nth ks i)) (key m (nth ks i))))))))
+
+(defn- schemas08 y/YVal [x: &y/YVal]
+  (match x
+    (y/YSeq xs) (loop [i 0 a (empty-map)] (if (>= i (count xs)) a (recur (+ i 1) (add-prefixed a (nth xs i) ""))))
+    (y/YMap ks vs) x
+    _ (empty-map)))
+
+(defn- ctx-of Ctx [doc: &y/YVal v08: Bool]
+  (let [uses (key doc "uses")
+        lnames (keys-of uses)
+        t0 (add-prefixed (add-prefixed (empty-map) (key doc "types") "") (schemas08 (key doc "schemas")) "")
+        tr0 (add-prefixed (empty-map) (key doc "traits") "")
+        rt0 (add-prefixed (empty-map) (key doc "resourceTypes") "")
+        [t tr rt] (loop [i 0 t t0 tr tr0 rt rt0]
+                    (if (>= i (count lnames)) (values t tr rt)
+                      (let [ln (nth lnames i) lib (key uses ln) pre (str ln ".")]
+                        (recur (+ i 1) (add-prefixed t (key lib "types") pre) (add-prefixed tr (key lib "traits") pre) (add-prefixed rt (key lib "resourceTypes") pre)))))
+        mt (key doc "mediaType")
+        media (match mt (y/YSeq xs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (str/lower-case (text (nth xs i)))))))
+                (y/YNull) ["application/json"]
+                _ [(str/lower-case (text mt))])]
+    (->Ctx t tr rt media v08 (atom (->dyn "")))))
+
+(defn- builtin Values(y/YVal Bool) [n: &Str]
+  (cond
+    (or (= n "string") (= n "number") (= n "integer") (= n "boolean") (= n "object") (= n "array")) (values (ymap ["type"] [(y/->YStr (str n))]) true)
+    (= n "date-only") (values (ymap ["type" "format"] [(y/->YStr "string") (y/->YStr "date")]) true)
+    (= n "datetime") (values (ymap ["type" "format"] [(y/->YStr "string") (y/->YStr "date-time")]) true)
+    (or (= n "datetime-only") (= n "time-only")) (values (ymap ["type" "format"] [(y/->YStr "string") (y/->YStr (str n))]) true)
+    (or (= n "file") (= n "any")) (values (empty-map) true)
+    (= n "nil") (values (ymap ["type"] [(y/->YStr "null")]) true)
+    :else (values (empty-map) false)))
+
+(defn- type-expr y/YVal [s0: &Str c: &Ctx depth: Int]
+  (let [s (str/trim s0)]
+    (cond
+      (> depth 40) (empty-map)
+      (str/starts-with? s "{") (let [[v e] (y/parse s)] (if (= e "") v (empty-map)))
+      (str/includes? s "|")
+      (let [parts: Vec(Str) (str/split s "|")]
+        (ymap ["anyOf"] [(y/->YSeq (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count parts)) acc (recur (+ i 1) (conj acc (type-expr (nth parts i) c (+ depth 1)))))))]))
+      (str/ends-with? s "[]") (ymap ["type" "items"] [(y/->YStr "array") (type-expr (subs s 0 (- (count s) 2)) c (+ depth 1))])
+      (and (str/starts-with? s "(") (str/ends-with? s ")")) (type-expr (subs s 1 (- (count s) 1)) c (+ depth 1))
+      :else
+      (let [[b ok] (builtin s)]
+        (cond ok b
+              (has? (:types c) s) (to-schema (key (:types c) s) c (+ depth 1))
+              :else
+              (let [ks (keys-of (:types c))
+                    k (loop [i 0] (if (>= i (count ks)) -1 (if (str/ends-with? (nth ks i) (str "." s)) i (recur (+ i 1)))))]
+                (if (< k 0)
+                  (let [z (swap! (:errs c) (fn Dyn [old: Dyn] (->dyn (str (dyn->str old) "Invalid reference '" s "'\n"))))] (empty-map))
+                  (to-schema (key (:types c) (nth ks k)) c (+ depth 1)))))))))
+
+(def FACETS ["enum" "pattern" "minLength" "maxLength" "minimum" "maximum" "multipleOf" "minItems" "maxItems" "uniqueItems"
+             "minProperties" "maxProperties" "additionalProperties" "format" "default"])
+
+(defn- optional? Bool [name: &Str decl: &y/YVal]
+  (or (str/ends-with? name "?")
+      (match (key decl "required") (y/YBool b) (not b) _ false)))
+
+(defn- prop-name Str [name: &Str] (if (str/ends-with? name "?") (subs name 0 (- (count name) 1)) (str name)))
+
+(defn to-schema y/YVal [decl: &y/YVal c: &Ctx depth: Int]
+  (if (> depth 40) (empty-map)
+    (match decl
+      (y/YNull) (empty-map)
+      (y/YTagged t v) (if (= t "!json") v (to-schema v c depth))
+      (y/YStr s) (type-expr s c depth)
+      (y/YSeq xs) (ymap ["allOf"] [(y/->YSeq (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (to-schema (nth xs i) c (+ depth 1)))))))])
+      (y/YMap ks vs)
+      (if (has? decl "formParameters") (form-params (key decl "formParameters") c depth)
+      (let [tv (if (has? decl "type") (key decl "type") (key decl "schema"))
+            base (match tv
+                   (y/YNull) (cond (has? decl "properties") (ymap ["type"] [(y/->YStr "object")])
+                                   (has? decl "items") (ymap ["type"] [(y/->YStr "array")])
+                                   (has? decl "enum") (empty-map)
+                                   :else (ymap ["type"] [(y/->YStr "string")]))
+                   _ (to-schema tv c (+ depth 1)))
+            s1 (loop [i 0 s base]
+                 (if (>= i (count FACETS)) s
+                   (let [f (nth FACETS i)] (recur (+ i 1) (if (has? decl f) (yset s f (key decl f)) s)))))
+            s2 (if (has? decl "items") (yset s1 "items" (to-schema (key decl "items") c (+ depth 1))) s1)]
+        (if (not (has? decl "properties")) s2
+          (let [props (key decl "properties")
+                pk (keys-of props)
+                base-props (key s2 "properties")
+                base-req (match (key s2 "required") (y/YSeq xs) xs _ [])
+                [pm req] (loop [i 0 pm base-props rq: Vec(y/YVal) (copy-vals base-req)]
+                           (if (>= i (count pk)) (values pm rq)
+                             (let [n (nth pk i) d (key props n) nm (prop-name n)]
+                               (recur (+ i 1) (yset pm nm (to-schema d c (+ depth 1)))
+                                      (if (optional? n d) rq (conj rq (y/->YStr nm)))))))
+                s3 (yset (yset s2 "type" (y/->YStr "object")) "properties" pm)]
+            (if (= (count req) 0) s3 (yset s3 "required" (y/->YSeq req)))))))
+      _ (empty-map))))
+
+(defn- form-params y/YVal [fp: &y/YVal c: &Ctx depth: Int]
+  (let [ks (keys-of fp)
+        [pm req] (loop [i 0 pm (empty-map) rq: Vec(y/YVal) []]
+                   (if (>= i (count ks)) (values pm rq)
+                     (let [n (nth ks i) d (key fp n)
+                           r (match (key d "required") (y/YBool b) b _ false)]
+                       (recur (+ i 1) (yset pm n (to-schema d c (+ depth 1))) (if r (conj rq (y/->YStr (str n))) rq)))))
+        s (ymap ["type" "properties"] [(y/->YStr "object") pm])]
+    (if (= (count req) 0) s (yset s "required" (y/->YSeq req)))))
+
+(defn- subst-str Str [s: &Str names: &Vec(Str) vals: &Vec(Str)]
+  (loop [i 0 out (str s)]
+    (let [a (str/index-of-after out "<<" i)]
+      (if (< a 0) out
+        (let [b (str/index-of-after out ">>" a)]
+          (if (< b 0) out
+            (let [inner (str/trim (subs out (+ a 2) b))
+                  nm (str/trim (let [k (str/index-of inner "|")] (if (< k 0) inner (subs inner 0 k))))
+                  k (loop [j 0] (if (>= j (count names)) -1 (if (= (nth names j) nm) j (recur (+ j 1)))))]
+              (if (< k 0) (recur (+ b 2) out)
+                (let [rep (nth vals k)]
+                  (recur (+ a (count rep)) (str (subs out 0 a) rep (subs out (+ b 2) (count out)))))))))))))
+
+(defn- subst y/YVal [x: &y/YVal names: &Vec(Str) vals: &Vec(Str)]
+  (match x
+    (y/YStr s) (if (str/includes? s "<<") (y/resolve-plain (subst-str s names vals)) x)
+    (y/YMap ks vs) (y/->YMap (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (subst (nth ks i) names vals)))))
+                             (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count vs)) acc (recur (+ i 1) (conj acc (subst (nth vs i) names vals))))))
+    (y/YSeq xs) (y/->YSeq (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (subst (nth xs i) names vals))))))
+    _ x))
+
+(defn- ymerge y/YVal [base: &y/YVal over: &y/YVal]
+  (match over
+    (y/YNull) base
+    (y/YMap oks ovs)
+    (match base
+      (y/YMap bks bvs)
+      (let [bk (keys-of base) ok (keys-of over)
+            m1 (loop [i 0 m (empty-map)]
+                 (if (>= i (count bk)) m
+                   (let [k (nth bk i)] (recur (+ i 1) (yset m k (if (has? over k) (ymerge (key base k) (key over k)) (key base k)))))))]
+        (loop [i 0 m m1] (if (>= i (count ok)) m (recur (+ i 1) (let [k (nth ok i)] (if (has? base k) m (yset m k (key over k))))))))
+      _ over)
+    _ over))
+
+(defn- ref-of Values(Str Vec(Str) Vec(Str)) [r: &y/YVal]
+  (match r
+    (y/YMap ks vs) (if (= (count ks) 0) (values "" [] [])
+                     (let [ps (nth vs 0) pk (keys-of ps)]
+                       (values (text (nth ks 0)) pk (loop [i 0 acc: Vec(Str) []] (if (>= i (count pk)) acc (recur (+ i 1) (conj acc (text (key ps (nth pk i))))))))))
+    _ (values (text r) [] [])))
+
+(defn- last-name Str [path: &Str]
+  (let [segs (sp/segs-of path)]
+    (loop [i (- (count segs) 1)] (if (< i 0) "" (let [s (nth segs i)] (if (str/starts-with? s "{") (recur (- i 1)) (str s)))))))
+
+(defn- apply-rtype y/YVal [node: &y/YVal path: &Str c: &Ctx depth: Int]
+  (if (or (not (has? node "type")) (> depth 8)) node
+    (let [[nm pn pv] (ref-of (key node "type"))
+          rt0 (key (:rtypes c) nm)
+          names (conj (conj pn "resourcePath") "resourcePathName")
+          vals (conj (conj pv (str path)) (last-name path))
+          rt1 (apply-rtype (subst rt0 names vals) path c (+ depth 1))
+          rk (keys-of rt1)
+          rt2 (loop [i 0 m (empty-map)]
+                (if (>= i (count rk)) m
+                  (let [k (nth rk i)]
+                    (cond (= k "type") (recur (+ i 1) m)
+                          (str/ends-with? k "?") (let [b (subs k 0 (- (count k) 1))] (recur (+ i 1) (if (has? node b) (yset m b (key rt1 k)) m)))
+                          :else (recur (+ i 1) (yset m k (key rt1 k)))))))]
+      (ymerge rt2 (ydel node "type")))))
+
+(defn- apply-traits y/YVal [mnode: &y/YVal is: &y/YVal path: &Str method: &Str c: &Ctx]
+  (let [refs (match is (y/YSeq xs) xs (y/YNull) [] _ [is])]
+    (loop [i 0 base (empty-map)]
+      (if (>= i (count refs)) (ymerge base mnode)
+        (let [[nm pn pv] (ref-of (nth refs i))
+              names (conj (conj (conj pn "resourcePath") "resourcePathName") "methodName")
+              vals (conj (conj (conj pv (str path)) (last-name path)) (str method))
+              t (subst (key (:traits c) nm) names vals)]
+          (recur (+ i 1) (ymerge base t)))))))
+
+(defn- params-of Vec(sp/Param) [node: &y/YVal in: &Str req-default: Bool c: &Ctx root: &y/YVal]
+  (let [ks (keys-of node)]
+    (loop [i 0 acc: Vec(sp/Param) []]
+      (if (>= i (count ks)) acc
+        (let [n (nth ks i) d (key node n)
+              req (cond (str/ends-with? n "?") false
+                        (has? d "required") (match (key d "required") (y/YBool b) b _ req-default)
+                        :else req-default)]
+          (recur (+ i 1) (conj acc (let [sc (to-schema d c 0)] (sp/->Param (prop-name n) in req sc (sp/clone sc) (sp/scalar-ex (raml-pick d c 0)))))))))))
+
+(defn- has-param? Bool [ps: &Vec(sp/Param) name: &Str] (loop [i 0] (if (>= i (count ps)) false (if (= (:name (nth ps i)) name) true (recur (+ i 1))))))
+
+(defn- implicit-uri Vec(sp/Param) [ps: Vec(sp/Param) path: &Str root: &y/YVal]
+  (let [segs (sp/segs-of path)]
+    (loop [i 0 acc ps]
+      (if (>= i (count segs)) acc
+        (let [s (nth segs i)]
+          (if (and (str/starts-with? s "{") (str/ends-with? s "}") (not (has-param? acc (subs s 1 (- (count s) 1)))))
+            (recur (+ i 1) (conj acc (sp/->Param (subs s 1 (- (count s) 1)) "path" true (ymap ["type"] [(y/->YStr "string")]) (sp/clone root) [])))
+            (recur (+ i 1) acc)))))))
+
+(defn- media-key? Bool [k: &Str] (str/includes? k "/"))
+
+(defn- body-of Vec(sp/Media) [b: &y/YVal c: &Ctx]
+  (let [ks (keys-of b)
+        by-media (loop [i 0] (if (>= i (count ks)) false (if (media-key? (nth ks i)) true (recur (+ i 1)))))]
+    (if by-media
+      (loop [i 0 acc: Vec(sp/Media) []]
+        (if (>= i (count ks)) acc
+          (let [k (nth ks i) d (key b k)
+                sc (to-schema d c 0)
+                has (match d (y/YNull) false _ true)]
+            (recur (+ i 1) (conj acc (sp/->Media (str/lower-case k) sc has (root-of d sc) (raml-example (raml-pick d c 0))))))))
+      (match b
+        (y/YNull) []
+        _ (let [sc (to-schema b c 0)]
+            (loop [i 0 acc: Vec(sp/Media) []] (if (>= i (count (:media c))) acc (recur (+ i 1) (conj acc (sp/->Media (nth (:media c) i) sc true (root-of b sc) (raml-example (raml-pick b c 0))))))))))))
+
+(defn- root-of y/YVal [d: &y/YVal sc: &y/YVal] (sp/clone sc))
+
+(def METHODS ["get" "put" "post" "delete" "options" "head" "patch"])
+
+(defn- op-of sp/Op [method: &Str m0: &y/YVal res-is: &y/YVal path: &Str uri: &Vec(sp/Param) c: &Ctx root: &y/YVal]
+  (let [m1 (apply-traits m0 res-is path method c)
+        m (apply-traits m1 (key m1 "is") path method c)
+        q (params-of (key m "queryParameters") "query" (not (:v08 c)) c root)
+        h (params-of (key m "headers") "header" (not (:v08 c)) c root)
+        all (loop [i 0 acc (copy-params uri)] (if (>= i (count q)) acc (recur (+ i 1) (conj acc (nth q i)))))
+        all2 (loop [i 0 acc all] (if (>= i (count h)) acc (recur (+ i 1) (conj acc (nth h i)))))
+        body (body-of (key m "body") c)
+        rs (key m "responses")
+        codes (keys-of rs)
+        rmedia (loop [i 0 acc: Vec(Str) []]
+                 (if (>= i (count codes)) acc
+                   (let [b (key (key rs (nth codes i)) "body")
+                         ms (body-of b c)]
+                     (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count ms)) a (recur (+ k 1) (conj a (:mime (nth ms k))))))))))]
+    (sp/->Op (str method) all2 body codes rmedia (raml-examples rs codes c))))
+
+(defn- raml-pick y/YVal [d: &y/YVal c: &Ctx depth: Int]
+  (if (> depth 40) (y/->YNull)
+    (match d
+      (y/YStr s) (if (has? (:types c) s) (raml-pick (key (:types c) s) c (+ depth 1)) (y/->YNull))
+      (y/YMap ks vs) (cond (has? d "example") (key d "example")
+                           (has? d "examples") (let [f (sp/first-val (key d "examples"))] (if (has? f "value") (key f "value") f))
+                           :else (match (key d "type")
+                                   (y/YStr s) (raml-pick (key d "type") c (+ depth 1))
+                                   _ (y/->YNull)))
+      _ (y/->YNull))))
+
+(defn- raml-example Vec(Str) [x: &y/YVal]
+  (match x
+    (y/YNull) []
+    (y/YStr s) [(str/trim s)]
+    (y/YTagged t v) (match v (y/YStr s) [(str/trim s)] _ [(js/to-json v)])
+    _ [(js/to-json x)]))
+
+(defn- raml-examples Vec(sp/Example) [rs: &y/YVal codes: &Vec(Str) c: &Ctx]
+  (loop [i 0 acc: Vec(sp/Example) []]
+    (if (>= i (count codes)) acc
+      (let [ms (body-of (key (key rs (nth codes i)) "body") c)
+            acc2 (loop [k 0 a acc]
+                   (if (>= k (count ms)) a
+                     (let [m (nth ms k)]
+                       (recur (+ k 1) (if (= (count (:example m)) 0) a (conj a (sp/->Example (str (nth codes i)) (:mime m) (nth (:example m) 0))))))))]
+        (recur (+ i 1) acc2)))))
+
+(defn- copy-params Vec(sp/Param) [ps: &Vec(sp/Param)] (loop [i 0 acc: Vec(sp/Param) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (nth ps i))))))
+
+(defn- merge-uri Vec(sp/Param) [inherited: &Vec(sp/Param) own: Vec(sp/Param)]
+  (loop [i 0 acc own] (if (>= i (count inherited)) acc (recur (+ i 1) (if (has-param? acc (:name (nth inherited i))) acc (conj acc (nth inherited i)))))))
+
+(defn- walk Vec(sp/Res) [acc0: Vec(sp/Res) node: &y/YVal parent: &Str inherited: &Vec(sp/Param) c: &Ctx root: &y/YVal]
+  (let [ks (keys-of node)]
+    (loop [i 0 acc acc0]
+      (if (>= i (count ks)) acc
+        (let [k (nth ks i)]
+          (if (not (str/starts-with? k "/")) (recur (+ i 1) acc)
+            (let [path (str parent k)
+                  rn (apply-rtype (key node k) path c 0)
+                  own (params-of (key rn "uriParameters") "path" true c root)
+                  uri (implicit-uri (merge-uri inherited own) path root)
+                  ops (loop [j 0 os: Vec(sp/Op) []]
+                        (if (>= j (count METHODS)) os
+                          (let [mt (nth METHODS j)]
+                            (recur (+ j 1) (if (has? rn mt) (conj os (op-of mt (key rn mt) (key rn "is") path uri c root)) os)))))
+                  acc2 (conj acc (sp/->Res path (sp/segs-of path) ops))]
+              (recur (+ i 1) (walk acc2 rn path uri c root)))))))))
+
+(defn parse-raml Values(sp/Api Str) [src: &Str name: &Str res: &Fn(Str Values(Str Bool))]
+  (let [v08 (str/starts-with? (str/trim src) "#%RAML 0.8")
+        [docs e] (y/parse-all-with src (yaml-opts))]
+    (if (not= e "") (values (sp/->Api [] (y/->YNull) false) (str "Errors while parsing API definition '" name "': " e))
+      (let [[doc ie] (resolve-inc (if (= (count docs) 0) (y/->YNull) (nth docs 0)) (dir-of name) res 0)]
+        (if (not= ie "") (values (sp/->Api [] (y/->YNull) false) ie)
+          (let [[doc2 ue] (load-uses doc (dir-of name) res)]
+            (if (not= ue "") (values (sp/->Api [] (y/->YNull) false) ue)
+          (let [c (ctx-of doc2 v08)
+                rs (walk [] doc2 "" [] c doc2)
+                errs: Str (dyn->str (deref (:errs c)))]
+            (if (not= errs "")
+              (values (sp/->Api [] (y/->YNull) false) (str "Errors while parsing API definition '" name "':\n - " (str/replace (str/trim errs) "\n" "\n - ")))
+              (values (sp/->Api rs doc2 false) ""))))))))))
+
+(defn- load-uses Values(y/YVal Str) [doc: &y/YVal dir: &Str res: &Fn(Str Values(Str Bool))]
+  (let [uses (key doc "uses") ks (keys-of uses)]
+    (loop [i 0 u uses]
+      (if (>= i (count ks)) (values (yset doc "uses" u) "")
+        (let [k (nth ks i) x (key uses k)]
+          (match x
+            (y/YStr p) (let [[lib e] (load-doc (join-path dir p) res 1)]
+                         (if (not= e "") (values doc e) (recur (+ i 1) (yset u k lib))))
+            _ (recur (+ i 1) u)))))))

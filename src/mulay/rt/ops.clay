@@ -1,0 +1,184 @@
+(ns mulay.rt.ops (:require [mulay.lib.host :as host] [clay.io :as io] [clay.string :as str]))
+
+(def STARTING 0)
+(def READY 1)
+(def DRAINING 2)
+
+(def BUCKETS ["0.005" "0.01" "0.025" "0.05" "0.1" "0.25" "0.5" "1" "2.5" "5" "10"])
+(def BUCKET-US [5000 10000 25000 50000 100000 250000 500000 1000000 2500000 5000000 10000000])
+
+(defrecord FlowStat [requests: Int errors: Int sum-us: Int buckets: Vec(Int) err-types: Map(Str Int)])
+
+(defn- empty-stats Map(Str FlowStat) [] (let [m: Map(Str FlowStat) {}] m))
+
+(def STATE (atom 0))
+(def INFLIGHT (atom 0))
+(def STATS (atom (empty-stats)))
+(def START-MS (epoch-ms))
+
+(defn set-state Int [s: Int] (let [z (reset! STATE s)] s))
+(defn state Int [] (deref STATE))
+(defn ready? Bool [] (= (deref STATE) READY))
+
+(def MAX-BACKGROUND 512)
+(def BACKGROUND (atom 0))
+
+(defn- counted Int [cnt: &Atom(Int) f: &Fn(Int Int) k: Int]
+  (let [c cnt g f] (with-cleanup (fn Int [] (g k)) (fn Int [] (swap! c (fn Int [x: Int] (- x 1)))))))
+
+(defn spawn-bg-in Int [cnt: Atom(Int) mx: Int f: Fn(Int Int)]
+  (let [n (swap! cnt (fn Int [x: Int] (+ x 1)))]
+    (if (> n mx)
+      (let [z (swap! cnt (fn Int [x: Int] (- x 1)))] (f 0))
+      (let [c1 cnt g f]
+        (do (future-detach (future (fn Int [k: Int] (counted c1 g k)) 1)) 0)))))
+
+(defn spawn-bg Int [f: Fn(Int Int)] (spawn-bg-in BACKGROUND MAX-BACKGROUND f))
+
+(defn spawn-bg-try-in Bool [cnt: Atom(Int) mx: Int f: Fn(Int Int)]
+  (let [n (swap! cnt (fn Int [x: Int] (+ x 1)))]
+    (if (> n mx)
+      (let [z (swap! cnt (fn Int [x: Int] (- x 1)))] false)
+      (let [c1 cnt g f
+            z (future-detach (future (fn Int [k: Int] (counted c1 g k)) 1))]
+        true))))
+
+(defn spawn-bg-try Bool [f: Fn(Int Int)] (spawn-bg-try-in BACKGROUND MAX-BACKGROUND f))
+
+(defn enter Int [] (swap! INFLIGHT (fn Int [n: Int] (+ n 1))))
+(defn leave Int [] (swap! INFLIGHT (fn Int [n: Int] (- n 1))))
+(defn in-flight Int [] (deref INFLIGHT))
+(defn on-fail a [f: Fn(a) undo: Fn(Int)]
+  (let [ok (atom false) g f]
+    (with-cleanup (fn a [] (let [r (g) z (reset! ok true)] r)) (fn Int [] (if (deref ok) 0 (undo))))))
+(defn tracked a [f: Fn(a)] (let [z (enter)] (with-cleanup f (fn Int [] (leave)))))
+
+(defn- new-stat FlowStat [] (let [t: Map(Str Int) {}] (->FlowStat 0 0 0 [0 0 0 0 0 0 0 0 0 0 0] t)))
+
+(defn- add-sample FlowStat [s: FlowStat us: Int err: &Str]
+  (let [bs (loop [i 0 v (:buckets s)]
+             (if (>= i (count BUCKET-US)) v
+               (recur (+ i 1) (if (<= us (nth BUCKET-US i)) (let [n (nth v i)] (assoc v i (+ n 1))) v))))
+        ts (:err-types s)
+        ts2 (if (= err "") ts (assoc ts err (+ (if (contains? ts err) (get! ts err) 0) 1)))]
+    (->FlowStat (+ (:requests s) 1) (+ (:errors s) (if (= err "") 0 1)) (+ (:sum-us s) us) bs ts2)))
+
+(defn record Int [flow: &Str us: Int err: &Str]
+  (let [z (swap! STATS (fn Map(Str FlowStat) [m: Map(Str FlowStat)]
+                         (let [s (if (contains? m flow) (get! m flow) (new-stat))] (assoc m flow (add-sample s us err)))))]
+    0))
+
+(defn- read-trim Str [path: &Str] (let [[s e] (host/file-read path)] (if (= e "") (str/trim s) "")))
+
+(defn- num-or Int [s: &Str default: Int] (let [[n e] (parse-long (str/trim s))] (if (= e "") n default)))
+
+(defn- status-field Int [st: &Str key: &Str]
+  (let [i (str/index-of st (str key ":"))]
+    (if (< i 0) -1
+      (let [e (str/index-of-after st "\n" i)
+            line (subs st (+ i (count key) 1) (if (< e 0) (count st) e))
+            parts (str/split (str/trim line) " ")]
+        (num-or (nth parts 0) -1)))))
+
+(defn proc Values(Int Int Int Int) []
+  (let [stat (read-trim "/proc/self/stat")
+        rp (str/index-of stat ")")
+        fields (if (< rp 0) [] (str/split (str/trim (subs stat (+ rp 1) (count stat))) " "))
+        cpu (if (> (count fields) 12) (* 10 (+ (num-or (nth fields 11) 0) (num-or (nth fields 12) 0))) -1)
+        [st se] (host/file-read "/proc/self/status")
+        rss (let [k (status-field st "VmRSS")] (if (< k 0) -1 (* k 1024)))
+        threads (status-field st "Threads")
+        [fds fe] (host/file-list "/proc/self/fd")]
+    (values cpu rss threads (if (= fe "") (count fds) -1))))
+
+(defn cgroup-memory Values(Int Int) []
+  (let [mx (read-trim "/sys/fs/cgroup/memory.max")
+        cur (read-trim "/sys/fs/cgroup/memory.current")]
+    (values (if (or (= mx "") (= mx "max")) -1 (num-or mx -1)) (if (= cur "") -1 (num-or cur -1)))))
+
+(defn- q Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1) (str out (cond (= c 34) "\\\"" (= c 92) "\\\\" (= c 10) "\\n" :else (subs s i (+ i 1)))))))))
+
+(defn- memory-check Str []
+  (let [[lim cur] (cgroup-memory)
+        [cpu rss th fd] (proc)
+        used (if (> cur 0) cur rss)]
+    (if (or (<= lim 0) (<= used 0)) "ok"
+      (cond (> (* used 10) (* lim 9)) "critical" (> (* used 10) (* lim 8)) "warning" :else "ok"))))
+
+(defn health-body Values(Int Str) []
+  (let [s (state)]
+    (cond
+      (= s STARTING) (values 503 "{\"status\":\"unhealthy\",\"reason\":\"starting\",\"uptime\":0}")
+      (= s DRAINING) (values 503 (str "{\"status\":\"unhealthy\",\"reason\":\"stopping\",\"uptime\":" (/ (- (epoch-ms) START-MS) 1000) "}"))
+      :else
+      (let [mem (memory-check)
+            status (cond (= mem "critical") "unhealthy" (= mem "warning") "degraded" :else "healthy")]
+        (values (if (= status "unhealthy") 503 200)
+                (str "{\"status\":" (q status) ",\"uptime\":" (/ (- (epoch-ms) START-MS) 1000) ",\"checks\":{\"memory\":" (q mem) "}}"))))))
+
+(defn- metric Str [out: Str name: &Str type: &Str help: &Str v: Int]
+  (if (< v 0) out (str out "# HELP " name " " help "\n# TYPE " name " " type "\n" name " " v "\n")))
+
+(defn secs Str [us: Int]
+  (let [whole (/ us 1000000)
+        frac (mod us 1000000)
+        f6 (let [s (str frac)] (str (subs "000000" 0 (- 6 (count s))) s))
+        e (loop [k 6] (if (and (> k 0) (= (nth f6 (- k 1)) 48)) (recur (- k 1)) k))]
+    (if (= e 0) (str whole) (str whole "." (subs f6 0 e)))))
+
+(defn metrics-text Str []
+  (let [[cpu rss th fd] (proc)
+        [lim cur] (cgroup-memory)
+        o1 (if (< cpu 0) "" (str "# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.\n# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total " (secs (* cpu 1000)) "\n"))
+        o2 (metric o1 "process_resident_memory_bytes" "gauge" "Resident memory size in bytes." rss)
+        o3 (metric o2 "process_open_fds" "gauge" "Number of open file descriptors." fd)
+        o4 (metric o3 "process_threads" "gauge" "Number of OS threads." th)
+        o5 (str o4 "# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.\n# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds " (/ START-MS 1000) "\n")
+        o6 (metric o5 "mulay_container_memory_limit_bytes" "gauge" "Memory limit of the container (cgroup v2)." lim)
+        o7 (metric o6 "mulay_container_memory_usage_bytes" "gauge" "Memory usage of the container (cgroup v2)." cur)
+        o8 (str o7 "# HELP mulay_inflight_requests Requests being processed.\n# TYPE mulay_inflight_requests gauge\nmulay_inflight_requests " (in-flight) "\n")
+        stats (deref STATS)
+        names (sort (keys stats))
+        o9 (str o8 "# HELP mulay_flow_requests_total Flow executions started by a source.\n# TYPE mulay_flow_requests_total counter\n")
+        o10 (loop [i 0 o o9] (if (>= i (count names)) o
+                              (let [n (nth names i)] (recur (+ i 1) (str o "mulay_flow_requests_total{flow=" (q n) "} " (:requests (get! stats n)) "\n")))))
+        o11 (str o10 "# HELP mulay_flow_errors_total Flow executions that ended with an error, by error type.\n# TYPE mulay_flow_errors_total counter\n")
+        o12 (loop [i 0 o o11] (if (>= i (count names)) o
+                               (let [n (nth names i)
+                                     ts (:err-types (get! stats n))
+                                     tk (sort (keys ts))]
+                                 (recur (+ i 1) (loop [j 0 oo o] (if (>= j (count tk)) oo
+                                                                   (recur (+ j 1) (str oo "mulay_flow_errors_total{flow=" (q n) ",type=" (q (nth tk j)) "} " (get! ts (nth tk j)) "\n"))))))))
+        o13 (str o12 "# HELP mulay_flow_duration_seconds Flow execution time.\n# TYPE mulay_flow_duration_seconds histogram\n")]
+    (loop [i 0 o o13]
+      (if (>= i (count names)) o
+        (let [n (nth names i)
+              s (get! stats n)
+              bs (:buckets s)
+              ob (loop [j 0 oo o] (if (>= j (count BUCKETS)) oo
+                                    (recur (+ j 1) (str oo "mulay_flow_duration_seconds_bucket{flow=" (q n) ",le=" (q (nth BUCKETS j)) "} " (nth bs j) "\n"))))]
+          (recur (+ i 1) (str ob "mulay_flow_duration_seconds_bucket{flow=" (q n) ",le=\"+Inf\"} " (:requests s) "\n"
+                              "mulay_flow_duration_seconds_sum{flow=" (q n) "} " (secs (:sum-us s)) "\n"
+                              "mulay_flow_duration_seconds_count{flow=" (q n) "} " (:requests s) "\n")))))))
+
+(defn metrics-json Str []
+  (let [[cpu rss th fd] (proc)
+        [lim cur] (cgroup-memory)
+        stats (deref STATS)
+        names (sort (keys stats))
+        flows (loop [i 0 o ""]
+                (if (>= i (count names)) o
+                  (let [n (nth names i)
+                        s (get! stats n)
+                        ts (:err-types s)
+                        tk (sort (keys ts))
+                        te (loop [j 0 oo ""] (if (>= j (count tk)) oo (recur (+ j 1) (str oo (if (= j 0) "" ",") (q (nth tk j)) ":" (get! ts (nth tk j))))))]
+                    (recur (+ i 1) (str o (if (= i 0) "" ",") (q n) ":{\"requests\":" (:requests s) ",\"errors\":" (:errors s)
+                                        ",\"errorTypes\":{" te "},\"durationSeconds\":" (secs (:sum-us s)) "}")))))]
+    (str "{\"process\":{\"cpuSeconds\":" (if (< cpu 0) "null" (secs (* cpu 1000))) ",\"rssBytes\":" rss ",\"threads\":" th ",\"openFds\":" fd
+         ",\"startTimeSeconds\":" (/ START-MS 1000) "},\"container\":{\"memoryLimitBytes\":" lim ",\"memoryUsageBytes\":" cur
+         "},\"inflight\":" (in-flight) ",\"flows\":{" flows "}}")))

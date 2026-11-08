@@ -1,0 +1,295 @@
+(ns mulay.mule.dump
+  (:require [clay.core] [clay.string :as str] [mulay.mule.model :as m] [mulay.lib.xml :as xml]))
+
+(defrecord KindCount [kind: Str n: Int])
+
+(defn- lower Str [s: &Str]
+  (loop [i 0 out ""] (if (>= i (count s)) out
+                       (let [c (nth s i)] (recur (+ i 1) (str out (chr (if (and (>= c 65) (<= c 90)) (+ c 32) c))))))))
+
+(defn secret-key? Bool [k: &Str]
+  (let [l (lower k)]
+    (or (str/includes? l "password") (str/includes? l "secret") (str/includes? l "token")
+        (str/includes? l "credential") (str/includes? l "apikey") (str/includes? l "api.key") (str/includes? l "passphrase")
+        (str/starts-with? l "secure::")
+        (str/ends-with? l "key") (str/ends-with? l "pass") (str/ends-with? l "passwd"))))
+
+(defn proc-kind Str [p: &m/Proc]
+  (match p
+    (m/PrSetPayload v mi e l) "set-payload"
+    (m/PrSetVar n v mi l) "set-variable"
+    (m/PrRemoveVar n l) "remove-variable"
+    (m/PrLogger ms lv c l) "logger"
+    (m/PrTransform pa at vs l) "ee:transform"
+    (m/PrFlowRef n t tv l) "flow-ref"
+    (m/PrRaise t d l) "raise-error"
+    (m/PrParseTemplate c pts t l) "parse-template"
+    (m/PrChoice ws o l) "choice"
+    (m/PrForEach c cn rn b ps l) "foreach"
+    (m/PrParallelForEach c mc to t ps l) "parallel-foreach"
+    (m/PrScatterGather rs to mc t l) "scatter-gather"
+    (m/PrTry ps hs r ta l) "try"
+    (m/PrUntilSuccessful mr mb ps l) "until-successful"
+    (m/PrAsync ps mc l) "async"
+    (m/PrIdempotent id vl so pr l) "idempotent-message-validator"
+    (m/PrCache sr fl ps l) "ee:cache"
+    (m/PrInvalidateKey sr kx l) "ee:invalidate-key"
+    (m/PrInvalidateCache sr l) "ee:invalidate-cache"
+    (m/PrBatchJob nm bs mf mc ss oc l) "batch:job"
+    (m/PrFirstSuccessful rs l) "first-successful"
+    (m/PrRoundRobin rs id l) "round-robin"
+    (m/PrConnectorOp cn op cr ps cs ex chs t tv l) (str cn ":" op)
+    (m/PrUnknown n l) (str "unknown(" n ")")))
+
+(defn source-kind Str [s: &m/Source]
+  (match s
+    (m/SrcHttpListener cr pa ms s1 h1 b1 s2 h2 b2 r1 r2 sm om oe l) "http:listener"
+    (m/SrcScheduler f sd cr tz dc l) "scheduler"
+    (m/SrcConnector cn nm cr ps cs _ex sch l) (str cn ":" nm)))
+
+(defn- sub-lists Vec(Vec(m/Proc)) [p: &m/Proc]
+  (match p
+    (m/PrChoice ws o l) (loop [i 0 acc: Vec(Vec(m/Proc)) []] (if (>= i (count ws)) (conj acc o) (recur (+ i 1) (conj acc (:procs (nth ws i))))))
+    (m/PrForEach c cn rn b ps l) [ps]
+    (m/PrParallelForEach c mc to t ps l) [ps]
+    (m/PrScatterGather rs to mc t l) (loop [i 0 acc: Vec(Vec(m/Proc)) []] (if (>= i (count rs)) acc (recur (+ i 1) (conj acc (:procs (nth rs i))))))
+    (m/PrTry ps hs r ta l) (loop [i 0 acc: Vec(Vec(m/Proc)) [ps]] (if (>= i (count hs)) acc (recur (+ i 1) (conj acc (:procs (nth hs i))))))
+    (m/PrUntilSuccessful mr mb ps l) [ps]
+    (m/PrAsync ps mc l) [ps]
+    (m/PrCache sr fl ps l) [ps]
+    (m/PrBatchJob nm bs mf mc ss oc l)
+    (loop [i 0 acc: Vec(Vec(m/Proc)) []]
+      (if (>= i (count ss)) (conj acc oc)
+        (let [st (nth ss i) ags (:aggregator st)
+              a1 (conj acc (:procs st))]
+          (recur (+ i 1) (if (= (count ags) 0) a1 (conj a1 (:procs (nth ags 0))))))))
+    (m/PrFirstSuccessful rs l) (loop [i 0 acc: Vec(Vec(m/Proc)) []] (if (>= i (count rs)) acc (recur (+ i 1) (conj acc (:procs (nth rs i))))))
+    (m/PrRoundRobin rs id l) (loop [i 0 acc: Vec(Vec(m/Proc)) []] (if (>= i (count rs)) acc (recur (+ i 1) (conj acc (:procs (nth rs i))))))
+    (m/PrConnectorOp cn op cr ps cs ex chs t tv l) (loop [i 0 acc: Vec(Vec(m/Proc)) []] (if (>= i (count chs)) acc (recur (+ i 1) (conj acc (:procs (nth chs i))))))
+    _ []))
+
+(defn- count-into Map(Str Int) [acc: Map(Str Int) ps: &Vec(m/Proc)]
+  (loop [i 0 a acc]
+    (if (>= i (count ps)) a
+      (let [p (nth ps i)
+            k (proc-kind p)
+            a2 (assoc a k (+ (get a k 0) 1))
+            subs (sub-lists p)
+            a3 (loop [j 0 b a2] (if (>= j (count subs)) b (recur (+ j 1) (count-into b (nth subs j)))))]
+        (recur (+ i 1) a3)))))
+
+(defn kind-counts Vec(KindCount) [app: &m/App]
+  (let [fs (:flows app)
+        mp (loop [i 0 a: Map(Str Int) {}]
+             (if (>= i (count fs)) a
+               (let [f (nth fs i)
+                     a1 (count-into a (:procs f))
+                     hs (:handlers f)
+                     a2 (loop [k 0 b a1] (if (>= k (count hs)) b (recur (+ k 1) (count-into b (:procs (nth hs k))))))]
+                 (recur (+ i 1) a2))))
+        gs (:global-handlers app)
+        mp2 (loop [i 0 a mp]
+              (if (>= i (count gs)) a
+                (let [hs (:handlers (nth gs i))]
+                  (recur (+ i 1) (loop [k 0 b a] (if (>= k (count hs)) b (recur (+ k 1) (count-into b (:procs (nth hs k))))))))))
+        ks: Vec(Str) (sort (keys mp2))
+        v (loop [i 0 acc: Vec(KindCount) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (->KindCount (nth ks i) (get mp2 (nth ks i) 0))))))]
+    (loop [i 1 w v]
+      (if (>= i (count w)) w
+        (let [x (nth w i)
+              w2 (loop [j i ww w]
+                   (if (and (> j 0) (< (:n (nth ww (- j 1))) (:n x)))
+                     (recur (- j 1) (assoc ww j (nth ww (- j 1))))
+                     (assoc ww j x)))]
+          (recur (+ i 1) w2))))))
+
+(defn count-procs Int [app: &m/App]
+  (let [kc (kind-counts app)] (loop [i 0 n 0] (if (>= i (count kc)) n (recur (+ i 1) (+ n (:n (nth kc i))))))))
+
+(defn summary Str [app: &m/App]
+  (let [fs (:flows app)
+        nsub (loop [i 0 n 0] (if (>= i (count fs)) n (recur (+ i 1) (if (:sub (nth fs i)) (+ n 1) n))))]
+    (str (:name app) ": " (- (count fs) nsub) " flows, " nsub " sub-flows, " (count (:configs app)) " configs, "
+         (count-procs app) " processors, " (count (:diags app)) " diags")))
+
+(defn- pv Str [v: &m/PVal]
+  (match v (m/PLit s) (str "\"" s "\"") (m/PExpr t c sr) (str t)))
+
+(defn- pvs Str [vs: &Vec(m/PVal)] (if (= (count vs) 0) "-" (pv (nth vs 0))))
+
+(defn- one-line Str [s: &Str]
+  (let [t (str/replace (str/replace (str s) "\r" "") "\n" "\\n")]
+    (if (> (count t) 100) (str (subs t 0 97) "...") t)))
+
+(defn- ind Str [n: Int] (loop [i 0 s ""] (if (>= i n) s (recur (+ i 1) (str s "  ")))))
+
+(defn- params-str Str [ps: &Vec(m/Param)]
+  (loop [i 0 out ""]
+    (if (>= i (count ps)) out
+      (let [p (nth ps i) k (:name p)]
+        (recur (+ i 1) (str out " " k "=" (if (secret-key? k) "****" (one-line (pv (:v p))))))))))
+
+(defn- children-str Str [cs: &Vec(xml/XNode)]
+  (loop [i 0 out ""]
+    (if (>= i (count cs)) (if (= out "") "" (str " <" out ">"))
+      (let [c (nth cs i)]
+        (recur (+ i 1) (if (xml/elem? c) (if (= out "") (xml/qname-str (xml/elem-name c)) (str out " " (xml/qname-str (xml/elem-name c)))) out))))))
+
+(defn- at Str [l: &m/Loc] (str "  @" (:line l)))
+
+(defn- dump-procs Str [out: Str ps: &Vec(m/Proc) depth: Int]
+  (loop [i 0 o out]
+    (if (>= i (count ps)) o
+      (recur (+ i 1) (dump-proc o (nth ps i) depth)))))
+
+(defn- dump-handlers Str [out: Str hs: &Vec(m/Handler) depth: Int]
+  (loop [i 0 o out]
+    (if (>= i (count hs)) o
+      (let [h (nth hs i)
+            o1 (str o (ind depth) (if (:propagate h) "on-error-propagate" "on-error-continue")
+                    " type=" (if (= (count (:types h)) 0) "ANY" (str/join "," (:types h)))
+                    (if (> (count (:when h)) 0) (str " when=" (one-line (pvs (:when h)))) "")
+                    (if (:log-exception h) "" " logException=false")
+                    (at (:loc h)) "\n")]
+        (recur (+ i 1) (dump-procs o1 (:procs h) (+ depth 1)))))))
+
+(defn- dump-routes Str [out: Str rs: &Vec(m/Route) depth: Int]
+  (loop [i 0 o out]
+    (if (>= i (count rs)) o
+      (recur (+ i 1) (dump-procs (str o (ind depth) "route " i "\n") (:procs (nth rs i)) (+ depth 1))))))
+
+(defn- dump-proc Str [out: Str p: &m/Proc depth: Int]
+  (let [o (str out (ind depth) (proc-kind p))]
+    (match p
+      (m/PrSetPayload v mi e l) (str o " " (one-line (pv v)) (if (= mi "") "" (str " mimeType=" mi)) (at l) "\n")
+      (m/PrSetVar n v mi l) (str o " " n " = " (one-line (pv v)) (at l) "\n")
+      (m/PrRemoveVar n l) (str o " " n (at l) "\n")
+      (m/PrLogger ms lv c l) (str o " " lv (if (= c "") "" (str " [" c "]")) " " (one-line (pvs ms)) (at l) "\n")
+      (m/PrTransform pa at0 vs l)
+      (str o (if (> (count pa) 0) " payload" "") (if (> (count at0) 0) " attributes" "")
+           (loop [i 0 s ""] (if (>= i (count vs)) s (recur (+ i 1) (str s " vars." (:name (nth vs i)))))) (at l) "\n")
+      (m/PrFlowRef n t tv l) (str o " " (pv n) (if (= t "") "" (str " target=" t)) (at l) "\n")
+      (m/PrRaise t d l) (str o " " t " " (one-line (pv d)) (at l) "\n")
+      (m/PrIdempotent id vl so pr l) (str o " id=" (one-line (pv id)) " value=" (one-line (pv vl)) (if (= so "") "" (str " objectStore=" so)) (if (> (count pr) 0) " private" "") (at l) "\n")
+      (m/PrParseTemplate c pts t l) (str o " " (count pts) " parts" (if (= t "") "" (str " target=" t)) (at l) "\n")
+      (m/PrChoice ws ow l)
+      (let [o1 (loop [i 0 s (str o (at l) "\n")]
+                 (if (>= i (count ws)) s
+                   (let [w (nth ws i)]
+                     (recur (+ i 1) (dump-procs (str s (ind (+ depth 1)) "when " (one-line (pv (:cond w))) "\n") (:procs w) (+ depth 2))))))]
+        (if (= (count ow) 0) o1 (dump-procs (str o1 (ind (+ depth 1)) "otherwise\n") ow (+ depth 2))))
+      (m/PrForEach c cn rn b ps l) (dump-procs (str o " " (pvs c) (if (= b 1) "" (str " batch=" b)) (at l) "\n") ps (+ depth 1))
+      (m/PrParallelForEach c mc to t ps l) (dump-procs (str o " " (pvs c) (at l) "\n") ps (+ depth 1))
+      (m/PrScatterGather rs to mc t l) (dump-routes (str o (at l) "\n") rs (+ depth 1))
+      (m/PrTry ps hs r ta l)
+      (let [o1 (dump-procs (str o (if (= r "") "" (str " error-handler=" r)) (at l) "\n") ps (+ depth 1))]
+        (dump-handlers o1 hs (+ depth 1)))
+      (m/PrUntilSuccessful mr mb ps l) (dump-procs (str o " maxRetries=" mr " millisBetweenRetries=" mb (at l) "\n") ps (+ depth 1))
+      (m/PrAsync ps mc l) (dump-procs (str o (at l) "\n") ps (+ depth 1))
+      (m/PrCache sr fl ps l) (dump-procs (str o (if (= sr "") "" (str " cachingStrategy-ref=" sr)) (if (= (count fl) 0) "" (str " filter=" (one-line (pv (nth fl 0))))) (at l) "\n") ps (+ depth 1))
+      (m/PrInvalidateKey sr kx l) (str o " cachingStrategy-ref=" sr (if (= (count kx) 0) "" (str " key=" (one-line (pv (nth kx 0))))) (at l) "\n")
+      (m/PrInvalidateCache sr l) (str o " cachingStrategy-ref=" sr (at l) "\n")
+      (m/PrBatchJob nm bs mf mc ss oc l)
+      (let [o1 (loop [i 0 s (str o " jobName=" nm " blockSize=" bs " maxFailedRecords=" mf (at l) "\n")]
+                 (if (>= i (count ss)) s
+                   (let [st (nth ss i) ags (:aggregator st)
+                         s1 (dump-procs (str s (ind (+ depth 1)) "step " (:name st) " " (:accept-policy st)
+                                            (if (= (count (:accept-expr st)) 0) "" (str " accept=" (one-line (pv (nth (:accept-expr st) 0))))) "\n")
+                                       (:procs st) (+ depth 2))
+                         s2 (if (= (count ags) 0) s1
+                              (dump-procs (str s1 (ind (+ depth 2)) "aggregator size=" (:size (nth ags 0)) "\n")
+                                          (:procs (nth ags 0)) (+ depth 3)))]
+                     (recur (+ i 1) s2))))]
+        (dump-procs (str o1 (ind (+ depth 1)) "on-complete\n") oc (+ depth 2)))
+      (m/PrFirstSuccessful rs l) (dump-routes (str o (at l) "\n") rs (+ depth 1))
+      (m/PrRoundRobin rs id l) (dump-routes (str o (at l) "\n") rs (+ depth 1))
+      (m/PrConnectorOp cn op cr ps cs ex chs t tv l)
+      (let [o1 (str o (params-str ps) (at l) "\n")
+            o2 (loop [i 0 s o1]
+                 (if (>= i (count ex)) s
+                   (let [e (nth ex i)] (recur (+ i 1) (str s (ind (+ depth 2)) "expr " (:name e) " = " (one-line (pv (:v e))) "\n")))))]
+        (loop [i 0 s o2]
+          (if (>= i (count chs)) s
+            (let [ch (nth chs i)] (recur (+ i 1) (dump-procs (str s (ind (+ depth 1)) "chain " (:name ch) "\n") (:procs ch) (+ depth 2)))))))
+      (m/PrUnknown n l) (str o (at l) "\n"))))
+
+(defn- dump-source Str [out: Str s: &m/Source]
+  (let [o (str out "    source " (source-kind s))]
+    (match s
+      (m/SrcHttpListener cr pa ms s1 h1 b1 s2 h2 b2 r1 r2 sm om oe l)
+      (str o " config-ref=" cr " path=" pa (if (= (count ms) 0) "" (str " methods=" (str/join "," ms)))
+           (if (> (count s1) 0) (str " status=" (one-line (pvs s1))) "")
+           (if (> (count h1) 0) (str " headers=" (one-line (pvs h1))) "")
+           (if (> (count b1) 0) (str " body=" (one-line (pvs b1))) "")
+           (if (> (count s2) 0) (str " error-status=" (one-line (pvs s2))) "")
+           (if (> (count b2) 0) (str " error-body=" (one-line (pvs b2))) "")
+           (if (> (count r1) 0) (str " reason=" (one-line (pvs r1))) "")
+           (if (> (count r2) 0) (str " error-reason=" (one-line (pvs r2))) "")
+           (if (= om "") "" (str " outputMimeType=" om)) (if (= oe "") "" (str " outputEncoding=" oe))
+           (at l) "\n")
+      (m/SrcScheduler f sd cr tz dc l)
+      (str o (if (= cr "") (str " every " f "ms" (if (= sd 0) "" (str " delay " sd "ms"))) (str " cron \"" cr "\"" (if (= tz "") "" (str " tz=" tz))))
+           (if dc " disallowConcurrentExecution" "") (at l) "\n")
+      (m/SrcConnector cn nm cr ps cs _ex sch l) (str o (params-str ps) (at l) "\n"))))
+
+(defn- props-lines Str [o0: Str app: &m/App]
+  (let [ps (:properties app)
+        os (:prop-origins app)]
+    (loop [i 0 o (if (> (count ps) 0) (str o0 "  properties\n") o0)]
+      (if (>= i (count ps)) o
+        (let [k (:name (nth ps i))
+              org (if (< i (count os)) (nth os i) "")]
+          (recur (+ i 1) (str o "    " k " = " (if (secret-key? k) "****" (one-line (pv (:v (nth ps i)))))
+                              (if (= org "") "" (str "  (" org ")")) "\n")))))))
+
+(defn dump-props Str [app: &m/App] (mask-secrets (props-lines (str "app " (:name app) "\n") app) app))
+
+(defn dump-app Str [app: &m/App]
+  (let [o0 (str "app " (:name app) "\n")
+        o1 (loop [i 0 o o0 last ""]
+             (if (>= i (count (:configs app))) o
+               (let [c (nth (:configs app) i)
+                     f (:file (:loc c))
+                     oh (if (= f last) o (str o "file " f "\n"))]
+                 (recur (+ i 1) (str oh "  config " (:kind c) " " (:name c) (params-str (:params c))
+                                     (children-str (:children c))
+                                     (at (:loc c)) "\n") f))))
+        o2 (loop [i 0 o o1]
+             (if (>= i (count (:flows app))) o
+               (let [f (nth (:flows app) i)
+                     oh (str o "  " (if (:sub f) "sub-flow " "flow ") (:name f)
+                             (if (= (:initial-state f) "started") "" (str " initialState=" (:initial-state f)))
+                             (if (< (:max-concurrency f) 0) "" (str " maxConcurrency=" (:max-concurrency f)))
+                             (if (= (:handler-ref f) "") "" (str " error-handler=" (:handler-ref f)))
+                             "  " (:file (:loc f)) ":" (:line (:loc f)) "\n")
+                     os (if (> (count (:source f)) 0) (dump-source oh (nth (:source f) 0)) oh)
+                     op (dump-procs os (:procs f) 2)
+                     oe (if (> (count (:handlers f)) 0) (dump-handlers (str op "    error-handler\n") (:handlers f) 3) op)]
+                 (recur (+ i 1) oe))))
+        o3 (loop [i 0 o o2]
+             (if (>= i (count (:global-handlers app))) o
+               (let [g (nth (:global-handlers app) i)]
+                 (recur (+ i 1) (dump-handlers (str o "  error-handler " (:name g) (at (:loc g)) "\n") (:handlers g) 2)))))
+        o4 (if (= (:default-handler app) "") o3 (str o3 "  default error handler: " (:default-handler app) "\n"))
+        o5 (props-lines o4 app)
+        ds (:diags app)
+        o6 (loop [i 0 o (if (> (count ds) 0) (str o5 "diagnostics (" (count ds) ")\n") o5)]
+             (if (>= i (count ds)) o (recur (+ i 1) (str o "  " (m/diag-str (nth ds i)) "\n"))))]
+    (mask-secrets (str o6 (summary app) "\n") app)))
+
+(defn- secret-values Vec(Str) [app: &m/App]
+  (let [ps (:properties app)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count ps)) acc
+        (let [p (nth ps i)
+              v (match (:v p) (m/PLit x) (str x) _ "")]
+          (recur (+ i 1) (if (and (secret-key? (:name p)) (>= (count v) 3)) (conj acc v) acc)))))))
+
+(defn- mask-one Str [text: Str v: &Str]
+  (let [t1 (str/replace text v "****")]
+    (loop [k (- (count v) 1) t t1]
+      (if (< k 3) t (recur (- k 1) (str/replace t (str (subs v 0 k) "...") "****..."))))))
+
+(defn mask-secrets Str [text: Str app: &m/App]
+  (let [vs (secret-values app)]
+    (loop [i 0 t text] (if (>= i (count vs)) t (recur (+ i 1) (mask-one t (nth vs i)))))))

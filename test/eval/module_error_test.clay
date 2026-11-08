@@ -1,0 +1,43 @@
+(ns module-error-test (:require [mulay.dw.engine :as eng] [mulay.mule.model :as m] [clay.string :as str]))
+
+;; 利用者のモジュール (my::mod) に構文エラーがあるとき、実 Mule 4.11.3 はそのモジュールのエラー
+;; ("Invalid field name identifier. ... at 2 : 14") を出す。mulay は「Unable to resolve module」と出していた (2026-10-12)。
+
+(defn- load-mod Values(Str Bool) [mod: Str]
+  (cond (= mod "my::mod") (values "%dw 2.0\nfun f(b) = b.input\n" true)
+        (= mod "my::good") (values "%dw 2.0\nfun f(b) = b.a\n" true)
+        ;; do の var now の初期化で now() を呼ぶ (var now 自身を指す)。実 DW はモジュールのコンパイルエラー
+        ;; "Variable: `now` is not yet initialized." を出す (2026-10-12)
+        (= mod "max::jwt") (values "%dw 2.0\nfun token() = do {\n  var now = now() as Number {unit: \"seconds\"}\n  ---\n  now\n}\n" true)
+        :else (values "" false)))
+
+(defn- loader Fn(Str Values(Str Bool)) [] (fn Values(Str Bool) [mod: Str] (load-mod mod)))
+
+(defn- first-error Str [script: Str]
+  (let [c (eng/compile-with script m/BINDINGS (loader))] (eng/render-first-error script c "x")))
+
+(deftest module-syntax-error-is-shown
+  (let [msg (first-error "%dw 2.0\nimport f from my::mod\noutput application/json\n---\nf({a: 1})")]
+    (is (str/starts-with? msg "Module my::mod: Invalid field name identifier. Reason: The name `input` is a reserved word."))))
+
+(deftest missing-module-is-still-unresolved
+  (let [msg (first-error "%dw 2.0\nimport f from my::none\noutput application/json\n---\nf({a: 1})")]
+    (is (str/starts-with? msg "Unable to resolve module with identifier my::none."))))
+
+(deftest good-module-compiles
+  (let [c (eng/compile-with "%dw 2.0\nimport f from my::good\noutput application/json\n---\nf({a: 1})" m/BINDINGS (loader))]
+    (is (eng/ok? c))))
+
+(deftest module-forward-reference-is-shown
+  (let [msg (first-error "%dw 2.0\nimport token from max::jwt\noutput application/json\n---\ntoken()")]
+    (is (str/starts-with? msg "Variable: `now` is not yet initialized."))))
+
+(deftest module-forward-reference-qualified
+  (let [msg (first-error "%dw 2.0\noutput application/json\n---\nmax::jwt::token()")]
+    (is (str/starts-with? msg "Variable: `now` is not yet initialized."))))
+
+;; 抜粋と位置はモジュールのソースで数える (本体のスクリプトの行を指していた)
+(deftest module-error-excerpt-is-in-module
+  (let [msg (first-error "%dw 2.0\nimport token from max::jwt\noutput application/json\n---\ntoken()")]
+    (is (str/includes? msg "3|   var now = now() as Number {unit: \"seconds\"}"))
+    (is (str/ends-with? msg "max::jwt (line: 3, column: 13)"))))

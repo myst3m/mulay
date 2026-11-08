@@ -1,0 +1,360 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Validation モジュール (mule-validation-module 2.0.11) の操作。値はクエリ (v など) か本文で渡す。 -->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18450"/>
+    </http:listener-config>
+
+    <configuration defaultErrorHandler-ref="eh"/>
+
+    <!-- 検査の失敗は VALIDATION:VALIDATION の子。それ以外は ANY で拾う -->
+    <error-handler name="eh">
+        <on-error-continue type="VALIDATION:VALIDATION">
+            <set-variable variableName="by" value="validation"/>
+            <flow-ref name="report"/>
+        </on-error-continue>
+        <on-error-continue type="ANY">
+            <set-variable variableName="by" value="any"/>
+            <flow-ref name="report"/>
+        </on-error-continue>
+    </error-handler>
+
+    <sub-flow name="report">
+        <set-payload value="#[output application/json --- {
+            by: vars.by,
+            'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier,
+            parent: (error.errorType.parentErrorType.namespace default '') ++ ':' ++ (error.errorType.parentErrorType.identifier default ''),
+            description: error.description,
+            children: (error.childErrors default []) map ($.errorType.identifier ++ ': ' ++ $.description)
+        }]"/>
+    </sub-flow>
+
+    <validation:ip-filter-list name="denied">
+        <validation:ips>
+            <validation:ip value="10.0.0.0/8"/>
+            <validation:ip value="192.168.1.5"/>
+        </validation:ips>
+    </validation:ip-filter-list>
+
+    <flow name="is-true-msg">
+        <http:listener config-ref="L" path="/is-true-msg"/>
+        <set-variable variableName="credit" value="#[attributes.queryParams.c]"/>
+        <validation:is-true expression="#[vars.credit == null or vars.credit != 'x']" message="#[output text/plain --- '入金先の口座 $(vars.credit) に入金できません']"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-true-msg-fail">
+        <http:listener config-ref="L" path="/is-true-msg-fail"/>
+        <set-variable variableName="credit" value="#[attributes.queryParams.c]"/>
+        <validation:is-true expression="#[vars.credit != null]" message="#[output text/plain --- '入金先の口座 $(vars.credit) に入金できません']"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-email-msg">
+        <http:listener config-ref="L" path="/is-email-msg"/>
+        <validation:is-email email="#[attributes.queryParams.e]" message="#[output text/plain --- 'bad ' ++ (vars.nope as String)]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-true">
+        <http:listener config-ref="L" path="/is-true"/>
+        <validation:is-true expression="#[attributes.queryParams.v == 'yes']"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-true-str">
+        <http:listener config-ref="L" path="/is-true-str"/>
+        <validation:is-true expression="#[attributes.queryParams.v]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-true-default">
+        <http:listener config-ref="L" path="/is-true-default"/>
+        <validation:is-true/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-false">
+        <http:listener config-ref="L" path="/is-false"/>
+        <validation:is-false expression="#[attributes.queryParams.v == 'yes']"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="is-email">
+        <http:listener config-ref="L" path="/is-email"/>
+        <validation:is-email email="#[attributes.queryParams.v]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-ip">
+        <http:listener config-ref="L" path="/is-ip"/>
+        <validation:is-ip ip="#[attributes.queryParams.v]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-url">
+        <http:listener config-ref="L" path="/is-url"/>
+        <validation:is-url url="#[attributes.queryParams.v]"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="matches-regex">
+        <http:listener config-ref="L" path="/matches-regex"/>
+        <validation:matches-regex value="#[attributes.queryParams.v]" regex="#[attributes.queryParams.re]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="matches-regex-ci">
+        <http:listener config-ref="L" path="/matches-regex-ci"/>
+        <validation:matches-regex value="#[attributes.queryParams.v]" regex="[a-z]+" caseSensitive="false"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- 本文 (JSON) の大きさ。min / max はクエリ -->
+    <flow name="validate-size">
+        <http:listener config-ref="L" path="/validate-size"/>
+        <validation:validate-size value="#[payload]" min="#[attributes.queryParams.min default 0]" max="#[attributes.queryParams.max]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <!-- DW の値 (本文の JSON の items) の大きさ -->
+    <flow name="validate-size-expr">
+        <http:listener config-ref="L" path="/validate-size-expr"/>
+        <validation:validate-size value="#[payload.items]" min="2" max="3"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="validate-size-str">
+        <http:listener config-ref="L" path="/validate-size-str"/>
+        <validation:validate-size value="#[attributes.queryParams.v]" min="2" max="4"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="is-not-blank">
+        <http:listener config-ref="L" path="/is-not-blank"/>
+        <validation:is-not-blank-string value="#[attributes.queryParams.v]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <!-- value の既定は payload -->
+    <flow name="is-not-blank-payload">
+        <http:listener config-ref="L" path="/is-not-blank-payload"/>
+        <validation:is-not-blank-string/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-blank">
+        <http:listener config-ref="L" path="/is-blank"/>
+        <validation:is-blank-string value="#[attributes.queryParams.v]"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="is-not-empty">
+        <http:listener config-ref="L" path="/is-not-empty"/>
+        <validation:is-not-empty-collection/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-empty">
+        <http:listener config-ref="L" path="/is-empty"/>
+        <validation:is-empty-collection values="#[payload]"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="is-not-null">
+        <http:listener config-ref="L" path="/is-not-null"/>
+        <validation:is-not-null value="#[attributes.queryParams.v]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <!-- payload (JSON) が null か -->
+    <flow name="is-not-null-payload">
+        <http:listener config-ref="L" path="/is-not-null-payload"/>
+        <validation:is-not-null value="#[payload]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-null">
+        <http:listener config-ref="L" path="/is-null"/>
+        <validation:is-null value="#[attributes.queryParams.v]"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- 数。min / max / locale / pattern はクエリ (無ければ null) -->
+    <flow name="num-int">
+        <http:listener config-ref="L" path="/num-int"/>
+        <validation:is-number value="#[attributes.queryParams.v]" numberType="INTEGER" minValue="#[attributes.queryParams.min]" maxValue="#[attributes.queryParams.max]"
+                              locale="#[attributes.queryParams.locale]" pattern="#[attributes.queryParams.pattern]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="num-long">
+        <http:listener config-ref="L" path="/num-long"/>
+        <validation:is-number value="#[attributes.queryParams.v]" numberType="LONG"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="num-short">
+        <http:listener config-ref="L" path="/num-short"/>
+        <validation:is-number value="#[attributes.queryParams.v]" numberType="SHORT"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="num-double">
+        <http:listener config-ref="L" path="/num-double"/>
+        <validation:is-number value="#[attributes.queryParams.v]" numberType="DOUBLE" minValue="#[attributes.queryParams.min]" maxValue="#[attributes.queryParams.max]"
+                              locale="#[attributes.queryParams.locale]" pattern="#[attributes.queryParams.pattern]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="num-float">
+        <http:listener config-ref="L" path="/num-float"/>
+        <validation:is-number value="#[attributes.queryParams.v]" numberType="FLOAT"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="is-time">
+        <http:listener config-ref="L" path="/is-time"/>
+        <validation:is-time time="#[attributes.queryParams.v]" pattern="#[attributes.queryParams.pattern]" locale="#[attributes.queryParams.locale]"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="is-elapsed">
+        <http:listener config-ref="L" path="/is-elapsed"/>
+        <validation:is-elapsed time="#[attributes.queryParams.t as Number]" timeUnit="HOURS" since="#[attributes.queryParams.since as LocalDateTime]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-not-elapsed">
+        <http:listener config-ref="L" path="/is-not-elapsed"/>
+        <validation:is-not-elapsed time="#[attributes.queryParams.t as Number]" timeUnit="HOURS" since="#[attributes.queryParams.since as LocalDateTime]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-elapsed-nanoseconds">
+        <http:listener config-ref="L" path="/is-elapsed-nanoseconds"/>
+        <validation:is-elapsed time="#[attributes.queryParams.t as Number]" timeUnit="NANOSECONDS" since="#[attributes.queryParams.since as LocalDateTime]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-elapsed-microseconds">
+        <http:listener config-ref="L" path="/is-elapsed-microseconds"/>
+        <validation:is-elapsed time="#[attributes.queryParams.t as Number]" timeUnit="MICROSECONDS" since="#[attributes.queryParams.since as LocalDateTime]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-elapsed-milliseconds">
+        <http:listener config-ref="L" path="/is-elapsed-milliseconds"/>
+        <validation:is-elapsed time="#[attributes.queryParams.t as Number]" timeUnit="MILLISECONDS" since="#[attributes.queryParams.since as LocalDateTime]"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="is-allowed-ip">
+        <http:listener config-ref="L" path="/is-allowed-ip"/>
+        <validation:is-allowed-ip ipAddress="#[attributes.queryParams.v]">
+            <validation:allow-list>
+                <validation:ips>
+                    <validation:ip value="192.168.1.0/24"/>
+                    <validation:ip value="127.0.0.1"/>
+                </validation:ips>
+            </validation:allow-list>
+        </validation:is-allowed-ip>
+        <set-payload value="ok"/>
+    </flow>
+    <!-- 1〜3 個の数だけの項目 ("10"、"172.16") は "項目." を含むか。IPv6 の CIDR -->
+    <flow name="ip-partial">
+        <http:listener config-ref="L" path="/ip-partial"/>
+        <validation:is-allowed-ip ipAddress="#[attributes.queryParams.v]">
+            <validation:allow-list>
+                <validation:ips>
+                    <validation:ip value="10"/>
+                    <validation:ip value="172.16"/>
+                    <validation:ip value="2001:db8::/32"/>
+                    <validation:ip value="::1"/>
+                </validation:ips>
+            </validation:allow-list>
+        </validation:is-allowed-ip>
+        <set-payload value="ok"/>
+    </flow>
+    <!-- ips 属性 (式の列) -->
+    <flow name="ip-attr">
+        <http:listener config-ref="L" path="/ip-attr"/>
+        <validation:is-not-denied-ip ipAddress="#[attributes.queryParams.v]">
+            <validation:deny-list ips="#[['9.9.9.9', '172.16']]"/>
+        </validation:is-not-denied-ip>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="is-not-denied-ip">
+        <http:listener config-ref="L" path="/is-not-denied-ip"/>
+        <validation:is-not-denied-ip ipAddress="#[attributes.queryParams.v]" denyList="denied"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- 本文 {name, email, age} をまとめて検査する -->
+    <flow name="all">
+        <http:listener config-ref="L" path="/all"/>
+        <validation:all>
+            <validation:is-not-blank-string value="#[payload.name]"/>
+            <validation:is-email email="#[payload.email]"/>
+            <validation:is-number value="#[payload.age]" numberType="INTEGER" minValue="0" maxValue="150"/>
+        </validation:all>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="any">
+        <http:listener config-ref="L" path="/any"/>
+        <validation:any>
+            <validation:is-email email="#[payload.email]"/>
+            <validation:matches-regex value="#[payload.phone]" regex="\d{3}-\d{4}"/>
+        </validation:any>
+        <set-payload value="ok"/>
+    </flow>
+    <!-- 検査でない失敗 (式の失敗) は集めずにそのまま -->
+    <flow name="all-expr-error">
+        <http:listener config-ref="L" path="/all-expr-error"/>
+        <validation:all>
+            <validation:is-email email="nope"/>
+            <validation:is-true expression="#[(1 / 0) == 1]"/>
+        </validation:all>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="msg">
+        <http:listener config-ref="L" path="/msg"/>
+        <validation:is-email email="#[attributes.queryParams.v]" message="please give an email address"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="msg-expr">
+        <http:listener config-ref="L" path="/msg-expr"/>
+        <validation:is-email email="#[attributes.queryParams.v]" message="#['not an email: ' ++ (attributes.queryParams.v default 'nothing')]"/>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- 検査が通るとき、message の式は評価されるか (失敗する式) -->
+    <flow name="msg-eval">
+        <http:listener config-ref="L" path="/msg-eval"/>
+        <validation:is-email email="#[attributes.queryParams.v]" message="#[(1 / 0) as String]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="mapping">
+        <http:listener config-ref="L" path="/mapping"/>
+        <validation:is-email email="#[attributes.queryParams.v]">
+            <error-mapping sourceType="VALIDATION:INVALID_EMAIL" targetType="APP:BAD_INPUT"/>
+        </validation:is-email>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- 検査は payload と attributes を変えない -->
+    <flow name="keep">
+        <http:listener config-ref="L" path="/keep"/>
+        <validation:is-not-null value="#[payload]"/>
+        <validation:validate-size value="#[payload.items]" min="1"/>
+        <set-payload value="#[output application/json --- {payload: payload, method: attributes.method}]"/>
+    </flow>
+
+    <!-- ハンドラが propagate なら、listener の既定の失敗応答 (500、本文は description) -->
+    <flow name="propagate">
+        <http:listener config-ref="L" path="/propagate"/>
+        <validation:is-not-blank-string value="#[attributes.queryParams.v]"/>
+        <set-payload value="ok"/>
+        <error-handler>
+            <on-error-propagate/>
+        </error-handler>
+    </flow>
+
+    <!-- DataWeave の関数 -->
+    <flow name="fn">
+        <http:listener config-ref="L" path="/fn"/>
+        <set-payload value="#[output application/json --- {
+            email: Validation::isEmail(attributes.queryParams.email default ''),
+            regex: Validation::matchesRegex(attributes.queryParams.v default '', '[a-z]+', false),
+            time: Validation::isTime(attributes.queryParams.time default '', 'yyyy-MM-dd', 'en'),
+            number: Validation::isNumber(attributes.queryParams.n default '', 'INTEGER'),
+            ip: Validation::isIp(attributes.queryParams.ip default ''),
+            url: Validation::isUrl(attributes.queryParams.url default '')
+        }]"/>
+    </flow>
+</mule>

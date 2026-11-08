@@ -1,0 +1,86 @@
+(ns mulay.rt.cron
+  (:require [mulay.lib.time.types :as tt] [mulay.lib.time.local :as tl] [mulay.lib.time.zoned :as tz]
+            [mulay.lib.time.tz :as tzr] [mulay.lib.numparse :as npz] [clay.string :as str]))
+
+(defrecord Cron [sec: Vec(Bool) min: Vec(Bool) hour: Vec(Bool) dom: Vec(Bool) dom-any: Bool
+                 mon: Vec(Bool) dow: Vec(Bool) dow-any: Bool year: Vec(Int)])
+
+(def MONTHS ["JAN" "FEB" "MAR" "APR" "MAY" "JUN" "JUL" "AUG" "SEP" "OCT" "NOV" "DEC"])
+(def DAYS ["SUN" "MON" "TUE" "WED" "THU" "FRI" "SAT"])
+
+(defn- name-value Int [t: &Str names: &Vec(Str) base: Int]
+  (let [u (str/upper-case (str t))]
+    (loop [i 0] (if (>= i (count names)) (npz/int-or u -1) (if (= (nth names i) u) (+ i base) (recur (+ i 1)))))))
+
+(defn- all-false Vec(Bool) [n: Int] (loop [acc: Vec(Bool) [] i 0] (if (>= i n) acc (recur (conj acc false) (+ i 1)))))
+
+(defn- field Values(Vec(Bool) Str) [f: &Str lo: Int hi: Int names: &Vec(Str) nbase: Int]
+  (let [parts: Vec(Str) (str/split f ",")]
+    (loop [i 0 acc (all-false (+ hi 1))]
+      (if (>= i (count parts)) (values acc "")
+        (let [p (nth parts i)
+              sl (str/index-of p "/")
+              rng (if (< sl 0) (str p) (subs p 0 sl))
+              step (if (< sl 0) 1 (npz/int-or (subs p (+ sl 1) (count p)) -1))
+              dash (str/index-of rng "-")
+              [a b] (if (or (= rng "*") (= rng "?")) (values lo hi)
+                      (if (< dash 0)
+                        (let [x (name-value rng names nbase)] (values x (if (< sl 0) x hi)))
+                        (values (name-value (subs rng 0 dash) names nbase) (name-value (subs rng (+ dash 1) (count rng)) names nbase))))]
+          (if (or (< a lo) (> b hi) (< step 1) (> a b))
+            (values acc (str "Invalid cron field '" f "'"))
+            (recur (+ i 1) (loop [k a v acc] (if (> k b) v (recur (+ k step) (assoc v k true)))))))))))
+
+(defn parse Values(Cron Str) [expr: &Str]
+  (let [fs0: Vec(Str) (str/split (str/trim expr) " ")
+        fs (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs0)) acc (recur (+ i 1) (if (= (nth fs0 i) "") acc (conj acc (nth fs0 i))))))
+        empty (->Cron [] [] [] [] true [] [] true [])]
+    (if (or (< (count fs) 6) (> (count fs) 7)) (values empty (str "Invalid cron expression '" expr "': expected 6 or 7 fields"))
+      (if (or (str/includes? expr "L") (str/includes? expr "W") (str/includes? expr "#"))
+        (values empty (str "Unsupported cron expression '" expr "': L, W and # are not supported"))
+        (let [[s e1] (field (nth fs 0) 0 59 [] 0)
+              [mi e2] (field (nth fs 1) 0 59 [] 0)
+              [h e3] (field (nth fs 2) 0 23 [] 0)
+              [d e4] (field (nth fs 3) 1 31 [] 0)
+              [mo e5] (field (nth fs 4) 1 12 MONTHS 1)
+              [w e6] (field (nth fs 5) 1 7 DAYS 1)
+              years: Vec(Int) (if (= (count fs) 7)
+                                (let [y (nth fs 6)]
+                                  (if (or (= y "*") (= y "?")) []
+                                    (let [ys: Vec(Str) (str/split y ",")]
+                                      (loop [i 0 acc: Vec(Int) []] (if (>= i (count ys)) acc (recur (+ i 1) (conj acc (npz/int-or (nth ys i) 0))))))))
+                                [])
+              err (loop [es: Vec(Str) [e1 e2 e3 e4 e5 e6] i 0] (if (>= i (count es)) "" (if (not= (nth es i) "") (nth es i) (recur es (+ i 1)))))]
+          (values (->Cron s mi h d (= (nth fs 3) "?") mo w (= (nth fs 5) "?") years) err))))))
+
+(defn- next-local Vec(tt/LocalDateTime) [c: &Cron after: &tt/LocalDateTime]
+  (let [[start e] (tl/ldt-plus-seconds after 1 0)
+        s0 (tl/ldt (tl/ldt-date start) (tt/->LocalTime (:hour (tl/ldt-time start)) (:minute (tl/ldt-time start)) (:second (tl/ldt-time start)) 0))]
+    (loop [t s0 n 0]
+      (if (> n 200000) []
+        (let [d (tl/ldt-date t) tm (tl/ldt-time t)
+              y (:year d) mo (:month d) dd (:day d)
+              year-ok (or (= (count (:year c)) 0) (loop [i 0] (if (>= i (count (:year c))) false (if (= (nth (:year c) i) y) true (recur (+ i 1))))))
+              qdow (+ (mod (tl/date-dow d) 7) 1)
+              day-ok (and (or (:dom-any c) (nth (:dom c) dd)) (or (:dow-any c) (nth (:dow c) qdow)))]
+          (cond
+            (not year-ok) (if (> y 2200) [] (let [[nd e2] (tl/of-date (+ y 1) 1 1)] (recur (tl/ldt nd (tt/->LocalTime 0 0 0 0)) (+ n 1))))
+            (not (nth (:mon c) mo))
+            (let [[first e2] (tl/of-date y mo 1) [nd e3] (tl/date-plus-months first 1)] (recur (tl/ldt nd (tt/->LocalTime 0 0 0 0)) (+ n 1)))
+            (not day-ok) (let [[nd e2] (tl/date-plus-days d 1)] (recur (tl/ldt nd (tt/->LocalTime 0 0 0 0)) (+ n 1)))
+            (not (nth (:hour c) (:hour tm)))
+            (let [[nt e2] (tl/ldt-plus-seconds (tl/ldt d (tt/->LocalTime (:hour tm) 0 0 0)) 3600 0)] (recur nt (+ n 1)))
+            (not (nth (:min c) (:minute tm)))
+            (let [[nt e2] (tl/ldt-plus-seconds (tl/ldt d (tt/->LocalTime (:hour tm) (:minute tm) 0 0)) 60 0)] (recur nt (+ n 1)))
+            (not (nth (:sec c) (:second tm)))
+            (let [[nt e2] (tl/ldt-plus-seconds t 1 0)] (recur nt (+ n 1)))
+            :else [t]))))))
+
+(defn next-fire-ms Int [c: &Cron now-ms: Int zone-id: &Str]
+  (let [[zone ze] (if (= zone-id "") (values (tzr/system-zone) "") (tzr/zone-of-id zone-id))
+        now (tz/zdt-of-epoch-milli now-ms zone)
+        nx (next-local c (tz/zdt-ldt now))]
+    (if (= (count nx) 0) -1
+      (let [z (tz/zdt-of-local (nth nx 0) zone [])
+            [ms me] (tz/zdt-epoch-milli z)]
+        (if (= me "") ms -1)))))

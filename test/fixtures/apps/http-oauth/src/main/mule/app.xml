@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:oauth="http://www.mulesoft.org/schema/mule/oauth"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/oauth http://www.mulesoft.org/schema/mule/oauth/current/mule-oauth.xsd">
+
+    <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18402"/></http:listener-config>
+    <http:listener-config name="S"><http:listener-connection host="0.0.0.0" port="18403"/></http:listener-config>
+    <os:object-store name="STORE" persistent="false"/>
+
+    <!-- Authorization ヘッダの basic 認証 (clientId:clientSecret) でトークンを取りに行く既定 -->
+    <http:request-config name="OA">
+        <http:request-connection host="localhost" port="18403">
+            <http:authentication>
+                <oauth:client-credentials-grant-type clientId="my-id" clientSecret="my-secret"
+                    tokenUrl="http://localhost:18403/token" scopes="read write"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+    <!-- 認証情報を本文に入れる -->
+    <http:request-config name="OB">
+        <http:request-connection host="localhost" port="18403">
+            <http:authentication>
+                <oauth:client-credentials-grant-type clientId="my-id" clientSecret="my-secret"
+                    tokenUrl="http://localhost:18403/token" scopes="s1 s2" encodeClientCredentialsInBody="true"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+    <!-- トークンの取得に失敗する -->
+    <http:request-config name="OC">
+        <http:request-connection host="localhost" port="18403">
+            <http:authentication>
+                <oauth:client-credentials-grant-type clientId="my-id" clientSecret="my-secret"
+                    tokenUrl="http://localhost:18403/token-bad"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <http:request-config name="OD">
+        <http:request-connection host="localhost" port="18403">
+            <http:authentication>
+                <oauth:client-credentials-grant-type clientId="my-id" clientSecret="my-secret" tokenUrl="http://localhost:18499/token"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+    <http:request-config name="OE">
+        <http:request-connection host="localhost" port="18403">
+            <http:authentication>
+                <oauth:client-credentials-grant-type clientId="my-id" clientSecret="my-secret" tokenUrl="http://localhost:18403/token-empty"/>
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <!-- トークンの発行元: 取得のたびに tok-1, tok-2 .. -->
+    <flow name="token">
+        <http:listener config-ref="S" path="/token" allowedMethods="POST"/>
+        <set-variable variableName="req" value="#[output application/json --- {authorization: attributes.headers.authorization default null, contentType: attributes.headers.'content-type' default null, body: payload default null}]"/>
+        <os:retrieve key="n" objectStore="STORE"><os:default-value>0</os:default-value></os:retrieve>
+        <set-variable variableName="n" value="#[(payload as Number) + 1]"/>
+        <os:store key="n" objectStore="STORE"><os:value>#[vars.n]</os:value></os:store>
+        <os:store key="last" objectStore="STORE"><os:value>#[vars.req]</os:value></os:store>
+        <set-payload value="#[output application/json --- {access_token: 'tok-' ++ vars.n, token_type: 'Bearer', expires_in: 3600}]"/>
+    </flow>
+    <flow name="token-bad">
+        <http:listener config-ref="S" path="/token-bad"><http:response statusCode="400"/></http:listener>
+        <set-payload value="#[output application/json --- {error: 'invalid_client'}]"/>
+    </flow>
+    <flow name="token-empty">
+        <http:listener config-ref="S" path="/token-empty"/>
+        <set-payload value="#[output application/json --- {}]"/>
+    </flow>
+    <flow name="token-last">
+        <http:listener config-ref="S" path="/token-last"/>
+        <os:retrieve key="last" objectStore="STORE"><os:default-value>#[null]</os:default-value></os:retrieve>
+    </flow>
+    <!-- 資源: tok-<min> 以上だけ通す (それ未満は 401) -->
+    <flow name="res">
+        <http:listener config-ref="S" path="/res">
+            <http:response statusCode="#[vars.st default 200]"/>
+        </http:listener>
+        <logger level="INFO" message="RES hit auth=#[attributes.headers.authorization default 'none']"/>
+        <set-variable variableName="auth" value="#[attributes.headers.authorization default 'none']"/>
+        <set-variable variableName="tok" value="#[(attributes.headers.authorization default '') replace 'Bearer tok-' with '']"/>
+        <os:retrieve key="min" objectStore="STORE"><os:default-value>0</os:default-value></os:retrieve>
+        <choice>
+            <when expression="#[isEmpty(vars.tok) or ((vars.tok as Number) &lt; (payload as Number))]">
+                <set-variable variableName="st" value="401"/>
+                <set-payload value="denied"/>
+            </when>
+            <otherwise>
+                <set-payload value="#[output application/json --- {ok: true, auth: vars.auth}]"/>
+            </otherwise>
+        </choice>
+    </flow>
+    <!-- 何度でも 401 / 403 を返す -->
+    <flow name="deny401">
+        <http:listener config-ref="S" path="/deny401"><http:response statusCode="401"/></http:listener>
+        <set-payload value="no"/>
+    </flow>
+    <flow name="deny403">
+        <http:listener config-ref="S" path="/deny403"><http:response statusCode="403"/></http:listener>
+        <set-payload value="no"/>
+    </flow>
+    <!-- 1 度だけ 403 を返す (min より古いトークン) -->
+    <flow name="invalidate">
+        <http:listener config-ref="S" path="/invalidate"/>
+        <os:retrieve key="n" objectStore="STORE"><os:default-value>0</os:default-value></os:retrieve>
+        <os:store key="min" objectStore="STORE"><os:value>#[(payload as Number) + 1]</os:value></os:store>
+        <set-payload value="invalidated"/>
+    </flow>
+
+    <flow name="call-a">
+        <http:listener config-ref="L" path="/call-a"/>
+        <try>
+            <http:request config-ref="OA" method="GET" path="/res"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description, body: error.errorMessage.payload as String default null}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <flow name="call-b">
+        <http:listener config-ref="L" path="/call-b"/>
+        <try>
+            <http:request config-ref="OB" method="GET" path="/res"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description, body: error.errorMessage.payload as String default null}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <flow name="call-c">
+        <http:listener config-ref="L" path="/call-c"/>
+        <try>
+            <http:request config-ref="OC" method="GET" path="/res"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <flow name="call-d">
+        <http:listener config-ref="L" path="/call-d"/>
+        <try>
+            <http:request config-ref="OA" method="GET" path="/deny401"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <flow name="call-e">
+        <http:listener config-ref="L" path="/call-e"/>
+        <try>
+            <http:request config-ref="OA" method="GET" path="/deny403"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <flow name="call-f">
+        <http:listener config-ref="L" path="/call-f"/>
+        <try>
+            <http:request config-ref="OD" method="GET" path="/res"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+    <flow name="call-g">
+        <http:listener config-ref="L" path="/call-g"/>
+        <try>
+            <http:request config-ref="OE" method="GET" path="/res"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+</mule>

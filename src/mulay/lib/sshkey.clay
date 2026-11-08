@@ -1,0 +1,128 @@
+(ns mulay.lib.sshkey (:require [mulay.lib.sshwire :as w] [mulay.lib.hash :as hash] [clay.crypto :as cc] [clay.base64 :as b64]
+                               [clay.string :as str]))
+
+(defn key-type Str [blob: &Str]
+  (let [[t p ok] (w/get-string blob 0)] (if ok t "")))
+
+(defn rsa-bits-ok? Bool [n: &Str]
+  (let [lead (loop [i 0] (if (and (< i (count n)) (= (nth n i) 0)) (recur (+ i 1)) i))
+        bytes (- (count n) lead)]
+    (or (> bytes 128) (and (= bytes 128) (>= (nth n lead) 128)))))
+
+(defn- rsa-hash Str [alg: &Str]
+  (cond (= alg "rsa-sha2-256") "sha256" (= alg "rsa-sha2-512") "sha512" :else ""))
+
+(defn verify-signature Str [alg: &Str key-blob: &Str sig-blob: &Str data: &Str]
+  (let [[kt kp kok] (w/get-string key-blob 0)
+        [st sp sok] (w/get-string sig-blob 0)
+        [sig se sok2] (w/get-string sig-blob sp)]
+    (cond
+      (not (and kok sok sok2)) "malformed host key or signature"
+      (not= se (count sig-blob)) "trailing data after the signature"
+      (not= st alg) (str "signature algorithm " st " does not match the negotiated " alg)
+      (= alg "ssh-ed25519")
+      (let [[pub pe pok] (w/get-string key-blob kp)]
+        (cond (or (not= kt "ssh-ed25519") (not pok) (not= pe (count key-blob)) (not= (count pub) 32)) "malformed ssh-ed25519 host key"
+              (not= (count sig) 64) "malformed ssh-ed25519 signature"
+              (cc/ed25519-verify pub data sig) ""
+              :else "host key signature is not valid"))
+      (= alg "ecdsa-sha2-nistp256")
+      (let [[curve p1 o1] (w/get-string key-blob kp)
+            [q p2 o2] (w/get-string key-blob p1)
+            [r p3 o3] (w/get-mpint sig 0)
+            [s p4 o4] (w/get-mpint sig p3)]
+        (cond (or (not= kt "ecdsa-sha2-nistp256") (not o1) (not o2) (not= curve "nistp256") (not= p2 (count key-blob))
+                  (not= (count q) 65) (not= (nth q 0) 4))
+              "malformed ecdsa-sha2-nistp256 host key"
+              (or (not o3) (not o4) (not= p4 (count sig))) "malformed ecdsa-sha2-nistp256 signature"
+              (cc/ecdsa-verify "P-256" q data r s "sha256") ""
+              :else "host key signature is not valid"))
+      (not= (rsa-hash alg) "")
+      (let [[e ep eok] (w/get-mpint key-blob kp)
+            [n np nok] (w/get-mpint key-blob ep)]
+        (cond (or (not= kt "ssh-rsa") (not eok) (not nok) (not= np (count key-blob))) "malformed ssh-rsa host key"
+              (not (rsa-bits-ok? n)) "RSA host key is shorter than 1024 bits"
+              (cc/rsa-verify n e data sig (rsa-hash alg)) ""
+              :else "host key signature is not valid"))
+      :else (str "unsupported host key algorithm " alg))))
+
+(defn host-name Str [host: &Str port: Int]
+  (if (= port 22) (str host) (str "[" host "]:" port)))
+
+(defn- glob? Bool [p: &Str s: &Str]
+  (loop [pi 0 si 0 star -1 mark 0]
+    (cond
+      (< si (count s))
+      (cond (and (< pi (count p)) (or (= (nth p pi) 63) (= (nth p pi) (nth s si)))) (recur (+ pi 1) (+ si 1) star mark)
+            (and (< pi (count p)) (= (nth p pi) 42)) (recur (+ pi 1) si pi si)
+            (>= star 0) (recur (+ star 1) (+ mark 1) star (+ mark 1))
+            :else false)
+      (and (< pi (count p)) (= (nth p pi) 42)) (recur (+ pi 1) si star mark)
+      :else (= pi (count p)))))
+
+(defn- hashed? Bool [pat: &Str name: &Str]
+  (let [bar (str/index-of-after pat "|" 3)]
+    (if (< bar 0) false
+      (let [[salt e1] (b64/decode (subs pat 3 bar))
+            [want e2] (b64/decode (subs pat (+ bar 1) (count pat)))
+            [got ok] (hash/hmac "SHA1" salt name)]
+        (and (= e1 "") (= e2 "") ok (= (count salt) 20) (= got want))))))
+
+(defn- hosts-match? Bool [pats: &Str name: &Str]
+  (if (str/starts-with? pats "|1|") (hashed? pats name)
+    (let [ps (str/split pats ",")]
+      (loop [i 0 hit false]
+        (if (>= i (count ps)) hit
+          (let [p (str/lower-case (nth ps i))]
+            (cond (= (count p) 0) (recur (+ i 1) hit)
+                  (= (nth p 0) 33) (if (glob? (subs p 1 (count p)) name) false (recur (+ i 1) hit))
+                  (glob? p name) (recur (+ i 1) true)
+                  :else (recur (+ i 1) hit))))))))
+
+(defn- fields Vec(Str) [line: &Str]
+  (loop [i 0 start -1 acc: Vec(Str) []]
+    (if (>= i (count line))
+      (if (>= start 0) (conj acc (subs line start (count line))) acc)
+      (let [c (nth line i) sp (or (= c 32) (= c 9) (= c 13))]
+        (cond (and sp (>= start 0)) (recur (+ i 1) -1 (conj acc (subs line start i)))
+              (and (not sp) (< start 0)) (recur (+ i 1) i acc)
+              :else (recur (+ i 1) start acc))))))
+
+(defn- line-verdict Int [line: &Str name: &Str ktype: &Str blob: &Str]
+  (let [fs (fields line)]
+    (if (or (= (count fs) 0) (= (nth (nth fs 0) 0) 35)) 0
+      (let [marker (if (= (nth (nth fs 0) 0) 64) (nth fs 0) "")
+            at (if (= marker "") 0 1)]
+        (if (< (count fs) (+ at 3)) 0
+          (let [[key err] (b64/decode (nth fs (+ at 2)))]
+            (cond (or (not= err "") (not= (nth fs (+ at 1)) ktype) (not= key blob)) 0
+                  (not (hosts-match? (nth fs at) name)) 0
+                  (= marker "@revoked") 2
+                  (= marker "") 1
+                  :else 0)))))))
+
+(defn known? Bool [text: &Str host: &Str port: Int key-blob: &Str]
+  (let [name (str/lower-case (host-name host port))
+        ktype (key-type key-blob)]
+    (loop [p 0 known false]
+      (if (>= p (count text)) known
+        (let [nl (str/index-of-after text "\n" p)
+              e (if (< nl 0) (count text) nl)
+              v (line-verdict (subs text p e) name ktype key-blob)]
+          (if (= v 2) false (recur (+ e 1) (or known (= v 1)))))))))
+
+(defn- add-alg Vec(Str) [acc: Vec(Str) alg: &Str]
+  (if (loop [i 0] (cond (>= i (count acc)) false (= (nth acc i) alg) true :else (recur (+ i 1)))) acc (conj acc (str alg))))
+
+(defn known-algorithms Vec(Str) [text: &Str host: &Str port: Int]
+  (let [name (str/lower-case (host-name host port))]
+    (loop [p 0 acc: Vec(Str) []]
+      (if (>= p (count text)) acc
+        (let [nl (str/index-of-after text "\n" p)
+              e (if (< nl 0) (count text) nl)
+              fs (fields (subs text p e))
+              ok (and (>= (count fs) 3) (not= (nth (nth fs 0) 0) 35) (not= (nth (nth fs 0) 0) 64) (hosts-match? (nth fs 0) name))
+              t (if ok (nth fs 1) "")]
+          (recur (+ e 1) (cond (= t "") acc
+                               (= t "ssh-rsa") (add-alg (add-alg acc "rsa-sha2-512") "rsa-sha2-256")
+                               :else (add-alg acc t))))))))

@@ -1,0 +1,557 @@
+(ns mulay.lib.protobuf
+  (:require [mulay.lib.ieee :as ieee] [clay.string :as str]))
+
+(def TRUNCATED "While parsing a protocol message, the input ended unexpectedly in the middle of a field.  This could mean either that the input has been truncated or that an embedded message misreported its own length.")
+(def MALFORMED "CodedInputStream encountered a malformed varint.")
+(def NEG-SIZE "CodedInputStream encountered an embedded string or message which claimed to have negative size.")
+(def ZERO-TAG "Protocol message contained an invalid tag (zero).")
+(def BAD-WIRE "Protocol message tag had invalid wire type.")
+(def END-GROUP "Protocol message end-group tag did not match expected tag.")
+(def TOO-DEEP "Protocol message had too many levels of nesting.  May be malicious.  Use setRecursionLimit() to increase the recursion depth limit.")
+
+(def T-DOUBLE 1)
+(def T-FLOAT 2)
+(def T-INT64 3)
+(def T-UINT64 4)
+(def T-INT32 5)
+(def T-FIXED64 6)
+(def T-FIXED32 7)
+(def T-BOOL 8)
+(def T-STRING 9)
+(def T-GROUP 10)
+(def T-MESSAGE 11)
+(def T-BYTES 12)
+(def T-UINT32 13)
+(def T-ENUM 14)
+(def T-SFIXED32 15)
+(def T-SFIXED64 16)
+(def T-SINT32 17)
+(def T-SINT64 18)
+
+(def L-OPTIONAL 1)
+(def L-REQUIRED 2)
+(def L-REPEATED 3)
+
+(def W-VARINT 0)
+(def W-FIXED64 1)
+(def W-LEN 2)
+(def W-START 3)
+(def W-END 4)
+(def W-FIXED32 5)
+
+(defn put-varint Str [out: Str n: Int]
+  (loop [v n o out]
+    (if (= (bit-and v -128) 0) (str o (chr v))
+      (recur (unsigned-bit-shift-right v 7) (str o (chr (bit-or 128 (bit-and v 127))))))))
+
+(defn get-varint Values(Int Int Str) [b: &Str pos: Int]
+  (let [n (count b)]
+    (loop [i pos shift 0 acc 0]
+      (cond (>= i n) (values 0 i TRUNCATED)
+            (>= shift 70) (values 0 i MALFORMED)
+            :else (let [c (nth b i)
+                        acc2 (if (< shift 64) (bit-or acc (bit-shift-left (bit-and c 127) shift)) acc)]
+                    (if (< c 128) (values acc2 (+ i 1) "") (recur (+ i 1) (+ shift 7) acc2)))))))
+
+(defn put-fixed Str [out: Str n: Int bytes: Int]
+  (loop [i 0 o out] (if (>= i bytes) o (recur (+ i 1) (str o (chr (bit-and (unsigned-bit-shift-right n (* 8 i)) 255)))))))
+
+(defn get-fixed Values(Int Int Str) [b: &Str pos: Int bytes: Int]
+  (if (> (+ pos bytes) (count b)) (values 0 pos TRUNCATED)
+    (values (loop [i 0 acc 0] (if (>= i bytes) acc (recur (+ i 1) (bit-or acc (bit-shift-left (nth b (+ pos i)) (* 8 i))))))
+            (+ pos bytes) "")))
+
+(defn put-fixed-be Str [out: Str n: Int bytes: Int]
+  (loop [i (- bytes 1) o out] (if (< i 0) o (recur (- i 1) (str o (chr (bit-and (unsigned-bit-shift-right n (* 8 i)) 255)))))))
+
+(defn get-fixed-be Int [b: &Str pos: Int bytes: Int]
+  (loop [i 0 acc 0] (if (>= i bytes) acc (recur (+ i 1) (bit-or (bit-shift-left acc 8) (nth b (+ pos i)))))))
+
+(defn to-i32 Int [v: Int]
+  (let [x (bit-and v 4294967295)] (if (>= x 2147483648) (- x 4294967296) x)))
+
+(defn zigzag Int [n: Int] (bit-xor (bit-shift-left n 1) (bit-shift-right n 63)))
+
+(defn unzigzag Int [v: Int] (bit-xor (unsigned-bit-shift-right v 1) (- 0 (bit-and v 1))))
+
+(defrecord Raw [num: Int wire: Int ival: Int bytes: Str])
+
+(defn- read-len Values(Str Int Str) [b: &Str pos: Int]
+  (let [[n p e] (get-varint b pos)]
+    (cond (not= e "") (values "" p e)
+          (< n 0) (values "" p NEG-SIZE)
+          (> n (- (count b) p)) (values "" p TRUNCATED)
+          :else (values (subs b p (+ p n)) (+ p n) ""))))
+
+(defn- skip-group Values(Int Str) [b: &Str pos: Int num: Int depth: Int]
+  (if (> depth 100) (values pos TOO-DEEP)
+    (loop [p pos]
+      (if (>= p (count b)) (values p TRUNCATED)
+        (let [[tag p2 e] (get-varint b p)
+              w (bit-and tag 7)
+              fnum (unsigned-bit-shift-right tag 3)]
+          (cond
+            (not= e "") (values p2 e)
+            (= w W-END) (if (= fnum num) (values p2 "") (values p2 END-GROUP))
+            (= w W-VARINT) (let [[x p3 e3] (get-varint b p2)] (if (not= e3 "") (values p3 e3) (recur p3)))
+            (= w W-FIXED64) (if (> (+ p2 8) (count b)) (values p2 TRUNCATED) (recur (+ p2 8)))
+            (= w W-FIXED32) (if (> (+ p2 4) (count b)) (values p2 TRUNCATED) (recur (+ p2 4)))
+            (= w W-LEN) (let [[s p3 e3] (read-len b p2)] (if (not= e3 "") (values p3 e3) (recur p3)))
+            (= w W-START) (let [[p3 e3] (skip-group b p2 fnum (+ depth 1))] (if (not= e3 "") (values p3 e3) (recur p3)))
+            :else (values p2 BAD-WIRE)))))))
+
+(defn scan Values(Vec(Raw) Str) [b: &Str]
+  (loop [p 0 acc: Vec(Raw) []]
+    (if (>= p (count b)) (values acc "")
+      (let [[tag p2 e] (get-varint b p)
+            w (bit-and tag 7)
+            num (unsigned-bit-shift-right tag 3)]
+        (cond
+          (not= e "") (values acc e)
+          (= num 0) (values acc ZERO-TAG)
+          (= w W-VARINT) (let [[x p3 e3] (get-varint b p2)] (if (not= e3 "") (values acc e3) (recur p3 (conj acc (->Raw num w x "")))))
+          (= w W-FIXED64) (let [[x p3 e3] (get-fixed b p2 8)] (if (not= e3 "") (values acc e3) (recur p3 (conj acc (->Raw num w x "")))))
+          (= w W-FIXED32) (let [[x p3 e3] (get-fixed b p2 4)] (if (not= e3 "") (values acc e3) (recur p3 (conj acc (->Raw num w x "")))))
+          (= w W-LEN) (let [[s p3 e3] (read-len b p2)] (if (not= e3 "") (values acc e3) (recur p3 (conj acc (->Raw num w 0 s)))))
+          (= w W-START) (let [[p3 e3] (skip-group b p2 num 1)]
+                          (if (not= e3 "") (values acc e3)
+                            (let [end-tag (put-varint "" (bit-or (bit-shift-left num 3) W-END))]
+                              (recur p3 (conj acc (->Raw num w 0 (subs b p2 (- p3 (count end-tag)))))))))
+          :else (values acc BAD-WIRE))))))
+
+(defrecord Field [name: Str number: Int label: Int type: Int type-name: Str default: Str oneof: Int proto3-opt: Bool packed: Int json-name: Str])
+(defrecord Message [full: Str fields: Vec(Field) oneofs: Vec(Str) map-entry: Bool proto3: Bool])
+(defrecord EnumV [name: Str number: Int])
+(defrecord Enum [full: Str values: Vec(EnumV) closed: Bool])
+(defrecord Method [name: Str input: Str output: Str client-streaming: Bool server-streaming: Bool])
+(defrecord Service [full: Str methods: Vec(Method)])
+(defrecord Desc [messages: Vec(Message) enums: Vec(Enum) services: Vec(Service) top: Vec(Str)])
+
+(defn- raw-str Str [rs: &Vec(Raw) num: Int]
+  (loop [i (- (count rs) 1)] (if (< i 0) "" (let [r (nth rs i)] (if (and (= (:num r) num) (= (:wire r) W-LEN)) (str (:bytes r)) (recur (- i 1)))))))
+
+(defn- raw-int Int [rs: &Vec(Raw) num: Int default: Int]
+  (loop [i (- (count rs) 1)] (if (< i 0) default (let [r (nth rs i)] (if (and (= (:num r) num) (= (:wire r) W-VARINT)) (:ival r) (recur (- i 1)))))))
+
+(defn- raw-has Bool [rs: &Vec(Raw) num: Int]
+  (loop [i 0] (if (>= i (count rs)) false (if (= (:num (nth rs i)) num) true (recur (+ i 1))))))
+
+(defn- raw-all Vec(Str) [rs: &Vec(Raw) num: Int]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i (count rs)) acc (recur (+ i 1) (let [r (nth rs i)] (if (and (= (:num r) num) (= (:wire r) W-LEN)) (conj acc (:bytes r)) acc))))))
+
+(defn- strip-dot Str [s: &Str] (if (str/starts-with? s ".") (subs s 1 (count s)) (str s)))
+
+(defn- join-name Str [scope: &Str name: &Str] (if (= scope "") (str name) (str scope "." name)))
+
+(defn- parse-field Values(Field Str) [b: &Str]
+  (let [[rs e] (scan b)]
+    (if (not= e "") (values (->Field "" 0 0 0 "" "" -1 false -1 "") e)
+      (let [[os oe] (scan (raw-str rs 8))
+            packed (if (and (= oe "") (raw-has os 2)) (raw-int os 2 0) -1)]
+        (values (->Field (raw-str rs 1) (raw-int rs 3 0) (raw-int rs 4 1) (raw-int rs 5 0) (strip-dot (raw-str rs 6)) (raw-str rs 7)
+                         (if (raw-has rs 9) (raw-int rs 9 0) -1) (not= (raw-int rs 17 0) 0) packed (raw-str rs 10))
+                "")))))
+
+(defn- parse-enum Values(Enum Str) [b: &Str scope: &Str closed: Bool]
+  (let [[rs e] (scan b)]
+    (if (not= e "") (values (->Enum "" [] closed) e)
+      (let [vs (raw-all rs 2)
+            [vals ve] (loop [i 0 acc: Vec(EnumV) []]
+                        (if (>= i (count vs)) (values acc "")
+                          (let [[vr vre] (scan (nth vs i))]
+                            (if (not= vre "") (values acc vre)
+                              (recur (+ i 1) (conj acc (->EnumV (raw-str vr 1) (to-i32 (raw-int vr 2 0)))))))))]
+        (values (->Enum (join-name scope (raw-str rs 1)) vals closed) ve)))))
+
+(defrecord- Acc [messages: Vec(Message) enums: Vec(Enum) err: Str])
+
+(defn- parse-message Acc [acc: Acc b: &Str scope: &Str proto3: Bool]
+  (let [[rs e] (scan b)]
+    (if (not= e "") (assoc acc :err e)
+      (let [full (join-name scope (raw-str rs 1))
+            fbs (raw-all rs 2)
+            [fields fe] (loop [i 0 out: Vec(Field) []]
+                          (if (>= i (count fbs)) (values out "")
+                            (let [[f e2] (parse-field (nth fbs i))] (if (not= e2 "") (values out e2) (recur (+ i 1) (conj out f))))))
+            obs (raw-all rs 8)
+            oneofs (loop [i 0 out: Vec(Str) []] (if (>= i (count obs)) out (recur (+ i 1) (let [[orr oe] (scan (nth obs i))] (conj out (raw-str orr 1))))))
+            [mo moe] (scan (raw-str rs 7))
+            map-entry (and (= moe "") (not= (raw-int mo 7 0) 0))
+            acc1 (assoc acc :messages (conj (:messages acc) (->Message full fields oneofs map-entry proto3)))
+            acc2 (if (not= fe "") (assoc acc1 :err fe) acc1)
+            ebs (raw-all rs 4)
+            acc3 (loop [i 0 a acc2] (if (>= i (count ebs)) a
+                                      (let [[en ee] (parse-enum (nth ebs i) full (not proto3))]
+                                        (recur (+ i 1) (if (not= ee "") (assoc a :err ee) (assoc a :enums (conj (:enums a) en)))))))
+            nbs (raw-all rs 3)]
+        (loop [i 0 a acc3] (if (>= i (count nbs)) a (recur (+ i 1) (parse-message a (nth nbs i) full proto3))))))))
+
+(defn- parse-service Values(Service Str) [b: &Str pkg: &Str]
+  (let [[rs e] (scan b)]
+    (if (not= e "") (values (->Service "" []) e)
+      (let [mbs (raw-all rs 2)
+            [ms me] (loop [i 0 out: Vec(Method) []]
+                      (if (>= i (count mbs)) (values out "")
+                        (let [[mr mre] (scan (nth mbs i))]
+                          (if (not= mre "") (values out mre)
+                            (recur (+ i 1) (conj out (->Method (raw-str mr 1) (strip-dot (raw-str mr 2)) (strip-dot (raw-str mr 3))
+                                                               (not= (raw-int mr 5 0) 0) (not= (raw-int mr 6 0) 0))))))))]
+        (values (->Service (join-name pkg (raw-str rs 1)) ms) me)))))
+
+(defn parse-set Values(Desc Str) [b: &Str]
+  (let [[d e] (parse-unlinked b)]
+    (if (not= e "") (values d e)
+      (let [le (link-error d)] (if (= le "") (values d "") (values (->Desc [] [] [] []) le))))))
+
+(defn- type-ref Str [kinds: &Map(Str Int) owner: &Str name: &Str want: Int]
+  (match (get kinds name)
+    (Some k) (cond (= k want) ""
+                   (= want 1) (str owner ": \"." name "\" is not a message type.")
+                   :else (str owner ": \"." name "\" is not an enum type."))
+    (None) (str owner ": \"." name "\" is not defined.")))
+
+(defn link-error Str [d: &Desc]
+  (let [ms (:messages d)
+        k0 (loop [i 0 acc: Map(Str Int) {}] (if (>= i (count ms)) acc (recur (+ i 1) (assoc acc (:full (nth ms i)) 1))))
+        kinds (loop [i 0 acc k0] (if (>= i (count (:enums d))) acc (recur (+ i 1) (assoc acc (:full (nth (:enums d) i)) 2))))
+        fe (loop [i 0]
+             (if (>= i (count ms)) ""
+               (let [m (nth ms i)
+                     e (loop [j 0]
+                         (if (>= j (count (:fields m))) ""
+                           (let [f (nth (:fields m) j)
+                                 t (:type f)
+                                 want (cond (or (= t T-MESSAGE) (= t T-GROUP)) 1 (= t T-ENUM) 2 :else 0)
+                                 r (if (= want 0) "" (type-ref kinds (str (:full m) "." (:name f)) (:type-name f) want))]
+                             (if (= r "") (recur (+ j 1)) r))))]
+                 (if (= e "") (recur (+ i 1)) e))))]
+    (if (not= fe "") fe
+      (loop [i 0]
+        (if (>= i (count (:services d))) ""
+          (let [sv (nth (:services d) i)
+                e (loop [j 0]
+                    (if (>= j (count (:methods sv))) ""
+                      (let [mt (nth (:methods sv) j)
+                            owner (str (:full sv) "." (:name mt))
+                            r1 (type-ref kinds owner (:input mt) 1)
+                            r (if (= r1 "") (type-ref kinds owner (:output mt) 1) r1)]
+                        (if (= r "") (recur (+ j 1)) r))))]
+            (if (= e "") (recur (+ i 1)) e)))))))
+
+(defn parse-unlinked Values(Desc Str) [b: &Str]
+  (let [[rs e] (scan b)]
+    (if (not= e "") (values (->Desc [] [] [] []) e)
+      (let [files (raw-all rs 1)]
+        (loop [i 0 acc (->Acc [] [] "") svcs: Vec(Service) [] top: Vec(Str) []]
+          (cond
+            (not= (:err acc) "") (values (->Desc [] [] [] []) (:err acc))
+            (>= i (count files)) (values (->Desc (:messages acc) (:enums acc) svcs top) "")
+            :else
+            (let [[fr fe] (scan (nth files i))]
+              (if (not= fe "") (values (->Desc [] [] [] []) fe)
+                (let [pkg (raw-str fr 2)
+                      syntax (raw-str fr 12)
+                      proto3 (= syntax "proto3")
+                      mbs (raw-all fr 4)
+                      top2 (loop [j 0 t top] (if (>= j (count mbs)) t (recur (+ j 1) (let [[mr me] (scan (nth mbs j))] (conj t (join-name pkg (raw-str mr 1)))))))
+                      acc2 (loop [j 0 a acc] (if (>= j (count mbs)) a (recur (+ j 1) (parse-message a (nth mbs j) pkg proto3))))
+                      ebs (raw-all fr 5)
+                      acc3 (loop [j 0 a acc2] (if (>= j (count ebs)) a
+                                                (let [[en ee] (parse-enum (nth ebs j) pkg (not proto3))]
+                                                  (recur (+ j 1) (if (not= ee "") (assoc a :err ee) (assoc a :enums (conj (:enums a) en)))))))
+                      sbs (raw-all fr 6)
+                      [svcs2 se] (loop [j 0 s svcs] (if (>= j (count sbs)) (values s "")
+                                                      (let [[sv sve] (parse-service (nth sbs j) pkg)] (if (not= sve "") (values s sve) (recur (+ j 1) (conj s sv))))))]
+                  (recur (+ i 1) (if (not= se "") (assoc acc3 :err se) acc3) svcs2 top2))))))))))
+
+(defn message-index Int [d: &Desc full: &Str]
+  (loop [i 0] (if (>= i (count (:messages d))) -1 (if (= (:full (nth (:messages d) i)) full) i (recur (+ i 1))))))
+
+(defn enum-index Int [d: &Desc full: &Str]
+  (loop [i 0] (if (>= i (count (:enums d))) -1 (if (= (:full (nth (:enums d) i)) full) i (recur (+ i 1))))))
+
+(defn top-level? Bool [d: &Desc full: &Str]
+  (loop [i 0] (if (>= i (count (:top d))) false (if (= (nth (:top d) i) full) true (recur (+ i 1))))))
+
+(defn find-method Vec(Method) [d: &Desc svc: &Str name: &Str]
+  (loop [i 0]
+    (if (>= i (count (:services d))) []
+      (let [s (nth (:services d) i)]
+        (if (= (:full s) svc)
+          (loop [j 0] (if (>= j (count (:methods s))) [] (if (= (:name (nth (:methods s) j)) name) [(nth (:methods s) j)] (recur (+ j 1)))))
+          (recur (+ i 1)))))))
+
+(defn enum-name Vec(Str) [e: &Enum n: Int]
+  (loop [i 0] (if (>= i (count (:values e))) [] (let [v (nth (:values e) i)] (if (= (:number v) n) [(:name v)] (recur (+ i 1)))))))
+
+(defn enum-number Vec(Int) [e: &Enum name: &Str]
+  (loop [i 0] (if (>= i (count (:values e))) [] (let [v (nth (:values e) i)] (if (= (:name v) name) [(:number v)] (recur (+ i 1)))))))
+
+(defn repeated? Bool [f: &Field] (= (:label f) L-REPEATED))
+
+(defn has-presence? Bool [m: &Message f: &Field]
+  (cond (repeated? f) false
+        (or (= (:type f) T-MESSAGE) (= (:type f) T-GROUP)) true
+        (>= (:oneof f) 0) true
+        :else (not (:proto3 m))))
+
+(defn packable? Bool [f: &Field]
+  (and (repeated? f) (not= (:type f) T-STRING) (not= (:type f) T-BYTES) (not= (:type f) T-MESSAGE) (not= (:type f) T-GROUP)))
+
+(defn packed? Bool [m: &Message f: &Field]
+  (and (packable? f) (if (>= (:packed f) 0) (= (:packed f) 1) (:proto3 m))))
+
+(defn wire-of Int [t: Int]
+  (cond (or (= t T-DOUBLE) (= t T-FIXED64) (= t T-SFIXED64)) W-FIXED64
+        (or (= t T-FLOAT) (= t T-FIXED32) (= t T-SFIXED32)) W-FIXED32
+        (or (= t T-STRING) (= t T-BYTES) (= t T-MESSAGE)) W-LEN
+        (= t T-GROUP) W-START
+        :else W-VARINT))
+
+(defvariant PVal
+  (PInt i: Int)
+  (PFloat f: Float)
+  (PBool b: Bool)
+  (PStr s: Str)
+  (PEnum n: Int)
+  (PMsg m: DynMsg))
+
+(defrecord Unknown [num: Int wire: Int ival: Int bytes: Str])
+
+(defrecord DynMsg [mi: Int vals: Vec(Vec(PVal)) unknown: Vec(Unknown)])
+
+(defn field-vals Vec(PVal) [m: &DynMsg i: Int] (nth (:vals m) i))
+
+(defn empty-msg DynMsg [d: &Desc mi: Int]
+  (let [n (count (:fields (nth (:messages d) mi)))]
+    (->DynMsg mi (loop [i 0 acc: Vec(Vec(PVal)) []] (if (>= i n) acc (recur (+ i 1) (conj acc (let [z: Vec(PVal) []] z))))) [])))
+
+(defn- field-pos Int [m: &Message num: Int]
+  (loop [i 0] (if (>= i (count (:fields m))) -1 (if (= (:number (nth (:fields m) i)) num) i (recur (+ i 1))))))
+
+(defn- scalar-of Values(PVal Bool) [t: Int x: Int]
+  (cond
+    (= t T-DOUBLE) (values (->PFloat (ieee/bits->double x)) true)
+    (= t T-FLOAT) (values (->PFloat (ieee/bits->float32 (bit-and x 4294967295))) true)
+    (or (= t T-INT32) (= t T-UINT32) (= t T-FIXED32) (= t T-SFIXED32)) (values (->PInt (to-i32 x)) true)
+    (= t T-SINT32) (values (->PInt (to-i32 (unzigzag (bit-and x 4294967295)))) true)
+    (= t T-SINT64) (values (->PInt (unzigzag x)) true)
+    (= t T-BOOL) (values (->PBool (not= x 0)) true)
+    (= t T-ENUM) (values (->PEnum (to-i32 x)) true)
+    :else (values (->PInt x) true)))
+
+(defn- unpack Values(Vec(PVal) Str) [t: Int b: &Str]
+  (let [w (wire-of t)]
+    (loop [p 0 acc: Vec(PVal) []]
+      (if (>= p (count b)) (values acc "")
+        (let [[x p2 e] (cond (= w W-FIXED64) (get-fixed b p 8) (= w W-FIXED32) (get-fixed b p 4) :else (get-varint b p))]
+          (if (not= e "") (values acc e)
+            (let [[v ok] (scalar-of t x)] (recur p2 (conj acc v)))))))))
+
+(defn- closed-unknown? Bool [d: &Desc f: &Field v: &PVal]
+  (if (not= (:type f) T-ENUM) false
+    (let [ei (enum-index d (:type-name f))]
+      (if (< ei 0) false
+        (let [en (nth (:enums d) ei)]
+          (and (:closed en) (match v (PEnum n) (= (count (enum-name en n)) 0) _ false)))))))
+
+(defn- add-unknown DynMsg [m: DynMsg r: &Raw]
+  (let [us (:unknown m)
+        m2 (assoc m :unknown [])]
+    (assoc m2 :unknown (conj us (->Unknown (:num r) (:wire r) (:ival r) (:bytes r))))))
+
+(defn- put-vals DynMsg [m: DynMsg i: Int rep: Bool vs: Vec(PVal)]
+  (let [vals (:vals m)
+        m2 (assoc m :vals [])
+        old (nth vals i)
+        vals2 (assoc vals i [])
+        nv (if rep (loop [j 0 acc old] (if (>= j (count vs)) acc (recur (+ j 1) (conj acc (nth vs j))))) vs)]
+    (assoc m2 :vals (assoc vals2 i nv))))
+
+(defn decode-into Values(DynMsg Str) [d: &Desc mi: Int b: &Str depth: Int]
+  (if (> depth 100) (values (empty-msg d mi) TOO-DEEP)
+    (let [msg (nth (:messages d) mi)
+          [rs e] (scan b)]
+      (if (not= e "") (values (empty-msg d mi) e)
+        (loop [k 0 m (empty-msg d mi) pend: Vec(Str) (loop [q 0 acc: Vec(Str) []] (if (>= q (count (:fields msg))) acc (recur (+ q 1) (conj acc ""))))]
+          (if (>= k (count rs))
+            (loop [i 0 m2 m]
+              (if (>= i (count (:fields msg))) (values m2 "")
+                (if (= (nth pend i) "") (recur (+ i 1) m2)
+                  (let [f (nth (:fields msg) i)
+                        si (message-index d (:type-name f))
+                        [sub se] (decode-into d si (nth pend i) (+ depth 1))]
+                    (if (not= se "") (values m2 se) (recur (+ i 1) (put-vals m2 i false [(->PMsg sub)])))))))
+            (let [r (nth rs k)
+                  fi (field-pos msg (:num r))]
+              (if (< fi 0) (recur (+ k 1) (add-unknown m r) pend)
+                (let [f (nth (:fields msg) fi)
+                      t (:type f)
+                      rep (repeated? f)
+                      ew (wire-of t)]
+                  (cond
+                    (and (packable? f) (= (:wire r) W-LEN))
+                    (let [[vs ue] (unpack t (:bytes r))]
+                      (if (not= ue "") (values m ue) (recur (+ k 1) (put-vals m fi true vs) pend)))
+                    (not= (:wire r) ew) (recur (+ k 1) (add-unknown m r) pend)
+                    (or (= t T-MESSAGE) (= t T-GROUP))
+                    (if rep
+                      (let [si (message-index d (:type-name f))
+                            [sub se] (decode-into d si (:bytes r) (+ depth 1))]
+                        (if (not= se "") (values m se) (recur (+ k 1) (put-vals m fi true [(->PMsg sub)]) pend)))
+                      (recur (+ k 1) m (let [cur (nth pend fi) p2 (assoc pend fi "")] (assoc p2 fi (str cur (:bytes r))))))
+                    (or (= t T-STRING) (= t T-BYTES)) (recur (+ k 1) (put-vals m fi rep [(->PStr (:bytes r))]) pend)
+                    :else
+                    (let [[v ok] (scalar-of t (:ival r))]
+                      (if (closed-unknown? d f v) (recur (+ k 1) (add-unknown m r) pend)
+                        (recur (+ k 1) (put-vals m fi rep [v]) pend)))))))))))))
+
+(defn missing-required Vec(Str) [d: &Desc m: &DynMsg prefix: &Str]
+  (let [msg (nth (:messages d) (:mi m))
+        fs (:fields msg)
+        own (loop [i 0 acc: Vec(Str) []]
+              (if (>= i (count fs)) acc
+                (recur (+ i 1) (let [f (nth fs i)] (if (and (= (:label f) L-REQUIRED) (= (count (field-vals m i)) 0)) (conj acc (str prefix (:name f))) acc)))))]
+    (loop [i 0 acc own]
+      (if (>= i (count fs)) acc
+        (let [f (nth fs i) vs (field-vals m i)]
+          (if (not (or (= (:type f) T-MESSAGE) (= (:type f) T-GROUP))) (recur (+ i 1) acc)
+            (recur (+ i 1)
+                   (loop [j 0 a acc]
+                     (if (>= j (count vs)) a
+                       (recur (+ j 1)
+                              (match (nth vs j)
+                                (PMsg sub) (let [p (if (repeated? f) (str prefix (:name f) "[" j "].") (str prefix (:name f) "."))
+                                                 more (missing-required d sub p)]
+                                             (loop [q 0 a2 a] (if (>= q (count more)) a2 (recur (+ q 1) (conj a2 (nth more q))))))
+                                _ a)))))))))))
+
+(defn decode Values(DynMsg Str) [d: &Desc mi: Int b: &Str]
+  (let [[m e] (decode-into d mi b 0)]
+    (if (not= e "") (values m e)
+      (let [miss (missing-required d m "")]
+        (if (= (count miss) 0) (values m "")
+          (values m (str "Message missing required fields: " (str/join ", " miss))))))))
+
+(defn default-scalar PVal [d: &Desc f: &Field]
+  (let [t (:type f) dv (:default f)]
+    (cond
+      (or (= t T-DOUBLE) (= t T-FLOAT))
+      (if (= dv "") (->PFloat 0.0) (let [[x xe] (parse-double dv)] (->PFloat (if (= xe "") (if (= t T-FLOAT) (ieee/to-float32 x) x) 0.0))))
+      (= t T-BOOL) (->PBool (= dv "true"))
+      (or (= t T-STRING) (= t T-BYTES)) (->PStr (str dv))
+      (= t T-ENUM)
+      (let [ei (enum-index d (:type-name f))]
+        (if (< ei 0) (->PEnum 0)
+          (let [en (nth (:enums d) ei)]
+            (if (= dv "") (->PEnum (if (> (count (:values en)) 0) (:number (nth (:values en) 0)) 0))
+              (let [ns (enum-number en dv)] (->PEnum (if (> (count ns) 0) (nth ns 0) 0)))))))
+      :else (if (= dv "") (->PInt 0) (let [[n ne] (parse-long dv)] (->PInt (if (= ne "") n 0)))))))
+
+(defn- default? Bool [v: &PVal]
+  (match v
+    (PInt i) (= i 0)
+    (PFloat x) (and (= x 0.0) (not (< (/ 1.0 x) 0.0)))
+    (PBool b) (not b)
+    (PStr s) (= (count s) 0)
+    (PEnum n) (= n 0)
+    (PMsg m) false))
+
+(defn- put-tag Str [out: Str num: Int w: Int] (put-varint out (bit-or (bit-shift-left num 3) w)))
+
+(defn- put-scalar Str [out: Str t: Int v: &PVal]
+  (match v
+    (PInt i) (cond (or (= t T-FIXED64) (= t T-SFIXED64)) (put-fixed out i 8)
+                   (or (= t T-FIXED32) (= t T-SFIXED32)) (put-fixed out i 4)
+                   (= t T-SINT32) (put-varint out (bit-and (zigzag (to-i32 i)) 4294967295))
+                   (= t T-SINT64) (put-varint out (zigzag i))
+                   (= t T-UINT32) (put-varint out (bit-and i 4294967295))
+                   (= t T-INT32) (put-varint out (to-i32 i))
+                   :else (put-varint out i))
+    (PFloat x) (if (= t T-FLOAT) (put-fixed out (ieee/float32->bits x) 4) (put-fixed out (ieee/double->bits x) 8))
+    (PBool b) (put-varint out (if b 1 0))
+    (PEnum n) (put-varint out n)
+    (PStr s) (let [o1 (put-varint out (count s))] (str o1 s))
+    (PMsg m) out))
+
+(defn- put-one Str [o: Str d: &Desc msg: &Message f: &Field v: &PVal]
+  (let [t (:type f)]
+    (cond
+      (and (not (has-presence? msg f)) (not (repeated? f)) (default? v)) o
+      (= t T-GROUP)
+      (match v (PMsg sub) (let [inner (encode d sub) o1 (put-tag o (:number f) W-START) o2 (str o1 inner)] (put-tag o2 (:number f) W-END)) _ o)
+      (= t T-MESSAGE)
+      (match v (PMsg sub) (let [inner (encode d sub) o1 (put-tag o (:number f) W-LEN) o2 (put-varint o1 (count inner))] (str o2 inner)) _ o)
+      :else (let [o1 (put-tag o (:number f) (wire-of t))] (put-scalar o1 t v)))))
+
+(defn- put-field Str [out: Str d: &Desc msg: &Message f: &Field vs: &Vec(PVal)]
+  (cond
+    (= (count vs) 0) out
+    (packed? msg f)
+    (let [inner (loop [j 0 o ""] (if (>= j (count vs)) o (recur (+ j 1) (put-scalar o (:type f) (nth vs j)))))
+          o1 (put-tag out (:number f) W-LEN)
+          o2 (put-varint o1 (count inner))]
+      (str o2 inner))
+    :else (loop [j 0 o out] (if (>= j (count vs)) o (recur (+ j 1) (put-one o d msg f (nth vs j)))))))
+
+(defn- number-order Vec(Int) [fs: &Vec(Field)]
+  (loop [i 1 a (loop [k 0 acc: Vec(Int) []] (if (>= k (count fs)) acc (recur (+ k 1) (conj acc k))))]
+    (if (>= i (count a)) a
+      (recur (+ i 1) (loop [j i b a]
+                       (if (or (= j 0) (<= (:number (nth fs (nth b (- j 1)))) (:number (nth fs (nth b j))))) b
+                         (recur (- j 1) (let [x (nth b j) y (nth b (- j 1))] (assoc (assoc b j y) (- j 1) x)))))))))
+
+(defn encode Str [d: &Desc m: &DynMsg]
+  (let [msg (nth (:messages d) (:mi m))
+        fs (:fields msg)
+        order (number-order fs)
+        body (loop [k 0 out ""]
+               (if (>= k (count order)) out
+                 (let [i (nth order k)] (recur (+ k 1) (put-field out d msg (nth fs i) (field-vals m i))))))]
+    (put-unknown body (:unknown m))))
+
+(def UNKNOWN-WIRES [0 5 1 2 3])
+
+(defn- wire-rank Int [wires: &Vec(Int) w: Int]
+  (loop [k 0] (if (>= k (count wires)) -1 (if (= (nth wires k) w) k (recur (+ k 1))))))
+
+(defn- unknown-before? Bool [us: &Vec(Unknown) rk: &Vec(Int) a: Int b: Int]
+  (let [na (:num (nth us a)) nb (:num (nth us b))]
+    (cond (not= na nb) (< na nb)
+          (not= (nth rk a) (nth rk b)) (< (nth rk a) (nth rk b))
+          :else (< a b))))
+
+(defn- merge-runs Vec(Int) [us: &Vec(Unknown) rk: &Vec(Int) src: &Vec(Int) dst: Vec(Int) lo: Int mid: Int hi: Int]
+  (loop [i lo j mid out dst]
+    (cond (and (>= i mid) (>= j hi)) out
+          (>= i mid) (recur i (+ j 1) (conj out (nth src j)))
+          (>= j hi) (recur (+ i 1) j (conj out (nth src i)))
+          (unknown-before? us rk (nth src j) (nth src i)) (recur i (+ j 1) (conj out (nth src j)))
+          :else (recur (+ i 1) j (conj out (nth src i))))))
+
+(defn- sort-unknown Vec(Int) [us: &Vec(Unknown) rk: &Vec(Int) idx: Vec(Int)]
+  (let [n (count idx)]
+    (loop [w 1 src idx]
+      (if (>= w n) src
+        (recur (* w 2)
+               (loop [lo 0 out: Vec(Int) []]
+                 (if (>= lo n) out
+                   (recur (+ lo (* 2 w)) (merge-runs us rk src out lo (min n (+ lo w)) (min n (+ lo (* 2 w))))))))))))
+
+(defn unknown-sorted Vec(Unknown) [us: &Vec(Unknown) wires: &Vec(Int)]
+  (let [rk (loop [i 0 acc: Vec(Int) []] (if (>= i (count us)) acc (recur (+ i 1) (conj acc (wire-rank wires (:wire (nth us i)))))))
+        idx (loop [i 0 acc: Vec(Int) []] (if (>= i (count us)) acc (recur (+ i 1) (if (< (nth rk i) 0) acc (conj acc i)))))
+        order (sort-unknown us rk idx)]
+    (loop [k 0 acc: Vec(Unknown) []] (if (>= k (count order)) acc (recur (+ k 1) (conj acc (nth us (nth order k))))))))
+
+(defn- put-unknown Str [out: Str us: &Vec(Unknown)]
+  (let [sorted (unknown-sorted us UNKNOWN-WIRES)]
+    (loop [i 0 o out]
+      (if (>= i (count sorted)) o
+        (let [u (nth sorted i) w (:wire u) o1 (put-tag o (:num u) w)]
+          (recur (+ i 1)
+                 (cond (= w W-VARINT) (put-varint o1 (:ival u))
+                       (= w W-FIXED32) (put-fixed o1 (:ival u) 4)
+                       (= w W-FIXED64) (put-fixed o1 (:ival u) 8)
+                       (= w W-LEN) (let [o2 (put-varint o1 (count (:bytes u)))] (str o2 (:bytes u)))
+                       :else (let [o2 (str o1 (:bytes u))] (put-tag o2 (:num u) W-END)))))))))

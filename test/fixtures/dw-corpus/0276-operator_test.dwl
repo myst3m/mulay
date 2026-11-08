@@ -1,0 +1,3 @@
+%dw 2.0
+---
+[1,2,3,4] reduce ((item, acc = 5) -> acc + item)

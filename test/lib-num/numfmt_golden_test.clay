@@ -1,0 +1,40 @@
+(ns numfmt-golden-test (:require [mulay.lib.numparse :as npz] [mulay.dw.numfmt :as nf] [mulay.lib.dec :as d] [clay.string :as str] [numfmt-golden-data :as g]))
+
+;; test/lib-num/gen-numfmt-golden.java が Java 17 の DecimalFormat で作った期待値 (numfmt_golden_data.clay) との照合。
+;; 食い違った行は表示して数える。
+
+(defn- dp d/Dec [s: &Str] (let [[x e] (d/parse s)] x))
+(defn- loc Str [s: &Str] (if (= s "-") "" s))
+
+(defn- run-format Str [f: &Vec(Str)]
+  (let [[s pe ae] (nf/format-dec (dp (nth f 4)) (nth f 1) (loc (nth f 2)) (npz/int-or (nth f 3) 0))]
+    (cond
+      (not= pe "") (str "ERRP:" pe)
+      (not= ae "") (str "ERRA:" ae)
+      :else s)))
+
+(defn- run-parse Str [f: &Vec(Str)]
+  (let [[x pe ok] (nf/parse-dec (nth f 4) (nth f 1) (loc (nth f 2)))]
+    (cond
+      (not= pe "") (str "ERRP:" pe)
+      (not ok) "FAIL"
+      :else (d/to-string x))))
+
+(defn- run-all Int [text: Str]
+  (let [lines: Vec(Str) (str/split text "\n")]
+    (loop [i 0 bad 0]
+      (if (>= i (count lines)) bad
+        (let [f: Vec(Str) (str/split (nth lines i) "\t")
+              want (nth f 5)
+              got (if (= (nth f 0) "F") (run-format f) (run-parse f))]
+          (if (= got want) (recur (+ i 1) bad)
+            (let [z (if (< bad 60) (println (str "MISMATCH " (nth lines i) "\n     got: " got)) 0)]
+              (recur (+ i 1) (+ bad 1)))))))))
+
+(deftest numfmt-format-golden
+  (let [bad (run-all (g/format-cases)) z (println (str "format mismatches: " bad))]
+    (is (= bad 0))))
+
+(deftest numfmt-parse-golden
+  (let [bad (run-all (g/parse-cases)) z (println (str "parse mismatches: " bad))]
+    (is (= bad 0))))

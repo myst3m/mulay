@@ -1,0 +1,124 @@
+(ns mulay.dw.lib.coercions
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.coerce :as co] [mulay.lib.uni :as uni]))
+
+(def M "dw::util::Coercions")
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- nullish? Bool [a: &Vec(v/Val) i: Int] (or (>= i (count a)) (v/null? (nth a i))))
+
+(defn- as-with Values(v/Val dwe/DwErr) [x: &v/Val name: Str keys: Vec(Str) a: &Vec(v/Val) from: Int]
+  (let [meta (loop [i 0 acc: Vec(v/Field) []]
+               (if (>= i (count keys)) acc
+                 (recur (+ i 1) (if (nullish? a (+ from i)) acc (conj acc (v/field (nth keys i) (nth a (+ from i))))))))]
+    (co/coerce x (v/->TypeV "name" name [] [] [] meta))))
+
+(defn- as-fn Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [name: Str keys: Vec(Str)]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (as-with (nth a 0) name keys a 1)))
+
+(defn- key->str v/Val [x: &v/Val]
+  (match (v/unmeta x) (v/VKey k) (v/->VStr (:name k)) _ x))
+
+(defn- as-str-fn Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [name: Str keys: Vec(Str)]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (as-with (key->str (nth a 0)) name keys a 1)))
+
+(defn- with-formatters Values(v/Val dwe/DwErr) [s: &v/Val name: Str fs: &Vec(v/Val)]
+  (loop [i 0]
+    (if (>= i (count fs))
+      (rt/failure "UserException" (str "Could not find a valid formatter for '" (core/arg-str [s] 0) "'"))
+      (let [f (core/arg-fields fs i)
+            fmt (v/obj-get f "format") loc (v/obj-get f "locale")
+            args: Vec(v/Val) [(if (= (count fmt) 0) (v/null-v) (nth fmt 0)) (if (= (count loc) 0) (v/null-v) (nth loc 0))]
+            [y e] (as-with s name ["format" "locale"] args 0)]
+        (if (and (dwe/ok? e) (not (v/null? y))) (values y e) (recur (+ i 1)))))))
+
+(defn- fmts-fn Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [name: Str or-null: Bool]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (let [[y e] (with-formatters (nth a 0) name (core/arg-items a 1))]
+      (if (and or-null (not (dwe/ok? e))) (ok (v/null-v)) (values y e)))))
+
+(defn- join-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (core/arg-items a 0)]
+    (loop [i 0 out ""]
+      (if (>= i (count xs)) (ok (v/->VStr out))
+        (let [[s e] (rt/to-text (nth xs i))]
+          (if (dwe/ok? e) (recur (+ i 1) (str out s)) (values (v/null-v) e)))))))
+
+(defn- to-array Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) n (count s)]
+    (loop [i 0 acc: Vec(v/Val) []]
+      (if (>= i n) (ok (v/->VArr acc))
+        (let [j (uni/next-index s i)] (recur j (conj acc (v/->VStr (subs s i j)))))))))
+
+(defn- ascii-lower Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)] (recur (+ i 1) (str out (chr (if (and (>= c 65) (<= c 90)) (+ c 32) c))))))))
+
+(defn- to-boolean Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) l (ascii-lower s)]
+    (cond
+      (= l "true") (ok (v/bool-v true))
+      (= l "false") (ok (v/bool-v false))
+      :else (rt/failure "CoercionException" (str "Cannot coerce String (" s ") to Boolean")))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+(defn- o rt/Overload [ps: Vec(Str) f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] (rt/overload ps f))
+
+(defn- opt-overloads Vec(rt/Overload) [t: Str n: Int f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))]
+  (loop [k 0 acc: Vec(rt/Overload) []]
+    (if (> k n) acc
+      (recur (+ k 1) (conj acc (o (loop [i 0 ps: Vec(Str) [t]] (if (>= i k) ps (recur (+ i 1) (conj ps "Any")))) f))))))
+
+(defn- cat-os Vec(rt/Overload) [parts: Vec(Vec(rt/Overload))]
+  (loop [i 0 acc: Vec(rt/Overload) []]
+    (if (>= i (count parts)) acc
+      (recur (+ i 1) (loop [a acc k 0] (if (>= k (count (nth parts i))) a (recur (conj a (nth (nth parts i) k)) (+ k 1))))))))
+
+(def DATE-TYPES ["Date" "DateTime" "LocalDateTime" "LocalTime" "Time"])
+(def PLAIN-TYPES ["TimeZone" "String" "Boolean" "Period" "Regex" "Key"])
+
+(defn- temporal Vec(rt/Overload) [name: Str]
+  (let [with-f (fmts-fn name false)
+        plain (as-fn name ["format" "locale"])]
+    (cat-os [[(o ["String" "Array"] with-f)] (opt-overloads "String" 2 plain)])))
+
+(defn builtins Vec(rt/Builtin) []
+  (let [to-str-num (as-fn "String" ["format" "locale" "roundMode"])
+        to-str-date (as-fn "String" ["format" "locale"])
+        to-str-plain (as-fn "String" [])
+        date-os (loop [i 0 acc: Vec(rt/Overload) []]
+                  (if (>= i (count DATE-TYPES)) acc
+                    (recur (+ i 1) (cat-os [acc (opt-overloads (nth DATE-TYPES i) 2 to-str-date)]))))
+        plain-os (loop [i 0 acc: Vec(rt/Overload) []]
+                   (if (>= i (count PLAIN-TYPES)) acc (recur (+ i 1) (conj acc (o [(nth PLAIN-TYPES i)] to-str-plain)))))]
+    [(B "toString" (cat-os [(opt-overloads "Number" 3 to-str-num) date-os
+                            [(o ["Binary" "String"] (as-fn "String" ["encoding"]))]
+                            plain-os [(o ["Array"] join-arr)]]))
+     (B "toArray" [(rt/b1 "String" to-array)])
+     (B "toNumber" (cat-os [[(o ["String" "Array"] (fmts-fn "Number" false))]
+                            (opt-overloads "DateTime" 1 (as-fn "Number" ["unit"]))
+                            (opt-overloads "Period" 1 (as-fn "Number" ["unit"]))
+                            (opt-overloads "String" 2 (as-str-fn "Number" ["format" "locale"]))
+                            (opt-overloads "Key" 2 (as-str-fn "Number" ["format" "locale"]))]))
+     (B "toNumberOrNull" [(o ["String" "Array"] (fmts-fn "Number" true))])
+     (B "toDateTime" (cat-os [[(o ["String" "Array"] (fmts-fn "DateTime" false))]
+                              (opt-overloads "Number" 1 (as-fn "DateTime" ["unit"]))
+                              (opt-overloads "String" 2 (as-fn "DateTime" ["format" "locale"]))]))
+     (B "toDateTimeOrNull" [(o ["String" "Array"] (fmts-fn "DateTime" true))])
+     (B "toLocalDateTime" (temporal "LocalDateTime"))
+     (B "toLocalDateTimeOrNull" [(o ["String" "Array"] (fmts-fn "LocalDateTime" true))])
+     (B "toDate" (temporal "Date"))
+     (B "toDateOrNull" [(o ["String" "Array"] (fmts-fn "Date" true))])
+     (B "toTime" (temporal "Time"))
+     (B "toTimeOrNull" [(o ["String" "Array"] (fmts-fn "Time" true))])
+     (B "toLocalTime" (temporal "LocalTime"))
+     (B "toLocalTimeOrNull" [(o ["String" "Array"] (fmts-fn "LocalTime" true))])
+     (B "toPeriod" [(rt/b1 "String" (as-fn "Period" []))])
+     (B "toRegex" [(rt/b1 "String" (as-fn "Regex" []))])
+     (B "toBoolean" [(rt/b1 "String" to-boolean)])
+     (B "toTimeZone" [(rt/b1 "String" (as-fn "TimeZone" []))])
+     (B "toUri" [(rt/b1 "String" (as-fn "Uri" []))])
+     (B "toBinary" [(rt/b2 "String" "String" (as-fn "Binary" ["encoding"]))])]))

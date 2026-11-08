@@ -1,0 +1,235 @@
+(ns mulay.lib.sqlval (:require [mulay.lib.sqlfile :as sf] [mulay.lib.sqlnum :as num] [clay.string :as str]))
+
+(def AFF-NONE 64)
+(def AFF-BLOB 65)
+(def AFF-TEXT 66)
+(def AFF-NUMERIC 67)
+(def AFF-INTEGER 68)
+(def AFF-REAL 69)
+
+(defn to-text Str [v: &sf/Val]
+  (match v
+    (sf/VInt n) (str n)
+    (sf/VReal x) (num/real->text x)
+    (sf/VText s) (str s)
+    (sf/VBlob s) (str s)
+    _ ""))
+
+(defn to-int Int [v: &sf/Val]
+  (match v
+    (sf/VInt n) n
+    (sf/VReal x) (num/real->i64 x)
+    (sf/VText s) (let [[n rc] (num/atoi64 s)] n)
+    (sf/VBlob s) (let [[n rc] (num/atoi64 s)] n)
+    _ 0))
+
+(defn to-real Float [v: &sf/Val]
+  (match v
+    (sf/VInt n) (float n)
+    (sf/VReal x) x
+    (sf/VText s) (let [[x k] (num/atof s)] x)
+    (sf/VBlob s) (let [[x k] (num/atof s)] x)
+    _ 0.0))
+
+(defn null? Bool [v: &sf/Val] (match v (sf/VNull) true _ false))
+(defn vint? Bool [v: &sf/Val] (match v (sf/VInt n) true _ false))
+(defn real? Bool [v: &sf/Val] (match v (sf/VReal x) true _ false))
+(defn text? Bool [v: &sf/Val] (match v (sf/VText s) true _ false))
+(defn blob? Bool [v: &sf/Val] (match v (sf/VBlob s) true _ false))
+(defn num? Bool [v: &sf/Val] (or (vint? v) (real? v)))
+
+(defn numeric sf/Val [v: &sf/Val]
+  (match v
+    (sf/VText s) (num-of-text s)
+    (sf/VBlob s) (num-of-text s)
+    _ (copy v)))
+
+(defn- num-of-text sf/Val [s: &Str]
+  (let [[r rc] (num/atof s)]
+    (if (<= rc 0)
+      (let [[ix rc2] (num/atoi64 s)] (if (and (= rc 0) (<= rc2 1)) (sf/->VInt ix) (sf/->VReal r)))
+      (let [[ix rc2] (num/atoi64 s)] (if (and (= rc 1) (= rc2 0)) (sf/->VInt ix) (sf/->VReal r))))))
+
+(defn numeric-affinity sf/Val [v: &sf/Val try-int: Bool]
+  (match v
+    (sf/VText s)
+    (let [[r rc] (num/atof s)]
+      (if (<= rc 0) (copy v)
+        (let [ix (num/real->i64 r)]
+          (cond (and (= rc 1) (num/real-same-as-int? r ix)) (sf/->VInt ix)
+                (and (= rc 1) (let [[n rc2] (num/atoi64 s)] (= rc2 0))) (let [[n rc2] (num/atoi64 s)] (sf/->VInt n))
+                (and try-int (= r (float ix)) (> ix num/I64-MIN) (< ix num/I64-MAX)) (sf/->VInt ix)
+                :else (sf/->VReal r)))))
+    _ (copy v)))
+
+(defn numeric-type sf/Val [v: &sf/Val] (match v (sf/VText s) (numeric-affinity v false) _ (copy v)))
+
+(defn apply-affinity sf/Val [v: &sf/Val aff: Int]
+  (cond
+    (>= aff AFF-NUMERIC)
+    (match v
+      (sf/VText s) (numeric-affinity v true)
+      (sf/VReal x) (if (<= aff AFF-REAL) (let [ix (num/real->i64 x)]
+                                          (if (and (= x (float ix)) (> ix num/I64-MIN) (< ix num/I64-MAX)) (sf/->VInt ix) (copy v)))
+                     (copy v))
+      _ (copy v))
+    (= aff AFF-TEXT) (match v (sf/VInt n) (sf/->VText (str n)) (sf/VReal x) (sf/->VText (num/real->text x)) _ (copy v))
+    :else (copy v)))
+
+(defn- numerify sf/Val [v: &sf/Val]
+  (match v
+    (sf/VText s) (numerify-text s)
+    (sf/VBlob s) (numerify-text s)
+    _ (copy v)))
+
+(defn- numerify-text sf/Val [s: &Str]
+  (let [[r rc] (num/atof s)
+        [ix rc2] (num/atoi64 s)]
+    (cond (and (or (= rc 0) (= rc 1)) (<= rc2 1)) (sf/->VInt ix)
+          (num/real-same-as-int? r (num/real->i64 r)) (sf/->VInt (num/real->i64 r))
+          :else (sf/->VReal r))))
+
+(defn affinity-of-type Int [name: &Str]
+  (let [z (str/lower-case name)]
+    (loop [i 0 h 0 aff AFF-NUMERIC]
+      (if (>= i (count z)) aff
+        (let [h2 (bit-and (+ (bit-shift-left h 8) (nth z i)) 0xffffffff)
+              w (fn-word h2)]
+          (cond (= (bit-and h2 0xffffff) 6909556) AFF-INTEGER
+                (or (= w "char") (= w "clob") (= w "text")) (recur (+ i 1) h2 AFF-TEXT)
+                (and (= w "blob") (or (= aff AFF-NUMERIC) (= aff AFF-REAL))) (recur (+ i 1) h2 AFF-BLOB)
+                (and (or (= w "real") (= w "floa") (= w "doub")) (= aff AFF-NUMERIC)) (recur (+ i 1) h2 AFF-REAL)
+                :else (recur (+ i 1) h2 aff)))))))
+
+(defn- fn-word Str [h: Int]
+  (str (chr (bit-and (bit-shift-right h 24) 255)) (chr (bit-and (bit-shift-right h 16) 255)) (chr (bit-and (bit-shift-right h 8) 255)) (chr (bit-and h 255))))
+
+(defn cast-to sf/Val [v: &sf/Val aff: Int]
+  (if (null? v) (sf/->VNull)
+    (cond (= aff AFF-BLOB) (match v (sf/VBlob s) (copy v) _ (sf/->VBlob (to-text v)))
+          (= aff AFF-NUMERIC) (numerify v)
+          (= aff AFF-INTEGER) (sf/->VInt (to-int v))
+          (= aff AFF-REAL) (sf/->VReal (to-real v))
+          :else (sf/->VText (to-text v)))))
+
+(defn truthy Int [v: &sf/Val]
+  (match v
+    (sf/VNull) -1
+    (sf/VInt n) (if (= n 0) 0 1)
+    _ (if (= (to-real v) 0.0) 0 1)))
+
+(defn- int-float-cmp Int [i: Int r: Float]
+  (cond (not= r r) 1
+        (< r -9223372036854775808.0) 1
+        (>= r 9223372036854775808.0) -1
+        :else (let [y (int r)]
+                (cond (< i y) -1 (> i y) 1 (< (float i) r) -1 (> (float i) r) 1 :else 0))))
+
+(defn coll-cmp Int [a: &Str b: &Str coll: &Str]
+  (cond
+    (= coll "NOCASE") (bytes-cmp (lower-ascii a) (lower-ascii b))
+    (= coll "RTRIM") (bytes-cmp (rtrim-sp a) (rtrim-sp b))
+    :else (bytes-cmp a b)))
+
+(defn lower-ascii Str [s: &Str]
+  (loop [i 0 out ""] (if (>= i (count s)) out (let [c (nth s i)] (recur (+ i 1) (str out (chr (if (and (>= c 65) (<= c 90)) (+ c 32) c))))))))
+(defn rtrim-sp Str [s: &Str] (let [e (loop [e (count s)] (if (and (> e 0) (= (nth s (- e 1)) 32)) (recur (- e 1)) e))] (subs s 0 e)))
+
+(defn bytes-cmp Int [a: &Str b: &Str]
+  (let [n (min (count a) (count b))]
+    (loop [i 0] (cond (>= i n) (- (count a) (count b)) (not= (nth a i) (nth b i)) (- (nth a i) (nth b i)) :else (recur (+ i 1))))))
+
+(defn compare-vals Int [a: &sf/Val b: &sf/Val coll: &Str]
+  (cond
+    (or (null? a) (null? b)) (- (if (null? b) 1 0) (if (null? a) 1 0))
+    (or (num? a) (num? b))
+    (match a
+      (sf/VInt x) (match b (sf/VInt y) (cond (< x y) -1 (> x y) 1 :else 0) (sf/VReal r) (int-float-cmp x r) _ -1)
+      (sf/VReal x) (match b (sf/VReal y) (cond (< x y) -1 (> x y) 1 :else 0) (sf/VInt i) (- 0 (int-float-cmp i x)) _ -1)
+      _ 1)
+    (or (text? a) (text? b))
+    (cond (not (text? a)) 1 (not (text? b)) -1 :else (coll-cmp (to-text a) (to-text b) coll))
+    :else (bytes-cmp (to-text a) (to-text b))))
+
+(defn cmp-affinity Int [a1: Int a2: Int]
+  (cond (and (> a1 AFF-NONE) (> a2 AFF-NONE)) (if (or (>= a1 AFF-NUMERIC) (>= a2 AFF-NUMERIC)) AFF-NUMERIC AFF-BLOB)
+        (and (<= a1 AFF-NONE) (<= a2 AFF-NONE)) AFF-BLOB
+        :else (bit-or (max a1 a2) 64)))
+
+(defn- cmp-prep Values(sf/Val sf/Val) [a: &sf/Val b: &sf/Val aff: Int]
+  (cond
+    (>= aff AFF-NUMERIC)
+    (values (if (text? a) (numeric-affinity a false) (copy a)) (if (text? b) (numeric-affinity b false) (copy b)))
+    (= aff AFF-TEXT)
+    (values (if (num? a) (sf/->VText (to-text a)) (copy a)) (if (num? b) (sf/->VText (to-text b)) (copy b)))
+    :else (values (copy a) (copy b))))
+
+(defn cmp-values Values(Int Bool) [a: &sf/Val b: &sf/Val aff: Int coll: &Str]
+  (if (or (null? a) (null? b)) (values 0 true)
+    (let [[x y] (cmp-prep a b aff)] (values (compare-vals x y coll) false))))
+
+(defn bool-val sf/Val [b: Bool] (sf/->VInt (if b 1 0)))
+
+(defn- add-ok Bool [a: Int b: Int] (let [s (+ a b)] (not (or (and (>= a 0) (>= b 0) (< s 0)) (and (< a 0) (< b 0) (>= s 0))))))
+(defn- mul-ok Bool [a: Int b: Int]
+  (cond (or (= a 0) (= b 0)) true
+        (and (= a -1) (= b num/I64-MIN)) false
+        (and (= b -1) (= a num/I64-MIN)) false
+        :else (let [p (* a b)] (and (= (quot p b) a) (= (quot p a) b)))))
+
+(defn arith sf/Val [op: &Str a0: &sf/Val b0: &sf/Val]
+  (if (or (null? a0) (null? b0)) (sf/->VNull)
+    (let [a (numeric a0) b (numeric b0)]
+      (match a
+        (sf/VInt x)
+        (match b
+          (sf/VInt y)
+          (cond
+            (= op "+") (if (add-ok x y) (sf/->VInt (+ x y)) (real-arith op a0 b0))
+            (= op "-") (if (and (not (= y num/I64-MIN)) (add-ok x (- 0 y))) (sf/->VInt (- x y))
+                         (if (and (= y num/I64-MIN) (< x 0)) (sf/->VInt (- x y)) (real-arith op a0 b0)))
+            (= op "*") (if (mul-ok x y) (sf/->VInt (* x y)) (real-arith op a0 b0))
+            (= op "/") (cond (= y 0) (sf/->VNull) (and (= y -1) (= x num/I64-MIN)) (real-arith op a0 b0) :else (sf/->VInt (quot x y)))
+            :else (cond (= y 0) (sf/->VNull) :else (sf/->VInt (rem x (if (= y -1) 1 y)))))
+          _ (real-arith op a0 b0))
+        _ (real-arith op a0 b0)))))
+
+(defn- real-arith sf/Val [op: &Str a: &sf/Val b: &sf/Val]
+  (let [x (to-real a) y (to-real b)]
+    (if (= op "%")
+      (let [ia (to-int a) ib (to-int b)]
+        (if (= ib 0) (sf/->VNull) (sf/->VReal (float (rem ia (if (= ib -1) 1 ib))))))
+      (let [r (cond (= op "+") (+ x y) (= op "-") (- x y) (= op "*") (* x y) (= y 0.0) 0.0 :else (/ x y))]
+        (if (or (not= r r) (and (= op "/") (= y 0.0))) (sf/->VNull) (sf/->VReal r))))))
+
+(defn bitop sf/Val [op: &Str a: &sf/Val b: &sf/Val]
+  (if (or (null? a) (null? b)) (sf/->VNull)
+    (let [x (to-int a) y (to-int b)]
+      (cond (= op "&") (sf/->VInt (bit-and x y))
+            (= op "|") (sf/->VInt (bit-or x y))
+            (= y 0) (sf/->VInt x)
+            :else
+            (let [left (if (< y 0) (= op ">>") (= op "<<"))
+                  k (if (< y 0) (if (> y -64) (- 0 y) 64) y)]
+              (sf/->VInt (cond (>= k 64) (if (or (>= x 0) left) 0 -1)
+                               left (bit-shift-left x k)
+                               :else (bit-shift-right x k))))))))
+
+(defn concat-v sf/Val [a: &sf/Val b: &sf/Val]
+  (if (or (null? a) (null? b)) (sf/->VNull) (let [x (to-text a) y (to-text b)] (sf/->VText (str x y)))))
+
+(defn- int-type? Bool [t: Int] (and (>= t 1) (<= t 9) (not= t 7)))
+
+(defn record-compare Int [a: &Str b: &Str colls: &Vec(Str) desc: &Vec(Bool)] (record-compare-at a 0 b colls desc))
+
+(defn record-compare-at Int [a: &Str ao: Int b: &Str colls: &Vec(Str) desc: &Vec(Bool)]
+  (let [[ha0 pa oka] (sf/get-varint a ao) ha (+ ao ha0) [hb pb okb] (sf/get-varint b 0)]
+    (loop [i 0 hpa pa dpa ha hpb pb dpb hb]
+      (if (or (>= hpa ha) (>= hpb hb)) 0
+        (let [[ta hpa2 ok1] (sf/get-varint a hpa) [tb hpb2 ok2] (sf/get-varint b hpb)
+              coll (if (< i (count colls)) (nth colls i) "BINARY")
+              c (if (and (int-type? ta) (int-type? tb))
+                  (let [x (sf/int-at a dpa ta) y (sf/int-at b dpb tb)] (cond (< x y) -1 (> x y) 1 :else 0))
+                  (let [x (sf/value-at a dpa ta) y (sf/value-at b dpb tb)] (compare-vals x y coll)))
+              c2 (if (and (< i (count desc)) (nth desc i)) (- 0 c) c)]
+          (if (not= c2 0) c2 (recur (+ i 1) hpa2 (+ dpa (sf/serial-len ta)) hpb2 (+ dpb (sf/serial-len tb)))))))))

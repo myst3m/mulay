@@ -1,0 +1,615 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18213"/>
+    </http:listener-config>
+    <http:listener-config name="L2">
+        <http:listener-connection host="0.0.0.0" port="18214"/>
+    </http:listener-config>
+
+    <mcp:server-config name="SrvC" serverName="Srv" serverVersion="1.0.0">
+        <mcp:streamable-http-server-connection listenerConfig="L" mcpEndpointPath="/mcp" responseContentType="JSON"/>
+    </mcp:server-config>
+    <mcp:server-config name="SrvM" serverName="SrvM" serverVersion="1.0.0">
+        <mcp:streamable-http-server-connection listenerConfig="L" mcpEndpointPath="/m"/>
+    </mcp:server-config>
+
+    <mcp:client-config name="Cli" clientName="mulay-test" clientVersion="9.9">
+        <mcp:streamable-http-client-connection serverUrl="http://localhost:18213" mcpEndpointPath="/mcp"/>
+    </mcp:client-config>
+    <mcp:client-config name="CliM" clientName="mulay-test" clientVersion="9.9">
+        <mcp:streamable-http-client-connection serverUrl="http://localhost:18213" mcpEndpointPath="/m"/>
+    </mcp:client-config>
+    <mcp:client-config name="CliDown" clientName="mulay-test" clientVersion="9.9">
+        <mcp:streamable-http-client-connection serverUrl="http://localhost:18299" mcpEndpointPath="/mcp"/>
+    </mcp:client-config>
+    <mcp:client-config name="CliBad" clientName="mulay-test" clientVersion="9.9">
+        <mcp:streamable-http-client-connection serverUrl="http://localhost:18213" mcpEndpointPath="/nothere"/>
+    </mcp:client-config>
+    <mcp:client-config name="CliH" clientName="mulay-test" clientVersion="9.9">
+        <mcp:streamable-http-client-connection serverUrl="http://localhost:18213" mcpEndpointPath="/m">
+            <mcp:default-request-headers>
+                <mcp:default-request-header key="X-Trace" value="abc"/>
+            </mcp:default-request-headers>
+        </mcp:streamable-http-client-connection>
+    </mcp:client-config>
+
+    <flow name="tool-add">
+        <mcp:tool-listener config-ref="SrvC" name="add">
+            <mcp:description>Adds two numbers</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="#[(payload.a + payload.b) as String]"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="add"/>
+    </flow>
+
+    <flow name="tool-echo">
+        <mcp:tool-listener config-ref="SrvM" name="echo">
+            <mcp:description>Echo</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="#[write(payload, 'text/plain')]"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="echo"/>
+    </flow>
+
+    <flow name="tool-multi">
+        <mcp:tool-listener config-ref="SrvM" name="multi">
+            <mcp:description>Several contents</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="one"/><mcp:image-tool-response-content data="aGk=" mimeType="image/png"/><mcp:text-resource-tool-response-content uri="mule://r" mimeType="text/plain" text="res"/><mcp:blob-resource-tool-response-content uri="mule://b" mimeType="application/octet-stream" blob="blobby"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="multi"/>
+    </flow>
+
+    <flow name="tool-fail">
+        <mcp:tool-listener config-ref="SrvM" name="fail">
+            <mcp:description>Fails</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="unreachable"/></mcp:responses>
+        </mcp:tool-listener>
+        <raise-error type="APP:BOOM" description="tool boom"/>
+        <logger level="INFO" message="fail"/>
+    </flow>
+
+    <flow name="tool-hdrs">
+        <mcp:tool-listener config-ref="SrvM" name="hdrs">
+            <mcp:description>Request headers</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="#[write({contentType: attributes.additionalProperties.'content-type', accept: attributes.additionalProperties.accept, version: attributes.additionalProperties.'mcp-protocol-version', agent: attributes.additionalProperties.'user-agent', trace: attributes.additionalProperties.'x-trace', sid: attributes.sessionId}, 'application/json')]"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="hdrs"/>
+    </flow>
+
+    <flow name="tool-j-obj">
+        <mcp:tool-listener config-ref="SrvM" name="j-obj">
+            <mcp:description>d</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="{&quot;k&quot;:1}"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="j-obj"/>
+    </flow>
+
+    <flow name="tool-j-arr">
+        <mcp:tool-listener config-ref="SrvM" name="j-arr">
+            <mcp:description>d</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="[1,2]"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="j-arr"/>
+    </flow>
+
+    <flow name="tool-j-str">
+        <mcp:tool-listener config-ref="SrvM" name="j-str">
+            <mcp:description>d</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="abc"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="j-str"/>
+    </flow>
+
+    <flow name="tool-j-bad">
+        <mcp:tool-listener config-ref="SrvM" name="j-bad">
+            <mcp:description>d</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="{bad"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="j-bad"/>
+    </flow>
+
+    <flow name="tool-j-sp">
+        <mcp:tool-listener config-ref="SrvM" name="j-sp">
+            <mcp:description>d</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text=" {&quot;k&quot;:1}"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="j-sp"/>
+    </flow>
+
+    <flow name="tool-j-num">
+        <mcp:tool-listener config-ref="SrvM" name="j-num">
+            <mcp:description>d</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="42"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="j-num"/>
+    </flow>
+
+    <flow name="tool-j-trail">
+        <mcp:tool-listener config-ref="SrvM" name="j-trail">
+            <mcp:description>d</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="{&quot;k&quot;:1} tail"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="j-trail"/>
+    </flow>
+
+    <flow name="tool-j-two">
+        <mcp:tool-listener config-ref="SrvM" name="j-two">
+            <mcp:description>d</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="{&quot;k&quot;:1}"/><mcp:text-tool-response-content text="second"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="j-two"/>
+    </flow>
+
+    <flow name="tool-j-img">
+        <mcp:tool-listener config-ref="SrvM" name="j-img">
+            <mcp:description>d</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object"}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:image-tool-response-content data="aGk=" mimeType="image/png"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="j-img"/>
+    </flow>
+
+    <flow name="greeting">
+        <mcp:resource-listener config-ref="SrvC" name="greeting" uri="mule://greeting" resourceMimeType="text/plain">
+            <mcp:description>A greeting</mcp:description>
+            <mcp:resource-listener-content>
+                <mcp:text-resource text="hello"/>
+            </mcp:resource-listener-content>
+        </mcp:resource-listener>
+        <logger level="INFO" message="greeting"/>
+    </flow>
+    <flow name="blob">
+        <mcp:resource-listener config-ref="SrvM" name="blob" uri="mule://blob" resourceMimeType="application/octet-stream">
+            <mcp:description>A blob</mcp:description>
+            <mcp:resource-listener-content>
+                <mcp:blob-resource blob="bytes"/>
+            </mcp:resource-listener-content>
+        </mcp:resource-listener>
+        <logger level="INFO" message="blob"/>
+    </flow>
+    <flow name="boom">
+        <mcp:resource-listener config-ref="SrvM" name="boom" uri="mule://boom" resourceMimeType="text/plain">
+            <mcp:description>Fails</mcp:description>
+            <mcp:resource-listener-content>
+                <mcp:text-resource text="unreachable"/>
+            </mcp:resource-listener-content>
+        </mcp:resource-listener>
+        <raise-error type="APP:BOOM" description="resource boom"/>
+    </flow>
+    <flow name="rich">
+        <mcp:prompt-listener config-ref="SrvM" name="rich">
+            <mcp:messages>
+                <mcp:text-prompt-message-content role="ASSISTANT" text="first"/>
+                <mcp:image-prompt-message-content mimeType="image/png">
+                    <mcp:image-data>
+                        <mcp:inline-image-data imageData="#['aGk=']"/>
+                    </mcp:image-data>
+                </mcp:image-prompt-message-content>
+                <mcp:resource-link-prompt-message-content uri="mule://greeting" name="greeting" description="d" mimeType="text/plain" size="5"/>
+                <mcp:embedded-resource-prompt-message-content uri="mule://e" mimeType="text/plain">
+                    <mcp:resource-content>
+                        <mcp:text-embedded-resource text="emb"/>
+                    </mcp:resource-content>
+                </mcp:embedded-resource-prompt-message-content>
+                <mcp:embedded-resource-prompt-message-content uri="mule://f" mimeType="application/octet-stream">
+                    <mcp:resource-content>
+                        <mcp:blob-embedded-resource blob="#['Ymxv']"/>
+                    </mcp:resource-content>
+                </mcp:embedded-resource-prompt-message-content>
+            </mcp:messages>
+        </mcp:prompt-listener>
+        <logger level="INFO" message="rich"/>
+    </flow>
+    <flow name="review">
+        <mcp:prompt-listener config-ref="SrvC" name="review" title="Code review">
+            <mcp:description>Review some code</mcp:description>
+            <mcp:prompt-arguments>
+                <mcp:prompt-argument name="code" description="The code" required="true"/>
+            </mcp:prompt-arguments>
+            <mcp:messages>
+                <mcp:text-prompt-message-content role="USER" text="#['Review ' ++ (payload.arguments.code default '?')]"/>
+                <mcp:text-prompt-message-content role="ASSISTANT" text="ok"/>
+            </mcp:messages>
+        </mcp:prompt-listener>
+        <logger level="INFO" message="review"/>
+    </flow>
+
+    <flow name="call-add">
+        <http:listener config-ref="L2" path="/call-add"/>
+        <try>
+            <mcp:call-tool config-ref="Cli" toolName="add"><mcp:arguments>#[{a: 1, b: 2}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-multi">
+        <http:listener config-ref="L2" path="/call-multi"/>
+        <try>
+            <mcp:call-tool config-ref="CliM" toolName="multi"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-fail">
+        <http:listener config-ref="L2" path="/call-fail"/>
+        <try>
+            <mcp:call-tool config-ref="CliM" toolName="fail"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-unknown">
+        <http:listener config-ref="L2" path="/call-unknown"/>
+        <try>
+            <mcp:call-tool config-ref="Cli" toolName="nope"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-invalid">
+        <http:listener config-ref="L2" path="/call-invalid"/>
+        <try>
+            <mcp:call-tool config-ref="Cli" toolName="add"><mcp:arguments>#[{a: "x"}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-expr-name">
+        <http:listener config-ref="L2" path="/call-expr-name"/>
+        <try>
+            <mcp:call-tool config-ref="Cli" toolName="#['ad' ++ 'd']"><mcp:arguments>#[{a: 1, b: 1}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- payload.contents[0].text]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-default-args">
+        <http:listener config-ref="L2" path="/call-default-args"/>
+        <try>
+            <set-payload value="#[{a: 5, b: 6}]"/>
+            <mcp:call-tool config-ref="Cli" toolName="add"/>
+            <set-payload value="#[output application/json --- payload.contents[0].text]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-target">
+        <http:listener config-ref="L2" path="/call-target"/>
+        <try>
+            <mcp:call-tool config-ref="Cli" toolName="add" target="res" targetValue="#[payload.contents[0].text]"><mcp:arguments>#[{a: 2, b: 2}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {res: vars.res, payloadKind: typeOf(payload) as String}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-j">
+        <http:listener config-ref="L2" path="/call-j"/>
+        <try>
+            <mcp:call-tool config-ref="CliM" toolName="#[attributes.queryParams.t]"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-j-false">
+        <http:listener config-ref="L2" path="/call-j-false"/>
+        <try>
+            <mcp:call-tool config-ref="CliM" toolName="#[attributes.queryParams.t]" extractStructuredContent="false"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="call-j-true">
+        <http:listener config-ref="L2" path="/call-j-true"/>
+        <try>
+            <mcp:call-tool config-ref="CliM" toolName="#[attributes.queryParams.t]" extractStructuredContent="true"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="hdrs">
+        <http:listener config-ref="L2" path="/hdrs"/>
+        <try>
+            <mcp:call-tool config-ref="CliM" toolName="hdrs" extractStructuredContent="false"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- payload.contents[0].text]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="hdrs-default">
+        <http:listener config-ref="L2" path="/hdrs-default"/>
+        <try>
+            <mcp:call-tool config-ref="CliH" toolName="hdrs" extractStructuredContent="false"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- payload.contents[0].text]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="hdrs-twice">
+        <http:listener config-ref="L2" path="/hdrs-twice"/>
+        <try>
+            <mcp:call-tool config-ref="CliM" toolName="hdrs" extractStructuredContent="false" target="first"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <mcp:call-tool config-ref="CliM" toolName="hdrs" extractStructuredContent="false" target="second"><mcp:arguments>#[{}]</mcp:arguments></mcp:call-tool>
+            <set-payload value="#[output application/json --- {same: (read(vars.first.contents[0].text, 'application/json').sid) == (read(vars.second.contents[0].text, 'application/json').sid)}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="list-tools">
+        <http:listener config-ref="L2" path="/list-tools"/>
+        <try>
+            <mcp:list-tools config-ref="Cli"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="list-resources">
+        <http:listener config-ref="L2" path="/list-resources"/>
+        <try>
+            <mcp:list-resources config-ref="Cli"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="read-text">
+        <http:listener config-ref="L2" path="/read-text"/>
+        <try>
+            <mcp:read-resource config-ref="Cli" uri="mule://greeting"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="read-blob">
+        <http:listener config-ref="L2" path="/read-blob"/>
+        <try>
+            <mcp:read-resource config-ref="CliM" uri="mule://blob"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="read-unknown">
+        <http:listener config-ref="L2" path="/read-unknown"/>
+        <try>
+            <mcp:read-resource config-ref="Cli" uri="mule://nope"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="read-boom">
+        <http:listener config-ref="L2" path="/read-boom"/>
+        <try>
+            <mcp:read-resource config-ref="CliM" uri="mule://boom"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="read-expr-uri">
+        <http:listener config-ref="L2" path="/read-expr-uri"/>
+        <try>
+            <mcp:read-resource config-ref="Cli" uri="#['mule://' ++ 'greeting']"/>
+            <set-payload value="#[output application/json --- payload.text]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="list-prompts">
+        <http:listener config-ref="L2" path="/list-prompts"/>
+        <try>
+            <mcp:list-prompts config-ref="Cli"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="get-prompt">
+        <http:listener config-ref="L2" path="/get-prompt"/>
+        <try>
+            <mcp:get-prompt config-ref="Cli" promptName="review"><mcp:prompt-args>#[{code: "x=1"}]</mcp:prompt-args></mcp:get-prompt>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="get-prompt-rich">
+        <http:listener config-ref="L2" path="/get-prompt-rich"/>
+        <try>
+            <mcp:get-prompt config-ref="CliM" promptName="rich"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="get-prompt-missing">
+        <http:listener config-ref="L2" path="/get-prompt-missing"/>
+        <try>
+            <mcp:get-prompt config-ref="Cli" promptName="review"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="get-prompt-unknown">
+        <http:listener config-ref="L2" path="/get-prompt-unknown"/>
+        <try>
+            <mcp:get-prompt config-ref="Cli" promptName="nope"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="ping">
+        <http:listener config-ref="L2" path="/ping"/>
+        <try>
+            <mcp:ping config-ref="Cli"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, method: attributes.method}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="ping-down">
+        <http:listener config-ref="L2" path="/ping-down"/>
+        <try>
+            <mcp:ping config-ref="CliDown"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="ping-bad-path">
+        <http:listener config-ref="L2" path="/ping-bad-path"/>
+        <try>
+            <mcp:ping config-ref="CliBad"/>
+            <set-payload value="#[output application/json --- {payload: payload, kind: typeOf(payload) as String, attrs: attributes}]"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, desc: error.description}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+</mule>

@@ -1,0 +1,56 @@
+(ns load-test (:require [mulay.lib.diag :as d] [clay.string :as str] [mulay.conn.registry :as creg] [mulay.mule.load :as ld] [mulay.mule.props :as pr] [mulay.lib.res :as res] [mulay.mule.model :as m]))
+(deftest basic
+  (let [x "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\">\n<flow name=\"f\">\n<http:listener config-ref=\"L\" path=\"/a\"/>\n<set-payload value=\"#[1 + 1]\"/>\n</flow>\n<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"8081\"/></http:listener-config>\n</mule>"
+        opts (ld/->LoadOpts [] false (creg/hints))
+        l (ld/load-texts "t" ["a.xml"] [x] (res/res-none) opts)
+        app (:app l)]
+    (is (= (count (:diags app)) 0))
+    (is (= (count (:flows app)) 1))))
+
+(defn- first-procs Vec(m/Proc) [x: Str]
+  (let [opts (ld/->LoadOpts [] false (creg/hints))
+        l (ld/load-texts "t" ["a.xml"] [x] (res/res-none) opts)]
+    (:procs (nth (:flows (:app l)) 0))))
+
+(defn- pval-src Vec(m/ExprSrc) [p: &m/PVal] (match p (m/PExpr t c s) [s] _ []))
+
+(deftest expression-file-offsets
+  (let [x (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:ee=\"http://www.mulesoft.org/schema/mule/ee/core\">\n"
+               "<flow name=\"f\">\n"
+               "<set-payload value=\"#[payload.a + 1]\"/>\n"
+               "<set-variable variableName=\"v\"\n   value=\"#[&quot;x&quot; ++ payload]\"/>\n"
+               "<set-variable variableName=\"w\"\n   value=\"#[vars.v]\"/>\n"
+               "<ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0\noutput application/json\n---\npayload]]></ee:set-payload></ee:message></ee:transform>\n"
+               "</flow>\n</mule>")
+        ps (first-procs x)
+        sp (match (nth ps 0) (m/PrSetPayload v a b l) (pval-src v) _ [])
+        sv (match (nth ps 1) (m/PrSetVar n v a l) (pval-src v) _ [])
+        sw (match (nth ps 2) (m/PrSetVar n v a l) (pval-src v) _ [])
+        tr (match (nth ps 3) (m/PrTransform p a v l) (:src (nth p 0)) _ (m/->ExprSrc "" "" 0 "" false [] "" -2))]
+    (is (= (:file (nth sp 0)) "a.xml"))
+    (is (= (:base (nth sp 0)) (+ (str/index-of x "#[payload.a") 2)))
+    (is (= (:base (nth sv 0)) -1))
+    (is (= (:base (nth sw 0)) (+ (str/index-of x "#[vars.v") 2)))
+    (is (= (:base tr) (str/index-of x "%dw 2.0\noutput")))))
+
+(deftest compile-error-report-points-into-the-file
+  (let [x (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\">\n"
+               "<flow name=\"f\">\n"
+               "  <set-payload value=\"#[sizeOf(itmes)]\"/>\n"
+               "</flow>\n</mule>")
+        opts (ld/->LoadOpts [] false (creg/hints))
+        l (ld/load-texts "t" ["a.xml"] [x] (res/res-none) opts)
+        ds (:diags (:app l))
+        r (:rep (nth ds 0))]
+    (is (= (count ds) 1))
+    (is (str/starts-with? (:msg (nth ds 0)) "<set-payload> value: DataWeave compile error: Unable to resolve reference of: `itmes`."))
+    (is (= (count r) 1))
+    (is (= (d/render (nth r 0) false)
+           (str/join "\n" ["error[DW]: cannot find `itmes` in this scope"
+                           " --> a.xml:3:32"
+                           "  |"
+                           "3 |   <set-payload value=\"#[sizeOf(itmes)]\"/>"
+                           "  |                                ^^^^^ not found in this scope"
+                           "  |"
+                           "  = note: DataWeave: Unable to resolve reference of: `itmes`."
+                           "  = note: in <set-payload> value"])))))

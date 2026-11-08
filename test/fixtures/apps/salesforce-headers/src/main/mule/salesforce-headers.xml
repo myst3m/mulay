@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
+
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18564"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="SF">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {error: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <sub-flow name="pick">
+        <set-variable variableName="mode" value="#[attributes.queryParams.mode default 'plain']"/>
+        <set-variable variableName="h" value="#[output application/java --- {
+  plain: {},
+  aon: {AllOrNoneHeader: {allOrNone: true}},
+  aonoff: {AllOrNoneHeader: {allOrNone: false}},
+  lower: {allornoneheader: {ALLORNONE: true}},
+  notmap: {AllOrNoneHeader: 'allOrNone'},
+  strval: {AllOrNoneHeader: {allOrNone: 'true'}},
+  nullval: {AllOrNoneHeader: null},
+  unknown: {Foo: {a: 1}, AllOrNoneHeader: {allOrNone: true}},
+  locale: {LocaleOptions: {language: 'ja'}, AllOrNoneHeader: {allOrNone: true}},
+  many: {EmailHeader: {triggerUserEmail: false}, MruHeader: {updateMru: true}, CallOptions: {client: 'mulay'}, DisableFeedTrackingHeader: {disableFeedTracking: true}, DuplicateRuleHeader: {allowSave: true}, AllOrNoneHeader: {allOrNone: true}},
+  trunc: {AllowFieldTruncationHeader: {allowFieldTruncation: true}},
+  qo200: {QueryOptions: {batchSize: 200}},
+  qo100: {QueryOptions: {batchSize: 100}},
+  qo5000: {QueryOptions: {batchSize: 5000}},
+  qostr: {QueryOptions: {batchSize: '200'}},
+  qonone: {QueryOptions: {}}
+}[vars.mode]]"/>
+    </sub-flow>
+
+    <flow name="reset">
+        <http:listener config-ref="HTTP" path="/reset" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>SELECT Id FROM Account WHERE Name LIKE 'mulay hdr%'</salesforce:salesforce-query>
+        </salesforce:query>
+        <choice>
+            <when expression="#[sizeOf(vars.found) > 0]">
+                <salesforce:delete config-ref="SF"><salesforce:ids>#[vars.found map $.Id]</salesforce:ids></salesforce:delete>
+            </when>
+        </choice>
+        <set-payload value="#[output application/json --- {ok: true}]"/>
+    </flow>
+
+    <!-- 成功する行と失敗する行 (Name が無い) を 1 度に作る -->
+    <flow name="create">
+        <http:listener config-ref="HTTP" path="/create" allowedMethods="POST"/>
+        <flow-ref name="pick"/>
+        <salesforce:create config-ref="SF" type="Account" headers="#[vars.h]">
+            <salesforce:records>#[[{Name: "mulay hdr create " ++ vars.mode}, {Description: "no name"}]]</salesforce:records>
+        </salesforce:create>
+        <set-variable variableName="items" value="#[payload.items map ((it) -> {successful: it.successful, statusCode: it.statusCode, message: it.message})]"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Name FROM Account WHERE Name = 'mulay hdr create " ++ vars.mode ++ "'"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <set-payload value="#[output application/json --- {items: vars.items, saved: sizeOf(vars.found)}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 子要素の形 (<salesforce:headers><salesforce:header key value/>) -->
+    <flow name="create-child">
+        <http:listener config-ref="HTTP" path="/create-child" allowedMethods="POST"/>
+        <salesforce:create config-ref="SF" type="Account">
+            <salesforce:records>#[[{Name: "mulay hdr create child"}, {Description: "no name"}]]</salesforce:records>
+            <salesforce:headers>
+                <salesforce:header key="AllOrNoneHeader" value="#[{allOrNone: true}]"/>
+            </salesforce:headers>
+        </salesforce:create>
+        <set-payload value="#[output application/json --- payload.items map ((it) -> {successful: it.successful, statusCode: it.statusCode, message: it.message})]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 項目の長さを超える名前 -->
+    <flow name="trunc">
+        <http:listener config-ref="HTTP" path="/trunc" allowedMethods="POST"/>
+        <flow-ref name="pick"/>
+        <salesforce:create config-ref="SF" type="Account" headers="#[vars.h]">
+            <salesforce:records>#[[{Name: "mulay hdr trunc " ++ vars.mode ++ " " ++ ((1 to 300) map "x" joinBy "")}]]</salesforce:records>
+        </salesforce:create>
+        <set-variable variableName="items" value="#[payload.items map ((it) -> {successful: it.successful, statusCode: it.statusCode, message: it.message})]"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Name FROM Account WHERE Name LIKE 'mulay hdr trunc " ++ vars.mode ++ " %'"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <set-payload value="#[output application/json --- {items: vars.items, lengths: vars.found map sizeOf($.Name)}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 有る Id と無い Id を 1 度に更新する -->
+    <flow name="update">
+        <http:listener config-ref="HTTP" path="/update" allowedMethods="POST"/>
+        <flow-ref name="pick"/>
+        <salesforce:create config-ref="SF" type="Account" target="made">
+            <salesforce:records>#[[{Name: "mulay hdr upd " ++ vars.mode}]]</salesforce:records>
+        </salesforce:create>
+        <set-variable variableName="id" value="#[vars.made.items[0].id]"/>
+        <salesforce:update config-ref="SF" type="Account" headers="#[vars.h]">
+            <salesforce:records>#[[{Id: vars.id, Name: "mulay hdr upd " ++ vars.mode ++ " changed"}, {Id: "001000000000000AAA", Name: "mulay hdr none"}]]</salesforce:records>
+        </salesforce:update>
+        <set-variable variableName="items" value="#[payload.items map ((it) -> {successful: it.successful, statusCode: it.statusCode, message: it.message})]"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Name FROM Account WHERE Id = '" ++ vars.id ++ "'"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <set-payload value="#[output application/json --- {items: vars.items, name: vars.found[0].Name}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 有る Id と無い Id を 1 度に消す -->
+    <flow name="delete">
+        <http:listener config-ref="HTTP" path="/delete" allowedMethods="POST"/>
+        <flow-ref name="pick"/>
+        <salesforce:create config-ref="SF" type="Account" target="made">
+            <salesforce:records>#[[{Name: "mulay hdr del " ++ vars.mode}]]</salesforce:records>
+        </salesforce:create>
+        <set-variable variableName="id" value="#[vars.made.items[0].id]"/>
+        <salesforce:delete config-ref="SF" headers="#[vars.h]">
+            <salesforce:ids>#[[vars.id, "001000000000000AAA"]]</salesforce:ids>
+        </salesforce:delete>
+        <set-variable variableName="items" value="#[payload.items map ((it) -> {successful: it.successful, statusCode: it.statusCode, message: it.message})]"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>#["SELECT Name FROM Account WHERE Id = '" ++ vars.id ++ "'"]</salesforce:salesforce-query>
+        </salesforce:query>
+        <set-payload value="#[output application/json --- {items: vars.items, left: sizeOf(vars.found)}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="query">
+        <http:listener config-ref="HTTP" path="/query" allowedMethods="GET"/>
+        <flow-ref name="pick"/>
+        <salesforce:query config-ref="SF" headers="#[vars.h]">
+            <salesforce:salesforce-query>SELECT Id FROM Account</salesforce:salesforce-query>
+        </salesforce:query>
+        <set-payload value="#[output application/json --- {rows: sizeOf(payload) > 50}]"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

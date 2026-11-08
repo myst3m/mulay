@@ -1,0 +1,587 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- 表側 (シナリオが叩く) と裏側 (http:request が叩く) で listener-config を分ける -->
+    <http:listener-config name="Front">
+        <http:listener-connection host="0.0.0.0" port="18121"/>
+    </http:listener-config>
+    <http:listener-config name="Back">
+        <http:listener-connection host="0.0.0.0" port="18122"/>
+    </http:listener-config>
+
+    <http:request-config name="ToBack">
+        <http:request-connection host="localhost" port="18122"/>
+    </http:request-config>
+    <http:request-config name="ToBackBase" basePath="/api">
+        <http:request-connection host="localhost" port="18122"/>
+    </http:request-config>
+    <http:request-config name="ToBackCidNever" sendCorrelationId="NEVER">
+        <http:request-connection host="localhost" port="18122"/>
+    </http:request-config>
+    <http:request-config name="ToBackCidAlways" sendCorrelationId="ALWAYS">
+        <http:request-connection host="localhost" port="18122"/>
+    </http:request-config>
+    <http:request-config name="ToBackBodyAlways" sendBodyMode="ALWAYS">
+        <http:request-connection host="localhost" port="18122"/>
+    </http:request-config>
+    <http:request-config name="ToBackStreamAlways" requestStreamingMode="ALWAYS">
+        <http:request-connection host="localhost" port="18122"/>
+    </http:request-config>
+    <http:request-config name="ToRawstatus-4096">
+        <http:request-connection host="localhost" port="18441"/>
+    </http:request-config>
+    <http:request-config name="ToRawstatus-4097">
+        <http:request-connection host="localhost" port="18442"/>
+    </http:request-config>
+    <http:request-config name="ToRawhead-8192">
+        <http:request-connection host="localhost" port="18443"/>
+    </http:request-config>
+    <http:request-config name="ToRawhead-8193">
+        <http:request-connection host="localhost" port="18444"/>
+    </http:request-config>
+    <http:request-config name="ToNowhere">
+        <http:request-connection host="localhost" port="18998"/>
+    </http:request-config>
+    <http:request-config name="ToBackShortTimeout" responseTimeout="300">
+        <http:request-connection host="localhost" port="18122"/>
+    </http:request-config>
+
+    <http:request-config name="ToBackNoFollow" followRedirects="false">
+        <http:request-connection host="localhost" port="18122"/>
+    </http:request-config>
+
+    <!-- ===== 裏側 ===== -->
+    <!-- /redirect/n は 302 で /redirect/n-1 へ、0 で 200 -->
+    <flow name="back-redirect">
+        <http:listener config-ref="Back" path="/redirect/{n}">
+            <http:response statusCode="#[vars.code]">
+                <http:headers><![CDATA[#[vars.hdrs]]]></http:headers>
+            </http:response>
+        </http:listener>
+        <set-variable variableName="n" value="#[attributes.uriParams.n as Number]"/>
+        <set-variable variableName="code" value="#[if (vars.n > 0) 302 else 200]"/>
+        <set-variable variableName="hdrs" value="#[if (vars.n > 0) {'Location': '/redirect/' ++ ((vars.n - 1) as String)} else {}]"/>
+        <set-payload value="#['landed after ' ++ attributes.uriParams.n]" mimeType="text/plain"/>
+    </flow>
+    <flow name="back-echo">
+        <http:listener config-ref="Back" path="/api/echo/{id}">
+            <http:response statusCode="#[vars.status default 200]">
+                <http:headers><![CDATA[#[{'X-Back': 'yes'}]]]></http:headers>
+            </http:response>
+        </http:listener>
+        <set-variable variableName="status" value="#[(attributes.queryParams.status default '200') as Number]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  method: attributes.method,
+  id: attributes.uriParams.id,
+  query: attributes.queryParams,
+  contentType: attributes.headers.'content-type',
+  xFront: attributes.headers.'x-front',
+  body: payload
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="back-status">
+        <http:listener config-ref="Back" path="/status/{code}">
+            <http:response statusCode="#[attributes.uriParams.code as Number]"/>
+        </http:listener>
+        <set-payload value="#['back says ' ++ attributes.uriParams.code]" mimeType="text/plain"/>
+    </flow>
+
+    <flow name="back-slow">
+        <http:listener config-ref="Back" path="/slow"/>
+        <until-successful maxRetries="10" millisBetweenRetries="100">
+            <raise-error type="APP:WAIT" description="waiting"/>
+        </until-successful>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="slow done"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ===== 表側 ===== -->
+
+    <!-- 本文・method・uri-params・query-params・headers を渡して、応答の attributes を見る -->
+    <flow name="call">
+        <http:listener config-ref="Front" path="/call"/>
+        <http:request config-ref="ToBackBase" method="POST" path="/echo/{id}">
+            <http:headers><![CDATA[#[{'X-Front': 'from-front'}]]]></http:headers>
+            <http:uri-params><![CDATA[#[{id: 'abc 1'}]]]></http:uri-params>
+            <http:query-params><![CDATA[#[{q: 'x&y', n: 1}]]]></http:query-params>
+        </http:request>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  statusCode: attributes.statusCode,
+  reasonPhrase: attributes.reasonPhrase,
+  xBack: attributes.headers.'x-back',
+  responseContentType: attributes.headers.'content-type',
+  payloadMime: payload.^mimeType,
+  body: payload
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- target: 応答を変数へ。payload と attributes は元のまま -->
+    <flow name="call-target">
+        <http:listener config-ref="Front" path="/call-target"/>
+        <set-payload value="keep me" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="GET" path="/api/echo/t1" target="resp"/>
+        <set-payload value="#[output application/json --- {payload: payload, frontMethod: attributes.method, respIsMessage: vars.resp.id default 'not-an-object', resp: vars.resp}]"/>
+    </flow>
+
+    <!-- 既定の応答検証: 4xx/5xx は HTTP:<種類> のエラー -->
+    <flow name="status">
+        <http:listener config-ref="Front" path="/status/{code}"/>
+        <http:request config-ref="ToBack" method="GET" path="#['/status/' ++ attributes.uriParams.code]"/>
+        <error-handler>
+            <on-error-continue>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  errorType: error.errorType.namespace ++ ":" ++ error.errorType.identifier,
+  parent: error.errorType.parentErrorType.namespace ++ ":" ++ error.errorType.parentErrorType.identifier,
+  description: error.description,
+  responseStatus: error.errorMessage.attributes.statusCode default null,
+  responseBody: error.errorMessage.payload default null
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- 既定の応答検証に当たって、ハンドラが無いとき -->
+    <flow name="status-unhandled">
+        <http:listener config-ref="Front" path="/status-unhandled/{code}"/>
+        <http:request config-ref="ToBack" method="GET" path="#['/status/' ++ attributes.uriParams.code]"/>
+    </flow>
+
+    <!-- response-validator で 2xx..4xx を成功扱いにする -->
+    <flow name="status-lenient">
+        <http:listener config-ref="Front" path="/status-lenient/{code}"/>
+        <http:request config-ref="ToBack" method="GET" path="#['/status/' ++ attributes.uriParams.code]">
+            <http:response-validator>
+                <http:success-status-code-validator values="200..499"/>
+            </http:response-validator>
+        </http:request>
+        <set-payload value="#[output application/json --- {status: attributes.statusCode, body: payload}]"/>
+    </flow>
+
+    <!-- 接続できない (HTTP:CONNECTIVITY)、タイムアウト (HTTP:TIMEOUT) -->
+    <flow name="unreachable">
+        <http:listener config-ref="Front" path="/unreachable"/>
+        <http:request config-ref="ToNowhere" method="GET" path="/"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="timeout">
+        <http:listener config-ref="Front" path="/timeout"/>
+        <http:request config-ref="ToBackShortTimeout" method="GET" path="/slow"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- responseTimeout を書かない要求は app の defaultResponseTimeout (既定 10 秒) で切れる。backend は約 12 秒 -->
+    <flow name="back-very-slow">
+        <http:listener config-ref="Back" path="/very-slow"/>
+        <until-successful maxRetries="120" millisBetweenRetries="100">
+            <raise-error type="APP:WAIT" description="waiting"/>
+        </until-successful>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="very slow done"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="default-timeout">
+        <http:listener config-ref="Front" path="/default-timeout"/>
+        <http:request config-ref="ToBack" method="GET" path="/very-slow"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- followRedirects: 既定は辿る。操作か設定で false なら 3xx をそのまま返す -->
+    <flow name="follow">
+        <http:listener config-ref="Front" path="/follow/{n}"/>
+        <http:request config-ref="ToBack" method="GET" path="#['/redirect/' ++ attributes.uriParams.n]"/>
+        <set-payload value="#[output application/json --- {status: attributes.statusCode, location: attributes.headers.location, body: payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="nofollow-op">
+        <http:listener config-ref="Front" path="/nofollow-op"/>
+        <http:request config-ref="ToBack" method="GET" path="/redirect/2" followRedirects="false"/>
+        <set-payload value="#[output application/json --- {status: attributes.statusCode, location: attributes.headers.location, body: payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="nofollow-config">
+        <http:listener config-ref="Front" path="/nofollow-config"/>
+        <http:request config-ref="ToBackNoFollow" method="GET" path="/redirect/2"/>
+        <set-payload value="#[output application/json --- {status: attributes.statusCode, location: attributes.headers.location, body: payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="follow-config-override">
+        <http:listener config-ref="Front" path="/follow-config-override"/>
+        <http:request config-ref="ToBackNoFollow" method="GET" path="/redirect/2" followRedirects="true"/>
+        <set-payload value="#[output application/json --- {status: attributes.statusCode, location: attributes.headers.location, body: payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- error-mapping: HTTP:NOT_FOUND を APP:MISSING に付け替える -->
+    <flow name="mapping">
+        <http:listener config-ref="Front" path="/mapping"/>
+        <http:request config-ref="ToBack" method="GET" path="/status/404">
+            <error-mapping sourceType="HTTP:NOT_FOUND" targetType="APP:MISSING"/>
+        </http:request>
+        <error-handler>
+            <on-error-continue type="APP:MISSING">
+                <set-payload value="#[output application/json --- {mapped: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- JSON 以外の応答 (text/plain) をそのまま中継する -->
+    <flow name="relay">
+        <http:listener config-ref="Front" path="/relay"/>
+        <http:request config-ref="ToBack" method="GET" path="/status/200"/>
+    </flow>
+
+
+    <!-- sendCorrelationId (AUTO / ALWAYS / NEVER、設定と操作) と操作の correlationId: 裏側が受けた X-Correlation-ID を返す -->
+    <flow name="back-cid">
+        <http:listener config-ref="Back" path="/api/cid"/>
+        <set-payload value="#[output application/json --- {xcid: attributes.headers.'x-correlation-id' default null}]"/>
+    </flow>
+    <flow name="cid-default">
+        <http:listener config-ref="Front" path="/cid/default"/>
+        <http:request config-ref="ToBack" method="GET" path="/api/cid"/>
+        <set-payload value="#[output application/json --- {hasHeader: payload.xcid != null, same: payload.xcid == correlationId, xcid: if (payload.xcid == null or payload.xcid == correlationId) null else payload.xcid}]"/>
+    </flow>
+    <flow name="cid-never">
+        <http:listener config-ref="Front" path="/cid/never"/>
+        <http:request config-ref="ToBackCidNever" method="GET" path="/api/cid"/>
+        <set-payload value="#[output application/json --- {hasHeader: payload.xcid != null, same: payload.xcid == correlationId, xcid: if (payload.xcid == null or payload.xcid == correlationId) null else payload.xcid}]"/>
+    </flow>
+    <flow name="cid-always">
+        <http:listener config-ref="Front" path="/cid/always"/>
+        <http:request config-ref="ToBackCidAlways" method="GET" path="/api/cid"/>
+        <set-payload value="#[output application/json --- {hasHeader: payload.xcid != null, same: payload.xcid == correlationId, xcid: if (payload.xcid == null or payload.xcid == correlationId) null else payload.xcid}]"/>
+    </flow>
+    <flow name="cid-op-never">
+        <http:listener config-ref="Front" path="/cid/op-never"/>
+        <http:request config-ref="ToBack" method="GET" path="/api/cid" sendCorrelationId="NEVER"/>
+        <set-payload value="#[output application/json --- {hasHeader: payload.xcid != null, same: payload.xcid == correlationId, xcid: if (payload.xcid == null or payload.xcid == correlationId) null else payload.xcid}]"/>
+    </flow>
+    <flow name="cid-op-always">
+        <http:listener config-ref="Front" path="/cid/op-always"/>
+        <http:request config-ref="ToBackCidNever" method="GET" path="/api/cid" sendCorrelationId="ALWAYS"/>
+        <set-payload value="#[output application/json --- {hasHeader: payload.xcid != null, same: payload.xcid == correlationId, xcid: if (payload.xcid == null or payload.xcid == correlationId) null else payload.xcid}]"/>
+    </flow>
+    <flow name="cid-op-auto">
+        <http:listener config-ref="Front" path="/cid/op-auto"/>
+        <http:request config-ref="ToBackCidNever" method="GET" path="/api/cid" sendCorrelationId="AUTO"/>
+        <set-payload value="#[output application/json --- {hasHeader: payload.xcid != null, same: payload.xcid == correlationId, xcid: if (payload.xcid == null or payload.xcid == correlationId) null else payload.xcid}]"/>
+    </flow>
+    <flow name="cid-custom">
+        <http:listener config-ref="Front" path="/cid/custom"/>
+        <http:request config-ref="ToBack" method="GET" path="/api/cid" correlationId="#['custom-' ++ '1']"/>
+        <set-payload value="#[output application/json --- {hasHeader: payload.xcid != null, same: payload.xcid == correlationId, xcid: if (payload.xcid == null or payload.xcid == correlationId) null else payload.xcid}]"/>
+    </flow>
+    <flow name="cid-custom-never">
+        <http:listener config-ref="Front" path="/cid/custom-never"/>
+        <http:request config-ref="ToBackCidNever" method="GET" path="/api/cid" correlationId="#['custom-2']"/>
+        <set-payload value="#[output application/json --- {hasHeader: payload.xcid != null, same: payload.xcid == correlationId, xcid: if (payload.xcid == null or payload.xcid == correlationId) null else payload.xcid}]"/>
+    </flow>
+    <flow name="cid-custom-op-never">
+        <http:listener config-ref="Front" path="/cid/custom-op-never"/>
+        <http:request config-ref="ToBack" method="GET" path="/api/cid" sendCorrelationId="NEVER" correlationId="#['custom-3']"/>
+        <set-payload value="#[output application/json --- {hasHeader: payload.xcid != null, same: payload.xcid == correlationId, xcid: if (payload.xcid == null or payload.xcid == correlationId) null else payload.xcid}]"/>
+    </flow>
+
+
+    <!-- listener が受けた X-Correlation-ID はフローの correlationId になる -->
+    <flow name="cid-echo">
+        <http:listener config-ref="Front" path="/cid/echo"/>
+        <set-payload value="#[output application/json --- {cid: correlationId}]"/>
+    </flow>
+
+
+    <!-- sendBodyMode と requestStreamingMode: 裏側が受けた method、Transfer-Encoding、Content-Length、本文を返す -->
+    <flow name="back-body">
+        <http:listener config-ref="Back" path="/api/body"/>
+        <set-payload value="#[output application/json --- {method: attributes.method, te: attributes.headers.'transfer-encoding' default null, cl: attributes.headers.'content-length' default null, ct: attributes.headers.'content-type' default null, body: (payload.^raw default '') as String default null}]"/>
+    </flow>
+    <flow name="body-get-auto">
+        <http:listener config-ref="Front" path="/body/get-auto"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="GET" path="/api/body"/>
+    </flow>
+    <flow name="body-get-always">
+        <http:listener config-ref="Front" path="/body/get-always"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="GET" path="/api/body" sendBodyMode="ALWAYS"/>
+    </flow>
+    <flow name="body-get-config-always">
+        <http:listener config-ref="Front" path="/body/get-config-always"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBackBodyAlways" method="GET" path="/api/body"/>
+    </flow>
+    <flow name="body-get-config-always-op-auto">
+        <http:listener config-ref="Front" path="/body/get-config-always-op-auto"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBackBodyAlways" method="GET" path="/api/body" sendBodyMode="AUTO"/>
+    </flow>
+    <flow name="body-post-never">
+        <http:listener config-ref="Front" path="/body/post-never"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body" sendBodyMode="NEVER"/>
+    </flow>
+    <flow name="body-post-auto">
+        <http:listener config-ref="Front" path="/body/post-auto"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+    <flow name="body-delete-auto">
+        <http:listener config-ref="Front" path="/body/delete-auto"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="DELETE" path="/api/body"/>
+    </flow>
+    <flow name="body-options-auto">
+        <http:listener config-ref="Front" path="/body/options-auto"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="OPTIONS" path="/api/body"/>
+    </flow>
+    <flow name="body-patch-auto">
+        <http:listener config-ref="Front" path="/body/patch-auto"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="PATCH" path="/api/body"/>
+    </flow>
+    <flow name="body-put-never">
+        <http:listener config-ref="Front" path="/body/put-never"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="PUT" path="/api/body" sendBodyMode="NEVER"/>
+    </flow>
+    <flow name="body-options-always">
+        <http:listener config-ref="Front" path="/body/options-always"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="OPTIONS" path="/api/body" sendBodyMode="ALWAYS"/>
+    </flow>
+    <flow name="stream-auto-string">
+        <http:listener config-ref="Front" path="/stream/auto-string"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+    <flow name="stream-auto-dw">
+        <http:listener config-ref="Front" path="/stream/auto-dw"/>
+        <set-payload value="#[output application/json --- {a: 1}]"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+    <flow name="stream-always-string">
+        <http:listener config-ref="Front" path="/stream/always-string"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body" requestStreamingMode="ALWAYS"/>
+    </flow>
+    <flow name="stream-never-dw">
+        <http:listener config-ref="Front" path="/stream/never-dw"/>
+        <set-payload value="#[output application/json --- {a: 1}]"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body" requestStreamingMode="NEVER"/>
+    </flow>
+    <flow name="stream-config-always-string">
+        <http:listener config-ref="Front" path="/stream/config-always-string"/>
+        <set-payload value="hello" mimeType="text/plain"/>
+        <http:request config-ref="ToBackStreamAlways" method="POST" path="/api/body"/>
+    </flow>
+    <flow name="stream-config-always-op-auto-dw">
+        <http:listener config-ref="Front" path="/stream/config-always-op-auto-dw"/>
+        <set-payload value="#[output application/json --- {a: 1}]"/>
+        <http:request config-ref="ToBackStreamAlways" method="POST" path="/api/body" requestStreamingMode="AUTO"/>
+    </flow>
+    <flow name="stream-auto-empty">
+        <http:listener config-ref="Front" path="/stream/auto-empty"/>
+        <set-payload value="" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+
+    <flow name="stream-auto-dw-empty">
+        <http:listener config-ref="Front" path="/stream/auto-dw-empty"/>
+        <set-payload value="#[output text/plain --- '']"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+    <flow name="stream-always-empty">
+        <http:listener config-ref="Front" path="/stream/always-empty"/>
+        <set-payload value="" mimeType="text/plain"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body" requestStreamingMode="ALWAYS"/>
+    </flow>
+    <flow name="stream-get-always-stream">
+        <http:listener config-ref="Front" path="/stream/get-always-stream"/>
+        <set-payload value="#[output application/json --- {a: 1}]"/>
+        <http:request config-ref="ToBack" path="/api/body" method="GET" sendBodyMode="ALWAYS"/>
+    </flow>
+
+    <!-- requestStreamingMode=AUTO で、長さの分かるストリーム (listener の本文、HTTP の応答) と output の無い式を送る -->
+    <flow name="back-text">
+        <http:listener config-ref="Back" path="/api/text"/>
+        <set-payload value="some text" mimeType="text/plain"/>
+    </flow>
+    <flow name="back-json">
+        <http:listener config-ref="Back" path="/api/json"/>
+        <set-payload value='{"a": 1}' mimeType="application/json"/>
+    </flow>
+    <flow name="stream-fwd-listener">
+        <http:listener config-ref="Front" path="/stream/fwd-listener"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+    <flow name="stream-fwd-response">
+        <http:listener config-ref="Front" path="/stream/fwd-response"/>
+        <http:request config-ref="ToBack" method="GET" path="/api/text"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+    <flow name="stream-fwd-response-json">
+        <http:listener config-ref="Front" path="/stream/fwd-response-json"/>
+        <http:request config-ref="ToBack" method="GET" path="/api/json"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+    <flow name="stream-infer-str">
+        <http:listener config-ref="Front" path="/stream/infer-str"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body">
+            <http:body><![CDATA[#[payload as String]]]></http:body>
+        </http:request>
+    </flow>
+    <flow name="stream-infer-obj">
+        <http:listener config-ref="Front" path="/stream/infer-obj"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body">
+            <http:body><![CDATA[#[{b: payload.a}]]]></http:body>
+        </http:request>
+    </flow>
+    <flow name="stream-setpayload-infer-obj">
+        <http:listener config-ref="Front" path="/stream/setpayload-infer-obj"/>
+        <set-payload value="#[{b: payload.a}]"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+    <flow name="stream-setpayload-str">
+        <http:listener config-ref="Front" path="/stream/setpayload-str"/>
+        <set-payload value="#['x' ++ 'y']"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body"/>
+    </flow>
+
+    <flow name="stream-body-output">
+        <http:listener config-ref="Front" path="/stream/body-output"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body">
+            <http:body><![CDATA[#[output application/json --- {c: 1}]]]></http:body>
+        </http:request>
+    </flow>
+    <flow name="stream-body-payload-dw">
+        <http:listener config-ref="Front" path="/stream/body-payload-dw"/>
+        <set-payload value="#[output application/json --- {d: 1}]"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body">
+            <http:body><![CDATA[#[payload]]]></http:body>
+        </http:request>
+    </flow>
+    <flow name="stream-body-infer-from-dw">
+        <http:listener config-ref="Front" path="/stream/body-infer-from-dw"/>
+        <set-payload value="#[output application/json --- {e: 1}]"/>
+        <http:request config-ref="ToBack" method="POST" path="/api/body">
+            <http:body><![CDATA[#[{f: payload.e}]]]></http:body>
+        </http:request>
+    </flow>
+
+    <!-- Content-Type: application/java の本文を listener で受けて読む -->
+    <flow name="java-read">
+        <http:listener config-ref="Front" path="/java/read"/>
+        <set-payload value="#[output application/json --- {t: typeOf(payload) as String, cls: payload.^class default null, mime: payload.^mimeType default null, raw: payload.^raw as String default null, asStr: payload as String default null}]"/>
+    </flow>
+
+
+    <!-- 応答の頭の上限 (状態行 4,096 バイト、ヘッダ行の合計 8,192 バイト。CRLF を除く)。相手は mule-oracle の rawserver -->
+    <flow name="head-status-4096">
+        <http:listener config-ref="Front" path="/head/status-4096"/>
+        <http:request config-ref="ToRawstatus-4096" method="GET" path="/"/>
+        <set-payload value="#[output application/json --- {status: attributes.statusCode, reasonLength: sizeOf(attributes.reasonPhrase), padLength: sizeOf(attributes.headers.'x-pad' default ''), body: payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="head-status-4097">
+        <http:listener config-ref="Front" path="/head/status-4097"/>
+        <http:request config-ref="ToRawstatus-4097" method="GET" path="/"/>
+        <set-payload value="#[output application/json --- {status: attributes.statusCode, reasonLength: sizeOf(attributes.reasonPhrase), padLength: sizeOf(attributes.headers.'x-pad' default ''), body: payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="head-head-8192">
+        <http:listener config-ref="Front" path="/head/head-8192"/>
+        <http:request config-ref="ToRawhead-8192" method="GET" path="/"/>
+        <set-payload value="#[output application/json --- {status: attributes.statusCode, reasonLength: sizeOf(attributes.reasonPhrase), padLength: sizeOf(attributes.headers.'x-pad' default ''), body: payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="head-head-8193">
+        <http:listener config-ref="Front" path="/head/head-8193"/>
+        <http:request config-ref="ToRawhead-8193" method="GET" path="/"/>
+        <set-payload value="#[output application/json --- {status: attributes.statusCode, reasonLength: sizeOf(attributes.reasonPhrase), padLength: sizeOf(attributes.headers.'x-pad' default ''), body: payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="call-method-expr">
+        <http:listener config-ref="Front" path="/call-method"/>
+        <http:request config-ref="ToBack" method="#[attributes.queryParams.m]" path="/api/echo/m1"/>
+        <set-payload value="#[output application/json --- payload.method]"/>
+    </flow>
+</mule>

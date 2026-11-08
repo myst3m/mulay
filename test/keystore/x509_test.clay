@@ -1,0 +1,49 @@
+(ns x509-test (:require [mulay.lib.x509 :as x]))
+
+(defn- load Str [name: Str] (let [[s e] (read-file (str "test/fixtures/apps/https-test/certs/" name))] s))
+
+(deftest client-cert
+  (let [[c e] (x/parse-pem (load "client.pem"))]
+    (is (= e ""))
+    (is (= (:version c) 3))
+    (is (= (:serial c) "470691020887658211209772108376539068939075997124"))
+    (is (= (:subject c) "O=mulay, CN=mulay client"))
+    (is (= (:issuer c) "CN=mulay test CA"))
+    (is (= (:sig-oid c) "1.2.840.113549.1.1.11"))
+    (is (= (:sig-name c) "SHA256withRSA"))
+    (is (= (:sig-params c) ""))
+    (is (= (:not-before c) 1790652168))
+    (is (= (:not-after c) 4944252168))
+    (is (= (:public-key-alg c) "RSA"))
+    (is (= (count (:der c)) 810))
+    (is (= (count (:signature c)) 256))
+    (is (= (:ext-key-usage c) ["1.3.6.1.5.5.7.3.2"]))
+    (is (= (:non-critical c) ["2.5.29.37" "2.5.29.14" "2.5.29.35"]))
+    (is (= (count (:critical c)) 0))
+    (is (= (:basic-constraints c) -1))))
+
+(deftest ca-cert
+  (let [[c e] (x/parse-pem (load "ca.pem"))]
+    (is (= e ""))
+    (is (= (:subject c) "CN=mulay test CA"))
+    (is (= (:basic-constraints c) 2147483647))
+    (is (= (:critical c) ["2.5.29.19"]))))
+
+(deftest broken
+  (let [[c e] (x/parse-der (str "0" (chr 3) "abc"))]
+    (is (not= e ""))))
+
+;; 1 バイトずつ壊した証明書でも、止まらずに誤りか何かの値を返す
+(deftest corrupt-der-never-aborts
+  (let [[c e] (x/parse-pem (let [[s se] (read-file "test/fixtures/apps/https-test/certs/client.pem")] s))
+        der (:der c)
+        n (loop [pos 0 seen 0]
+            (if (>= pos (count der)) seen
+              (let [v (if (= (nth der pos) 255) 0 255)
+                    bad (str (subs der 0 pos) (chr v) (subs der (+ pos 1) (count der)))
+                    [c2 e2] (x/parse-der bad)
+                    trunc (subs der 0 pos)
+                    [c3 e3] (x/parse-der trunc)]
+                (recur (+ pos 1) (+ seen 1)))))]
+    (is (= e ""))
+    (is (= n (count der)))))

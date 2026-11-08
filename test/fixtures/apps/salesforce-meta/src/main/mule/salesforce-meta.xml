@@ -1,0 +1,369 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <!-- retrieve-metadata の zip を書いて読み直す場所 -->
+    <file:config name="Tmp">
+        <file:connection workingDir="/tmp"/>
+    </file:config>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="SF">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+        <flow name="describe">
+        <http:listener config-ref="HTTP" path="/describe"/>
+        <salesforce:describe-metadata config-ref="SF"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+do {
+  var co = (payload.metadataObjects filter ($.xmlName == "CustomObject"))[0]
+  ---
+  {class: payload.^class, keys: keysOf(payload) map ($ as String),
+   organizationNamespace: payload.organizationNamespace, partialSaveAllowed: payload.partialSaveAllowed,
+   testRequired: payload.testRequired, many: sizeOf(payload.metadataObjects) > 50,
+   customObject: co, customObjectClass: co.^class}
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="reset">
+        <http:listener config-ref="HTTP" path="/reset"/>
+        <salesforce:delete-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:full-names>#[["MulayMeta1", "MulayMeta2", "MulayMeta3"]]</salesforce:full-names>
+        </salesforce:delete-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map {fullName: $.fullName, success: $.success}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="create">
+        <http:listener config-ref="HTTP" path="/create"/>
+        <salesforce:create-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:objects>#[[{fullName: "MulayMeta1", url: "https://example.com", isActive: true, description: "mulay test"}]]</salesforce:objects>
+        </salesforce:create-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{class: payload.^class, items: payload, itemClass: payload[0].^class}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="create-dup">
+        <http:listener config-ref="HTTP" path="/create-dup"/>
+        <salesforce:create-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:objects>#[[{fullName: "MulayMeta1", url: "https://example.com", isActive: true}]]</salesforce:objects>
+        </salesforce:create-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="list">
+        <http:listener config-ref="HTTP" path="/list"/>
+        <salesforce:list-metadata config-ref="SF" type="RemoteSiteSetting"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+do {
+  var mine = payload filter ($.fullName startsWith "MulayMeta")
+  ---
+  {class: payload.^class, itemClass: mine[0].^class,
+   items: mine map ($ mapObject (v, k) -> {(k): if (["fullName", "type", "fileName", "manageableState", "namespacePrefix"] contains (k as String)) v else typeOf(v)})}
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="read">
+        <http:listener config-ref="HTTP" path="/read"/>
+        <salesforce:read-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:full-names>#[["MulayMeta1"]]</salesforce:full-names>
+        </salesforce:read-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{class: payload.^class, items: payload, itemClass: payload[0].^class}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="update">
+        <http:listener config-ref="HTTP" path="/update"/>
+        <salesforce:update-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:objects>#[[{fullName: "MulayMeta1", url: "https://example.org", isActive: false, description: "mulay updated"}]]</salesforce:objects>
+        </salesforce:update-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="upsert">
+        <http:listener config-ref="HTTP" path="/upsert"/>
+        <salesforce:upsert-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:objects>#[[{fullName: "MulayMeta1", url: "https://example.net", isActive: true}, {fullName: "MulayMeta2", url: "https://example.com/2", isActive: true}]]</salesforce:objects>
+        </salesforce:upsert-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{class: payload.^class, items: payload, itemClass: payload[0].^class}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="rename">
+        <http:listener config-ref="HTTP" path="/rename"/>
+        <salesforce:rename-metadata config-ref="SF" type="RemoteSiteSetting" oldFullName="MulayMeta2" newFullName="MulayMeta3"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{class: payload.^class, result: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="read-all">
+        <http:listener config-ref="HTTP" path="/read-all"/>
+        <salesforce:read-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:full-names>#[["MulayMeta1", "MulayMeta2", "MulayMeta3"]]</salesforce:full-names>
+        </salesforce:read-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="delete">
+        <http:listener config-ref="HTTP" path="/delete"/>
+        <salesforce:delete-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:full-names>#[["MulayMeta1", "MulayMeta3"]]</salesforce:full-names>
+        </salesforce:delete-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{class: payload.^class, items: payload, itemClass: payload[0].^class}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="read-missing">
+        <http:listener config-ref="HTTP" path="/read-missing"/>
+        <salesforce:read-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:full-names>#[["MulayMeta1"]]</salesforce:full-names>
+        </salesforce:read-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bad-type">
+        <http:listener config-ref="HTTP" path="/bad-type"/>
+        <salesforce:list-metadata config-ref="SF" type="NoSuchType"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="read-object">
+        <http:listener config-ref="HTTP" path="/read-object"/>
+        <salesforce:read-metadata config-ref="SF" type="CustomField">
+            <salesforce:full-names>#[["Account.Industry"]]</salesforce:full-names>
+        </salesforce:read-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+do {
+  var o = payload[0]
+  ---
+  {keys: keysOf(o) map ($ as String),
+   types: o mapObject (v, k) -> {(k): typeOf(v)},
+   fullName: o.fullName, "type": o."type", trackHistory: o.trackHistory,
+   valueSet: if (o.valueSet == null) null else {keys: keysOf(o.valueSet) map ($ as String),
+     restricted: o.valueSet.restricted,
+     definition: if (o.valueSet.valueSetDefinition == null) null else {keys: keysOf(o.valueSet.valueSetDefinition) map ($ as String),
+       first: o.valueSet.valueSetDefinition.value[0]}}}
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="deploy">
+        <http:listener config-ref="HTTP" path="/deploy"/>
+        <set-payload value="#['before']"/>
+        <salesforce:deploy-metadata config-ref="SF">
+            <salesforce:deploy-metadata-request stream="#[readUrl('classpath://deploy-ok.zip', 'application/octet-stream')]"/>
+        </salesforce:deploy-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payload: payload, class: payload.^class}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="read-deployed">
+        <http:listener config-ref="HTTP" path="/read-deployed"/>
+        <set-payload value="#['before']"/>
+        <salesforce:read-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:full-names>#[["MulayMeta4"]]</salesforce:full-names>
+        </salesforce:read-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map {url: $.url, description: $.description, isActive: $.isActive}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="retrieve">
+        <http:listener config-ref="HTTP" path="/retrieve"/>
+        <salesforce:retrieve-metadata config-ref="SF" unpackaged="#[readUrl('classpath://retrieve-package.xml', 'text/plain')]"/>
+        <file:write config-ref="Tmp" path="mulay-sf-retrieve.zip"/>
+        <file:read config-ref="Tmp" path="mulay-sf-retrieve.zip" outputMimeType="application/octet-stream"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{head: (payload as String {encoding: "ISO-8859-1"})[0 to 1], large: sizeOf(payload) > 200}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <file:delete config-ref="Tmp" path="mulay-sf-retrieve.zip"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="delete-deployed">
+        <http:listener config-ref="HTTP" path="/delete-deployed"/>
+        <set-payload value="#['before']"/>
+        <salesforce:delete-metadata config-ref="SF" type="RemoteSiteSetting">
+            <salesforce:full-names>#[["MulayMeta4"]]</salesforce:full-names>
+        </salesforce:delete-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map {success: $.success}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="deploy-bad">
+        <http:listener config-ref="HTTP" path="/deploy-bad"/>
+        <set-payload value="#['before']"/>
+        <salesforce:deploy-metadata config-ref="SF">
+            <salesforce:deploy-metadata-request stream="#[readUrl('classpath://deploy-bad.zip', 'application/octet-stream')]"/>
+        </salesforce:deploy-metadata>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payload: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+</mule>

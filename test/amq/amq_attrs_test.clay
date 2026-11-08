@@ -1,0 +1,97 @@
+(ns amq-attrs-test (:require [mulay.conn.anypoint_mq :as mq] [mulay.conn.amq_wire :as w] [mulay.dw.val :as v]
+                             [mulay.rt.event :as ev] [clay.string :as str]))
+
+;; consume / subscriber の attributes と payload の mime、publish のユーザーのプロパティ。期待値は実 Mule 4.11.3 の記録
+;; (test/fixtures/apps/anypoint-mq-ops の /con、/conout、/err?k=prop-*。anypoint-mq-sub の /next)。
+
+(defn- hdr v/Field [k: Str s: Str] (v/field k (v/->VStr s)))
+
+(defn- msg w/RMsg [hs: Vec(v/Field) ps: Vec(v/Field)] (w/->RMsg hs ps "body"))
+
+;; オブジェクトのキーを "," でつないだもの
+(defn- keys-of Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) (loop [i 0 out ""] (if (>= i (count fs)) out (recur (+ i 1) (str out (if (= i 0) "" ",") (:name (:key (nth fs i)))))))
+    _ "<not an object>"))
+
+;; キーの値を文字列で ("null"、文字列はそのまま、整数は 10 進、ほかは "?")
+(defn- val-of Str [x: &v/Val k: &Str]
+  (match (v/unmeta x)
+    (v/VObj fs) (let [f (v/obj-get fs k)]
+                  (if (= (count f) 0) "<missing>"
+                    (match (v/unmeta (nth f 0))
+                      (v/VNull) "null"
+                      (v/VStr s) (str s)
+                      (v/VInt n) (str n)
+                      _ "?")))
+    _ "<not an object>"))
+
+;; Kv の列を "k=s:v" (文字列) / "k=n:v" (数) でつなぐ
+(defn- kvs-str Str [ks: &Vec(w/Kv)]
+  (loop [i 0 out ""]
+    (if (>= i (count ks)) out
+      (let [kv (nth ks i)
+            s (match (:v kv) (w/JStr x) (str "s:" x) (w/JNum x) (str "n:" x))]
+        (recur (+ i 1) (str out (if (= i 0) "" ",") (:k kv) "=" s))))))
+
+(defn- sub-keys Str [x: &v/Val k: &Str]
+  (match (v/unmeta x)
+    (v/VObj fs) (let [f (v/obj-get fs k)] (if (= (count f) 0) "<missing>" (keys-of (nth f 0))))
+    _ "<not an object>"))
+
+(defn- props-str Str [x: v/Val] (let [[ks e] (mq/user-props x)] (if (not= e "") (str "ERR " e) (kvs-str ks))))
+
+(deftest attrs-shape
+  (let [m (msg [(hdr "lockId" "L1") (hdr "created" "c") (hdr "messageId" "m1") (hdr "ttl" "120000") (hdr "deliveryCount" "2")]
+               [(hdr "contentType" "text/plain; charset=UTF-8") (hdr "MULE_ENCODING" "UTF-8")])
+        a (:val (mq/msg-attrs "mulay-test-q" m false))
+        am (:val (mq/msg-attrs "mulay-test-q" m true))]
+    ;; bean の並び (実 Mule の記録の attrs と同じ)
+    (is (= (keys-of a) "headers,destination,messageId,ackToken,deliveryCount,contentType,properties"))
+    (is (= (val-of a "destination") "mulay-test-q"))
+    (is (= (val-of a "messageId") "m1"))
+    (is (= (val-of a "deliveryCount") "2"))
+    (is (= (val-of a "contentType") "text/plain; charset=UTF-8"))
+    ;; ackToken は MANUAL のときだけ
+    (is (= (val-of a "ackToken") "null"))
+    (is (= (val-of am "ackToken") (w/ack-token "mulay-test-q" "m1" "L1")))
+    ;; headers と properties はブローカーの並びのまま
+    (is (= (sub-keys a "headers") "lockId,created,messageId,ttl,deliveryCount"))
+    (is (= (sub-keys a "properties") "contentType,MULE_ENCODING"))))
+
+(deftest attrs-missing
+  (let [m (msg [(hdr "lockId" "L1")] [])
+        a (:val (mq/msg-attrs "q" m false))]
+    ;; contentType のプロパティが無ければ null、messageId が無ければ null、deliveryCount は 1
+    (is (= (val-of a "contentType") "null"))
+    (is (= (val-of a "messageId") "null"))
+    (is (= (val-of a "deliveryCount") "1"))))
+
+(deftest delivery-count-header
+  (is (= (mq/delivery-count (msg [] [])) 1))
+  (is (= (mq/delivery-count (msg [(hdr "deliveryCount" "3")] [])) 3))
+  (is (= (mq/delivery-count (msg [(hdr "deliveryCount" " 3")] [])) 1))
+  (is (= (mq/delivery-count (msg [(hdr "deliveryCount" "x")] [])) 1)))
+
+(deftest output-mime
+  (let [t (ev/tv-raw "{}" "application/json; charset=UTF-8")
+        any (ev/tv-raw "{}" ev/ANY)]
+    ;; どちらも無ければそのまま
+    (is (= (:mime (mq/with-output t "" "")) "application/json; charset=UTF-8"))
+    ;; outputMimeType は元の charset を残す (/conout: mime application/json、encoding UTF-8)
+    (is (= (:mime (mq/with-output any "application/json" "")) "application/json"))
+    (is (= (:mime (mq/with-output (ev/tv-raw "{}" "text/plain; charset=UTF-8") "application/json" "")) "application/json; charset=UTF-8"))
+    ;; outputEncoding は charset を替える (/conout?enc=1: encoding ISO-8859-1)
+    (is (= (:mime (mq/with-output t "application/json" "ISO-8859-1")) "application/json; charset=ISO-8859-1"))
+    (is (= (:mime (mq/with-output t "" "ISO-8859-1")) "application/json; charset=ISO-8859-1"))
+    ;; 本文はそのまま
+    (is (= (:raw (mq/with-output t "application/json" "ISO-8859-1")) "{}"))))
+
+(deftest user-properties
+  (is (= (props-str (v/null-v)) ""))
+  (is (= (props-str (v/->VObj [(v/field "s" (v/->VStr "x")) (v/field "b" (v/->VBool true)) (v/field "n" (v/int-v 42))]))
+         "s=s:x,b=s:true,n=n:42"))
+  (is (= (props-str (v/->VObj [(v/field "a" (v/->VStr "x")) (v/field "z" (v/null-v))])) "ERR Property value can not be null"))
+  (is (= (props-str (v/->VObj [(v/field "o" (v/->VObj []))]))
+         "ERR Property value accept only string or number or boolean as values"))
+  (is (= (props-str (v/->VArr [])) "ERR Property value accept only string or number or boolean as values")))

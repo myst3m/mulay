@@ -1,0 +1,64 @@
+(ns mulay.dw.gen
+  (:require [mulay.dw.ast :as ast] [mulay.dw.val :as v] [mulay.dw.rir :as r] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe]
+            [mulay.dw.eval :as ev] [clay.string :as str]))
+
+(defn size Int [n: &r/R]
+  (let [ks (r/kids n)] (loop [i 0 s 1] (if (>= i (count ks)) s (recur (+ i 1) (+ s (size (nth ks i))))))))
+
+(defn- push-tree Vec(r/R) [acc: Vec(r/R) n: &r/R]
+  (let [ks (r/kids n)] (loop [i 0 a (conj acc n)] (if (>= i (count ks)) a (recur (+ i 1) (push-tree a (nth ks i)))))))
+
+(defn roots Vec(r/R) [p: &r/Prog]
+  (let [a (loop [i 0 acc: Vec(r/R) []]
+            (if (>= i (count (:fns p))) acc
+              (let [fd (nth (:fns p) i)
+                    ps (:params fd)
+                    a1 (loop [k 0 a acc] (if (>= k (count ps)) a (recur (+ k 1) (r/cat a (:default (nth ps k))))))]
+                (recur (+ i 1) (conj a1 (:body fd))))))
+        b (loop [i 0 acc a] (if (>= i (count (:globals p))) acc (recur (+ i 1) (conj acc (:body (nth (:globals p) i))))))]
+    (conj b (:body p))))
+
+(defn nodes Vec(r/R) [p: &r/Prog]
+  (let [rs (roots p)] (loop [i 0 acc: Vec(r/R) []] (if (>= i (count rs)) acc (recur (+ i 1) (push-tree acc (nth rs i)))))))
+
+(defn script-hash Str [text: &Str inputs: &Vec(Str)]
+  (let [h0 (fnv -3750763034362895579 text)
+        h (loop [i 0 h h0] (if (>= i (count inputs)) h (recur (+ i 1) (fnv (fnv h "\n") (nth inputs i)))))]
+    (hex h)))
+
+(defn- fnv Int [h0: Int s: &Str]
+  (loop [i 0 h h0] (if (>= i (count s)) h (recur (+ i 1) (* (bit-xor h (nth s i)) 1099511628211)))))
+
+(defn- hex Str [h: Int]
+  (loop [i 0 x h out ""]
+    (if (>= i 16) out
+      (let [d (bit-and x 15)]
+        (recur (+ i 1) (bit-shift-right x 4) (str (subs "0123456789abcdef" d (+ d 1)) out))))))
+
+(defrecord G [cs: Vec(ev/C) vals: Vec(v/Val) sps: Vec(ast/Span)])
+
+(defn make-g G [p: &r/Prog delegated: &Vec(Int)]
+  (let [ns (nodes p)
+        dummy (ev/cx p (r/->R (r/->RConst (v/null-v)) (dwe/no-span)))
+        cs (loop [i 0 acc: Vec(ev/C) []] (if (>= i (count ns)) acc (recur (+ i 1) (conj acc dummy))))
+        cs2 (loop [i 0 acc cs] (if (>= i (count delegated)) acc (recur (+ i 1) (assoc acc (nth delegated i) (ev/cx p (nth ns (nth delegated i)))))))
+        vals (loop [i 0 acc: Vec(v/Val) []]
+               (if (>= i (count ns)) acc
+                 (recur (+ i 1) (conj acc (match (:x (nth ns i))
+                                            (r/RConst x) x
+                                            (r/RAs x0 ty) (v/->VType (:t ty))
+                                            (r/RIs x0 ty) (v/->VType (:t ty))
+                                            _ (v/null-v))))))
+        sps (loop [i 0 acc: Vec(ast/Span) []] (if (>= i (count ns)) acc (recur (+ i 1) (conj acc (:sp (nth ns i))))))]
+    (->G cs2 vals sps)))
+
+(defn assemble ev/CProg [p: &r/Prog bodies: Vec(ev/T) globals: Vec(ev/C) body: ev/C]
+  (let [c0 (ev/compile-prog p)
+        fns (loop [i 0 acc: Vec(ev/CFn) []]
+              (if (>= i (count (:fns c0))) acc
+                (let [fd (nth (:fns c0) i)]
+                  (recur (+ i 1) (conj acc (assoc fd :body (nth bodies i)))))))
+        gs (loop [i 0 acc: Vec(ev/CGlobal) []]
+             (if (>= i (count (:globals c0))) acc
+               (recur (+ i 1) (conj acc (ev/->CGlobal (nth globals i) (:nslots (nth (:globals c0) i)))))))]
+    (ev/->CProg fns gs body (:nslots c0) (rt/no-srcs) ev/no-runner [])))

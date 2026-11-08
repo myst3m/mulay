@@ -1,0 +1,339 @@
+(ns mulay.cli.boot
+  (:require [mulay.rt.conn :as conn] [mulay.dw.val :as v] [mulay.dw.lib.runtime :as l-runtime] [mulay.cli.dwtest :as dwtest] [mulay.dw.lib.testio :as l-testio] [mulay.mule.load :as ld] [mulay.mule.model :as m] [mulay.mule.props :as pr] [mulay.lib.res :as res] [mulay.mule.dump :as dump] [mulay.mule.lint :as lint] [mulay.mule.amodel :as am] [mulay.conn.catalog :as cat] [mulay.conn.apikit :as apikit] [mulay.note.run :as note]
+            [mulay.app.run :as run] [mulay.app.munit :as munit] [mulay.rt.log :as log] [mulay.dw.engine :as eng] [mulay.dw.lib.mule :as dwm] [mulay.dw.urls :as urls] [mulay.dw.gencode :as gc] [mulay.dw.gen :as gen]
+            [mulay.dw.genreg :as gr] [mulay.dw.lib.binaries :as bin] [mulay.lib.fs :as fs] [mulay.lib.seal :as seal] [mulay.cli.help :as help] [mulay.cli.opts :as opts] [mulay.cli.dwpath :as dwpath] [mulay.dw.explain :as ex] [mulay.lib.diag :as diag] [mulay.dw.rt :as drt] [mulay.dw.err :as dwe] [clay.term :as term] [clay.string :as str] [clay.io :as io]))
+(defextern system system)
+
+(def VERSION "0.3.1")
+
+(defn- show Int [text: &Str rc: Int] (let [z (println text)] rc))
+
+(defn- misuse Int [cmd: &Str msg: &Str]
+  (let [more (if (= cmd "") "Run 'mulay help' for the list of commands." (str "Run 'mulay help " cmd "' for details."))
+        z (eprintln (str "mulay: " msg "\n" (help/usage-line cmd) "\n" more))]
+    2))
+
+(defrecord Argv [as: Vec(Str) err: Str])
+
+(defn- read-argv Argv [emb: Bool]
+  (let [raw (loop [i 1 acc: Vec(Str) []] (if (>= i (argv-len)) acc (recur (+ i 1) (conj acc (argv-nth i)))))
+        [as err] (opts/expand-props-files raw)]
+    (->Argv (if emb as (opts/with-default-app as)) err)))
+
+(defn- load-opts ld/LoadOpts [ps: Vec(m/Param) h: m/Hints]
+  (let [fs (loop [i 0 acc: Vec(v/Field) []]
+             (if (>= i (count ps)) acc
+               (let [p (nth ps i)]
+                 (recur (+ i 1) (match (:v p) (m/PLit x) (conj acc (v/field (:name p) (v/->VStr (str x)))) _ acc)))))
+        z (l-runtime/set-sys-props! fs)]
+    (ld/->LoadOpts ps true h)))
+
+(defn- load Values(m/App Bool) [path: &Str props: Vec(m/Param) cmd: &Str h: &m/Hints]
+  (finish (ld/load-path path (load-opts props h)) cmd))
+
+(defn- embedded Values(ld/Bundle Str) [a: &gr/Aot]
+  (let [[raw de] (bin/b64-decode (:app a))
+        z: Vec(Str) []]
+    (if (not= de "") (values (ld/->Bundle "" z z z z []) de) (ld/bundle-decode raw))))
+
+(defn- embedded? Bool [a: &gr/Aot] (not= (:app a) ""))
+
+(defn- key-of Str [given: &Str]
+  (if (not= given "") (str given) (getenv "MULAY_KEY" "")))
+
+(defn- embedded-props Values(Vec(m/Param) Str) [a: &gr/Aot key: &Str exe: &Str]
+  (let [raw (:props a)
+        none: Vec(m/Param) []]
+    (if (= raw "") (values none "")
+      (let [[bytes de] (bin/b64-decode (subs raw 1 (count raw)))]
+        (cond
+          (not= de "") (values none "embedded properties are damaged")
+          (= (subs raw 0 1) "P") (opts/decode-props bytes)
+          (= key "") (values none (opts/need-key-hint exe))
+          :else (let [[plain ue] (seal/unseal key bytes)]
+                  (if (not= ue "") (values none (str "cannot open the embedded properties: " ue)) (opts/decode-props plain))))))))
+
+(defn- load-embedded Values(m/App Bool) [a: &gr/Aot props: Vec(m/Param) h: &m/Hints]
+  (let [[b e] (embedded a)]
+    (if (not= e "") (let [z (eprintln (str "error: embedded application: " e))] (finish (ld/load-texts "app" [] [] (res/res-none) (load-opts props h)) EXE-CMD))
+      (finish (ld/load-bundle b (load-opts props h)) EXE-CMD))))
+
+(def EXE-CMD "<this executable>")
+
+(defn- finish Values(m/App Bool) [l: ld/Loaded cmd: &Str]
+  (let [app (:app l)
+        ds (m/diag-strs (:diags app))
+        pz (ld/use-properties! app)
+        lz (log/use-app-config! (:res app))
+        cz (urls/set-classpath! (:res l))
+        ws (warnings (:files l) (:texts l))
+        wz (loop [i 0] (if (>= i (count ws)) 0 (let [y (eprintln (str "warning: " (nth ws i)))] (recur (+ i 1)))))]
+    (if (= (count ds) 0) (values app true)
+      (let [dd (:diags app)
+            z (loop [i 0] (if (>= i (count dd)) 0
+                            (let [x (nth dd i)
+                                  y (eprintln (if (> (count (:rep x)) 0) (str (diag/render (nth (:rep x) 0) (color?)) "\n") (str "error: " (nth ds i))))]
+                              (recur (+ i 1)))))
+            ks (opts/unresolved-keys ds)
+            z2 (if (> (count ks) 0) (eprintln (str "error: " (opts/missing-hint cmd ks))) 0)]
+        (values app false)))))
+
+(defrecord Boot [ok: Bool server: Vec(run/Server) hints: m/Hints as: Vec(Str) err: Str aot: gr/Aot cs: Vec(conn/Connector)])
+
+(defn boot-from-argv Boot [cs: Vec(conn/Connector) a: gr/Aot]
+  (let [z (eng/set-generated! (:table a))
+        emb (embedded? a)
+        av (read-argv emb)
+        as (:as av)
+        h (conn/parse-hints cs)]
+    (cond
+      (not= (:err av) "") (->Boot false [] h as (:err av) a cs)
+      (not (opts/serves-app? as emb)) (->Boot false [] h as "" a cs)
+      emb
+      (let [[k0 as1] (opts/take-key as)
+            [ps0 lvl rest] (opts/parse as1 (if (and (> (count as1) 0) (= (nth as1 0) "run")) 1 0))
+            [eps ee] (embedded-props a (key-of k0) (argv-nth 0))
+            [app ok] (if (= ee "") (load-embedded a (opts/merge-props eps ps0) h)
+                       (let [z (eprintln (str "error: " ee))
+                             [a o] (finish (ld/load-texts "app" [] [] (res/res-none) (load-opts ps0 h)) EXE-CMD)]
+                         (values a false)))
+            ps ps0]
+        (if (> (count rest) 0)
+          (let [z (eprintln (str "error: unexpected argument " (nth rest 0) " (this executable embeds its application)"))] (->Boot false [(run/prepare app lvl cs)] h as "" a cs))
+          (->Boot ok [(run/prepare app lvl cs)] h as "" a cs)))
+      :else
+      (let [[ps lvl rest] (opts/parse as 2)
+            [app ok] (load (nth as 1) ps "mulay run <app>" h)]
+        (->Boot ok [(run/prepare app lvl cs)] h as "" a cs)))))
+
+(defn- cmd-run Int [as: &Vec(Str) b: &Boot]
+  (if (< (count as) 2) (misuse "run" "run needs <app>")
+    (if (not (:ok b)) 1 (run/serve (nth (:server b) 0)))))
+
+(defn- warnings Vec(Str) [files: &Vec(Str) texts: &Vec(Str)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (min (count files) (count texts))) acc
+      (let [w (lint/check (nth files i) (nth texts i))]
+        (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count w)) a (recur (+ k 1) (conj a (nth w k))))))))))
+
+(defn- cmd-validate Int [as: &Vec(Str) h: &m/Hints]
+  (if (< (count as) 2) (misuse "validate" "validate needs <app>")
+    (let [[ps lvl rest] (opts/parse as 2)
+          l (ld/load-path (nth as 1) (load-opts ps h))
+          [app ok] (finish l "mulay validate <app>")]
+      (if ok (let [y (println (dump/summary app))] 0) 1))))
+
+(defn- cmd-inspect Int [as: &Vec(Str) h: &m/Hints]
+  (if (< (count as) 2) (misuse "inspect" "inspect needs <app>")
+    (let [[ps lvl rest] (opts/parse as 2)
+          only-props (loop [i 0] (if (>= i (count rest)) false (if (= (nth rest i) "--props") true (recur (+ i 1)))))
+          json (loop [i 0] (if (>= i (count rest)) false (if (= (nth rest i) "--json") true (recur (+ i 1)))))]
+      (if json (inspect-json (nth as 1) ps h)
+        (let [[app ok] (load (nth as 1) ps "mulay inspect <app>" h)
+              z (println (if only-props (dump/dump-props app) (dump/dump-app app)))]
+          (if ok 0 1))))))
+
+(defn- inspect-json Int [path: &Str ps: Vec(m/Param) h: &m/Hints]
+  (let [l (ld/load-path path (load-opts ps h))
+        dir (io/dir? path)
+        a (am/with-apis (am/build l h cat/component-info (if dir "src/main/mule/" "")) (:app l) (apikit/api-models (:app l) (if dir "src/main/resources/" "")))
+        z (println (am/to-json a))]
+    (if (= (count (:diags a)) 0) 0 1)))
+
+(defn- cmd-test Int [as: &Vec(Str) b: &Boot]
+  (let [[ps lvl rest0] (opts/parse as 1)
+        [golden rest] (loop [i 0 g "" r: Vec(Str) []]
+                        (if (>= i (count rest0)) (values g r)
+                          (if (and (= (nth rest0 i) "--golden") (< (+ i 1) (count rest0))) (recur (+ i 2) (nth rest0 (+ i 1)) r)
+                            (recur (+ i 1) g (conj r (nth rest0 i))))))
+        dir (if (= (count rest) 0) "." (nth rest 0))]
+    (munit/run-dir dir (load-opts ps (:hints b)) (:cs b) (if (= lvl log/INFO) log/WARN lvl) golden)))
+
+(defn- cmd-dw-test Int [as0: &Vec(Str)]
+  (let [[paths props targets pe]
+        (loop [i 2 ps: Vec(Str) [] pr: Vec(v/Field) [] ts: Vec(Str) []]
+          (if (>= i (count as0)) (values ps pr ts "")
+            (let [a (nth as0 i)]
+              (cond
+                (and (= a "--path") (< (+ i 1) (count as0))) (recur (+ i 2) (conj ps (nth as0 (+ i 1))) pr ts)
+                (= a "--path") (values ps pr ts "--path needs a directory")
+                (and (= a "-D") (< (+ i 1) (count as0)))
+                (let [kv (nth as0 (+ i 1)) eq (str/index-of kv "=")]
+                  (if (<= eq 0) (values ps pr ts (str "-D needs name=value: " kv))
+                    (recur (+ i 2) ps (conj pr (v/field (subs kv 0 eq) (v/->VStr (subs kv (+ eq 1) (count kv))))) ts)))
+                (= a "-D") (values ps pr ts "-D needs name=value")
+                :else (recur (+ i 1) ps pr (conj ts a))))))
+        [cwd ce] (io/cwd)]
+    (if (not= pe "") (misuse "dw" pe)
+      (let [has-res (loop [i 0] (if (>= i (count props)) false (if (= (:name (:key (nth props i))) "dwtestResources") true (recur (+ i 1)))))
+            props2 (if (or has-res (not (fs/dir? "src/test/resources"))) props (conj props (v/field "dwtestResources" (v/->VStr "src/test/resources"))))
+            z (l-runtime/set-sys-props! props2)
+            ts (if (> (count targets) 0) targets (if (fs/dir? "src/test/dw") ["src/test/dw"] ["."]))]
+        (dwtest/run ts paths cwd (and (= (getenv "NO_COLOR" "") "") (= (term/term-isatty-c 1) 1)))))))
+
+(defn- cmd-dw Int [as0: &Vec(Str)]
+  (if (and (> (count as0) 1) (= (nth as0 1) "test")) (cmd-dw-test as0) (cmd-dw-eval as0)))
+
+(defn- cmd-dw-eval Int [as0: &Vec(Str)]
+  (let [[paths as pe] (loop [i 1 ps: Vec(Str) [] rest: Vec(Str) ["dw"]]
+                        (if (>= i (count as0)) (values ps rest "")
+                          (let [a (nth as0 i)]
+                            (cond (and (= a "--path") (< (+ i 1) (count as0))) (recur (+ i 2) (conj ps (nth as0 (+ i 1))) rest)
+                                  (= a "--path") (values ps rest "--path needs a directory")
+                                  :else (recur (+ i 1) ps (conj rest a))))))]
+    (cond
+      (not= pe "") (misuse "dw" pe)
+      (< (count as) 2) (misuse "dw" "dw needs <script.dwl>")
+      :else
+      (let [[script se] (read-file (nth as 1))]
+        (if (not= se "") (do (eprintln (str "mulay: " se)) 1)
+          (let [[ins ie] (loop [i 2 acc: Vec(eng/Input) []]
+                           (if (>= i (count as)) (values acc "")
+                             (let [a (nth as i) eq (str/index-of a "=") col (str/index-of a ":")]
+                               (if (or (< eq 0) (< col eq)) (values acc (str "bad input argument: " a))
+                                 (let [[text re] (read-file (subs a (+ col 1) (count a)))]
+                                   (if (not= re "") (values acc re)
+                                     (recur (+ i 1) (conj acc (eng/->Input (subs a 0 eq) (subs a (+ eq 1) col) [] text)))))))))
+                [cwd ce] (io/cwd)]
+            (if (not= ie "") (do (eprintln (str "mulay: " ie)) 1)
+              (let [roots (dwpath/roots paths (nth as 1) cwd)
+                    zr (l-testio/set-roots! roots)
+                    [mime out err c de] (eng/run-text-with script ins (dwpath/loader roots))]
+                (if (not= err "") (do (eprintln (render-dw-error (nth as 1) script c de err ins)) 1)
+                  (let [z (println out)] 0))))))))))
+
+(defn- color? Bool [] (and (= (getenv "NO_COLOR" "") "") (= (term/term-isatty-c 2) 1)))
+
+(defn- render-dw-error Str [file: &Str script: &Str c: &eng/Compiled de: &dwe/DwErr err: &Str ins: &Vec(eng/Input)]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count ins)) acc (recur (+ i 1) (conj acc (:name (nth ins i))))))
+        ctx (ex/->Ctx names true)
+        r (if (not (eng/ok? c)) (ex/compile-report (str file) (str script) c ctx)
+            (if (dwe/ok? de) (ex/explain (diag/with-src (diag/report "error" "DW" (str err)) (str file) (str script)) err [] ctx) (ex/run-report (str file) (str script) c de ctx)))]
+    (diag/render r (color?))))
+
+(defn- q Str [s: &Str] (fs/sh-quote s))
+(defn- sh Int [cmd: &Str] (unsafe (system cmd)))
+
+(defn- src-root Str [entry: &Str]
+  (let [e (getenv "MULAY_SRC" "")]
+    (if (not= e "") e
+      (let [a0 (argv-nth 0) sl (str/last-index-of a0 "/")
+            dir (if (< sl 0) "." (subs a0 0 sl))]
+        (if (fs/file? (str dir "/" entry)) dir (str dir "/../src"))))))
+
+(defn- props-payload Values(Str Str) [ps: &Vec(m/Param) enc: Bool key: &Str]
+  (if (= (count ps) 0) (values "" "")
+    (let [plain (opts/encode-props ps)]
+      (if (not enc) (values (str "P" (bin/b64-encode plain)) "")
+        (let [[sealed e] (seal/seal key plain)]
+          (if (not= e "") (values "" e) (values (str "E" (bin/b64-encode sealed)) "")))))))
+
+(defn- link-level Str [src: &Str dst: &Str skips: &Vec(Str)]
+  (let [guard (loop [i 0 out ""] (if (>= i (count skips)) out (recur (+ i 1) (str out "[ \"$n\" = " (q (nth skips i)) " ] || "))))]
+    (str "for e in " (q src) "/*; do n=$(basename \"$e\"); " guard "ln -s \"$(cd \"$(dirname \"$e\")\" && pwd)/$n\" " (q dst) "/; done")))
+
+(defn- mirror-cmd Str [src: &Str b: &Str rel: &Str]
+  (let [cs: Vec(Str) (str/split rel "/")
+        li (- (count cs) 1)
+        file (nth cs li)]
+    (loop [i 0 sd (str src) bd (str b) out (str "rm -rf " (q b) " && mkdir -p " (q b) " && chmod 700 " (q b))]
+      (if (>= i li)
+        (str out " && " (link-level sd bd (if (= i 0) [file (fs/base-name b)] [file])))
+        (let [c (nth cs i)
+              l (link-level sd bd (if (= i 0) [c (fs/base-name b)] [c]))
+              bd2 (str bd "/" c)]
+          (recur (+ i 1) (str sd "/" c) bd2 (str out " && " l " && mkdir -p " (q bd2))))))))
+
+(defn- cmd-build Int [as0: &Vec(Str) b: &Boot]
+  (let [[enc as1] (opts/take-flag as0 "--encrypt")
+        [k0 as] (opts/take-key as1)]
+    (cmd-build-with as enc (key-of k0) (:hints b) (:aot b))))
+
+(defn- cmd-build-with Int [as: &Vec(Str) enc: Bool key: &Str h: &m/Hints a: &gr/Aot]
+  (let [[ps lvl rest] (opts/parse as 2)
+        out (loop [i 0] (if (>= (+ i 1) (count rest)) "" (if (= (nth rest i) "-o") (nth rest (+ i 1)) (recur (+ i 1)))))
+        srcr (src-root (:entry a))
+        [pstr perr] (props-payload ps enc key)]
+    (if (< (count as) 2) (misuse "build" "build needs <app>")
+     (if (= out "") (misuse "build" "build needs -o <out>")
+     (if (and enc (= key "")) (misuse "build" "--encrypt needs a key: -k <key> (or the environment variable MULAY_KEY)")
+     (if (and enc (= (count ps) 0)) (misuse "build" "--encrypt has nothing to encrypt: pass the properties as key=value")
+      (if (or (= (read-file-or (str srcr "/" (:entry a)) "") "") (= (read-file-or (str srcr "/" (:path a)) "") ""))
+        (do (eprintln (str "mulay: mulay source not found at " srcr " (set MULAY_SRC)")) 1)
+        (let [z0 (eng/start-recording! (:ns a))
+              l (ld/load-path (nth as 1) (load-opts ps h))
+              [bundle be] (ld/bundle-of l)
+              [app ok] (finish l "mulay build <app> -o <out>")]
+          (if (not ok) 1
+           (if (not= perr "") (let [z (eprintln (str "mulay build: " perr))] 1)
+           (if (not= be "") (let [z (eprintln (str "mulay build: " be))] 1)
+            (let [[hs srcs] (eng/recorded)
+                  b (str out ".build")
+                  p (:path a)
+                  gd (str b "/" (subs p 0 (- (count p) 5)))
+                  z1 (sh (mirror-cmd srcr b p))
+                  z2 (loop [i 0] (if (>= i (count hs)) 0 (let [w (write-file (str gd "_s" (nth hs i) ".clay") (nth srcs i))] (recur (+ i 1)))))
+                  z3 (write-file (str b "/" p) (gc/aot-module a hs true))
+                  za (write-file (str gd "_app.clay") (gc/app-module (:ns a) (bin/b64-encode (ld/bundle-encode bundle)) pstr))
+                  z4 (println (str "mulay build: " (count hs) " DataWeave script(s), " (count (:files bundle)) " config(s), "
+                                   (count (:rkeys bundle)) " resource(s), " (count ps) (if enc " encrypted" "") " propert" (if (= (count ps) 1) "y" "ies")
+                                   " embedded -> " out))
+                  target (if (fs/file? (str srcr "/clay.pkg")) b (str b "/" (:entry a)))
+                  rc (sh (str "clay build " (q target) " -o " (q out)))
+                  zr (sh (str "rm -rf " (q b)))]
+              (if (= rc 0) 0 (do (eprintln "mulay build: clay build failed") 1))))))))))))))
+
+(defn- cmd-dw-gen Int [as: &Vec(Str)]
+  (if (< (count as) 3) (misuse "" "dw-gen needs <script.dwl> <module-name>")
+    (let [[script se] (read-file (nth as 1))]
+      (if (not= se "") (do (eprintln (str "mulay: " se)) 1)
+        (let [ins (loop [i 3 acc: Vec(Str) []] (if (>= i (count as)) acc (recur (+ i 1) (conj acc (nth as i)))))
+              c (eng/compile script ins)]
+          (if (not (eng/ok? c)) (do (eprintln (str "error: " (nth (:errors c) 0))) 1)
+            (let [z (println (str ";; hash " (gen/script-hash script ins) "\n" (gc/module (nth as 2) (:prog c) (:builtins c))))] 0)))))))
+
+(defn- cmd-help Int [as: &Vec(Str)]
+  (if (< (count as) 2) (show (help/overview VERSION) 0)
+    (let [t (help/command-help (if (opts/wants-help? as 1) "help" (nth as 1)))]
+      (if (= t "") (misuse "" (str "unknown command '" (nth as 1) "'")) (show t 0)))))
+
+(defn- cmd-version Int []
+  (let [n (eng/generated-count) z (println (str "mulay " VERSION (if (> n 0) (str " (" n " precompiled DataWeave script(s))") "")))] 0))
+
+(defn- cmd-note Int [as: &Vec(Str)]
+  (if (< (count as) 2) (misuse "note" "note needs <dir>")
+    (let [dir (nth as 1)
+          md (note/load-dir dir)]
+      (if (= (count as) 2) (let [z (println (am/to-json md))] 0)
+        (let [xs (note/examples dir)]
+          (loop [i 2]
+            (if (>= i (count as)) 0
+              (let [id (nth as i)
+                    k (loop [j 0] (if (>= j (count xs)) -1 (if (= (note/example-id (nth xs j)) id) j (recur (+ j 1)))))
+                    z (if (< k 0) (eprintln (str "mulay note: no example " id))
+                        (let [t (note/run-example-val (nth xs k) "")] (println (note/trace-json t))))]
+                (recur (+ i 1))))))))))
+
+(defn run-main Int [b: &Boot]
+  (let [as (:as b)]
+    (if (not= (:err b) "") (let [z (eprintln (str "mulay: " (:err b)))] 2)
+    (if (embedded? (:aot b))
+      (cond
+        (and (> (count as) 0) (= (nth as 0) "version")) (cmd-version)
+        (or (opts/wants-help? as 0) (and (> (count as) 0) (= (nth as 0) "help"))) (show (help/embedded-help (argv-nth 0)) 0)
+        :else (if (not (:ok b)) 1 (run/serve (nth (:server b) 0))))
+    (if (= (count as) 0) (show (help/overview VERSION) 2)
+      (let [c (nth as 0)]
+        (cond
+          (or (= c "help") (= c "--help") (= c "-h")) (cmd-help as)
+          (and (not= (help/command-help c) "") (opts/wants-help? as 1)) (show (help/command-help c) 0)
+          (= c "run") (cmd-run as b)
+          (= c "note") (cmd-note as)
+          (= c "validate") (cmd-validate as (:hints b))
+          (= c "inspect") (cmd-inspect as (:hints b))
+          (= c "test") (cmd-test as b)
+          (= c "dw") (cmd-dw as)
+          (= c "dw-gen") (cmd-dw-gen as)
+          (= c "build") (cmd-build as b)
+          (= c "version") (cmd-version)
+          :else (misuse "" (str "unknown command '" c "'")))))))))

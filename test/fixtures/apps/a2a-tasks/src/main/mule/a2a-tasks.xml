@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18163"/>
+    </http:listener-config>
+
+    <http:request-config name="Raw">
+        <http:request-connection host="localhost" port="18163"/>
+    </http:request-config>
+
+    <os:object-store name="Snap" persistent="false"/>
+
+    <!-- タスクの記録あり (既定) -->
+    <a2a:server-config name="Srv">
+        <a2a:connection listenerConfig="L" agentPath="/agent"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{"name": "Tasks", "description": "Task agent", "url": "http://localhost:18163/agent", "version": "1.0.0",
+  "capabilities": {}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []}]]></a2a:json>
+        </a2a:agent-card>
+    </a2a:server-config>
+
+    <!-- タスクの記録なし -->
+    <a2a:server-config name="NoHist">
+        <a2a:connection listenerConfig="L" agentPath="/nohist"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{"name": "NoHist", "description": "No history", "url": "http://localhost:18163/nohist", "version": "1.0.0",
+  "capabilities": {}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []}]]></a2a:json>
+        </a2a:agent-card>
+        <a2a:history taskHistoryEnabled="false"/>
+    </a2a:server-config>
+
+    <a2a:client-config name="Cl">
+        <a2a:client-connection serverUrl="http://localhost:18163/agent"/>
+    </a2a:client-config>
+
+    <!-- 認可: Authorization が "Bearer ok" でなければ断る -->
+    <flow name="auth">
+        <a2a:authorization-listener config-ref="Srv"/>
+        <os:store key="auth" objectStore="Snap">
+            <os:value><![CDATA[#[output application/json --- {
+  payload: write(payload, "application/json") replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;",
+  mime: payload.^mimeType,
+  attrClass: attributes.^class,
+  rpc: attributes.jsonRpcMethod,
+  taskIdIsUuid: (attributes.taskId default "") matches /[0-9a-f-]{36}/,
+  contextId: attributes.contextId
+}]]]></os:value>
+        </os:store>
+        <choice>
+            <when expression="#[attributes.headers.authorization != 'Bearer ok']">
+                <raise-error type="APP:DENIED" description="no token"/>
+            </when>
+        </choice>
+    </flow>
+
+    <flow name="auth-nohist">
+        <a2a:authorization-listener config-ref="NoHist"/>
+        <logger level="DEBUG" message="ok"/>
+    </flow>
+
+    <!-- 最初の text で応答を変える -->
+    <flow name="agent">
+        <a2a:task-listener config-ref="Srv"/>
+        <set-variable variableName="text" value="#[payload.message.parts[0].text default '']"/>
+        <choice>
+            <when expression="#[vars.text == 'work']">
+                <set-payload value='#[output application/json --- {kind: "task", id: attributes.taskId, contextId: attributes.contextId, status: {state: "working", timestamp: "2026-01-02T03:04:05Z", message: {kind: "message", role: "agent", messageId: "m-work", parts: [{kind: "text", text: "working"}]}}, artifacts: [{artifactId: "a1", parts: [{kind: "text", text: "part 1"}]}]}]'/>
+            </when>
+            <when expression="#[vars.text == 'more']">
+                <set-payload value='#[output application/json --- {kind: "task", id: attributes.taskId, contextId: attributes.contextId, status: {state: "input-required", timestamp: "2026-01-02T03:04:06Z", message: {kind: "message", role: "agent", messageId: "m-more", parts: [{kind: "text", text: "need more"}]}}, artifacts: [{artifactId: "a2", parts: [{kind: "text", text: "part 2"}]}]}]'/>
+            </when>
+            <when expression="#[vars.text == 'nomsg']">
+                <set-payload value='#[output application/json --- {kind: "task", id: attributes.taskId, contextId: attributes.contextId, status: {state: "working", timestamp: "2026-01-02T03:04:07Z"}}]'/>
+            </when>
+            <when expression="#[vars.text == 'done']">
+                <set-payload value='#[output application/json --- {kind: "task", id: attributes.taskId, contextId: attributes.contextId, status: {state: "completed", timestamp: "2026-01-02T03:04:08Z"}}]'/>
+            </when>
+            <when expression="#[vars.text == 'reply']">
+                <set-payload value='#[output application/json --- {kind: "message", role: "agent", messageId: "m-reply", taskId: attributes.taskId, contextId: attributes.contextId, parts: [{kind: "text", text: "reply"}]}]'/>
+            </when>
+            <otherwise>
+                <set-payload value='#[output application/json --- {kind: "message", role: "agent", messageId: "m-echo", parts: [{kind: "text", text: "echo: " ++ vars.text}]}]'/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <flow name="agent-nohist">
+        <a2a:task-listener config-ref="NoHist"/>
+        <set-payload value='#[output application/json --- {kind: "task", id: attributes.taskId, contextId: attributes.contextId, status: {state: "working", timestamp: "2026-01-02T03:04:05Z"}}]'/>
+    </flow>
+
+    <!-- 生の JSON-RPC。本文の @TID@ / @CID@ は、前に Task を返した応答のタスク ID とコンテキスト ID に置き換える。
+         ?auth= を Authorization に、?path= を送り先にする -->
+    <flow name="rpc-raw">
+        <http:listener config-ref="L" path="/t/rpc" allowedMethods="POST"/>
+        <set-variable variableName="path" value="#[attributes.queryParams.path default '/agent']"/>
+        <set-variable variableName="auth" value="#[attributes.queryParams.auth default '']"/>
+        <os:retrieve key="ids" objectStore="Snap" target="ids">
+            <os:default-value><![CDATA[#[output application/json --- {tid: "none", cid: "none"}]]]></os:default-value>
+        </os:retrieve>
+        <set-variable variableName="body" value="#[output text/plain --- (payload as String) replace '@TID@' with vars.ids.tid replace '@CID@' with vars.ids.cid]"/>
+        <http:request config-ref="Raw" method="POST" path="#[vars.path]" outputMimeType="text/plain">
+            <http:body><![CDATA[#[vars.body]]]></http:body>
+            <http:headers><![CDATA[#[if (vars.auth == '') {"Content-Type": "application/json"} else {"Content-Type": "application/json", "Authorization": vars.auth}]]]></http:headers>
+            <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+        </http:request>
+        <set-variable variableName="status" value="#[attributes.statusCode]"/>
+        <set-variable variableName="raw" value="#[payload as String]"/>
+        <choice>
+            <when expression="#[(read(vars.raw, 'application/json').result.kind default '') == 'task' and vars.path == '/agent']">
+                <os:store key="ids" objectStore="Snap">
+                    <os:value><![CDATA[#[output application/json --- {tid: read(vars.raw, 'application/json').result.id, cid: read(vars.raw, 'application/json').result.contextId}]]]></os:value>
+                </os:store>
+            </when>
+            <when expression="#[(read(vars.raw, 'application/json').result.taskId default '') != '' and vars.path == '/agent']">
+                <os:store key="ids" objectStore="Snap">
+                    <os:value><![CDATA[#[output application/json --- {tid: read(vars.raw, 'application/json').result.taskId, cid: read(vars.raw, 'application/json').result.contextId}]]]></os:value>
+                </os:store>
+            </when>
+        </choice>
+        <os:retrieve key="ids" objectStore="Snap" target="ids2">
+            <os:default-value><![CDATA[#[output application/json --- {tid: "none", cid: "none"}]]]></os:default-value>
+        </os:retrieve>
+        <set-payload value='#[output application/json --- {status: vars.status, body: vars.raw replace vars.ids2.tid with "&lt;tid&gt;" replace vars.ids2.cid with "&lt;cid&gt;" replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;" replace /20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;"}]'/>
+    </flow>
+
+    <flow name="last-auth">
+        <http:listener config-ref="L" path="/t/last-auth"/>
+        <os:retrieve key="auth" objectStore="Snap"/>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <!-- クライアントの get-task / cancel-task (前に Task を返したタスク) -->
+    <flow name="client-get">
+        <http:listener config-ref="L" path="/t/client-get"/>
+        <os:retrieve key="ids" objectStore="Snap" target="ids">
+            <os:default-value><![CDATA[#[output application/json --- {tid: "none", cid: "none"}]]]></os:default-value>
+        </os:retrieve>
+        <a2a:get-task config-ref="Cl">
+            <a2a:task-query><![CDATA[#[output application/json --- {id: vars.ids.tid, historyLength: (attributes.queryParams.h default "0") as Number}]]]></a2a:task-query>
+            <a2a:additional-properties><![CDATA[#[{Authorization: attributes.queryParams.auth default "Bearer ok"}]]]></a2a:additional-properties>
+        </a2a:get-task>
+        <flow-ref name="client-out"/>
+        <error-handler>
+            <on-error-continue>
+                <flow-ref name="client-err"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="client-cancel">
+        <http:listener config-ref="L" path="/t/client-cancel"/>
+        <os:retrieve key="ids" objectStore="Snap" target="ids">
+            <os:default-value><![CDATA[#[output application/json --- {tid: "none", cid: "none"}]]]></os:default-value>
+        </os:retrieve>
+        <a2a:cancel-task config-ref="Cl">
+            <a2a:task-id><![CDATA[#[output application/json --- {id: attributes.queryParams.id default vars.ids.tid}]]]></a2a:task-id>
+            <a2a:additional-properties><![CDATA[#[{Authorization: "Bearer ok"}]]]></a2a:additional-properties>
+        </a2a:cancel-task>
+        <flow-ref name="client-out"/>
+        <error-handler>
+            <on-error-continue>
+                <flow-ref name="client-err"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <sub-flow name="client-out">
+        <set-payload value='#[output application/json --- {
+  "type": typeOf(payload) as String, mime: payload.^mimeType, status: attributes.statusCode,
+  body: write(payload, "application/json") replace vars.ids.tid with "&lt;tid&gt;" replace vars.ids.cid with "&lt;cid&gt;" replace /20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;"}]'/>
+    </sub-flow>
+
+    <sub-flow name="client-err">
+        <set-payload value='#[output application/json --- {error: error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description replace vars.ids.tid with "&lt;tid&gt;"}]'/>
+    </sub-flow>
+</mule>

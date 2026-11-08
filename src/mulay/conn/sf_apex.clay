@@ -1,0 +1,218 @@
+(ns mulay.conn.sf_apex
+  (:require [mulay.dw.val :as v] [mulay.dw.fmt.registry :as reg] [mulay.mule.model :as m] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.rt.event :as ev] [mulay.lib.xml :as xml] [mulay.lib.time.iso :as iso]
+            [mulay.conn.sf_core :as sc] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(def KEY-MSG "restMethodName parameter does not have the proper format (ClassName||MethodName\\^RestResourceURL\\^HttpMethod\\^OutputType\\^InputParameterName1=ParameterType1,InputParameterName2=ParameterType2): ")
+
+(defn- cls-meta v/Val [x: v/Val c: &Str] (v/->VMeta x [(v/field "class" (v/->VStr (str c)))]))
+
+(defn- generic Str [t: &Str]
+  (let [s (str/trim t)]
+    (cond
+      (and (str/starts-with? s "List") (>= (str/index-of s "<") 0) (str/ends-with? s ">"))
+      (str/trim (subs s (+ (str/index-of s "<") 1) (- (count s) 1)))
+      (str/ends-with? s "[]") (str/trim (subs s 0 (- (count s) 2)))
+      (and (str/starts-with? s "Map") (>= (str/index-of s ",") 0) (str/ends-with? s ">"))
+      (str/trim (subs s (+ (str/index-of s ",") 1) (- (count s) 1)))
+      :else s)))
+
+(defn- map-type? Bool [t: &Str] (and (str/starts-with? (str/trim t) "Map") (>= (str/index-of t ",") 0)))
+(defn- date-type? Bool [t: &Str] (or (str/includes? t "Date") (str/includes? t "Time")))
+
+(defn- date-only? Bool [s: &Str]
+  (and (= (count s) 10) (= (nth s 4) 45) (= (nth s 7) 45)
+       (loop [i 0] (if (>= i 10) true (if (or (= i 4) (= i 7) (and (>= (nth s i) 48) (<= (nth s i) 57))) (recur (+ i 1)) false)))))
+
+(defn- out-val v/Val [x: &v/Val t: &Str]
+  (let [inner (generic t)]
+    (match (v/unmeta x)
+      (v/VObj fs) (let [m (cls-meta (sc/hashmap-obj (loop [i 0 acc: Vec(v/Field) []]
+                                                      (if (>= i (count fs)) acc
+                                                        (recur (+ i 1) (conj acc (v/field (:name (:key (nth fs i))) (out-val (:value (nth fs i)) inner)))))))
+                                    "java.util.HashMap")]
+                    (if (map-type? t) (kv-list m) m))
+      (v/VArr xs) (cls-meta (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (out-val (nth xs i) inner))))))
+                            "java.util.ArrayList")
+      (v/VStr s) (if (and (date-type? t) (date-only? s))
+                   (cls-meta (local-dt (str s "T00:00:00")) "java.util.Date")
+                   (cls-meta (v/->VStr s) "java.lang.String"))
+      (v/VBool b) (cls-meta (v/bool-v b) "java.lang.Boolean")
+      (v/VNull) (v/null-v)
+      _ (cls-meta (v/unmeta x) (if (= (str/lower-case (str/trim inner)) "long") "java.lang.Long" (num-class x))))))
+
+(defn- num-class Str [x: &v/Val]
+  (match (v/unmeta x) (v/VInt n) (if (or (> n 2147483647) (< n -2147483648)) "java.lang.Long" "java.lang.Integer") _ "java.math.BigDecimal"))
+
+(defn- local-dt v/Val [s: &Str]
+  (let [[x e] (iso/parse-ldt s)] (if (= e "") (v/->VLocalDateTime x) (v/->VStr (str s)))))
+
+(defn- kv-list v/Val [m: &v/Val]
+  (match (v/unmeta m)
+    (v/VObj fs) (cls-meta (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                                      (if (>= i (count fs)) acc
+                                        (recur (+ i 1) (conj acc (cls-meta (sc/hashmap-obj [(v/field "key" (v/->VStr (:name (:key (nth fs i))))) (v/field "value" (:value (nth fs i)))]) "java.util.HashMap"))))))
+                          "java.util.ArrayList")
+    _ m))
+
+(defn- verb Str [http: &Str]
+  (cond (= http "HttpGet") "GET" (= http "HttpPost") "POST" (= http "HttpPut") "PUT" (= http "HttpDelete") "DELETE" (= http "HttpPatch") "PATCH" :else ""))
+
+(defn- obj-fields Vec(v/Field) [x: &v/Val] (match (v/unmeta x) (v/VObj fs) fs _ []))
+(defn- get1 v/Val [fs: &Vec(v/Field) k: &Str] (let [r (v/obj-get fs k)] (if (= (count r) 0) (v/null-v) (nth r 0))))
+
+(defn- in-val v/Val [x: &v/Val t: &Str]
+  (let [inner (generic t)]
+    (match (v/unmeta x)
+      (v/VArr xs) (if (map-type? t)
+                    (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                                (if (>= i (count xs)) acc
+                                  (let [e (obj-fields (nth xs i))]
+                                    (recur (+ i 1) (conj acc (v/field (sc/field-text (get1 e "key")) (in-val (get1 e "value") inner))))))))
+                    (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (in-val (nth xs i) inner)))))))
+      _ (v/unmeta x))))
+
+(defn- param-types Vec(Str) [s: &Str]
+  (loop [i 0 depth 0 start 0 acc: Vec(Str) []]
+    (if (>= i (count s))
+      (let [seg (str/trim (subs s start (count s)))] (if (= seg "") acc (add-param acc seg)))
+      (let [c (nth s i)]
+        (cond (= c 60) (recur (+ i 1) (+ depth 1) start acc)
+              (= c 62) (recur (+ i 1) (- depth 1) start acc)
+              (and (= c 44) (= depth 0)) (recur (+ i 1) depth (+ i 1) (add-param acc (str/trim (subs s start i))))
+              :else (recur (+ i 1) depth start acc))))))
+
+(defn- add-param Vec(Str) [acc: Vec(Str) seg: Str]
+  (let [k (str/index-of seg "=")]
+    (if (< k 0) acc (conj (conj acc (str/trim (subs seg 0 k))) (str/trim (subs seg (+ k 1) (count seg)))))))
+
+(defn- apply-types v/Val [body: &v/Val types: &Vec(Str)]
+  (let [fs (obj-fields body)]
+    (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                (if (>= i (count fs)) acc
+                  (let [k (:name (:key (nth fs i)))
+                        t (loop [j 0] (if (>= j (count types)) "" (if (= (nth types j) k) (nth types (+ j 1)) (recur (+ j 2)))))]
+                    (recur (+ i 1) (conj acc (v/field k (if (= t "") (:value (nth fs i)) (in-val (:value (nth fs i)) t)))))))))))
+
+(defn- rel-path Str [url: &Str params: &Vec(v/Field)]
+  (if (< (str/index-of url "*") 0) (str url)
+    (if (= (count params) 0) (str/replace url "*" "")
+      (loop [i 1 p (str url)]
+        (if (> i (count params)) p
+          (let [w (v/obj-get params (str "Parameter" i))]
+            (recur (+ i 1) (if (= (count w) 0) p
+                             (let [k (str/index-of p "*")] (if (< k 0) p (str (subs p 0 k) (sc/field-text (nth w 0)) (subs p (+ k 1) (count p)))))))))))))
+
+(defn- query-string Str [qs: &Vec(v/Field)]
+  (if (= (count qs) 0) ""
+    (let [o (match (v/unmeta (sc/hashmap-obj qs)) (v/VObj fs) fs _ [])]
+      (loop [i 0 out "?"] (if (>= i (count o)) out
+                            (recur (+ i 1) (str out (if (> i 0) "&" "") (:name (:key (nth o i))) "=" (sc/field-text (:value (nth o i))))))))))
+
+(defn- rest-call conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config]
+  (let [[cls cx] (conn/attr-str c "className" "")
+        [mn mx] (conn/attr-str c "methodName" "")
+        parts (str/split mn "^")]
+    (if (< (count parts) 4) (conn/fail-result (sc/sferr "INVALID_INPUT" (str KEY-MSG cls "||" mn)))
+      (let [meth (nth parts 0) url (nth parts 1) http (verb (nth parts 2)) otype (nth parts 3)
+            types (if (> (count parts) 4) (param-types (nth parts 4)) [])
+            [req re] (sc/child-val c "request")
+            rfs (obj-fields req)
+            bodyv (get1 rfs "body")
+            [s se] (sc/session cache cfg false)]
+        (cond
+          (> (count re) 0) (conn/fail-result (nth re 0))
+          (not= se "") (conn/fail-result (sc/session-err se))
+          :else
+          (let [input (match (v/unmeta bodyv) (v/VObj b) (apply-types (without-urlparams b) types) (v/VArr b) bodyv
+                        _ (apply-types (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                                                   (if (>= i (count rfs)) acc
+                                                     (recur (+ i 1) (if (= (:name (:key (nth rfs i))) "URLParameters") acc (conj acc (nth rfs i)))))))
+                                       types))
+                ups (match (v/unmeta bodyv) (v/VObj b) (obj-fields (get1 b "URLParameters")) _ (obj-fields (get1 rfs "URLParameters")))
+                full2 (str (:instance s) "/services/apexrest/" (rel-path url ups) (query-string (obj-fields (get1 rfs "queryParams"))))
+                [js je] (reg/write-fmt "application/json" [] (drop-nulls input))
+                send-body (or (= http "POST") (= http "PUT") (= http "PATCH"))
+                hs0: Vec(hm/Header) [(sc/hpair "Content-Type" "application/json") (sc/hpair "charset" "UTF-8") (sc/hpair "Accept-Encoding" "application/json")
+                               (sc/hpair "Authorization" (str "Bearer " (:token s)))]
+                hs (let [uh (obj-fields (get1 rfs "headers"))]
+                     (loop [i 0 acc hs0] (if (>= i (count uh)) acc (recur (+ i 1) (conj acc (sc/hpair (:name (:key (nth uh i))) (sc/field-text (:value (nth uh i)))))))))
+                [st rb e] (sc/send http full2 hs (if send-body js ""))]
+            (cond
+              (not= e "") (conn/fail-result (sc/sferr "CONNECTIVITY" e))
+              (or (< st 200) (>= st 300)) (conn/fail-result (sc/sferr "CONNECTIVITY" (str "Invalid status code: " st ", response body: " rb)))
+              :else
+              (let [[x pe] (if (= (str/trim rb) "") (values (v/->VStr "") "") (reg/read-fmt "application/json" [] rb))]
+                (if (not= pe "") (conn/fail-result (sc/sferr "INVALID_RESPONSE" pe))
+                  (sc/java (cls-meta (sc/hashmap-obj [(v/field (str meth "Output") (out-val x otype))]) "java.util.HashMap")))))))))))
+
+(defn- without-urlparams v/Val [fs: &Vec(v/Field)]
+  (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+              (if (>= i (count fs)) acc (recur (+ i 1) (if (= (:name (:key (nth fs i))) "URLParameters") acc (conj acc (nth fs i))))))))
+
+(defn- drop-nulls v/Val [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                            (if (>= i (count fs)) acc
+                              (recur (+ i 1) (match (v/unmeta (:value (nth fs i))) (v/VNull) acc _ (conj acc (v/field (:name (:key (nth fs i))) (drop-nulls (:value (nth fs i))))))))))
+    (v/VArr xs) (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (drop-nulls (nth xs i)))))))
+    _ (v/unmeta x)))
+
+(defn- strip-decl Str [s: &Str]
+  (let [t (str/trim s)]
+    (if (str/starts-with? t "<?xml") (let [k (str/index-of t "?>")] (if (< k 0) t (str/trim (subs t (+ k 2) (count t))))) t)))
+
+(defn- ns-decls Vec(Str) [start-tag: &Str]
+  (loop [i 0 acc: Vec(Str) []]
+    (let [k (str/index-of-after start-tag "xmlns" i)]
+      (if (< k 0) acc
+        (let [eq (str/index-of-after start-tag "=" k)
+              q (if (< eq 0) -1 (nth start-tag (+ eq 1)))
+              close (if (< eq 0) -1 (str/index-of-after start-tag (chr q) (+ eq 2)))]
+          (if (or (< eq 0) (< close 0)) acc
+            (recur (+ close 1) (conj (conj acc (subs start-tag k eq)) (subs start-tag (+ eq 2) close)))))))))
+
+(defn- body-element Str [resp: &Str]
+  (let [b (str/index-of resp ":Body")
+        bs (if (< b 0) -1 (str/index-of-after resp ">" b))
+        be (str/last-index-of resp ":Body>")
+        inner (if (or (< bs 0) (< be 0)) "" (let [lt (str/last-index-of (subs resp 0 be) "<")] (subs resp (+ bs 1) lt)))
+        env (let [k (str/index-of resp "Envelope")] (if (< k 0) "" (subs resp k (str/index-of-after resp ">" k))))
+        decls (ns-decls env)
+        name-end (loop [i 1] (if (or (>= i (count inner)) (= (nth inner i) 32) (= (nth inner i) 62) (= (nth inner i) 47)) i (recur (+ i 1))))
+        tag (if (= (count inner) 0) "" (subs inner 1 name-end))
+        add (loop [i 0 out ""]
+              (if (>= i (count decls)) out
+                (let [d (nth decls i) val (nth decls (+ i 1))
+                      p (if (= d "xmlns") "" (subs d 6 (count d)))
+                      used (if (= p "") (< (str/index-of tag ":") 0) (or (str/includes? inner (str "<" p ":")) (str/includes? inner (str " " p ":"))))
+                      dup (str/includes? (subs inner 0 (let [g (str/index-of inner ">")] (if (< g 0) (count inner) g))) (str d "="))]
+                  (recur (+ i 2) (if (and used (not dup) (not= p "soapenv")) (str out " " d "=\"" val "\"") out)))))]
+    (if (= (count inner) 0) "" (str "<?xml version='1.0' encoding='UTF-8'?>" (subs inner 0 name-end) add (subs inner name-end (count inner))))))
+
+(defn- soap-call conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config]
+  (let [[cls cx] (conn/attr-str c "className" "")
+        [meth mx] (conn/attr-str c "methodName" "")
+        [ts tx] (conn/child-tv c "input")
+        [raw be] (if (> (count ts) 0) (ev/bytes (nth ts 0)) (ev/bytes (:payload (:event c))))
+        [s se] (sc/session cache cfg false)]
+    (cond
+      (> (count tx) 0) (conn/fail-result (nth tx 0))
+      (not= be "") (conn/fail-result (err/mk "MULE" "EXPRESSION" be))
+      (not= se "") (conn/fail-result (sc/session-err se))
+      :else
+      (let [ns (str "http://soap.sforce.com/schemas/class/" cls)
+            env (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Header><SessionHeader xmlns=\""
+                     ns "\"><sessionId>" (sc/xml-esc (:token s)) "</sessionId></SessionHeader></soap:Header><soap:Body>" (strip-decl raw) "</soap:Body></soap:Envelope>")
+            [st rb e] (sc/send "POST" (str (:instance s) "/services/Soap/class/" cls) [(sc/hpair "Content-Type" "text/xml; charset=UTF-8") (sc/hpair "SOAPAction" "\"\"")] env)]
+        (cond
+          (not= e "") (conn/fail-result (sc/sferr "CONNECTIVITY" e))
+          (str/includes? rb ":Fault>")
+          (let [[doc pe] (xml/parse rb)
+                f (if (= pe "") (sc/find-desc (xml/doc-root doc) "Fault") [])
+                fs (if (= (count f) 0) rb (sc/text-of (nth f 0) "faultstring"))]
+            (conn/fail-result (sc/sferr "NOT_FOUND" (str "Client received SOAP Fault from server: " fs " Please see the server log to find more detail regarding exact cause of the failure."))))
+          :else (conn/ok-result (ev/tv-raw (body-element rb) "application/xml") (ev/tv-null)))))))
+
+(defn run conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config]
+  (if (= (:op c) "invoke-apex-rest-method") (rest-call cache c cfg) (soap-call cache c cfg)))

@@ -1,0 +1,148 @@
+(ns fs-test (:require [mulay.lib.fs :as fs] [clay.io :as io]))
+(defextern getpid getpid)
+(defextern c-symlink symlink)
+
+(c-include "<unistd.h>")
+
+;; テストごとに別の作業場所 (テストは別プロセスで並行に走る)
+(defn- scratch Str [name: Str]
+  (let [d (str "/tmp/mulay-fs-test-" (unsafe (getpid)) "-" name)
+        z (fs/remove-tree d)
+        e (fs/mkdirs d)]
+    d))
+
+(deftest paths
+  (is (= (fs/join "/a" "b") "/a/b"))
+  (is (= (fs/join "/a/" "b") "/a/b"))
+  (is (= (fs/join "" "b") "b"))
+  (is (= (fs/base-name "/a/b.txt") "b.txt"))
+  (is (= (fs/base-name "/a/b/") "b"))
+  (is (= (fs/base-name "b") "b"))
+  (is (= (fs/base-name "/") "/"))
+  (is (= (fs/parent "/a/b") "/a"))
+  (is (= (fs/parent "/a") "/"))
+  (is (= (fs/parent "a") ""))
+  (is (= (fs/parent "a/b/") "a")))
+
+(deftest stat-kinds
+  (let [d (scratch "stat")
+        f (fs/join d "x.txt")
+        w (write-file f "hello")
+        st (fs/stat f)
+        sd (fs/stat d)
+        sn (fs/stat (fs/join d "none"))
+        l (fs/join d "link")
+        r (unsafe (c-symlink f l))
+        sl (fs/stat l)
+        z (fs/remove-tree d)]
+    (is (= (:kind st) fs/FILE))
+    (is (= (:size st) 5))
+    (is (> (:mtime-s st) 1700000000))
+    (is (and (>= (:mtime-ns st) 0) (< (:mtime-ns st) 1000000000)))
+    (is (not (:link st)))
+    (is (= (:kind sd) fs/DIR))
+    (is (= (:kind sn) fs/NONE))
+    (is (= (:kind sl) fs/FILE))
+    (is (:link sl))
+    (is (not (fs/exists? d)))))
+
+(deftest mkdirs-and-remove
+  (let [d (scratch "mk")
+        p (fs/join d "a/b/c")
+        e1 (fs/mkdirs p)
+        e2 (fs/mkdirs p)
+        w (write-file (fs/join d "a/b/f.txt") "x")
+        e3 (fs/mkdirs (fs/join d "a/b/f.txt"))
+        e4 (fs/remove-tree (fs/join d "a"))
+        gone (not (fs/exists? (fs/join d "a")))
+        e5 (fs/remove-tree (fs/join d "a"))
+        z (fs/remove-tree d)]
+    (is (= e1 ""))
+    (is (= e2 ""))
+    (is (not= e3 ""))
+    (is (= e4 ""))
+    (is gone)
+    (is (not= e5 ""))))
+
+(deftest copy-and-move
+  (let [d (scratch "cp")
+        w1 (write-file (fs/join d "src/one.txt") "")
+        m (fs/mkdirs (fs/join d "src/sub"))
+        w2 (write-file (fs/join d "src/one.txt") "1")
+        w3 (write-file (fs/join d "src/sub/two.txt") "22")
+        c (fs/copy-tree (fs/join d "src") (fs/join d "dst"))
+        [two e] (read-file (fs/join d "dst/sub/two.txt"))
+        still (fs/file? (fs/join d "src/one.txt"))
+        mv (fs/move (fs/join d "dst") (fs/join d "moved"))
+        [one e2] (read-file (fs/join d "moved/one.txt"))
+        c2 (fs/copy-tree (fs/join d "none") (fs/join d "x"))
+        z (fs/remove-tree d)]
+    (is (= c ""))
+    (is (= two "22"))
+    (is still)
+    (is (= mv ""))
+    (is (= one "1"))
+    (is (not= c2 ""))))
+
+;; sh-quote: POSIX シェルの 1 語 (単一引用符の中の ' は '\'' に)。- で始まる相対パスは ./ を付けてオプションにしない
+(deftest sh-quote
+  (is (= (fs/sh-quote "out/app") "'out/app'"))
+  (is (= (fs/sh-quote "a'; rm -rf ~; echo '") "'a'\\''; rm -rf ~; echo '\\'''"))
+  (is (= (fs/sh-quote "$(id) `id` \\ \"x\"") "'$(id) `id` \\ \"x\"'"))
+  (is (= (fs/sh-quote "-rf") "'./-rf'"))
+  (is (= (fs/sh-quote "") "''")))
+
+;; create-new: 無ければ空のファイルを作る (O_EXCL)。既にあるもの (ファイル、壊れた symlink も) は exists = true。
+;; 確かめてから書くと、その間に置かれた symlink の先を上書きする
+(deftest create-new
+  (let [d (scratch "create-new")
+        [ex1 e1] (fs/create-new (fs/join d "a"))
+        [ex2 e2] (fs/create-new (fs/join d "a"))
+        zl (unsafe (c-symlink (fs/join d "target") (fs/join d "link")))
+        [ex3 e3] (fs/create-new (fs/join d "link"))
+        [ex4 e4] (fs/create-new (fs/join d "no/such"))
+        z (fs/remove-tree d)]
+    (is (= ex1 false))
+    (is (= e1 ""))
+    (is (= ex2 true))
+    (is (= ex3 true))
+    (is (not (fs/exists? (fs/join d "target"))))
+    (is (= ex4 false))
+    (is (= e4 (str (fs/join d "no/such") ": No such file or directory")))))
+
+;; mulay の内部の状態 (Object Store、VM の待ち行列、本文の spool) は持ち主だけが読める: ファイルは 0600、ディレクトリは 0700
+(deftest private-files-and-dirs
+  (let [d (scratch "private")
+        [ex e] (fs/create-new-private (fs/join d "f"))
+        [ex2 e2] (fs/create-new-private (fs/join d "f"))
+        me (fs/mkdirs-private (fs/join d "a/b/c"))
+        z (fs/remove-tree d)]
+    (is (= ex false))
+    (is (= e ""))
+    (is (= ex2 true))
+    (is (= me ""))
+    (is (= (fs/perm (fs/join d "none")) -1))))
+
+(deftest private-modes
+  (let [d (scratch "private-modes")
+        [ex e] (fs/create-new-private (fs/join d "f"))
+        fm (fs/perm (fs/join d "f"))
+        me (fs/mkdirs-private (fs/join d "a/b"))
+        am (fs/perm (fs/join d "a"))
+        bm (fs/perm (fs/join d "a/b"))
+        ze (fs/mkdirs (fs/join d "open"))
+        me2 (fs/mkdirs-private (fs/join d "open"))
+        om (fs/perm (fs/join d "open"))
+        z (fs/remove-tree d)]
+    (is (= fm 384))
+    (is (= am 448))
+    (is (= bm 448))
+    (is (= om 448))))
+
+(deftest disk-space
+  (let [[avail total e] (fs/disk-space "/tmp")
+        [a2 t2 e2] (fs/disk-space "/no/such/dir")]
+    (is (= e ""))
+    (is (> avail 0))
+    (is (>= total avail))
+    (is (not= e2 ""))))

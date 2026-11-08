@@ -1,0 +1,316 @@
+%%% note
+agent-harness の既定 (LLM を指定しない = llm.url が空) で、統計的なモデル (stat.xml、stat/agent.dwl) が答えることを確かめる。
+ツールの選び方 (例文との TF-IDF、trigger の正規表現)、引数の取り出し (注文の番号、足し算の 2 つの数)、答えのひな形、
+ツールの失敗 (error: ..)、引数が足りないときの問い返し、文書の検索への切り替え (日本語の文書も)、どれにも当たらないときの答え、
+ask_agent (相手はこのアプリ自身。「ask:」を外した部分だけを渡すので、重ねても止まる)、A2A の入口。
+%%% jvm -Dhttp.port=18432 -Dstore.persistent=false -DtestHooks.state=started -Dadmin.key=test-admin-key
+%%% port 18432
+%%% mask
+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
+[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z
+%%% request GET /agent/.well-known/agent-card.json
+%%% response 200
+content-type: application/json
+
+{"name":"Mulay Agent Harness","description":"An agent built from the agent-harness template","url":"http://localhost:18432/agent","version":"1.0.0","capabilities":{"streaming":true,"pushNotifications":true,"stateTransitionHistory":false},"defaultInputModes":["text/plain"],"defaultOutputModes":["text/plain"],"skills":[{"id":"chat","name":"Chat","description":"Answers questions, using its tools when needed","tags":["chat"]}],"supportsAuthenticatedExtendedCard":false,"preferredTransport":"JSONRPC","protocolVersion":"0.3.0"}
+%%% request DELETE /test/docs
+%%% response 200
+
+deleted
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"where is order A100?","sessionId":"s1"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s1",
+  "answer": "Order A100 is shipped (ETA 2026-10-12).",
+  "steps": [
+    {
+      "tool": "lookup_order",
+      "arguments": {
+        "id": "A100"
+      },
+      "result": "{\"status\": \"shipped\",\"eta\": \"2026-10-12\"}"
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"注文 B200 の状況を教えて","sessionId":"s2"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s2",
+  "answer": "Order B200 is packing.",
+  "steps": [
+    {
+      "tool": "lookup_order",
+      "arguments": {
+        "id": "B200"
+      },
+      "result": "{\"status\": \"packing\"}"
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"what is 2 + 3?","sessionId":"s3"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s3",
+  "answer": "2 + 3 = 5",
+  "steps": [
+    {
+      "tool": "add",
+      "arguments": {
+        "a": 2,
+        "b": 3
+      },
+      "result": "5"
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"3 たす 4 は？","sessionId":"s4"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s4",
+  "answer": "3 + 4 = 7",
+  "steps": [
+    {
+      "tool": "add",
+      "arguments": {
+        "a": 3,
+        "b": 4
+      },
+      "result": "7"
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"order X999","sessionId":"s5"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s5",
+  "answer": "error: the order system is down",
+  "steps": [
+    {
+      "tool": "lookup_order",
+      "arguments": {
+        "id": "X999"
+      },
+      "result": "error: the order system is down"
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"check my order","sessionId":"s6"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s6",
+  "answer": "Please tell me id: Order id: one capital letter and three digits, e.g. A100.",
+  "steps": [
+    {
+      "tool": "search_docs",
+      "arguments": {
+        "query": "check my order"
+      },
+      "result": "no matching documents"
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"weather today","sessionId":"s7"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s7",
+  "answer": "Sorry, I could not find an answer.",
+  "steps": [
+    {
+      "tool": "search_docs",
+      "arguments": {
+        "query": "weather today"
+      },
+      "result": "no matching documents"
+    }
+  ]
+}
+%%% capture SID header:mcp-session-id
+%%% request POST /admin/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer test-admin-key
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 200
+content-type: application/json
+
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"experimental":{},"logging":{},"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"serverInfo":{"name":"docs-admin","version":"1.0.0"}}}
+%%% request POST /admin/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer test-admin-key
+Mcp-Session-Id: {{SID}}
+
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+%%% response 202
+
+
+%%% request POST /admin/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer test-admin-key
+Mcp-Session-Id: {{SID}}
+
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add_document","arguments":{"id":"faq","source":"faq","text":"Orders ship in two days. Refunds take a week after the order is returned."}}}
+%%% response 200
+content-type: application/json
+
+{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"id\": \"faq\",\"chunks\": 1,\"replaced\": false}"}],"isError":false}}
+%%% request POST /admin/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer test-admin-key
+Mcp-Session-Id: {{SID}}
+
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add_document","arguments":{"id":"ja","source":"faq-ja","text":"注文した商品は2日以内に発送します。返品は30日以内なら無料です。"}}}
+%%% response 200
+content-type: application/json
+
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"id\": \"ja\",\"chunks\": 1,\"replaced\": false}"}],"isError":false}}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"when will my order ship?","sessionId":"d1"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "d1",
+  "answer": "Orders ship in two days. Refunds take a week after the order is returned.",
+  "steps": [
+    {
+      "tool": "search_docs",
+      "arguments": {
+        "query": "when will my order ship?"
+      },
+      "result": "Orders ship in two days. Refunds take a week after the order is returned."
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"返品は無料ですか","sessionId":"d2"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "d2",
+  "answer": "注文した商品は2日以内に発送します。返品は30日以内なら無料です。",
+  "steps": [
+    {
+      "tool": "search_docs",
+      "arguments": {
+        "query": "返品は無料ですか"
+      },
+      "result": "注文した商品は2日以内に発送します。返品は30日以内なら無料です。"
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"発送はいつ？","sessionId":"d3"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "d3",
+  "answer": "注文した商品は2日以内に発送します。返品は30日以内なら無料です。",
+  "steps": [
+    {
+      "tool": "search_docs",
+      "arguments": {
+        "query": "発送はいつ？"
+      },
+      "result": "注文した商品は2日以内に発送します。返品は30日以内なら無料です。"
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"ask: what is 2 + 3?","sessionId":"a1"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "a1",
+  "answer": "The other agent says: 2 + 3 = 5",
+  "steps": [
+    {
+      "tool": "ask_agent",
+      "arguments": {
+        "text": "what is 2 + 3?"
+      },
+      "result": "2 + 3 = 5"
+    }
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"ask: ask: hello","sessionId":"a2"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "a2",
+  "answer": "The other agent says: The other agent says: Sorry, I could not find an answer.",
+  "steps": [
+    {
+      "tool": "ask_agent",
+      "arguments": {
+        "text": "ask: hello"
+      },
+      "result": "The other agent says: Sorry, I could not find an answer."
+    }
+  ]
+}
+%%% request POST /agent
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"kind":"message","role":"user","messageId":"u-1","parts":[{"kind":"text","text":"where is order B200?"}]}}}
+%%% response 200
+content-type: application/json
+
+{"jsonrpc":"2.0","id":1,"result":{"id":"***","contextId":"***","status":{"state":"completed","message":{"role":"agent","parts":[{"text":"Order B200 is packing.","kind":"text"}],"messageId":"***","kind":"message"},"timestamp":"***"},"artifacts":[{"artifactId":"***","name":"answer","parts":[{"text":"Order B200 is packing.","kind":"text"}]}],"history":[],"kind":"task"}}
+%%% request DELETE /test/docs
+%%% response 200
+
+deleted

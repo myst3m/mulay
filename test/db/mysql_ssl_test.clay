@@ -1,0 +1,74 @@
+(ns mysql-ssl-test (:require [mulay.db.mysql :as my] [mulay.db.sql :as sql] [clay.tls :as tls] [clay.string :as str] [clay.io :as io]))
+
+;; sslMode と信頼する証明書 (trustCertificateKeyStore*) の読み方。期待値は Connector/J 9.2 を Java 17 で動かして
+;; MySQL 8.4 (127.0.0.1:13306) につないで確かめたもの (2026-11-08)
+(def CERTS "test/fixtures/apps/https-test/certs/")
+
+(defn- file Str [name: &Str] (let [[s e] (read-file (str CERTS name))] s))
+
+(defn- path-of Str [name: &Str] (let [[d e] (io/cwd)] (str d "/" CERTS name)))
+
+(defn- mode-of Str [kvs: Vec(Str)] (let [[m c e] (my/ssl-config kvs)] m))
+
+(defn- err-of Str [kvs: Vec(Str)] (let [[m c e] (my/ssl-config kvs)] (str (:state e) " " (:exc e) " " (:msg e))))
+
+(deftest modes
+  (is (= (mode-of []) "PREFERRED"))
+  (is (= (mode-of ["sslMode=verify_identity"]) "VERIFY_IDENTITY"))
+  (is (= (mode-of ["useSSL=false"]) "DISABLED"))
+  (is (= (mode-of ["useSSL=true"]) "PREFERRED"))
+  (is (= (mode-of ["requireSSL=true"]) "REQUIRED"))
+  (is (= (mode-of ["useSSL=true" "verifyServerCertificate=true"]) "VERIFY_CA"))
+  (is (= (mode-of ["verifyServerCertificate=true"]) "VERIFY_CA"))
+  (is (= (mode-of ["useSSL=false" "verifyServerCertificate=true"]) "DISABLED"))
+  (is (= (mode-of ["sslMode=REQUIRED" "verifyServerCertificate=true"]) "REQUIRED"))
+  (is (= (err-of ["sslMode=SOMETIMES"]) "S1009 java.sql.SQLException The connection property 'sslMode' acceptable values are: 'DISABLED', 'PREFERRED', 'REQUIRED', 'VERIFY_CA' or 'VERIFY_IDENTITY'. The value 'SOMETIMES' is not acceptable.")))
+
+(deftest unverified-modes-skip-the-certificate
+  (let [[m1 c1 e1] (my/ssl-config [])
+        [m2 c2 e2] (my/ssl-config ["sslMode=REQUIRED" (str "trustCertificateKeyStoreUrl=file:" (path-of "truststore.jks"))])]
+    (is (sql/ok? e1))
+    (is (= (:verify c1) (tls/->VerifyNone)))
+    (is (sql/ok? e2))
+    (is (= (:verify c2) (tls/->VerifyNone)))))
+
+(deftest verified-modes-trust-the-system-cas-by-default
+  (let [[m c e] (my/ssl-config ["sslMode=VERIFY_CA"])]
+    (is (sql/ok? e))
+    (is (= (:verify c) (tls/->VerifyCa)))
+    (is (= (:ca c) ""))
+    (is (= (:ca-pkcs12 c) ""))))
+
+(deftest trust-stores
+  (let [[m1 c1 e1] (my/ssl-config ["sslMode=VERIFY_IDENTITY" (str "trustCertificateKeyStoreUrl=file:" (path-of "truststore.jks")) "trustCertificateKeyStorePassword=changeit"])
+        [m2 c2 e2] (my/ssl-config ["sslMode=VERIFY_CA" (str "trustCertificateKeyStoreUrl=file://" (path-of "truststore.jks"))])
+        [m3 c3 e3] (my/ssl-config ["sslMode=VERIFY_CA" (str "trustCertificateKeyStoreUrl=file:" (path-of "truststore.p12")) "trustCertificateKeyStoreType=PKCS12" "trustCertificateKeyStorePassword=changeit"])
+        [m4 c4 e4] (my/ssl-config ["sslMode=VERIFY_CA" (str "trustCertificateKeyStoreUrl=file:" (path-of "truststore.p12")) "trustCertificateKeyStorePassword=changeit"])]
+    (is (sql/ok? e1))
+    (is (= (:verify c1) (tls/->VerifyFull)))
+    (is (= (:ca c1) (file "ca.pem")))
+    (is (sql/ok? e2))
+    (is (= (:verify c2) (tls/->VerifyCa)))
+    (is (= (:ca c2) (file "ca.pem")))
+    (is (sql/ok? e3))
+    (is (= (:verify c3) (tls/->VerifyCa)))
+    (is (= (:ca-pkcs12 c3) (file "truststore.p12")))
+    (is (= (:ca-pkcs12-password c3) "changeit"))
+    (is (sql/ok? e4))
+    (is (= (:ca-pkcs12 c4) (file "truststore.p12")))))
+
+(deftest trust-store-errors
+  (let [p (path-of "truststore.jks")
+        missing (path-of "no-such.jks")]
+    (is (= (err-of ["sslMode=VERIFY_CA" (str "trustCertificateKeyStoreUrl=" p)])
+           (str "08000 java.sql.SQLNonTransientConnectionException " p " does not appear to be a valid URL.")))
+    (is (= (err-of ["sslMode=VERIFY_CA" (str "trustCertificateKeyStoreUrl=file:" missing)])
+           (str "08000 java.sql.SQLNonTransientConnectionException Cannot open file:" missing " [" missing " (No such file or directory)]")))
+    (is (= (err-of ["sslMode=VERIFY_CA" (str "trustCertificateKeyStoreUrl=file:" p) "trustCertificateKeyStorePassword=wrong"])
+           (str "08000 java.sql.SQLNonTransientConnectionException Cannot open file:" p " [Keystore was tampered with, or password was incorrect]")))
+    (is (= (err-of ["sslMode=VERIFY_CA" (str "trustCertificateKeyStoreUrl=file:" p) "trustCertificateKeyStoreType=FOO"])
+           "08000 java.sql.SQLNonTransientConnectionException Could not create KeyStore instance [FOO not found]"))
+    (is (= (err-of ["sslMode=VERIFY_CA" "trustCertificateKeyStoreUrl=https://example.com/ca.jks"])
+           "08000 java.sql.SQLNonTransientConnectionException Cannot open https://example.com/ca.jks [mulay reads trustCertificateKeyStoreUrl only from file: URLs]"))
+    (is (= (err-of ["sslMode=VERIFY_CA" "fallbackToSystemTrustStore=false"])
+           "08000 java.sql.SQLNonTransientConnectionException Failed setting up server certificate validation because no X.509 Trust Manager was found."))))

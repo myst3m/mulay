@@ -1,0 +1,41 @@
+(ns mulay.dw.lib.system
+  (:require [mulay.lib.host :as host] [mulay.lib.jhash :as jh] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [clay.string :as str]))
+
+
+(def M "dw::System")
+
+(defn environ Vec(Str) [] (host/environ))
+
+(defn env-fields Vec(v/Field) []
+  (let [es (environ)
+        [names vals] (loop [i 0 ns: Vec(Str) [] vs: Map(Str Str) {}]
+                       (if (>= i (count es)) (values ns vs)
+                         (let [e (nth es i) k (str/index-of e "=")
+                               nm (if (< k 0) (str e) (subs e 0 k))
+                               vl (if (< k 0) "" (subs e (+ k 1) (count e)))]
+                           (recur (+ i 1) (conj ns nm) (assoc vs nm vl)))))
+        rev (loop [i (- (count names) 1) acc: Vec(Str) []] (if (< i 0) acc (recur (- i 1) (conj acc (nth names i)))))
+        order (jh/scala-map-order (jh/hashmap-order-with rev (+ (count es) 3)))]
+    (loop [i 0 acc: Vec(v/Field) []]
+      (if (>= i (count order)) acc
+        (recur (+ i 1) (conj acc (v/field (nth order i) (v/->VStr (get! vals (nth order i))))))))))
+
+(defn env-lookup Vec(Str) [name: &Str]
+  (let [es (environ) pre (str name "=")]
+    (loop [i 0]
+      (if (>= i (count es)) []
+        (let [e (nth es i)]
+          (if (str/starts-with? e pre) [(subs e (count pre) (count e))] (recur (+ i 1))))))))
+
+(defn- env-vars Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (rt/ret (v/->VObj (env-fields))))
+
+(defn- env-var Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [r (env-lookup (core/arg-str a 0))]
+    (rt/ret (if (= (count r) 0) (v/null-v) (v/->VStr (nth r 0))))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "envVars" [(rt/overload [] env-vars)])
+   (B "envVar" [(rt/b1 "String" env-var)])])

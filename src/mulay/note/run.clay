@@ -1,0 +1,862 @@
+(ns mulay.note.run
+  (:require [mulay.dw.err :as dwe] [mulay.lib.html :as html] [mulay.note.contract :as ct] [mulay.lib.xml :as xml] [mulay.lib.host :as host] [mulay.lib.uni :as uni] [mulay.lib.time.iso :as iso] [mulay.lib.time.types :as tt] [mulay.lib.time.zoned :as zt] [mulay.lib.res :as res] [mulay.mule.load :as ld] [mulay.mule.model :as m] [mulay.mule.amodel :as am]
+            [mulay.conn.catalog :as cat] [mulay.conn.catalog_gen :as cg] [mulay.conn.validation :as cval] [mulay.conn.os :as cos] [mulay.conn.apikit :as apikit] [mulay.conn.db :as dbc] [mulay.conn.http_req :as hr] [mulay.conn.apikit_scaffold :as scaf]
+            [mulay.rt.conn :as conn] [mulay.rt.engine :as en] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.log :as log]
+            [mulay.app.exchange :as ex] [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.fmt.registry :as reg] [mulay.dw.lib.core_misc :as cm]
+            [clay.json :as json] [clay.base64 :as b64] [clay.string :as str] [clay.httpmsg :as hm]))
+
+(defrecord NStep [path: Str doc-id: Str status: Str ms: Float iteration: Int route: Int
+                  in-payload: Str in-vars: Vec(Vec(Str)) out-payload: Str out-vars: Vec(Vec(Str)) err-type: Str err-desc: Str
+                  in-attrs: Str out-attrs: Str warn: Str logs: Vec(Vec(Str)) in-error: Str request: Str example: Str handler: Str])
+
+(defrecord NTrace [example-id: Str ms: Float steps: Vec(NStep) handler: Str stopped: Str has-resp: Bool status: Int body: Str logs: Vec(Vec(Str)) resp-headers: Vec(hm/Header)])
+
+(defrecord Rec [has-out: Bool payload: v/Val attrs: v/Val mime: Str err-type: Str err-desc: Str req: Vec(v/Val)])
+
+(defrecord Session [ok: Bool app: m/App model: am/AModel ctx: en/Ctx dir: Str])
+
+(defrecord- Frame [idx: Int t0: Int path: Str])
+
+(def BROWSER ["validation" "os" "mule-apikit"])
+
+(def SESSION (atom (let [v: Vec(Session) []] v)))
+(def RECS (atom (let [m: Map(Str Vec(Rec)) {}] m)))
+(def COUNTS (atom (let [m: Map(Str Int) {}] m)))
+(def MARKS (atom (let [m: Map(Str Str) {}] m)))
+
+(def EXAMPLES (atom (let [m: Map(Str Str) {}] m)))
+(def WARNS (atom (let [m: Map(Str Str) {}] m)))
+(def TLOGS (atom (let [v: Vec(Vec(Str)) []] v)))
+(def REQS (atom (let [m: Map(Str Str) {}] m)))
+
+(defn- request-val v/Val [c: &conn/OpCall]
+  (let [e (:event c)
+        [pv pt pe] (ev/value (:payload e))
+        add (fn Vec(v/Field) [acc: Vec(v/Field) ps: Vec(m/Param)]
+              (loop [i 0 a acc]
+                (if (>= i (count ps)) a
+                  (let [p (nth ps i)
+                        x (match (:v p) (m/PLit s) (v/->VStr (str s)) _ (let [[r re] ((:eval c) (:v p) e)] (if (= re "") r (v/null-v))))]
+                    (recur (+ i 1) (conj a (v/field (str (:name p)) x)))))))
+        fs0 (add (add [(v/field "payload" pv)] (copy-params (:params c))) (copy-params (:exprs c)))
+        ks (:children c)
+        fs (loop [i 0 a fs0]
+             (if (>= i (count ks)) a
+               (let [k (nth ks i)
+                     nm (xml/elem-local k)]
+                 (recur (+ i 1) (if (or (> (count (xml/child-elems k)) 0) (> (count (v/obj-get a nm)) 0)) a
+                                  (conj a (v/field (str nm) (v/->VStr (str/trim (xml/text-content k))))))))))]
+    (v/->VObj fs)))
+
+(defn- copy-params Vec(m/Param) [ps: &Vec(m/Param)] (mapv (fn m/Param [p: m/Param] p) ps))
+
+(defn- compact Str [x: &v/Val] (let [[t e] (reg/write-fmt "application/json" [(v/field "indent" (v/bool-v false))] x)] t))
+
+(def MASK "******")
+
+(defn- masked-match? Bool [a: &Str b: &Str]
+  (let [segs: Vec(Str) (str/split (str a) MASK)
+        n (count segs)]
+    (if (= n 1) (= a b)
+      (let [hd (nth segs 0)
+            tl (nth segs (- n 1))
+            lim (- (count b) (count tl))]
+        (if (or (> (count hd) lim) (not (str/starts-with? b hd)) (not (str/ends-with? b tl))) false
+          (loop [i 1 pos (count hd)]
+            (if (>= i (- n 1)) true
+              (let [sg (nth segs i)
+                    h (str/index-of-after b sg pos)]
+                (if (or (< h 0) (> h (- lim (count sg)))) false (recur (+ i 1) (+ h (count sg))))))))))))
+
+(defn- request-diff Str [rec: &v/Val cur: &v/Val]
+  (let [rf (match (v/unmeta rec) (v/VObj fs) fs _ [])
+        parts (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count rf)) acc
+                  (let [k (str (:name (:key (nth rf i))))
+                        a (compact (:value (nth rf i)))
+                        r (match (v/unmeta cur) (v/VObj fs) (v/obj-get fs k) _ [])
+                        b (if (= (count r) 0) "(missing)" (compact (nth r 0)))]
+                    (recur (+ i 1) (if (masked-match? a b) acc (conj acc (str k " was " a " but now " b)))))))]
+    (if (= (count parts) 0) "" (str "the request differs from the recording: " (str/join "; " parts)))))
+
+(defn- note-request! v/Val [c: &conn/OpCall]
+  (let [x (request-val c)
+        id (keep-value (ev/tv-val x ev/JAVA))
+        p (str (:path (:loc c)))
+        z (swap! REQS (fn Map(Str Str) [m: Map(Str Str)] (assoc m p id)))]
+    x))
+
+(defn- logged Int [lv: Int cat: &Str msg: &Str shown: Bool]
+  (let [entry [(str/trim (log/level-name lv)) (str cat) (str msg) (if shown "true" "false")]
+        fs: Vec(Frame) (deref FRAMES)]
+    (if (= (count fs) 0) (let [z (swap! TLOGS (fn Vec(Vec(Str)) [v: Vec(Vec(Str))] (conj v entry)))] 0)
+      (let [i (:idx (nth fs (- (count fs) 1)))
+            z (swap! TRACE (fn Vec(NStep) [v: Vec(NStep)] (let [st (nth v i) ls (:logs st)] (assoc v i (assoc st :logs (conj ls entry))))))]
+        0))))
+(def ROUTES (atom (let [m: Map(Str Int) {}] m)))
+(def TRACE (atom (let [v: Vec(NStep) []] v)))
+(def FRAMES (atom (let [v: Vec(Frame) []] v)))
+(def VALUES (atom (let [m: Map(Str ev/TV) {}] m)))
+(def PREFIX (atom ""))
+(def SEQ (atom 0))
+
+(defn- vals-map Map(Str ev/TV) [] (let [m: Map(Str ev/TV) (deref VALUES)] m))
+
+(defn- keep-value Str [t: &ev/TV]
+  (let [n (swap! SEQ (fn Int [k: Int] (+ k 1)))
+        p: Str (deref PREFIX)
+        id (str p ":" n)
+        tv (ev/->TV (:val t) (str (:mime t)) (:props t) (str (:raw t)) (:state t) (:stream t))
+        z (swap! VALUES (fn Map(Str ev/TV) [m: Map(Str ev/TV)] (assoc m id tv)))]
+    id))
+
+(defn- keep-vars Vec(Vec(Str)) [e: &ev/Event]
+  (let [vs (:vars e)]
+    (loop [i 0 acc: Vec(Vec(Str)) []]
+      (if (>= i (count vs)) acc
+        (recur (+ i 1) (conj acc [(str (:name (nth vs i))) (keep-value (:tv (nth vs i)))]))))))
+
+(defn render Values(Str Str) [t: &ev/TV]
+  (cond
+    (= (:state t) ev/RAW) (values (str (:raw t)) (ev/content-type t))
+    (or (= (:state t) ev/PIPE) (= (:state t) ev/CURSOR)) (values "(stream)" (ev/content-type t))
+    (not= (:state t) ev/VAL) (let [[b e] (ev/bytes t)] (values (if (= e "") b (str "(" e ")")) (ev/content-type t)))
+    :else
+    (let [x (v/unmeta (:val t))]
+      (if (or (ev/java-mime? (:mime t)) (= (:mime t) "*/*") (= (:mime t) ""))
+        (match x
+          (v/VStr s) (values (str s) (ev/content-type t))
+          _ (let [[s e] (reg/write-fmt "application/json" [] (:val t))] (values (if (dwe/ok? e) s (str "(" (:msg e) ")")) "application/json")))
+        (let [[s e] (ev/wire-bytes t)] (values (if (= e "") s (str "(" e ")")) (ev/content-type t)))))))
+
+(defn value-text Str [id: &Str]
+  (let [m (vals-map)]
+    (if (not (contains? m id)) ""
+      (let [t (get m id (ev/tv-null)) [s mt] (render t)] s))))
+
+(defn- doc-id Str [l: &m/Loc]
+  (let [as (:attrs l)]
+    (loop [i 0] (if (>= (+ i 1) (count as)) "" (if (= (nth as i) "doc:id") (str (nth as (+ i 1))) (recur (+ i 2)))))))
+
+(defn- rec-key Str [l: &m/Loc] (let [d (doc-id l)] (if (= d "") (str (:path l)) d)))
+
+(defn- mark! Int [path: &Str st: &Str]
+  (let [p (str path) s (str st) z (swap! MARKS (fn Map(Str Str) [m: Map(Str Str)] (assoc m p s)))] 0))
+
+(defn- replay conn/OpResult [c: conn/OpCall]
+  (let [cur (note-request! c)
+        l (:loc c)
+        k (rec-key l)
+        rs: Map(Str Vec(Rec)) (deref RECS)
+        calls (get rs k [])
+        n (swap! COUNTS (fn Map(Str Int) [m: Map(Str Int)] (assoc m k (+ (get m k 0) 1))))
+        i (- (get n k 1) 1)]
+    (if (>= i (count calls))
+      (let [z (mark! (:path l) "held")] (conn/fail-result (err/halt (str "no recording for " (:elem l) " (" k ")"))))
+      (let [r (nth calls i)
+            zq (if (= (count (:req r)) 0) 0 (let [d (request-diff (nth (:req r) 0) cur)] (if (= d "") 0 (warn! (:path l) d))))]
+        (if (not (:has-out r))
+          (let [t (:err-type r) j (str/index-of t ":")
+                z (mark! (:path l) "failed")]
+            (conn/fail-result (err/mk (if (< j 0) "MULE" (subs t 0 j)) (if (< j 0) t (subs t (+ j 1) (count t))) (:err-desc r))))
+          (let [z (mark! (:path l) "replayed")]
+            (conn/ok-result (ev/tv-val (:payload r) (:mime r)) (ev/tv-val (:attrs r) ev/JAVA))))))))
+
+(defn- recorded? Bool [l: &m/Loc]
+  (let [k (rec-key l)
+        rs: Map(Str Vec(Rec)) (deref RECS)
+        n: Map(Str Int) (deref COUNTS)]
+    (< (get n k 0) (count (get rs k [])))))
+
+(defn- jobj-headers Str [out: Str hs: &Vec(hm/Header)]
+  (loop [i 0 o (str out "{")] (if (>= i (count hs)) (str o "}") (recur (+ i 1) (jstr (str (jstr (if (> i 0) (str o ",") o) (:hd-name (nth hs i))) ":") (:hd-value (nth hs i)))))))
+
+(defn- bridge-request Values(Str Str) [c: &conn/OpCall]
+  (let [[t te] (hr/target c)
+        [b be] (hr/body-of c (:method t))
+        [uh he] (hr/user-headers c)
+        hs (if (or (= (count (:bytes b)) 0) (= (:ct b) "") (:ct uh)) (:headers uh) (conj (:headers uh) (hr/hpair "Content-Type" (:ct b))))
+        l (:loc c)
+        o1 (jstr (str (jstr (str (jstr (str "{\"method\":") (:method t)) ",\"url\":") (:url t)) ",\"path\":") (:path-only t))
+        ob (if (uni/valid? (:bytes b)) (jstr (str (jobj-headers (str o1 ",\"headers\":") hs) ",\"body\":") (:bytes b))
+             (str (jobj-headers (str o1 ",\"headers\":") hs) ",\"body\":\"\",\"bodyBase64\":\"" (b64/encode (:bytes b)) "\""))
+        o2 (jstr (str ob ",\"mediaType\":") (:ct b))
+        o3 (str (jstr (str (jstr (str o2 ",\"from\":{\"flowPath\":") (:path l)) ",\"docId\":") (doc-id l)) "}}")
+        e (cond (not= te "") te (not= be "") be :else he)]
+    (values o3 e)))
+
+(defn- spec-answer conn/OpResult [c: conn/OpCall]
+  (let [[t te] (hr/target c)
+        as (if (= te "") (ct/answer (:url t) (:method t)) [])]
+    (if (= (count as) 0) (replay c)
+      (let [a (nth as 0)
+            p (str (:path (:loc c)))
+            zm (mark! p "example")
+            zx (swap! EXAMPLES (fn Map(Str Str) [m: Map(Str Str)] (assoc m p (str (:meta a)))))
+            [b be] (hr/body-of c (:method t))
+            rl: Vec(hm/Header) (if (= (:mime a) "") [] [(hm/->Header "content-type" (str (:mime a)))])
+            [attrs rct] (hr/resp-attrs (:status a) "" rl)
+            payload (ev/tv-raw (:body a) (hr/payload-mime c rct (:body a)))]
+        (hr/status-result c t b (:status a) payload attrs)))))
+
+(defn- bridged conn/OpResult [c: conn/OpCall]
+  (if (or (not= (:op c) "request") (recorded? (:loc c))) (replay c)
+    (let [zq (note-request! c)
+          [req re] (bridge-request c)]
+      (if (not= re "") (conn/fail-result (err/mk "MULE" "EXPRESSION" re))
+        (let [res (host/http-call req)]
+          (if (= res "") (spec-answer c)
+            (let [[x xe] (read-json res)
+                  ee (fobj x "error")]
+              (cond
+                (not= xe "") (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "bad bridge response: " xe)))
+                (> (count (fget x "error")) 0)
+                (let [ty (fstr (nth (fget x "error") 0) "type" "MULE:UNKNOWN") j (str/index-of ty ":")]
+                  (conn/fail-result (err/mk (if (< j 0) "MULE" (subs ty 0 j)) (if (< j 0) ty (subs ty (+ j 1) (count ty))) (fstr (nth (fget x "error") 0) "description" ""))))
+                :else
+                (let [[t te] (hr/target c)
+                      [b be] (hr/body-of c (:method t))
+                      st (let [r (fget x "status")] (if (= (count r) 0) 200 (match (v/unmeta (nth r 0)) (v/VInt n) n _ 200)))
+                      hfs (fobj x "headers")
+                      mt (fstr x "mediaType" "")
+                      rl0 (loop [i 0 acc: Vec(hm/Header) []] (if (>= i (count hfs)) acc (recur (+ i 1) (let [[tx e] (drt/to-text (:value (nth hfs i)))] (conj acc (hm/->Header (str (:name (:key (nth hfs i)))) tx))))))
+                      has-ct (loop [i 0] (if (>= i (count rl0)) false (if (= (str/lower-case (:hd-name (nth rl0 i))) "content-type") true (recur (+ i 1)))))
+                      rl (if (or has-ct (= mt "")) rl0 (conj rl0 (hm/->Header "content-type" mt)))
+                      body (let [b6 (fstr x "bodyBase64" "")] (if (= b6 "") (fstr x "body" "") (let [[d de] (b64/decode b6)] d)))
+                      [attrs rct] (hr/resp-attrs st (fstr x "reason" "") rl)
+                      payload (ev/tv-raw body (hr/payload-mime c rct body))]
+                  (hr/status-result c t b st payload attrs))))))))))
+
+(def DB-DIR (atom ""))
+
+(defn- seed-path Str [cfg: &Str] (str (deref DB-DIR) "/livenote/db/" cfg ".sql"))
+
+(defn- seed-of Str [cfg: Str] (host/file-read-or (seed-path cfg) ""))
+
+(defn- json-kind Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VNull) "" (v/VBool b) "boolean" (v/VInt n) "number" (v/VNum n) "number" (v/VArr xs) "array" (v/VObj fs) "object" _ "string"))
+
+(defn- first-row Vec(v/Field) [x: &v/Val]
+  (match (v/unmeta x) (v/VArr xs) (if (= (count xs) 0) [] (match (v/unmeta (nth xs 0)) (v/VObj fs) fs _ [])) _ []))
+
+(defn- shape-diff Str [rec: &v/Val emu: &v/Val]
+  (let [a (first-row rec) b (first-row emu)
+        has (fn Bool [fs: Vec(v/Field) k: Str] (loop [i 0] (if (>= i (count fs)) false (if (= (str (:name (:key (nth fs i)))) k) true (recur (+ i 1))))))
+        only-a (loop [i 0 acc: Vec(Str) []] (if (>= i (count a)) acc (recur (+ i 1) (let [k (str (:name (:key (nth a i))))] (if (has b k) acc (conj acc k))))))
+        only-b (loop [i 0 acc: Vec(Str) []] (if (>= i (count b)) acc (recur (+ i 1) (let [k (str (:name (:key (nth b i))))] (if (has a k) acc (conj acc k))))))
+        kinds (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count a)) acc
+                  (let [k (str (:name (:key (nth a i))))
+                        ka (json-kind (:value (nth a i)))
+                        r (v/obj-get b k)
+                        kb (if (= (count r) 0) "" (json-kind (nth r 0)))]
+                    (recur (+ i 1) (if (or (= ka "") (= kb "") (= ka kb)) acc (conj acc (str k " is " ka " in the recording but " kb " in the emulator")))))))
+        parts (let [p0: Vec(Str) []
+                    p1 (if (= (count only-a) 0) p0 (conj p0 (str "columns only in the recording: " (str/join ", " only-a))))
+                    p2 (if (= (count only-b) 0) p1 (conj p1 (str "columns only in the emulator: " (str/join ", " only-b))))]
+                (loop [i 0 p p2] (if (>= i (count kinds)) p (recur (+ i 1) (conj p (nth kinds i))))))]
+    (if (or (= (count a) 0) (= (count b) 0) (= (count parts) 0)) "" (str "the emulator's result differs from the recording: " (str/join "; " parts)))))
+
+(defn- warn! Int [path: &Str msg: &Str]
+  (let [p (str path) s (str msg) z (swap! WARNS (fn Map(Str Str) [m: Map(Str Str)] (assoc m p s)))] 0))
+
+(defn- compare-shapes Int [run: &Fn(conn/OpCall conn/OpResult) c: &conn/OpCall r: &conn/OpResult]
+  (if (> (count (:err r)) 0) 0
+    (let [e (run (copy-call c))]
+      (if (> (count (:err e)) 0) 0
+        (let [[a at ae] (ev/value (:payload r))
+              [b bt be] (ev/value (:payload e))
+              d (shape-diff a b)]
+          (if (= d "") 0 (warn! (:path (:loc c)) d)))))))
+
+(defn- copy-call conn/OpCall [c: &conn/OpCall] c)
+
+(defn- emulated conn/OpResult [run: &Fn(conn/OpCall conn/OpResult) c: conn/OpCall]
+  (let [l (:loc c)
+        cfg (if (= (count (:config c)) 0) "" (str (:name (nth (:config c) 0))))
+        seeded (and (not= cfg "") (host/file-exists? (seed-path cfg)))]
+    (cond
+      (and (recorded? l) seeded) (let [r (replay (copy-call c)) z (compare-shapes run c r)] r)
+      (or (recorded? l) (not seeded)) (replay c)
+      :else
+      (let [zq (note-request! c)
+            r (run c)
+            z (cond (and (> (count (:err r)) 0) (err/halt? (nth (:err r) 0))) (mark! (:path l) "held")
+                    (> (count (:err r)) 0) (mark! (:path l) "failed")
+                    :else (mark! (:path l) "emulated"))]
+        r))))
+
+(defn- db-connector conn/Connector [nm: &Str uri: &Str]
+  (let [d (dbc/connector) run (:run d)]
+    (assoc d :run (fn conn/OpResult [c: conn/OpCall] (emulated run c)))))
+
+(defn- emu-start! Int [dir: &Str] (let [z (reset! DB-DIR (str dir))] (dbc/set-emulator! (fn Str [cfg: Str] (seed-of cfg)))))
+
+(defn- emu-reset! Int [] (dbc/reset-emulator!))
+
+(defn- has? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn connectors Vec(conn/Connector) []
+  (let [cs cg/CONNS]
+    (loop [i 0 acc: Vec(conn/Connector) []]
+      (if (>= i (count cs)) acc
+        (let [nm (nth (nth cs i) 0) uri (nth (nth cs i) 1)
+              c0 (cond (= nm "validation") (cval/connector)
+                       (= nm "os") (cos/connector)
+                       (= nm "mule-apikit") (apikit/connector)
+                       (= nm "db") (db-connector nm uri)
+                       (= nm "http") (conn/connector (str nm) (str uri) (fn conn/OpResult [c: conn/OpCall] (bridged c)))
+                       :else (conn/connector (str nm) (str uri) (fn conn/OpResult [c: conn/OpCall] (replay c))))
+              c1 (if (= i 0) (assoc c0 :error-parents cg/PARENTS :error-classes cg/CLASSES) c0)]
+          (recur (+ i 1) (conj acc c1)))))))
+
+(defn- before Int [l: m/Loc e: ev/Event]
+  (let [inp (keep-value (:payload e))
+        ivs (keep-vars e)
+        tr: Vec(NStep) (deref TRACE)
+        idx (count tr)
+        ia (keep-value (:attributes e))
+        ie (if (= (count (:error e)) 0) "" (keep-value (ev/tv-val (err/to-val (nth (:error e) 0)) ev/JAVA)))
+        s (->NStep (str (:path l)) (doc-id l) "" 0.0 -1 -1 inp ivs "" [] "" "" ia "" "" [] ie "" "" "")
+        z (swap! TRACE (fn Vec(NStep) [v: Vec(NStep)] (conj v s)))
+        f (->Frame idx (mono-us) (str (:path l)))
+        z2 (swap! FRAMES (fn Vec(Frame) [v: Vec(Frame)] (conj v f)))]
+    0))
+
+(defn- after Int [l: m/Loc e: ev/Event x: Vec(err/MErr)]
+  (let [fs: Vec(Frame) (deref FRAMES)
+        f (nth fs (- (count fs) 1))
+        z (swap! FRAMES (fn Vec(Frame) [v: Vec(Frame)] (subvec v 0 (- (count v) 1))))
+        ms (/ (float (- (mono-us) (:t0 f))) 1000.0)
+        p (str (:path l))
+        mk: Map(Str Str) (deref MARKS)
+        mark (get mk p "")
+        z2 (swap! MARKS (fn Map(Str Str) [m: Map(Str Str)] (dissoc m p)))
+        rq: Map(Str Str) (deref REQS)
+        req (get rq p "")
+        zrq (swap! REQS (fn Map(Str Str) [m: Map(Str Str)] (dissoc m p)))
+        hdm: Map(Str Str) (deref HANDLED)
+        hdl (get hdm p "")
+        zhd (swap! HANDLED (fn Map(Str Str) [m: Map(Str Str)] (dissoc m p)))
+        exm: Map(Str Str) (deref EXAMPLES)
+        exj (get exm p "")
+        zex (swap! EXAMPLES (fn Map(Str Str) [m: Map(Str Str)] (dissoc m p)))
+        wm: Map(Str Str) (deref WARNS)
+        warn (get wm p "")
+        zw (swap! WARNS (fn Map(Str Str) [m: Map(Str Str)] (dissoc m p)))
+        rt: Map(Str Int) (deref ROUTES)
+        route (get rt p -1)
+        z3 (swap! ROUTES (fn Map(Str Int) [m: Map(Str Int)] (dissoc m p)))
+        halted (and (> (count x) 0) (err/halt? (nth x 0)))
+        status (cond (not= mark "") mark
+                     halted "held"
+                     (> (count x) 0) "failed"
+                     :else "ok")
+        et (if (or (= (count x) 0) halted) "" (err/type-str (nth x 0)))
+        ed (if (or (= (count x) 0) halted) "" (str (:description (nth x 0))))
+        out (keep-value (:payload e))
+        oa (keep-value (:attributes e))
+        ovs (keep-vars e)
+        z4 (swap! TRACE (fn Vec(NStep) [v: Vec(NStep)]
+                          (let [s (nth v (:idx f))]
+                            (assoc v (:idx f) (assoc s :status status :ms ms :route route :out-payload out :out-vars ovs :err-type et :err-desc ed :out-attrs oa :warn warn :request req :example exj :handler hdl)))))]
+    0))
+
+(def HANDLED (atom (let [m: Map(Str Str) {}] m)))
+
+(defn- handled Int [l: m/Loc]
+  (let [p (str (:path l))
+        k (str/last-index-of p "/errorHandler/")
+        owner (if (< k 0) "" (subs p 0 k))
+        z (if (= owner "") 0 (let [y (swap! HANDLED (fn Map(Str Str) [m: Map(Str Str)] (assoc m owner p)))] 0))]
+    0))
+
+(defn- routed Int [l: m/Loc i: Int]
+  (let [p (str (:path l)) z (swap! ROUTES (fn Map(Str Int) [m: Map(Str Int)] (assoc m p i)))] 0))
+
+(defn- no-session Session []
+  (let [z: Vec(Str) []
+        l (ld/load-texts "none" z z (res/res-none) (ld/->LoadOpts [] false (cg/hints)))
+        a (:app l)]
+    (->Session false a (am/build l (cg/hints) cat/component-info "") (en/new-ctx a [] 5) "")))
+
+(defn load-dir am/AModel [dir: &Str] (let [z: Vec(m/Param) []] (load-dir-with dir z)))
+
+(defn load-dir-with am/AModel [dir: &Str props: Vec(m/Param)]
+  (let [l (ld/load-path dir (ld/->LoadOpts props false (cg/hints)))
+        a (:app l)
+        md (am/with-apis (am/build l (cg/hints) cat/component-info "src/main/mule/") a (apikit/api-models a "src/main/resources/"))
+        c0 (en/new-ctx a (connectors) log/INFO)
+        zl (log/set-sink! (fn Int [lv: Int cat: Str msg: Str shown: Bool] (logged lv cat msg shown)))
+        c (assoc c0 :hook [(en/->Hook before after routed handled)] :inline-batch true)
+        z (reset! SESSION [(->Session true a md c (str dir))])
+        zp (ld/use-properties! a)
+        zlc (log/use-app-config! (:res a))
+        ze (emu-start! dir)
+        zk (ct/set-links! [])
+        z2 (reset! VALUES (let [m: Map(Str ev/TV) {}] m))]
+    md))
+
+(defn load-dir-full am/AModel [dir: &Str props: Vec(m/Param) links: &Str]
+  (let [md (load-dir-with dir props)
+        [ls le] (if (= links "") (let [z: Vec(ct/Link) []] (values z "")) (ct/links-json links))
+        z (ct/set-links! ls)
+        app (:app (session))
+        md2 (am/with-diags md (ct/sql-warnings app md dir))]
+    (cond (not= le "") (am/with-diags md2 [(am/->ADiag "warning" (str le) "" "" [] "links.invalid" "")])
+          (= (count ls) 0) md2
+          :else (am/with-diags md2 (ct/http-warnings app md2 ls)))))
+
+(defn props-json Values(Vec(m/Param) Str) [t: &Str]
+  (let [none: Vec(m/Param) []
+        [x xe] (read-json t)]
+    (match (v/unmeta x)
+      (v/VObj fs)
+      (loop [i 0 acc: Vec(m/Param) []]
+        (if (>= i (count fs)) (values acc "")
+          (let [k (str (:name (:key (nth fs i)))) val (v/unmeta (:value (nth fs i)))]
+            (match val
+              (v/VNull) (recur (+ i 1) acc)
+              (v/VStr s) (recur (+ i 1) (conj acc (m/->Param k (m/->PLit (str s)))))
+              (v/VBool b) (recur (+ i 1) (conj acc (m/->Param k (m/->PLit (if b "true" "false")))))
+              (v/VInt n) (recur (+ i 1) (conj acc (m/->Param k (m/->PLit (str n)))))
+              (v/VNum n) (let [[s e] (drt/to-text val)] (recur (+ i 1) (conj acc (m/->Param k (m/->PLit s)))))
+              _ (values none (str "@properties: value of '" k "' must be a string, number or boolean"))))))
+      _ (values none "@properties must be a JSON object of strings"))))
+
+(defn- pct-decode Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)
+            h (fn Int [x: Int] (cond (and (>= x 48) (<= x 57)) (- x 48) (and (>= x 97) (<= x 102)) (- x 87) (and (>= x 65) (<= x 70)) (- x 55) :else -1))]
+        (cond (= c 43) (recur (+ i 1) (str out " "))
+              (and (= c 37) (< (+ i 2) (count s)) (>= (h (nth s (+ i 1))) 0) (>= (h (nth s (+ i 2))) 0))
+              (recur (+ i 3) (str out (chr (+ (* 16 (h (nth s (+ i 1)))) (h (nth s (+ i 2)))))))
+              :else (recur (+ i 1) (str out (subs s i (+ i 1)))))))))
+
+(defn- query-json Str [qs: &Str]
+  (let [parts: Vec(Str) (str/split qs "&")]
+    (loop [i 0 o "{" n 0]
+      (if (>= i (count parts)) (str o "}")
+        (let [p (nth parts i) e (str/index-of p "=")]
+          (if (= p "") (recur (+ i 1) o n)
+            (recur (+ i 1) (jstr (str (jstr (if (> n 0) (str o ",") o) (pct-decode (if (< e 0) p (subs p 0 e)))) ":") (pct-decode (if (< e 0) "" (subs p (+ e 1) (count p))))) (+ n 1))))))))
+
+(defn- copy-headers Vec(hm/Header) [hs: &Vec(hm/Header)] (mapv (fn hm/Header [h: hm/Header] h) hs))
+
+(defn- call-reply-h Str [st: Int hs: &Vec(hm/Header) body: &Str mt: &Str trace: &Str]
+  (let [keep (loop [i 0 acc: Vec(hm/Header) []]
+               (if (>= i (count hs)) acc
+                 (let [n (str/lower-case (:hd-name (nth hs i)))]
+                   (recur (+ i 1) (if (or (= n "content-length") (= n "transfer-encoding") (= n "date") (= n "connection")) acc
+                                    (conj acc (hm/->Header n (str (:hd-value (nth hs i))))))))))]
+    (str (jstr (str (jstr (str (jobj-headers (str "{\"status\":" st ",\"headers\":") keep) ",\"body\":") body) ",\"mediaType\":") mt) ",\"trace\":" trace "}")))
+
+(defn- call-reply Str [st: Int body: &Str mt: &Str trace: &Str] (let [z: Vec(hm/Header) []] (call-reply-h st z body mt trace)))
+
+(defn- route-http Values(Int Bool) [es: &Vec(am/AEntry) method: &Str path: &Str only: &Str]
+  (loop [i 0 any false]
+    (if (>= i (count es)) (values -1 any)
+      (let [e (nth es i)
+            [ok ps] (if (and (= (:kind e) "http") (or (= only "") (= (:flow e) only))) (hr/match-path (:path e) path) (values false []))]
+        (cond (and ok (or (= (:method e) "*") (= (:method e) method))) (values i true)
+              ok (recur (+ i 1) true)
+              :else (recur (+ i 1) any))))))
+
+(defn- no-route-body Str [st: Int method: &Str path: &Str]
+  (cond (= method "HEAD") ""
+        (= st 405) (str "Method not allowed for endpoint: " (html/escape-html4-latin1 path))
+        :else (str "No listener for endpoint: " (html/escape-html4-latin1 path))))
+
+(defn call-json Str [req: &Str]
+  (let [s (session)
+        [x xe] (read-json req)
+        method (str/upper-case (fstr x "method" "GET"))
+        full (fstr x "path" "/")
+        q (str/index-of full "?")
+        path (if (< q 0) full (subs full 0 q))
+        es (:entries (:model s))
+        [fi any] (route-http es method path "")]
+    (cond
+      (not= xe "") (call-reply 400 (str "bad request: " xe) "text/plain" "null")
+      (and (< fi 0) any) (call-reply 405 (no-route-body 405 method path) "text/plain" "null")
+      (< fi 0) (call-reply 404 (no-route-body 404 method path) "text/plain" "null")
+      :else
+      (let [e (nth es fi)
+            ex (str (jstr (str (jstr (str "{\"id\":\"call\",\"flow\":") (:flow e)) ",\"request\":{\"method\":") method)
+                    ",\"path\":\"" (json/escape path) "\""
+                    (if (< q 0) "" (str ",\"query\":" (query-json (subs full (+ q 1) (count full)))))
+                    (let [h (fget x "headers")] (if (= (count h) 0) "" (str ",\"headers\":" (let [[t te] (reg/write-fmt "application/json" [] (nth h 0))] t))))
+                    (let [b (fstr x "body" "")] (if (= b "") "" (jstr ",\"body\":" b)))
+                    (let [m (fstr x "mediaType" "")] (if (= m "") "" (jstr ",\"mediaType\":" m)))
+                    "}"
+                    (let [c (fstr x "clock" "")] (if (= c "") "" (jstr ",\"clock\":" c)))
+                    "}")
+            t (run-example ex)
+            [bs bm] (if (:has-resp t) (let [m (vals-map)] (if (contains? m (:body t)) (render (get m (:body t) (ev/tv-null))) (values "" ""))) (values "" ""))]
+        (call-reply-h (if (:has-resp t) (:status t) 500) (:resp-headers t) bs bm (trace-json t))))))
+
+(defn scaffold-json Str [req: &Str]
+  (let [s (session)
+        [x xe] (read-json req)
+        r (if (not= xe "") (scaf/->Result [] [] (str "bad request: " xe))
+            (scaf/scaffold (:app s) (:model s) "src/main/mule/" (scaf/->Req (fstr x "config" "") (fstr x "file" "") (fstr x "listenerConfig" "") (fstr x "path" ""))))]
+    (scaf/to-json r)))
+
+(defn- session Session [] (let [v: Vec(Session) (deref SESSION)] (if (= (count v) 0) (no-session) (nth v 0))))
+
+(defn- fget Vec(v/Val) [x: &v/Val k: &Str] (match (v/unmeta x) (v/VObj fs) (v/obj-get fs k) _ []))
+
+(defn- fstr Str [x: &v/Val k: &Str d: Str]
+  (let [r (fget x k)] (if (= (count r) 0) d (match (v/unmeta (nth r 0)) (v/VNull) d _ (let [[s e] (drt/to-text (nth r 0))] s)))))
+
+(defn- fobj Vec(v/Field) [x: &v/Val k: &Str]
+  (let [r (fget x k)] (if (= (count r) 0) [] (match (v/unmeta (nth r 0)) (v/VObj fs) fs _ []))))
+
+(defn- read-json Values(v/Val Str) [t: &Str] (reg/read-named "application/json" [] t "json"))
+
+(defn- load-recs Int [dir: &Str id: &Str]
+  (let [[t e] (host/file-read (str dir "/livenote/recordings/" id ".json"))
+        [x xe] (if (= e "") (read-json t) (values (v/null-v) "none"))
+        m (match (v/unmeta x)
+            (v/VObj fs)
+            (loop [i 0 acc: Map(Str Vec(Rec)) {}]
+              (if (>= i (count fs)) acc
+                (let [k (str (:name (:key (nth fs i))))
+                      calls (match (v/unmeta (:value (nth fs i))) (v/VArr xs) xs _ [])
+                      rs (loop [j 0 a: Vec(Rec) []]
+                           (if (>= j (count calls)) a
+                             (let [c (nth calls j)
+                                   out (fget c "output")
+                                   er (fget c "error")]
+                               (recur (+ j 1)
+                                      (conj a (if (> (count out) 0)
+                                                (let [o (nth out 0) p (fget o "payload") at (fget o "attributes")]
+                                                  (->Rec true (if (= (count p) 0) (v/null-v) (nth p 0)) (if (= (count at) 0) (v/null-v) (nth at 0))
+                                                         (fstr o "mediaType" "application/java") "" "" (fget c "request")))
+                                                (let [eo (if (> (count er) 0) (nth er 0) (v/null-v))]
+                                                  (->Rec false (v/null-v) (v/null-v) "" (fstr eo "type" "MULE:UNKNOWN") (fstr eo "description" "") (fget c "request")))))))))]
+                  (recur (+ i 1) (assoc acc k rs)))))
+            _ (let [z: Map(Str Vec(Rec)) {}] z))
+        z (reset! RECS m)]
+    (count m)))
+
+(defn- clear-values! Int [prefix: &Str]
+  (let [pre (str prefix ":")
+        z (swap! VALUES (fn Map(Str ev/TV) [m: Map(Str ev/TV)]
+                          (let [ks (keys m)]
+                            (loop [i 0 a m] (if (>= i (count ks)) a (recur (+ i 1) (if (str/starts-with? (nth ks i) pre) (dissoc a (nth ks i)) a)))))))]
+    0))
+
+(defn- seg Vec(Str) [p: &Str] (let [ps: Vec(Str) (str/split (str p) "/")] (loop [i 0 a: Vec(Str) []] (if (>= i (count ps)) a (recur (+ i 1) (if (= (nth ps i) "") a (conj a (nth ps i))))))))
+
+(defn- uri-params Vec(v/Field) [pattern: &Str path: &Str]
+  (let [a (seg pattern) b (seg path)]
+    (loop [i 0 acc: Vec(v/Field) []]
+      (if (or (>= i (count a)) (>= i (count b))) acc
+        (let [s (nth a i)]
+          (recur (+ i 1) (if (and (str/starts-with? s "{") (str/ends-with? s "}")) (conj acc (v/field (subs s 1 (- (count s) 1)) (v/->VStr (str (nth b i))))) acc)))))))
+
+(defn- pct Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)
+            ok (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 45) (= c 46) (= c 95) (= c 126))
+            h "0123456789ABCDEF"]
+        (recur (+ i 1) (if ok (str out (chr c)) (str out "%" (subs h (quot c 16) (+ (quot c 16) 1)) (subs h (mod c 16) (+ (mod c 16) 1)))))))))
+
+(defn- find-flow Vec(m/Flow) [a: &m/App name: &Str]
+  (let [fs (:flows a)] (loop [i 0] (if (>= i (count fs)) [] (if (= (:name (nth fs i)) name) [(nth fs i)] (recur (+ i 1)))))))
+
+(defn- flow-paths Vec(Vec(Str)) [md: &am/AModel name: &Str]
+  (let [fs (:flows md)
+        k (loop [i 0] (if (>= i (count fs)) -1 (if (= (:name (nth fs i)) name) i (recur (+ i 1)))))]
+    (if (< k 0) []
+      (let [f (nth fs k)] (walk-nodes (:entries f) (walk-nodes (:steps f) []))))))
+
+(defn- walk-nodes Vec(Vec(Str)) [ns: &Vec(am/ANode) acc0: Vec(Vec(Str))]
+  (loop [i 0 acc acc0]
+    (if (>= i (count ns)) acc
+      (let [x (nth ns i)
+            k (:kind x)
+            step (not (or (am/route? k) (= k "eh") (= k "entry")))
+            a2 (if step (conj acc [(str (:path x)) (if (= (count (:doc-id x)) 0) "" (str (nth (:doc-id x) 0)))]) acc)]
+        (recur (+ i 1) (walk-nodes (:kids x) a2))))))
+
+(defn- empty-trace NTrace [id: &Str why: &Str]
+  (let [z: Vec(NStep) []] (->NTrace (str id) 0.0 z "" (str why) false 0 "" [] [])))
+
+(defn run-example NTrace [text: &Str] (let [[x xe] (read-json text)] (run-example-val x xe)))
+
+(defn example-id Str [x: &v/Val] (fstr x "id" ""))
+
+(defn examples Vec(v/Val) [dir: &Str]
+  (let [[t e] (host/file-read (str dir "/livenote/examples.json"))
+        [x xe] (if (= e "") (read-json t) (values (v/null-v) e))]
+    (match (v/unmeta x) (v/VArr xs) xs _ [])))
+
+(defn run-example-val NTrace [x: &v/Val xe: &Str]
+  (let [s (session)
+        id (fstr x "id" "")
+        flow (fstr x "flow" "")
+        clock (fstr x "clock" "")
+        seed (let [r (fget x "seed")] (if (= (count r) 0) 0 (match (v/unmeta (nth r 0)) (v/VInt n) n _ (let [[t e] (drt/to-text (nth r 0)) [n ne] (parse-long t)] n))))
+        [ins ie] (if (= clock "") (values (tt/->Instant 0 0) "none") (iso/parse-instant clock))
+        z1 (if (= ie "") (host/set-clock! (+ (* (:seconds ins) 1000) (quot (:nanos ins) 1000000))) (host/clear-clock!))
+        z2 (host/set-seed! seed)
+        z3 (reset! PREFIX (str id))
+        z4 (clear-values! id)
+        z5 (reset! TRACE (let [v: Vec(NStep) []] v))
+        z6 (reset! FRAMES (let [v: Vec(Frame) []] v))
+        z7 (reset! MARKS (let [m: Map(Str Str) {}] m))
+        z7e (reset! EXAMPLES (let [m: Map(Str Str) {}] m))
+        z7h (reset! HANDLED (let [m: Map(Str Str) {}] m))
+        z7w (reset! WARNS (let [m: Map(Str Str) {}] m))
+        z7q (reset! REQS (let [m: Map(Str Str) {}] m))
+        z8 (reset! ROUTES (let [m: Map(Str Int) {}] m))
+        z9 (reset! COUNTS (let [m: Map(Str Int) {}] m))
+        za (load-recs (:dir s) id)
+        zr (emu-reset!)
+        fl (find-flow (:app s) flow)
+        zt (reset! TLOGS (let [v: Vec(Vec(Str)) []] v))
+        tr0 (if (or (not= xe "") (not (:ok s)) (= (count fl) 0)) (empty-trace id (if (= (count fl) 0) "" ""))
+              (run-routed s (nth fl 0) x id))
+        tr (assoc tr0 :logs (deref TLOGS))
+        zb (host/clear-clock!)
+        zc (host/clear-seed!)]
+    tr))
+
+(def FILE-CLASS "org.mule.extension.file.api.LocalFileAttributes")
+(def SFTP-CLASS "org.mule.extension.sftp.api.SftpFileAttributes")
+(def VM-CLASS "org.mule.extensions.vm.api.VMMessageAttributes")
+
+(defn- overlay Vec(v/Field) [base: Vec(v/Field) over: &Vec(v/Field)]
+  (loop [i 0 acc base]
+    (if (>= i (count over)) acc
+      (let [o (nth over i)
+            k (loop [j 0] (if (>= j (count acc)) -1 (if (= (:name (:key (nth acc j))) (:name (:key o))) j (recur (+ j 1)))))]
+        (recur (+ i 1) (if (< k 0) (conj acc o) (assoc acc k o)))))))
+
+(defn- join-dir Str [d: &Str n: &Str] (cond (= d "") (str n) (str/ends-with? d "/") (str d n) :else (str d "/" n)))
+
+(defn- file-defaults Vec(v/Field) [kind: &Str dir: &Str user: &Vec(v/Field) size: Int now: &tt/ZonedDateTime]
+  (let [un (let [r (loop [i 0] (if (>= i (count user)) [] (if (= (:name (:key (nth user i))) "fileName") [(:value (nth user i))] (recur (+ i 1)))))]
+             (if (= (count r) 0) "example.txt" (let [[t e] (drt/to-text (nth r 0))] t)))
+        path (join-dir dir un)
+        common [(v/field "fileName" (v/->VStr un))]
+        ts (if (= kind "file")
+             [(v/field "lastModifiedTime" (v/->VLocalDateTime (zt/zdt-ldt now))) (v/field "lastAccessTime" (v/->VLocalDateTime (zt/zdt-ldt now)))
+              (v/field "creationTime" (v/->VLocalDateTime (zt/zdt-ldt now)))]
+             [])
+        flags [(v/field "symbolicLink" (v/bool-v false)) (v/field "regularFile" (v/bool-v true)) (v/field "directory" (v/bool-v false))
+               (v/field "path" (v/->VStr path)) (v/field "size" (v/int-v size))]
+        tail (if (= kind "file") [(v/field "name" (v/->VStr un))]
+               [(v/field "permissions" (v/int-v 420)) (v/field "name" (v/->VStr un)) (v/field "timestamp" (v/->VDateTime now))])]
+    (loop [i 0 acc (loop [j 0 a (loop [k 0 b common] (if (>= k (count ts)) b (recur (+ k 1) (conj b (nth ts k)))))] (if (>= j (count flags)) a (recur (+ j 1) (conj a (nth flags j)))))]
+      (if (>= i (count tail)) acc (recur (+ i 1) (conj acc (nth tail i)))))))
+
+(defn- source-attrs ev/TV [src: &m/Source x: &v/Val body: &Str]
+  (let [ua (fget x "attributes")
+        uv (if (= (count ua) 0) (v/null-v) (nth ua 0))
+        user (match (v/unmeta uv) (v/VObj fs) fs _ [])
+        now (zt/now-zdt-in (tt/utc))
+        [base cls] (match src
+                     (m/SrcConnector cn nm cref ps a b c l)
+                     (cond (and (= cn "vm") (= nm "listener"))
+                           (values [(v/field "queueName" (v/->VStr (param-str ps "queueName"))) (v/field "correlationId" (v/null-v))
+                                    (v/field "timestamp" (v/->VLocalDateTime (zt/zdt-ldt now)))] VM-CLASS)
+                           (and (or (= cn "file") (= cn "sftp")) (= nm "listener"))
+                           (values (file-defaults cn (param-str ps "directory") user (count body) now) (if (= cn "file") FILE-CLASS SFTP-CLASS))
+                           :else (let [z: Vec(v/Field) []] (values z "")))
+                     _ (let [z: Vec(v/Field) []] (values z "")))]
+    (cond (and (= cls "") (= (count ua) 0)) (ev/tv-null)
+          (= cls "") (ev/tv-val uv ev/JAVA)
+          :else (ev/tv-val (v/->VMeta (v/->VObj (overlay base user)) [(v/field "class" (v/->VStr cls))]) ev/JAVA))))
+
+(defn- param-str Str [ps: &Vec(m/Param) k: &Str]
+  (loop [i 0] (if (>= i (count ps)) "" (if (= (:name (nth ps i)) k) (match (:v (nth ps i)) (m/PLit s) (str s) _ "") (recur (+ i 1))))))
+
+(defn- http-source? Bool [f: &m/Flow]
+  (and (> (count (:source f)) 0) (match (nth (:source f) 0) (m/SrcHttpListener a p b c d e g h k l o q w y z) true _ false)))
+
+(defn- run-routed NTrace [s: &Session f: &m/Flow x: &v/Val id: &Str]
+  (if (not (http-source? f)) (run-flow s f x id)
+    (let [rq (fget x "request")
+          r (if (= (count rq) 0) (v/null-v) (nth rq 0))
+          method (str/upper-case (fstr r "method" "GET"))
+          full (fstr r "path" "/")
+          q (str/index-of full "?")
+          path (if (< q 0) full (subs full 0 q))
+          es (:entries (:model s))
+          [own oany] (route-http es method path (:name f))]
+      (if (>= own 0) (run-flow s f x id)
+        (let [[fi any] (route-http es method path "")]
+          (if (>= fi 0)
+            (let [fl (find-flow (:app s) (:flow (nth es fi)))] (if (= (count fl) 0) (run-flow s f x id) (run-flow s (nth fl 0) x id)))
+            (let [st (if any 405 404)
+                  all (flow-paths (:model s) (:name f))
+                  steps (mapv (fn NStep [pp: Vec(Str)] (->NStep (str (nth pp 0)) (str (nth pp 1)) "not-reached" 0.0 -1 -1 "" [] "" [] "" "" "" "" "" [] "" "" "" "")) all)
+                  src [(->NStep (str (:name f) "/source") (source-doc-id (:model s) (:name f)) "not-reached" 0.0 -1 -1 "" [] "" [] "" "" "" "" "" [] "" "" "" "")]
+                  steps2 (loop [i 0 acc src] (if (>= i (count steps)) acc (recur (+ i 1) (conj acc (nth steps i)))))
+                  bid (keep-value (ev/tv-raw (no-route-body st method path) "text/plain"))]
+              (->NTrace (str id) 0.0 steps2 "" "" true st bid [] [(hm/->Header "content-type" "text/plain")]))))))))
+
+(defn- run-flow NTrace [s: &Session f: &m/Flow x: &v/Val id: &Str]
+  (let [rq (fget x "request")
+        r (if (= (count rq) 0) (v/null-v) (nth rq 0))
+        method (str/upper-case (fstr r "method" "GET"))
+        path (fstr r "path" "/")
+        qs (fobj r "query")
+        query (loop [i 0 o ""] (if (>= i (count qs)) o (recur (+ i 1) (let [[t e] (drt/to-text (:value (nth qs i)))] (str o (if (= i 0) "?" "&") (pct (:name (:key (nth qs i)))) "=" (pct t))))))
+        hfs (fobj r "headers")
+        mt (if (= (count rq) 0) (fstr x "mediaType" "") (fstr r "mediaType" ""))
+        hs0 (loop [i 0 acc: Vec(hm/Header) []] (if (>= i (count hfs)) acc (recur (+ i 1) (let [[t e] (drt/to-text (:value (nth hfs i)))] (conj acc (hm/->Header (str (:name (:key (nth hfs i)))) t))))))
+        has-ct (loop [i 0] (if (>= i (count hs0)) false (if (= (str/lower-case (:hd-name (nth hs0 i))) "content-type") true (recur (+ i 1)))))
+        hs (if (or has-ct (= mt "")) hs0 (conj hs0 (hm/->Header "Content-Type" mt)))
+        ct (loop [i 0] (if (>= i (count hs)) "" (if (= (str/lower-case (:hd-name (nth hs i))) "content-type") (str (:hd-value (nth hs i))) (recur (+ i 1)))))
+        body (if (= (count rq) 0) (fstr x "body" "") (fstr r "body" ""))
+        src (if (= (count (:source f)) 0) [] [(nth (:source f) 0)])
+        lpath (if (= (count src) 0) "/" (match (nth src 0) (m/SrcHttpListener a p b c d e g h k l o q w y z) (str p) _ "/"))
+        corr (cm/uuid4)
+        http (and (> (count src) 0) (match (nth src 0) (m/SrcHttpListener a p b c d e g h k l o q w y z) true _ false))
+        e0 (cond (= (count src) 0) (ev/new-event (ev/tv-raw body (if (= ct "") ev/ANY (ev/with-charset ct))) (ev/tv-null) corr (:name f))
+             (not http) (ev/new-event (if (= body "") (ev/tv-null) (ev/tv-raw body (if (= ct "") ev/ANY (ev/with-charset ct)))) (source-attrs (nth src 0) x body) corr (:name f))
+             :else (ex/request-event method (str path query) hs body ct lpath "" (uri-params lpath path) 8081 "127.0.0.1:50000" "HTTP" "" "HTTP/1.1" (nth src 0) corr (:name f)))
+        sstep (if (= (count src) 0) []
+                [(->NStep (str (:name f) "/source") (source-doc-id (:model s) (:name f)) "ok" 0.0 -1 -1 "" [] (keep-value (:payload e0)) (keep-vars e0) "" "" "" (keep-value (:attributes e0)) "" [] "" "" "" "")])
+        t0 (mono-us)
+        [e xs] (en/run-flow-body (:ctx s) f e0)
+        ms (/ (float (- (mono-us) t0)) 1000.0)
+        steps0: Vec(NStep) (deref TRACE)
+        stopped (loop [i 0] (if (>= i (count steps0)) "" (if (= (:status (nth steps0 i)) "held") (str (:path (nth steps0 i))) (recur (+ i 1)))))
+        stopped2 (loop [i (- (count steps0) 1) best stopped] (if (< i 0) best (recur (- i 1) (if (and (= (:status (nth steps0 i)) "held") (> (count (:path (nth steps0 i))) (count best))) (str (:path (nth steps0 i))) best))))
+        halted (or (not= stopped2 "") (and (> (count xs) 0) (err/halt? (nth xs 0))))
+        hmap: Map(Str Str) (deref HANDLED)
+        handler (let [pre (str (:name f) "/errorHandler/")]
+                  (loop [i 0] (if (>= i (count steps0)) (get hmap (:name f) "")
+                                (let [p (:path (nth steps0 i))]
+                                  (if (str/starts-with? p pre)
+                                    (let [k (str/index-of-after p "/" (count pre))] (if (< k 0) (str p) (subs p 0 k)))
+                                    (recur (+ i 1)))))))
+        steps1 (loop [i 0 acc sstep] (if (>= i (count steps0)) acc (recur (+ i 1) (conj acc (nth steps0 i)))))
+        steps1b (iterations steps1)
+        seen (loop [i 0 m: Map(Str Bool) {}] (if (>= i (count steps1b)) m (recur (+ i 1) (assoc m (:path (nth steps1b i)) true))))
+        all (flow-paths (:model s) (:name f))
+        steps (loop [i 0 acc steps1b]
+                (if (>= i (count all)) acc
+                  (let [pp (nth all i)]
+                    (recur (+ i 1) (if (contains? seen (nth pp 0)) acc (conj acc (->NStep (str (nth pp 0)) (str (nth pp 1)) "not-reached" 0.0 -1 -1 "" [] "" [] "" "" "" "" "" [] "" "" "" "")))))))]
+    (cond
+      halted (->NTrace (str id) ms steps "" (if (= stopped2 "") (str (:name f)) stopped2) false 0 "" [] [])
+      (or (= (count src) 0) (not http)) (->NTrace (str id) ms steps handler "" false 0 "" [] [])
+      :else
+      (let [rp (ex/reply (:ctx s) (nth src 0) e xs)
+            bt (ev/tv-raw (:body rp) (header-ct (:headers rp)))
+            bid (keep-value bt)]
+        (->NTrace (str id) ms steps handler "" true (if (not= (:err rp) "") 500 (:status rp)) bid [] (copy-headers (:headers rp)))))))
+
+(defn- source-doc-id Str [md: &am/AModel name: &Str]
+  (let [fs (:flows md)]
+    (loop [i 0]
+      (if (>= i (count fs)) ""
+        (let [f (nth fs i)]
+          (if (and (= (:name f) name) (> (count (:source f)) 0))
+            (let [d (:doc-id (nth (:source f) 0))] (if (= (count d) 0) "" (str (nth d 0))))
+            (recur (+ i 1))))))))
+
+(defn- header-ct Str [hs: &Vec(hm/Header)]
+  (loop [i 0] (if (>= i (count hs)) "*/*" (if (= (str/lower-case (:hd-name (nth hs i))) "content-type") (str (:hd-value (nth hs i))) (recur (+ i 1))))))
+
+(defn- iterations Vec(NStep) [ss: &Vec(NStep)]
+  (let [n (loop [i 0 m: Map(Str Int) {}] (if (>= i (count ss)) m (recur (+ i 1) (assoc m (:path (nth ss i)) (+ (get m (:path (nth ss i)) 0) 1)))))]
+    (loop [i 0 seen: Map(Str Int) {} acc: Vec(NStep) []]
+      (if (>= i (count ss)) acc
+        (let [s (nth ss i) p (:path s) k (get seen p 0)]
+          (recur (+ i 1) (assoc seen p (+ k 1)) (conj acc (if (> (get n p 0) 1) (assoc s :iteration k) s))))))))
+
+(defn first-value-id Str [t: &NTrace]
+  (let [ss (:steps t)] (loop [i 0] (if (>= i (count ss)) "" (if (not= (:in-payload (nth ss i)) "") (str (:in-payload (nth ss i))) (recur (+ i 1)))))))
+
+(defn- jstr Str [out: Str s: &Str] (let [e (json/escape (uni/sanitize (str s)))] (str out "\"" e "\"")))
+
+(defn- preview Str [s: &Str]
+  (let [cut (loop [i 0 n 0] (cond (>= i (count s)) i (>= n 120) i
+                                  :else (let [c (nth s i)] (recur (+ i 1) (if (= (bit-and c 192) 128) n (+ n 1))))))
+        cut2 (loop [k cut] (if (and (< k (count s)) (= (bit-and (nth s k) 192) 128)) (+ k 1) k))
+        t (subs s 0 (if (> cut2 (count s)) (count s) cut2))
+        one (loop [i 0 o "" sp false]
+              (if (>= i (count t)) o
+                (let [c (nth t i) w (or (= c 10) (= c 13) (= c 9) (= c 32))]
+                  (cond (and w sp) (recur (+ i 1) o true)
+                        w (recur (+ i 1) (str o " ") true)
+                        :else (recur (+ i 1) (str o (chr c)) false)))))]
+    (if (< (count t) (count s)) (str one "…") one)))
+
+(defn- jref Str [out: Str id: &Str]
+  (let [m (vals-map)
+        t (get m id (ev/tv-null))
+        [s mt] (render t)]
+    (str (jstr (str (jstr (str (jstr (str out "{\"id\":") id) ",\"mediaType\":") mt) ",\"bytes\":" (count s) ",\"preview\":") (preview s)) "}")))
+
+(defn- jvars Str [out: Str vs: &Vec(Vec(Str))]
+  (loop [i 0 o (str out "{")] (if (>= i (count vs)) (str o "}") (recur (+ i 1) (jref (str (jstr (if (> i 0) (str o ",") o) (nth (nth vs i) 0)) ":") (nth (nth vs i) 1))))))
+
+(defn- jfloat Str [x: Float] (let [n (int (* x 1000.0))] (str (quot n 1000) "." (let [r (mod n 1000)] (cond (< r 10) (str "00" r) (< r 100) (str "0" r) :else (str r))))))
+
+(defn- jattrs Str [out: Str id: &Str] (if (= id "") out (jref (str out ",\"attributes\":") id)))
+
+(defn- jerror Str [out: Str id: &Str] (if (= id "") out (jref (str out ",\"error\":") id)))
+
+(defn- jlogs Str [out: Str ls: &Vec(Vec(Str))]
+  (loop [i 0 o (str out "[")]
+    (if (>= i (count ls)) (str o "]")
+      (let [l (nth ls i)
+            o1 (jstr (str (jstr (str (jstr (str (if (> i 0) (str o ",") o) "{\"level\":") (nth l 0)) ",\"category\":") (nth l 1)) ",\"message\":") (nth l 2))]
+        (recur (+ i 1) (str o1 ",\"shown\":" (nth l 3) "}"))))))
+
+(defn trace-json Str [t: &NTrace]
+  (let [ss (:steps t)
+        o1 (str (jstr "{\"exampleId\":" (:example-id t)) ",\"ms\":" (jfloat (:ms t)) ",\"steps\":[")
+        o2 (loop [i 0 o o1]
+             (if (>= i (count ss)) (str o "]")
+               (let [s (nth ss i)
+                     a (jstr (str (if (> i 0) (str o ",") o) "{\"path\":") (:path s))
+                     b (if (= (:doc-id s) "") a (jstr (str a ",\"docId\":") (:doc-id s)))
+                     c (str (jstr (str b ",\"status\":") (:status s)) ",\"ms\":" (jfloat (:ms s)))
+                     d (if (>= (:iteration s) 0) (str c ",\"iteration\":" (:iteration s)) c)
+                     e (if (>= (:route s) 0) (str d ",\"route\":" (:route s)) d)
+                     f (if (= (:in-payload s) "") e (str (jerror (jattrs (jvars (str (jref (str e ",\"input\":{\"payload\":") (:in-payload s)) ",\"vars\":") (:in-vars s)) (:in-attrs s)) (:in-error s)) "}"))
+                     g (if (= (:out-payload s) "") f (str (jattrs (jvars (str (jref (str f ",\"output\":{\"payload\":") (:out-payload s)) ",\"vars\":") (:out-vars s)) (:out-attrs s)) "}"))
+                     h0 (if (= (:err-type s) "") g (str (jstr (str (jstr (str g ",\"error\":{\"type\":") (:err-type s)) ",\"description\":") (:err-desc s)) "}"))
+                     h1 (if (= (:warn s) "") h0 (str (jstr (str h0 ",\"warnings\":[") (:warn s)) "]"))
+                     h2 (if (= (count (:logs s)) 0) h1 (jlogs (str h1 ",\"logs\":") (:logs s)))
+                     h3 (if (= (:request s) "") h2 (jref (str h2 ",\"request\":") (:request s)))
+                     h4 (if (= (:example s) "") h3 (str h3 ",\"example\":" (:example s)))
+                     h (if (= (:handler s) "") h4 (jstr (str h4 ",\"handler\":") (:handler s)))]
+                 (recur (+ i 1) (str h "}")))))
+        o3 (if (= (:handler t) "") o2 (jstr (str o2 ",\"handler\":") (:handler t)))
+        o4a (if (= (:stopped t) "") o3 (jstr (str o3 ",\"stoppedAt\":") (:stopped t)))
+        o4 (if (= (count (:logs t)) 0) o4a (jlogs (str o4a ",\"logs\":") (:logs t)))
+        o5 (if (:has-resp t) (str (jref (str o4 ",\"response\":{\"status\":" (:status t) ",\"body\":") (:body t)) "}") o4)]
+    (str o5 "}")))
+
+(defn get-value Str [id: &Str]
+  (let [m (vals-map)]
+    (if (not (contains? m id)) (str (jstr "{\"error\":" (str "unknown value id " id)) "}")
+      (let [t (get m id (ev/tv-null)) [s mt] (render t)]
+        (str (jstr (str (jstr "{\"text\":" s) ",\"mediaType\":") mt) "}")))))
+
+(defn components-json Str [names: &Vec(Str)]
+  (loop [i 0 o "["]
+    (if (>= i (count names)) (str o "]")
+      (let [n (nth names i)
+            k (str/index-of n ":")
+            pre0 (if (< k 0) "" (subs n 0 k))
+            pre (if (= pre0 "apikit") "mule-apikit" pre0)
+            op (if (< k 0) (str n) (subs n (+ k 1) (count n)))
+            known (> (count (cat/conn-name-of pre)) 0)
+            [sp ef] (cond (or (= pre "") (= pre "ee") (= pre "batch")) (values "browser" "none")
+                          (not known) (values "unsupported" "none")
+                          :else (let [e (cat/op-effect pre op [])] (values (if (has? BROWSER pre) "browser" (if (= e "none") "browser" "relay")) e)))]
+        (recur (+ i 1) (str (jstr (str (jstr (str (jstr (str (if (> i 0) (str o ",") o) "{\"element\":") n) ",\"support\":") sp) ",\"effect\":") ef) "}"))))))

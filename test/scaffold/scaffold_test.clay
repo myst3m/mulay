@@ -1,0 +1,87 @@
+(ns scaffold-test (:require [mulay.conn.registry :as creg] [mulay.conn.catalog :as cat] [mulay.conn.apikit :as apikit] [mulay.conn.apikit_scaffold :as sc]
+                            [mulay.mule.load :as ld] [mulay.mule.amodel :as am] [mulay.lib.res :as res] [clay.string :as str]))
+
+(def SPEC (str "openapi: 3.0.0\ninfo:\n  title: shop\n  version: \"1\"\npaths:\n"
+               "  /items:\n    get:\n      responses:\n        \"200\":\n          description: ok\n          content:\n            application/json:\n              example: [{name: pen}]\n"
+               "    post:\n      requestBody:\n        content:\n          application/json:\n            schema: {type: object}\n      responses:\n        \"201\":\n          description: made\n"
+               "  /items/{id}:\n    delete:\n      parameters:\n        - {name: id, in: path, required: true, schema: {type: string}}\n      responses:\n        \"204\":\n          description: gone\n"))
+
+(def WITH-MAIN (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\"\n"
+                    "      xmlns:apikit=\"http://www.mulesoft.org/schema/mule/mule-apikit\"\n"
+                    "      xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd\">\n"
+                    "\t<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"8081\"/></http:listener-config>\n"
+                    "\t<apikit:config name=\"shop-config\" api=\"api/shop.yaml\" outboundHeadersMapName=\"outboundHeaders\" httpStatusVarName=\"httpStatus\"/>\n"
+                    "\t<flow name=\"shop-main\">\n\t\t<http:listener config-ref=\"L\" path=\"/api/*\"/>\n\t\t<apikit:router config-ref=\"shop-config\"/>\n\t</flow>\n"
+                    "\t<flow name=\"get:\\items:shop-config\">\n\t\t<logger/>\n\t</flow>\n"
+                    "</mule>\n"))
+
+(def NO-MAIN (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\" xmlns:apikit=\"http://www.mulesoft.org/schema/mule/mule-apikit\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd\">\n"
+                  "  <http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"8081\"/></http:listener-config>\n"
+                  "  <apikit:config name=\"shop-config\" api=\"api/shop.yaml\" outboundHeadersMapName=\"outboundHeaders\" httpStatusVarName=\"httpStatus\"/>\n"
+                  "</mule>"))
+
+(defn- opts ld/LoadOpts [] (ld/->LoadOpts [] false (creg/hints)))
+
+(defn- loaded ld/Loaded [xml: &Str] (ld/load-texts "t" ["a.xml"] [(str xml)] (res/res-mem ["api/shop.yaml"] [SPEC]) (opts)))
+
+(defn- model am/AModel [l: &ld/Loaded] (am/with-apis (am/build l (creg/hints) cat/component-info "") (:app l) (apikit/api-models (:app l) "")))
+
+(defn- apply-edits Str [t: &Str es: &Vec(sc/Edit)]
+  (loop [i (- (count es) 1) out (str t)]
+    (if (< i 0) out
+      (let [e (nth es i)] (recur (- i 1) (str (subs out 0 (:start e)) (:text e) (subs out (:end e) (count out))))))))
+
+(defn- no-ids Str [s: &Str]
+  (loop [i 0 out ""]
+    (let [k (str/index-of-after s "doc:id=\"" i)]
+      (if (< k 0) (str out (subs s i (count s)))
+        (let [e (str/index-of-after s "\"" (+ k 8))] (recur (+ e 1) (str out (subs s i k) "doc:id=\"*\"")))))))
+
+(defn- scaffold sc/Result [xml: &Str req: sc/Req] (let [l (loaded xml)] (sc/scaffold (:app l) (model l) "" req)))
+
+(defn- ops-impl Str [xml: &Str]
+  (let [l (loaded xml) a (model l)]
+    (str (count (:diags a)) " " (str/join "," (mapv (fn Str [o: am/AOp] (str (:method o) (if (:implemented o) "+" "-"))) (:ops (nth (:apis a) 0)))))))
+
+(deftest adds-only-missing-flows
+  (let [r (scaffold WITH-MAIN (sc/->Req "shop-config" "" "" ""))
+        out (apply-edits WITH-MAIN (:edits r))]
+    (is (= (:error r) ""))
+    (is (= (str/join "," (:flows r)) "post:\\items:application\\json:shop-config,delete:\\items\\(id):shop-config"))
+    (is (= (ops-impl WITH-MAIN) "0 GET+,POST-,DELETE-"))
+    (is (= (ops-impl out) "0 GET+,POST+,DELETE+"))
+    (is (str/includes? out "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:doc=\"http://www.mulesoft.org/schema/mule/documentation\" xsi:schemaLocation="))
+    (is (not (str/includes? out "xmlns:ee")))
+    (is (str/includes? (no-ids out) (str "\t</flow>\n"
+                                         "\n\t<flow name=\"post:\\items:application\\json:shop-config\">\n\t\t<logger level=\"INFO\" doc:id=\"*\" message=\"post:\\items:application\\json:shop-config\"/>\n\t</flow>\n"
+                                         "\n\t<flow name=\"delete:\\items\\(id):shop-config\">\n\t\t<logger level=\"INFO\" doc:id=\"*\" message=\"delete:\\items\\(id):shop-config\"/>\n\t</flow>\n"
+                                         "</mule>\n")))
+    (is (= (count (:flows (scaffold out (sc/->Req "shop-config" "" "" "")))) 0))))
+
+(deftest adds-main-flow-and-error-handler
+  (let [r (scaffold NO-MAIN (sc/->Req "shop-config" "" "" ""))
+        out (apply-edits NO-MAIN (:edits r))
+        l (loaded out)
+        a (model l)
+        es (:entries a)]
+    (is (= (:error r) ""))
+    (is (= (nth (:flows r) 0) "shop-main"))
+    (is (= (nth (:flows r) 1) "shop-console"))
+    (is (= (ops-impl out) "0 GET+,POST+,DELETE+"))
+    (is (= (str/join "," (mapv (fn Str [e: am/AEntry] (str (:kind e) " " (:method e) " " (:path e))) es))
+           "http * /api/*,http * /console/*,apikit GET /api/items,apikit POST /api/items,apikit DELETE /api/items/{id}"))
+    (is (str/includes? out "<apikit:console config-ref=\"shop-config\"/>"))
+    (is (str/includes? out "<on-error-propagate type=\"APIKIT:NOT_IMPLEMENTED\">"))
+    (is (str/includes? out "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:doc=\"http://www.mulesoft.org/schema/mule/documentation\" xmlns:ee=\"http://www.mulesoft.org/schema/mule/ee/core\" xsi:schemaLocation="))
+    (is (str/includes? out "mule.xsd http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd\">"))
+    (is (str/includes? out "output application/json\n---\n[{\"name\":\"pen\"}]]]></ee:set-payload>"))
+    (is (str/includes? out "<ee:set-variable variableName=\"httpStatus\">501</ee:set-variable>"))))
+
+(deftest errors
+  (let [a (scaffold NO-MAIN (sc/->Req "nope" "" "" ""))
+        b (scaffold (str/replace NO-MAIN "<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"8081\"/></http:listener-config>" "") (sc/->Req "shop-config" "" "" ""))
+        c (scaffold NO-MAIN (sc/->Req "shop-config" "" "M" "/x/*"))]
+    (is (= (:error a) "no apikit:config named 'nope'"))
+    (is (= (:error b) "no http:listener-config to put the main flow on; pass listenerConfig"))
+    (is (= (:error c) "no http:listener-config named 'M'"))))

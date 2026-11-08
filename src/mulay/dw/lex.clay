@@ -1,0 +1,278 @@
+(ns mulay.dw.lex
+  (:require [clay.core]
+            [clay.string :as str]))
+
+(defrecord Tok [k: Int s: Int e: Int])
+
+(def M-INFIX 0)
+(def M-PREFIX 1)
+(def M-TYPE 2)
+
+(def K-EOF 0)
+(def K-ERR 1)
+(def K-IDENT 2)
+(def K-NUM 3)
+(def K-STR 4)
+(def K-REGEX 5)
+(def K-TEMPORAL 6)
+(def K-DOLLAR 7)
+(def K-SEP 8)
+
+(def K-LPAREN 20)
+(def K-RPAREN 21)
+(def K-LBRACK 22)
+(def K-RBRACK 23)
+(def K-LBRACE 24)
+(def K-RBRACE 25)
+(def K-COMMA 26)
+(def K-COLON 27)
+(def K-ARROW 28)
+(def K-ASSIGN 29)
+(def K-DOT 30)
+(def K-DOTDOT 31)
+(def K-SEMI 32)
+(def K-AT 33)
+(def K-QUEST 34)
+(def K-BANG 35)
+(def K-PLUS 36)
+(def K-MINUS 37)
+(def K-STAR 38)
+(def K-SLASH 39)
+(def K-PLUSPLUS 40)
+(def K-MINUSMINUS 41)
+(def K-EQ 42)
+(def K-NE 43)
+(def K-SIM 44)
+(def K-LT 45)
+(def K-GT 46)
+(def K-LE 47)
+(def K-GE 48)
+(def K-SHR 49)
+(def K-SHL 50)
+(def K-META 51)
+(def K-TILDE 52)
+(def K-PIPE 53)
+(def K-AMP 54)
+(def K-LBRACE-PIPE 55)
+(def K-PIPE-RBRACE 56)
+(def K-LBRACE-DASH 57)
+(def K-DASH-RBRACE 58)
+(def K-HASH 59)
+(def K-PERCENT 60)
+(def K-CARET 61)
+
+(def K-KW 100)
+(def KW-IF 100)
+(def KW-ELSE 101)
+(def KW-UNLESS 102)
+(def KW-USING 103)
+(def KW-AS 104)
+(def KW-IS 105)
+(def KW-NULL 106)
+(def KW-TRUE 107)
+(def KW-FALSE 108)
+(def KW-DEFAULT 109)
+(def KW-CASE 110)
+(def KW-FUN 111)
+(def KW-INPUT 112)
+(def KW-OUTPUT 113)
+(def KW-NS 114)
+(def KW-TYPE 115)
+(def KW-IMPORT 116)
+(def KW-VAR 117)
+(def KW-AND 118)
+(def KW-OR 119)
+(def KW-THROW 120)
+(def KW-DO 121)
+
+(defn tok-text Str [s: &Str t: &Tok] (subs s (:s t) (:e t)))
+
+(defn at Int [s: &Str i: Int] (if (and (>= i 0) (< i (count s))) (nth s i) -1))
+(defn ident-start? Bool [c: Int]
+  (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (= c 95) (>= c 128)))
+(defn ident-char? Bool [c: Int] (or (ident-start? c) (digit? c)))
+(defn- ws? Bool [c: Int] (or (= c 32) (= c 10) (= c 9) (= c 13) (= c 12)))
+
+(defn ident-end Int [s: &Str i: Int]
+  (loop [j i] (if (ident-char? (at s j)) (recur (+ j 1)) j)))
+
+(defn span-is? Bool [s: &Str a: Int b: Int w: &Str]
+  (if (not (= (- b a) (count w))) false
+    (loop [i 0] (if (>= i (count w)) true (if (= (nth s (+ a i)) (nth w i)) (recur (+ i 1)) false)))))
+
+(defn- kw-code Int [s: &Str a: Int b: Int]
+  (let [n (- b a)]
+    (if (or (< n 2) (> n 7)) -1
+      (case (nth s a)
+        97 (if (span-is? s a b "as") KW-AS (if (span-is? s a b "and") KW-AND (if (span-is? s a b "async") (+ K-KW 26) -1)))
+        99 (if (span-is? s a b "case") KW-CASE -1)
+        100 (if (span-is? s a b "do") KW-DO (if (span-is? s a b "default") KW-DEFAULT -1))
+        101 (if (span-is? s a b "else") KW-ELSE (if (span-is? s a b "enum") (+ K-KW 24) -1))
+        102 (if (span-is? s a b "fun") KW-FUN (if (span-is? s a b "false") KW-FALSE (if (span-is? s a b "for") (+ K-KW 22) -1)))
+        105 (if (span-is? s a b "if") KW-IF (if (span-is? s a b "is") KW-IS
+              (if (span-is? s a b "input") KW-INPUT (if (span-is? s a b "import") KW-IMPORT -1))))
+        110 (if (span-is? s a b "null") KW-NULL (if (span-is? s a b "ns") KW-NS -1))
+        111 (if (span-is? s a b "or") KW-OR (if (span-is? s a b "output") KW-OUTPUT -1))
+        112 (if (span-is? s a b "private") (+ K-KW 25) -1)
+        116 (if (span-is? s a b "true") KW-TRUE (if (span-is? s a b "type") KW-TYPE (if (span-is? s a b "throw") KW-THROW -1)))
+        117 (if (span-is? s a b "using") KW-USING (if (span-is? s a b "unless") KW-UNLESS -1))
+        118 (if (span-is? s a b "var") KW-VAR -1)
+        121 (if (span-is? s a b "yield") (+ K-KW 23) -1)
+        -1))))
+
+(defn reserved? Bool [w: &Str] (>= (kw-code w 0 (count w)) 0))
+
+(defn unclosed-comment Int [s: &Str pos: Int]
+  (let [n (count s)]
+    (loop [p pos]
+      (if (>= p n) -1
+        (let [c (nth s p)]
+          (if (ws? c) (recur (+ p 1))
+            (if (and (= c 47) (= (at s (+ p 1)) 47))
+              (recur (loop [q (+ p 2)] (if (or (>= q n) (= (nth s q) 10)) q (recur (+ q 1)))))
+              (if (and (= c 47) (= (at s (+ p 1)) 42))
+                (let [e (loop [q (+ p 2)]
+                          (if (>= q n) -1
+                            (if (and (= (nth s q) 42) (= (at s (+ q 1)) 47)) (+ q 2) (recur (+ q 1)))))]
+                  (if (< e 0) p (recur e)))
+                (if (and (= c 239) (= (at s (+ p 1)) 187) (= (at s (+ p 2)) 191)) (recur (+ p 3))
+                  (if (and (= c 194) (= (at s (+ p 1)) 160)) (recur (+ p 2)) -1))))))))))
+
+(defn skip-trivia Int [s: &Str pos: Int]
+  (let [n (count s)]
+    (loop [p pos]
+      (if (>= p n) p
+        (let [c (nth s p)]
+          (if (ws? c) (recur (+ p 1))
+            (if (and (= c 47) (= (at s (+ p 1)) 47))
+              (recur (loop [q (+ p 2)] (if (or (>= q n) (= (nth s q) 10)) q (recur (+ q 1)))))
+              (if (and (= c 47) (= (at s (+ p 1)) 42))
+                (recur (loop [q (+ p 2)]
+                         (if (>= q n) n
+                           (if (and (= (nth s q) 42) (= (at s (+ q 1)) 47)) (+ q 2) (recur (+ q 1))))))
+                (if (and (= c 239) (= (at s (+ p 1)) 187) (= (at s (+ p 2)) 191)) (recur (+ p 3))
+                  (if (and (= c 194) (= (at s (+ p 1)) 160)) (recur (+ p 2)) p))))))))))
+
+(defn num-end Int [s: &Str i: Int]
+  (let [a (loop [j i] (if (digit? (at s j)) (recur (+ j 1)) j))
+        b (if (and (= (at s a) 46) (digit? (at s (+ a 1))))
+            (loop [j (+ a 1)] (if (digit? (at s j)) (recur (+ j 1)) j))
+            a)]
+    (if (or (= (at s b) 101) (= (at s b) 69))
+      (let [c (if (or (= (at s (+ b 1)) 43) (= (at s (+ b 1)) 45)) (+ b 2) (+ b 1))]
+        (if (digit? (at s c)) (loop [j c] (if (digit? (at s j)) (recur (+ j 1)) j)) b))
+      b)))
+
+(defn skip-string Int [s: &Str pos: Int] (skip-nested s (+ pos 1) [(nth s pos)]))
+
+(defn skip-balanced Int [s: &Str pos: Int] (skip-nested s (+ pos 1) [-1]))
+
+(defn- skip-nested Int [s: &Str p0: Int st0: Vec(Int)]
+  (let [n (count s)]
+    (loop [p p0 st st0]
+      (let [top (nth st (- (count st) 1))]
+        (if (> top 0)
+          (if (>= p n) -1
+            (let [c (nth s p)]
+              (cond (= c top) (let [st2 (pop st)] (if (= (count st2) 0) (+ p 1) (recur (+ p 1) st2)))
+                    (= c 92) (recur (+ p 2) st)
+                    (and (= c 36) (= (at s (+ p 1)) 40)) (recur (+ p 2) (conj st -1))
+                    :else (recur (+ p 1) st))))
+          (let [p2 (skip-trivia s p)]
+            (if (>= p2 n) -1
+              (let [c (nth s p2)]
+                (cond (or (= c 34) (= c 39) (= c 96)) (recur (+ p2 1) (conj st c))
+                      (= c 40) (recur (+ p2 1) (assoc st (- (count st) 1) (- top 1)))
+                      (= c 41) (if (= top -1)
+                                 (let [st2 (pop st)] (if (= (count st2) 0) (+ p2 1) (recur (+ p2 1) st2)))
+                                 (recur (+ p2 1) (assoc st (- (count st) 1) (+ top 1))))
+                      :else (recur (+ p2 1) st))))))))))
+
+(defn- regex-end Int [s: &Str pos: Int]
+  (let [n (count s)]
+    (loop [p (+ pos 1)]
+      (if (>= p n) -1
+        (let [c (nth s p)]
+          (if (= c 47) (+ p 1)
+            (if (= c 92) (recur (+ p 2))
+              (if (= c 10) -1 (recur (+ p 1))))))))))
+
+(defn- temporal-end Int [s: &Str pos: Int]
+  (let [n (count s)]
+    (loop [p (+ pos 1)]
+      (if (>= p n) -1
+        (let [c (nth s p)]
+          (if (= c 124) (if (> p (+ pos 1)) (+ p 1) -1)
+            (if (= c 10) -1 (recur (+ p 1)))))))))
+
+(defn- tk Tok [k: Int s: Int e: Int] (->Tok k s e))
+
+(defn- lex-ident Tok [s: &Str p: Int]
+  (let [e0 (ident-end s p)
+        e (loop [j e0]
+            (if (and (= (at s j) 58) (= (at s (+ j 1)) 58) (ident-start? (at s (+ j 2))))
+              (recur (ident-end s (+ j 2)))
+              j))
+        kw (if (= e e0) (kw-code s p e) -1)]
+    (tk (if (>= kw 0) kw K-IDENT) p e)))
+
+(defn- lex-punct Tok [s: &Str p: Int mode: Int]
+  (let [c (nth s p)
+        c1 (at s (+ p 1))
+        c2 (at s (+ p 2))
+        ty (= mode M-TYPE)]
+    (case c
+      40 (tk K-LPAREN p (+ p 1))
+      41 (tk K-RPAREN p (+ p 1))
+      91 (tk K-LBRACK p (+ p 1))
+      93 (tk K-RBRACK p (+ p 1))
+      123 (if (and ty (= c1 124)) (tk K-LBRACE-PIPE p (+ p 2))
+            (if (and ty (= c1 45)) (tk K-LBRACE-DASH p (+ p 2)) (tk K-LBRACE p (+ p 1))))
+      125 (tk K-RBRACE p (+ p 1))
+      44 (tk K-COMMA p (+ p 1))
+      58 (tk K-COLON p (+ p 1))
+      59 (tk K-SEMI p (+ p 1))
+      64 (tk K-AT p (+ p 1))
+      63 (tk K-QUEST p (+ p 1))
+      35 (tk K-HASH p (+ p 1))
+      37 (tk K-PERCENT p (+ p 1))
+      94 (tk K-CARET p (+ p 1))
+      38 (tk K-AMP p (+ p 1))
+      42 (tk K-STAR p (+ p 1))
+      46 (if (= c1 46) (tk K-DOTDOT p (+ p 2)) (tk K-DOT p (+ p 1)))
+      33 (if (= c1 61) (tk K-NE p (+ p 2)) (tk K-BANG p (+ p 1)))
+      126 (if (= c1 61) (tk K-SIM p (+ p 2)) (tk K-TILDE p (+ p 1)))
+      61 (if (= c1 61) (tk K-EQ p (+ p 2)) (tk K-ASSIGN p (+ p 1)))
+      43 (if (= c1 43) (tk K-PLUSPLUS p (+ p 2)) (tk K-PLUS p (+ p 1)))
+      45 (if (and (= c1 45) (= c2 45)) (tk K-SEP p (+ p 3))
+           (if (= c1 45) (tk K-MINUSMINUS p (+ p 2))
+             (if (= c1 62) (tk K-ARROW p (+ p 2))
+               (if (and ty (= c1 125)) (tk K-DASH-RBRACE p (+ p 2)) (tk K-MINUS p (+ p 1))))))
+      60 (if (= c1 126) (tk K-META p (+ p 2))
+           (if ty (tk K-LT p (+ p 1))
+             (if (= c1 61) (tk K-LE p (+ p 2)) (if (= c1 60) (tk K-SHL p (+ p 2)) (tk K-LT p (+ p 1))))))
+      62 (if ty (tk K-GT p (+ p 1))
+           (if (= c1 61) (tk K-GE p (+ p 2)) (if (= c1 62) (tk K-SHR p (+ p 2)) (tk K-GT p (+ p 1)))))
+      124 (if (and ty (= c1 125)) (tk K-PIPE-RBRACE p (+ p 2))
+            (if (= mode M-PREFIX)
+              (let [e (temporal-end s p)] (if (< e 0) (tk K-ERR p (+ p 1)) (tk K-TEMPORAL p e)))
+              (tk K-PIPE p (+ p 1))))
+      47 (if (= mode M-PREFIX)
+           (let [e (regex-end s p)] (if (< e 0) (tk K-ERR p (+ p 1)) (tk K-REGEX p e)))
+           (tk K-SLASH p (+ p 1)))
+      36 (if (= c1 36) (if (= c2 36) (tk K-DOLLAR p (+ p 3)) (tk K-DOLLAR p (+ p 2))) (tk K-DOLLAR p (+ p 1)))
+      (tk K-ERR p (+ p 1)))))
+
+(defn next-tok Tok [s: &Str pos: Int mode: Int]
+  (let [p (skip-trivia s pos)
+        n (count s)]
+    (if (>= p n) (tk K-EOF n n)
+      (let [c (nth s p)]
+        (if (ident-start? c) (lex-ident s p)
+          (if (digit? c)
+            (if (and (= c 48) (digit? (at s (+ p 1))))
+              (tk K-ERR p (loop [j p] (if (digit? (at s j)) (recur (+ j 1)) j)))
+              (tk K-NUM p (num-end s p)))
+            (if (or (= c 34) (= c 39) (= c 96))
+              (let [e (skip-string s p)] (if (< e 0) (tk K-ERR p n) (tk K-STR p e)))
+              (lex-punct s p mode))))))))

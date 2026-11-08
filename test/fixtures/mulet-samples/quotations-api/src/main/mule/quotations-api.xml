@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="HTTP_Listener_Config">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <db:config name="Oracle_Config">
+        <db:oracle-connection host="${db.host}" port="${db.port}" serviceName="${db.service}"
+                              user="${db.user}" password="${db.password}"/>
+    </db:config>
+
+    <!-- GET /quotations - 全件取得 -->
+    <flow name="get-all-quotations-flow">
+        <http:listener config-ref="HTTP_Listener_Config" path="/quotations"/>
+        <db:select config-ref="Oracle_Config">
+            <db:sql>SELECT * FROM SAL_QUOTATIONS ORDER BY QUOTATION_ID</db:sql>
+        </db:select>
+        <logger level="INFO" message="#['Retrieved ' ++ sizeOf(payload) ++ ' quotations']"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- GET /quotations/{id} - ID指定取得 -->
+    <flow name="get-quotation-by-id-flow">
+        <http:listener config-ref="HTTP_Listener_Config" path="/quotations/{id}"/>
+        <db:select config-ref="Oracle_Config">
+            <db:sql>SELECT * FROM SAL_QUOTATIONS WHERE QUOTATION_ID = :id</db:sql>
+            <db:input-parameters><![CDATA[#[{
+                id: attributes.uriParams.id
+            }]]]></db:input-parameters>
+        </db:select>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+if (sizeOf(payload) > 0) payload[0] else null]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>

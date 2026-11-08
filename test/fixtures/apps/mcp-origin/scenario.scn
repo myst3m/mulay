@@ -1,0 +1,79 @@
+%%% note
+MCP サーバーが要求の Origin ヘッダーを調べる (DNS rebinding を防ぐ。MCP の仕様の「サーバーは Origin を検証しなければならない」)。
+Origin が無い要求 (ブラウザでないクライアント) と、Origin のホストが loopback (localhost、127.x、[::1]) の要求は通す。
+ほかは mulay.mcp.allowedOrigins (カンマ区切り、* はすべて) に完全に一致しなければ 403。streamable-http と旧式の SSE の両方。
+実 Mule (mcp 1.5.0) は Origin を見ずに答えるので、期待は mulay で記録した (docs/compat/deviations.md、ADR 118)。
+%%% oracle mulay
+%%% jvm -Dmulay.mcp.allowedOrigins=https://app.example.com
+%%% port 18221
+%%% mask
+mcp-session-id: (.*)
+%%% request POST /mcp headers=*
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 200
+content-type: application/json
+mcp-session-id: ***
+mcp-protocol-version: 2025-06-18
+
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"experimental":{},"logging":{},"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"serverInfo":{"name":"Origin","version":"1.0.0"}}}
+%%% request POST /mcp headers=*
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Origin: http://localhost:6274
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 200
+content-type: application/json
+mcp-session-id: ***
+mcp-protocol-version: 2025-06-18
+
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"experimental":{},"logging":{},"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"serverInfo":{"name":"Origin","version":"1.0.0"}}}
+%%% request POST /mcp headers=*
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Origin: https://app.example.com
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 200
+content-type: application/json
+mcp-session-id: ***
+mcp-protocol-version: 2025-06-18
+
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"experimental":{},"logging":{},"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"serverInfo":{"name":"Origin","version":"1.0.0"}}}
+%%% request POST /mcp headers=*
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Origin: http://evil.example:18221
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 403
+content-type: application/json
+
+{"jsonrpc":"2.0","error":{"code":-32600,"message":"Origin not allowed: http://evil.example:18221 (mulay.mcp.allowedOrigins)"}}
+%%% request DELETE /mcp headers=*
+Origin: http://evil.example:18221
+Mcp-Session-Id: x
+
+%%% response 403
+content-type: application/json
+
+{"jsonrpc":"2.0","error":{"code":-32600,"message":"Origin not allowed: http://evil.example:18221 (mulay.mcp.allowedOrigins)"}}
+%%% request GET /sse headers=*
+Origin: http://evil.example:18221
+
+%%% response 403
+content-type: application/json
+
+{"jsonrpc":"2.0","error":{"code":-32600,"message":"Origin not allowed: http://evil.example:18221 (mulay.mcp.allowedOrigins)"}}
+%%% request POST /message?sessionId=x headers=*
+Content-Type: application/json
+Origin: http://evil.example:18221
+
+{"jsonrpc":"2.0","id":2,"method":"ping"}
+%%% response 403
+content-type: application/json
+
+{"jsonrpc":"2.0","error":{"code":-32600,"message":"Origin not allowed: http://evil.example:18221 (mulay.mcp.allowedOrigins)"}}

@@ -1,0 +1,118 @@
+(ns mulay.lib.tracectx (:require [mulay.lib.host :as host] [clay.string :as str]))
+
+(def NONE 0)
+(def BAD 1)
+(def VALID 2)
+
+(def HEXD "0123456789abcdef")
+
+(defn hex Str [raw: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count raw)) out
+      (let [b (bit-and (nth raw i) 255)]
+        (recur (+ i 1) (str out (subs HEXD (bit-shift-right b 4) (+ (bit-shift-right b 4) 1)) (subs HEXD (bit-and b 15) (+ (bit-and b 15) 1))))))))
+
+(defn- lhex Int [c: Int]
+  (cond (and (>= c 48) (<= c 57)) (- c 48)
+        (and (>= c 97) (<= c 102)) (- c 87)
+        :else -1))
+
+(defn- lower-hex? Bool [s: &Str a: Int b: Int]
+  (loop [i a] (if (>= i b) true (if (< (lhex (nth s i)) 0) false (recur (+ i 1))))))
+
+(defn unhex Str [h: &Str]
+  (loop [i 0 out ""]
+    (if (>= (+ i 1) (count h)) out
+      (recur (+ i 2) (str out (chr (+ (* (lhex (nth h i)) 16) (lhex (nth h (+ i 1))))))))))
+
+(defn valid-id? Bool [raw: &Str]
+  (loop [i 0] (if (>= i (count raw)) false (if (not= (nth raw i) 0) true (recur (+ i 1))))))
+
+(defn parse-parent Values(Int Str Str Int) [s: &Str]
+  (let [n (count s)
+        shape (and (>= n 55) (or (= n 55) (= (nth s 55) 45))
+                   (= (nth s 2) 45) (= (nth s 35) 45) (= (nth s 52) 45)
+                   (lower-hex? s 0 2) (not (and (= (nth s 0) 102) (= (nth s 1) 102)))
+                   (not (and (= (nth s 0) 48) (= (nth s 1) 48) (> n 55)))
+                   (lower-hex? s 53 55))]
+    (if (not shape) (values NONE "" "" 0)
+      (let [flags (+ (* (lhex (nth s 53)) 16) (lhex (nth s 54)))
+            ok (and (lower-hex? s 3 35) (lower-hex? s 36 52))
+            tr (if ok (unhex (subs s 3 35)) "")
+            sp (if ok (unhex (subs s 36 52)) "")]
+        (if (and ok (valid-id? tr) (valid-id? sp)) (values VALID tr sp flags) (values BAD "" "" flags))))))
+
+(defn format-parent Str [trace: &Str span: &Str sampled: Bool]
+  (str "00-" (hex trace) "-" (hex span) (if sampled "-01" "-00")))
+
+(defn- key-char? Bool [c: Int]
+  (or (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 95) (= c 45) (= c 42) (= c 47)))
+
+(defn- valid-key? Bool [k: &Str]
+  (let [n (count k)
+        at (str/index-of k "@")]
+    (if (< at 0)
+      (and (> n 0) (<= n 256) (>= (nth k 0) 97) (<= (nth k 0) 122)
+           (loop [i 1] (if (>= i n) true (if (key-char? (nth k i)) (recur (+ i 1)) false))))
+      (let [tenant (subs k 0 at)
+            sys (subs k (+ at 1) n)]
+        (and (> (count tenant) 0) (<= (count tenant) 241) (> (count sys) 0) (<= (count sys) 14)
+             (let [t0 (nth tenant 0)] (or (and (>= t0 97) (<= t0 122)) (and (>= t0 48) (<= t0 57))))
+             (>= (nth sys 0) 97) (<= (nth sys 0) 122)
+             (loop [i 0] (if (>= i (count tenant)) true (if (key-char? (nth tenant i)) (recur (+ i 1)) false)))
+             (loop [i 0] (if (>= i (count sys)) true (if (key-char? (nth sys i)) (recur (+ i 1)) false))))))))
+
+(defn- valid-value? Bool [v: &Str]
+  (let [n (count v)]
+    (and (> n 0) (<= n 256) (not= (nth v (- n 1)) 32)
+         (loop [i 0]
+           (if (>= i n) true
+             (let [c (nth v i)] (if (and (>= c 32) (<= c 126) (not= c 44) (not= c 61)) (recur (+ i 1)) false)))))))
+
+(defn- trim-ows Str [s: &Str]
+  (let [n (count s)
+        a (loop [i 0] (if (and (< i n) (or (= (nth s i) 32) (= (nth s i) 9))) (recur (+ i 1)) i))
+        b (loop [j n] (if (and (> j a) (or (= (nth s (- j 1)) 32) (= (nth s (- j 1)) 9))) (recur (- j 1)) j))]
+    (subs s a b)))
+
+(defn parse-state Str [s: &Str]
+  (let [parts (str/split s ",")]
+    (loop [i 0 out "" k 0]
+      (if (>= i (count parts)) out
+        (let [m (trim-ows (nth parts i))]
+          (if (= m "") (recur (+ i 1) out k)
+            (let [eq (str/index-of m "=")]
+              (if (or (<= eq 0) (>= k 32)) ""
+                (let [key (subs m 0 eq) val (subs m (+ eq 1) (count m))]
+                  (if (and (valid-key? key) (valid-value? val))
+                    (recur (+ i 1) (str out (if (= k 0) "" ",") m) (+ k 1))
+                    ""))))))))))
+
+(def LONG-MAX 9223372036854775807)
+(def LONG-MIN (- -9223372036854775807 1))
+
+(defn ratio-bound Int [ratio: Float]
+  (cond (= ratio 0.0) LONG-MIN
+        (= ratio 1.0) LONG-MAX
+        :else (int (* ratio 9223372036854775807.0))))
+
+(defn ratio-sampled? Bool [trace: &Str bound: Int]
+  (let [v (loop [i 8 acc 0] (if (>= i 16) acc (recur (+ i 1) (bit-or (bit-shift-left acc 8) (bit-and (nth trace i) 255)))))
+        a (if (< v 0) (- 0 v) v)]
+    (< a bound)))
+
+(defn- root-sample? Bool [stype: &Str ratio: Float trace: &Str]
+  (cond (or (= stype "always_on") (= stype "parentbased_always_on")) true
+        (or (= stype "always_off") (= stype "parentbased_always_off")) false
+        :else (ratio-sampled? trace (ratio-bound ratio))))
+
+(defn sample? Bool [stype: &Str ratio: Float pkind: Int psampled: Bool trace: &Str]
+  (if (and (str/starts-with? stype "parentbased_") (= pkind VALID)) psampled (root-sample? stype ratio trace)))
+
+(defn- random-id Str [n: Int]
+  (loop []
+    (let [[b ok] (host/real-random-bytes n)]
+      (if (and ok (= (count b) n) (valid-id? b)) b (recur)))))
+
+(defn new-trace-id Str [] (random-id 16))
+(defn new-span-id Str [] (random-id 8))

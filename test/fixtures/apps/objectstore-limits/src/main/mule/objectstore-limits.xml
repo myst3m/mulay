@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18151"/>
+    </http:listener-config>
+
+    <!-- entryTtl: 1 秒で消える (期限の確かめは 300 ms ごと) -->
+    <os:object-store name="ttlStore" persistent="false" entryTtl="1" entryTtlUnit="SECONDS" expirationInterval="300" expirationIntervalUnit="MILLISECONDS"/>
+    <!-- maxEntries: 3 件まで -->
+    <os:object-store name="maxStore" persistent="false" maxEntries="3" expirationInterval="300" expirationIntervalUnit="MILLISECONDS"/>
+    <!-- persistent: 再起動をまたぐ -->
+    <os:object-store name="durable" persistent="true"/>
+    <os:object-store name="mem" persistent="false"/>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload></ee:message></ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="ttl-put">
+        <http:listener config-ref="L" path="/ttl/put"/>
+        <os:clear objectStore="ttlStore"/>
+        <os:store key="a" objectStore="ttlStore"><os:value>#[1]</os:value></os:store>
+        <os:store key="b" objectStore="ttlStore"><os:value>#[2]</os:value></os:store>
+        <os:retrieve-all-keys objectStore="ttlStore"/>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload orderBy $]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="ttl-keys">
+        <http:listener config-ref="L" path="/ttl/keys"/>
+        <os:retrieve-all-keys objectStore="ttlStore"/>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload orderBy $]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="ttl-get">
+        <http:listener config-ref="L" path="/ttl/get"/>
+        <os:retrieve key="a" objectStore="ttlStore"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="ttl-contains">
+        <http:listener config-ref="L" path="/ttl/contains"/>
+        <os:contains key="a" objectStore="ttlStore"/>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{contains: payload}]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="max-put">
+        <http:listener config-ref="L" path="/max/put"/>
+        <os:clear objectStore="maxStore"/>
+        <os:store key="k1" objectStore="maxStore"><os:value>#[1]</os:value></os:store>
+        <os:store key="k2" objectStore="maxStore"><os:value>#[2]</os:value></os:store>
+        <os:store key="k3" objectStore="maxStore"><os:value>#[3]</os:value></os:store>
+        <os:store key="k4" objectStore="maxStore"><os:value>#[4]</os:value></os:store>
+        <os:store key="k5" objectStore="maxStore"><os:value>#[5]</os:value></os:store>
+        <os:retrieve-all-keys objectStore="maxStore"/>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload orderBy $]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="max-keys">
+        <http:listener config-ref="L" path="/max/keys"/>
+        <os:retrieve-all-keys objectStore="maxStore"/>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload orderBy $]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="durable-put">
+        <http:listener config-ref="L" path="/durable/put"/>
+        <os:store key="#[attributes.queryParams.k]" objectStore="durable"><os:value>#[payload]</os:value></os:store>
+        <os:retrieve-all objectStore="durable"/>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+    <flow name="mem-put">
+        <http:listener config-ref="L" path="/mem/put"/>
+        <os:store key="#[attributes.queryParams.k]" objectStore="mem"><os:value>#[payload]</os:value></os:store>
+        <os:retrieve-all objectStore="mem"/>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="durable-get">
+        <http:listener config-ref="L" path="/durable/get"/>
+        <os:retrieve key="x" objectStore="durable"/>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{v: payload, t: typeOf(payload) as String, mime: payload.^mimeType, cls: payload.^class default null}]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="mem-get">
+        <http:listener config-ref="L" path="/mem/get"/>
+        <os:retrieve key="x" objectStore="mem"/>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{v: payload, t: typeOf(payload) as String, mime: payload.^mimeType, cls: payload.^class default null}]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+</mule>

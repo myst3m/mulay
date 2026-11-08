@@ -1,0 +1,210 @@
+(ns mulay.conn.httpmsg
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.num :as num] [mulay.lib.x509 :as x509] [mulay.lib.time.tz :as tz]
+            [mulay.lib.time.zoned :as zd] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(defn parse-query v/Val [q: &Str]
+  (if (= (count q) 0) (v/->VObj [])
+    (let [parts: Vec(Str) (str/split q "&")]
+      (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                  (if (>= i (count parts)) acc
+                    (let [p (nth parts i) eq (str/index-of p "=")]
+                      (if (= (count p) 0) (recur (+ i 1) acc)
+                        (recur (+ i 1) (conj acc (if (< eq 0) (v/field (url-decode p) (v/->VStr ""))
+                                                   (v/field (url-decode (subs p 0 eq)) (v/->VStr (url-decode (subs p (+ eq 1) (count p))))))))))))))))
+
+(defn- hexv Int [c: Int]
+  (if (and (>= c 48) (<= c 57)) (- c 48) (if (and (>= c 97) (<= c 102)) (- c 87) (if (and (>= c 65) (<= c 70)) (- c 55) -1))))
+
+(defn url-decode Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (if (and (= c 37) (< (+ i 2) (count s)) (>= (hexv (nth s (+ i 1))) 0) (>= (hexv (nth s (+ i 2))) 0))
+          (recur (+ i 3) (str out (chr (+ (* 16 (hexv (nth s (+ i 1)))) (hexv (nth s (+ i 2)))))))
+          (recur (+ i 1) (str out (if (= c 43) " " (subs s i (+ i 1))))))))))
+
+(defn join-path Str [a: &Str b: &Str]
+  (let [x (if (str/ends-with? a "/") (subs a 0 (- (count a) 1)) (str a))
+        y (if (str/starts-with? b "/") (str b) (str "/" b))]
+    (if (= y "/") (if (= x "") "/" x) (str x y))))
+
+(defn origin-form? Bool [uri: &Str]
+  (and (str/starts-with? uri "/") (< (str/index-of uri "#") 0)))
+
+(defn origin-target Str [uri: &Str]
+  (let [k (str/index-of uri "#")
+        u (if (< k 0) (str uri) (subs uri 0 k))
+        start (cond (str/starts-with? u "http://") 7 (str/starts-with? u "https://") 8 :else -1)]
+    (if (< start 0) u
+      (let [s (str/index-of-after u "/" start)
+            q (str/index-of-after u "?" start)]
+        (cond
+          (and (>= s 0) (or (< q 0) (< s q))) (subs u s (count u))
+          (>= q 0) (str "/" (subs u q (count u)))
+          :else "/")))))
+
+(defn url-decode-path Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (if (and (= c 37) (< (+ i 2) (count s)) (>= (hexv (nth s (+ i 1))) 0) (>= (hexv (nth s (+ i 2))) 0))
+          (recur (+ i 3) (str out (chr (+ (* 16 (hexv (nth s (+ i 1)))) (hexv (nth s (+ i 2)))))))
+          (recur (+ i 1) (str out (subs s i (+ i 1)))))))))
+
+(defn query-params v/Val [qs: &Str]
+  (match (parse-query qs)
+    (v/VObj fs)
+    (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                (if (>= i (count fs)) acc
+                  (let [k (:name (:key (nth fs i)))
+                        seen (loop [j 0] (if (>= j i) false (if (= (:name (:key (nth fs j))) k) true (recur (+ j 1)))))]
+                    (if seen (recur (+ i 1) acc)
+                      (recur (+ i 1) (loop [j i a acc] (if (>= j (count fs)) a (recur (+ j 1) (if (= (:name (:key (nth fs j))) k) (conj a (nth fs j)) a))))))))))
+    _ (v/->VObj [])))
+
+(defn- oid-arr v/Val [xs: &Vec(Str)]
+  (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (v/->VStr (nth xs i))))))))
+
+(defn- name-obj v/Val [dn: &Str] (v/->VObj [(v/field "name" (v/->VStr dn))]))
+
+(defn- java-date v/Val [secs: Int] (v/->VLocalDateTime (zd/zdt-ldt (zd/zdt-of-instant secs 0 (tz/system-zone)))))
+
+(defn- serial-v v/Val [s: &Str]
+  (let [[n e] (num/parse-lit s)] (if (= e "") (v/num-v n) (v/->VStr s))))
+
+(defn client-cert-val v/Val [pem: &Str]
+  (if (= pem "") (v/null-v)
+    (let [[c e] (x509/parse-pem pem)]
+      (if (not= e "") (v/null-v)
+        (let [ext? (or (> (count (:critical c)) 0) (> (count (:non-critical c)) 0))
+              ku (:key-usage c)]
+          (v/->VMeta
+            (v/->VObj [(v/field "basicConstraints" (v/int-v (:basic-constraints c)))
+                       (v/field "criticalExtensionOIDs" (if ext? (oid-arr (:critical c)) (v/null-v)))
+                       (v/field "encoded" (v/->VBin (:der c)))
+                       (v/field "extendedKeyUsage" (if (:has-ext-key-usage c) (oid-arr (:ext-key-usage c)) (v/null-v)))
+                       (v/field "extensions" (v/null-v))
+                       (v/field "issuerAlternativeNames" (v/null-v))
+                       (v/field "issuerDN" (name-obj (:issuer c)))
+                       (v/field "issuerUniqueID" (v/null-v))
+                       (v/field "issuerX500Principal" (name-obj (:issuer c)))
+                       (v/field "keyUsage" (if (= (count ku) 0) (v/null-v)
+                                             (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count ku)) acc (recur (+ i 1) (conj acc (v/bool-v (nth ku i)))))))))
+                       (v/field "name" (v/->VStr "x509"))
+                       (v/field "nonCriticalExtensionOIDs" (if ext? (oid-arr (:non-critical c)) (v/null-v)))
+                       (v/field "notAfter" (java-date (:not-after c)))
+                       (v/field "notBefore" (java-date (:not-before c)))
+                       (v/field "publicKey" (v/->VObj [(v/field "algorithm" (v/->VStr (:public-key-alg c)))
+                                                       (v/field "encoded" (v/->VBin (:public-key c)))
+                                                       (v/field "format" (v/->VStr "X.509"))]))
+                       (v/field "serialNumber" (serial-v (:serial c)))
+                       (v/field "serialNumberObject" (v/->VObj [(v/field "number" (serial-v (:serial c)))]))
+                       (v/field "sigAlgName" (v/->VStr (:sig-name c)))
+                       (v/field "sigAlgOID" (v/->VStr (:sig-oid c)))
+                       (v/field "sigAlgParams" (if (= (:sig-params c) "") (v/null-v) (v/->VBin (:sig-params c))))
+                       (v/field "signature" (v/->VBin (:signature c)))
+                       (v/field "subjectAlternativeNames" (v/null-v))
+                       (v/field "subjectDN" (name-obj (:subject c)))
+                       (v/field "subjectX500Principal" (name-obj (:subject c)))
+                       (v/field "type" (v/->VStr "X.509"))
+                       (v/field "version" (v/int-v (:version c)))])
+            [(v/field "class" (v/->VStr "sun.security.x509.X509CertImpl"))]))))))
+
+(defn request-attributes v/Val [method: &Str uri: &Str listener-path: &Str base: &Str hlist: &Vec(hm/Header) uri-params: Vec(v/Field) port: Int remote: &Str scheme: &Str cert-pem: &Str version: &Str]
+  (let [q (str/index-of uri "?")
+        raw-path (if (< q 0) (str uri) (subs uri 0 q))
+        raw-qs (if (< q 0) "" (subs uri (+ q 1) (count uri)))
+        path (url-decode-path raw-path)
+        qs (url-decode-path raw-qs)
+        hs (loop [i 0 acc: Vec(v/Field) []]
+             (if (>= i (count hlist)) acc
+               (let [hd (nth hlist i)]
+                 (recur (+ i 1) (conj acc (v/field (str/lower-case (:hd-name hd)) (v/->VStr (str (:hd-value hd)))))))))
+        rel (if (and (> (count base) 0) (str/starts-with? path base)) (subs path (count base) (count path)) (str path))]
+    (v/->VMeta (v/->VObj [(v/field "headers" (v/->VObj hs))
+               (v/field "clientCertificate" (client-cert-val cert-pem))
+               (v/field "method" (v/->VStr (str method)))
+               (v/field "scheme" (v/->VStr (str scheme)))
+               (v/field "queryParams" (query-params raw-qs))
+               (v/field "requestUri" (v/->VStr (if (< q 0) path (str path "?" qs))))
+               (v/field "queryString" (v/->VStr qs))
+               (v/field "version" (v/->VStr (if (= version "") "HTTP/1.1" (str version))))
+               (v/field "maskedRequestPath" (v/null-v))
+               (v/field "listenerPath" (v/->VStr (join-path base listener-path)))
+               (v/field "localAddress" (v/->VStr (str "/127.0.0.1:" port)))
+               (v/field "relativePath" (v/->VStr (if (= rel "") "/" rel)))
+               (v/field "uriParams" (v/->VObj uri-params))
+               (v/field "rawRequestUri" (v/->VStr (str uri)))
+               (v/field "rawRequestPath" (v/->VStr raw-path))
+               (v/field "remoteAddress" (v/->VStr (str "/" remote)))
+               (v/field "requestPath" (v/->VStr path))])
+               [(v/field "class" (v/->VStr "org.mule.extension.http.api.HttpRequestAttributes"))])))
+
+(defn mule-reason Str [st: Int]
+  (case st
+    100 "Continue" 101 "Switching Protocols" 102 "Processing"
+    200 "OK" 201 "Created" 202 "Accepted" 203 "Non Authoritative Information" 204 "No Content" 205 "Reset Content"
+    206 "Partial Content" 207 "Multi-Status"
+    300 "Multiple Choices" 301 "Moved Permanently" 302 "Moved Temporarily" 303 "See Other" 304 "Not Modified" 305 "Use Proxy"
+    307 "Temporary Redirect"
+    400 "Bad Request" 401 "Unauthorized" 402 "Payment Required" 403 "Forbidden" 404 "Not Found" 405 "Method Not Allowed"
+    406 "Not Acceptable" 407 "Proxy Authentication Required" 408 "Request Timeout" 409 "Conflict" 410 "Gone"
+    411 "Length Required" 412 "Precondition Failed" 413 "Request Entity Too Large" 414 "Request-URI Too Long"
+    415 "Unsupported Media Type" 416 "Requested Range Not Satisfiable" 417 "Expectation Failed" 422 "Unprocessable Entity"
+    429 "Too Many Requests"
+    500 "Server Error" 501 "Not Implemented" 502 "Bad Gateway" 503 "Service Unavailable" 504 "Gateway Timeout"
+    505 "HTTP Version Not Supported"
+    ""))
+
+(defn mule-resp hm/Response [status: Int hs: Vec(hm/Header) body: Str reason: Str]
+  (assoc (hm/response status hs body false) :reason (if (= reason "") (mule-reason status) reason)))
+
+(defn ct-resp hm/Response [status: Int ct: Str body: Str] (mule-resp status [(hm/->Header "Content-Type" ct)] body ""))
+
+(defn text-resp hm/Response [status: Int body: Str] (ct-resp status "text/plain" body))
+
+(defn qparam Str [uri: &Str name: &Str]
+  (let [q (str/index-of uri "?")]
+    (if (< q 0) ""
+      (match (v/unmeta (query-params (subs uri (+ q 1) (count uri))))
+        (v/VObj fs) (let [r (v/obj-get fs name)] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr x) (str x) _ "")))
+        _ ""))))
+
+(defn header-list Values(Vec(hm/Header) Str Str) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) (loop [i 0 acc: Vec(hm/Header) [] ct ""]
+                  (if (>= i (count fs)) (values acc ct "")
+                    (let [fv (v/unmeta (:value (nth fs i)))
+                          name (:name (:key (nth fs i)))]
+                      (match fv
+                        (v/VArr xs) (values acc ct "Unable to convert `Array` to class 'java.lang.String'")
+                        (v/VObj gs) (values acc ct "Unable to convert `Object` to class 'java.lang.String'")
+                        (v/VNull) (recur (+ i 1) acc ct)
+                        _ (let [[s se] (drt/to-text fv)]
+                            (if (= (str/lower-case name) "content-type") (recur (+ i 1) acc s)
+                              (recur (+ i 1) (conj acc (hm/->Header name s)) ct)))))))
+    (v/VNull) (values [] "" "")
+    _ (values [] "" "Unable to convert value to class 'java.util.Map'")))
+
+(def LISTENER-ATTRS-CLASS "org.mule.extension.http.api.HttpListenerResponseAttributes")
+
+(defn listener-attrs v/Val [st: Int reason: &Str]
+  (v/->VMeta (v/->VObj [(v/field "headers" (v/->VObj [])) (v/field "reasonPhrase" (v/->VStr (str reason))) (v/field "statusCode" (v/int-v st))])
+             [(v/field "class" (v/->VStr LISTENER-ATTRS-CLASS))]))
+
+(defrecord Custom [status: Int reason: Str headers: v/Val])
+
+(defn listener-custom Vec(Custom) [x: &v/Val]
+  (match x
+    (v/VMeta o ms)
+    (let [c (v/obj-get ms "class")
+          cls (if (= (count c) 0) "" (match (nth c 0) (v/VStr s) (str s) _ ""))
+          fs (match o (v/VObj xs) xs _ [])
+          st (v/obj-get fs "statusCode")
+          rp (v/obj-get fs "reasonPhrase")
+          hd (v/obj-get fs "headers")]
+      (if (or (not= cls LISTENER-ATTRS-CLASS) (= (count st) 0)) []
+        [(->Custom (let [[n e] (num/to-int (v/num-of (nth st 0)))] n)
+                   (if (= (count rp) 0) "" (match (nth rp 0) (v/VStr s) (str s) _ ""))
+                   (if (= (count hd) 0) (v/->VObj []) (nth hd 0)))]))
+    _ []))

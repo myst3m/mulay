@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:sftp="http://www.mulesoft.org/schema/mule/sftp"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/sftp http://www.mulesoft.org/schema/mule/sftp/current/mule-sftp.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18193"/>
+    </http:listener-config>
+
+    <sftp:config name="S">
+        <sftp:connection host="localhost" port="2222" username="mulay" password="mulay" workingDir="/upload"/>
+    </sftp:config>
+
+    <!-- knownHostsFile はクラスパスの資源 -->
+    <sftp:config name="Kh">
+        <sftp:connection host="localhost" port="2222" username="mulay" password="mulay" workingDir="/upload" knownHostsFile="known_hosts_good"/>
+    </sftp:config>
+
+    <sftp:matcher name="txtOnly" filenamePattern="*.txt"/>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="drop">
+        <http:listener config-ref="HTTP" path="/drop" allowedMethods="POST"/>
+        <sftp:write config-ref="S" path="#['li/' ++ attributes.queryParams.path]"/>
+        <set-payload value="dropped"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="names">
+        <http:listener config-ref="HTTP" path="/names"/>
+        <sftp:list config-ref="S" directoryPath="li" recursive="true"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(payload map ((item) -> item.attributes.path[sizeOf("/upload/li/") to -1] ++ (if (item.attributes.directory) "/" else ""))) orderBy $]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="get">
+        <http:listener config-ref="HTTP" path="/get"/>
+        <sftp:read config-ref="S" path="#['li/' ++ attributes.queryParams.path]" outputMimeType="text/plain"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- in: *.txt だけ (matcher の参照)、処理したら done へ移す -->
+    <flow name="l1">
+        <sftp:listener config-ref="S" directory="li/in" moveToDirectory="li/done" matcher="txtOnly">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </sftp:listener>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  mime: payload.^mimeType,
+  attrClass: attributes.^class,
+  fileName: attributes.fileName,
+  name: attributes.name,
+  path: attributes.path,
+  size: attributes.size,
+  directory: attributes.directory,
+  regularFile: attributes.regularFile,
+  tsType: typeOf(attributes.timestamp),
+  body: payload as String
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <sftp:write config-ref="S" path="#['li/seen/' ++ attributes.fileName ++ '.json']"/>
+    </flow>
+
+    <!-- in2: 下のディレクトリも (recursive の既定は true)。読んだら消す。中身は JSON として読む -->
+    <flow name="l2">
+        <sftp:listener config-ref="S" directory="li/in2" autoDelete="true" outputMimeType="application/json">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </sftp:listener>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{mime: payload.^mimeType, path: attributes.path, value: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <sftp:write config-ref="S" path="#['li/seen2/' ++ attributes.fileName]"/>
+    </flow>
+
+    <!-- in3: inline の matcher (csv、1 バイト以上)。done3 へ名前を変えて移す。拡張子からの mime -->
+    <flow name="l3">
+        <sftp:listener config-ref="S" directory="li/in3" moveToDirectory="li/done3" renameTo="moved.csv">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+            <sftp:matcher filenamePattern="*.csv" minSize="1"/>
+        </sftp:listener>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, rows: payload}]"/>
+        <sftp:write config-ref="S" path="#['li/seen3/' ++ attributes.fileName ++ '.json']"/>
+    </flow>
+
+    <!-- in4: 後処理なし、watermark で同じファイルを二度読まない -->
+    <flow name="l4">
+        <sftp:listener config-ref="S" directory="li/in4" watermarkEnabled="true">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </sftp:listener>
+        <sftp:write config-ref="S" path="li/seen4/log.txt" mode="APPEND"><sftp:content>#[attributes.fileName ++ "\n"]</sftp:content></sftp:write>
+    </flow>
+
+    <!-- in5: 直下だけ (recursive=false)。bad* は失敗するが、後処理 (done5 へ移す) はする -->
+    <flow name="l5">
+        <sftp:listener config-ref="S" directory="li/in5" recursive="false" moveToDirectory="li/done5">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </sftp:listener>
+        <sftp:write config-ref="S" path="#['li/seen5/' ++ attributes.fileName]"><sftp:content>#[payload]</sftp:content></sftp:write>
+        <choice>
+            <when expression="#[attributes.fileName startsWith 'bad']">
+                <raise-error type="APP:BAD" description="bad file"/>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- in6: knownHostsFile のある接続で見る -->
+    <flow name="l6">
+        <sftp:listener config-ref="Kh" directory="li/in6" autoDelete="true">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </sftp:listener>
+        <sftp:write config-ref="S" path="#['li/seen/kh-' ++ attributes.fileName]"/>
+    </flow>
+
+    <!-- in7: 失敗したら後処理しない (applyPostActionWhenFailed=false)。bad* は in7 に残る -->
+    <flow name="l7">
+        <sftp:listener config-ref="S" directory="li/in7" moveToDirectory="li/done7" applyPostActionWhenFailed="false">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </sftp:listener>
+        <choice>
+            <when expression="#[attributes.fileName startsWith 'bad']">
+                <raise-error type="APP:BAD" description="bad file"/>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- in8: 2000 年より前に更新したものだけ (timestampUntil)。どれも読まない -->
+    <flow name="l8">
+        <sftp:listener config-ref="S" directory="li/in8" autoDelete="true">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+            <sftp:matcher timestampUntil="2000-01-01T00:00:00" timestampSince="1990-01-01T00:00:00"/>
+        </sftp:listener>
+        <sftp:write config-ref="S" path="#['li/seen/old-' ++ attributes.fileName]"/>
+    </flow>
+
+    <!-- in9: 2000 年より後 (timestampSince)。読んで消す -->
+    <flow name="l9">
+        <sftp:listener config-ref="S" directory="li/in9" autoDelete="true">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+            <sftp:matcher timestampSince="2000-01-01T00:00:00"/>
+        </sftp:listener>
+        <sftp:write config-ref="S" path="#['li/seen/new-' ++ attributes.fileName]"/>
+    </flow>
+
+    <!-- never: 起動の時点で無いディレクトリ。listener は止まる -->
+    <flow name="l0">
+        <sftp:listener config-ref="S" directory="li/never" autoDelete="true">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </sftp:listener>
+        <sftp:write config-ref="S" path="#['li/seen/never-' ++ attributes.fileName]"/>
+    </flow>
+
+</mule>

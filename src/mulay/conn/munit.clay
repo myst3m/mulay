@@ -1,0 +1,523 @@
+(ns mulay.conn.munit
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.err :as dwe] [mulay.dw.engine :as eng] [mulay.dw.num :as num]
+            [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.conn :as conn]
+            [mulay.lib.xml :as xml] [mulay.lib.dec :as dec] [mulay.lib.numparse :as npz] [clay.string :as str]))
+
+(def NS-MUNIT "http://www.mulesoft.org/schema/mule/munit")
+(def NS-TOOLS "http://www.mulesoft.org/schema/mule/munit-tools")
+(def ASSERTION "java.lang.AssertionError")
+(def ASSERTION-PLAIN "java.lang.AssertionError/plain")
+(def MATCHER-CLASS "org.mule.munit.assertion.api.matchers.Matcher")
+
+(def TOOLS-MODULE
+  "%dw 2.0
+
+fun matcherOf(kind: String, xs: Array) = {\"type\": kind, expected: xs, munitMatcher: true}
+fun isMatcher(x) = (x is Object) and ((x.munitMatcher default false) == true)
+fun asMatcher(x) = if (isMatcher(x)) x else equalTo(x)
+
+fun equalTo(value, config = {}) = matcherOf(\"equalTo\", [value, config])
+fun not(m) = matcherOf(\"not\", [asMatcher(m)])
+fun notNullValue() = matcherOf(\"notNullValue\", [])
+fun nullValue() = matcherOf(\"nullValue\", [])
+fun both(m1, m2) = matcherOf(\"both\", [m1, m2])
+fun either(m1, m2) = matcherOf(\"either\", [m1, m2])
+fun withEncoding(encoding = null) = matcherOf(\"withEncoding\", [encoding])
+fun withMediaType(mediaType) = matcherOf(\"withMediaType\", [mediaType])
+fun allOf(ms) = matcherOf(\"allOf\", ms)
+fun anyOf(ms) = matcherOf(\"anyOf\", ms)
+fun matches(regex) = matcherOf(\"matches\", [regex])
+fun containsString(value) = matcherOf(\"containsString\", [value])
+fun startsWith(prefix) = matcherOf(\"startsWith\", [prefix])
+fun endsWith(suffix) = matcherOf(\"endsWith\", [suffix])
+fun isEmptyString() = matcherOf(\"isEmptyString\", [])
+fun isEmptyOrNullString() = matcherOf(\"isEmptyOrNullString\", [])
+fun equalToIgnoringCase(value) = matcherOf(\"equalToIgnoringCase\", [value])
+fun equalToIgnoringWhiteSpace(value) = matcherOf(\"equalToIgnoringWhiteSpace\", [value])
+fun stringContainsInOrder(values) = matcherOf(\"stringContainsInOrder\", [values])
+fun greaterThan(value) = matcherOf(\"greaterThan\", [value])
+fun greaterThanOrEqualTo(value) = matcherOf(\"greaterThanOrEqualTo\", [value])
+fun lessThan(value) = matcherOf(\"lessThan\", [value])
+fun lessThanOrEqualTo(value) = matcherOf(\"lessThanOrEqualTo\", [value])
+fun closeTo(value, error) = matcherOf(\"closeTo\", [value, error])
+fun everyItem(m) = matcherOf(\"everyItem\", [m])
+fun hasItem(m) = matcherOf(\"hasItem\", [asMatcher(m)])
+fun hasSize(m) = matcherOf(\"hasSize\", [asMatcher(m)])
+fun isEmpty() = matcherOf(\"isEmpty\", [])
+fun hasKey(m) = matcherOf(\"hasKey\", [asMatcher(m)])
+fun hasValue(m) = matcherOf(\"hasValue\", [asMatcher(m)])
+fun getResourceAsString(path, encoding = null) = readUrl(\"classpath://\" ++ path, \"text/plain\") as String
+")
+
+(defn- no-code Vec(eng/Compiled) [] (let [z: Vec(eng/Compiled) []] z))
+(def DIFF (atom (no-code)))
+(def WRITE (atom (no-code)))
+(def MATCH (atom (no-code)))
+(def CMP (atom (no-code)))
+
+(defn- cached eng/Compiled [a: &Atom(Vec(eng/Compiled)) script: &Str names: Vec(Str)]
+  (let [c (deref a)]
+    (if (> (count c) 0) (nth c 0)
+      (let [x (eng/compile script names) z (reset! a [x])] x))))
+
+(defn- run2 Values(v/Val Str) [a: &Atom(Vec(eng/Compiled)) script: &Str x: &v/Val y: &v/Val z: &v/Val]
+  (let [[r de] (eng/eval-compiled (cached a script ["a" "b" "c"]) [x y z])]
+    (if (dwe/ok? de) (values r "") (values (v/null-v) (:msg de)))))
+
+(defn- dw-diff Values(v/Val Str) [a: &v/Val b: &v/Val cfg: &v/Val]
+  (run2 DIFF "%dw 2.0\nimport diff from dw::util::Diff\n---\ndiff(a, b, c default {})" a b cfg))
+
+(defn- dw-write Str [a: &v/Val]
+  (let [[r e] (run2 WRITE "%dw 2.0\n---\nwrite(a)" a (v/null-v) (v/null-v))] (if (not= e "") "" (text-of r))))
+
+(defn- dw-matches Bool [s: &v/Val re: &v/Val]
+  (let [[r e] (run2 MATCH "%dw 2.0\n---\na matches b" s re (v/null-v))] (match (v/unmeta r) (v/VBool b) b _ false)))
+
+(defn- dw-cmp Values(Int Str) [a: &v/Val b: &v/Val]
+  (let [[r e] (run2 CMP "%dw 2.0\n---\nif (a > b) 1 else if (a == b) 0 else -1" a b (v/null-v))]
+    (if (not= e "") (values 0 e) (match (v/unmeta r) (v/VInt n) (values n "") (v/VNum n) (let [[k ke] (num/to-int n)] (values k "")) _ (values 0 "")))))
+
+(defrecord Actual [dw: v/Val java: v/Val media: Str mime: Str enc: Str cls: Str])
+
+(defn- base-mime Str [m: &Str] (let [i (str/index-of m ";")] (str/trim (if (< i 0) (str m) (subs m 0 i)))))
+
+(defn- java-mime? Bool [m: &Str] (= (base-mime m) "application/java"))
+
+(defn- meta-str Str [x: &v/Val k: &Str]
+  (match x (v/VMeta y ms) (let [r (v/obj-get ms k)] (if (= (count r) 0) "" (match (nth r 0) (v/VStr s) (str s) _ ""))) _ ""))
+
+(defn- int32? Bool [n: Int] (and (>= n -2147483648) (<= n 2147483647)))
+
+(defn- class-of Str [x: &v/Val]
+  (let [c (meta-str x "class")]
+    (if (not= c "") c
+      (match (v/unmeta x)
+        (v/VStr s) "java.lang.String"
+        (v/VBool b) "java.lang.Boolean"
+        (v/VInt i) (if (int32? i) "java.lang.Integer" "java.lang.Long")
+        (v/VNum n) (if (num/integer? n) (let [[k ke] (num/to-int n)] (if (and (= ke "") (int32? k)) "java.lang.Integer" "java.lang.Long")) "java.lang.Double")
+        (v/VObj fs) "java.util.LinkedHashMap"
+        (v/VArr xs) "java.util.ArrayList"
+        _ ""))))
+
+(defn- with-classes v/Val [x: &v/Val]
+  (let [y (v/unmeta x)
+        inner (match y
+                (v/VArr xs) (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (with-classes (nth xs i)))))))
+                (v/VObj fs) (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (v/->Field (:key (nth fs i)) (with-classes (:value (nth fs i)))))))))
+                _ y)
+        c (class-of x)]
+    (if (= c "") inner (v/->VMeta inner [(v/field "class" (v/->VStr c))]))))
+
+(defn- uni-len Int [s: &Str] (loop [i 0 n 0] (if (>= i (count s)) n (recur (+ i 1) (if (= (bit-and (nth s i) 192) 128) n (+ n 1))))))
+
+(defn actual-of Values(Actual Str) [t0: &ev/TV]
+  (let [[x t pe] (ev/value t0)
+        media0 (str (:mime t))
+        java (java-mime? media0)
+        media (if (and java (< (str/index-of media0 "charset") 0)) (str media0 "; charset=UTF-8") media0)
+        mime (base-mime media)
+        enc (let [c (ev/charset-of media)] (if (= c "") "UTF-8" c))
+        plain (v/unmeta x)
+        nul (v/null? plain)
+        cls (if (or nul (not java)) "" (class-of x))
+        body (if java (v/unmeta (with-classes x)) plain)
+        clen (cond (not java) (count (:raw t)) (= cls "java.lang.String") (match plain (v/VStr s) (uni-len s) _ -1) :else -1)
+        ms0 [(v/field "encoding" (v/->VStr enc)) (v/field "mediaType" (v/->VStr media)) (v/field "mimeType" (v/->VStr mime))]
+        ms1 (if (= cls "") ms0 (conj ms0 (v/field "class" (v/->VStr cls))))
+        ms2 (if (and (>= clen 0) (or (not nul) (not java))) (conj ms1 (v/field "contentLength" (v/int-v clen))) ms1)]
+    (values (->Actual (v/->VMeta body ms2) plain media mime enc cls) pe)))
+
+(defn- item-actual Actual [x: &v/Val]
+  (let [c (class-of x)
+        body (v/unmeta (with-classes x))]
+    (->Actual (if (= c "") body (v/->VMeta body [(v/field "class" (v/->VStr c))])) (v/unmeta x) "application/java; charset=UTF-8" "application/java" "UTF-8" c)))
+
+(defn- dbl-str Str [n: &num/Num]
+  (if (num/integer? n) (str (let [[k e] (num/to-int n)] k) ".0") (dec/float->shortest-str (num/to-float n))))
+
+(defn jstr Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VNull) "null"
+    (v/VStr s) (str s)
+    (v/VBool b) (if b "true" "false")
+    (v/VInt i) (str i)
+    (v/VNum n) (if (= (class-of x) "java.lang.Double") (dbl-str n) (let [[s e] (drt/to-text (v/unmeta x))] s))
+    (v/VArr xs) (str "[" (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (str out (if (= i 0) "" ", ") (jstr (nth xs i)))))) "]")
+    (v/VObj fs) (str "{" (loop [i 0 out ""] (if (>= i (count fs)) out (recur (+ i 1) (str out (if (= i 0) "" ", ") (:name (:key (nth fs i))) "=" (jstr (:value (nth fs i))))))) "}")
+    _ (let [[s e] (drt/to-text (v/unmeta x))] s)))
+
+(defn- typed-str Str [a: &Actual]
+  (str "TypedValue[value: '" (jstr (:java a)) "', dataType: 'SimpleDataType{type=" (if (= (:cls a) "") "java.lang.Object" (:cls a)) ", mimeType='" (:media a) "'}']"))
+
+(defrecord Res [ok: Bool desc: Str mis: Str err: Str])
+
+(defn- res-err Res [e: Str] (->Res false "" "" e))
+(defn- good Res [] (->Res true "" "" ""))
+(defn- bad Res [e: Str a: Str] (->Res false (str e) (str a " at (root)") ""))
+
+(defn- has-str? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(def STRING-KINDS ["matches" "containsString" "startsWith" "endsWith" "isEmptyString" "isEmptyOrNullString" "equalToIgnoringCase"
+                   "equalToIgnoringWhiteSpace" "stringContainsInOrder"])
+(def ORDER-KINDS ["greaterThan" "greaterThanOrEqualTo" "lessThan" "lessThanOrEqualTo"])
+
+(defn- ws? Bool [c: Int] (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 11) (= c 12)))
+
+(defn- squeeze Str [s: &Str]
+  (loop [i 0 out "" sp false]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (if (ws? c) (recur (+ i 1) (if sp out (str out " ")) true) (recur (+ i 1) (str out (chr c)) false))))))
+
+(defn- in-order? Bool [s: &Str parts: &Vec(v/Val)]
+  (loop [i 0 from 0]
+    (if (>= i (count parts)) true
+      (let [p (text-of (nth parts i))
+            k (str/index-of-after s p from)]
+        (if (< k 0) false (recur (+ i 1) (+ k 1)))))))
+
+(defn- type-name Str [x: &v/Val] (v/type-name (v/unmeta x)))
+
+(defn- string-check Res [kind: &Str xs: &Vec(v/Val) a: &Actual]
+  (let [arg (if (> (count xs) 0) (nth xs 0) (v/null-v))
+        at (text-of arg)]
+    (match (:java a)
+      (v/VStr s)
+      (cond
+        (= kind "matches") (if (dw-matches (:java a) arg) (good) (bad (str "A string matching " (match (v/unmeta arg) (v/VRegex src fl) (str src) _ at)) s))
+        (= kind "containsString") (if (str/includes? s at) (good) (bad (str "A string containing " at) s))
+        (= kind "startsWith") (if (str/starts-with? s at) (good) (bad (str "A string starting with " at) s))
+        (= kind "endsWith") (if (str/ends-with? s at) (good) (bad (str "A string ending with " at) s))
+        (= kind "isEmptyString") (if (= s "") (good) (bad "An empty string" s))
+        (= kind "isEmptyOrNullString") (if (= s "") (good) (bad "An empty or null string" s))
+        (= kind "equalToIgnoringCase") (if (= (str/lower-case s) (str/lower-case at)) (good) (bad (str "'" at "' ignoring case") s))
+        (= kind "equalToIgnoringWhiteSpace") (if (= (squeeze s) (squeeze at)) (good) (bad (squeeze at) s))
+        :else (let [ps (match (v/unmeta arg) (v/VArr ys) ys _ [])
+                    names (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (text-of (nth ps i))))))]
+                (if (in-order? s ps) (good) (bad (str (str/join ", " names) ", in order") s))))
+      _ (if (and (= kind "isEmptyOrNullString") (v/null? (:java a))) (good) (bad "String" (type-name (:java a)))))))
+
+(defn- text-of Str [x: &v/Val] (match (v/unmeta x) (v/VStr s) (str s) (v/VNull) "null" _ (let [[s e] (drt/to-text (v/unmeta x))] s)))
+
+(defn- field-of v/Val [x: &v/Val k: &Str] (match (v/unmeta x) (v/VObj fs) (let [r (v/obj-get fs k)] (if (= (count r) 0) (v/null-v) (nth r 0))) _ (v/null-v)))
+
+(defn- arr-of Vec(v/Val) [x: &v/Val] (match (v/unmeta x) (v/VArr xs) xs _ []))
+
+(defn- diff-res Res [d: &v/Val]
+  (let [ok (match (v/unmeta (field-of d "matches")) (v/VBool b) b _ false)
+        ds (arr-of (field-of d "diffs"))
+        es (loop [i 0 out ""] (if (>= i (count ds)) out (recur (+ i 1) (str out (if (= i 0) "" ",") (text-of (field-of (nth ds i) "expected"))))))
+        as (loop [i 0 out ""] (if (>= i (count ds)) out
+                                (recur (+ i 1) (str out (if (= i 0) "" ",") (text-of (field-of (nth ds i) "actual")) " at " (text-of (field-of (nth ds i) "path"))))))]
+    (if ok (->Res true "" "" "") (->Res false es as ""))))
+
+(defn- coll-of Vec(v/Val) [a: &Actual] (match (:java a) (v/VArr xs) xs (v/VObj fs) (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (:value (nth fs i)))))) _ []))
+
+(defn- was Str [a: &Actual] (str "was <" (jstr (:java a)) ">"))
+
+(defn check Res [m: &v/Val a: &Actual]
+  (let [kind (text-of (field-of m "type"))
+        xs (arr-of (field-of m "expected"))]
+    (cond
+      (= kind "equalTo")
+      (let [[d e] (dw-diff (:dw a) (nth xs 0) (if (> (count xs) 1) (nth xs 1) (v/null-v)))] (if (not= e "") (res-err e) (diff-res d)))
+      (= kind "notNullValue") (if (v/null? (:java a)) (bad "not null" (dw-write (:dw a))) (good))
+      (= kind "nullValue") (if (v/null? (:java a)) (good) (bad "null" (dw-write (:dw a))))
+      (has-str? STRING-KINDS kind) (string-check kind xs a)
+      (has-str? ORDER-KINDS kind)
+      (let [[cv ce] (dw-cmp (:java a) (nth xs 0))
+            ok (cond (= kind "greaterThan") (> cv 0) (= kind "greaterThanOrEqualTo") (>= cv 0) (= kind "lessThan") (< cv 0) :else (<= cv 0))
+            what (if (str/starts-with? kind "greater") " to be greater than " " to be less than ")]
+        (cond (not= ce "") (res-err ce) ok (good) :else (bad (str what (text-of (nth xs 0))) (text-of (:java a)))))
+      (= kind "not")
+      (let [r (check (nth xs 0) a)]
+        (if (not= (:err r) "") r (->Res (not (:ok r)) (str "not " (:desc r)) (str "was <" (typed-str a) ">") "")))
+      (or (= kind "both") (= kind "allOf"))
+      (loop [i 0 descs: Vec(Str) [] fail: Vec(Res) []]
+        (if (>= i (count xs))
+          (let [d (str "(" (str/join " and " descs) ")")]
+            (if (= (count fail) 0) (->Res true d "" "") (->Res false d (str (:desc (nth fail 0)) " " (:mis (nth fail 0))) "")))
+          (if (> (count fail) 0) (recur (+ i 1) (conj descs "") fail)
+            (let [r (check (nth xs i) a)]
+              (if (not= (:err r) "") r (recur (+ i 1) (conj descs (:desc r)) (if (:ok r) fail [r])))))))
+      (or (= kind "either") (= kind "anyOf"))
+      (loop [i 0 descs: Vec(Str) [] hit false]
+        (if (>= i (count xs))
+          (->Res hit (str "(" (str/join " or " descs) ")") (str "was <" (typed-str a) ">") "")
+          (if hit (recur (+ i 1) (conj descs "") hit)
+            (let [r (check (nth xs i) a)]
+              (if (not= (:err r) "") r (recur (+ i 1) (conj descs (:desc r)) (:ok r)))))))
+      (= kind "everyItem")
+      (let [items (coll-of a)]
+        (loop [i 0 last ""]
+          (if (>= i (count items)) (->Res true (str "every item is " last) (was a) "")
+            (let [r (check (nth xs 0) (item-actual (nth items i)))]
+              (cond (not= (:err r) "") r
+                    (:ok r) (recur (+ i 1) (:desc r))
+                    :else (->Res false (str "every item is " (:desc r)) (was a) ""))))))
+      (= kind "hasItem")
+      (let [items (coll-of a)]
+        (loop [i 0 last ""]
+          (if (>= i (count items)) (->Res false (str "a collection containing " last) (was a) "")
+            (let [r (check (nth xs 0) (item-actual (nth items i)))]
+              (cond (not= (:err r) "") r
+                    (:ok r) (->Res true (str "a collection containing " (:desc r)) (was a) "")
+                    :else (recur (+ i 1) (:desc r)))))))
+      (= kind "hasSize")
+      (let [n (match (:java a) (v/VArr ys) (count ys) (v/VObj fs) (count fs) (v/VStr s) (uni-len s) _ 0)
+            r (check (nth xs 0) (item-actual (v/int-v n)))]
+        (if (not= (:err r) "") r (->Res (:ok r) (str "a collection with size " (:desc r)) (was a) "")))
+      (= kind "isEmpty")
+      (->Res (= (count (coll-of a)) 0) "an empty collection" (was a) "")
+      (or (= kind "hasKey") (= kind "hasValue"))
+      (let [fs (match (:java a) (v/VObj f) f _ [])
+            key? (= kind "hasKey")
+            wrap (fn Str [d: Str] (if key? (str "map containing [" d "->ANYTHING]") (str "map containing [ANYTHING->" d "]")))]
+        (loop [i 0 last ""]
+          (if (>= i (count fs)) (->Res false (wrap last) (was a) "")
+            (let [f (nth fs i)
+                  r (check (nth xs 0) (item-actual (if key? (v/->VStr (:name (:key f))) (:value f))))]
+              (cond (not= (:err r) "") r
+                    (:ok r) (->Res true (wrap (:desc r)) (was a) "")
+                    :else (recur (+ i 1) (:desc r)))))))
+      (= kind "withMediaType")
+      (let [want (text-of (nth xs 0))] (->Res (= (base-mime want) (:mime a)) want (str "was \"" (:mime a) "\"") ""))
+      (= kind "withEncoding")
+      (let [want (if (v/null? (nth xs 0)) "" (text-of (nth xs 0)))]
+        (->Res (= (str/lower-case want) (str/lower-case (:enc a))) (str "<" want ">") (str "was <" (:enc a) ">") ""))
+      (= kind "closeTo")
+      (let [to-n (fn num/Num [x: v/Val] (match (v/unmeta x) (v/VInt i) (num/from-int i) (v/VNum n) n _ (num/from-int 0)))
+            target (to-n (nth xs 0))
+            tol (to-n (nth xs 1))
+            got (to-n (:java a))
+            d (- (num/to-float got) (num/to-float target))
+            ad (if (< d 0.0) (- 0.0 d) d)]
+        (->Res (<= ad (num/to-float tol)) (str "a numeric value within <" (dbl-str tol) "> of <" (dbl-str target) ">") (was a) ""))
+      :else (res-err (str "Unknown matcher '" kind "'")))))
+
+(defn- assertion-err err/MErr [msg: &Str text: &Str]
+  (assoc (assoc (err/mk "MUNIT-TOOLS" "ASSERTION_ERROR" (str text)) :detailed (str msg)) :cause ASSERTION))
+
+(defn- pval-tv Values(ev/TV Str) [c: &conn/OpCall name: &Str]
+  (let [p (conn/param (:params c) name)]
+    (if (= (count p) 0) (values (ev/tv-null) "")
+      ((:eval-tv c) (nth p 0) (:event c)))))
+
+(defn- run-assert-that conn/OpResult [c: &conn/OpCall]
+  (let [[at ae] (pval-tv c "expression")
+        p (conn/param (:params c) "is")
+        [mv me] (if (= (count p) 0) (values (v/null-v) "") ((:eval c) (nth p 0) (:event c)))
+        [msg xe] (conn/attr-str c "message" "")]
+    (cond
+      (not= ae "") (conn/fail-result (err/mk "MULE" "EXPRESSION" ae))
+      (not= me "") (conn/fail-result (err/mk "MULE" "EXPRESSION" me))
+      (> (count xe) 0) (conn/fail-result (nth xe 0))
+      :else
+      (let [[a pe] (actual-of at)
+            r (check mv a)]
+        (cond
+          (not= pe "") (conn/fail-result (err/mk "MULE" "EXPRESSION" pe))
+          (not= (:err r) "") (conn/fail-result (err/mk "MULE" "EXPRESSION" (:err r)))
+          (:ok r) (conn/keep-result c)
+          :else (conn/fail-result (assertion-err msg (str "Expected: " (:desc r) "\n     but: " (:mis r)))))))))
+
+(defn- run-assert-equals conn/OpResult [c: &conn/OpCall]
+  (let [[at ae] (pval-tv c "actual")
+        [et ee] (pval-tv c "expected")
+        [msg xe] (conn/attr-str c "message" "")]
+    (cond
+      (not= ae "") (conn/fail-result (err/mk "MULE" "EXPRESSION" ae))
+      (not= ee "") (conn/fail-result (err/mk "MULE" "EXPRESSION" ee))
+      (> (count xe) 0) (conn/fail-result (nth xe 0))
+      :else
+      (let [[a pa] (actual-of at)
+            [b pb] (actual-of et)
+            [d de] (dw-diff (:dw a) (:dw b) (v/null-v))
+            r (diff-res d)]
+        (cond
+          (not= de "") (conn/fail-result (err/mk "MULE" "EXPRESSION" de))
+          (:ok r) (conn/keep-result c)
+          :else (conn/fail-result (assertion-err msg (str "Expected: " (:desc r) "\n     but: " (:mis r)))))))))
+
+(defn- run-fail conn/OpResult [c: &conn/OpCall]
+  (let [[msg xe] (conn/attr-str c "message" "")]
+    (if (> (count xe) 0) (conn/fail-result (nth xe 0))
+      (conn/fail-result (err/mk "MUNIT-TOOLS" "ASSERTION_ERROR" msg)))))
+
+(defn- unit-ms Int [u: &Str]
+  (let [x (str/upper-case (str/trim u))]
+    (cond (= x "SECONDS") 1000 (= x "MINUTES") 60000 (= x "HOURS") 3600000 (= x "DAYS") 86400000 :else 1)))
+
+(defn- run-sleep conn/OpResult [c: &conn/OpCall]
+  (let [[t xe] (conn/attr-str c "time" "0")
+        [u ue] (conn/attr-str c "timeUnit" "MILLISECONDS")
+        n (npz/int-or (str/trim t) 0)
+        z (if (> n 0) (sleep-ms (* n (unit-ms u))) 0)]
+    (conn/keep-result c)))
+
+(defrecord Mock [proc: Str attrs: Vec(Str) payload: Vec(ev/TV) attributes: Vec(ev/TV) var-names: Vec(Str) var-tvs: Vec(ev/TV) error: Str])
+(defrecord Call [proc: Str attrs: Vec(Str)])
+
+(defn- no-mocks Vec(Mock) [] (let [z: Vec(Mock) []] z))
+(defn- no-calls Vec(Call) [] (let [z: Vec(Call) []] z))
+(def MOCKS (atom (no-mocks)))
+(def CALLS (atom (no-calls)))
+
+(defn reset-test! Int [] (let [z1 (reset! MOCKS (no-mocks)) z2 (reset! CALLS (no-calls))] 0))
+
+(defn- proc-name Str [p: &Str] (let [t (str/trim p)] (if (< (str/index-of t ":") 0) (str "mule:" t) t)))
+
+(defn- loc-attr Vec(Str) [attrs: &Vec(Str) name: &Str]
+  (loop [i 0] (if (>= (+ i 1) (count attrs)) [] (if (= (nth attrs i) name) [(nth attrs (+ i 1))] (recur (+ i 2))))))
+
+(defn- attrs-match? Bool [want: &Vec(Str) have: &Vec(Str)]
+  (loop [i 0]
+    (if (>= (+ i 1) (count want)) true
+      (let [h (loc-attr have (nth want i))]
+        (if (and (> (count h) 0) (= (nth h 0) (nth want (+ i 1)))) (recur (+ i 2)) false)))))
+
+(defn- attr-path-text Values(Str Str) [c: &conn/OpCall node: &xml/XNode path: &Str name: &Str]
+  (let [p (conn/param (:exprs c) (str path "@" name))]
+    (if (= (count p) 0) (values (xml/attr node "" name "") "")
+      (let [[x e] ((:eval c) (nth p 0) (:event c))] (values (text-of x) e)))))
+
+(defn- with-attrs Values(Vec(Str) Str) [c: &conn/OpCall]
+  (let [w (conn/child-elem (:children c) "with-attributes")
+        kids (if (= (count w) 0) [] (xml/child-elems (nth w 0)))]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count kids)) (values acc "")
+        (let [k (nth kids i)
+              path (if (> (count kids) 1) (str "with-attributes/with-attribute[" i "]") "with-attributes/with-attribute")
+              [v e] (attr-path-text c k path "whereValue")]
+          (if (not= e "") (values acc e) (recur (+ i 1) (conj (conj acc (xml/attr k "" "attributeName" "")) v))))))))
+
+(defn- return-tv Values(Vec(ev/TV) Str) [c: &conn/OpCall tr: &Vec(xml/XNode) local: &Str]
+  (let [n (if (= (count tr) 0) [] (conn/child-elem (xml/child-elems (nth tr 0)) local))]
+    (if (= (count n) 0) (values [] "") (child-tv c (nth n 0) (str "then-return/" local)))))
+
+(defn- run-mock-when conn/OpResult [c: &conn/OpCall]
+  (let [[proc pe] (conn/attr-str c "processor" "")
+        [attrs ae] (with-attrs c)
+        tr (conn/child-elem (:children c) "then-return")
+        [pt pte] (return-tv c tr "payload")
+        [at ate] (return-tv c tr "attributes")
+        trk (if (= (count tr) 0) [] (xml/child-elems (nth tr 0)))
+        en (conn/child-elem trk "error")
+        vn (conn/child-elem trk "variables")
+        vkids (if (= (count vn) 0) [] (xml/child-elems (nth vn 0)))
+        [names tvs ve] (loop [i 0 ns: Vec(Str) [] ts: Vec(ev/TV) []]
+                         (if (>= i (count vkids)) (values ns ts "")
+                           (let [k (nth vkids i)
+                                 path (if (> (count vkids) 1) (str "then-return/variables/variable[" i "]") "then-return/variables/variable")
+                                 [t te] (child-tv c k path)]
+                             (if (not= te "") (values ns ts te)
+                               (recur (+ i 1) (conj ns (xml/attr k "" "key" "")) (conj ts (if (= (count t) 0) (ev/tv-null) (nth t 0))))))))
+        first-err (cond (> (count pe) 0) (:description (nth pe 0)) (not= ae "") ae (not= pte "") pte (not= ate "") ate :else ve)]
+    (if (not= first-err "") (conn/fail-result (err/mk "MULE" "EXPRESSION" first-err))
+      (let [mk (->Mock (proc-name proc) attrs pt at names tvs (if (= (count en) 0) "" (xml/attr (nth en 0) "" "typeId" "")))
+            z (swap! MOCKS (fn Vec(Mock) [ms: Vec(Mock)] (conj ms mk)))]
+        (conn/keep-result c)))))
+
+(defn- count-calls Int [proc: &Str attrs: &Vec(Str)]
+  (let [cs (deref CALLS)]
+    (loop [i 0 n 0] (if (>= i (count cs)) n (recur (+ i 1) (if (and (= (:proc (nth cs i)) proc) (attrs-match? attrs (:attrs (nth cs i)))) (+ n 1) n))))))
+
+(defn- verify-err err/MErr [text: &Str] (assoc (err/mk "MUNIT-TOOLS" "ASSERTION_ERROR" (str text)) :cause ASSERTION-PLAIN))
+
+(defn- run-verify-call conn/OpResult [c: &conn/OpCall]
+  (let [[proc pe] (conn/attr-str c "processor" "")
+        [attrs ae] (with-attrs c)
+        [ts te] (conn/attr-str c "times" "")
+        [ls le] (conn/attr-str c "atLeast" "")
+        [ms me] (conn/attr-str c "atMost" "")
+        p (proc-name proc)
+        n (count-calls p attrs)
+        times (if (and (= ts "") (= ls "") (= ms "")) 1 (npz/int-or (str/trim ts) -1))
+        at-least (npz/int-or (str/trim ls) -1)
+        at-most (npz/int-or (str/trim ms) -1)]
+    (cond
+      (not= ae "") (conn/fail-result (err/mk "MULE" "EXPRESSION" ae))
+      (and (>= times 0) (not= n times)) (conn/fail-result (verify-err (str "On " p ". Expected " times " but got " n " calls")))
+      (and (>= at-least 0) (< n at-least)) (conn/fail-result (verify-err (str "On " p ". Expected at least " at-least " but got " n " calls")))
+      (and (>= at-most 0) (> n at-most)) (conn/fail-result (verify-err (str "On " p ". Expected at most " at-most " but got " n " calls")))
+      :else (conn/keep-result c))))
+
+(defn- munit-elem? Bool [e: &Str] (or (str/starts-with? e "munit:") (str/starts-with? e "munit-tools:")))
+
+(defn intercept Values(Int ev/Event Vec(err/MErr)) [l: &m/Loc e: ev/Event]
+  (if (munit-elem? (:elem l)) (values 0 e [])
+    (let [z (swap! CALLS (fn Vec(Call) [cs: Vec(Call)] (conj cs (->Call (str (:elem l)) (:attrs l)))))
+          ms (deref MOCKS)
+          k (loop [i 0] (if (>= i (count ms)) -1 (if (and (= (:proc (nth ms i)) (:elem l)) (attrs-match? (:attrs (nth ms i)) (:attrs l))) i (recur (+ i 1)))))]
+      (if (< k 0) (values 0 e [])
+        (let [mk (nth ms k)]
+          (if (not= (:error mk) "")
+            (let [t (err/norm-type (:error mk)) i (str/index-of t ":")]
+              (values 1 e [(err/mk (subs t 0 i) (subs t (+ i 1) (count t)) "")]))
+            (let [e1 (ev/with-attributes (ev/with-payload e (if (= (count (:payload mk)) 0) (ev/tv-null) (nth (:payload mk) 0)))
+                                         (if (= (count (:attributes mk)) 0) (ev/tv-null) (nth (:attributes mk) 0)))
+                  e2 (loop [i 0 x e1] (if (>= i (count (:var-names mk))) x (recur (+ i 1) (ev/set-var x (nth (:var-names mk) i) (nth (:var-tvs mk) i)))))]
+              (values 1 e2 []))))))))
+
+(defn- tools-op conn/OpResult [c: conn/OpCall]
+  (let [op (:op c)]
+    (cond
+      (= op "assert-that") (run-assert-that c)
+      (= op "assert-equals") (run-assert-equals c)
+      (= op "fail") (run-fail c)
+      (= op "sleep") (run-sleep c)
+      (= op "mock-when") (run-mock-when c)
+      (= op "verify-call") (run-verify-call c)
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation munit-tools:" op))))))
+
+(defn- child-tv Values(Vec(ev/TV) Str) [c: &conn/OpCall node: &xml/XNode path: &Str]
+  (let [p (conn/param (:exprs c) (str path "@value"))
+        mt (xml/attr node "" "mediaType" "")
+        enc (xml/attr node "" "encoding" "")
+        mime (cond (= mt "") "" (= enc "") mt :else (str mt "; charset=" enc))]
+    (if (> (count p) 0)
+      (let [[t e] ((:eval-tv c) (nth p 0) (:event c))]
+        (if (not= e "") (values [] e)
+          (values [(if (= mime "") t (ev/->TV (:val t) mime (:props t) (:raw t) (:state t) (:stream t)))] "")))
+      (if (not (xml/has-attr? node "" "value")) (values [] "")
+        (values [(ev/tv-val (v/->VStr (xml/attr node "" "value" "")) (if (= mime "") ev/ANY mime))] "")))))
+
+(defn- run-set-event conn/OpResult [c: &conn/OpCall]
+  (let [kids (:children c)
+        find (fn Vec(xml/XNode) [k: Str] (conn/child-elem kids k))
+        pn (find "payload")
+        an (find "attributes")
+        vn (find "variables")
+        [pt pe] (if (= (count pn) 0) (values [] "") (child-tv c (nth pn 0) "payload"))
+        [at ae] (if (= (count an) 0) (values [] "") (child-tv c (nth an 0) "attributes"))
+        e0 (:event c)
+        e1 (if (= (count pt) 0) e0 (ev/with-payload e0 (nth pt 0)))
+        e2 (if (= (count at) 0) e1 (ev/with-attributes e1 (nth at 0)))
+        vkids (if (= (count vn) 0) [] (xml/child-elems (nth vn 0)))
+        [e3 ve] (loop [i 0 e e2]
+                  (if (>= i (count vkids)) (values e "")
+                    (let [k (nth vkids i)
+                          path (if (> (count vkids) 1) (str "variables/variable[" i "]") "variables/variable")
+                          [t te] (child-tv c k path)]
+                      (cond (not= te "") (values e te)
+                            (= (count t) 0) (recur (+ i 1) (ev/set-var e (xml/attr k "" "key" "") (ev/tv-null)))
+                            :else (recur (+ i 1) (ev/set-var e (xml/attr k "" "key" "") (nth t 0)))))))
+        first-err (cond (not= pe "") pe (not= ae "") ae :else ve)]
+    (if (not= first-err "") (conn/fail-result (err/mk "MULE" "EXPRESSION" first-err))
+      (conn/event-result e3 []))))
+
+(defn- munit-op conn/OpResult [c: conn/OpCall]
+  (let [op (:op c)]
+    (cond
+      (= op "set-event") (run-set-event c)
+      (= op "set-null-payload") (conn/event-result (ev/with-payload (:event c) (ev/tv-null)) [])
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation munit:" op))))))
+
+(defn munit-connector conn/Connector []
+  (conn/connector "munit" NS-MUNIT (fn conn/OpResult [c: conn/OpCall] (munit-op c))))
+
+(defn tools-connector conn/Connector []
+  (assoc (conn/connector "munit-tools" NS-TOOLS (fn conn/OpResult [c: conn/OpCall] (tools-op c)))
+         :dw-modules ["MunitTools" TOOLS-MODULE]
+         :error-parents ["MUNIT-TOOLS:ASSERTION_ERROR" "MULE:ANY"]))

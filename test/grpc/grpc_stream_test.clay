@@ -1,0 +1,84 @@
+(ns grpc-stream-test (:require [mulay.conn.grpc :as g] [clay.httpmsg :as hm] [mulay.dw.val :as v]))
+
+(defn- rm Str [body: Str max: Int]
+  (let [[c m ms] (g/read-messages body max)] (str c "|" m "|" (count ms) "|" (if (> (count ms) 0) (nth ms (- (count ms) 1)) ""))))
+
+;; ストリームの要求は 0 個以上のメッセージ。枠の誤りの文言は単項と同じ (grpc-java)
+(deftest stream-request-messages
+  (is (= (rm "" 64) "0||0|"))
+  (is (= (rm (str (g/frame "a") (g/frame "bc")) 64) "0||2|bc"))
+  (is (= (rm (str (g/frame "a") (chr 0) (chr 0)) 64) "13|Encountered end-of-stream mid-frame|0|"))
+  (is (= (rm (str (g/frame "a") (chr 1) (chr 0) (chr 0) (chr 0) (chr 1) "x") 64) "13|Can't decode compressed gRPC message as compression not configured|0|"))
+  (is (= (rm (g/frame "0123456789") 4) "8|gRPC message exceeds maximum size 4: 10|0|")))
+
+;; メソッドの種類と source の組み合わせ (実 Mule 4.11.3: unary のメソッドに server-streaming-method は 12、
+;; ストリーミングのメソッドに unary-method は 2。test/fixtures/apps/grpc-stream と grpc-basic)
+(deftest source-dispatch
+  (is (= (g/dispatch g/K-UNARY "unary-method") "unary"))
+  (is (= (g/dispatch g/K-UNARY "server-streaming-method") "no-executor"))
+  (is (= (g/dispatch g/K-SERVER-STREAM "unary-method") "unknown"))
+  (is (= (g/dispatch g/K-SERVER-STREAM "server-streaming-method") "server-stream"))
+  (is (= (g/dispatch g/K-CLIENT-STREAM "client-streaming-method") "client-stream"))
+  (is (= (g/dispatch g/K-BIDI "bidirectional-streaming-method") "bidi"))
+  (is (= (g/dispatch g/K-BIDI "client-streaming-method") "no-executor")))
+
+(defn- keys-of Str [x: &v/Val]
+  (match (v/unmeta x) (v/VObj fs) (loop [i 0 o ""] (if (>= i (count fs)) o (recur (+ i 1) (str o (:name (:key (nth fs i))) ",")))) _ ""))
+
+(def HS [(hm/->Header "te" "trailers")])
+
+;; 属性の項目の並びは実 Mule の keysOf(attributes)
+(deftest stream-attributes
+  (is (= (keys-of (g/server-stream-attributes "p.S/M" HS "id")) "headers,methodName,connectionId,"))
+  (is (= (keys-of (g/client-stream-attributes HS 2 (v/->VObj []) false)) "headers,messageCount,streamState,streamCompleted,"))
+  (is (= (keys-of (g/bidi-attributes "p.S/M" HS 1 false (v/->VObj []) 1 "id" (v/null-v))) "headers,messageCount,clientStreamCompleted,streamState,methodName,messageIndex,connectionId,timestamp,")))
+
+;; server-streaming の送り口 (send-stream-message と end-stream が connectionId で引く)。送ったメッセージは
+;; 流す応答の sink に入り、end-stream は grpc-status 0 の trailer で閉じる。閉じた後と知らない id は誤り
+(defn- piece Str [sk: hm/Sink]
+  (let [[p done why] (hm/body-next (hm/->Request "POST" "/" [] "" "" 0 "" "HTTP/2" (hm/->Streaming sk)))] p))
+
+(deftest stream-registry
+  (let [[resp sk sig] (g/open-out "c1")
+        e1 (g/push-message "c1" "ab")
+        e2 (g/push-message "nope" "x")
+        p1 (piece sk)
+        open0 (chan-done? sig)
+        z2 (g/end-stream "c1")
+        e3 (g/push-message "c1" "cd")
+        tr (hm/sink-trailers sk)]
+    (is (= e1 ""))
+    (is (= e2 "No active stream found for connection: nope"))
+    (is (= e3 "No active stream found for connection: c1"))
+    (is (= p1 (g/frame "ab")))
+    (is (= open0 true))
+    (is (= (count tr) 1))
+    (is (= (:hd-value (nth tr 0)) "0"))
+    (is (= (:status resp) 200))))
+
+;; フローの失敗は error-response の status で閉じる
+(deftest stream-fail
+  (let [[resp sk sig] (g/open-out "c2")
+        z (g/fail-stream "c2" 10 "stopped")
+        tr (hm/sink-trailers sk)]
+    (is (= (chan-done? sig) true))
+    (is (= (count tr) 2))
+    (is (= (:hd-value (nth tr 0)) "10"))
+    (is (= (:hd-value (nth tr 1)) "stopped"))))
+
+;; 届いた片を枠で切る。片の終わりで途切れた枠は残し、要求の終わり (done) なら途中の終わりの誤り
+(defn- sf Str [buf: Str done: Bool]
+  (let [[c m ms rest] (g/split-frames buf 64 done)] (str c "|" m "|" (count ms) "|" (count rest))))
+
+(deftest split-frames
+  (is (= (sf (str (g/frame "ab") (subs (g/frame "cde") 0 6)) false) "0||1|6"))
+  (is (= (sf (str (g/frame "ab") (subs (g/frame "cde") 0 6)) true) "13|Encountered end-of-stream mid-frame|0|0"))
+  (is (= (sf (subs (g/frame "cde") 0 3) false) "0||0|3"))
+  (is (= (sf (str (chr 2) (chr 0) (chr 0) (chr 0) (chr 1)) false) "13|gRPC frame header malformed: reserved bits not zero|0|0"))
+  (is (= (sf (g/frame (str "0123456789" "0123456789" "0123456789" "0123456789" "0123456789" "0123456789" "0123456789")) false) "8|gRPC message exceeds maximum size 64: 70|0|0")))
+
+;; 属性の headers: te を先頭に、残りは要求の順 (host と : で始まる名前を除く。実 Mule 4.11.3、grpc-stream の Ticks)
+(deftest header-order
+  (let [fs (g/header-fields [(hm/->Header ":path" "/p.S/M") (hm/->Header "host" "h") (hm/->Header "content-type" "application/grpc")
+                             (hm/->Header "te" "trailers") (hm/->Header "x-zeta" "1") (hm/->Header "User-Agent" "u")])]
+    (is (= (keys-of (v/->VObj fs)) "te,content-type,x-zeta,user-agent,"))))

@@ -1,0 +1,188 @@
+(ns misc-test
+  (:require [mulay.lib.time.types :as t]
+            [mulay.lib.time.amount :as am]
+            [mulay.lib.time.local :as l]
+            [mulay.lib.time.tz :as tz]
+            [mulay.lib.time.zoned :as zd]
+            [mulay.lib.time.iso :as iso]
+            [mulay.lib.time.fmt :as fmt]
+            [clay.io :as io]))
+(defextern unlink unlink)
+(defextern rmdir rmdir)
+
+(defn- env Str [k: Str] (getenv k ""))
+
+;; golden に載せにくいもの: DataWeave の Period 規則、リテラルの種類分け、DataWeave 流の表示、
+;; 既定ゾーン、現在時刻、TZif の壊れたファイル、週定義の差し替え、エラー文。期待値は Java 17 / dw CLI で確かめた。
+
+(defn- dwp Str [s: &Str] (let [[p e] (am/parse-dw-period s)] (if (= e "") (am/dw-period-str p) (str "ERR:" e))))
+
+(deftest dw-period-rules
+  (is (= (dwp "P1Y2M3D") "P1Y2M3D"))
+  (is (= (dwp "PT1H30M") "PT1H30M"))
+  (is (= (dwp "P1DT2H") "PT26H"))
+  (is (= (dwp "P1W") "P7D"))
+  (is (= (dwp "-P1D") "P-1D"))
+  (is (= (dwp "PT1.5S") "PT1.5S"))
+  (is (= (dwp "P1Y2M3DT4H") "ERR:Text cannot be parsed to a Duration"))
+  (is (= (dwp "P2DT0H") "PT48H"))
+  (is (= (dwp "PT90M") "PT1H30M")))
+
+(defn- kind Str [s: &Str]
+  (let [[x e] (iso/parse-temporal s)]
+    (if (not= e "") (str "ERR:" e)
+      (match x
+        (iso/TmDate d) (str "Date " (iso/dw-date-str d))
+        (iso/TmTime tm) (str "LocalTime " (iso/dw-time-str tm))
+        (iso/TmLdt y) (str "LocalDateTime " (iso/dw-ldt-str y))
+        (iso/TmOffTime o) (str "Time " (iso/dw-ot-str o))
+        (iso/TmZdt z) (str "DateTime " (iso/dw-zdt-str z true))
+        (iso/TmZone z) (str "TimeZone " (t/zone-id z))
+        (iso/TmPeriod p) (str "Period " (am/dw-period-str p))))))
+
+(deftest dw-literals
+  (is (= (kind "2020-01-01") "Date 2020-01-01"))
+  (is (= (kind "10:00") "LocalTime 10:00:00"))
+  (is (= (kind "10:00:00.100") "LocalTime 10:00:00.1"))
+  (is (= (kind "10:00:00+01:00") "Time 10:00:00+01:00"))
+  (is (= (kind "10:00:00Z") "Time 10:00:00Z"))
+  (is (= (kind "2020-01-01T10:00") "LocalDateTime 2020-01-01T10:00:00"))
+  (is (= (kind "2020-01-01T10:00:00.120Z") "DateTime 2020-01-01T10:00:00.12Z"))
+  (is (= (kind "2020-01-01T10:00:00+05:30") "DateTime 2020-01-01T10:00:00+05:30"))
+  (is (= (kind "2020-01-01T10:00:00-05:00[America/New_York]") "DateTime 2020-01-01T10:00:00-05:00[America/New_York]"))
+  (is (= (kind "2020-01-01T10:00:00Z[Asia/Tokyo]") "DateTime 2020-01-01T19:00:00+09:00[Asia/Tokyo]"))
+  (is (= (kind "-05:00") "TimeZone -05:00"))
+  (is (= (kind "Z") "TimeZone Z"))
+  (is (= (kind "P1D") "Period P1D"))
+  (is (= (kind "PT0.000000001S") "Period PT0.000000001S"))
+  (is (= (kind "2020-13-01") "ERR:Text '2020-13-01' could not be parsed: Invalid value for MonthOfYear (valid values 1 - 12): 13"))
+  (is (= (kind "+10000-01-01") "Date +10000-01-01"))
+  (is (= (kind "-0001-01-01") "Date -0001-01-01")))
+
+(deftest zoned-strict-and-compare
+  (let [[x e] (iso/parse-ldt "2021-03-14T02:30")
+        [y e2] (iso/parse-ldt "2021-06-14T02:30")
+        [ny e3] (tz/zone-of-id "America/New_York")
+        [z1 s1] (zd/zdt-of-strict x -18000 ny)
+        [z2 s2] (zd/zdt-of-strict y -18000 ny)
+        [a ea] (iso/parse-zdt "2021-03-14T03:30-04:00[America/New_York]")]
+    (is (= s1 "LocalDateTime '2021-03-14T02:30' does not exist in zone 'America/New_York' due to a gap in the local time-line, typically caused by daylight savings"))
+    (is (= s2 "ZoneOffset '-05:00' is not valid for LocalDateTime '2021-06-14T02:30' in zone 'America/New_York'"))
+    (is (= (zd/zdt-compare (zd/zdt-of-local x ny []) a) 0))))
+
+(deftest local-errors
+  (let [[d e] (l/date-plus-days (t/->LocalDate 999999999 12 31) 1)
+        [d2 e2] (l/date-plus-months (t/->LocalDate 999999999 12 31) 1)
+        [d3 e3] (l/date-with-year (t/->LocalDate 2020 2 29) 2021)
+        [d4 e4] (l/date-with-month (t/->LocalDate 2020 1 31) 4)
+        [d5 e5] (l/of-date 2021 4 31)
+        [tm e6] (l/of-time 24 0 0 0)
+        [p e7] (l/date-plus-duration (t/->LocalDate 2020 1 1) (am/duration-of-hours 25))]
+    (is (= e "Invalid value for Year (valid values -999999999 - 999999999): 1000000000"))
+    (is (= e2 "Invalid value for Year (valid values -999999999 - 999999999): 1000000000"))
+    (is (= (iso/date-str d3) "2021-02-28"))
+    (is (= (iso/date-str d4) "2020-04-30"))
+    (is (= e5 "Invalid date 'APRIL 31'"))
+    (is (= e6 "Invalid value for HourOfDay (valid values 0 - 23): 24"))
+    (is (= e7 "Unsupported unit: Seconds"))))
+
+(deftest iso-week-definition
+  (let [[f e] (fmt/compile-weeks "YYYY-'W'ww-e" 1 4)
+        [s1 x1] (fmt/format-date f (t/->LocalDate 2021 1 3))
+        [s2 x2] (fmt/format-date f (t/->LocalDate 2020 12 28))
+        [d x3] (fmt/parse-date f "2020-W53-7")]
+    (is (= s1 "2020-W53-7"))
+    (is (= s2 "2020-W53-1"))
+    (is (= (iso/date-str d) "2021-01-03"))))
+
+(deftest parse-errors
+  (let [[f e] (fmt/compile "HH:mm")
+        [d e2] (fmt/parse-date f "10:30")
+        [f2 e3] (fmt/compile "yyyy-MM-dd")
+        [z e4] (fmt/parse-zdt f2 "2021-03-15")]
+    (is (= e2 "Text '10:30' could not be parsed: Unable to obtain LocalDate from TemporalAccessor"))
+    (is (= e4 "Text '2021-03-15' could not be parsed: Unable to obtain ZonedDateTime from TemporalAccessor"))))
+
+(deftest system-zone-and-now
+  (let [old (env "TZ")
+        a (setenv "TZ" "America/New_York")
+        z1 (tz/system-zone)
+        b (setenv "TZ" ":Europe/London")
+        z2 (tz/system-zone)
+        c (setenv "TZ" "Not/AZone")
+        z3 (tz/system-zone)
+        d (setenv "TZ" "/usr/share/zoneinfo/Asia/Tokyo")
+        z4 (tz/system-zone)
+        r (setenv "TZ" old)
+        now (zd/now-zdt-in (t/->TzOffset 0))
+        [ms me] (zd/zdt-epoch-milli now)]
+    (is (= (t/zone-id z1) "America/New_York"))
+    (is (= (t/zone-id z2) "Europe/London"))
+    (is (= (t/zone-id z3) "Z"))
+    (is (= (t/zone-id z4) "Asia/Tokyo"))
+    (is (> (:year (zd/zdt-date now)) 2024))
+    (is (= (rem (:nano (zd/zdt-time now)) 1000) 0))
+    (is (> ms 1700000000000))))
+
+(defn- b32 Str [v: Int]
+  (let [u (if (< v 0) (+ v 4294967296) v)]
+    (str (chr (bit-and (bit-shift-right u 24) 255)) (chr (bit-and (bit-shift-right u 16) 255))
+         (chr (bit-and (bit-shift-right u 8) 255)) (chr (bit-and u 255)))))
+
+(defn- zeros Str [k: Int] (loop [i 0 acc ""] (if (>= i k) acc (recur (+ i 1) (str acc (chr 0))))))
+
+;; TZif v1 だけのファイル: 遷移 1 つ (1000000 秒に +01:00 "AAA" から +02:00 "BBB" 夏時間へ)
+(defn- tzif-v1 Str []
+  (str "TZif" (zeros 16) (b32 0) (b32 0) (b32 0) (b32 1) (b32 2) (b32 8)
+       (b32 1000000) (chr 1)
+       (b32 3600) (chr 0) (chr 0)
+       (b32 7200) (chr 1) (chr 4)
+       "AAA" (chr 0) "BBB" (chr 0)))
+
+(deftest tzif-v1-and-broken-files
+  (let [dir "/tmp/mulay-time-test-tzdir"
+        mk (io/mkdir dir)
+        w1 (write-file (str dir "/Test_V1") (tzif-v1))
+        w2 (write-file (str dir "/Test_Broken") (subs (tzif-v1) 0 30))
+        w3 (write-file (str dir "/Test_NotTzif") "hello world, this is not a tzif file at all.....")
+        old (env "TZDIR")
+        a (setenv "TZDIR" dir)
+        [r ok] (tz/rules-for-id "Test_V1")
+        [b okb] (tz/rules-for-id "Test_Broken")
+        [nz e] (tz/zone-of-id "Test_NotTzif")
+        [m e2] (tz/zone-of-id "Asia/Nowhere")
+        c (setenv "TZDIR" old)
+        rm1 (unsafe (unlink (str dir "/Test_V1")))
+        rm2 (unsafe (unlink (str dir "/Test_Broken")))
+        rm3 (unsafe (unlink (str dir "/Test_NotTzif")))
+        rm4 (unsafe (rmdir dir))
+        [u e3] (tz/zone-of-id "UTC")
+        [g e4] (tz/zone-of-id "GMT-03:30")]
+    (is ok)
+    (is (= (tz/offset-at r 999999) 3600))
+    (is (= (tz/offset-at r 1000000) 7200))
+    (is (= (tz/abbr-at r 0) "AAA"))
+    (is (= (tz/abbr-at r 2000000) "BBB"))
+    (is (tz/dst-at? r 2000000))
+    (is-refuted okb)
+    (is (= e "Unknown time-zone ID: Test_NotTzif"))
+    (is (= e2 "Unknown time-zone ID: Asia/Nowhere"))
+    (is (= (tz/offset-at (tz/rules-of g) 0) -12600))
+    (is (= (tz/offset-at (tz/rules-of u) 0) 0))))
+
+(deftest posix-footers
+  (let [[p ok] (tz/parse-posix "<+1030>-10:30<+11>-11,M10.1.0,M4.1.0")
+        [q ok2] (tz/parse-posix "IST-2IDT,M3.4.4/26,M10.5.0")
+        [r ok3] (tz/parse-posix "<-02>2<-01>,M3.5.0/-1,M10.5.0/0")
+        [s ok4] (tz/parse-posix "JST-9")
+        [u ok5] (tz/parse-posix "EST5EDT,J60/1:30,300")
+        [w ok6] (tz/parse-posix "bad")]
+    (is ok) (is ok2) (is ok3) (is ok4) (is ok5) (is-refuted ok6)
+    (is (= (:std-off p) 37800))
+    (is (= (:dst-off p) 39600))
+    (is (= (:time (:start q)) 93600))
+    (is (= (:time (:start r)) -3600))
+    (is-refuted (:has-dst s))
+    (is (= (:kind (:start u)) 0))
+    (is (= (:time (:start u)) 5400))
+    (is (= (:kind (:end u)) 1))))

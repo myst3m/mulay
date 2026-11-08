@@ -1,0 +1,44 @@
+(ns toy.conn (:require [mulay.rt.conn :as conn] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.dw.val :as v]
+                       [mulay.mule.model :as m] [clay.httpmsg :as hm]))
+
+(def NS "http://www.mulesoft.org/schema/mule/toy")
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (if (= (:op c) "shout")
+    (let [[s x] (conn/attr-str c "text" "")]
+      (if (> (count x) 0) (conn/fail-result (nth x 0))
+        (conn/ok-result (ev/tv-val (v/->VStr (str s "!")) "text/plain") (ev/tv-null))))
+    (conn/fail-result (err/mk "TOY" "UNKNOWN" (str "Unsupported operation toy:" (:op c))))))
+
+(defn- ping Values(Vec(conn/Mount) Str) [app: &m/App fi: Int cref: &Str]
+  (let [cfg (conn/find-config (:configs app) "toy:config" cref)
+        fname (:name (nth (:flows app) fi))
+        none: Vec(conn/Mount) []]
+    (if (= (count cfg) 0) (values none (str "toy config '" cref "' not found"))
+      (let [ps (:params (nth cfg 0))]
+        (values [(conn/->Mount (conn/param-lit ps "listenerConfig" "") (conn/param-lit ps "path" "/ping") ["GET"] true false
+                               (fn hm/Response [ho: conn/Host at: conn/At q: hm/Request]
+                                 (let [e0 (ev/new-event (ev/tv-val (v/->VStr (:uri q)) "text/plain") (ev/tv-null) (conn/corr-id fi) fname)
+                                       [e x] ((:run ho) fi e0)
+                                       [b be] (ev/wire-bytes (:payload e))]
+                                   (hm/response (if (> (count x) 0) 500 200) [] b false))))]
+                "")))))
+
+(defn- mounts Values(Vec(conn/Mount) Vec(Str)) [app: m/App]
+  (let [fs (:flows app)]
+    (loop [i 0 acc: Vec(conn/Mount) [] errs: Vec(Str) []]
+      (if (>= i (count fs)) (values acc errs)
+        (let [srcs (:source (nth fs i))
+              hit (if (= (count srcs) 0) ""
+                    (match (nth srcs 0)
+                      (m/SrcConnector cn nm cref ps ch ex sch loc) (if (and (= cn "toy") (= nm "ping-listener")) (str cref) "")
+                      _ ""))]
+          (if (= hit "") (recur (+ i 1) acc errs)
+            (let [[ms e] (ping app i hit)]
+              (if (not= e "") (recur (+ i 1) acc (conj errs e))
+                (recur (+ i 1) (conj acc (nth ms 0)) errs)))))))))
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "toy" NS (fn conn/OpResult [c: conn/OpCall] (run-op c)))
+         :error-parents ["TOY:UNKNOWN" "MULE:ANY"]
+         :source-elems ["ping-listener"] :routed ["ping-listener"] :mounts mounts))

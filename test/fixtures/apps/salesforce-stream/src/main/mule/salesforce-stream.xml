@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="SF">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <os:object-store name="Got" persistent="false"/>
+
+    <error-handler name="report">
+        <on-error-continue>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 受けたもの: 値の型と、変わらない値だけ -->
+    <sub-flow name="keep">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+fun shape(x) = x match {
+  case o is Object -> o mapObject (v, k) -> {(k): shape(v)}
+  case a is Array -> a map shape($)
+  else -> typeOf(x)
+}
+---
+{payloadClass: payload.^class, payloadMime: payload.^mimeType, payloadShape: shape(payload),
+ attributesClass: attributes.^class, attributesShape: shape(attributes),
+ channel: attributes.channel, name: payload.Name, message: payload.data.payload.Message__c,
+ eventType: attributes."type", eventApiName: attributes.EventApiName}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <os:store key="#[vars.key]" objectStore="Got"><os:value>#[write(payload, "application/json")]</os:value></os:store>
+    </sub-flow>
+
+    <flow name="on-topic">
+        <salesforce:replay-topic-listener config-ref="SF" topic="MulayAccounts" replayOption="ONLY_NEW"/>
+        <set-variable variableName="key" value="topic"/>
+        <flow-ref name="keep"/>
+    </flow>
+
+    <flow name="on-channel">
+        <salesforce:replay-channel-listener config-ref="SF" streamingChannel="/u/MulayChannel" replayOption="ONLY_NEW"/>
+        <set-variable variableName="key" value="channel"/>
+        <flow-ref name="keep"/>
+    </flow>
+
+    <flow name="on-event">
+        <salesforce:replay-channel-listener config-ref="SF" streamingChannel="/event/MulayEvent__e" replayOption="ONLY_NEW"/>
+        <set-variable variableName="key" value="event"/>
+        <flow-ref name="keep"/>
+    </flow>
+
+    <sub-flow name="result-shape">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun s(x) = x match {
+  case o is Object -> (o mapObject ((v, k) -> {(k): if (["id", "message"] contains (k as String)) typeOf(v) else s(v)})) orderBy $$
+  case a is Array -> a map s($)
+  else -> x
+}
+---
+{class: payload.^class, keys: if (payload is Array) keysOf(payload[0]) else keysOf(payload), result: s(payload)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <flow name="topic">
+        <http:listener config-ref="HTTP" path="/topic" allowedMethods="POST"/>
+        <salesforce:publish-topic config-ref="SF" topicName="MulayAccounts" query="SELECT Id, Name FROM Account WHERE Name LIKE 'mulayst%'" description="mulay streaming test"/>
+        <flow-ref name="result-shape"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="channel">
+        <http:listener config-ref="HTTP" path="/channel" allowedMethods="POST"/>
+        <salesforce:publish-streaming-channel config-ref="SF" channelName="/u/MulayChannel" description="mulay streaming test"/>
+        <flow-ref name="result-shape"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="trigger-topic">
+        <http:listener config-ref="HTTP" path="/trigger/topic" allowedMethods="POST"/>
+        <salesforce:create config-ref="SF" type="Account"><salesforce:records>#[[{Name: "mulayst one", Description: "created"}]]</salesforce:records></salesforce:create>
+        <set-payload value="#[output application/json --- {successful: payload.successful}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="push">
+        <http:listener config-ref="HTTP" path="/push" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="ch">
+            <salesforce:salesforce-query>SELECT Id FROM StreamingChannel WHERE Name = '/u/MulayChannel'</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:push-generic-event config-ref="SF" channelId="#[vars.ch[0].Id]">
+            <salesforce:events>#[[{payload: "hello channel"}]]</salesforce:events>
+        </salesforce:push-generic-event>
+        <set-payload value="#[output application/json --- {class: payload.^class, itemClass: payload[0].^class, result: payload}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="publish-event">
+        <http:listener config-ref="HTTP" path="/publish/event" allowedMethods="POST"/>
+        <salesforce:publish-platform-event-message config-ref="SF" platformEventName="MulayEvent__e">
+            <salesforce:platform-event-messages>#[[{Message__c: "hello event"}]]</salesforce:platform-event-messages>
+        </salesforce:publish-platform-event-message>
+        <flow-ref name="result-shape"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="got">
+        <http:listener config-ref="HTTP" path="/got/{key}"/>
+        <until-successful maxRetries="40" millisBetweenRetries="500">
+            <os:retrieve key="#[attributes.uriParams.key]" objectStore="Got"/>
+        </until-successful>
+        <set-payload value="#[output application/json --- read(payload, 'application/json')]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 前の実行の残りを消す (数は実行ごとに違うので返さない) -->
+    <flow name="reset">
+        <http:listener config-ref="HTTP" path="/reset" allowedMethods="POST"/>
+        <flow-ref name="cleanup"/>
+        <set-payload value="#[output application/json --- {ok: true}]"/>
+    </flow>
+
+    <flow name="cleanup">
+        <http:listener config-ref="HTTP" path="/cleanup" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="a">
+            <salesforce:salesforce-query>SELECT Id FROM Account WHERE Name LIKE 'mulayst%'</salesforce:salesforce-query>
+        </salesforce:query>
+        <salesforce:delete config-ref="SF"><salesforce:ids>#[vars.a map $.Id]</salesforce:ids></salesforce:delete>
+        <set-payload value="#[output application/json --- {deleted: sizeOf(payload.items)}]"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

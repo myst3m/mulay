@@ -1,0 +1,145 @@
+(ns mulay.dw.lib.validation
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core] [mulay.dw.numfmt :as nf]
+            [mulay.lib.dec :as d] [mulay.lib.validate :as va] [mulay.lib.regex :as re] [mulay.lib.time.fmt :as tf]
+            [mulay.lib.uni :as u] [clay.string :as str]))
+
+(defrecord JNum [kind: Str i: Int f: Float])
+
+(def DEFAULT-LOCALE "en")
+(def INT-TYPES ["INTEGER" "LONG" "SHORT"])
+
+(defn- blank? Bool [s: &Str] (= (count (u/java-trim s)) 0))
+
+(defn- compat-symbols nf/Syms [locale: &Str]
+  (let [sy (nf/symbols (if (= locale "") DEFAULT-LOCALE locale))
+        fr (or (= (str/lower-case locale) "fr") (str/starts-with? (str/lower-case locale) "fr_") (str/starts-with? (str/lower-case locale) "fr-"))
+        s2 (if fr (assoc (assoc sy :group 0xA0) :mgroup 0xA0) sy)]
+    (assoc s2 :nan "�")))
+
+(defn- neg-zero Float [] (* -1.0 0.0))
+
+(defn- inf Float [] (let [x (* 1.0e300 1.0e300)] x))
+
+(defn- to-number JNum [r: &nf/PRes int-only: Bool]
+  (cond
+    (= (:kind r) 2) (->JNum "Double" 0 (- (inf) (inf)))
+    (= (:kind r) 3) (->JNum "Double" 0 (if (:positive r) (inf) (- 0.0 (inf))))
+    :else
+    (let [x (:value r)
+          pos (:positive r)
+          zero (= (d/signum x) 0)
+          [lv fits] (if zero (values 0 (or pos int-only))
+                      (let [[ip e] (d/set-scale x 0 d/UNNECESSARY)]
+                        (if (not= e "") (values 0 false)
+                          (let [s (d/to-string ip)
+                                lim (if pos "9223372036854775807" "9223372036854775808")
+                                ok (or (< (count s) 19) (and (= (count s) 19) (<= (str-cmp s lim) 0)))]
+                            (if (not ok) (values 0 false)
+                              (if (and (not pos) (= s "9223372036854775808")) (values (- -9223372036854775807 1) true)
+                                (let [[n pe] (parse-long s)] (values (if pos n (- 0 n)) true))))))))]
+      (if fits (->JNum "Long" lv 0.0)
+        (let [fx (d/to-float x)] (->JNum "Double" 0 (if pos fx (if (= fx 0.0) (neg-zero) (- 0.0 fx)))))))))
+
+(defn- str-cmp Int [a: &Str b: &Str]
+  (loop [i 0] (if (>= i (count a)) 0
+                (let [x (nth a i) y (nth b i)] (if (< x y) -1 (if (> x y) 1 (recur (+ i 1))))))))
+
+(defn- long-value Int [n: &JNum]
+  (if (not= (:kind n) "Double") (:i n)
+    (let [x (:f n)]
+      (cond (not (= x x)) 0
+            (>= x 9.223372036854775807e18) 9223372036854775807
+            (<= x -9.223372036854775808e18) (- -9223372036854775807 1)
+            :else (int x)))))
+
+(defn- double-value Float [n: &JNum] (if (= (:kind n) "Double") (:f n) (float (:i n))))
+
+(def FLOAT-MIN 1.401298464324817e-45)
+(def FLOAT-MAX 3.4028234663852886e38)
+
+(defn- typed Vec(JNum) [n: &JNum type: &Str]
+  (cond
+    (= type "INTEGER") (let [lv (long-value n)] (if (or (< lv -2147483648) (> lv 2147483647)) [] [(->JNum "Integer" lv 0.0)]))
+    (= type "LONG") (if (= (:kind n) "Long") [n] [])
+    (= type "SHORT") (let [lv (long-value n)] (if (or (< lv -32768) (> lv 32767)) [] [(->JNum "Short" lv 0.0)]))
+    (= type "DOUBLE") [(->JNum "Double" 0 (double-value n))]
+    :else (let [x (double-value n)
+                ax (if (< x 0.0) (- 0.0 x) x)]
+            (if (and (not= x 0.0) (or (< ax FLOAT-MIN) (> ax FLOAT-MAX))) [] [(->JNum "Float" 0 x)]))))
+
+(defn parse-number Values(Vec(JNum) Str) [value: &Str pattern: &Str locale: &Str type: &Str]
+  (let [s (u/java-trim value)]
+    (if (= (count s) 0) (values [] "")
+      (let [[p pe] (nf/compile-pattern (if (blank? pattern) "#,##0.###" pattern))]
+        (if (not= pe "") (values [] pe)
+          (let [int-only (or (= type "INTEGER") (= type "LONG") (= type "SHORT"))
+                r (nf/parse-at s p (compat-symbols locale) int-only)]
+            (if (or (= (:kind r) 0) (< (:end r) (count s))) (values [] "")
+              (values (typed (to-number r int-only) type) ""))))))))
+
+(defn format-num Str [n: &JNum]
+  (if (or (= (:kind n) "Double") (= (:kind n) "Float"))
+    (let [x (:f n)]
+      (cond (not (= x x)) "�"
+            (and (not= x 0.0) (= x (* x 2.0))) (if (> x 0.0) "∞" "-∞")
+            (and (= x 0.0) (< (/ 1.0 x) 0.0)) "-0"
+            :else (let [[dx e] (d/from-float x)
+                        [s fe z] (nf/format-dec dx "#,##0.###" DEFAULT-LOCALE d/HALF-EVEN)] s)))
+    (let [[s fe z] (nf/format-dec (d/from-int (:i n)) "#,##0.###" DEFAULT-LOCALE d/HALF-EVEN)] s)))
+
+(defn compare-num Int [a: &JNum b: &JNum]
+  (if (or (= (:kind a) "Double") (= (:kind a) "Float"))
+    (let [x (:f a) y (:f b)
+          xn (not (= x x)) yn (not (= y y))]
+      (cond (and xn yn) 0 xn 1 yn -1
+            (< x y) -1 (> x y) 1
+            :else (let [xz (and (= x 0.0) (< (/ 1.0 x) 0.0)) yz (and (= y 0.0) (< (/ 1.0 y) 0.0))]
+                    (cond (= xz yz) 0 xz -1 :else 1))))
+    (cond (< (:i a) (:i b)) -1 (> (:i a) (:i b)) 1 :else 0)))
+
+(defn parse-bound Vec(JNum) [s: &Str type: &Str]
+  (if (blank? s) [] (let [[n e] (parse-number s "" DEFAULT-LOCALE type)] n)))
+
+(defn time-check Values(Bool Str) [time: &Str pattern: &Str locale: &Str]
+  (let [[f e] (tf/compile-locale pattern (if (= locale "") DEFAULT-LOCALE locale) false)]
+    (if (not= e "") (values false e)
+      (let [[p pe] (tf/parse f time)] (values (= pe "") "")))))
+
+(defn regex-check Values(Bool Str) [value: &Str regex: &Str case-sensitive: Bool]
+  (if (= (count regex) 0) (values false "Regular expression[0] is missing")
+    (let [[p e] (re/compile regex (if case-sensitive 0 re/CASE-INSENSITIVE))]
+      (if (not= e "") (values false e)
+        (let [[ok me] (re/matches? p value)] (values ok ""))))))
+
+(defn email-ok? Bool [s: &Str] (and (= (u/java-trim s) s) (va/email? s)))
+
+(def M "dw::Validation")
+
+(defn- java-ex Values(v/Val dwe/DwErr) [msg: &Str] (rt/failure "ExecutionException" (str msg)))
+
+(defn- is-email Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (core/ok (v/bool-v (email-ok? (core/arg-str a 0)))))
+(defn- is-ip Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (core/ok (v/bool-v (va/inet-address? (core/arg-str a 0)))))
+(defn- is-url Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (core/ok (v/bool-v (va/url? (core/arg-str a 0)))))
+
+(defn- matches-regex Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [cs (if (< (count a) 3) true (match (v/unmeta (nth a 2)) (v/VBool b) b (v/VStr s) (= (str/lower-case s) "true") _ true))
+        [ok e] (regex-check (core/arg-str a 0) (core/arg-str a 1) cs)]
+    (if (not= e "") (java-ex e) (core/ok (v/bool-v ok)))))
+
+(defn- is-time Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (if (or (< (count a) 2) (v/null? (nth a 1))) (java-ex "pattern")
+    (let [loc (if (or (< (count a) 3) (v/null? (nth a 2))) DEFAULT-LOCALE (core/arg-str a 2))
+          [ok e] (time-check (core/arg-str a 0) (core/arg-str a 1) loc)]
+      (if (not= e "") (java-ex e) (core/ok (v/bool-v ok))))))
+
+(defn- is-number Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[n e] (parse-number (core/arg-str a 0) "" DEFAULT-LOCALE (str/upper-case (core/arg-str a 1)))]
+    (if (not= e "") (java-ex e) (core/ok (v/bool-v (> (count n) 0))))))
+
+(defn builtins Vec(rt/Builtin) []
+  [(rt/builtin "isEmail" M [(rt/b1 "String" is-email)])
+   (rt/builtin "isIp" M [(rt/b1 "String" is-ip)])
+   (rt/builtin "isUrl" M [(rt/b1 "String" is-url)])
+   (rt/builtin "matchesRegex" M [(rt/b2 "String" "String" matches-regex) (rt/overload ["String" "String" "Any"] matches-regex)])
+   (rt/builtin "isTime" M [(rt/b1 "String" is-time) (rt/b2 "String" "Any" is-time) (rt/overload ["String" "Any" "Any"] is-time)])
+   (rt/builtin "isNumber" M [(rt/b2 "String" "String" is-number)])])

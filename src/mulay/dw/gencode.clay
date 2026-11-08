@@ -1,0 +1,582 @@
+(ns mulay.dw.gencode
+  (:require [mulay.dw.val :as v] [mulay.dw.rir :as r] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.gen :as g] [mulay.dw.genreg :as gr] [clay.string :as str]))
+
+(defrecord Cx [p: r/Prog names: Vec(Str) bodyid: Vec(Int) defids: Vec(Vec(Int))])
+
+(defrecord Ev [fr: Str locals: Vec(Str) caps: Str nslots: Int])
+
+(defrecord St [delegated: Vec(Int) keys: Vec(Str)])
+
+(defn- key-const Values(Str St) [st: St name: &Str]
+  (let [ks (:keys st)
+        i (loop [i 0] (if (>= i (count ks)) -1 (if (= (nth ks i) name) i (recur (+ i 1)))))]
+    (if (>= i 0) (values (str "KEY" i) st)
+      (values (str "KEY" (count ks)) (->St (:delegated st) (conj ks name))))))
+
+(defn- frame-ev Ev [fr: Str] (->Ev fr [] "" 0))
+
+(defn- sp Str [k: Int] (str "(nth (:sps g) " k ")"))
+(defn- deep Str [k: Int d: &Str body: &Str] (str "(if (> " d " ev/MAX-STACK) (ev/so " (sp k) ") " body ")"))
+
+(defn- slot-expr Str [e: &Ev i: Int]
+  (if (not= (:fr e) "") (str "(nth (:slots " (:fr e) ") " i ")")
+    (if (and (< i (count (:locals e))) (not= (nth (:locals e) i) "")) (nth (:locals e) i) "(v/null-v)")))
+
+(defn- caps-expr Str [e: &Ev] (if (not= (:fr e) "") (str "(:caps " (:fr e) ")") (:caps e)))
+
+(defn- frame-expr Str [e: &Ev]
+  (if (not= (:fr e) "") (:fr e)
+    (let [slots (loop [i 0 out "["] (if (>= i (:nslots e)) (str out "]") (recur (+ i 1) (str out (if (= i 0) "" " ") (slot-expr e i)))))]
+      (str "(ev/->Frame " slots " " (:caps e) ")"))))
+
+(defn- bind-local Ev [e: &Ev i: Int x: &Str]
+  (->Ev "" (assoc (:locals e) i x) (:caps e) (:nslots e)))
+
+(defn- kid-id Int [k: Int ks: &Vec(r/R) j: Int]
+  (loop [i 0 id (+ k 1)] (if (>= i j) id (recur (+ i 1) (+ id (g/size (nth ks i)))))))
+
+(defn lit Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [ch (nth s i)]
+        (recur (+ i 1)
+               (cond (= ch 34) (str out "\\\"")
+                     (= ch 92) (str out "\\\\")
+                     (= ch 10) (str out "\\n")
+                     (= ch 9) (str out "\\t")
+                     (= ch 13) (str out "\\r")
+                     (< ch 32) (str out "\" (chr " ch ") \"")
+                     :else (str out (subs s i (+ i 1)))))))))
+
+(defn- delegate Values(Str St) [st: St k: Int e: &Ev d: &Str]
+  (values (str "(ev/run (nth (:cs g) " k ") c " (frame-expr e) " " d ")") (->St (conj (:delegated st) k) (:keys st))))
+
+(defn- direct Str [n: &r/R k: Int e: &Ev]
+  (match (:x n)
+    (r/RSlot i) (slot-expr e i)
+    (r/RConst x) (str "(nth (:vals g) " k ")")
+    _ ""))
+
+(defn- emit-args Values(Str Str St) [st: St cx: &Cx ks: &Vec(r/R) ids: &Vec(Int) k: Int e: &Ev d: &Str fail-pre: &Str fail-post: &Str]
+  (loop [j 0 pre "" post "" s st]
+    (if (>= j (count ks)) (values pre post s)
+      (let [[code s2] (emit-v s cx (nth ks j) (nth ids j) e d)
+            a (str "a" k "_" j) ea (str "ea" k "_" j)]
+        (recur (+ j 1) (str pre "(let [[" a " " ea "] " code "] (if (not (dwe/ok? " ea ")) " fail-pre ea fail-post " ") (str post "))") s2)))))
+
+(defn- arg-vec Str [k: Int n: Int]
+  (loop [j 0 out "["] (if (>= j n) (str out "]") (recur (+ j 1) (str out (if (= j 0) "" " ") "a" k "_" j)))))
+
+(defn- ids-of Vec(Int) [k: Int ks: &Vec(r/R) from: Int n: Int]
+  (loop [j 0 acc: Vec(Int) []] (if (>= j n) acc (recur (+ j 1) (conj acc (kid-id k ks (+ from j)))))))
+
+(defn- sub Vec(r/R) [ks: &Vec(r/R) from: Int n: Int]
+  (loop [j 0 acc: Vec(r/R) []] (if (>= j n) acc (recur (+ j 1) (conj acc (nth ks (+ from j)))))))
+
+(defn emit-v Values(Str St) [st: St cx: &Cx n: &r/R k: Int e: &Ev d: &Str]
+  (let [ks (r/kids n)
+        x (str "x" k) er (str "e" k)]
+    (match (:x n)
+      (r/RConst c0) (values (deep k d (str "(values (nth (:vals g) " k ") (dwe/ok))")) st)
+      (r/RSlot i) (values (deep k d (str "(values " (slot-expr e i) " (dwe/ok))")) st)
+      (r/RCap i) (values (deep k d (str "(values (nth " (caps-expr e) " " i ") (dwe/ok))")) st)
+      (r/RGlob i) (values (deep k d (str "(if (< " i " (count (:globals c))) (values (nth (:globals c) " i ") (dwe/ok)) (ev/no-var "
+                                         (lit (r/glob-name (:p cx) i)) " " (sp k) "))")) st)
+      (r/RInput i) (values (deep k d (str "(values (nth (:inputs c) " i ") (dwe/ok))")) st)
+      (r/RNumOp op id l rr)
+      (let [lk (kid-id k ks 0) rk (kid-id k ks 1)
+            ld (direct l lk e) rd (direct rr rk e)
+            [lc s1] (if (= ld "") (emit-v st cx l lk e d) (values "" st))
+            [rc s2] (if (= rd "") (emit-v s1 cx rr rk e d) (values "" s1))
+            lx (if (= ld "") (str "l" k) ld)
+            rx (if (= rd "") (str "r" k) rd)
+            call (str "(ev/num-op-vals c " op " " id " " lx " " rx " " d " " (sp k) ")")
+            inner (if (= rd "") (str "(let [[r" k " er" k "] " rc "] (if (not (dwe/ok? er" k ")) (values r" k " er" k ") " call "))") call)
+            outer (if (= ld "") (str "(let [[l" k " el" k "] " lc "] (if (not (dwe/ok? el" k ")) (values l" k " el" k ") " inner "))") inner)]
+        (values (deep k d outer) s2))
+      (r/RIf cnd th el)
+      (let [[cc s1] (emit-v st cx cnd (kid-id k ks 0) e d)
+            [tc s2] (emit-v s1 cx th (kid-id k ks 1) e d)
+            [ec s3] (emit-v s2 cx el (kid-id k ks 2) e d)]
+        (values (deep k d (str "(let [[" x " " er "] " cc "] (if (not (dwe/ok? " er ")) (values " x " " er ") "
+                               "(let [[b" k " f" k "] (ev/if-cond " x " " (sp (kid-id k ks 0)) ")] (if (not (dwe/ok? f" k ")) (values (ev/nul) f" k ") "
+                               "(if b" k " " tc " " ec ")))))"))
+                s3))
+      (r/RAnd l rr) (emit-andor st cx ks k e d true)
+      (r/ROr l rr) (emit-andor st cx ks k e d false)
+      (r/RNot x0)
+      (let [[xc s1] (emit-v st cx x0 (kid-id k ks 0) e d)]
+        (values (deep k d (str "(let [[" x " " er "] " xc "] (if (not (dwe/ok? " er ")) (values " x " " er ") "
+                               "(let [[b" k " f" k "] (ev/truthy " x " " (sp (kid-id k ks 0)) ")] (values (v/bool-v (not b" k ")) f" k "))))"))
+                s1))
+      (r/RDefault x0 fb)
+      (let [[xc s1] (emit-v st cx x0 (kid-id k ks 0) e d)
+            [fc s2] (emit-v s1 cx fb (kid-id k ks 1) e d)]
+        (values (deep k d (str "(let [[" x " " er "] " xc "] (if (not (dwe/ok? " er ")) (if (ev/default-catches? " er ") " fc " (values " x " " er ")) "
+                               "(if (v/null? " x ") " fc " (values " x " (dwe/ok)))))"))
+                s2))
+      (r/RLet slot x0 body)
+      (let [[xc s1] (emit-v st cx x0 (kid-id k ks 0) e d)]
+        (if (not= (:fr e) "")
+          (let [f2 (str "fr" k)
+                [bc s2] (emit-v s1 cx body (kid-id k ks 1) (frame-ev f2) d)]
+            (values (deep k d (str "(let [[" x " " er "] " xc "] (if (not (dwe/ok? " er ")) (values " x " " er ") "
+                                   "(let [" f2 " (ev/->Frame (assoc (:slots " (:fr e) ") " slot " " x ") (:caps " (:fr e) "))] " bc ")))"))
+                    s2))
+          (let [[bc s2] (emit-v s1 cx body (kid-id k ks 1) (bind-local e slot x) d)]
+            (values (deep k d (str "(let [[" x " " er "] " xc "] (if (not (dwe/ok? " er ")) (values " x " " er ") " bc "))")) s2))))
+      (r/RCallB id args)
+      (let [hof (hof-kind cx id ks)
+            fk (fold-kind cx id ks)]
+        (cond
+          (> fk 0)
+          (let [inner (nth ks 0)
+                ik (kid-id k ks 0)
+                iid (match (:x inner) (r/RCallB i2 a2) i2 _ 0)
+                iks (r/kids inner)]
+            (emit-hof st cx iks ik e d iid (hof-kind cx iid iks) fk k id))
+          (> hof 0) (emit-hof st cx ks k e d id hof 0 0 0)
+          :else
+          (let [[pre post s1] (emit-args st cx ks (ids-of k ks 0 (count ks)) k e d "(values (ev/nul) " ")")
+                generic (str "(let [[" x " " er "] (rt/invoke (ev/env-of c " d ") (nth (:builtins c) " id ") " (arg-vec k (count ks)) ")] (values " x " (dwe/at " er " " (sp k) ")))")
+                fast (fast-builtin (nth (:names cx) id) k (count ks) generic)]
+            (values (deep k d (str pre (if (= fast "") generic fast) post)) s1))))
+      (r/RCallG df args)
+      (let [[pre post s1] (emit-args st cx ks (ids-of k ks 0 (count ks)) k e d "(values (ev/nul) " ")")]
+        (values (deep k d (str pre "(ev/call-def c " df " [] " (arg-vec k (count ks)) " (+ " d " 1) " (sp k) " true)" post)) s1))
+      (r/RCall fe args)
+      (let [[fc s1] (emit-v st cx fe (kid-id k ks 0) e d)
+            n2 (- (count ks) 1)
+            [pre post s2] (emit-args s1 cx (sub ks 1 n2) (ids-of k ks 1 n2) k e d "(values (ev/nul) " ")")]
+        (values (deep k d (str "(let [[" x " " er "] " fc "] (if (not (dwe/ok? " er ")) (values " x " " er ") "
+                               pre "(ev/call-val-at c " x " " (arg-vec k n2) " (+ " d " 1) " (sp k) " " (sp (kid-id k ks 0)) ")" post "))"))
+                s2))
+      (r/RClosure df caps)
+      (let [fd (nth (:fns (:p cx)) df)
+            [pre post s1] (emit-args st cx ks (ids-of k ks 0 (count ks)) k e d "(values (ev/nul) " ")")]
+        (values (deep k d (str pre "(values (v/->VFn (v/->FnV " df " " (arg-vec k (count ks)) " (->None) " (count (:params fd)) ")) (dwe/ok))" post))
+                s1))
+      (r/RSibling df)
+      (let [fd (nth (:fns (:p cx)) df)]
+        (values (deep k d (str "(values (v/->VFn (v/->FnV " df " " (caps-expr e) " (->None) " (count (:params fd)) ")) (dwe/ok))")) st))
+      (r/RAs x0 ty)
+      (let [[xc s1] (emit-v st cx x0 (kid-id k ks 0) e d)]
+        (values (deep k d (str "(let [[" x " " er "] " xc "] (if (not (dwe/ok? " er ")) (values " x " " er ") "
+                               "(match (nth (:vals g) " k ") (v/VType t" k ") (let [[y" k " f" k "] (co/coerce " x " t" k ")] (values y" k " (dwe/at f" k " " (sp k) "))) "
+                               "_ (values " x " (dwe/ok)))))"))
+                s1))
+      (r/RIs x0 ty)
+      (let [[xc s1] (emit-v st cx x0 (kid-id k ks 0) e d)]
+        (values (deep k d (str "(let [[" x " " er "] " xc "] (if (not (dwe/ok? " er ")) (values " x " " er ") "
+                               "(match (nth (:vals g) " k ") (v/VType t" k ") (values (v/bool-v (co/is-type? " x " t" k ")) (dwe/ok)) "
+                               "_ (values " x " (dwe/ok)))))"))
+                s1))
+      (r/RInterp parts) (emit-interp st cx ks k e d)
+      (r/RObj entries)
+      (if (simple-obj? entries) (emit-obj st cx n ks k e d) (delegate st k e d))
+      (r/RArr elems) (emit-arr st cx n ks k e d)
+      (r/RSel t s)
+      (match s
+        (r/SKey nsx name)
+        (if (> (count nsx) 0) (delegate st k e d)
+          (let [[tc s1] (emit-v st cx t (kid-id k ks 0) e d)]
+            (values (deep k d (str "(let [[" x " " er "] " tc "] (if (not (dwe/ok? " er ")) (values " x " " er ") "
+                                   "(let [[y" k " f" k "] (sel/key-sel " x " " (lit name) ")] (values y" k " (dwe/at f" k " " (sp k) ")))))"))
+                    s1)))
+        _ (delegate st k e d))
+      _ (delegate st k e d))))
+
+(defn- emit-interp Values(Str St) [st: St cx: &Cx ks: &Vec(r/R) k: Int e: &Ev d: &Str]
+  (let [n (count ks)]
+    (loop [j 0 pre "" post "" ts "" s st]
+      (if (>= j n)
+        (values (deep k d (str pre "(values (v/->VStr (str \"\"" ts ")) (dwe/ok))" post)) s)
+        (let [pk (kid-id k ks j)
+              [pc s2] (emit-v s cx (nth ks j) pk e d)
+              pv (str "ip" k "_" j) pe (str "ie" k "_" j) tv (str "it" k "_" j) te (str "ite" k "_" j)
+              te0 (str "ite" k "_0")
+              bad (cond (= n 1) (str "(not (dwe/ok? " te "))")
+                        (= j 0) "false"
+                        (= j 1) (str "(or (not (dwe/ok? " te ")) (not (dwe/ok? " te0 ")))")
+                        :else (str "(not (dwe/ok? " te "))"))
+              fail (cond (= n 1) (str "(values (ev/nul) (dwe/at " te " " (sp pk) "))")
+                         (= j 1) (str "(values (ev/nul) (ev/append-fail (copy ip" k "_0) " pv " " (sp pk) "))")
+                         :else (str "(values (ev/nul) (ev/append-fail (v/->VStr (str \"\"" ts ")) " pv " " (sp pk) "))"))]
+          (recur (+ j 1)
+                 (str pre "(let [[" pv " " pe "] " pc "] (if (not (dwe/ok? " pe ")) (values " pv " " pe ") "
+                      "(let [[" tv " " te "] (rt/to-text " pv ")] (if " bad " " fail " ")
+                 (str post "))))")
+                 (str ts " " tv)
+                 s2))))))
+
+(defn- simple-obj? Bool [es: &Vec(r/REntry)]
+  (loop [i 0]
+    (if (>= i (count es)) true
+      (match (nth es i)
+        (r/REKV key attrs x cnd) (match key
+                                   (r/RKName nsx name) (if (and (= (count nsx) 0) (= (count attrs) 0)) (recur (+ i 1)) false)
+                                   (r/RKExpr nsx ke) (if (and (= (count nsx) 0) (= (count attrs) 0)) (recur (+ i 1)) false))
+        (r/RESpread x cnd) (recur (+ i 1))))))
+
+(defn- emit-cond Values(Str St) [st: St cx: &Cx cnd: &r/R cid: Int e: &Ev d: &Str tag: &Str then: &Str else: &Str fail: &Str]
+  (let [[cc s1] (emit-v st cx cnd cid e d)]
+    (values (str "(let [[cv" tag " ce" tag "] " cc "] (if (not (dwe/ok? ce" tag ")) " fail "(ev/nul) ce" tag ") "
+                 "(let [[cb" tag " cf" tag "] (ev/truthy cv" tag " " (sp cid) ")] (if (not (dwe/ok? cf" tag ")) " fail "(ev/nul) cf" tag ") "
+                 "(if cb" tag " " then " " else ")))))")
+            s1)))
+
+(defn- emit-obj Values(Str St) [st: St cx: &Cx n: &r/R ks: &Vec(r/R) k: Int e: &Ev d: &Str]
+  (let [es (match (:x n) (r/RObj xs) xs _ [])
+        ne (count es)]
+    (loop [i (- ne 1) body (str "(values (v/->VObj " (str "fs" k "_" ne) ") (dwe/ok))") s st kidx (count ks)]
+      (if (< i 0)
+        (values (deep k d (str "(let [fs" k "_0: Vec(v/Field) []] " body ")")) s)
+        (let [cur (str "fs" k "_" i) nxt (str "fs" k "_" (+ i 1)) tag (str k "_" i)
+              skip (str "(let [" nxt " " cur "] " body ")")]
+          (match (nth es i)
+            (r/REKV key attrs x cnd)
+            (let [dyn (match key (r/RKExpr nsx ke) true _ false)
+                  nk (+ (if dyn 2 1) (count cnd))
+                  base (- kidx nk)
+                  vid (kid-id k ks (if dyn (+ base 1) base))
+                  [vc s0] (emit-v s cx x vid e d)
+                  put-field (fn Str [kc: Str] (str "(let [[fv" tag " fe" tag "] " vc "] (if (not (dwe/ok? fe" tag ")) (values fv" tag " fe" tag ") "
+                                             "(let [" nxt " (conj " cur " (v/->Field " kc " fv" tag "))] " body ")))"))
+                  [push s1] (if (not dyn)
+                              (let [[kc sk] (key-const s0 (match key (r/RKName nsx nm) nm _ ""))] (values (put-field kc) sk))
+                              (let [kid (kid-id k ks base)
+                                    [kc sk] (emit-v s0 cx (match key (r/RKExpr nsx ke) ke _ x) kid e d)]
+                                (values (str "(let [[kv" tag " kve" tag "] " kc "] (if (not (dwe/ok? kve" tag ")) (values (ev/nul) kve" tag ") "
+                                             "(let [[kk" tag " kke" tag "] (ev/key-of kv" tag " [] [] false " (sp kid) ")] (if (not (dwe/ok? kke" tag ")) (values (ev/nul) kke" tag ") "
+                                             (put-field (str "kk" tag)) "))))")
+                                        sk)))
+                  [code s2] (if (= (count cnd) 0) (values push s1)
+                              (emit-cond s1 cx (nth cnd 0) (kid-id k ks (+ base (if dyn 2 1))) e d tag push skip "(values "))]
+              (recur (- i 1) code s2 base))
+            (r/RESpread x cnd)
+            (let [nk (+ 1 (count cnd))
+                  base (- kidx nk)
+                  xid (kid-id k ks base)
+                  [xc s0] (emit-v s cx x xid e d)
+                  push (str "(let [[sv" tag " sve" tag "] " xc "] (if (not (dwe/ok? sve" tag ")) (values sv" tag " sve" tag ") "
+                            "(let [[" nxt " sfe" tag "] (ev/spread-fields " cur " sv" tag " " (sp xid) ")] (if (not (dwe/ok? sfe" tag ")) (values (ev/nul) sfe" tag ") " body "))))")
+                  [code s2] (if (= (count cnd) 0) (values push s0)
+                              (emit-cond s0 cx (nth cnd 0) (kid-id k ks (+ base 1)) e d tag push skip "(values "))]
+              (recur (- i 1) code s2 base))))))))
+
+(defn- emit-arr Values(Str St) [st: St cx: &Cx n: &r/R ks: &Vec(r/R) k: Int e: &Ev d: &Str]
+  (let [es (match (:x n) (r/RArr xs) xs _ [])
+        ne (count es)]
+    (loop [i (- ne 1) body (str "(values (v/->VArr " (str "xs" k "_" ne) ") (dwe/ok))") s st kidx (count ks)]
+      (if (< i 0)
+        (values (deep k d (str "(let [xs" k "_0: Vec(v/Val) []] " body ")")) s)
+        (let [el (nth es i)
+              cnd (:cond el)
+              nk (+ 1 (count cnd))
+              base (- kidx nk)
+              [vc s1] (emit-v s cx (:value el) (kid-id k ks base) e d)
+              cur (str "xs" k "_" i) nxt (str "xs" k "_" (+ i 1))
+              push (str "(let [[av" k "_" i " ae" k "_" i "] " vc "] (if (not (dwe/ok? ae" k "_" i ")) (values av" k "_" i " ae" k "_" i ") "
+                        "(let [" nxt " (conj " cur " av" k "_" i ")] " body ")))")
+              skip (str "(let [" nxt " " cur "] " body ")")
+              [code s2] (if (= (count cnd) 0) (values push s1)
+                          (emit-cond s1 cx (nth cnd 0) (kid-id k ks (+ base 1)) e d (str k "_" i) push skip "(values "))]
+          (recur (- i 1) code s2 base))))))
+
+(defn- emit-andor Values(Str St) [st: St cx: &Cx ks: &Vec(r/R) k: Int e: &Ev d: &Str and?: Bool]
+  (let [lk (kid-id k ks 0) rk (kid-id k ks 1)
+        [lc s1] (emit-v st cx (nth ks 0) lk e d)
+        [rc s2] (emit-v s1 cx (nth ks 1) rk e d)
+        x (str "x" k) er (str "e" k)
+        rhs (str "(let [[y" k " q" k "] " rc "] (if (not (dwe/ok? q" k ")) (values y" k " q" k ") "
+                 "(let [[c" k " h" k "] (ev/truthy y" k " " (sp rk) ")] (values (v/bool-v c" k ") h" k "))))")
+        short (if and? "(values (v/bool-v false) (dwe/ok))" "(values (v/bool-v true) (dwe/ok))")]
+    (values (deep k d (str "(let [[" x " " er "] " lc "] (if (not (dwe/ok? " er ")) (values " x " " er ") "
+                           "(let [[b" k " f" k "] (ev/truthy " x " " (sp lk) ")] (if (not (dwe/ok? f" k ")) (values (ev/nul) f" k ") "
+                           (if and? (str "(if b" k " " rhs " " short ")") (str "(if b" k " " short " " rhs ")")) "))))"))
+            s2)))
+
+(defn- emit-t-body Values(Str St) [st: St cx: &Cx n: &r/R k: Int e: &Ev d: &Str]
+  (match (:x n)
+    (r/RCallG df args) (emit-t-plain st cx n k e d)
+    (r/RCall fe args) (emit-t-plain st cx n k e d)
+    _ (emit-t st cx n k e d)))
+
+(defn- emit-t-plain Values(Str St) [st: St cx: &Cx n: &r/R k: Int e: &Ev d: &Str]
+  (let [x (str "x" k) er (str "e" k)
+        [vc s1] (emit-v st cx n k e (str "d" k))]
+    (values (str "(let [d" k " (+ " d " 1) [" x " " er "] " vc "] (values " x " " er " -1 ev/NO-FRAME))") s1)))
+
+(defn emit-t Values(Str St) [st: St cx: &Cx n: &r/R k: Int e: &Ev d: &Str]
+  (let [ks (r/kids n)
+        fr (:fr e)
+        x (str "x" k) er (str "e" k)]
+    (match (:x n)
+      (r/RIf cnd th el)
+      (let [[cc s1] (emit-v st cx cnd (kid-id k ks 0) e d)
+            [tc s2] (emit-t s1 cx th (kid-id k ks 1) e d)
+            [ec s3] (emit-t s2 cx el (kid-id k ks 2) e d)]
+        (values (str "(let [[" x " " er "] " cc "] (if (not (dwe/ok? " er ")) (values " x " " er " -1 ev/NO-FRAME) "
+                     "(let [[b" k " f" k "] (ev/if-cond " x " " (sp (kid-id k ks 0)) ")] (if (not (dwe/ok? f" k ")) (values (ev/nul) f" k " -1 ev/NO-FRAME) "
+                     "(if b" k " " tc " " ec ")))))")
+                s3))
+      (r/RLet slot x0 body)
+      (let [f2 (str "fr" k)
+            [xc s1] (emit-v st cx x0 (kid-id k ks 0) e d)
+            [bc s2] (emit-t s1 cx body (kid-id k ks 1) (frame-ev f2) d)]
+        (values (str "(let [[" x " " er "] " xc "] (if (not (dwe/ok? " er ")) (values " x " " er " -1 ev/NO-FRAME) "
+                     "(let [" f2 " (ev/->Frame (assoc (:slots " fr ") " slot " " x ") (:caps " fr "))] " bc ")))")
+                s2))
+      (r/RCallG df args)
+      (let [[pre post s1] (emit-args st cx ks (ids-of k ks 0 (count ks)) k e d "(values (ev/nul) " " -1 ev/NO-FRAME)")]
+        (values (str pre "(let [[df" k " nf" k " be" k "] (ev/bind-pick c " df " [] " (arg-vec k (count ks)) " " d ")] "
+                     "(if (dwe/ok? be" k ") (values (ev/nul) (dwe/tail-mark " (sp k) ") df" k " nf" k ") (values (ev/nul) (dwe/at be" k " " (sp k) ") -1 ev/NO-FRAME)))" post)
+                s1))
+      (r/RCall fe args)
+      (let [[fc s1] (emit-v st cx fe (kid-id k ks 0) e d)
+            n2 (- (count ks) 1)
+            [pre post s2] (emit-args s1 cx (sub ks 1 n2) (ids-of k ks 1 n2) k e d "(values (ev/nul) " " -1 ev/NO-FRAME)")
+            xs (arg-vec k n2)]
+        (values (str "(let [[" x " " er "] " fc "] (if (not (dwe/ok? " er ")) (values " x " " er " -1 ev/NO-FRAME) "
+                     pre "(match (v/unmeta " x ") "
+                     "(v/VFn fv" k ") (if (< (:def fv" k ") 0) "
+                     "(let [[y" k " ye" k "] (ev/call-fnv c fv" k " " xs " (+ " d " 1) true)] (values y" k " (dwe/at ye" k " (ev/call-sp fv" k " " (sp k) " " (sp (kid-id k ks 0)) ")) -1 ev/NO-FRAME)) "
+                     "(let [[df" k " nf" k " be" k "] (ev/bind-pick c (:def fv" k ") (:caps fv" k ") " xs " " d ")] "
+                     "(if (dwe/ok? be" k ") (values (ev/nul) (dwe/tail-mark " (sp k) ") df" k " nf" k ") (values (ev/nul) (dwe/at be" k " " (sp k) ") -1 ev/NO-FRAME)))) "
+                     "_ (let [[y" k " ye" k "] (ev/call-val c " x " " xs " (+ " d " 1) " (sp k) ")] (values y" k " ye" k " -1 ev/NO-FRAME)))"
+                     post "))")
+                s2))
+      _ (emit-t-plain st cx n k e d))))
+
+(defn- fast-builtin Str [name: &Str k: Int n: Int generic: &Str]
+  (let [a0 (str "a" k "_0") a1 (str "a" k "_1")]
+    (cond
+      (and (= name "dw::Core::++") (= n 2))
+      (str "(let [s" k "a (match " a0 " (v/VStr q) q (v/VInt q) (str q) _ \"\") ok" k "a (match " a0 " (v/VStr q) true (v/VInt q) true _ false) "
+           "s" k "b (match " a1 " (v/VStr q) q (v/VInt q) (str q) _ \"\") ok" k "b (match " a1 " (v/VStr q) true (v/VInt q) true _ false)] "
+           "(if (and ok" k "a ok" k "b) (values (v/->VStr (str s" k "a s" k "b)) (dwe/ok)) " generic "))")
+      (and (= name "dw::Core::sizeOf") (= n 1))
+      (str "(match " a0 " (v/VArr q) (values (v/int-v (count q)) (dwe/ok)) (v/VObj q) (values (v/int-v (count q)) (dwe/ok)) "
+           "(v/VStr q) (values (v/int-v (u8/codepoint-count q)) (dwe/ok)) _ " generic ")")
+      :else "")))
+
+(defn- hof-kind Int [cx: &Cx id: Int ks: &Vec(r/R)]
+  (let [nm (nth (:names cx) id)
+        kind (cond (= nm "dw::Core::map") 1 (= nm "dw::Core::filter") 2 (= nm "dw::Core::reduce") 3 (= nm "dw::Core::orderBy") 4 :else 0)]
+    (if (or (= kind 0) (not= (count ks) 2)) 0
+      (match (:x (nth ks 1))
+        (r/RClosure df caps)
+        (let [fd (nth (:fns (:p cx)) df)
+              ps (:params fd)
+              defaults-ok (loop [j 2 ok true] (if (>= j (count ps)) ok (recur (+ j 1) (and ok (> (count (:default (nth ps j))) 0)))))]
+          (if (and defaults-ok (= (count (:alts fd)) 0) (not (tail-call? (:body fd)))) kind 0))
+        _ 0))))
+
+(defn- tail-call? Bool [n: &r/R]
+  (match (:x n)
+    (r/RIf c t e) (or (tail-call? t) (tail-call? e))
+    (r/RLet s x b) (tail-call? b)
+    (r/RCallG d a) true
+    (r/RCall f a) true
+    _ false))
+
+(defn- fold-kind Int [cx: &Cx id: Int ks: &Vec(r/R)]
+  (let [nm (nth (:names cx) id)
+        fk (cond (= nm "dw::Core::sizeOf") 1 (= nm "dw::Core::sum") 2 (= nm "dw::Core::avg") 3
+                 (= nm "dw::Core::max") 4 (= nm "dw::Core::min") 5 :else 0)]
+    (if (or (= fk 0) (not= (count ks) 1)) 0
+      (match (:x (nth ks 0))
+        (r/RCallB i2 a2) (let [h (hof-kind cx i2 (r/kids (nth ks 0)))] (if (or (= h 1) (= h 2)) fk 0))
+        _ 0))))
+
+(defn- emit-body Values(Str St) [st: St cx: &Cx n: &r/R k: Int e: &Ev d: &Str]
+  (let [ks (r/kids n)
+        x (str "x" k) er (str "e" k)]
+    (match (:x n)
+      (r/RIf cnd th el)
+      (let [[cc s1] (emit-v st cx cnd (kid-id k ks 0) e d)
+            [tc s2] (emit-body s1 cx th (kid-id k ks 1) e d)
+            [ec s3] (emit-body s2 cx el (kid-id k ks 2) e d)]
+        (values (str "(let [[" x " " er "] " cc "] (if (not (dwe/ok? " er ")) (values " x " " er ") "
+                     "(let [[b" k " f" k "] (ev/if-cond " x " " (sp (kid-id k ks 0)) ")] (if (not (dwe/ok? f" k ")) (values (ev/nul) f" k ") "
+                     "(if b" k " " tc " " ec ")))))")
+                s3))
+      (r/RLet slot x0 body)
+      (let [[xc s1] (emit-v st cx x0 (kid-id k ks 0) e d)
+            [bc s2] (emit-body s1 cx body (kid-id k ks 1) (bind-local e slot x) d)]
+        (values (str "(let [[" x " " er "] " xc "] (if (not (dwe/ok? " er ")) (values " x " " er ") " bc "))") s2))
+      _ (let [[vc s1] (emit-v st cx n k e (str "d" k))]
+          (values (str "(let [d" k " (+ " d " 1)] " vc ")") s1)))))
+
+(defn- bind-params Values(Str Str Ev St) [st: St cx: &Cx df: Int given: Vec(Str) caps: &Str k: Int d: &Str fail-pre: &Str fail-post: &Str]
+  (let [fd (nth (:fns (:p cx)) df)
+        np (count (:params fd))
+        ns (:nslots fd)
+        empty (loop [i 0 acc: Vec(Str) []] (if (>= i ns) acc (recur (+ i 1) (conj acc ""))))
+        e0 (loop [i 0 e (->Ev "" empty caps ns)] (if (or (>= i (count given)) (>= i np)) e (recur (+ i 1) (bind-local e i (nth given i)))))]
+    (loop [j (count given) pre "" post "" e e0 s st]
+      (if (>= j np) (values pre post e s)
+        (let [di (nth (nth (:defids cx) df) j)
+              [dc s2] (emit-v s cx (nth (:default (nth (:params fd) j)) 0) di e d)
+              pv (str "p" k "_" j) pe (str "pe" k "_" j)]
+          (recur (+ j 1) (str pre "(let [[" pv " " pe "] " dc "] (if (not (dwe/ok? " pe ")) " fail-pre pe fail-post " ")
+                 (str post "))") (bind-local e j pv) s2))))))
+
+(defn- emit-hof Values(Str St) [st: St cx: &Cx ks: &Vec(r/R) k: Int e: &Ev d: &Str id: Int kind: Int fk: Int ok: Int oid: Int]
+  (let [ck (kid-id k ks 0) lk (kid-id k ks 1)
+        lam (nth ks 1)
+        df (match (:x lam) (r/RClosure dd cs) dd _ 0)
+        fd (nth (:fns (:p cx)) df)
+        np (count (:params fd))
+        lks (r/kids lam)
+        [cc s1] (emit-v st cx (nth ks 0) ck e d)
+        [cpre cpost s2] (emit-args s1 cx lks (ids-of lk lks 0 (count lks)) lk e d "(values (ev/nul) " ")")
+        capsv (arg-vec lk (count lks))
+        caps (str "cp" k) coll (str "co" k) xs (str "xs" k) i (str "i" k) acc (str "ac" k)
+        d1 (str "d" k "i")
+        fn-val (str "(v/->VFn (v/->FnV " df " " caps " (->None) " np "))")
+        inner-call (str "(let [[y" k " f" k "] (rt/invoke (ev/env-of c " d ") (nth (:builtins c) " id ") [" coll " " fn-val "])] (values y" k " (dwe/at f" k " " (sp k) ")))")
+        generic (if (= fk 0) inner-call
+                  (str "(let [[y" k " f" k "] " inner-call "] (if (not (dwe/ok? f" k ")) (values (ev/nul) f" k ") "
+                       "(let [[z" k " g" k "] (rt/invoke (ev/env-of c " d ") (nth (:builtins c) " oid ") [y" k "])] (values z" k " (dwe/at g" k " " (sp ok) ")))))"))
+        ofail (fn Str [ev: Str] (str "(dwe/at (rt/native-frame " ev " (nth (:builtins c) " oid ") (rt/exact-index (nth (:builtins c) " oid ") [5])) " (sp ok) ")"))
+        bid (nth (:bodyid cx) df)
+        item-at (fn Str [idx: Str] (str "(if isr" k " (v/int-v (v/range-at ra" k " rb" k " " idx ")) (nth " xs " " idx "))"))
+        item (item-at i)
+        n (str "n" k)
+        fail-pre "(values (ev/nul) (dwe/at "
+        fail-post (str " " (sp k) "))")
+        [loop-src s9]
+        (if (not= kind 3)
+          (let [given: Vec(Str) [(str "it" k) (str "ix" k)]
+                [bpre bpost be s3] (bind-params s2 cx df given caps k d1 fail-pre fail-post)
+                [bc s4] (emit-body s3 cx (:body fd) bid be d1)
+                fstep (fn Str [y: Str] (str "(let [[fs" k " fe" k "] (cc/fold-add fv" k " " fk " fo" k " fn" k " " acc " " y ")] "
+                                          "(if (dwe/ok? fe" k ") (recur (+ " i " 1) (+ fn" k " 1) fs" k ") (values (ev/nul) " (ofail (str "fe" k)) ")))"))
+                frec (fn Str [] (str "(recur (+ " i " 1) fn" k " " acc ")"))
+                step (cond
+                       (and (> fk 0) (= kind 1))
+                       (str "(if (not (dwe/ok? f" k ")) (values y" k " (dwe/at f" k " " (sp k) ")) " (fstep (str "y" k)) ")")
+                       (> fk 0)
+                       (str "(if (not (dwe/ok? f" k ")) (values y" k " (dwe/at f" k " " (sp k) ")) "
+                            "(let [[t" k " te" k "] (cc/to-bool y" k ")] (if (not (dwe/ok? te" k ")) (values (ev/nul) (dwe/at te" k " " (sp k) ")) "
+                            "(if t" k " " (fstep item) " " (frec) "))))")
+                       (not= kind 2)
+                       (str "(if (dwe/ok? f" k ") (recur (+ " i " 1) (conj " acc " y" k ")) (values y" k " (dwe/at f" k " " (sp k) ")))")
+                       :else
+                       (str "(if (not (dwe/ok? f" k ")) (values y" k " (dwe/at f" k " " (sp k) ")) "
+                            "(let [[t" k " te" k "] (cc/to-bool y" k ")] (if (not (dwe/ok? te" k ")) (values (ev/nul) (dwe/at te" k " " (sp k) ")) "
+                            "(recur (+ " i " 1) (if t" k " (conj " acc " " item ") " acc ")))))"))]
+            (values (str (if (> fk 0) (str "(let [fv" k " (ev/env-of c " d ") fo" k " (cc/fold-op fv" k " " fk ")] ") "")
+                         "(loop [" i " 0 " (if (> fk 0) (str "fn" k " 0 " acc " (ev/nul)") (str acc ": Vec(v/Val) []")) "] (if (>= " i " " n ") "
+                         (cond
+                           (> fk 0)
+                           (str "(let [[fr" k " fre" k "] (cc/fold-end fv" k " " fk " fn" k " " acc ")] (if (dwe/ok? fre" k ") (values fr" k " fre" k ") (values fr" k " " (ofail (str "fre" k)) ")))")
+                           (= kind 4)
+                           (str "(let [[ox" k " oe" k "] (cc/sort-by-keys " acc ")] (if (not (dwe/ok? oe" k ")) (values (ev/nul) (dwe/at oe" k " " (sp k) ")) "
+                                "(values (v/->VArr (loop [q 0 out: Vec(v/Val) []] (if (>= q (count ox" k ")) out (recur (+ q 1) (conj out " (item-at (str "(nth ox" k " q)")) "))))) (dwe/ok))))")
+                           :else
+                           (str "(values (v/->VArr " acc ") (dwe/ok))"))
+                         " "
+                         "(let [it" k " " item " ix" k " (v/int-v " i ")] " bpre "(let [[y" k " f" k "] " bc "] " step ")" bpost ")))"
+                         (if (> fk 0) ")" ""))
+                    s4))
+          (let [dollar (and (= (:name fd) "<anonymous>") (= np 3))
+                ps (:params fd)
+                has-pd (and (not dollar) (>= np 2) (> (count (:default (nth ps 1))) 0))
+                empty-ev (->Ev "" (loop [q 0 a: Vec(Str) []] (if (>= q (:nslots fd)) a (recur (+ q 1) (conj a "")))) caps (:nslots fd))
+                [pdc s3] (if has-pd
+                           (emit-v s2 cx (nth (:default (nth ps 1)) 0) (nth (nth (:defids cx) df) 1) empty-ev d1)
+                           (values "" s2))
+                given: Vec(Str) [(str "it" k) acc]
+                [bpre bpost be s4] (bind-params s3 cx df given caps k d1 fail-pre fail-post)
+                [bc s5] (emit-body s4 cx (:body fd) bid be d1)
+                lp (str "(loop [" i " i0" k " " acc " a0" k "] (if (>= " i " " n ") (values " acc " (dwe/ok)) "
+                        "(let [it" k " " item "] " bpre "(let [[y" k " f" k "] " bc "] "
+                        "(if (dwe/ok? f" k ") (recur (+ " i " 1) y" k ") (values y" k " (dwe/at f" k " " (sp k) "))))" bpost ")))")]
+            (values (if has-pd
+                      (str "(let [[pd" k " pde" k "] " pdc "] (if (not (dwe/ok? pde" k ")) (values (ev/nul) (dwe/at pde" k " " (sp k) ")) "
+                           "(if (= " n " 0) (values pd" k " (dwe/ok)) (let [a0" k " pd" k " i0" k " 0] " lp "))))")
+                      (str "(if (= " n " 0) (values (ev/nul) (dwe/ok)) (let [a0" k " " (item-at "0") " i0" k " 1] " lp "))"))
+                    s5)))]
+    (values (deep (if (> fk 0) ok k) d (str "(let [[" coll " ec" k "] " cc "] (if (not (dwe/ok? ec" k ")) (values (ev/nul) ec" k ") "
+                           cpre "(let [" caps " " capsv " " d1 " (+ " d " 1)] "
+                           "(let [uc" k " (v/unmeta " coll ") isr" k " (match uc" k " (v/VRange a b) true _ false) isa" k " (match uc" k " (v/VArr q) true _ false)] "
+                           "(if (not (or isr" k " isa" k ")) " generic " "
+                           "(let [ra" k " (match uc" k " (v/VRange a b) a _ 0) rb" k " (match uc" k " (v/VRange a b) b _ 0) "
+                           xs " (match uc" k " (v/VArr q) q _ (let [z: Vec(v/Val) []] z)) " n " (if isr" k " (v/range-size ra" k " rb" k ") (count " xs "))] "
+                           (if (= kind 4)
+                             (str "(if (<= " n " 1) (values (v/->VArr (if (= " n " 0) (let [z: Vec(v/Val) []] z) [" (item-at "0") "])) (dwe/ok)) " loop-src ")")
+                             loop-src)
+                           "))))" cpost "))"))
+            s9)))
+
+(defn- ints Str [xs: &Vec(Int)]
+  (loop [i 0 out "["] (if (>= i (count xs)) (str out "]") (recur (+ i 1) (str out (if (= i 0) "" " ") (nth xs i))))))
+
+(defn- lam-t Str [i: Int] (str "(ev/->T (fn Values(v/Val dwe/DwErr Int ev/Frame) [c: &ev/Ctx f: &ev/Frame depth: Int] (t" i " gg c f depth)))"))
+
+(defn module Str [name: &Str p: &r/Prog builtins: &Vec(rt/Builtin)]
+  (let [rs (g/roots p)
+        starts (loop [i 0 at 0 acc: Vec(Int) []] (if (>= i (count rs)) acc (recur (+ i 1) (+ at (g/size (nth rs i))) (conj acc at))))
+        [fbody-ix defids gl-ix] (loop [i 0 at 0 acc: Vec(Int) [] ds: Vec(Vec(Int)) []]
+                                  (if (>= i (count (:fns p))) (values acc ds at)
+                                    (let [ps (:params (nth (:fns p) i))
+                                          [dv at2] (loop [kk 0 a at dv: Vec(Int) []]
+                                                     (if (>= kk (count ps)) (values dv a)
+                                                       (if (> (count (:default (nth ps kk))) 0) (recur (+ kk 1) (+ a 1) (conj dv (nth starts a)))
+                                                         (recur (+ kk 1) a (conj dv -1)))))]
+                                      (recur (+ i 1) (+ at2 1) (conj acc at2) (conj ds dv)))))
+        bodyid (loop [i 0 acc: Vec(Int) []] (if (>= i (count fbody-ix)) acc (recur (+ i 1) (conj acc (nth starts (nth fbody-ix i))))))
+        names (loop [i 0 acc: Vec(Str) []] (if (>= i (count builtins)) acc (recur (+ i 1) (conj acc (str (:module (nth builtins i)) "::" (:name (nth builtins i)))))))
+        cx (->Cx p names bodyid defids)
+        sig-v "Values(v/Val dwe/DwErr) [g: &g/G c: &ev/Ctx f: &ev/Frame depth: Int]"
+        sig-t "Values(v/Val dwe/DwErr Int ev/Frame) [g: &g/G c: &ev/Ctx f: &ev/Frame depth: Int]"
+        [fsrc s1] (loop [i 0 out "" st (->St [] [])]
+                    (if (>= i (count fbody-ix)) (values out st)
+                      (let [ri (nth fbody-ix i)
+                            [code s2] (emit-t-body st cx (nth rs ri) (nth starts ri) (frame-ev "f") "depth")]
+                        (recur (+ i 1) (str out "(defn- t" i " " sig-t "\n  " code ")\n\n") s2))))
+        ng (count (:globals p))
+        [gsrc s3] (loop [i 0 out "" st s1]
+                    (if (>= i ng) (values out st)
+                      (let [ri (+ gl-ix i)
+                            [code s2] (emit-v st cx (nth rs ri) (nth starts ri) (frame-ev "f") "depth")]
+                        (recur (+ i 1) (str out "(defn- g" i " " sig-v "\n  " code ")\n\n") s2))))
+        mi (- (count rs) 1)
+        [msrc s4] (emit-v s3 cx (nth rs mi) (nth starts mi) (frame-ev "f") "depth")
+        bodies (loop [i 0 out "["] (if (>= i (count fbody-ix)) (str out "]") (recur (+ i 1) (str out "\n     " (lam-t i)))))
+        globals (loop [i 0 out "["]
+                  (if (>= i ng) (str out "]")
+                    (recur (+ i 1) (str out "\n     (ev/->C (fn Values(v/Val dwe/DwErr) [c: &ev/Ctx f: &ev/Frame depth: Int] (g" i " gg c f depth)) (:sp (:body (nth (:globals p) " i "))))"))))]
+    (str/replace (str "(ns " name "\n"
+         "  (:require [mulay.dw.ast :as ast] [mulay.dw.val :as v] [mulay.dw.rir :as r] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe]\n"
+         "            [mulay.dw.eval :as ev] [mulay.dw.sel :as sel] [mulay.dw.gen :as g] [mulay.dw.lib.core_coll :as cc]\n"
+         "            [mulay.dw.coerce :as co]\n"
+         "            [mulay.lib.uni :as uni] [clay.utf8 :as u8]))\n\n"
+         ";; mulay build が生成した (docs/aot.md)。手で直さない。\n\n"
+         ";; dwe/ok? と同じ (同じモジュールに置いて、clang がその場に展開できるようにする)\n"
+         "(defn- ok? Bool [e: &dwe/DwErr] (= (count (:kind e)) 0))\n\n"
+         (loop [i 0 out ""] (if (>= i (count (:keys s4))) out (recur (+ i 1) (str out "(def KEY" i " (v/simple-key " (lit (nth (:keys s4) i)) "))\n"))))
+         "\n"
+         fsrc gsrc
+         "(defn- m " sig-v "\n  " msrc ")\n\n"
+         "(defn build ev/CProg [p: &r/Prog]\n"
+         "  (let [gg (g/make-g p " (ints (:delegated s4)) ")]\n"
+         "    (g/assemble p " bodies "\n"
+         "      " globals "\n"
+         "      (ev/->C (fn Values(v/Val dwe/DwErr) [c: &ev/Ctx f: &ev/Frame depth: Int] (m gg c f depth)) (:sp (:body p))))))\n")
+                 "(dwe/ok? " "(ok? ")))
+
+(defn- clay-str Str [s: &Str] (str "\"" s "\""))
+
+(defn aot-module Str [a: &gr/Aot hashes: &Vec(Str) app?: Bool]
+  (let [n (:ns a)
+        reqs (loop [i 0 out ""] (if (>= i (count hashes)) out (recur (+ i 1) (str out "\n            [" n "_s" (nth hashes i) " :as s" (nth hashes i) "]"))))
+        rows (loop [i 0 out ""] (if (>= i (count hashes)) out (recur (+ i 1) (str out "\n           (gr/->Gen \"" (nth hashes i) "\" (fn ev/CProg [p: &r/Prog] (s" (nth hashes i) "/build p)))"))))]
+    (str "(ns " n "\n  (:require [mulay.dw.genreg :as gr] [mulay.dw.eval :as ev] [mulay.dw.rir :as r]" reqs (if app? (str "\n            [" n "_app :as app]") "") "))\n\n"
+         "(defn aot gr/Aot []\n  (let [t: Vec(gr/Gen) [" rows "]]\n    (gr/->Aot " (clay-str n) " " (clay-str (:path a)) " " (clay-str (:entry a)) " t "
+         (if app? "app/APP app/PROPS" "\"\" \"\"") ")))\n")))
+
+(defn app-module Str [n: &Str b64: &Str props: &Str]
+  (str "(ns " n "_app)\n\n(def APP \"" b64 "\")\n\n(def PROPS \"" props "\")\n"))

@@ -1,0 +1,3 @@
+{
+                id: attributes.uriParams.id
+            }

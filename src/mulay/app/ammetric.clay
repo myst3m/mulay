@@ -1,0 +1,213 @@
+(ns mulay.app.ammetric
+  (:require [mulay.mule.model :as m] [mulay.rt.log :as log] [mulay.lib.uni :as uni] [mulay.lib.fs :as fs] [clay.string :as str]))
+
+(defn- put-seg Str [out: Str s: &Str from: Int to: Int first: Bool]
+  (loop [i from letters true upper true]
+    (if (< i to)
+      (let [[cp j] (uni/decode-at s i)
+            bmp (<= cp 0xFFFF)
+            l (and letters (or (= cp 45) (= cp 95) (and bmp (uni/letter? cp))))
+            u (and upper bmp (uni/upper-case? cp))]
+        (recur j l u))
+      (if (or (not letters) (and upper (not first)))
+        (str out "X")
+        (str out (subs s from to))))))
+
+(defn- normalize Str [s: &Str keep-first: Bool]
+  (let [n (count s)]
+    (loop [i 0 start 0 idx 0 out ""]
+      (if (>= i n)
+        (if (> i start) (put-seg out s start i (and keep-first (= idx 0))) out)
+        (if (= (nth s i) 47)
+          (if (> i start)
+            (let [o2 (put-seg out s start i (and keep-first (= idx 0)))]
+              (recur (+ i 1) (+ i 1) (+ idx 1) (str o2 "/")))
+            (recur (+ i 1) (+ i 1) idx (str out "/")))
+          (recur (+ i 1) start idx out))))))
+
+(defn endpoint Str [base: &Str path: &Str]
+  (if (and (not= base "") (not= base "/") (str/starts-with? path base))
+    (let [rest (subs path (count base) (count path))
+          tail (normalize rest false)]
+      (str base tail))
+    (normalize path true)))
+
+(defrecord Agg [flow: Str etype: Str rtype: Str proto: Str host: Str remote: Str endpoint: Str
+                n: Int sum: Int min: Int max: Int sos: Int])
+
+(defrecord Window [aggs: Vec(Agg) index: Map(Str Int) groups: Map(Str Int)])
+
+(def LIMIT 5)
+(def OTHER "other")
+
+(defn- empty-window Window []
+  (->Window [] (let [m: Map(Str Int) {}] m) (let [m: Map(Str Int) {}] m)))
+
+(def ON (atom false))
+(def WIN (atom (empty-window)))
+
+(defn enable! Int [on: Bool] (let [z (reset! ON on)] 0))
+(defn on? Bool [] (deref ON))
+
+(defn- remote-host Str [r: &Str]
+  (if (str/starts-with? r "[")
+    (let [k (str/index-of r "]")] (if (< k 0) (str r) (subs r 1 k)))
+    (let [k (str/last-index-of r ":")] (if (< k 0) (str r) (subs r 0 k)))))
+
+(defn- sep Str [] (chr 1))
+
+(defn- group-key Str [a: &Agg]
+  (let [s (sep)] (str (:flow a) s (:etype a) s (:rtype a) s (:proto a) s (:host a))))
+
+(defn- add-to Agg [a: Agg b: &Agg]
+  (let [n (:n a) mn (:min a) mx (:max a) t (:sum b)]
+    (assoc a :n (+ n (:n b)) :sum (+ (:sum a) t) :min (if (< t mn) t mn) :max (if (> t mx) t mx) :sos (+ (:sos a) (:sos b)))))
+
+(defn- add Window [w: Window b: Agg]
+  (let [gk (group-key b)
+        s (sep)
+        k (str gk s (:remote b) s (:endpoint b))
+        idx (:index w)]
+    (if (contains? idx k)
+      (let [i (get! idx k) aggs (:aggs w) a (nth aggs i)]
+        (assoc w :aggs (assoc aggs i (add-to a b))))
+      (let [gs (:groups w)
+            used (if (contains? gs gk) (get! gs gk) 0)]
+        (if (< used LIMIT)
+          (let [i (count (:aggs w))]
+            (assoc w :aggs (conj (:aggs w) b) :index (assoc idx k i) :groups (assoc gs gk (+ used 1))))
+          (let [ko (str gk s (:remote b) s OTHER)]
+            (if (contains? idx ko)
+              (let [i (get! idx ko) aggs (:aggs w) a (nth aggs i)]
+                (assoc w :aggs (assoc aggs i (add-to a b))))
+              (let [i (count (:aggs w))]
+                (assoc w :aggs (conj (:aggs w) (assoc b :endpoint OTHER)) :index (assoc idx ko i))))))))))
+
+(defn record! Int [flow: &Str host: &Str remote: &Str proto: &Str base: &Str path: &Str failed: Bool ms: Int]
+  (if (not (deref ON)) 0
+    (let [b (->Agg (str flow) "http" (if failed "FAILED" "OK") (str proto) (str host) (remote-host remote) (endpoint base path)
+                   1 ms ms ms (* ms ms))
+          z (swap! WIN add b)]
+      0)))
+
+(defn take! Vec(Agg) []
+  (let [w: Window (prim/atom-take WIN)
+        z (prim/atom-put! WIN (empty-window))]
+    (:aggs w)))
+
+(defrecord Commons [cluster: Str env: Str org: Str server: Str app: Str worker: Str])
+
+(defn- jstr Str [out: Str s: &Str]
+  (loop [i 0 o (str out "\"")]
+    (if (>= i (count s)) (str o "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (cond (= c 34) (str o "\\\"")
+                     (= c 92) (str o "\\\\")
+                     (= c 10) (str o "\\n")
+                     (= c 13) (str o "\\r")
+                     (= c 9) (str o "\\t")
+                     (< c 32) (str o "\\u00" (if (< c 16) "0" "1") (subs "0123456789abcdef" (mod c 16) (+ (mod c 16) 1)))
+                     :else (str o (subs s i (+ i 1)))))))))
+
+(defn- kv-str Str [out: Str k: &Str v: &Str] (jstr (str out "\"" k "\":") v))
+(defn- kv-int Str [out: Str k: &Str v: Int] (str out "\"" k "\":" v))
+
+(defn- event Str [out: Str a: &Agg]
+  (let [n (:n a)
+        o0 (str out "{")
+        o1 (kv-int o0 "avg_request_count.max" 0)
+        o2 (kv-int (str o1 ",") "avg_response_time.sos" 0)
+        o3 (kv-int (str o2 ",") "response_time.max" (:max a))
+        o4 (kv-int (str o3 ",") "avg_request_count.sum" 0)
+        o5 (kv-int (str o4 ",") "avg_response_time.min" 0)
+        o6 (kv-int (str o5 ",") "response_time.min" (:min a))
+        o7 (kv-str (str o6 ",") "response_type" (:rtype a))
+        o8 (kv-int (str o7 ",") "avg_request_count" n)
+        o9 (kv-int (str o8 ",") "response_time.count" n)
+        o10 (kv-str (str o9 ",") "host_header" (:host a))
+        o11 (kv-str (str o10 ",") "remote_host" (:remote a))
+        o12 (kv-int (str o11 ",") "response_time.sum" (:sum a))
+        o13 (kv-int (str o12 ",") "avg_request_count.count" n)
+        o14 (kv-int (str o13 ",") "avg_response_time.max" 0)
+        o15 (kv-str (str o14 ",") "endpoint_type" (:etype a))
+        o16 (kv-str (str o15 ",") "protocol" (:proto a))
+        o17 (kv-str (str o16 ",") "endpoint" (:endpoint a))
+        o18 (kv-int (str o17 ",") "avg_request_count.sos" 0)
+        o19 (kv-int (str o18 ",") "response_time.sos" (:sos a))
+        o20 (kv-int (str o19 ",") "avg_response_time.count" n)
+        o21 (kv-str (str o20 ",") "flow_id" (:flow a))
+        o22 (kv-int (str o21 ",") "avg_request_count.min" 0)
+        o23 (kv-int (str o22 ",") "avg_response_time.sum" 0)
+        o24 (kv-int (str o23 ",") "avg_response_time" (if (> n 0) (quot (:sum a) n) 0))]
+    (str o24 "}")))
+
+(defn line Str [c: &Commons time: Int aggs: &Vec(Agg)]
+  (let [h (str "{\"format\":\"v2\",\"time\":" time ",\"type\":\"app_inbound_metric\",\"commons\":{\"deployment_type\":\"RTF\"")
+        h1 (if (= (:cluster c) "") h (kv-str (str h ",") "cluster_id" (:cluster c)))
+        h2 (kv-str (str h1 ",") "env_id" (:env c))
+        h3 (kv-str (str h2 ",") "org_id" (:org c))
+        h4 (kv-str (str h3 ",") "server_id" (:server c))
+        h5 (kv-str (str h4 ",") "app_id" (:app c))
+        h6 (kv-str (str h5 ",") "worker_id" (:worker c))
+        evs (loop [i 0 o (str h6 "},\"events\":[")]
+              (if (>= i (count aggs)) o
+                (recur (+ i 1) (event (if (= i 0) o (str o ",")) (nth aggs i)))))]
+    (str evs "],\"metadata\":{\"batch_id\":0,\"aggregated\":true,\"limited\":false,"
+         "\"producer_name\":\"analytics-metrics-collector-mule4\",\"producer_version\":\"3.2.16\"}}")))
+
+(def ROTATE 10000000)
+(def PROP "mulay.am.metricFile")
+
+(defrecord Writer [file: Str commons: Commons log-level: Int])
+(def WRITER (atom (let [z: Vec(Writer) []] z)))
+
+(defn- prop Str [app: &m/App key: &Str]
+  (let [ps (:properties app)]
+    (loop [i 0]
+      (if (>= i (count ps)) ""
+        (if (= (:name (nth ps i)) key)
+          (match (:v (nth ps i)) (m/PLit s) (str/trim s) _ "")
+          (recur (+ i 1)))))))
+
+(defn- env Str [k: &Str] (getenv k ""))
+
+(defn- commons-from-env Commons []
+  (->Commons "" (env "ENV_ID") (env "ORG_ID") (env "NODE_NAME") (env "APP_NAME") (env "POD_NAME")))
+
+(defn- flush-window Int [w: &Writer time: Int]
+  (let [aggs (take!)]
+    (if (= (count aggs) 0) 0
+      (let [f (:file w)
+            zr (if (> (:size (fs/stat f)) ROTATE) (fs/move f (str f ".1")) "")
+            l (line (:commons w) time aggs)
+            e (append-file f (str l "\n"))]
+        (if (= e "") 0
+          (log/emit log/WARN (:log-level w) "mulay" "mulay.app" (str "Could not write the Anypoint Monitoring metrics to " f ": " e)))))))
+
+(defn- tick Int [w: Writer]
+  (loop []
+    (let [now (epoch-ms)
+          next (* (+ (quot now 60000) 1) 60000)
+          z (sleep-ms (- next now))
+          e (flush-window w (- next 60000))]
+      (recur))))
+
+(defn start Int [app: &m/App log-level: Int]
+  (let [f (prop app PROP)]
+    (if (= f "") 0
+      (let [de (fs/mkdirs (fs/parent f))
+            [existed ce] (fs/create-new f)
+            err (if (not= de "") de ce)]
+        (if (not= err "")
+          (log/emit log/WARN log-level "mulay" "mulay.app" (str "Not writing the Anypoint Monitoring metrics: " err))
+          (let [w (->Writer f (commons-from-env) log-level)
+                z0 (reset! WRITER [w])
+                z1 (enable! true)
+                z2 (future-detach (future (fn Int [x: Writer] (tick x)) w))]
+            (log/emit log/INFO log-level "mulay" "mulay.app" (str "Writing the Anypoint Monitoring metrics to " f " every minute"))))))))
+
+(defn shutdown Int []
+  (let [ws (deref WRITER)]
+    (if (= (count ws) 0) 0
+      (flush-window (nth ws 0) (* (quot (epoch-ms) 60000) 60000)))))

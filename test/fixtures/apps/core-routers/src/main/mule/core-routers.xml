@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18125"/>
+    </http:listener-config>
+
+    <!-- async: 中の変更は呼び出し側に見えない。応答を待たない -->
+    <flow name="async">
+        <http:listener config-ref="L" path="/async"/>
+        <set-variable variableName="v" value="before"/>
+        <async>
+            <set-variable variableName="v" value="changed in async"/>
+            <set-payload value="async payload"/>
+            <logger level="INFO" message="#['in async: ' ++ vars.v]"/>
+        </async>
+        <set-payload value="#[output application/json --- {v: vars.v, payload: payload}]"/>
+    </flow>
+
+    <!-- async の中のエラーは呼び出し側に伝わらない -->
+    <flow name="async-error">
+        <http:listener config-ref="L" path="/async-error"/>
+        <async>
+            <raise-error type="APP:IN_ASYNC" description="error inside async"/>
+        </async>
+        <set-payload value="caller unaffected"/>
+    </flow>
+
+    <!-- first-successful: 最初に成功したルートの結果 -->
+    <flow name="first-successful">
+        <http:listener config-ref="L" path="/first-successful"/>
+        <set-variable variableName="failUntil" value="#[(attributes.queryParams.failUntil default '0') as Number]"/>
+        <first-successful>
+            <route>
+                <choice>
+                    <when expression="#[vars.failUntil &gt;= 1]">
+                        <raise-error type="APP:R1" description="route 1 failed"/>
+                    </when>
+                </choice>
+                <set-payload value="route 1"/>
+            </route>
+            <route>
+                <choice>
+                    <when expression="#[vars.failUntil &gt;= 2]">
+                        <raise-error type="APP:R2" description="route 2 failed"/>
+                    </when>
+                </choice>
+                <set-payload value="route 2"/>
+            </route>
+            <route>
+                <choice>
+                    <when expression="#[vars.failUntil &gt;= 3]">
+                        <raise-error type="APP:R3" description="route 3 failed"/>
+                    </when>
+                </choice>
+                <set-payload value="route 3"/>
+            </route>
+        </first-successful>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- round-robin: リクエストごとに順番にルートを選ぶ (起動からの通し番号) -->
+    <flow name="round-robin">
+        <http:listener config-ref="L" path="/round-robin"/>
+        <round-robin>
+            <route>
+                <set-payload value="rr-0"/>
+            </route>
+            <route>
+                <set-payload value="rr-1"/>
+            </route>
+            <route>
+                <set-payload value="rr-2"/>
+            </route>
+        </round-robin>
+    </flow>
+
+</mule>

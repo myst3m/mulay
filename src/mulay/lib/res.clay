@@ -1,0 +1,89 @@
+(ns mulay.lib.res
+  (:require [mulay.lib.host :as host] [clay.core] [clay.string :as str] [clay.io :as io] [mulay.lib.zip :as zip]))
+
+(defrecord ResSet [dir: Str zip: Str entries: Vec(zip/ZipEntry) prefix: Str mkeys: Vec(Str) mvals: Vec(Str) first: Vec(Str) first-at: Vec(Str) home: Str])
+
+(defn res-none ResSet [] (let [e: Vec(zip/ZipEntry) [] k: Vec(Str) [] v: Vec(Str) []] (->ResSet "" "" e "" k v k k "")))
+
+(defn with-first ResSet [rs: ResSet dirs: Vec(Str) at: Vec(Str)] (assoc (assoc rs :first dirs) :first-at at))
+(defn with-home ResSet [rs: ResSet home: Str] (assoc rs :home home))
+(defn res-dir ResSet [dir: Str] (assoc (res-none) :dir dir :home dir))
+(defn res-zip ResSet [data: Str es: Vec(zip/ZipEntry) prefix: Str] (assoc (res-none) :zip data :entries es :prefix prefix))
+(defn res-mem ResSet [ks: Vec(Str) vs: Vec(Str)] (assoc (res-none) :mkeys ks :mvals vs))
+
+(defn norm-res-path Str [p0: &Str]
+  (let [p1 (cond (str/starts-with? p0 "classpath://") (subs p0 12 (count p0))
+                 (str/starts-with? p0 "classpath:") (subs p0 10 (count p0))
+                 :else (str p0))
+        p2 (loop [p p1] (cond (str/starts-with? p "/") (recur (subs p 1 (count p)))
+                              (str/starts-with? p "./") (recur (subs p 2 (count p)))
+                              :else p))
+        segs: Vec(Str) (str/split p2 "/")
+        bad (loop [i 0] (if (>= i (count segs)) false (if (= (nth segs i) "..") true (recur (+ i 1)))))]
+    (if (or bad (= p2 "")) "" p2)))
+
+(defn- first-file Values(Str Str) [rs: &ResSet p: &Str]
+  (let [ds (:first rs) as (:first-at rs)]
+    (loop [i 0]
+      (if (>= i (count ds)) (values "" "")
+        (let [at (if (< i (count as)) (nth as i) "")
+              rel (cond (= at "") (str p) (str/starts-with? p (str at "/")) (subs p (+ (count at) 1) (count p)) :else "")
+              f (str (nth ds i) "/" rel)]
+          (if (and (not= rel "") (host/file-exists? f) (not (host/file-dir? f))) (values f (nth ds i)) (recur (+ i 1))))))))
+
+(defn res-read Values(Str Bool) [rs: &ResSet path: &Str]
+  (let [p (norm-res-path path)
+        [ff fd] (if (= p "") (values "" "") (first-file rs p))]
+    (cond
+      (= p "") (values "" false)
+      (not= ff "") (let [[t e] (host/file-read ff)] (values t (= e "")))
+      :else
+      (let [mk (:mkeys rs)
+            mi (loop [i 0] (if (>= i (count mk)) -1 (if (= (nth mk i) p) i (recur (+ i 1)))))]
+        (if (>= mi 0) (values (nth (:mvals rs) mi) true)
+          (let [[t1 ok1] (if (= (:dir rs) "") (values "" false)
+                           (let [[t e] (host/file-read (str (:dir rs) "/" p))] (values t (= e ""))))]
+            (if ok1 (values t1 true)
+              (if (= (count (:entries rs)) 0) (values "" false)
+                (let [[e found] (zip/find-entry (:entries rs) (str (:prefix rs) p))]
+                  (if (not found) (values "" false)
+                    (let [[t err] (zip/read-entry-limit (:zip rs) e 268435456)] (values t (= err "")))))))))))))
+
+(defn res-url Str [rs: &ResSet path: &Str]
+  (let [p (norm-res-path path)
+        [ff fd] (if (= p "") (values "" "") (first-file rs p))]
+    (if (or (= p "") (and (= (:dir rs) "") (= fd ""))) ""
+      (let [d0 (if (= fd "") (:dir rs) fd)
+            d1 (loop [d (str d0)] (if (str/starts-with? d "./") (recur (subs d 2 (count d))) d))
+            d2 (if (str/ends-with? d1 "/") (subs d1 0 (- (count d1) 1)) d1)
+            [cwd ce] (host/work-dir)
+            dabs (cond (str/starts-with? d2 "/") d2 (= d2 ".") cwd :else (str cwd "/" d2))
+            f (if (= ff "") (str dabs "/" p) (if (str/starts-with? ff "/") (str ff) (str cwd "/" (str/replace ff "./" ""))))]
+        (if (and (= ce "") (host/file-exists? f) (not (host/file-dir? f))) (str "file:" f) "")))))
+
+(defn- under? Bool [names: &Vec(Str) pre: &Str]
+  (loop [i 0] (if (>= i (count names)) false (if (str/starts-with? (nth names i) pre) true (recur (+ i 1))))))
+
+(defn- dir-in? Bool [d: &Str p: &Str]
+  (and (not= d "") (host/file-dir? (if (= p "") (str d) (str d "/" p)))))
+
+(defn res-dir? Bool [rs: &ResSet path: &Str]
+  (let [p0 (norm-res-path path)
+        p (if (str/ends-with? p0 "/") (subs p0 0 (- (count p0) 1)) p0)
+        bad (and (= p "") (let [t (str/trim path)] (and (not= t "") (not= t "/") (not= t "./"))))
+        pre (if (= p "") "" (str p "/"))]
+    (cond
+      bad false
+      (dir-in? (:dir rs) p) true
+      (loop [i 0] (if (>= i (count (:first rs))) false (if (dir-in? (nth (:first rs) i) p) true (recur (+ i 1))))) true
+      (under? (:mkeys rs) pre) (> (count (:mkeys rs)) 0)
+      :else (loop [i 0]
+              (if (>= i (count (:entries rs))) false
+                (if (str/starts-with? (:name (nth (:entries rs) i)) (str (:prefix rs) pre)) true (recur (+ i 1))))))))
+
+(defn abs-home Str [rs: &ResSet]
+  (let [d0 (:home rs)
+        d1 (loop [x (str d0)] (if (str/starts-with? x "./") (recur (subs x 2 (count x))) x))
+        d2 (if (and (> (count d1) 1) (str/ends-with? d1 "/")) (subs d1 0 (- (count d1) 1)) d1)
+        [cwd ce] (host/work-dir)]
+    (cond (= d0 "") "" (str/starts-with? d2 "/") d2 (or (= d2 ".") (= d2 "")) cwd :else (str cwd "/" d2))))

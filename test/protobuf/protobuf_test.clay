@@ -1,0 +1,142 @@
+(ns protobuf-test (:require [mulay.lib.protobuf :as pb] [protobuf-golden-data :as g] [clay.base64 :as b64] [clay.string :as str]))
+
+(defn- desc pb/Desc []
+  (let [[t e] (read-file "test/fixtures/dw/protobuf_test/types.desc")
+        [d de] (pb/parse-set t)]
+    d))
+
+(defn- roundtrip Str [d: &pb/Desc c: &Vec(Str)]
+  (let [[bytes be] (b64/decode (nth c 1))
+        mi (pb/message-index d (nth c 0))
+        [m e] (pb/decode d mi bytes)]
+    (cond (< mi 0) (str (nth c 0) ": no such message")
+          (not= e "") (str (nth c 0) ": " e)
+          :else (let [out (pb/encode d m)] (if (= out bytes) "" (str (nth c 0) ": got " (b64/encode out) " want " (nth c 1)))))))
+
+(deftest varints
+  (let [a (pb/put-varint "" 300)
+        b (pb/put-varint "" -1)
+        [x p e] (pb/get-varint a 0)
+        [y q f] (pb/get-varint b 0)
+        [z r g] (pb/get-varint (str (chr 255) (chr 255)) 0)]
+    (is (= (b64/encode a) "rAI="))
+    (is (= (count b) 10))
+    (is (= x 300)) (is (= p 2)) (is (= e ""))
+    (is (= y -1)) (is (= q 10))
+    (is (= g pb/TRUNCATED))
+    (is (= (pb/zigzag -1) 1)) (is (= (pb/zigzag 1) 2)) (is (= (pb/unzigzag 3) -2))
+    (is (= (pb/to-i32 4000000000) -294967296))
+    (is (= (pb/put-fixed-be "" 300 4) (str (chr 0) (chr 0) (chr 1) (chr 44))))
+    (is (= (pb/get-fixed-be (str (chr 9) (chr 0) (chr 0) (chr 1) (chr 44)) 1 4) 300))))
+
+(deftest descriptor-set
+  (let [d (desc)
+        oi (pb/message-index d "t.Outer")
+        o (nth (:messages d) oi)
+        ei (pb/enum-index d "t.Color")
+        mi (pb/message-index d "t.Outer.CountsEntry")]
+    (is (>= oi 0))
+    (is (= (count (:fields o)) 15))
+    (is (= (:name (nth (:fields o) 6)) "by_id"))
+    (is (= (:type-name (nth (:fields o) 6)) "t.Outer.ByIdEntry"))
+    (is (= (:oneofs o) ["choice" "_maybe"]))
+    (is (:proto3-opt (nth (:fields o) 12)))
+    (is (= (:packed (nth (:fields o) 3)) 0))
+    (is (>= ei 0))
+    (is (= (pb/enum-name (nth (:enums d) ei) 2) ["BLUE"]))
+    (is (:map-entry (nth (:messages d) mi)))
+    (is (pb/top-level? d "t.Outer"))
+    (is-refuted (pb/top-level? d "t.Outer.CountsEntry"))
+    (is (pb/top-level? d "google.protobuf.Timestamp"))))
+
+(deftest roundtrip-like-python
+  (let [d (desc)
+        bad (loop [i 0 acc: Vec(Str) []] (if (>= i (count g/CASES)) acc (recur (+ i 1) (let [r (roundtrip d (nth g/CASES i))] (if (= r "") acc (conj acc r))))))]
+    (is (= bad []))))
+
+(deftest decode-values
+  (let [d (desc)
+        [bytes be] (b64/decode (nth (nth g/CASES 0) 1))
+        si (pb/message-index d "t.Scalars")
+        [m e] (pb/decode d si bytes)]
+    (is (= e ""))
+    (is (= (pb/field-vals m 4) [(pb/->PInt -294967296)]))
+    (is (= (pb/field-vals m 5) [(pb/->PInt -446744073709551616)]))
+    (is (= (pb/field-vals m 6) [(pb/->PInt -7)]))
+    (is (= (pb/field-vals m 1) [(pb/->PFloat 0.25)]))
+    (is (= (pb/field-vals m 14) [(pb/->PStr (str (chr 1) (chr 2) (chr 3)))]))))
+
+(deftest decode-errors
+  (let [d (desc)
+        ii (pb/message-index d "t.Inner")
+        pi (pb/message-index d "t2.P2")
+        [a ae] (pb/decode d ii (str (chr 10) (chr 6) "abc"))
+        [b be] (pb/decode d ii (str (chr 0) (chr 1)))
+        [c ce] (pb/decode d pi (str (chr 16) (chr 5)))
+        [x xe] (pb/decode d ii (str (chr 15) (chr 1)))]
+    (is (= ae pb/TRUNCATED))
+    (is (= be pb/ZERO-TAG))
+    (is (= ce "Message missing required fields: name"))
+    (is (= xe pb/BAD-WIRE))))
+
+(deftest huge-length-is-truncated
+  (let [d (desc)
+        ii (pb/message-index d "t.Inner")
+        big (str (chr 10) (chr 255) (chr 255) (chr 255) (chr 255) (chr 255) (chr 255) (chr 255) (chr 255) (chr 127))
+        [a ae] (pb/decode d ii big)
+        [rs re] (pb/scan big)]
+    (is (= ae pb/TRUNCATED))
+    (is (= re pb/TRUNCATED))))
+
+(defn- link-err Str [name: Str]
+  (let [[t e] (read-file (str "test/fixtures/dw/protobuf_test/broken/" name ".desc"))
+        [d de] (pb/parse-set t)]
+    (str e de)))
+
+(deftest unresolved-type-references-fail-like-protobuf-java
+  (is (= (link-err "unresolved") "t.A.b: \".t.B\" is not defined."))
+  (is (= (link-err "enum-missing") "t.A.b: \".t.Q\" is not defined."))
+  (is (= (link-err "msg-is-enum") "t.A.b: \".t.E\" is not a message type."))
+  (is (= (link-err "enum-is-msg") "t.A.b: \".t.A\" is not an enum type."))
+  (is (= (link-err "map-novalue") ""))
+  (is (= (link-err "struct-nofields") "")))
+
+(defn- tag Str [out: Str num: Int w: Int] (pb/put-varint out (bit-or (bit-shift-left num 3) w)))
+
+;; 知らないフィールドは番号の順、同じ番号では varint・fixed32・fixed64・長さ付き・group の順、その中は来た順に書く (protobuf-java の UnknownFieldSet)
+(deftest unknown-fields-are-written-by-number-then-wire-type
+  (let [d (desc)
+        ii (pb/message-index d "t.Inner")
+        in (let [a (pb/put-varint (tag "" 5 0) 1)
+                 b (str (pb/put-varint (tag a 3 2) 1) "x")
+                 c (pb/put-fixed (tag b 5 5) 7 4)
+                 e (pb/put-varint (tag c 3 0) 2)]
+             (pb/put-varint (tag e 5 0) 3))
+        want (let [a (pb/put-varint (tag "" 3 0) 2)
+                   b (str (pb/put-varint (tag a 3 2) 1) "x")
+                   c (pb/put-varint (tag b 5 0) 1)
+                   e (pb/put-varint (tag c 5 0) 3)]
+               (pb/put-fixed (tag e 5 5) 7 4))
+        [m err] (pb/decode d ii in)]
+    (is (= err ""))
+    (is (= (b64/encode (pb/encode d m)) (b64/encode want)))))
+
+;; 知らないフィールドの並べ替えと、繰り返しのフィールド・分けて来たメッセージのフィールドを足すのは個数に対して線形 (前は 2 乗で、
+;; 2 万個の知らないフィールドを書くのに 2.0 秒、2 万個の繰り返しのメッセージを読むのに 0.45 秒かかった)
+(defn- many Str [n: Int f: Fn(Str Int Str)] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (f out i)))))
+
+(deftest many-unknown-and-repeated-fields-are-linear
+  (let [d (desc)
+        oi (pb/message-index d "t.Outer")
+        n 300000
+        unk (many n (fn Str [o: Str i: Int] (pb/put-varint (tag o (+ 100 (rem (* i 7919) n)) 0) i)))
+        items (many n (fn Str [o: Str i: Int] (str (pb/put-varint (tag o 2 2) 3) (str (chr 10) (chr 1) "x"))))
+        inner (many n (fn Str [o: Str i: Int] (str (pb/put-varint (tag o 1 2) 3) (str (chr 10) (chr 1) "y"))))
+        [m1 e1] (pb/decode d oi unk)
+        [m2 e2] (pb/decode d oi items)
+        [m3 e3] (pb/decode d oi inner)
+        out1 (pb/encode d m1)]
+    (is (= (str e1 e2 e3) ""))
+    (is (= (count out1) (count unk)))
+    (is (= (count (pb/field-vals m2 1)) n))
+    (is (= (b64/encode (pb/encode d m2)) (b64/encode items)))))

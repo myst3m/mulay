@@ -1,0 +1,25 @@
+(ns lib-text-cp-test (:require [mulay.dw.engine :as eng] [clay.string :as cs]))
+
+;; 実 DW と意図して違うところと、エラーの経路。
+
+(defn- dw Str [expr: Str]
+  (let [script (str "%dw 2.0\nimport * from dw::core::Strings\noutput application/json indent=false\n---\n" expr)
+        ins: Vec(eng/Input) []
+        [mime out err] (eng/run-text script ins)]
+    (if (= err "") out (let [i (cs/index-of err "\n")] (str "ERROR: " (if (< i 0) err (subs err 0 i)))))))
+
+;; 実 DW は UTF-16 単位で数えるが、mulay はコードポイント単位 (sizeOf とセレクタに合わせた意図した差)。
+(deftest code-points-not-utf16
+  (is (= (dw "sizeOf(\"a😀b\")") "3"))
+  (is (= (dw "\"é😀x\" find \"x\"") "[2]"))
+  (is (= (dw "\"é😀x\" find /x/") "[[2]]"))
+  (is (= (dw "\"a😀b\" splitBy \"\"") "[\"a\",\"😀\",\"b\"]"))
+  (is (= (dw "reverse(\"aé😀\")") "\"😀éa\""))
+  (is (= (dw "charCodeAt(\"a😀b\", 2)") "98"))
+  (is (= (dw "substring(\"a😀b\", 1, 2)") "\"😀\"")))
+
+;; 置換の結果が String にできない値なら失敗する。
+(deftest replace-result-type
+  (is (= (dw "\"abc\" replace /b/ with (m) -> null") "ERROR: Expecting Type: `String`, but got: `Null`."))
+  (is (= (dw "\"abc\" replace /b/ with (m) -> 1") "\"a1c\""))
+  (is (= (dw "null replace \"a\" with \"b\"") "null")))

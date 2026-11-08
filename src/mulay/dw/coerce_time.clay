@@ -1,0 +1,399 @@
+(ns mulay.dw.coerce_time
+  (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.lib.dec :as d]
+            [clay.string :as str] [mulay.lib.uni :as uni]
+            [mulay.lib.time.types :as tt] [mulay.lib.time.iso :as iso] [mulay.lib.time.fmt :as fm]
+            [mulay.lib.time.local :as tl] [mulay.lib.time.zoned :as tz] [mulay.lib.time.tz :as tzr]
+            [mulay.lib.time.amount :as tam]))
+
+(defn- ok3 Values(v/Val dwe/DwErr Bool) [x: v/Val] (values x (dwe/ok) true))
+(defn- fail3 Values(v/Val dwe/DwErr Bool) [msg: Str] (values (v/null-v) (dwe/err "CoercionException" msg) true))
+
+(defn- fail-unit Values(v/Val dwe/DwErr Bool) [msg: Str] (values (v/null-v) (dwe/err "InvalidUnit" msg) true))
+(defn- pass3 Values(v/Val dwe/DwErr Bool) [] (values (v/null-v) (dwe/ok) false))
+
+(defn temporal-type? Bool [n: &Str]
+  (or (= n "Date") (= n "DateTime") (= n "LocalDateTime") (= n "Time") (= n "LocalTime")
+      (= n "TimeZone") (= n "Period")))
+
+(defn temporal? Bool [x0: &v/Val]
+  (let [[s ok] (v/temporal-str (v/unmeta x0))] ok))
+
+(defn- prop Vec(Str) [meta: &Vec(v/Field) name: Str]
+  (let [vs (v/obj-get meta name)]
+    (if (= (count vs) 0) []
+      (let [x (v/unmeta (nth vs 0))]
+        (match x
+          (v/VNull) []
+          _ (let [[s e] (rt/to-text x)] (if (dwe/ok? e) [s] [])))))))
+
+(defn- meta-show Str [meta: &Vec(v/Field)]
+  (loop [i 0 out "{"]
+    (if (>= i (count meta)) (str out "}")
+      (let [f (nth meta i)
+            x (v/unmeta (:value f))
+            vs (match x
+                 (v/VStr s) (str "\"" s "\"")
+                 _ (let [[s e] (rt/to-text x)] s))
+            sep (if (= i 0) "" ", ")]
+        (recur (+ i 1) (str out sep (:name (:key f)) ": " vs))))))
+
+(defn show-val Str [x0: &v/Val]
+  (let [s (show-top x0)]
+    (if (<= (u8/codepoint-count s) 77) s (str (uni/sub-cp s 0 77) "..."))))
+
+(defn- show-top Str [x0: &v/Val]
+  (let [x (v/unmeta x0)
+        [ts tok] (v/temporal-str x)
+        base (cond tok (str "|" ts "|")
+                   :else (match x
+                           (v/VStr s) (str s)
+                           (v/VKey k) (:name k)
+                           (v/VNum n) (num/to-string n)
+                           (v/VInt n-i) (let [n (num/from-int n-i)] (num/to-string n))
+                           (v/VBool b) (if b "true" "false")
+                           (v/VNull) "null"
+                           (v/VObj fs) (show-nested "" x)
+                           (v/VArr xs) (show-nested "" x)
+                           (v/VRange a b) (show-nested "" x)
+                           _ ""))
+        shown-meta (or tok (match x (v/VObj fs) true (v/VArr xs) true (v/VRange a b) true _ false))]
+    (match x0
+      (v/VMeta y m) (let [vm (visible-meta m)] (if (or (= (count vm) 0) (not shown-meta)) base (str base " as " (v/type-name x) " " (meta-show vm))))
+      _ base)))
+
+(defn- visible-meta Vec(v/Field) [m: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(v/Field) []]
+    (if (>= i (count m)) acc
+      (let [k (:name (:key (nth m i)))]
+        (recur (+ i 1) (if (str/starts-with? k "@") acc (conj acc (nth m i))))))))
+
+(defn- ident? Bool [k: &Str]
+  (and (> (count k) 0)
+       (let [c (nth k 0)] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 95) (= c 36)))
+       (loop [i 1] (if (>= i (count k)) true
+                     (let [c (nth k i)] (if (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 95) (= c 36)) (recur (+ i 1)) false))))))
+
+(defn quote-str Str [s: &Str] (quote-into "" s))
+
+(defn- quote-into Str [out: Str s: &Str]
+  (loop [i 0 o (str out "\"")]
+    (if (>= i (count s)) (str o "\"")
+      (let [c (nth s i)] (recur (+ i 1) (cond (= c 34) (str o "\\\"") (= c 92) (str o "\\\\") :else (str o (subs s i (+ i 1)))))))))
+
+(defn- show-nested Str [out: Str x0: &v/Val]
+  (let [o (show-bare out x0)]
+    (match x0
+      (v/VMeta y m) (let [vm (visible-meta m)] (if (= (count vm) 0) o (str o " as " (v/type-name y) " " (meta-show vm))))
+      _ o)))
+
+(defn- show-bare Str [out: Str x0: &v/Val]
+  (let [x (v/unmeta x0)
+        [ts tok] (v/temporal-str x)]
+    (if tok (str out "|" ts "|")
+      (match x
+        (v/VStr s) (quote-into out s)
+        (v/VNum n) (str out (num/to-string n))
+        (v/VInt n-i) (str out n-i)
+        (v/VBool b) (str out (if b "true" "false"))
+        (v/VNull) (str out "null")
+        (v/VKey k) (str out (:name k))
+        (v/VObj fs) (let [o (loop [i 0 o (str out "{")]
+                              (if (>= i (count fs)) o
+                                (let [k (:name (:key (nth fs i)))
+                                      o1 (if (= i 0) o (str o ","))
+                                      o2 (if (ident? k) (str o1 k) (quote-into o1 k))]
+                                  (recur (+ i 1) (show-nested (str o2 ": ") (:value (nth fs i)))))))]
+                      (str o "}"))
+        (v/VArr xs) (let [o (loop [i 0 o (str out "[")] (if (>= i (count xs)) o (recur (+ i 1) (show-nested (if (= i 0) o (str o ", ")) (nth xs i)))))] (str o "]"))
+        (v/VRange a b) (show-nested out (v/->VArr (v/items x)))
+        _ out))))
+
+(defn- cannot Str [x0: &v/Val target: &Str]
+  (let [x (v/unmeta x0)
+        s (show-val x0)
+        quoted (and (or (= target "TimeZone") (= target "Period"))
+                    (match x (v/VStr q) true (v/VKey k) true _ false))
+        shown (if quoted (str "\"" s "\"") s)]
+    (str "Cannot coerce " (v/type-name x) " (" shown ") to " target)))
+
+(defn- with-meta v/Val [x: v/Val meta: &Vec(v/Field)]
+  (if (= (count meta) 0) x (v/->VMeta x meta)))
+
+(defn convert Values(v/Val Bool) [x: &v/Val target: &Str]
+  (match x
+    (v/VDate dd) (if (= target "Date") (values (v/->VDate dd) true) (values (v/null-v) false))
+    (v/VDateTime z)
+    (cond
+      (= target "DateTime") (values (v/->VDateTime z) true)
+      (= target "Date") (values (v/->VDate (tz/zdt-date z)) true)
+      (= target "LocalDateTime") (values (v/->VLocalDateTime (tz/zdt-ldt z)) true)
+      (= target "Time") (values (v/->VTime (tt/->OffsetTime (tz/zdt-time z) (tz/zdt-offset z))) true)
+      (= target "LocalTime") (values (v/->VLocalTime (tz/zdt-time z)) true)
+      (= target "TimeZone") (values (v/->VTimeZone (tt/->TzOffset (tz/zdt-offset z))) true)
+      :else (values (v/null-v) false))
+    (v/VLocalDateTime y)
+    (cond
+      (= target "LocalDateTime") (values (v/->VLocalDateTime y) true)
+      (= target "DateTime") (values (v/->VDateTime (tz/zdt-of-offset y 0)) true)
+      (= target "Date") (values (v/->VDate (tl/ldt-date y)) true)
+      (= target "Time") (values (v/->VTime (tt/->OffsetTime (tl/ldt-time y) 0)) true)
+      (= target "LocalTime") (values (v/->VLocalTime (tl/ldt-time y)) true)
+      :else (values (v/null-v) false))
+    (v/VTime o)
+    (cond
+      (= target "Time") (values (v/->VTime o) true)
+      (= target "LocalTime") (values (v/->VLocalTime (:time o)) true)
+      (= target "TimeZone") (values (v/->VTimeZone (tt/->TzOffset (:offset o))) true)
+      :else (values (v/null-v) false))
+    (v/VLocalTime lt)
+    (cond
+      (= target "LocalTime") (values (v/->VLocalTime lt) true)
+      (= target "Time") (values (v/->VTime (tt/->OffsetTime lt 0)) true)
+      :else (values (v/null-v) false))
+    (v/VTimeZone zz) (if (= target "TimeZone") (values (v/->VTimeZone zz) true) (values (v/null-v) false))
+    (v/VPeriod p) (if (= target "Period") (values (v/->VPeriod p) true) (values (v/null-v) false))
+    _ (values (v/null-v) false)))
+
+(defn parse-any Values(v/Val Bool) [s: &Str]
+  (let [n (count s)
+        c0 (if (> n 0) (nth s 0) 0)
+        c1 (if (> n 1) (nth s 1) 0)
+        c2 (if (> n 2) (nth s 2) 0)]
+    (if (and (digit? c0) (digit? c1) (= c2 58))
+      (let [[lt e1] (iso/parse-time s)]
+        (if (= e1 "") (values (v/->VLocalTime lt) true)
+          (let [[o e2] (iso/parse-ot s)]
+            (if (= e2 "") (values (v/->VTime o) true) (values (v/null-v) false)))))
+      (let [[dd e1] (iso/parse-date s)]
+        (if (= e1 "") (values (v/->VDate dd) true)
+          (let [[x e2] (iso/parse-ldt s)]
+            (if (= e2 "") (values (v/->VLocalDateTime x) true)
+              (let [br (str/index-of s "[")
+                    zone-only (and (> br 0) (let [[y e3] (iso/parse-ldt (subs s 0 br))] (= e3 "")))]
+                (if zone-only (values (v/null-v) false)
+                  (let [[z e4] (iso/parse-zdt s)]
+                    (if (= e4 "") (values (v/->VDateTime z) true) (values (v/null-v) false))))))))))))
+
+(defn- short-id Str [s: &Str]
+  (case s
+    "EST" "-05:00" "MST" "-07:00" "HST" "-10:00"
+    "ACT" "Australia/Darwin" "AET" "Australia/Sydney" "AGT" "America/Argentina/Buenos_Aires"
+    "ART" "Africa/Cairo" "AST" "America/Anchorage" "BET" "America/Sao_Paulo" "BST" "Asia/Dhaka"
+    "CAT" "Africa/Harare" "CNT" "America/St_Johns" "CST" "America/Chicago" "CTT" "Asia/Shanghai"
+    "EAT" "Africa/Addis_Ababa" "ECT" "Europe/Paris" "IET" "America/Indiana/Indianapolis"
+    "IST" "Asia/Kolkata" "JST" "Asia/Tokyo" "MIT" "Pacific/Apia" "NET" "Asia/Yerevan"
+    "NST" "Pacific/Auckland" "PLT" "Asia/Karachi" "PNT" "America/Phoenix" "PRT" "America/Puerto_Rico"
+    "PST" "America/Los_Angeles" "SST" "Pacific/Guadalcanal" "VST" "Asia/Ho_Chi_Minh"
+    ""))
+
+(defn parse-zone Values(tt/TimeZone Str) [s: &Str]
+  (let [alias (short-id s)]
+    (tzr/zone-of-id (if (= alias "") s alias))))
+
+(defn parse-period Values(tt/DwPeriod Str) [s: &Str]
+  (let [[p e] (tam/parse-dw-period s)]
+    (if (= e "") (values p "")
+      (let [has-t (or (>= (str/index-of s "T") 0) (>= (str/index-of s "t") 0))]
+        (if has-t (values p e)
+          (let [[q e2] (tam/parse-period s)] (values p e2)))))))
+
+(defn- field-name Str [f: Int]
+  (case f
+    0 "Era" 1 "Year" 2 "YearOfEra" 3 "MonthOfYear" 4 "DayOfMonth" 5 "DayOfYear" 6 "DayOfWeek"
+    7 "AmPmOfDay" 8 "HourOfDay" 9 "ClockHourOfDay" 10 "HourOfAmPm" 11 "ClockHourOfAmPm" 12 "MinuteOfHour"
+    13 "SecondOfMinute" 14 "NanoOfSecond" 15 "MilliOfDay" 16 "NanoOfDay" 17 "QuarterOfYear"
+    18 "WeekBasedYear" 19 "WeekOfWeekBasedYear" 20 "WeekOfMonth" 21 "DayOfWeek"
+    22 "AlignedDayOfWeekInMonth" 23 "OffsetSeconds" 24 "SecondOfDay" 25 "MilliOfSecond"
+    27 "ModifiedJulianDay"
+    "DayPeriod"))
+
+(defn- parsed-desc Str [p: &fm/Parsed]
+  (let [has (:has p) vals (:vals p)
+        off (if (and (> (count has) 23) (= (nth has 23) 1)) (str "OffsetSeconds=" (nth vals 23)) "")
+        fields (loop [i 0 out off]
+                 (if (>= i (count has)) out
+                   (if (or (= i 23) (not= (nth has i) 1)) (recur (+ i 1) out)
+                     (recur (+ i 1) (str out (if (= out "") "" ", ") (field-name i) "=" (nth vals i))))))
+        zs (if (> (count (:zone p)) 0) (str "," (tt/zone-id (nth (:zone p) 0))) "")
+        [dd dok] (fm/parsed-date p)
+        [tm tok] (fm/parsed-time p)
+        res (if dok (str " resolved to " (iso/date-str dd) (if tok (str "T" (iso/time-str tm)) ""))
+              (if tok (str " resolved to " (iso/time-str tm)) ""))]
+    (str "{" fields "},ISO" zs res " of type java.time.format.Parsed")))
+
+(defn- abbr Str [s: &Str] (if (> (count s) 64) (str (subs s 0 64) "...") (str s)))
+
+(defn- unable Str [s: &Str what: &Str p: &fm/Parsed]
+  (str "Text '" (abbr s) "' could not be parsed: Unable to obtain " what " from TemporalAccessor: " (parsed-desc p)))
+
+(defn- compile-fmt Values(fm/Fmt Str) [pattern: &Str locale: &Str] (fm/compile-locale pattern locale true))
+
+(defn- mode-style Int [mode: &Str]
+  (let [u (str/upper-case mode)] (cond (= u "LENIENT") fm/LENIENT (= u "STRICT") fm/STRICT :else fm/SMART)))
+
+(defn parse-format Values(v/Val Str) [s: &Str pattern: &Str target: &Str locale: &Str mode: &Str]
+  (let [[f0 ce] (compile-fmt pattern locale)
+        f (fm/with-resolver f0 (mode-style mode))]
+    (if (not= ce "") (values (v/null-v) ce)
+      (let [[p pe] (fm/parse f s)]
+        (if (not= pe "") (values (v/null-v) pe)
+          (cond
+            (= target "Date") (let [[x ok] (fm/parsed-date p)]
+                                (if ok (values (v/->VDate x) "")
+                                  (values (v/null-v) (str "Text '" (abbr s) "' could not be parsed: Unable to convert `" s "` to Date."))))
+            (= target "DateTime") (let [[x ok] (fm/parsed-zdt p)]
+                                    (if ok (values (v/->VDateTime x) "") (values (v/null-v) (unable s "ZonedDateTime" p))))
+            (= target "LocalDateTime") (let [[x ok] (fm/parsed-ldt p)]
+                                         (if ok (values (v/->VLocalDateTime x) "") (values (v/null-v) (unable s "LocalDateTime" p))))
+            (= target "Time") (let [[x ok] (fm/parsed-ot p)]
+                                (if ok (values (v/->VTime x) "") (values (v/null-v) (unable s "OffsetTime" p))))
+            (= target "LocalTime") (let [[x ok] (fm/parsed-time p)]
+                                     (if ok (values (v/->VLocalTime x) "") (values (v/null-v) (unable s "LocalTime" p))))
+            :else (values (v/null-v) "unsupported")))))))
+
+(defn format-temporal Values(Str Str) [x0: &v/Val pattern: &Str locale: &Str]
+  (let [x (v/unmeta x0)
+        [f ce] (compile-fmt pattern locale)]
+    (if (not= ce "") (values "" ce)
+      (match x
+        (v/VDate dd) (fm/format-date f dd)
+        (v/VDateTime z) (fm/format-zdt f z)
+        (v/VLocalDateTime y) (fm/format-ldt f y)
+        (v/VTime o) (fm/format-ot f o)
+        (v/VLocalTime lt) (fm/format-time f lt)
+        _ (let [[s ok] (v/temporal-str x)] (values s ""))))))
+
+(defn meta-format-str Values(Str Bool Str) [x0: &v/Val]
+  (match x0
+    (v/VMeta y m) (let [fs (prop m "format") ls (prop m "locale")]
+                    (if (and (= (count fs) 1) (temporal? y))
+                      (let [[s e] (format-temporal y (nth fs 0) (if (= (count ls) 0) "" (nth ls 0)))]
+                        (if (= e "") (values s true "")
+                          (values "" true (str "Cannot coerce " (v/type-name (v/unmeta y)) " (" (show-val x0) ") to String, caused by: " e))))
+                      (meta-format-str y)))
+    _ (values "" false "")))
+
+(defn- trunc-int Values(Int Bool) [n: &num/Num]
+  (let [[t e] (d/set-scale (num/to-dec n) 0 d/DOWN)
+        [i e2] (d/to-int-exact t)]
+    (values i (and (= e "") (= e2 "")))))
+
+(def MIN-SEC -31557014167219200)
+(def MAX-SEC 31556889864403199)
+
+(defn- number->datetime Values(v/Val dwe/DwErr Bool) [x: &v/Val n: &num/Num unit: &Str meta: &Vec(v/Field)]
+  (if (and (not= unit "seconds") (not= unit "milliseconds"))
+    (fail-unit (str "Invalid unit: " unit " expecting 'milliseconds' or 'seconds'"))
+    (let [[i ok] (trunc-int n)]
+      (if (or (not ok) (and (= unit "seconds") (or (< i MIN-SEC) (> i MAX-SEC))))
+        (fail3 "Instant exceeds minimum or maximum instant")
+        (ok3 (with-meta (v/->VDateTime (if (= unit "seconds") (tz/zdt-of-epoch-second i (tt/utc)) (tz/zdt-of-epoch-milli i (tt/utc)))) meta))))))
+
+(defn- datetime->number Values(v/Val dwe/DwErr Bool) [z: &tt/ZonedDateTime unit: &Str]
+  (if (= unit "seconds") (ok3 (v/int-v (tz/zdt-epoch-second z)))
+    (if (= unit "milliseconds")
+      (let [[ms e] (tz/zdt-epoch-milli z)]
+        (if (= e "") (ok3 (v/int-v ms)) (fail3 (str "java.lang.ArithmeticException " e))))
+      (fail-unit (str "Invalid unit: " unit " expecting 'milliseconds' or 'seconds'")))))
+
+(defn- period->number Values(v/Val dwe/DwErr Bool) [p: &tt/DwPeriod unit0: &Vec(Str)]
+  (match p
+    (tt/PerDate q)
+    (let [unit (if (= (count unit0) 0) "months" (nth unit0 0))
+          tot (tam/period-total-months q)]
+      (cond
+        (= unit "months") (ok3 (v/int-v tot))
+        (= unit "years") (ok3 (v/int-v (quot tot 12)))
+        :else (fail-unit (str "Invalid unit: " unit " expecting 'years' or 'months'"))))
+    (tt/PerTime du)
+    (let [unit (if (= (count unit0) 0) "seconds" (nth unit0 0))]
+      (cond
+        (= unit "seconds") (ok3 (v/int-v (:seconds du)))
+        (= unit "minutes") (ok3 (v/int-v (tam/duration-to-minutes du)))
+        (= unit "hours") (ok3 (v/int-v (tam/duration-to-hours du)))
+        (= unit "days") (ok3 (v/int-v (tam/duration-to-days du)))
+        (= unit "milliseconds") (let [[ms e] (tam/duration-to-millis du)]
+                                  (if (= e "") (ok3 (v/int-v ms)) (fail3 (str "java.lang.ArithmeticException " e))))
+        (= unit "nanos") (let [[ns e] (tam/duration-to-nanos du)]
+                           (if (= e "") (ok3 (v/int-v ns)) (fail3 (str "java.lang.ArithmeticException " e))))
+        :else (fail-unit (str "Invalid unit: " unit " expecting 'days' or 'hours' or 'seconds' or 'minutes' or 'milliseconds' or 'nanos'"))))))
+
+(defn- check-mode Str [meta: &Vec(v/Field)]
+  (let [m (prop meta "mode")]
+    (if (= (count m) 0) ""
+      (let [s (nth m 0)]
+        (if (let [u (str/upper-case s)] (or (= u "LENIENT") (= u "SMART") (= u "STRICT"))) ""
+          (str "Invalid unit: " s " expecting 'LENIENT' or 'SMART' or 'STRICT'"))))))
+
+(defn- from-string Values(v/Val dwe/DwErr Bool) [x0: &v/Val s: &Str target: &Str meta: &Vec(v/Field)]
+  (cond
+    (= target "TimeZone") (let [[z e] (parse-zone s)]
+                            (if (= e "") (ok3 (with-meta (v/->VTimeZone z) meta)) (fail3 (cannot x0 target))))
+    (= target "Period") (let [[p e] (parse-period s)]
+                          (if (= e "") (ok3 (with-meta (v/->VPeriod p) meta))
+                            (fail3 (str (cannot x0 target) ", caused by: " e))))
+    :else
+    (let [fmt (prop meta "format")
+          me (check-mode meta)]
+      (if (not= me "") (fail-unit me)
+        (if (= (count fmt) 0)
+          (let [[y ok] (parse-any s)]
+            (if (not ok) (fail3 (cannot x0 target))
+              (let [[r ok2] (convert y target)]
+                (if ok2 (ok3 (with-meta r meta)) (fail3 (cannot x0 target))))))
+          (let [loc (prop meta "locale") md (prop meta "mode")
+                [r e] (parse-format s (nth fmt 0) target (if (= (count loc) 0) "" (nth loc 0)) (if (= (count md) 0) "" (nth md 0)))]
+            (if (= e "") (ok3 (with-meta r meta))
+              (fail3 (str (cannot x0 target) ", caused by: " e)))))))))
+
+(defn- to-string Values(v/Val dwe/DwErr Bool) [x0: &v/Val meta: &Vec(v/Field)]
+  (let [x (v/unmeta x0)
+        fmt (prop meta "format")]
+    (if (= (count fmt) 0)
+      (let [[s ok] (v/temporal-str x)] (ok3 (v/->VStr s)))
+      (let [loc (prop meta "locale")
+            [s e] (format-temporal x (nth fmt 0) (if (= (count loc) 0) "" (nth loc 0)))]
+        (if (= e "") (ok3 (v/->VStr s))
+          (fail3 (str "Cannot coerce " (v/type-name x) " (" (show-val x0) ") to String, caused by: " e)))))))
+
+(defn coerce-temporal Values(v/Val dwe/DwErr Bool) [x0: &v/Val t: &v/TypeV]
+  (if (not= (:kind t) "name") (pass3)
+    (let [target (:name t)
+          meta (:meta t)
+          x (v/unmeta x0)
+          src-t (temporal? x)]
+      (if (temporal-type? target)
+        (match x
+          (v/VStr s) (from-string x0 s target meta)
+          (v/VKey k) (from-string x0 (:name k) target meta)
+          (v/VNum n) (if (= target "DateTime")
+                       (let [u (prop meta "unit")] (number->datetime x n (if (= (count u) 0) "seconds" (nth u 0)) meta))
+                       (fail3 (cannot x0 target))) (v/VInt n-i) (let [n (num/from-int n-i)] (if (= target "DateTime")
+                       (let [u (prop meta "unit")] (number->datetime x n (if (= (count u) 0) "seconds" (nth u 0)) meta))
+                       (fail3 (cannot x0 target))))
+          _ (if src-t
+              (let [[r ok] (convert x target)]
+                (if ok (ok3 (with-meta r meta))
+                  (fail3 (cannot x0 target))))
+              (pass3)))
+        (if (not src-t) (pass3)
+          (cond
+            (= target "String") (to-string x0 meta)
+            (= target "Number") (match x
+                                  (v/VDateTime z) (let [u (prop meta "unit")] (datetime->number z (if (= (count u) 0) "seconds" (nth u 0))))
+                                  (v/VPeriod p) (period->number p (prop meta "unit"))
+                                  _ (fail3 (cannot x0 target)))
+            (or (= target "Any") (= target (v/type-name x))) (pass3)
+            :else (fail3 (cannot x0 target))))))))
+
+(defn to-type Values(v/Val dwe/DwErr) [x: &v/Val target: Str]
+  (let [[r e h] (coerce-temporal x (v/->TypeV "name" target [] [] [] []))]
+    (if h (values r e) (rt/failure "CoercionException" (cannot x target)))))
+
+(defn bad-args Values(v/Val dwe/DwErr) [fname: &Str args: &Vec(v/Val)]
+  (let [desc (loop [i 0 out ""]
+               (if (>= i (count args)) out
+                 (let [a (nth args i) s (show-val a)
+                       tn (v/type-name (v/unmeta a))]
+                   (recur (+ i 1) (str out "\n  " (+ i 1) ": " tn (if (= s "") "" (str " (" s ")")))))))]
+    (rt/failure (rt/call-types-kind args) (str "You called the function '" fname "' with these arguments: " desc))))

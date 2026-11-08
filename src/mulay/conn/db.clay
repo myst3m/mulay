@@ -1,0 +1,937 @@
+(ns mulay.conn.db
+  (:require [mulay.rt.stream :as stream] [mulay.lib.host :as host] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as drt] [mulay.mule.model :as m] [mulay.lib.res :as res] [mulay.rt.event :as ev]
+            [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.lib.xml :as xml] [mulay.lib.time.iso :as iso] [mulay.lib.time.unit :as tu] [mulay.rt.ops :as ops]
+            [mulay.lib.jhash :as jh] [mulay.db.sql :as sql] [mulay.db.sqltext :as qt] [mulay.db.sqlite :as sqlite] [mulay.db.emu :as emu] [mulay.conn.db_net :as dn] [mulay.db.pg :as pgd] [mulay.db.oracle :as orad] [mulay.db.mysql :as myd] [mulay.db.mywire :as myw] [clay.postgres :as pg]
+            [clay.string :as str] [mulay.rt.poll :as rp]))
+
+(def NS "http://www.mulesoft.org/schema/mule/db")
+
+(defn- child-el Vec(xml/XNode) [ns: &Vec(xml/XNode) local: &Str]
+  (loop [i 0] (if (>= i (count ns)) [] (if (and (xml/elem? (nth ns i)) (= (xml/elem-local (nth ns i)) local)) [(nth ns i)] (recur (+ i 1))))))
+
+(defrecord Spec [kind: Str loc: Str user: Str password: Str url: Str])
+
+(def MY-LOGGER "?logger=org.mule.extension.db.api.logger.MuleMySqlLogger$ByteBuddy$DCfiwK5c")
+
+(defn- conn-props Vec(Str) [el: &xml/XNode]
+  (let [cp (child-el (xml/elem-children el) "connection-properties")]
+    (if (= (count cp) 0) []
+      (let [ks (xml/elem-children (nth cp 0))]
+        (loop [i 0 acc: Vec(Str) []]
+          (if (>= i (count ks)) acc
+            (let [k (nth ks i)]
+              (recur (+ i 1) (if (and (xml/elem? k) (= (xml/elem-local k) "connection-property"))
+                               (conj acc (str (xml/attr k "" "key" "") "=" (xml/attr k "" "value" ""))) acc)))))))))
+
+(defn- conn-spec Values(Spec Str) [cfg: &m/Config]
+  (let [g (child-el (:children cfg) "generic-connection")
+        oc (child-el (:children cfg) "oracle-connection")
+        mc (child-el (:children cfg) "my-sql-connection")
+        none (->Spec "" "" "" "" "")]
+    (cond
+      (> (count mc) 0)
+      (let [el (nth mc 0)
+            base (str "//" (xml/attr el "" "host" "") ":" (xml/attr el "" "port" "3306") "/" (xml/attr el "" "database" ""))
+            props (conn-props el)]
+        (values (->Spec "mysql" (if (= (count props) 0) base (str base "?" (str/join "&" props)))
+                        (xml/attr el "" "user" "") (xml/attr el "" "password" "") (str "jdbc:mysql:" base MY-LOGGER)) ""))
+      (> (count oc) 0)
+      (let [el (nth oc 0)
+            host (xml/attr el "" "host" "")
+            port (xml/attr el "" "port" "1521")
+            inst (xml/attr el "" "instance" "")
+            svc (xml/attr el "" "serviceName" "")]
+        (values (->Spec "oracle" (if (= svc "") (str "@" host ":" port ":" inst) (str "@//" host ":" port "/" svc))
+                        (xml/attr el "" "user" "") (xml/attr el "" "password" "") "") ""))
+      (= (count g) 0) (values none "Only <db:generic-connection>, <db:oracle-connection> and <db:my-sql-connection> are supported yet")
+      :else
+      (let [el (nth g 0)
+            url (xml/attr el "" "url" "")
+            user (xml/attr el "" "user" "")
+            pw (xml/attr el "" "password" "")]
+        (cond
+          (str/starts-with? url "jdbc:sqlite:") (values (->Spec "sqlite" (subs url 12 (count url)) user pw "") "")
+          (str/starts-with? url "jdbc:postgresql:") (values (->Spec "postgresql" (subs url 16 (count url)) user pw "") "")
+          (str/starts-with? url "jdbc:oracle:thin:") (values (->Spec "oracle" (subs url 17 (count url)) user pw "") "")
+          (str/starts-with? url "jdbc:mysql:") (values (->Spec "mysql" (subs url 11 (count url)) user pw (str url)) "")
+          :else (values none (str "No driver for " url)))))))
+
+(defvariant Handle (HNone) (HSqlite h: Int) (HPg c: pg/Conn) (HOra c: orad/Conn) (HMy c: myd/Conn) (HEmu key: Str kind: Str schema: Str))
+
+(defn- kind-of Str [h: &Handle]
+  (match h (HSqlite x) "sqlite" (HPg c) "postgresql" (HOra c) "oracle" (HMy c) "mysql" (HEmu k kd sc) (str kd) (HNone) ""))
+
+(def EMU-SEED (atom (let [v: Vec(Fn(Str Str)) []] v)))
+(def EMUS (atom (let [m: Map(Str emu/Emu) {}] m)))
+
+(defn dialect-of Values(Str Str Str) [cfg: &m/Config]
+  (let [[sp e] (conn-spec cfg)]
+    (if (not= e "") (values "" "" e)
+      (let [[h he] (emu-handle cfg sp)]
+        (match h (HEmu n k sc) (values (str k) (str sc) "") _ (values "" "" "not emulated"))))))
+
+(defn set-emulator! Int [seed: Fn(Str Str)] (let [z (reset! EMU-SEED [seed])] 0))
+
+(defn reset-emulator! Int []
+  (let [m: Map(Str emu/Emu) (deref EMUS)
+        ks (keys m)
+        z (loop [i 0] (if (>= i (count ks)) 0 (let [w (emu/close (get! m (nth ks i)))] (recur (+ i 1)))))
+        z2 (reset! EMUS (let [e: Map(Str emu/Emu) {}] e))]
+    0))
+
+(defn clear-emulator! Int [] (let [z (reset-emulator!) z2 (reset! EMU-SEED (let [v: Vec(Fn(Str Str)) []] v))] 0))
+
+(defn- emulating? Bool [] (let [v: Vec(Fn(Str Str)) (deref EMU-SEED)] (> (count v) 0)))
+
+(defn- emu-of Values(emu/Emu sql/DbErr) [key: &Str kind: &Str schema: &Str]
+  (let [m: Map(Str emu/Emu) (deref EMUS)]
+    (if (contains? m key) (values (get! m key) (sql/ok-err))
+      (let [fs: Vec(Fn(Str Str)) (deref EMU-SEED)
+            seed (if (= (count fs) 0) "" ((nth fs 0) (str key)))
+            [e er] (emu/open kind schema seed)
+            z (if (sql/ok? er) (swap! EMUS (fn Map(Str emu/Emu) [mm: Map(Str emu/Emu)] (assoc mm (str key) e))) m)]
+        (values e er)))))
+
+(defn- emu-handle Values(Handle Str) [cfg: &m/Config sp: &Spec]
+  (let [kind (if (= (:kind sp) "sqlite") "sqlite" (str (:kind sp)))
+        schema (cond (= kind "oracle") (:user sp)
+                     (= kind "mysql") (let [[host port db kvs ue] (myw/parse-url (:loc sp))] db)
+                     :else "public")]
+    (values (->HEmu (str (:name cfg)) kind (str schema)) "")))
+
+(defn- open-conn Values(Handle Str) [sp: &Spec]
+  (cond
+    (= (:kind sp) "oracle")
+    (let [[host port service sid ue] (orad/parse-url (:loc sp))]
+      (if (not= ue "") (values (->HNone) ue)
+        (let [[cs de] (dn/ora-open host port service sid (:user sp) (:password sp))]
+          (if (= (count cs) 0) (values (->HNone) (:msg de)) (values (->HOra (nth cs 0)) "")))))
+    (= (:kind sp) "mysql")
+    (let [[host port db kvs ue] (myw/parse-url (:loc sp))]
+      (if (not= ue "") (values (->HNone) ue)
+        (let [[cs de] (dn/my-open host port db (:user sp) (:password sp) kvs)]
+          (if (= (count cs) 0) (values (->HNone) (str "Cannot get connection for URL " (:url sp) " : " (:msg de)))
+            (values (->HMy (nth cs 0)) "")))))
+    (= (:kind sp) "postgresql")
+    (let [[cs de] (dn/pg-open (:loc sp) (:user sp) (:password sp))]
+      (if (= (count cs) 0) (values (->HNone) (str "Cannot get connection for URL jdbc:postgresql:" (:loc sp) " : " (:msg de)))
+        (values (->HPg (nth cs 0)) "")))
+    :else
+    (let [[h de] (sqlite/open (:loc sp))]
+      (if (sql/ok? de) (values (->HSqlite h) "") (values (->HNone) (:msg de))))))
+
+(defrecord Pool [idle: Vec(Handle) taken: Map(Str Handle)])
+
+(defrecord TxConn [cfg: Str handle: Handle id: Str])
+
+
+(defrecord St [pools: Atom(Map(Str Pool)) seq: Atom(Int) txs: Atom(Map(Str TxConn))])
+
+(defn- next-id Str [st: &St] (str (swap! (:seq st) (fn Int [n: Int] (+ n 1)))))
+
+(defn- pool-of Pool [o: &Map(Str Pool) name: &Str]
+  (if (contains? o name) (get! o name) (let [t: Map(Str Handle) {}] (->Pool [] t))))
+
+(defn- take-idle Values(Handle Int) [st: &St name: &Str id: &Str max: Int]
+  (let [m (swap! (:pools st) (fn Map(Str Pool) [o: Map(Str Pool)]
+                                 (let [p (pool-of o name)
+                                       idle (:idle p)]
+                                   (cond
+                                     (> (count idle) 0)
+                                     (assoc o name (->Pool (subvec idle 0 (- (count idle) 1))
+                                                           (assoc (:taken p) id (nth idle (- (count idle) 1)))))
+                                     (or (< max 0) (< (count (:taken p)) max))
+                                     (assoc o name (->Pool idle (assoc (:taken p) id (->HNone))))
+                                     :else o))))
+        taken (:taken (pool-of m name))]
+    (if (contains? taken id)
+      (let [h (get! taken id)] (values h (match h (HNone) 1 _ 0)))
+      (values (->HNone) 2))))
+
+(defn- pool-limits Values(Int Int) [cfg: &m/Config]
+  (let [cs (:children cfg)
+        g (let [a (child-el cs "generic-connection") b (child-el cs "oracle-connection")] (if (> (count a) 0) a (if (> (count b) 0) b (child-el cs "my-sql-connection"))))
+        pp (if (= (count g) 0) [] (child-el (xml/elem-children (nth g 0)) "pooling-profile"))]
+    (if (= (count pp) 0) (values -1 -1)
+      (let [el (nth pp 0)
+            [mx e1] (parse-long (xml/attr el "" "maxPoolSize" "5"))
+            [w e2] (parse-long (xml/attr el "" "maxWait" "0"))
+            unit (xml/attr el "" "maxWaitUnit" "SECONDS")
+            ms (cond (= unit "MILLISECONDS") w (= unit "MICROSECONDS") (quot w 1000) (= unit "NANOSECONDS") (quot w 1000000)
+                     (= unit "MINUTES") (* w 60000) (= unit "HOURS") (* w 3600000) (= unit "DAYS") (* w 86400000) :else (* w 1000))]
+        (values (if (= e1 "") mx 5) (if (and (= e2 "") (> ms 0)) ms -1))))))
+
+(defn- close-conn Int [h: &Handle]
+  (match h
+    (HOra c) (dn/ora-close c)
+    (HPg c) (dn/pg-close c)
+    (HMy c) (dn/my-close c)
+    (HSqlite x) (sqlite/close x)
+    (HEmu k kd sc) 0
+    (HNone) 0))
+
+(defn- acquire Values(Handle Str Str) [st: &St cfg: &m/Config]
+  (if (emulating?)
+    (let [[sp e] (conn-spec cfg) [h he] (if (not= e "") (values (->HNone) e) (emu-handle cfg sp))] (values h (next-id st) he))
+    (acquire-real st cfg)))
+
+(defn- acquire-real Values(Handle Str Str) [st: &St cfg: &m/Config]
+  (let [name (:name cfg)
+        id (next-id st)
+        [max wait] (pool-limits cfg)
+        deadline (if (< wait 0) -1 (+ (quot (mono-us) 1000) wait))
+        [h r] (loop []
+                (let [[h r] (take-idle st name id max)]
+                  (if (and (= r 2) (or (< deadline 0) (< (quot (mono-us) 1000) deadline))) (let [z (sleep-ms 5)] (recur)) (values h r))))]
+    (cond
+      (= r 0) (values h id "")
+      (= r 2) (values (->HNone) id "An attempt by a client to checkout a Connection has timed out.")
+      :else
+      (let [[sp e] (conn-spec cfg)
+            [h2 oe] (if (not= e "") (values (->HNone) e) (open-conn sp))]
+        (if (not= oe "") (let [z (release st name h2 id true)] (values h2 id oe)) (values h2 id ""))))))
+
+(defn- release Int [st: &St name: &Str h: &Handle id: &Str broken: Bool]
+  (let [z (swap! (:pools st) (fn Map(Str Pool) [o: Map(Str Pool)]
+                                 (let [p (pool-of o name)]
+                                   (assoc o name (->Pool (if broken (:idle p) (conj (:idle p) h))
+                                                         (dissoc (:taken p) id))))))]
+    (if broken (close-conn h) 0)))
+
+(defn- broken? Bool [e: &sql/DbErr] (str/starts-with? (:state e) "08"))
+
+(defn- tx-begin Values(Handle Str) [h: Handle]
+  (match h
+    (HSqlite x) (let [[o e] (sqlite/run x "BEGIN" [] false)] (values h (:msg e)))
+    (HPg c) (let [[o e] (dn/pg-run c "BEGIN" [] false [])] (values h (:msg e)))
+    (HOra c) (values (->HOra (orad/with-autocommit c false)) "")
+    (HMy c) (values h (:msg (dn/my-begin c)))
+    (HEmu k kd sc) (let [[em ee] (emu-of k kd sc)] (if (not (sql/ok? ee)) (values h (:msg ee)) (let [[o e] (emu/run em "BEGIN" [] false)] (values h (:msg e)))))
+    (HNone) (values h "no connection")))
+
+(defn- tx-finish Values(Handle Str) [h: Handle commit: Bool]
+  (match h
+    (HSqlite x) (let [[o e] (sqlite/run x (if commit "COMMIT" "ROLLBACK") [] false)] (values h (:msg e)))
+    (HPg c) (let [[o e] (dn/pg-run c (if commit "COMMIT" "ROLLBACK") [] false [])] (values h (:msg e)))
+    (HOra c) (let [[c2 e] (dn/ora-finish c commit)] (values (->HOra (orad/with-autocommit c2 true)) (:msg e)))
+    (HMy c) (values h (:msg (dn/my-finish c commit)))
+    (HEmu k kd sc) (let [[em ee] (emu-of k kd sc)] (if (not (sql/ok? ee)) (values h (:msg ee)) (let [[o e] (emu/run em (if commit "COMMIT" "ROLLBACK") [] false)] (values h (:msg e)))))
+    (HNone) (values h "")))
+
+(defn- tx-handle Values(Handle Str) [st: &St cfg: &m/Config tx: &Str]
+  (let [k (str tx "\t" (:name cfg))
+        m (deref (:txs st))]
+    (if (contains? m k) (values (:handle (get! m k)) "")
+      (let [[h id he] (acquire st cfg)]
+        (if (not= he "") (values h he)
+          (let [[h2 be] (tx-begin h)]
+            (if (not= be "") (let [z (release st (:name cfg) h2 id true)] (values h2 be))
+              (let [z (swap! (:txs st) (fn Map(Str TxConn) [o: Map(Str TxConn)] (assoc o k (->TxConn (:name cfg) h2 id))))]
+                (values h2 "")))))))))
+
+(defn- tx-store Int [st: &St cfg: &m/Config tx: &Str h: Handle]
+  (let [k (str tx "\t" (:name cfg))
+        z (swap! (:txs st) (fn Map(Str TxConn) [o: Map(Str TxConn)]
+                               (if (contains? o k) (let [t (get! o k)] (assoc o k (->TxConn (:cfg t) h (:id t)))) o)))]
+    0))
+
+(defn- tx-end Str [st: &St tx: &Str commit: Bool]
+  (let [pre (str tx "\t")
+        m (deref (:txs st))
+        ks (loop [i 0 acc: Vec(Str) [] all (keys m)] (if (>= i (count all)) acc (recur (+ i 1) (if (str/starts-with? (nth all i) pre) (conj acc (nth all i)) acc) all)))]
+    (if (= (count ks) 0) ""
+      (let [z (swap! (:txs st) (fn Map(Str TxConn) [o: Map(Str TxConn)] (loop [i 0 a o] (if (>= i (count ks)) a (recur (+ i 1) (dissoc a (nth ks i)))))))]
+        (loop [i 0 err ""]
+          (if (>= i (count ks)) err
+            (let [t (get! m (nth ks i))
+                  fe (ops/on-fail (fn Str [] (let [[h2 fe] (tx-finish (:handle t) commit) z2 (release st (:cfg t) h2 (:id t) (not= fe ""))] fe))
+                                  (fn Int [] (release st (:cfg t) (:handle t) (:id t) true)))]
+              (recur (+ i 1) (if (= err "") fe err)))))))))
+
+(defn- exec-batch Values(Vec(Int) sql/DbErr) [kind: &Str hb: &Atom(Handle) text: &Str rows: &Vec(Vec(sql/Cell))]
+  (match (deref hb)
+    (HOra c) (let [[ns e c2] (dn/ora-run-batch c text rows) z (reset! hb (->HOra c2))] (values ns e))
+    (HSqlite x) (sqlite/run-batch x text rows)
+    (HPg c) (dn/pg-run-batch c text rows)
+    (HMy c) (dn/my-run-batch c text rows)
+    _ (loop [i 0 acc: Vec(Int) []]
+        (if (>= i (count rows)) (values acc (sql/ok-err))
+          (let [[o e] (exec kind hb text (nth rows i) false [])]
+            (if (not (sql/ok? e)) (values acc e)
+              (recur (+ i 1) (conj acc (:count o)))))))))
+
+(defn- exec Values(sql/Outcome sql/DbErr) [kind: &Str hb: &Atom(Handle) text: &Str ps: &Vec(sql/Cell) keys: Bool key-cols: &Vec(Str)]
+  (match (deref hb)
+    (HOra c) (let [[o e c2] (dn/ora-run c text ps keys key-cols) z (reset! hb (->HOra c2))] (values o e))
+    (HPg c) (dn/pg-run c text ps keys key-cols)
+    (HMy c) (dn/my-run c text ps keys)
+    (HSqlite x) (sqlite/run x text ps keys)
+    (HEmu k kd sc) (let [[em ee] (emu-of k kd sc)] (if (not (sql/ok? ee)) (values (sql/->Outcome (sql/no-rows) 0 (sql/no-rows)) ee) (emu/run em text ps keys)))
+    (HNone) (values (sql/->Outcome (sql/no-rows) 0 (sql/no-rows)) (sql/->DbErr "no connection" "08003" 0 "java.sql.SQLException"))))
+
+(defn- class-meta Vec(v/Field) [cls: &Str] [(v/field "class" (v/->VStr (str cls)))])
+(defn- jmeta v/Val [x: v/Val cls: &Str] (v/->VMeta x (class-meta cls)))
+(defn- cmeta v/Val [x: v/Val m: &Vec(v/Field)] (v/->VMeta x m))
+
+(def CM-INT (class-meta "java.lang.Integer"))
+(def CM-LONG (class-meta "java.lang.Long"))
+(def CM-DOUBLE (class-meta "java.lang.Double"))
+(def CM-FLOAT (class-meta "java.lang.Float"))
+(def CM-DECIMAL (class-meta "java.math.BigDecimal"))
+(def CM-STR (class-meta "java.lang.String"))
+(def CM-BYTES (class-meta "byte[]"))
+(def CM-BOOL (class-meta "java.lang.Boolean"))
+(def CM-DATE (class-meta "java.sql.Date"))
+(def CM-TS (class-meta "java.sql.Timestamp"))
+(def CM-BIGINT (class-meta "java.math.BigInteger"))
+(def CM-LDT (class-meta "java.time.LocalDateTime"))
+(def CM-TIME (class-meta "java.sql.Time"))
+
+(defn- datum-val v/Val [cls: &Str b: &Str zone: &Str]
+  (let [f0 [(v/field "length" (v/int-v (count b)))]
+        f1 (if (= cls "oracle.sql.ROWID") (conj f0 (v/field "ACProxy" (v/null-v))) f0)
+        f2 (if (= zone "") f1 (conj f1 (v/field "timeZone" (v/->VStr (str zone)))))]
+    (v/->VObj (conj (conj (conj f2 (v/field "null" (v/bool-v false))) (v/field "stream" (v/->VBin (str b)))) (v/field "bytes" (v/->VBin (str b)))))))
+
+(defn cell-val v/Val [c: &sql/Cell]
+  (match c
+    (sql/CNull) (v/null-v)
+    (sql/CInt i) (cmeta (v/int-v i) CM-INT)
+    (sql/CLong i) (cmeta (v/int-v i) CM-LONG)
+    (sql/CDouble f) (let [[n e] (num/from-float f)] (cmeta (v/num-v n) CM-DOUBLE))
+    (sql/CFloat s) (let [[n e] (num/parse-lit s)] (cmeta (if (= e "") (v/num-v n) (v/->VStr s)) CM-FLOAT))
+    (sql/CDecimal s) (let [[n e] (num/parse-lit s)] (cmeta (if (= e "") (v/num-v n) (v/->VStr s)) CM-DECIMAL))
+    (sql/CStr s) (cmeta (v/->VStr s) CM-STR)
+    (sql/CBytes b) (cmeta (v/->VBin b) CM-BYTES)
+    (sql/CBool b) (cmeta (v/bool-v b) CM-BOOL)
+    (sql/CDate s) (let [[d e] (iso/parse-date s)] (cmeta (if (= e "") (v/->VDate d) (v/->VStr s)) CM-DATE))
+    (sql/CTimestamp s) (let [[d e] (iso/parse-ldt s)] (cmeta (if (= e "") (v/->VLocalDateTime d) (v/->VStr s)) CM-TS))
+    (sql/CLdt s) (let [[d e] (iso/parse-ldt s)] (cmeta (if (= e "") (v/->VLocalDateTime d) (v/->VStr s)) CM-LDT))
+    (sql/CTime s) (let [[d e] (iso/parse-ldt (str "1970-01-01T" s))] (cmeta (if (= e "") (v/->VLocalDateTime d) (v/->VStr s)) CM-TIME))
+    (sql/CBigInt s) (let [[n e] (num/parse-lit s)] (cmeta (if (= e "") (v/num-v n) (v/->VStr s)) CM-BIGINT))
+    (sql/CZoned s) (cmeta (v/->VStr s) CM-STR)
+    (sql/CDatum cls b zone) (jmeta (datum-val cls b zone) cls)
+    (sql/CClob s) (v/->VStr s)))
+
+(def ROW-CLASS "org.mule.db.commons.shaded.internal.util.CaseInsensitiveLinkedMap")
+(def CM-ROW (class-meta ROW-CLASS))
+
+(defn- col-keys Vec(v/Key) [cols: &Vec(Str)]
+  (loop [i 0 acc: Vec(v/Key) []] (if (>= i (count cols)) acc (recur (+ i 1) (conj acc (v/simple-key (nth cols i)))))))
+
+(defn- row-val v/Val [ks: &Vec(v/Key) row: &Vec(sql/Cell)]
+  (cmeta (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (v/->Field (nth ks i) (cell-val (nth row i)))))))) CM-ROW))
+
+(defn- rows-val v/Val [r: &sql/Rows]
+  (let [ks (col-keys (:cols r))]
+    (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count (:rows r))) acc (recur (+ i 1) (conj acc (row-val ks (nth (:rows r) i)))))))))
+
+(defn- keys-val v/Val [r: &sql/Rows]
+  (if (= (count (:rows r)) 0) (v/->VObj [])
+    (let [cols (:cols r)
+          row (nth (:rows r) 0)
+          order (jh/hashmap-order cols)]
+      (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                  (if (>= i (count order)) acc
+                    (let [k (loop [j 0] (if (= (nth cols j) (nth order i)) j (recur (+ j 1))))]
+                      (recur (+ i 1) (conj acc (v/field (nth order i) (cell-val (nth row k))))))))))))
+
+(defn val-cell sql/Cell [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VNull) (sql/->CNull)
+      (v/VInt i) (if (and (>= i -2147483648) (<= i 2147483647)) (sql/->CInt i) (sql/->CLong i))
+      (v/VNum n) (sql/->CDecimal (num/to-plain-str n))
+      (v/VStr s) (sql/->CStr s)
+      (v/VBool b) (sql/->CBool b)
+      (v/VBin b) (sql/->CBytes b)
+      (v/VDate d) (sql/->CDate (iso/date-str d))
+      (v/VLocalDateTime d) (sql/->CTimestamp (iso/ldt-str d))
+      (v/VDateTime z) (let [[t e] (drt/to-text x)] (sql/->CZoned t))
+      _ (let [[t e] (drt/to-text x)] (sql/->CStr t)))))
+
+(defn- failure conn/OpResult [id: Str msg: Str] (conn/fail-result (err/mk "DB" id msg)))
+
+(defn- java conn/OpResult [x: v/Val] (conn/ok-result (ev/tv-val x ev/JAVA) (ev/tv-null)))
+
+(defn- sql-text Values(Str Str) [c: &conn/OpCall]
+  (let [p (conn/param (:exprs c) "sql")]
+    (if (> (count p) 0)
+      (let [[x e] ((:eval c) (nth p 0) (:event c))
+            [t te] (drt/to-text x)]
+        (values t e))
+      (let [el (child-el (:children c) "sql")]
+        (if (= (count el) 0) (values "" "") (values (xml/text-content (nth el 0)) ""))))))
+
+(defn- script-file-text Values(Str Vec(err/MErr)) [c: &conn/OpCall fname: &Str]
+  (let [[text found] ((:res c) fname)
+        missing [(err/mk "MULE" "UNKNOWN" (str "Unable to read script file: " fname))]]
+    (cond found (values text [])
+          (str/starts-with? fname "/") (let [[t e] (host/file-read fname)] (if (= e "") (values t []) (values "" missing)))
+          :else (values "" missing))))
+
+(defn- op-text Values(Str Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[f fx] (if (= (:op c) "execute-script") (conn/attr-str c "file" "") (values "" []))]
+    (cond (> (count fx) 0) (values "" fx)
+          (not= f "") (script-file-text c f)
+          :else (let [[t te] (sql-text c)]
+                  (if (not= te "") (values "" [(err/mk "MULE" "EXPRESSION" te)]) (values t []))))))
+
+(defn- child-val Values(Vec(v/Val) Str) [c: &conn/OpCall local: &Str]
+  (let [p (conn/param (:exprs c) local)]
+    (if (= (count p) 0) (values [] "")
+      (let [[x e] ((:eval c) (nth p 0) (:event c))] (values [x] e)))))
+
+(defn- params-of Vec(sql/Cell) [names: &Vec(Str) obj: &v/Val]
+  (let [fs (match (v/unmeta obj) (v/VObj f) f _ [])]
+    (loop [i 0 acc: Vec(sql/Cell) []]
+      (if (>= i (count names)) acc
+        (let [r (v/obj-get fs (nth names i))]
+          (recur (+ i 1) (conj acc (if (= (count r) 0) (sql/->CNull) (val-cell (nth r 0))))))))))
+
+(defn- attr-lit Str [c: &conn/OpCall name: &Str default: Str] (conn/param-lit (:params c) name default))
+
+(defn- unbound Str [names: &Vec(Str) pv: &Vec(v/Val)]
+  (let [fs (if (= (count pv) 0) [] (match (v/unmeta (nth pv 0)) (v/VObj f) f _ []))]
+    (loop [i 0] (if (>= i (count names)) "" (if (= (count (v/obj-get fs (nth names i))) 0) (nth names i) (recur (+ i 1)))))))
+
+(defn- unbound-fail conn/OpResult [name: &Str text: &Str]
+  (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Parameter '" name "' was not bound for query '" text "'"))))
+
+(defn- max-rows Int [c: &conn/OpCall]
+  (let [p (conn/param (:params c) "maxRows")]
+    (if (= (count p) 0) 0
+      (let [[x e] (match (nth p 0)
+                    (m/PLit t) (values (v/->VStr (str t)) "")
+                    _ ((:eval c) (nth p 0) (:event c)))
+            [t te] (drt/to-text x)
+            [n pe] (parse-long t)]
+        (if (and (= e "") (= (:kind te) "") (= pe "") (> n 0)) n 0)))))
+
+(defn- cap-source stream/Source [src: stream/Source limit: Int]
+  (if (<= limit 0) src
+    (let [seen (atom 0)
+          nx (:next src)]
+      (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int]
+                         (let [room (- limit (deref seen))]
+                           (if (<= room 0) (values [] true "")
+                             (let [[rows d e] (nx (if (> n room) room n))
+                                   z (swap! seen (fn Int [o: Int] (+ o (count rows))))]
+                               (values rows (or d (>= (deref seen) limit)) e)))))
+                       (:close src) (:drain src)))))
+
+(defn- check-kind Str [t: &qt/Template kinds: Vec(Str)]
+  (if (loop [i 0] (if (>= i (count kinds)) false (if (= (nth kinds i) (:kind t)) true (recur (+ i 1))))) ""
+    (str "Query type must be one of [" (str/join ", " kinds) "] but query '" (:sql t) "' is of type '" (:kind t) "'")))
+
+(defn- op-kinds Vec(Str) [op: &Str]
+  (cond (= op "select") ["SELECT" "STORE_PROCEDURE_CALL"]
+        (= op "query-single") ["SELECT"]
+        (or (= op "insert") (= op "bulk-insert")) ["INSERT"]
+        (or (= op "update") (= op "bulk-update")) ["UPDATE" "TRUNCATE" "MERGE" "STORE_PROCEDURE_CALL"]
+        (or (= op "delete") (= op "bulk-delete")) ["DELETE"]
+        (= op "execute-ddl") ["DDL"]
+        :else []))
+
+(defn- split-script Vec(Str) [s0: &Str]
+  (let [s (str/trim s0) n (count s)]
+    (loop [i 0 start 0 acc: Vec(Str) []]
+      (if (>= i n) (let [last (subs s start n)] (if (= (str/trim last) "") acc (conj acc last)))
+        (if (and (= (nth s i) 59) (< (+ i 1) n) (or (= (nth s (+ i 1)) 10) (= (nth s (+ i 1)) 13)))
+          (let [j (loop [k (+ i 1)] (if (and (< k n) (or (= (nth s k) 10) (= (nth s k) 13))) (recur (+ k 1)) k))
+                part (subs s start i)]
+            (recur j j (if (= (str/trim part) "") acc (conj acc part))))
+          (recur (+ i 1) start acc))))))
+
+(def CONN-STATES ["08000" "08001" "08S01" "08002" "08003" "08004" "08006"])
+
+(defn db-error Values(Str Str) [e: &sql/DbErr]
+  (let [msg (:msg e)
+        st (:state e)]
+    (cond
+      (= (:exc e) "java.sql.SQLSyntaxErrorException") (values "BAD_SQL_SYNTAX" (str (:exc e) ": " msg))
+      (or (loop [i 0] (if (>= i (count CONN-STATES)) false (if (= (nth CONN-STATES i) st) true (recur (+ i 1)))))
+          (>= (str/index-of msg "The connection is closed") 0)
+          (>= (str/index-of msg "Connection timed out") 0)) (values "CONNECTIVITY" (str msg))
+      (= st "S0001") (values "BAD_SQL_SYNTAX" (str msg))
+      :else (values "QUERY_EXECUTION" (str msg)))))
+
+(defn- db-fail Values(conn/OpResult Bool) [e: &sql/DbErr]
+  (if (= (:state e) emu/UNSUPPORTED) (values (conn/fail-result (err/halt (:msg e))) false)
+    (let [[id msg] (db-error e)] (values (failure id msg) (broken? e)))))
+
+(defn- bulk-fail Values(conn/OpResult Bool) [e: &sql/DbErr]
+  (let [[id msg] (db-error e)
+        exc (:exc e)]
+    (values (failure id (if (or (= id "CONNECTIVITY") (= exc "") (str/starts-with? msg exc)) msg (str exc ": " msg))) (broken? e))))
+
+(defn- batch-err sql/DbErr [kind: &Str i: Int sqltext: &Str e: &sql/DbErr]
+  (cond (= kind "sqlite") (sqlite/batch-err i sqltext e)
+        (= kind "postgresql") (pgd/batch-err i sqltext e)
+        :else (sql/->DbErr (:msg e) (:state e) (:code e) (:exc e))))
+
+(defn- counts-arr v/Val [ns: &Vec(Int)]
+  (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+              (if (>= i (count ns)) acc
+                (recur (+ i 1) (conj acc (jmeta (v/int-v (if (< (nth ns i) 0) 0 (nth ns i))) "java.lang.Integer")))))))
+
+(defn- run-script Values(conn/OpResult Bool) [kind: &Str h: &Atom(Handle) text: &Str]
+  (let [parts (split-script text)
+        pre (if (= kind "oracle") (orad/batch-check parts) (sql/ok-err))]
+    (match (deref h)
+      (HPg pc) (let [sqls (loop [i 0 acc: Vec(Str) []] (if (>= i (count parts)) acc (recur (+ i 1) (conj acc (:sql (qt/parse (nth parts i)))))))
+                     [ns e] (dn/pg-run-script pc sqls parts)]
+                 (if (not (sql/ok? e)) (db-fail e) (values (java (jmeta (counts-arr ns) "int[]")) false)))
+      (HMy mc) (let [[ns e] (dn/my-run-script mc parts)]
+                 (if (not (sql/ok? e)) (db-fail e)
+                   (values (java (jmeta (counts-arr ns) "int[]")) false)))
+      _
+    (loop [i 0 acc: Vec(v/Val) []]
+      (if (not (sql/ok? pre)) (db-fail pre)
+      (if (>= i (count parts)) (values (java (jmeta (v/->VArr acc) "int[]")) false)
+        (let [t (qt/parse (nth parts i))
+              [o e] (exec kind h (:sql t) [] false [])]
+          (if (not (sql/ok? e)) (db-fail (batch-err kind i (str/trim (nth parts i)) e))
+            (recur (+ i 1) (conj acc (jmeta (v/int-v (if (< (:count o) 0) 0 (:count o))) "java.lang.Integer")))))))))))
+
+(defn- key-columns Vec(Str) [c: &conn/OpCall]
+  (let [el (child-el (:children c) "auto-generated-keys-column-names")]
+    (if (= (count el) 0) []
+      (let [kids (xml/elem-children (nth el 0))]
+        (loop [i 0 acc: Vec(Str) []]
+          (if (>= i (count kids)) acc
+            (let [k (nth kids i)]
+              (recur (+ i 1) (if (and (xml/elem? k) (= (xml/elem-local k) "auto-generated-keys-column-name"))
+                               (conj acc (xml/attr k "" "value" "")) acc)))))))))
+
+(defn coerce-out sql/Cell [c: sql/Cell jdbc: &Str]
+  (let [text (match c
+               (sql/CInt i) (str i) (sql/CLong i) (str i) (sql/CDecimal s) (str s) (sql/CStr s) (str s)
+               (sql/CFloat s) (str s) (sql/CDouble f) (num/to-plain-str (let [[n e] (num/from-float f)] n))
+               (sql/CBool b) (if b "1" "0") (sql/CDate s) (str s) (sql/CTimestamp s) (str s) _ "")
+        null (match c (sql/CNull) true _ false)
+        [n ne] (num/parse-lit text)
+        whole (let [d (str/index-of text ".")] (if (< d 0) (str text) (subs text 0 d)))
+        [iv ie] (parse-long whole)]
+    (cond
+      null (sql/->CNull)
+      (and (or (= jdbc "INTEGER") (= jdbc "SMALLINT") (= jdbc "TINYINT")) (= ie "")) (sql/->CInt iv)
+      (and (= jdbc "BIGINT") (= ie "")) (sql/->CLong iv)
+      (and (or (= jdbc "NUMERIC") (= jdbc "DECIMAL")) (= ne "")) (sql/->CDecimal (num/to-plain-str n))
+      (and (or (= jdbc "DOUBLE") (= jdbc "FLOAT")) (= ne "")) (let [[f fe] (parse-double text)] (sql/->CDouble f))
+      (and (or (= jdbc "VARCHAR") (= jdbc "CHAR") (= jdbc "LONGVARCHAR") (= jdbc "NVARCHAR") (= jdbc "NCHAR")) (not= text ""))
+      (sql/->CStr text)
+      (and (= jdbc "DATE") (>= (count text) 10)) (sql/->CDate (subs text 0 10))
+      (and (or (= jdbc "BOOLEAN") (= jdbc "BIT")) (not= text "")) (sql/->CBool (or (= text "1") (= text "true")))
+      :else c)))
+
+(defn- kid-params Values(Vec(Str) Vec(v/Val) Vec(Str) Str) [c: &conn/OpCall local: &Str item: &Str]
+  (let [el (child-el (:children c) local)]
+    (if (= (count el) 0) (values [] [] [] "")
+      (let [kids0 (xml/elem-children (nth el 0))
+            kids (loop [i 0 acc: Vec(xml/XNode) []] (if (>= i (count kids0)) acc (recur (+ i 1) (if (and (xml/elem? (nth kids0 i)) (= (xml/elem-local (nth kids0 i)) item)) (conj acc (nth kids0 i)) acc))))
+            dup (> (count kids) 1)]
+        (loop [i 0 keys: Vec(Str) [] vals: Vec(v/Val) [] types: Vec(Str) []]
+          (if (>= i (count kids)) (values keys vals types "")
+            (let [k (nth kids i)
+                  path (str local "/" item (if dup (str "[" i "]") "") "@value")
+                  p (conn/param (:exprs c) path)
+                  [x xe] (if (> (count p) 0) ((:eval c) (nth p 0) (:event c)) (values (v/->VStr (xml/attr k "" "value" "")) ""))]
+              (if (not= xe "") (values [] [] [] xe)
+                (recur (+ i 1) (conj keys (xml/attr k "" "key" "")) (conj vals x) (conj types (xml/attr k "" "type" "")))))))))))
+
+(defn- find-str Int [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) -1 (if (= (nth xs i) s) i (recur (+ i 1))))))
+
+(def SP-CACHE-MAX 50)
+(def SP-KINDS (atom (empty-sp-kinds)))
+
+(defn- empty-sp-kinds Map(Str Vec(sql/SpParam)) [] (let [m: Map(Str Vec(sql/SpParam)) {}] m))
+
+(defn- sp-key Str [c: &conn/OpCall text: &Str]
+  (let [cfg (:config c)] (str (if (= (count cfg) 0) "" (:name (nth cfg 0))) "\n" text)))
+
+(defn- sp-kinds Vec(Vec(sql/SpParam)) [k: &Str]
+  (let [m (deref SP-KINDS)] (if (contains? m k) [(get! m k)] [])))
+
+(defn- remember-kinds Int [k: &Str ps: &Vec(sql/SpParam)]
+  (let [z (swap! SP-KINDS (fn Map(Str Vec(sql/SpParam)) [m: Map(Str Vec(sql/SpParam))]
+                            (if (or (contains? m k) (>= (count (keys m)) SP-CACHE-MAX)) m (assoc m (str k) ps))))]
+    0))
+
+(defn- bind-fresh Values(Vec(sql/SpParam) Str) [names: &Vec(Str) inobj: &Vec(v/Field) iok: &Vec(Str) iov: &Vec(v/Val) ook: &Vec(Str) oot: &Vec(Str)]
+  (loop [i 0 acc: Vec(sql/SpParam) []]
+    (if (>= i (count names)) (values acc "")
+      (let [n (nth names i)
+            oi (find-str ook n)
+            ii (v/obj-get inobj n)
+            xi (find-str iok n)]
+        (cond
+          (>= oi 0) (recur (+ i 1) (conj acc (sql/->SpParam n sql/OUT (sql/->CNull) (nth oot oi))))
+          (> (count ii) 0) (recur (+ i 1) (conj acc (sql/->SpParam n sql/IN (val-cell (nth ii 0)) "")))
+          (>= xi 0) (recur (+ i 1) (conj acc (sql/->SpParam n sql/INOUT (val-cell (nth iov xi)) "")))
+          :else (values acc n))))))
+
+(defn- bind-cached Values(Vec(sql/SpParam) Str) [ks: &Vec(sql/SpParam) inobj: &Vec(v/Field) iok: &Vec(Str) iov: &Vec(v/Val)]
+  (loop [i 0 acc: Vec(sql/SpParam) []]
+    (if (>= i (count ks)) (values acc "")
+      (let [k (nth ks i)
+            n (:name k)
+            d (:dir k)
+            ii (v/obj-get inobj n)
+            xi (find-str iok n)]
+        (cond
+          (= d sql/OUT) (recur (+ i 1) (conj acc k))
+          (> (count ii) 0) (recur (+ i 1) (conj acc (sql/->SpParam n d (val-cell (nth ii 0)) "")))
+          (>= xi 0) (recur (+ i 1) (conj acc (sql/->SpParam n d (val-cell (nth iov xi)) "")))
+          :else (values acc n))))))
+
+(defn- out-type Str [ps: &Vec(sql/SpParam) n: &Str]
+  (loop [i 0] (if (>= i (count ps)) ""
+                (let [p (nth ps i)] (if (and (= (:name p) n) (= (:dir p) sql/OUT)) (:type p) (recur (+ i 1)))))))
+
+(defn- run-proc Values(conn/OpResult Bool) [c: &conn/OpCall kind: &Str hb: &Atom(Handle) text: &Str t: &qt/Template]
+  (let [[pv pe] (child-val c "input-parameters")
+        [iok iov iot ie] (kid-params c "in-out-parameters" "in-out-parameter")
+        [ook oov oot oe] (kid-params c "output-parameters" "output-parameter")
+        inobj (if (= (count pv) 0) [] (match (v/unmeta (nth pv 0)) (v/VObj fs) fs _ []))
+        key (sp-key c text)
+        known (sp-kinds key)
+        [params bad] (if (> (count known) 0) (bind-cached (nth known 0) inobj iok iov)
+                       (bind-fresh (:names t) inobj iok iov ook oot))
+        zk (if (and (= bad "") (= pe "") (= ie "") (= (count known) 0)) (remember-kinds key params) 0)]
+    (cond
+      (not= pe "") (values (conn/fail-result (err/mk "MULE" "EXPRESSION" pe)) false)
+      (not= ie "") (values (conn/fail-result (err/mk "MULE" "EXPRESSION" ie)) false)
+      (not= bad "") (values (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Parameter '" bad "' was not bound for query '" text "'"))) false)
+      :else
+      (let [[res e] (match (deref hb)
+                      (HOra oc) (let [[r e2 c2] (dn/ora-call-proc oc (:sql t) params) z (reset! hb (->HOra c2))] (values r e2))
+                      (HPg pc) (dn/pg-call-proc pc (:sql t) params)
+                      (HMy mc) (dn/my-call-proc mc (:sql t) params)
+                      (HEmu k kd sc) (values (sql/no-sp) (sql/->DbErr (str "emulator: stored procedures cannot run in the " kd " emulator") emu/UNSUPPORTED 0 "mulay.emulator"))
+                      _ (values (sql/no-sp) (sql/->DbErr "Stored procedures are not supported by SQLite" "" 0 "java.sql.SQLException")))]
+        (if (not (sql/ok? e)) (db-fail e)
+          (let [rs (:rsets res)
+                cs (:counts res)
+                ns (:names res)
+                vs (:vals res)
+                [ks xs] (loop [i 0 ks: Vec(Str) [] xs: Vec(v/Val) []]
+                          (if (>= i (count rs)) (values ks xs)
+                            (recur (+ i 1) (conj ks (str "resultSet" (+ i 1))) (conj xs (rows-val (nth rs i))))))
+                [ks2 xs2] (loop [i 0 ks ks xs xs]
+                            (if (>= i (count cs)) (values ks xs)
+                              (recur (+ i 1) (conj ks (str "updateCount" (+ i 1))) (conj xs (jmeta (v/int-v (nth cs i)) "java.lang.Integer")))))
+                [ks3 xs3] (loop [i 0 ks ks2 xs xs2]
+                            (if (>= i (count ns)) (values ks xs)
+                              (let [n (nth ns i)
+                                    ty (out-type params n)
+                                    x (match (nth vs i)
+                                        (sql/SpRows r) (rows-val r)
+                                        (sql/SpCell cl) (cell-val (if (= ty "") cl (coerce-out cl ty))))]
+                                (recur (+ i 1) (conj ks n) (conj xs x)))))
+                order (jh/hashmap-order ks3)
+                fields (loop [i 0 acc: Vec(v/Field) []]
+                         (if (>= i (count order)) acc
+                           (let [k (find-str ks3 (nth order i))] (recur (+ i 1) (conj acc (v/field (nth order i) (nth xs3 k)))))))]
+            (values (java (v/->VObj fields)) false)))))))
+
+(defn- run-with Values(conn/OpResult Bool) [c: &conn/OpCall kind: &Str h: &Atom(Handle) text: &Str]
+  (let [op (:op c)]
+    (cond
+      (= op "execute-script") (run-script kind h text)
+      (= op "stored-procedure")
+      (let [t (qt/parse text) ke (check-kind t ["STORE_PROCEDURE_CALL"])]
+        (if (not= ke "") (values (failure "BAD_SQL_SYNTAX" ke) false) (run-proc c kind h text t)))
+      :else
+      (let [t (qt/parse text)
+            ke (check-kind t (op-kinds op))
+            bulk (str/starts-with? op "bulk-")
+            [pv pe] (child-val c (if bulk "bulk-input-parameters" "input-parameters"))]
+        (cond
+          (not= pe "") (values (conn/fail-result (err/mk "MULE" "EXPRESSION" pe)) false)
+          (not= ke "") (values (failure "BAD_SQL_SYNTAX" ke) false)
+          bulk
+          (let [sets (if (= (count pv) 0) [] (match (v/unmeta (nth pv 0)) (v/VArr xs) xs _ []))
+                rows (loop [i 0 acc: Vec(Vec(sql/Cell)) []]
+                       (if (>= i (count sets)) acc (recur (+ i 1) (conj acc (params-of (:names t) (nth sets i))))))
+                [ns e] (exec-batch kind h (:sql t) rows)]
+            (if (not (sql/ok? e)) (bulk-fail e)
+              (values (java (jmeta (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                                               (if (>= i (count ns)) acc
+                                                 (recur (+ i 1) (conj acc (jmeta (v/int-v (nth ns i)) "java.lang.Integer"))))))
+                                   "int[]")) false)))
+          (not= (unbound (:names t) pv) "") (values (unbound-fail (unbound (:names t) pv) text) false)
+          :else
+          (let [ps (if (= (count pv) 0) (params-of (:names t) (v/->VObj [])) (params-of (:names t) (nth pv 0)))
+                keys (and (= op "insert") (= (attr-lit c "autoGenerateKeys" "false") "true"))
+                [o e] (exec kind h (:sql t) ps keys (key-columns c))]
+            (cond
+              (not (sql/ok? e)) (db-fail e)
+              (= op "select") (values (java (rows-val (:rows o))) false)
+              (= op "query-single") (let [r (:rows o)]
+                                      (values (java (if (= (count (:rows r)) 0) (v/null-v) (row-val (col-keys (:cols r)) (nth (:rows r) 0)))) false))
+              (or (= op "insert") (= op "update"))
+              (values (java (v/->VObj [(v/field "generatedKeys" (keys-val (:keys o)))
+                                       (v/field "affectedRows" (jmeta (v/int-v (:count o)) "java.lang.Integer"))])) false)
+              :else (values (java (jmeta (v/int-v (if (< (:count o) 0) 0 (:count o))) "java.lang.Integer")) false))))))))
+
+(defn- query-timeout Values(Int Vec(err/MErr)) [c: &conn/OpCall]
+  (if (= (:op c) "execute-ddl") (values 0 [])
+    (let [[t x] (conn/attr-str c "queryTimeout" "0")]
+      (if (> (count x) 0) (values 0 x)
+        (let [[n pe] (parse-long (str/trim t))]
+          (if (not= pe "") (values 0 [(err/mk "MULE" "UNKNOWN" (str "queryTimeout '" t "' is not an integer"))])
+            (let [[s se] (tu/ceil-seconds n (str/upper-case (str/trim (attr-lit c "queryTimeoutUnit" "SECONDS"))))]
+              (cond (not= se "") (values 0 [(err/mk "MULE" "UNKNOWN" se)])
+                    (< s 0) (values 0 [(err/mk "MULE" "UNKNOWN" "Query timeout must be positive")])
+                    :else (values s [])))))))))
+
+(defn- kill-query Int [thread: Int cfg: &m/Config]
+  (let [[sp se] (conn-spec cfg)]
+    (if (not= se "") 0
+      (let [[h2 he] (open-conn sp)]
+        (match h2
+          (HMy c2) (let [[o e] (dn/my-run c2 (str "KILL QUERY " thread) [] false) z (dn/my-close c2)] 0)
+          _ 0)))))
+
+(defn- cancel-handle Int [h: &Handle cfg: &m/Config]
+  (match h
+    (HPg c) (let [e (dn/pg-cancel c)] 0)
+    (HMy c) (kill-query (:thread c) cfg)
+    (HOra c) (let [e (dn/ora-cancel c)] 0)
+    _ 0))
+
+(defn- cancellable? Bool [h: &Handle] (match h (HPg c) true (HMy c) true (HOra c) true _ false))
+
+(defn- timed-out conn/OpResult [r: conn/OpResult kind: &Str op: &Str fired: Bool]
+  (if (and fired (= kind "mysql") (not (str/starts-with? op "bulk-")))
+    (failure "QUERY_EXECUTION" "Statement cancelled due to timeout or client request")
+    r))
+
+(defn- watch Int [state: &Atom(Int) deadline: Int h: &Handle cfg: &m/Config]
+  (loop []
+    (let [s (deref state) now (quot (mono-us) 1000)]
+      (cond (not= s 0) 0
+            (>= now deadline)
+            (if (= (swap! state (fn Int [x: Int] (if (= x 0) 2 x))) 2)
+              (let [z (cancel-handle h cfg) z2 (reset! state 3)] 1)
+              0)
+            :else (let [z (sleep-ms (min 50 (- deadline now)))] (recur))))))
+
+(defn- arm Atom(Int) [secs: Int h: &Handle cfg: &m/Config]
+  (let [state (atom 0)]
+    (if (or (<= secs 0) (not (cancellable? h))) state
+      (let [st1 state h1 h cfg1 cfg deadline (+ (quot (mono-us) 1000) (* secs 1000))
+            ok (ops/spawn-bg-try (fn Int [k: Int] (watch st1 deadline h1 cfg1)))]
+        state))))
+
+(defn- disarm Bool [state: &Atom(Int)]
+  (let [s (swap! state (fn Int [x: Int] (if (= x 0) 1 x)))]
+    (if (= s 1) false
+      (let [z (loop [] (if (= (deref state) 3) 0 (let [w (sleep-ms 1)] (recur))))] true))))
+
+(defn- run-op conn/OpResult [st: &St c: &conn/OpCall]
+  (let [cfg (:config c)]
+    (if (= (count cfg) 0) (failure "CONNECTIVITY" "No <db:config> for the operation")
+      (let [[text te] (op-text c)
+            [secs tox] (query-timeout c)]
+        (cond
+          (> (count te) 0) (conn/fail-result (nth te 0))
+          (> (count tox) 0) (conn/fail-result (nth tox 0))
+          :else
+          (let [tx (:tx (:event c))
+                action (attr-lit c "transactionalAction" "JOIN_IF_POSSIBLE")]
+            (cond
+              (and (= tx "") (= action "ALWAYS_JOIN"))
+              (conn/fail-result (err/mk "MULE" "TRANSACTION" "A transaction is not available for this session, but transaction action is \"Always Join\""))
+              (and (not= tx "") (not= action "NOT_SUPPORTED"))
+              (let [[h he] (tx-handle st (nth cfg 0) tx)]
+                (if (not= he "") (failure "CONNECTIVITY" he)
+                  (let [hb (atom h)
+                        g (arm secs h (nth cfg 0))]
+                    (ops/on-fail (fn conn/OpResult []
+                                   (let [[r0 broken] (run-with c (kind-of h) hb text)
+                                         fired (disarm g)
+                                         z (tx-store st (nth cfg 0) tx (deref hb))]
+                                     (timed-out r0 (kind-of h) (:op c) fired)))
+                                 (fn Int [] (let [f (disarm g)] 0))))))
+              :else
+              (let [[h id he] (acquire st (nth cfg 0))]
+                (if (not= he "") (failure "CONNECTIVITY" he)
+                  (let [kind (kind-of h)
+                        hb (atom h)
+                        name (:name (nth cfg 0))
+                        owner (:rid (:event c))
+                        g (arm secs h (nth cfg 0))]
+                    (ops/on-fail
+                      (fn conn/OpResult []
+                        (if (and (= (:op c) "select") (match h (HOra x) true (HSqlite x) true _ false))
+                          (let [[r broken streaming] (open-select st c name hb id text owner)
+                                fired (disarm g)
+                                z (if streaming 0 (release st name (deref hb) id broken))]
+                            r)
+                          (let [[r0 broken] (run-with c kind hb text)
+                                fired (disarm g)
+                                r (timed-out r0 kind (:op c) fired)]
+                            (if (and (= (:op c) "select") (not broken) (= (count (:err r)) 0))
+                              (hold-rows st name (deref hb) id r owner (max-rows c))
+                              (let [z (release st name (deref hb) id broken)] r)))))
+                      (fn Int [] (let [f (disarm g)] (release st name (deref hb) id true))))))))))))))
+
+(def FETCH-SIZE 500)
+
+(defn- open-select Values(conn/OpResult Bool Bool) [st: &St c: &conn/OpCall name: &Str hb: &Atom(Handle) id: &Str text: &Str owner: &Str]
+  (let [t (qt/parse text)
+        ke (check-kind t (op-kinds "select"))
+        [pv pe] (child-val c "input-parameters")
+        fs (let [[n e] (parse-long (attr-lit c "fetchSize" "0"))] (if (and (= e "") (> n 0)) n FETCH-SIZE))
+        mr1 (max-rows c)]
+    (cond
+      (not= pe "") (values (conn/fail-result (err/mk "MULE" "EXPRESSION" pe)) false false)
+      (not= ke "") (values (failure "BAD_SQL_SYNTAX" ke) false false)
+      (not= (unbound (:names t) pv) "") (values (unbound-fail (unbound (:names t) pv) text) false false)
+      :else
+      (let [ps (if (= (count pv) 0) (params-of (:names t) (v/->VObj [])) (params-of (:names t) (nth pv 0)))]
+        (match (deref hb)
+          (HOra oc)
+          (let [[q e c2] (dn/ora-open-query oc (:sql t) ps)
+                z (reset! hb (->HOra c2))]
+            (if (not (sql/ok? e)) (let [[r b] (db-fail e)] (values r b false))
+              (let [buf (atom (:rows q))
+                    done (atom (:done q))
+                    prev (atom (let [rs (:rows q)] (if (> (count rs) 0) (nth rs (- (count rs) 1)) (let [z0: Vec(sql/Cell) []] z0))))
+                    st1 st name1 (str name) id1 (str id) hb1 hb q1 q fs1 fs
+                    src (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (ora-next hb1 q1 buf done prev fs1 n))
+                                         (fn Int [broken: Bool] (release st1 name1 (deref hb1) id1 broken)) true)
+                    cid (stream/open owner (cap-source src mr1))]
+                (values (conn/ok-result (ev/tv-cursor-typed cid "DB" "QUERY_EXECUTION") (ev/tv-null)) false true))))
+          (HSqlite x)
+          (let [[q e] (sqlite/open-query x (:sql t) ps)]
+            (if (not (sql/ok? e)) (let [[r b] (db-fail e)] (values r b false))
+              (let [[rows d fe] (sqlite/fetch q fs)]
+                (if (not (sql/ok? fe)) (let [z (sqlite/close-query q) [r b] (db-fail fe)] (values r b false))
+                  (let [buf (atom rows)
+                        done (atom d)
+                        st1 st name1 (str name) id1 (str id) hb1 hb q1 q fs1 fs
+                        src (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (sq-next q1 buf done fs1 n))
+                                             (fn Int [broken: Bool] (let [z (sqlite/close-query q1)] (release st1 name1 (deref hb1) id1 broken))) true)
+                        cid (stream/open owner (cap-source src mr1))]
+                    (values (conn/ok-result (ev/tv-cursor-typed cid "DB" "QUERY_EXECUTION") (ev/tv-null)) false true))))))
+          _ (values (failure "CONNECTIVITY" "no connection") true false))))))
+
+(defn- sq-next Values(Vec(v/Val) Bool Str) [q: &sqlite/Query buf: &Atom(Vec(Vec(sql/Cell))) done: &Atom(Bool) fs: Int n: Int]
+  (let [err (loop []
+              (if (or (>= (count (deref buf)) n) (deref done)) ""
+                (let [[rows d e] (sqlite/fetch q (if (> fs n) fs n))
+                      z1 (swap! buf (fn Vec(Vec(sql/Cell)) [b: Vec(Vec(sql/Cell))] (loop [i 0 o b] (if (>= i (count rows)) o (recur (+ i 1) (conj o (nth rows i)))))))
+                      z2 (reset! done d)]
+                  (if (not (sql/ok? e)) (:msg e) (recur)))))
+        b (deref buf)
+        k (if (> n (count b)) (count b) n)
+        names (col-keys (:names q))
+        out (loop [i 0 acc: Vec(v/Val) []] (if (>= i k) acc (recur (+ i 1) (conj acc (row-val names (nth b i))))))
+        rest (loop [i k acc: Vec(Vec(sql/Cell)) []] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i)))))
+        z (reset! buf rest)]
+    (values out (and (deref done) (= (count rest) 0)) err)))
+
+(defn- ora-next Values(Vec(v/Val) Bool Str) [hb: &Atom(Handle) q: &orad/Query buf: &Atom(Vec(Vec(sql/Cell))) done: &Atom(Bool) prev: &Atom(Vec(sql/Cell)) fs: Int n: Int]
+  (let [err (loop []
+              (if (or (>= (count (deref buf)) n) (deref done)) ""
+                (match (deref hb)
+                  (HOra oc)
+                  (let [[rows d e c2] (dn/ora-fetch-more oc q (deref prev) fs)
+                        z (reset! hb (->HOra c2))]
+                    (if (not (sql/ok? e)) (let [z1 (reset! done true)] (:msg e))
+                      (let [z2 (if (> (count rows) 0) (reset! prev (nth rows (- (count rows) 1))) (deref prev))
+                            z3 (swap! buf (fn Vec(Vec(sql/Cell)) [b: Vec(Vec(sql/Cell))] (loop [i 0 o b] (if (>= i (count rows)) o (recur (+ i 1) (conj o (nth rows i)))))))
+                            z4 (reset! done d)]
+                        (recur))))
+                  _ (let [z5 (reset! done true)] "no connection"))))
+        b (deref buf)
+        k (if (> n (count b)) (count b) n)
+        names (col-keys (:names q))
+        out (loop [i 0 acc: Vec(v/Val) []] (if (>= i k) acc (recur (+ i 1) (conj acc (row-val names (nth b i))))))
+        rest (loop [i k acc: Vec(Vec(sql/Cell)) []] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i)))))
+        z (reset! buf rest)]
+    (values out (and (deref done) (= (count rest) 0)) err)))
+
+(defn- hold-rows conn/OpResult [st: &St name: &Str h: Handle id: &Str r: &conn/OpResult owner: &Str mr: Int]
+  (let [rows (match (v/unmeta (:val (:payload r))) (v/VArr xs) xs _ [])
+        pos (atom 0)
+        st1 st name1 (str name) id1 (str id) h1 h
+        src (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (slice-rows rows pos n))
+                             (fn Int [broken: Bool] (release st1 name1 h1 id1 broken)) true)
+        cid (stream/open owner (cap-source src mr))]
+    (conn/ok-result (ev/tv-cursor-typed cid "DB" "QUERY_EXECUTION") (:attributes r))))
+
+(defn- slice-rows Values(Vec(v/Val) Bool Str) [rows: &Vec(v/Val) pos: &Atom(Int) n: Int]
+  (let [from (deref pos)
+        to (if (> (+ from n) (count rows)) (count rows) (+ from n))
+        out (loop [i from acc: Vec(v/Val) []] (if (>= i to) acc (recur (+ i 1) (conj acc (nth rows i)))))
+        z (reset! pos to)]
+    (values out (>= to (count rows)) "")))
+
+(def PMARK (str (chr 0) "input-parameters"))
+
+(defn- col-of Vec(v/Val) [row: &v/Val col: &Str]
+  (let [lc (str/lower-case col)]
+    (match (v/unmeta row)
+      (v/VObj fs) (loop [i 0] (if (>= i (count fs)) [] (if (= (str/lower-case (:name (:key (nth fs i)))) lc) [(:value (nth fs i))] (recur (+ i 1)))))
+      _ [])))
+
+(def SOURCE-ONLY ["transactionalAction"])
+
+(defn- op-params Vec(m/Param) [ps: &Vec(m/Param)]
+  (loop [i 0 acc: Vec(m/Param) []]
+    (if (>= i (count ps)) acc
+      (recur (+ i 1) (if (>= (find-str SOURCE-ONLY (:name (nth ps i))) 0) acc (conj acc (nth ps i)))))))
+
+(defn- poll-select Values(Vec(v/Val) Str) [st: &St s: &conn/SrcCall table: &Str wmc: &Str wm: &Vec(v/Val)]
+  (let [use-wm (and (not= wmc "") (> (count wm) 0))
+        sql (if use-wm (str "SELECT * FROM " table " WHERE " wmc " > :watermark") (str "SELECT * FROM " table))
+        owner (conn/corr-id 0)
+        pobj (v/->VObj (if use-wm [(v/field "watermark" (nth wm 0))] []))
+        evf (fn Values(v/Val Str) [p: m/PVal e: ev/Event]
+              (match p (m/PLit x) (if (= x PMARK) (values pobj "") (values (v/->VStr x) "")) _ (values (v/null-v) "")))
+        evt (fn Values(ev/TV Str) [p: m/PVal e: ev/Event]
+              (match p (m/PLit x) (values (ev/tv-val (v/->VStr x) ev/ANY) "") _ (values (ev/tv-null) "")))
+        no-flow (fn Values(ev/Event Vec(err/MErr) Bool) [n: Str e: ev/Event] (values e [] false))
+        exprs: Vec(m/Param) [(m/->Param "sql" (m/->PLit sql)) (m/->Param "input-parameters" (m/->PLit PMARK))]
+        call (conn/->OpCall "select" (:config s) (op-params (:params s)) [] exprs
+                            (ev/new-event (ev/tv-null) (ev/tv-null) owner (:flow s))
+                            evf evt (:configs s) no-flow (:res s) (fn Str [u: Str] "") no-flow (conn/no-loc) (res/res-none))
+        [r rows pe] (stream/owned owner (fn Values(conn/OpResult v/Val Str) []
+                                          (let [r (run-op st call)
+                                                [rows t pe] (if (> (count (:err r)) 0) (values (v/null-v) (ev/tv-null) "") (ev/value (:payload r)))]
+                                            (values r rows pe))))]
+    (cond
+      (> (count (:err r)) 0) (values [] (str "Failed to query table '" table "' for new rows. " (:description (nth (:err r) 0))))
+      (not= pe "") (values [] (str "Failed to query table '" table "' for new rows. " pe))
+      :else (values (match (v/unmeta rows) (v/VArr xs) xs _ []) ""))))
+
+(defn- poll-table Values(Int Str) [st: &St s: conn/SrcCall]
+  (let [table (str/trim (conn/param-lit (:params s) "table" ""))
+        wmc (str/trim (conn/param-lit (:params s) "watermarkColumn" ""))
+        idc (str/trim (conn/param-lit (:params s) "idColumn" ""))
+        key (str (:flow s) " " (:name s))]
+    (if (= table "") (values 0 "The 'table' attribute of the On Table Row source (<db:listener>) is required and must not be blank.")
+      (let [[rows e] (poll-select st s table wmc (rp/watermark key))]
+        (if (not= e "") (values 0 e)
+          (let [items (loop [i 0 acc: Vec(rp/Item) []]
+                        (if (>= i (count rows)) acc
+                          (let [row (nth rows i)
+                                w (if (= wmc "") [] (col-of row wmc))
+                                w2 (if (and (> (count w) 0) (not (v/null? (nth w 0)))) w [])
+                                idv (if (= idc "") [] (col-of row idc))
+                                id (if (or (= (count idv) 0) (v/null? (nth idv 0))) "" (let [[t te] (drt/to-text (v/unmeta (nth idv 0)))] t))]
+                            (recur (+ i 1) (conj acc (rp/->Item (ev/tv-val row ev/JAVA) (ev/tv-null) w2 id))))))]
+            (values (rp/run-items key items (:dispatch s)) "")))))))
+
+(defn connector conn/Connector []
+  (let [z: Map(Str Pool) {}
+        t0: Map(Str TxConn) {}
+        st (->St (atom z) (atom 0) (atom t0))]
+    (assoc (conn/connector "db" NS (fn conn/OpResult [c: conn/OpCall] (run-op st c)))
+           :tx-end (fn Str [id: Str commit: Bool] (tx-end st id commit))
+           :sources ["listener"]
+           :poll (fn Values(Int Str) [s: conn/SrcCall] (poll-table st s)))))

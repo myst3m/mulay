@@ -1,0 +1,40 @@
+(ns json-test (:require [mulay.dw.err :as dwe] [mulay.dw.fmt.json :as j] [mulay.dw.val :as v]))
+
+;; 期待値は実 DW 2.11.2 の出力 (tools/dw-oracle で確認した形)。
+
+(defn- rt Str [src: Str indent: Bool skip: Str]
+  (let [[x e] (j/read src)]
+    (if (not= e "") (str "READ-ERR:" e)
+      (let [[out we] (j/write x (j/opts-of indent skip))]
+        (if (dwe/ok? we) out (str "WRITE-ERR:" (:msg we)))))))
+
+(deftest pretty
+  (is (= (rt "{\"a\": 1.0, \"b\": 1.50, \"c\": 1e3, \"d\": -0, \"e\": 12345678901234567890123}" true "")
+         "{\n  \"a\": 1,\n  \"b\": 1.5,\n  \"c\": 1E+3,\n  \"d\": 0,\n  \"e\": 12345678901234567890123\n}"))
+  (is (= (rt "{\"f\": [], \"g\": {}, \"h\": [[],{}]}" true "")
+         "{\n  \"f\": [\n    \n  ],\n  \"g\": {\n    \n  },\n  \"h\": [\n    [\n      \n    ],\n    {\n      \n    }\n  ]\n}"))
+  (is (= (rt "{\"dup\": 1, \"dup\": 2, \"n\": null, \"t\": true}" true "")
+         "{\n  \"dup\": 1,\n  \"dup\": 2,\n  \"n\": null,\n  \"t\": true\n}"))
+  (is (= (rt "[]" true "") "[\n  \n]")))
+
+(deftest escapes
+  (is (= (rt "\"q\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0001\\u00e9\\ud83d\\ude00\"" true "")
+         "\"q\\\"\\\\/\\b\\f\\n\\r\\t\\u0001é😀\""))
+  (is (= (rt "\"\\ud800x\"" true "") "\"\\ufffdx\"")))
+
+(deftest compact
+  (is (= (rt "{\"a\": [1, {\"b\": null}], \"s\": \"x\"}" false "") "{\"a\": [1,{\"b\": null}],\"s\": \"x\"}")))
+
+(deftest skip-null
+  (is (= (rt "{\"a\": null, \"b\": [null, 1], \"c\": {\"d\": null}}" true "everywhere")
+         "{\n  \"b\": [\n    1\n  ],\n  \"c\": {\n    \n  }\n}")))
+
+;; 文言は実 Mule の DW (core-read-errors の記録) と同じ形。json/read は入力の名前 root
+(deftest errors
+  (is (= (rt "{\"a\": 1" true "") "READ-ERR:Unexpected end-of-input at root@[1:8] (line:column), expected '}', while reading `root` as Json.\n \n1| {\"a\": 1\n          ^"))
+  (is (= (rt "[01]" true "") "READ-ERR:Unexpected character '1' at root@[1:3] (line:column), expected ']', while reading `root` as Json.\n \n1| [01]\n     ^"))
+  (is (= (rt "[1] x" true "") "READ-ERR:Unexpected character 'x' at root@[1:5] (line:column), expected Expecting end of input but got `x, while reading `root` as Json.\n \n1| [1] x\n       ^"))
+  (is (= (rt "" true "") "READ-ERR:Unable to parse empty input, while reading `root` as Json.\n \n1| \n   ^"))
+  (is (= (rt "[1,,2]" true "") "READ-ERR:Unexpected character ',' at root@[1:4] (line:column), expected false or true or null or {...} or [...] or number but was , while reading `root` as Json.\n \n1| [1,,2]\n      ^"))
+  (is (= (rt "{\"a\": -}" true "") "READ-ERR:Unexpected character '}' at root@[1:8] (line:column), expected readDigit, while reading `root` as Json.\n \n1| {\"a\": -}\n          ^"))
+  (is (= (rt "  {\"a\": {\"b\": 0.10}}  " true "") "{\n  \"a\": {\n    \"b\": 0.1\n  }\n}")))

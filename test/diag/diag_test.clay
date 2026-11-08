@@ -1,0 +1,158 @@
+(ns diag-test (:require [mulay.lib.diag :as d] [clay.string :as str]))
+
+(defn- lines Str [xs: Vec(Str)] (str/join "\n" xs))
+
+(deftest two-labels-on-one-line
+  (let [src "let a = 1\nlet b = a + \"x\"\n"
+        r (-> (d/report "error" "DW" "`+` に Number と String を渡しました")
+              (d/with-src "a.dwl" src)
+              (d/label 18 19 "Number (1)" false)
+              (d/label 22 25 "String (\"x\")" true)
+              (d/help "文字列をつなぐなら `++` を使います"))]
+    (is (= (d/render r false)
+           (lines ["error[DW]: `+` に Number と String を渡しました"
+                   " --> a.dwl:2:13"
+                   "  |"
+                   "2 | let b = a + \"x\""
+                   "  |         -   ^^^ String (\"x\")"
+                   "  |         |"
+                   "  |         Number (1)"
+                   "  |"
+                   "  = help: 文字列をつなぐなら `++` を使います"])))))
+
+(deftest one-label-without-text
+  (let [r (-> (d/report "warning" "" "unused") (d/with-src "f" "abc") (d/label 1 2 "" true))]
+    (is (= (d/render r false)
+           (lines ["warning: unused"
+                   " --> f:1:2"
+                   "  |"
+                   "1 | abc"
+                   "  |  ^"])))))
+
+(deftest wide-characters-before-the-label
+  (let [r (-> (d/report "error" "" "m") (d/with-src "j.dwl" "name: \"山田\" ++ 1") (d/label 18 19 "Number" true))]
+    (is (= (d/render r false)
+           (lines ["error: m"
+                   " --> j.dwl:1:15"
+                   "  |"
+                   "1 | name: \"山田\" ++ 1"
+                   "  |                 ^ Number"])))))
+
+(deftest wide-characters-under-the-label
+  (let [r (-> (d/report "error" "" "m") (d/with-src "j" "x 山田 y") (d/label 2 8 "" true))]
+    (is (= (d/render r false)
+           (lines ["error: m"
+                   " --> j:1:3"
+                   "  |"
+                   "1 | x 山田 y"
+                   "  |   ^^^^"])))))
+
+(deftest tabs-expand-to-four-columns
+  (let [r (-> (d/report "error" "" "m") (d/with-src "t" "\tx + y") (d/label 1 2 "here" true))]
+    (is (= (d/render r false)
+           (lines ["error: m"
+                   " --> t:1:2"
+                   "  |"
+                   "1 |     x + y"
+                   "  |     ^ here"])))))
+
+(deftest crlf-lines
+  (let [r (-> (d/report "error" "" "m") (d/with-src "c" "a\r\nbb cc\r\n") (d/label 6 8 "" true))]
+    (is (= (d/render r false)
+           (lines ["error: m"
+                   " --> c:2:4"
+                   "  |"
+                   "2 | bb cc"
+                   "  |    ^^"])))))
+
+(deftest distant-lines-and-wide-gutter
+  (let [src "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n"
+        r (-> (d/report "error" "" "m") (d/with-src "f" src)
+              (d/label 0 1 "here" false)
+              (d/label 18 19 "there" true))]
+    (is (= (d/render r false)
+           (lines ["error: m"
+                   "  --> f:10:1"
+                   "   |"
+                   " 1 | a"
+                   "   | - here"
+                   "..."
+                   "10 | j"
+                   "   | ^ there"])))))
+
+(deftest adjacent-gap-shows-the-middle-line
+  (let [r (-> (d/report "error" "" "m") (d/with-src "f" "a\nb\nc\n") (d/label 0 1 "x" false) (d/label 4 5 "y" true))]
+    (is (= (d/render r false)
+           (lines ["error: m"
+                   " --> f:3:1"
+                   "  |"
+                   "1 | a"
+                   "  | - x"
+                   "2 | b"
+                   "3 | c"
+                   "  | ^ y"])))))
+
+(deftest label-over-several-lines-marks-to-end-of-first-line
+  (let [r (-> (d/report "error" "" "m") (d/with-src "f" "foo(\n  1,\n  2") (d/label 0 13 "unclosed" true))]
+    (is (= (d/render r false)
+           (lines ["error: m"
+                   " --> f:1:1"
+                   "  |"
+                   "1 | foo("
+                   "  | ^^^^ unclosed"])))))
+
+(deftest empty-span-at-end-of-line
+  (let [r (-> (d/report "error" "" "m") (d/with-src "f" "ab\ncd") (d/label 2 2 "expected `}`" true))]
+    (is (= (d/render r false)
+           (lines ["error: m"
+                   " --> f:1:3"
+                   "  |"
+                   "1 | ab"
+                   "  |   ^ expected `}`"])))))
+
+(deftest no-source
+  (let [r (-> (d/report "error" "LOAD" "msg") (d/with-src "app.xml" "") (d/note "n1") (d/help "a\nb"))]
+    (is (= (d/render r false)
+           (lines ["error[LOAD]: msg"
+                   " --> app.xml"
+                   "  = note: n1"
+                   "  = help: a"
+                   "          b"])))))
+
+(deftest message-only
+  (is (= (d/render (d/report "error" "" "boom") false) "error: boom")))
+
+(deftest three-labels-on-one-line
+  (let [r (-> (d/report "error" "" "m") (d/with-src "f" "f(a, b, c)")
+              (d/label 2 3 "A" false) (d/label 5 6 "B" false) (d/label 8 9 "C" true))]
+    (is (= (d/render r false)
+           (lines ["error: m"
+                   " --> f:1:9"
+                   "  |"
+                   "1 | f(a, b, c)"
+                   "  |   -  -  ^ C"
+                   "  |   |  |"
+                   "  |   |  B"
+                   "  |   |"
+                   "  |   A"])))))
+
+(deftest color
+  (let [out (d/render (-> (d/report "error" "DW" "m") (d/with-src "f" "abc") (d/label 0 1 "x" true)) true)]
+    (is (str/includes? out (str (chr 27) "[")))
+    (is (str/includes? out "f:1:1"))))
+
+(deftest closest-word
+  (is (= (d/closest "itmes" ["items" "sizeOf" "upper"]) ["items"]))
+  (is (= (d/closest "indnet" ["writeAttributes" "indent" "encoding"]) ["indent"]))
+  (is (= (d/closest "xyz" ["items" "upper"]) []))
+  (is (= (d/closest "a" ["b"]) []))
+  (is (= (d/closest "ab" ["abc"]) ["abc"]))
+  (is (= (d/closest "items" ["items"]) []))
+  (is (= (d/closest "Upper" ["upper" "lower"]) ["upper"])))
+
+(deftest edit-distance-counts
+  (is (= (d/edit-distance "itmes" "items") 1))
+  (is (= (d/edit-distance "abc" "abc") 0))
+  (is (= (d/edit-distance "" "abc") 3))
+  (is (= (d/edit-distance "kitten" "sitting") 3))
+  (is (= (d/edit-distance "ca" "abc") 3)))

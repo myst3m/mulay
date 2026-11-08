@@ -1,0 +1,198 @@
+(ns mulay.rt.conn
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err]
+            [mulay.lib.xml :as xml] [mulay.lib.uni :as uni] [mulay.lib.res :as res] [clay.string :as str] [clay.httpmsg :as hm]))
+
+(defrecord OpCall
+  [op: Str
+   config: Vec(m/Config)
+   params: Vec(m/Param)
+   children: Vec(xml/XNode)
+   exprs: Vec(m/Param)
+   event: ev/Event
+   eval: Fn(m/PVal ev/Event Values(v/Val Str))
+   eval-tv: Fn(m/PVal ev/Event Values(ev/TV Str))
+   configs: Vec(m/Config)
+   flow: Fn(Str ev/Event Values(ev/Event Vec(err/MErr) Bool))
+   res: Fn(Str Values(Str Bool))
+   res-url: Fn(Str Str)
+   chain: Fn(Str ev/Event Values(ev/Event Vec(err/MErr) Bool))
+   loc: m/Loc
+   rset: res/ResSet])
+
+(defn no-loc m/Loc [] (m/->Loc "" 0 "" "" "" []))
+
+(defrecord OpResult [payload: ev/TV attributes: ev/TV err: Vec(err/MErr) event: Vec(ev/Event)])
+
+(defn ok-result OpResult [p: ev/TV a: ev/TV] (->OpResult p a [] []))
+(defn fail-result OpResult [e: err/MErr] (->OpResult (ev/tv-null) (ev/tv-null) [e] []))
+(defn event-result OpResult [e: ev/Event x: Vec(err/MErr)] (->OpResult (ev/tv-null) (ev/tv-null) x [e]))
+
+(defn keep-result OpResult [c: &OpCall]
+  (ok-result (:payload (:event c)) (:attributes (:event c))))
+
+(defrecord SrcCall
+  [name: Str
+   flow: Str
+   config: Vec(m/Config)
+   params: Vec(m/Param)
+   children: Vec(xml/XNode)
+   configs: Vec(m/Config)
+   state: Atom
+   dispatch: Fn(ev/TV ev/TV Values(Bool Str))
+   run: Fn(ev/TV ev/TV Str Str Values(ev/Event Vec(err/MErr)))
+   res: Fn(Str Values(Str Bool))])
+
+(defrecord Host
+  [run: Fn(Int ev/Event Values(ev/Event Vec(err/MErr)))
+   eval: Fn(m/PVal ev/Event Values(v/Val ev/Event Vec(err/MErr)))
+   eval-tv: Fn(m/PVal ev/Event Values(ev/TV ev/Event Vec(err/MErr)))
+   eval-str: Fn(m/PVal ev/Event Values(ev/TV ev/Event Vec(err/MErr)))])
+
+(defrecord At [port: Int base: Str scheme: Str])
+
+(defrecord Mount
+  [listener: Str
+   path: Str
+   methods: Vec(Str)
+   base: Bool
+   stream: Bool
+   handle: Fn(Host At hm/Request hm/Response)])
+
+(defrecord Connector
+  [name: Str
+   uri: Str
+   run: Fn(OpCall OpResult)
+   sources: Vec(Str)
+   push: Vec(Str)
+   poll: Fn(SrcCall Values(Int Str))
+   tx-end: Fn(Str Bool Str)
+   init: Fn(m/App Vec(Str))
+   source-elems: Vec(Str)
+   op-chains: Vec(m/OpChains)
+   each-child: Vec(Str)
+   error-parents: Vec(Str)
+   error-classes: Vec(Str)
+   consumers: Int
+   mounts: Fn(m/App Values(Vec(Mount) Vec(Str)))
+   routed: Vec(Str)
+   raw-sources: Vec(Str)
+   dw-modules: Vec(Str)])
+
+(defn- no-poll Values(Int Str) [s: SrcCall] (values 0 (str "no source " (:name s))))
+(defn no-tx Str [id: Str commit: Bool] "")
+(defn no-init Vec(Str) [a: m/App] [])
+(defn no-mounts Values(Vec(Mount) Vec(Str)) [a: m/App] (let [z: Vec(Mount) [] e: Vec(Str) []] (values z e)))
+
+(defn connector Connector [name: Str uri: Str run: Fn(OpCall OpResult)]
+  (let [z: Vec(m/OpChains) []] (->Connector name uri run [] [] no-poll no-tx no-init [] z [] [] [] 1 no-mounts [] [] [])))
+
+(defn error-parents Vec(Str) [cs: &Vec(Connector)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count cs)) acc
+      (let [ps (:error-parents (nth cs i))]
+        (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count ps)) a (recur (+ k 1) (conj a (nth ps k))))))))))
+
+(defn error-classes Vec(Str) [cs: &Vec(Connector)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count cs)) acc
+      (let [ps (:error-classes (nth cs i))]
+        (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count ps)) a (recur (+ k 1) (conj a (nth ps k))))))))))
+
+(defn- key-of Str [uri: &Str local: &Str] (str uri " " local))
+
+(defn parse-hints m/Hints [cs: &Vec(Connector)]
+  (loop [i 0 us: Vec(Str) [] ss: Vec(Str) [] ch: Vec(m/OpChains) [] ea: Vec(Str) [] rs: Vec(Str) [] ms: Vec(Str) []]
+    (if (>= i (count cs)) (m/->Hints us ss ch ea rs ms)
+      (let [c (nth cs i) u (:uri c) se (:source-elems c) oc (:op-chains c) ec (:each-child c) rw (:raw-sources c) dm (:dw-modules c)
+            us2 (if (= (count se) 0) us (conj us (str u)))
+            ss2 (loop [k 0 a ss] (if (>= k (count se)) a (recur (+ k 1) (conj a (key-of u (nth se k))))))
+            ch2 (loop [k 0 a ch] (if (>= k (count oc)) a (recur (+ k 1) (conj a (m/->OpChains (key-of u (:op (nth oc k))) (:names (nth oc k)))))))
+            ea2 (loop [k 0 a ea] (if (>= k (count ec)) a (recur (+ k 1) (conj a (key-of u (nth ec k))))))
+            rs2 (loop [k 0 a rs] (if (>= k (count rw)) a (recur (+ k 1) (conj a (key-of u (nth rw k))))))
+            ms2 (loop [k 0 a ms] (if (>= k (count dm)) a (recur (+ k 1) (conj a (nth dm k)))))]
+        (recur (+ i 1) us2 ss2 ch2 ea2 rs2 ms2)))))
+
+(defn param Vec(m/PVal) [ps: &Vec(m/Param) name: &Str]
+  (loop [i 0] (if (>= i (count ps)) [] (if (= (:name (nth ps i)) name) [(:v (nth ps i))] (recur (+ i 1))))))
+
+(defn param-lit Str [ps: &Vec(m/Param) name: &Str default: Str]
+  (let [p (param ps name)]
+    (if (= (count p) 0) default
+      (match (nth p 0) (m/PLit s) s _ default))))
+
+(defn find-config Vec(m/Config) [cs: &Vec(m/Config) kind: &Str name: &Str]
+  (loop [i 0] (if (>= i (count cs)) []
+                (let [c (nth cs i)] (if (and (= (:name c) name) (= (:kind c) kind)) [c] (recur (+ i 1)))))))
+
+(defn attr-text Str [c: &OpCall name: &Str]
+  (let [p (param (:params c) name)]
+    (if (= (count p) 0) "" (match (nth p 0) (m/PLit s) (str s) (m/PExpr t cmp src) (str t)))))
+
+(defn attr-val Values(Vec(v/Val) Vec(err/MErr)) [c: &OpCall name: &Str]
+  (let [p (param (:params c) name)]
+    (if (= (count p) 0) (values [] [])
+      (match (nth p 0)
+        (m/PLit s) (values [(v/->VStr s)] [])
+        _ (let [[x e] ((:eval c) (nth p 0) (:event c))]
+            (if (not= e "") (values [] [(err/mk "MULE" "EXPRESSION" e)]) (values [(v/unmeta x)] [])))))))
+
+(defn- text-of Str [x: &v/Val] (match x (v/VStr s) (str s) _ (let [[t e] (drt/to-text x)] t)))
+
+(defn attr-str Values(Str Vec(err/MErr)) [c: &OpCall name: &Str default: Str]
+  (let [[xs x] (attr-val c name)]
+    (cond (> (count x) 0) (values "" x)
+          (or (= (count xs) 0) (v/null? (nth xs 0))) (values default [])
+          :else (values (text-of (nth xs 0)) []))))
+
+(defn outbound-corr Values(Vec(Str) Vec(err/MErr)) [c: &OpCall cfg-params: &Vec(m/Param)]
+  (let [mode (str/upper-case (str/trim (param-lit (:params c) "sendCorrelationId" (param-lit cfg-params "sendCorrelationId" "AUTO"))))]
+    (if (= mode "NEVER") (values [] [])
+      (let [[s x] (attr-str c "correlationId" (:corr (:event c)))]
+        (if (> (count x) 0) (values [] x) (values [s] []))))))
+
+(defn required-str Values(Str Vec(err/MErr)) [c: &OpCall name: &Str]
+  (let [[xs x] (attr-val c name)]
+    (cond (> (count x) 0) (values "" x)
+          (or (= (count xs) 0) (v/null? (nth xs 0)))
+          (values "" [(err/mk "MULE" "VALIDATION" (str "Required parameter '" name "' was assigned with value '" (attr-text c name)
+                                                       "' which resolved to null. Required parameters need to be assigned with non null values"))])
+          :else (values (text-of (nth xs 0)) []))))
+
+(defn attr-bool Values(Bool Vec(err/MErr)) [c: &OpCall name: &Str default: Bool]
+  (let [[xs x] (attr-val c name)]
+    (cond (> (count x) 0) (values default x)
+          (or (= (count xs) 0) (v/null? (nth xs 0))) (values default [])
+          :else (match (nth xs 0)
+                  (v/VBool b) (values b [])
+                  _ (values (= (str/lower-case (str/trim (text-of (nth xs 0)))) "true") [])))))
+
+(defn child-tv Values(Vec(ev/TV) Vec(err/MErr)) [c: &OpCall local: &Str]
+  (let [p (param (:exprs c) local)]
+    (if (> (count p) 0)
+      (let [[t e] ((:eval-tv c) (nth p 0) (:event c))]
+        (if (not= e "") (values [] [(err/mk "MULE" "EXPRESSION" e)]) (values [t] [])))
+      (let [ch (:children c)
+            k (loop [i 0] (if (>= i (count ch)) -1 (if (and (xml/elem? (nth ch i)) (= (xml/elem-local (nth ch i)) local)) i (recur (+ i 1)))))]
+        (if (< k 0) (values [] [])
+          (values [(ev/tv-val (v/->VStr (uni/java-trim (xml/text-content (nth ch k)))) ev/ANY)] []))))))
+
+(defn child-elem Vec(xml/XNode) [ch: &Vec(xml/XNode) local: &Str]
+  (loop [i 0] (if (>= i (count ch)) [] (if (and (xml/elem? (nth ch i)) (= (xml/elem-local (nth ch i)) local)) [(nth ch i)] (recur (+ i 1))))))
+
+(defn corr-id Str [n: Int] (str "mulay-" (mono-us) "-" n))
+
+(defn prop-lit Str [app: &m/App key: &Str default: Str]
+  (let [ps (:properties app)]
+    (loop [i 0]
+      (if (>= i (count ps)) default
+        (if (= (:name (nth ps i)) key)
+          (match (:v (nth ps i)) (m/PLit s) (str s) _ default)
+          (recur (+ i 1)))))))
+
+(defn host-eval Values(Vec(v/Val) ev/Event Vec(err/MErr)) [h: &Host p: &Vec(m/PVal) e: ev/Event]
+  (if (= (count p) 0) (values [] e [])
+    (let [[x e2 errs] ((:eval h) (nth p 0) e)] (values [x] e2 errs))))
+
+(defn host-eval-tv Values(Vec(ev/TV) ev/Event Vec(err/MErr)) [h: &Host p: &Vec(m/PVal) e: ev/Event]
+  (if (= (count p) 0) (values [] e [])
+    (let [[t e2 errs] ((:eval-tv h) (nth p 0) e)] (values [t] e2 errs))))

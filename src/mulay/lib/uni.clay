@@ -1,0 +1,413 @@
+(ns mulay.lib.uni (:require [mulay.lib.unitab :as t] [clay.utf8 :as u8]))
+
+(defn- cont? Bool [b: Int] (= (bit-and b 0xC0) 0x80))
+
+(defn decode-at Values(Int Int) [s: &Str i: Int]
+  (let [[cp len ok] (u8/decode-at s i)] (values (if ok cp 0xFFFD) (+ i len))))
+
+(defn cp-at Int [s: &Str i: Int]
+  (let [[c j] (decode-at s i)] c))
+
+(defn next-index Int [s: &Str i: Int]
+  (if (< (nth s i) 0x80) (+ i 1) (let [[c j] (decode-at s i)] j)))
+
+(defn prev-index Int [s: &Str i: Int]
+  (let [lo0 (- i 4)
+        lo (if (< lo0 0) 0 lo0)]
+    (loop [k (- i 1)]
+      (if (< k lo) (- i 1)
+        (let [b (nth s k)]
+          (if (and (cont? b) (> k lo)) (recur (- k 1))
+            (let [[c j] (decode-at s k)]
+              (if (= j i) k (- i 1)))))))))
+
+(defn encode Str [cp: Int]
+  (let [c (if (or (< cp 0) (> cp 0x10FFFF) (and (>= cp 0xD800) (<= cp 0xDFFF))) 0xFFFD cp)]
+    (if (< c 0x80) (chr c)
+      (if (< c 0x800)
+        (str (chr (+ 0xC0 (bit-shift-right c 6))) (chr (+ 0x80 (bit-and c 0x3F))))
+        (if (< c 0x10000)
+          (str (chr (+ 0xE0 (bit-shift-right c 12)))
+               (chr (+ 0x80 (bit-and (bit-shift-right c 6) 0x3F)))
+               (chr (+ 0x80 (bit-and c 0x3F))))
+          (str (chr (+ 0xF0 (bit-shift-right c 18)))
+               (chr (+ 0x80 (bit-and (bit-shift-right c 12) 0x3F)))
+               (chr (+ 0x80 (bit-and (bit-shift-right c 6) 0x3F)))
+               (chr (+ 0x80 (bit-and c 0x3F)))))))))
+
+(defn- ascii? Bool [s: &Str]
+  (let [n (count s)]
+    (loop [i 0] (if (>= i n) true (if (< (nth s i) 0x80) (recur (+ i 1)) false)))))
+
+(defn valid? Bool [s: &Str]
+  (let [n (count s)]
+    (loop [i 0]
+      (if (>= i n) true
+        (if (< (nth s i) 0x80) (recur (+ i 1))
+          (let [[c j] (decode-at s i)]
+            (if (and (= c 0xFFFD) (not (and (= (- j i) 3) (= (nth s i) 0xEF))))
+              false
+              (recur j))))))))
+
+(defn valid-prefix Str [s: &Str]
+  (let [n (count s)
+        k (loop [i 0]
+            (cond (>= i n) n
+                  (< (nth s i) 0x80) (recur (+ i (prim/str-ascii-run s i)))
+                  :else (let [[cp len ok] (u8/decode-at s i)] (if ok (recur (+ i len)) i))))]
+    (if (= k n) (str s) (subs s 0 k))))
+
+(defn sanitize Str [s: Str]
+  (if (valid? s) s
+    (let [n (count s)]
+      (loop [i 0 out ""]
+        (if (>= i n) out
+          (let [[c j] (decode-at s i)]
+            (recur j (str out (if (= c 0xFFFD) (encode 0xFFFD) (subs s i j))))))))))
+
+(defn cps Vec(Int) [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 out: Vec(Int) []]
+      (if (>= i n) out
+        (let [[c j] (decode-at s i)] (recur j (conj out c)))))))
+
+(defn from-cps Str [v: &Vec(Int)]
+  (loop [i 0 out ""]
+    (if (>= i (count v)) out (recur (+ i 1) (str out (encode (nth v i)))))))
+
+(defn byte-index-of-cp-index Int [s: &Str k: Int]
+  (if (< k 0) -1
+    (let [n (count s)]
+      (loop [i 0 j 0]
+        (if (= j k) i
+          (if (>= i n) -1 (recur (next-index s i) (+ j 1))))))))
+
+(defn cp-index-of-byte-index Int [s: &Str b: Int]
+  (let [n (count s)]
+    (loop [i 0 j 0]
+      (if (or (>= i n) (>= i b)) (if (> i b) (- j 1) j)
+        (recur (next-index s i) (+ j 1))))))
+
+(defn sub-cp Str [s: &Str from: Int to: Int]
+  (let [n (count s)
+        f (if (< from 0) 0 from)]
+    (if (>= f to) ""
+      (let [bs (loop [i 0 j 0] (if (or (= j f) (>= i n)) i (recur (next-index s i) (+ j 1))))
+            be (loop [i bs j f] (if (or (= j to) (>= i n)) i (recur (next-index s i) (+ j 1))))]
+        (subs s bs be)))))
+
+(defn- hexd Int [c: Int] (if (<= c 57) (- c 48) (- c 55)))
+
+(defn- hexv Int [s: &Str i: Int n: Int]
+  (loop [k 0 acc 0] (if (>= k n) acc (recur (+ k 1) (+ (* acc 16) (hexd (nth s (+ i k))))))))
+
+(defn- last-le Int [tab: &Str w: Int cp: Int]
+  (let [n (quot (count tab) w)]
+    (loop [lo 0 hi (- n 1) best -1]
+      (if (> lo hi) best
+        (let [mid (quot (+ lo hi) 2)]
+          (if (<= (hexv tab (* mid w) 6) cp)
+            (recur (+ mid 1) hi mid)
+            (recur lo (- mid 1) best)))))))
+
+(defn in-ranges? Bool [tab: &Str cp: Int]
+  (let [k (last-le tab 12 cp)]
+    (if (< k 0) false (<= cp (hexv tab (+ (* k 12) 6) 6)))))
+
+(defn- run-map Int [tab: &Str cp: Int]
+  (let [k (last-le tab 20 cp)]
+    (if (< k 0) cp
+      (let [o (* k 20)
+            lo (hexv tab o 6)
+            hi (hexv tab (+ o 6) 6)
+            st (- (nth tab (+ o 12)) 48)
+            d (hexv tab (+ o 14) 6)]
+        (if (and (<= cp hi) (= (mod (- cp lo) st) 0))
+          (if (= (nth tab (+ o 13)) 45) (- cp d) (+ cp d))
+          cp)))))
+
+(def GC-LU 1) (def GC-LL 2) (def GC-LT 3) (def GC-LM 4) (def GC-LO 5)
+(def GC-MN 6) (def GC-MC 7) (def GC-ME 8) (def GC-ND 9) (def GC-NL 10) (def GC-NO 11)
+(def GC-PC 12) (def GC-PD 13) (def GC-PS 14) (def GC-PE 15) (def GC-PI 16) (def GC-PF 17) (def GC-PO 18)
+(def GC-SM 19) (def GC-SC 20) (def GC-SK 21) (def GC-SO 22)
+(def GC-ZS 23) (def GC-ZL 24) (def GC-ZP 25) (def GC-CC 26) (def GC-CF 27) (def GC-CS 28) (def GC-CO 29)
+
+(defn- ascii-gc Int [c: Int]
+  (if (< c 32) GC-CC
+    (if (= c 127) GC-CC
+      (if (= c 32) GC-ZS
+        (if (and (>= c 48) (<= c 57)) GC-ND
+          (if (and (>= c 65) (<= c 90)) GC-LU
+            (if (and (>= c 97) (<= c 122)) GC-LL
+              (case c
+                36 GC-SC 43 GC-SM 60 GC-SM 61 GC-SM 62 GC-SM 124 GC-SM 126 GC-SM
+                94 GC-SK 96 GC-SK 95 GC-PC 45 GC-PD
+                40 GC-PS 91 GC-PS 123 GC-PS 41 GC-PE 93 GC-PE 125 GC-PE
+                GC-PO))))))))
+
+(defn gc-id Int [cp: Int]
+  (if (and (>= cp 0) (< cp 128)) (ascii-gc cp)
+    (if (or (< cp 0) (> cp 0x10FFFF)) 0
+      (- (nth t/GC (+ (* (last-le t/GC 7 cp) 7) 6)) 97))))
+
+(defn gc-name Str [id: Int] (subs t/GC-NAMES (* id 2) (+ (* id 2) 2)))
+
+(defn gc Str [cp: Int]
+  (gc-name (gc-id cp)))
+
+(defn gc-id-of-name Int [name: &Str]
+  (loop [i 0] (if (>= i 30) -1 (if (= (gc-name i) name) i (recur (+ i 1))))))
+
+(defn gc-mask Int [cp: Int] (bit-shift-left 1 (gc-id cp)))
+
+(def MASK-L 62)
+(def MASK-M 448)
+(def MASK-N 3584)
+(def MASK-P 516096)
+(def MASK-S 7864320)
+(def MASK-Z 58720256)
+(def MASK-C 1006632961)
+
+(defn letter? Bool [cp: Int]
+  (if (< cp 128) (or (and (>= cp 65) (<= cp 90)) (and (>= cp 97) (<= cp 122)))
+    (not= (bit-and (gc-mask cp) MASK-L) 0)))
+
+(defn java-digit? Bool [cp: Int]
+  (if (< cp 128) (and (>= cp 48) (<= cp 57)) (= (gc-id cp) GC-ND)))
+
+(defn char-digit Int [cp: Int radix: Int]
+  (if (or (< radix 2) (> radix 36)) -1
+    (let [v (cond (and (>= cp 48) (<= cp 57)) (- cp 48)
+                  (and (>= cp 65) (<= cp 90)) (- cp 55)
+                  (and (>= cp 97) (<= cp 122)) (- cp 87)
+                  (and (>= cp 0xFF21) (<= cp 0xFF3A)) (- cp 0xFF17)
+                  (and (>= cp 0xFF41) (<= cp 0xFF5A)) (- cp 0xFF37)
+                  (java-digit? cp) (let [start (loop [z cp] (if (java-digit? (- z 1)) (recur (- z 1)) z))] (mod (- cp start) 10))
+                  :else -1)]
+      (if (< v radix) v -1))))
+
+(defn letter-or-digit? Bool [cp: Int]
+  (or (letter? cp) (java-digit? cp)))
+
+(defn alphabetic? Bool [cp: Int]
+  (if (< cp 128) (letter? cp) (in-ranges? t/ALPHABETIC cp)))
+
+(defn upper-case? Bool [cp: Int]
+  (if (< cp 128) (and (>= cp 65) (<= cp 90)) (in-ranges? t/UPPERCASE cp)))
+
+(defn lower-case? Bool [cp: Int]
+  (if (< cp 128) (and (>= cp 97) (<= cp 122)) (in-ranges? t/LOWERCASE cp)))
+
+(defn title-case? Bool [cp: Int]
+  (and (>= cp 128) (= (gc-id cp) GC-LT)))
+
+(defn ideographic? Bool [cp: Int]
+  (and (>= cp 0x3000) (in-ranges? t/IDEOGRAPHIC cp)))
+
+(defn space-char? Bool [cp: Int]
+  (if (< cp 128) (= cp 32) (not= (bit-and (gc-mask cp) MASK-Z) 0)))
+
+(defn java-whitespace? Bool [cp: Int]
+  (if (< cp 128)
+    (or (= cp 32) (and (>= cp 9) (<= cp 13)) (and (>= cp 28) (<= cp 31)))
+    (and (not= cp 0xA0) (not= cp 0x2007) (not= cp 0x202F)
+         (not= (bit-and (gc-mask cp) MASK-Z) 0))))
+
+(defn white-space-prop? Bool [cp: Int]
+  (in-ranges? t/WHITE-SPACE cp))
+
+(defn cased? Bool [cp: Int]
+  (or (lower-case? cp) (upper-case? cp) (title-case? cp)))
+
+(defn case-ignorable? Bool [cp: Int]
+  (in-ranges? t/CASE-IGNORABLE cp))
+
+(defn upper-cp Int [cp: Int]
+  (if (< cp 128) (if (and (>= cp 97) (<= cp 122)) (- cp 32) cp)
+    (run-map t/UPPER-RUNS cp)))
+
+(defn lower-cp Int [cp: Int]
+  (if (< cp 128) (if (and (>= cp 65) (<= cp 90)) (+ cp 32) cp)
+    (run-map t/LOWER-RUNS cp)))
+
+(defn title-cp Int [cp: Int]
+  (if (< cp 0x1C4) (upper-cp cp)
+    (let [k (last-le t/TITLE 12 cp)]
+      (if (and (>= k 0) (= (hexv t/TITLE (* k 12) 6) cp))
+        (hexv t/TITLE (+ (* k 12) 6) 6)
+        (upper-cp cp)))))
+
+(defn fold-cp Int [cp: Int]
+  (lower-cp (upper-cp cp)))
+
+(defn upper-full Str [cp: Int]
+  (let [k (if (< cp 0xDF) -1 (last-le t/SPUP 25 cp))]
+    (if (and (>= k 0) (= (hexv t/SPUP (* k 25) 6) cp))
+      (let [o (* k 25)
+            n (- (nth t/SPUP (+ o 6)) 48)]
+        (loop [i 0 out ""]
+          (if (>= i n) out (recur (+ i 1) (str out (encode (hexv t/SPUP (+ o (+ 7 (* i 6))) 6)))))))
+      (encode (upper-cp cp)))))
+
+(defn- ascii-upper Str [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 start 0 out ""]
+      (if (>= i n) (if (= start 0) (subs s 0 n) (str out (subs s start n)))
+        (let [b (nth s i)]
+          (if (and (>= b 97) (<= b 122))
+            (recur (+ i 1) (+ i 1) (str out (subs s start i) (chr (- b 32))))
+            (recur (+ i 1) start out)))))))
+
+(defn- ascii-lower Str [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 start 0 out ""]
+      (if (>= i n) (if (= start 0) (subs s 0 n) (str out (subs s start n)))
+        (let [b (nth s i)]
+          (if (and (>= b 65) (<= b 90))
+            (recur (+ i 1) (+ i 1) (str out (subs s start i) (chr (+ b 32))))
+            (recur (+ i 1) start out)))))))
+
+(defn upper Str [s: &Str]
+  (if (ascii? s) (ascii-upper s)
+    (let [n (count s)]
+      (loop [i 0 out ""]
+        (if (>= i n) out
+          (let [[c j] (decode-at s i)
+                u (upper-cp c)]
+            (if (and (= u c) (< c 0xDF))
+              (recur j (str out (subs s i j)))
+              (recur j (str out (upper-full c))))))))))
+
+(defn- final-sigma? Bool [s: &Str i: Int j: Int]
+  (let [n (count s)
+        before (loop [k i]
+                 (if (<= k 0) false
+                   (let [p (prev-index s k)
+                         c (cp-at s p)]
+                     (if (case-ignorable? c) (recur p) (cased? c)))))]
+    (if (not before) false
+      (loop [k j]
+        (if (>= k n) true
+          (let [[c k2] (decode-at s k)]
+            (if (case-ignorable? c) (recur k2) (not (cased? c)))))))))
+
+(defn lower Str [s: &Str]
+  (if (ascii? s) (ascii-lower s)
+    (let [n (count s)]
+      (loop [i 0 out ""]
+        (if (>= i n) out
+          (let [[c j] (decode-at s i)]
+            (if (= c 0x130)
+              (recur j (str out "i" (encode 0x307)))
+              (if (= c 0x3A3)
+                (recur j (str out (encode (if (final-sigma? s i j) 0x3C2 0x3C3))))
+                (let [l (lower-cp c)]
+                  (if (and (= l c) (not= c 0xFFFD))
+                    (recur j (str out (subs s i j)))
+                    (recur j (str out (encode l)))))))))))))
+
+(defn java-trim Str [s: &Str]
+  (let [n (count s)
+        a (loop [i 0] (if (and (< i n) (<= (nth s i) 32)) (recur (+ i 1)) i))
+        b (loop [i n] (if (and (> i a) (<= (nth s (- i 1)) 32)) (recur (- i 1)) i))]
+    (subs s a b)))
+
+(defn- strip-start Int [s: &Str]
+  (let [n (count s)]
+    (loop [i 0]
+      (if (>= i n) n
+        (let [[c j] (decode-at s i)] (if (java-whitespace? c) (recur j) i))))))
+
+(defn- strip-end Int [s: &Str from: Int]
+  (let [n (count s)]
+    (loop [i from last from]
+      (if (>= i n) last
+        (let [[c j] (decode-at s i)] (recur j (if (java-whitespace? c) last j)))))))
+
+(defn strip Str [s: &Str]
+  (let [a (strip-start s)] (subs s a (strip-end s a))))
+
+(defn strip-leading Str [s: &Str]
+  (subs s (strip-start s) (count s)))
+
+(defn strip-trailing Str [s: &Str]
+  (subs s 0 (strip-end s 0)))
+
+(defn blank? Bool [s: &Str]
+  (= (strip-start s) (count s)))
+
+(defn script-id Int [cp: Int]
+  (if (or (< cp 0) (> cp 0x10FFFF)) 0
+    (hexv t/SCRIPT (+ (* (last-le t/SCRIPT 8 cp) 8) 6) 2)))
+
+(defn- loose Str [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 out ""]
+      (if (>= i n) out
+        (let [b (nth s i)]
+          (if (or (= b 32) (= b 95) (= b 45)) (recur (+ i 1) out)
+            (recur (+ i 1) (str out (chr (if (and (>= b 65) (<= b 90)) (+ b 32) b))))))))))
+
+(defn- nth-field Values(Int Int) [tab: &Str sep: Int k: Int]
+  (let [n (count tab)]
+    (loop [i 0 f 0 st 0]
+      (if (>= i n) (if (= f k) (values st n) (values -1 -1))
+        (if (= (nth tab i) sep)
+          (if (= f k) (values st i) (recur (+ i 1) (+ f 1) (+ i 1)))
+          (recur (+ i 1) f st))))))
+
+(defn script-of-name Int [name: &Str]
+  (let [want (loose name)
+        n (count t/SCRIPT-NAMES)]
+    (loop [i 0 id 0 st 0]
+      (if (> i n) -1
+        (let [b (if (< i n) (nth t/SCRIPT-NAMES i) 124)]
+          (if (or (= b 124) (= b 44))
+            (if (= (loose (subs t/SCRIPT-NAMES st i)) want) id
+              (recur (+ i 1) (if (= b 124) (+ id 1) id) (+ i 1)))
+            (recur (+ i 1) id st)))))))
+
+(defn block-of-name Values(Int Int) [name: &Str]
+  (let [w0 (loose name)
+        want (if (= w0 "greek") "greekandcoptic"
+               (if (= w0 "cyrillicsupplementary") "cyrillicsupplement"
+                 (if (= w0 "combiningmarksforsymbols") "combiningdiacriticalmarksforsymbols" w0)))
+        nb (quot (count t/BLOCKS) 12)]
+    (loop [k 0]
+      (if (>= k nb) (values -1 -1)
+        (let [[a b] (nth-field t/BLOCK-NAMES 124 k)]
+          (if (= (loose (subs t/BLOCK-NAMES a b)) want)
+            (values (hexv t/BLOCKS (* k 12) 6) (hexv t/BLOCKS (+ (* k 12) 6) 6))
+            (recur (+ k 1))))))))
+
+(def- WIDE [[0x1100 0x115F] [0x231A 0x231B] [0x2329 0x232A] [0x23E9 0x23EC] [0x23F0 0x23F0] [0x23F3 0x23F3]
+            [0x25FD 0x25FE] [0x2614 0x2615] [0x2648 0x2653] [0x267F 0x267F] [0x2693 0x2693] [0x26A1 0x26A1]
+            [0x26AA 0x26AB] [0x26BD 0x26BE] [0x26C4 0x26C5] [0x26CE 0x26CE] [0x26D4 0x26D4] [0x26EA 0x26EA]
+            [0x26F2 0x26F3] [0x26F5 0x26F5] [0x26FA 0x26FA] [0x26FD 0x26FD] [0x2705 0x2705] [0x270A 0x270B]
+            [0x2728 0x2728] [0x274C 0x274C] [0x274E 0x274E] [0x2753 0x2755] [0x2757 0x2757] [0x2795 0x2797]
+            [0x27B0 0x27B0] [0x27BF 0x27BF] [0x2B1B 0x2B1C] [0x2B50 0x2B50] [0x2B55 0x2B55]
+            [0x2E80 0x303E] [0x3041 0x33FF] [0x3400 0x4DBF] [0x4E00 0x9FFF] [0xA000 0xA4CF] [0xA960 0xA97F]
+            [0xAC00 0xD7A3] [0xF900 0xFAFF] [0xFE10 0xFE19] [0xFE30 0xFE6F] [0xFF00 0xFF60] [0xFFE0 0xFFE6]
+            [0x16FE0 0x16FE4] [0x17000 0x18CFF] [0x1B000 0x1B2FF] [0x1F004 0x1F004] [0x1F0CF 0x1F0CF]
+            [0x1F18E 0x1F18E] [0x1F191 0x1F19A] [0x1F200 0x1F251] [0x1F300 0x1F64F] [0x1F680 0x1F6FF]
+            [0x1F7E0 0x1F7EB] [0x1F90C 0x1F9FF] [0x1FA70 0x1FAFF] [0x20000 0x3FFFD]])
+
+(defn- wide? Bool [cp: Int]
+  (loop [lo 0 hi (- (count WIDE) 1)]
+    (if (> lo hi) false
+      (let [mid (quot (+ lo hi) 2) r (nth WIDE mid)]
+        (cond (< cp (nth r 0)) (recur lo (- mid 1))
+              (> cp (nth r 1)) (recur (+ mid 1) hi)
+              :else true)))))
+
+(defn cp-width Int [cp: Int]
+  (cond (< cp 0x300) 1
+        (wide? cp) 2
+        :else (let [g (gc cp)] (if (or (= g "Mn") (= g "Me") (= g "Cf")) 0 1))))
+
+(defn width Int [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 w 0]
+      (if (>= i n) w
+        (if (< (nth s i) 0x80) (recur (+ i 1) (+ w 1))
+          (let [[c j] (decode-at s i)] (recur j (+ w (cp-width c)))))))))

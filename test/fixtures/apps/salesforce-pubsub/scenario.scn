@@ -1,0 +1,999 @@
+%%% note
+Salesforce Pub/Sub コネクタ (mule4-salesforce-pubsub-connector 1.4.2、d30 の org):
+publish-event (結果の形、型の変換、エンコードの失敗、無い topic) と subscribe-channel-listener (replay は latest)。
+Platform Event MulayPubSub__e は sfdx/ で deploy しておく (sf project deploy start --target-org d30 --source-dir force-app)。
+CDC は SyncItem__c (templates/org-sync/sfdx を d30 に配備し、sfdx/ の PlatformEventChannelMember で有効にする) の作成・更新・削除。
+listener が受けたものは Object Store に Message__c (CDC は cdc-<changeType>) をキーに置き、/got/{key} で待って取り出す。ID と日時は型だけ比べる。
+%%% requires src/main/resources/sf-secret.yaml
+%%% port 18561
+%%% mask
+rpcId: ([0-9a-f]+)
+org core/prod/([0-9A-Za-z]{15,18})
+%%% wait 10000
+%%% request POST /pub/one
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "mime": "application/java",
+  "attributes": null,
+  "results": [
+    {
+      "class": "java.util.HashMap",
+      "keys": [
+        "eventBody",
+        "hasError",
+        "replayId",
+        "correlationKey",
+        "error"
+      ],
+      "hasError": false,
+      "error": null,
+      "errorClass": null,
+      "eventBody": {
+        "CreatedDate": 1792600000000,
+        "CreatedById": "005000000000000AAA",
+        "Message__c": "one",
+        "Count__c": 42,
+        "Amount__c": 12.5,
+        "Flag__c": true,
+        "When__c": 1792600000123,
+        "Day__c": 20500
+      },
+      "replayIdClass": "java.lang.Long",
+      "replayIdIsPositive": true,
+      "correlationKeyLength": 36
+    }
+  ]
+}
+%%% request POST /pub/two
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "mime": "application/java",
+  "attributes": null,
+  "results": [
+    {
+      "class": "java.util.HashMap",
+      "keys": [
+        "eventBody",
+        "hasError",
+        "replayId",
+        "correlationKey",
+        "error"
+      ],
+      "hasError": false,
+      "error": null,
+      "errorClass": null,
+      "eventBody": {
+        "CreatedDate": 1792600000000,
+        "CreatedById": "005000000000000AAA",
+        "Message__c": "two-a",
+        "Count__c": 1
+      },
+      "replayIdClass": "java.lang.Long",
+      "replayIdIsPositive": true,
+      "correlationKeyLength": 36
+    },
+    {
+      "class": "java.util.HashMap",
+      "keys": [
+        "eventBody",
+        "hasError",
+        "replayId",
+        "correlationKey",
+        "error"
+      ],
+      "hasError": false,
+      "error": null,
+      "errorClass": null,
+      "eventBody": {
+        "CreatedDate": 1792600000000,
+        "CreatedById": "005000000000000AAA",
+        "Message__c": "two-b",
+        "Flag__c": false
+      },
+      "replayIdClass": "java.lang.Long",
+      "replayIdIsPositive": true,
+      "correlationKeyLength": 36
+    }
+  ]
+}
+%%% request POST /pub/bigint
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "mime": "application/java",
+  "attributes": null,
+  "results": [
+    {
+      "class": "java.util.HashMap",
+      "keys": [
+        "eventBody",
+        "hasError",
+        "replayId",
+        "correlationKey",
+        "error"
+      ],
+      "hasError": false,
+      "error": null,
+      "errorClass": null,
+      "eventBody": {
+        "CreatedDate": 1792600000000,
+        "CreatedById": "005000000000000AAA",
+        "Message__c": "bigint",
+        "Count__c": 9007199254740993,
+        "Amount__c": 0.1
+      },
+      "replayIdClass": "java.lang.Long",
+      "replayIdIsPositive": true,
+      "correlationKeyLength": 36
+    }
+  ]
+}
+%%% request POST /pub/nulls
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "mime": "application/java",
+  "attributes": null,
+  "results": [
+    {
+      "class": "java.util.HashMap",
+      "keys": [
+        "eventBody",
+        "hasError",
+        "replayId",
+        "correlationKey",
+        "error"
+      ],
+      "hasError": false,
+      "error": null,
+      "errorClass": null,
+      "eventBody": {
+        "CreatedDate": 1792600000000,
+        "CreatedById": "005000000000000AAA",
+        "Message__c": "nulls",
+        "Count__c": null,
+        "Flag__c": null
+      },
+      "replayIdClass": "java.lang.Long",
+      "replayIdIsPositive": true,
+      "correlationKeyLength": 36
+    }
+  ]
+}
+%%% request POST /pub/missing-required
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "SALESFORCE-PUB-SUB:INVALID_INPUT",
+  "description": "null value for (non-nullable) long at MulayPubSub__e.CreatedDate"
+}
+%%% request POST /pub/unknown-field
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "MULE:UNKNOWN",
+  "description": "Cannot invoke \"org.apache.avro.Schema$Field.schema()\" because the return value of \"org.apache.avro.Schema.getField(String)\" is null"
+}
+%%% request POST /pub/string-in-number
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "MULE:UNKNOWN",
+  "description": "Not in union [\"null\",\"double\"]: abc (field=Count__c)"
+}
+%%% request POST /pub/number-in-string
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "MULE:UNKNOWN",
+  "description": "Not in union [\"null\",\"string\"]: 5 (field=Message__c)"
+}
+%%% request POST /pub/decimal-in-long
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "mime": "application/java",
+  "attributes": null,
+  "results": [
+    {
+      "class": "java.util.HashMap",
+      "keys": [
+        "eventBody",
+        "hasError",
+        "replayId",
+        "correlationKey",
+        "error"
+      ],
+      "hasError": false,
+      "error": null,
+      "errorClass": null,
+      "eventBody": {
+        "CreatedDate": 1792600000000,
+        "CreatedById": "005000000000000AAA",
+        "Message__c": "decimal-in-long",
+        "When__c": 1.9
+      },
+      "replayIdClass": "java.lang.Long",
+      "replayIdIsPositive": true,
+      "correlationKeyLength": 36
+    }
+  ]
+}
+%%% request POST /pub/empty
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "SALESFORCE-PUB-SUB:INVALID_INPUT",
+  "description": "io.grpc.StatusRuntimeException: INVALID_ARGUMENT: The request contains no events. rpcId: ***"
+}
+%%% request POST /pub/object
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "MULE:EXPRESSION",
+  "description": "\"Cannot coerce Object ({CreatedDate: 1792600000000 as Number {class: \"java.lang.Long\"},CreatedById: ...) to Array\" evaluating expression: \"payload\"."
+}
+%%% request GET /got/one
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payloadClass": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+  "payloadMime": "*/*",
+  "attributes": null,
+  "shape": {
+    "^class": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+    "eventId": {
+      "^type": "String",
+      "^class": "java.lang.String"
+    },
+    "replayId": {
+      "^type": "Number",
+      "^class": "java.lang.Long"
+    },
+    "event": {
+      "^class": "com.google.gson.internal.LinkedTreeMap",
+      "CreatedDate": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "CreatedById": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "Amount__c": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "Count__c": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "Day__c": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "Flag__c": {
+        "^type": "Boolean",
+        "^class": "java.lang.Boolean"
+      },
+      "Message__c": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "When__c": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      }
+    }
+  },
+  "keys": [
+    "eventId",
+    "replayId",
+    "event"
+  ],
+  "eventKeys": [
+    "CreatedDate",
+    "CreatedById",
+    "Amount__c",
+    "Count__c",
+    "Day__c",
+    "Flag__c",
+    "Message__c",
+    "When__c"
+  ],
+  "values": {
+    "Amount__c": 12.5,
+    "Count__c": 42,
+    "Day__c": 20500,
+    "Flag__c": true,
+    "Message__c": "one",
+    "When__c": 1792600000123
+  },
+  "createdBy": "005000000000000AAA",
+  "replayIdIsPositive": true,
+  "eventIdLength": 36
+}
+%%% request GET /got/two-a
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payloadClass": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+  "payloadMime": "*/*",
+  "attributes": null,
+  "shape": {
+    "^class": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+    "eventId": {
+      "^type": "String",
+      "^class": "java.lang.String"
+    },
+    "replayId": {
+      "^type": "Number",
+      "^class": "java.lang.Long"
+    },
+    "event": {
+      "^class": "com.google.gson.internal.LinkedTreeMap",
+      "CreatedDate": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "CreatedById": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "Amount__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Count__c": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "Day__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Flag__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Message__c": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "When__c": {
+        "^type": "Null",
+        "^class": null
+      }
+    }
+  },
+  "keys": [
+    "eventId",
+    "replayId",
+    "event"
+  ],
+  "eventKeys": [
+    "CreatedDate",
+    "CreatedById",
+    "Amount__c",
+    "Count__c",
+    "Day__c",
+    "Flag__c",
+    "Message__c",
+    "When__c"
+  ],
+  "values": {
+    "Amount__c": null,
+    "Count__c": 1,
+    "Day__c": null,
+    "Flag__c": null,
+    "Message__c": "two-a",
+    "When__c": null
+  },
+  "createdBy": "005000000000000AAA",
+  "replayIdIsPositive": true,
+  "eventIdLength": 36
+}
+%%% request GET /got/two-b
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payloadClass": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+  "payloadMime": "*/*",
+  "attributes": null,
+  "shape": {
+    "^class": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+    "eventId": {
+      "^type": "String",
+      "^class": "java.lang.String"
+    },
+    "replayId": {
+      "^type": "Number",
+      "^class": "java.lang.Long"
+    },
+    "event": {
+      "^class": "com.google.gson.internal.LinkedTreeMap",
+      "CreatedDate": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "CreatedById": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "Amount__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Count__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Day__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Flag__c": {
+        "^type": "Boolean",
+        "^class": "java.lang.Boolean"
+      },
+      "Message__c": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "When__c": {
+        "^type": "Null",
+        "^class": null
+      }
+    }
+  },
+  "keys": [
+    "eventId",
+    "replayId",
+    "event"
+  ],
+  "eventKeys": [
+    "CreatedDate",
+    "CreatedById",
+    "Amount__c",
+    "Count__c",
+    "Day__c",
+    "Flag__c",
+    "Message__c",
+    "When__c"
+  ],
+  "values": {
+    "Amount__c": null,
+    "Count__c": null,
+    "Day__c": null,
+    "Flag__c": false,
+    "Message__c": "two-b",
+    "When__c": null
+  },
+  "createdBy": "005000000000000AAA",
+  "replayIdIsPositive": true,
+  "eventIdLength": 36
+}
+%%% request GET /got/bigint
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payloadClass": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+  "payloadMime": "*/*",
+  "attributes": null,
+  "shape": {
+    "^class": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+    "eventId": {
+      "^type": "String",
+      "^class": "java.lang.String"
+    },
+    "replayId": {
+      "^type": "Number",
+      "^class": "java.lang.Long"
+    },
+    "event": {
+      "^class": "com.google.gson.internal.LinkedTreeMap",
+      "CreatedDate": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "CreatedById": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "Amount__c": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "Count__c": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "Day__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Flag__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Message__c": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "When__c": {
+        "^type": "Null",
+        "^class": null
+      }
+    }
+  },
+  "keys": [
+    "eventId",
+    "replayId",
+    "event"
+  ],
+  "eventKeys": [
+    "CreatedDate",
+    "CreatedById",
+    "Amount__c",
+    "Count__c",
+    "Day__c",
+    "Flag__c",
+    "Message__c",
+    "When__c"
+  ],
+  "values": {
+    "Amount__c": 0.1,
+    "Count__c": 9007199254740992,
+    "Day__c": null,
+    "Flag__c": null,
+    "Message__c": "bigint",
+    "When__c": null
+  },
+  "createdBy": "005000000000000AAA",
+  "replayIdIsPositive": true,
+  "eventIdLength": 36
+}
+%%% request GET /got/nulls
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payloadClass": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+  "payloadMime": "*/*",
+  "attributes": null,
+  "shape": {
+    "^class": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+    "eventId": {
+      "^type": "String",
+      "^class": "java.lang.String"
+    },
+    "replayId": {
+      "^type": "Number",
+      "^class": "java.lang.Long"
+    },
+    "event": {
+      "^class": "com.google.gson.internal.LinkedTreeMap",
+      "CreatedDate": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "CreatedById": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "Amount__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Count__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Day__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Flag__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Message__c": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "When__c": {
+        "^type": "Null",
+        "^class": null
+      }
+    }
+  },
+  "keys": [
+    "eventId",
+    "replayId",
+    "event"
+  ],
+  "eventKeys": [
+    "CreatedDate",
+    "CreatedById",
+    "Amount__c",
+    "Count__c",
+    "Day__c",
+    "Flag__c",
+    "Message__c",
+    "When__c"
+  ],
+  "values": {
+    "Amount__c": null,
+    "Count__c": null,
+    "Day__c": null,
+    "Flag__c": null,
+    "Message__c": "nulls",
+    "When__c": null
+  },
+  "createdBy": "005000000000000AAA",
+  "replayIdIsPositive": true,
+  "eventIdLength": 36
+}
+%%% request GET /got/decimal-in-long
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "payloadClass": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+  "payloadMime": "*/*",
+  "attributes": null,
+  "shape": {
+    "^class": "com.mulesoft.connector.salesforce.pubsub.api.EventDTO",
+    "eventId": {
+      "^type": "String",
+      "^class": "java.lang.String"
+    },
+    "replayId": {
+      "^type": "Number",
+      "^class": "java.lang.Long"
+    },
+    "event": {
+      "^class": "com.google.gson.internal.LinkedTreeMap",
+      "CreatedDate": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      },
+      "CreatedById": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "Amount__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Count__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Day__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Flag__c": {
+        "^type": "Null",
+        "^class": null
+      },
+      "Message__c": {
+        "^type": "String",
+        "^class": "java.lang.String"
+      },
+      "When__c": {
+        "^type": "Number",
+        "^class": "java.lang.Double"
+      }
+    }
+  },
+  "keys": [
+    "eventId",
+    "replayId",
+    "event"
+  ],
+  "eventKeys": [
+    "CreatedDate",
+    "CreatedById",
+    "Amount__c",
+    "Count__c",
+    "Day__c",
+    "Flag__c",
+    "Message__c",
+    "When__c"
+  ],
+  "values": {
+    "Amount__c": null,
+    "Count__c": null,
+    "Day__c": null,
+    "Flag__c": null,
+    "Message__c": "decimal-in-long",
+    "When__c": 1
+  },
+  "createdBy": "005000000000000AAA",
+  "replayIdIsPositive": true,
+  "eventIdLength": 36
+}
+%%% request POST /pub-topic?topic=/event/Nope__e
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "error": "SALESFORCE-PUB-SUB:NOT_FOUND",
+  "description": "io.grpc.StatusRuntimeException: NOT_FOUND: The topic information for org core/prod/*** and topic /event/Nope__e not found. Ensure the topic name is correct and that the topic exists. rpcId: ***"
+}
+%%% request POST /pub-topic?topic=/event/MulayEvent__e
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "mime": "application/java",
+  "attributes": null,
+  "results": [
+    {
+      "class": "java.util.HashMap",
+      "keys": [
+        "eventBody",
+        "hasError",
+        "replayId",
+        "correlationKey",
+        "error"
+      ],
+      "hasError": false,
+      "error": null,
+      "errorClass": null,
+      "eventBody": {
+        "CreatedDate": 1792600000000,
+        "CreatedById": "005000000000000AAA"
+      },
+      "replayIdClass": "java.lang.Long",
+      "replayIdIsPositive": true,
+      "correlationKeyLength": 36
+    }
+  ]
+}
+%%% request POST /cdc/create
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "ok": true,
+  "errors": [
+    null
+  ]
+}
+%%% wait 4000
+%%% request POST /cdc/update
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "ok": true,
+  "errors": [
+    null
+  ]
+}
+%%% wait 4000
+%%% request POST /cdc/delete
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "ok": true,
+  "errors": [
+    null
+  ]
+}
+%%% request GET /got/cdc-CREATE
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "eventKeys": [
+    "ChangeEventHeader",
+    "OwnerId",
+    "Name",
+    "CurrencyIsoCode",
+    "CreatedDate",
+    "CreatedById",
+    "LastModifiedDate",
+    "LastModifiedById",
+    "Amount__c",
+    "Due__c",
+    "Phone__c",
+    "Status__c",
+    "Sync_Deleting__c",
+    "Sync_Key__c",
+    "Sync_Version__c"
+  ],
+  "headerClass": "com.google.gson.internal.LinkedTreeMap",
+  "headerKeys": [
+    "entityName",
+    "recordIds",
+    "changeType",
+    "changeOrigin",
+    "transactionKey",
+    "sequenceNumber",
+    "commitTimestamp",
+    "commitNumber",
+    "commitUser",
+    "nulledFields",
+    "diffFields",
+    "changedFields"
+  ],
+  "entityName": "SyncItem__c",
+  "changeType": "CREATE",
+  "changedFields": [
+    
+  ],
+  "nulledFields": [
+    
+  ],
+  "diffFields": [
+    
+  ],
+  "recordIds": 1,
+  "sequenceNumber": 1,
+  "commitTimestampType": "Number",
+  "commitUserLength": 18,
+  "transactionKeyType": "String",
+  "changedFieldsClass": "java.util.ArrayList",
+  "values": {
+    "Name": "mulay cdc",
+    "Status__c": "new",
+    "Amount__c": 5,
+    "Due__c": 1.7980704E+12,
+    "Phone__c": null
+  }
+}
+%%% request GET /got/cdc-UPDATE
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "eventKeys": [
+    "ChangeEventHeader",
+    "OwnerId",
+    "Name",
+    "CurrencyIsoCode",
+    "CreatedDate",
+    "CreatedById",
+    "LastModifiedDate",
+    "LastModifiedById",
+    "Amount__c",
+    "Due__c",
+    "Phone__c",
+    "Status__c",
+    "Sync_Deleting__c",
+    "Sync_Key__c",
+    "Sync_Version__c"
+  ],
+  "headerClass": "com.google.gson.internal.LinkedTreeMap",
+  "headerKeys": [
+    "entityName",
+    "recordIds",
+    "changeType",
+    "changeOrigin",
+    "transactionKey",
+    "sequenceNumber",
+    "commitTimestamp",
+    "commitNumber",
+    "commitUser",
+    "nulledFields",
+    "diffFields",
+    "changedFields"
+  ],
+  "entityName": "SyncItem__c",
+  "changeType": "UPDATE",
+  "changedFields": [
+    "LastModifiedDate",
+    "Amount__c",
+    "Status__c",
+    "Sync_Version__c"
+  ],
+  "nulledFields": [
+    
+  ],
+  "diffFields": [
+    
+  ],
+  "recordIds": 1,
+  "sequenceNumber": 1,
+  "commitTimestampType": "Number",
+  "commitUserLength": 18,
+  "transactionKeyType": "String",
+  "changedFieldsClass": "java.util.ArrayList",
+  "values": {
+    "Name": null,
+    "Status__c": "changed",
+    "Amount__c": 7,
+    "Due__c": null,
+    "Phone__c": null
+  }
+}
+%%% request GET /got/cdc-DELETE
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "eventKeys": [
+    "ChangeEventHeader",
+    "OwnerId",
+    "Name",
+    "CurrencyIsoCode",
+    "CreatedDate",
+    "CreatedById",
+    "LastModifiedDate",
+    "LastModifiedById",
+    "Amount__c",
+    "Due__c",
+    "Phone__c",
+    "Status__c",
+    "Sync_Deleting__c",
+    "Sync_Key__c",
+    "Sync_Version__c"
+  ],
+  "headerClass": "com.google.gson.internal.LinkedTreeMap",
+  "headerKeys": [
+    "entityName",
+    "recordIds",
+    "changeType",
+    "changeOrigin",
+    "transactionKey",
+    "sequenceNumber",
+    "commitTimestamp",
+    "commitNumber",
+    "commitUser",
+    "nulledFields",
+    "diffFields",
+    "changedFields"
+  ],
+  "entityName": "SyncItem__c",
+  "changeType": "DELETE",
+  "changedFields": [
+    
+  ],
+  "nulledFields": [
+    
+  ],
+  "diffFields": [
+    
+  ],
+  "recordIds": 1,
+  "sequenceNumber": 1,
+  "commitTimestampType": "Number",
+  "commitUserLength": 18,
+  "transactionKeyType": "String",
+  "changedFieldsClass": "java.util.ArrayList",
+  "values": {
+    "Name": null,
+    "Status__c": null,
+    "Amount__c": null,
+    "Due__c": null,
+    "Phone__c": null
+  }
+}

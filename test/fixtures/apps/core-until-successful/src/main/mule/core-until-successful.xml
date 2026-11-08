@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <os:object-store name="attemptsStore" persistent="false"/>
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18115"/>
+    </http:listener-config>
+
+    <!-- 試行ごとに変数は元に戻るか: 変数だけで数えると毎回 1 になる -->
+    <flow name="until-vars-reset">
+        <http:listener config-ref="L" path="/vars-reset"/>
+        <set-variable variableName="attempts" value="#[0]"/>
+        <set-variable variableName="succeedOn" value="#[(attributes.queryParams.on default '3') as Number]"/>
+        <until-successful maxRetries="4" millisBetweenRetries="10">
+            <set-variable variableName="attempts" value="#[vars.attempts + 1]"/>
+            <choice>
+                <when expression="#[vars.attempts &lt; vars.succeedOn]">
+                    <raise-error type="APP:TRANSIENT" description="#['attempt ' ++ (vars.attempts as String) ++ ' failed']"/>
+                </when>
+            </choice>
+            <set-payload value="#[output application/json --- {attempts: vars.attempts}]"/>
+        </until-successful>
+    </flow>
+
+    <!-- n 回目で成功する。試行回数は ObjectStore で数える (key はリクエストごとに変える) -->
+    <flow name="until-eventually">
+        <http:listener config-ref="L" path="/eventually"/>
+        <set-variable variableName="key" value="#[attributes.queryParams.key]"/>
+        <set-variable variableName="succeedOn" value="#[(attributes.queryParams.on default '3') as Number]"/>
+        <until-successful maxRetries="4" millisBetweenRetries="10">
+            <os:retrieve key="#[vars.key]" objectStore="attemptsStore" target="prev">
+                <os:default-value>#[0]</os:default-value>
+            </os:retrieve>
+            <os:store key="#[vars.key]" objectStore="attemptsStore">
+                <os:value>#[vars.prev + 1]</os:value>
+            </os:store>
+            <choice>
+                <when expression="#[(vars.prev + 1) &lt; vars.succeedOn]">
+                    <raise-error type="APP:TRANSIENT" description="#['attempt ' ++ ((vars.prev + 1) as String) ++ ' failed']"/>
+                </when>
+            </choice>
+            <set-payload value="#[output application/json --- {attempts: vars.prev + 1}]"/>
+        </until-successful>
+    </flow>
+
+    <!-- 使い果たすと MULE:RETRY_EXHAUSTED。元のエラーはどこに見えるか -->
+    <flow name="until-exhausted">
+        <http:listener config-ref="L" path="/exhausted"/>
+        <set-variable variableName="attempts" value="#[0]"/>
+        <until-successful maxRetries="2" millisBetweenRetries="10">
+            <set-variable variableName="attempts" value="#[vars.attempts + 1]"/>
+            <raise-error type="APP:ALWAYS" description="always fails"/>
+        </until-successful>
+        <error-handler>
+            <on-error-continue type="MULE:RETRY_EXHAUSTED">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  attempts: vars.attempts,
+  errorType: error.errorType.namespace ++ ":" ++ error.errorType.identifier,
+  parent: error.errorType.parentErrorType.namespace ++ ":" ++ error.errorType.parentErrorType.identifier,
+  description: error.description
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- ハンドラ無しで使い果たしたときの既定の応答 -->
+    <flow name="until-exhausted-unhandled">
+        <http:listener config-ref="L" path="/exhausted-unhandled"/>
+        <until-successful maxRetries="1" millisBetweenRetries="10">
+            <raise-error type="APP:ALWAYS" description="always fails"/>
+        </until-successful>
+    </flow>
+
+    <!-- APP:ALWAYS で捕まえられるか (RETRY_EXHAUSTED の親が何か) -->
+    <flow name="until-catch-original">
+        <http:listener config-ref="L" path="/catch-original"/>
+        <until-successful maxRetries="1" millisBetweenRetries="10">
+            <raise-error type="APP:ALWAYS" description="always fails"/>
+        </until-successful>
+        <error-handler>
+            <on-error-continue type="APP:ALWAYS">
+                <set-payload value="caught as APP:ALWAYS"/>
+            </on-error-continue>
+            <on-error-continue type="ANY">
+                <set-payload value="#['caught as ANY: ' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- maxRetries=0: 1 回だけ試す -->
+    <flow name="until-zero">
+        <http:listener config-ref="L" path="/zero"/>
+        <set-variable variableName="attempts" value="#[0]"/>
+        <try>
+            <until-successful maxRetries="0" millisBetweenRetries="10">
+                <set-variable variableName="attempts" value="#[vars.attempts + 1]"/>
+                <raise-error type="APP:ALWAYS" description="always fails"/>
+            </until-successful>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="#[output application/json --- {attempts: vars.attempts, errorType: error.errorType.identifier}]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+</mule>

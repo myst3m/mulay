@@ -1,0 +1,156 @@
+(ns mulay.rt.ostore
+  (:require [mulay.lib.host :as host] [mulay.dw.val :as v] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.persist :as ps] [mulay.lib.fs :as fs] [clay.string :as str]))
+
+(defrecord Cfg [ttl-ms: Int max: Int interval-ms: Int persistent: Bool])
+
+(defrecord Entry [value: ev/TV at: Int attrs: Vec(ev/TV)])
+
+(defrecord Store [entries: Map(Str Entry) sweep: Int])
+
+(defrecord St [stores: Atom(Map(Str Store)) cfgs: Atom(Map(Str Cfg)) dir: Atom(Str) ticket: Atom(Int) serving: Atom(Int)])
+
+(def ST: St (->St (atom (let [m: Map(Str Store) {}] m)) (atom (let [m: Map(Str Cfg) {}] m)) (atom ".mulay/app/objectstore") (atom 0) (atom 0)))
+
+(defn default-cfg Cfg [] (->Cfg 0 0 60000 true))
+
+(defn- new-store Store [now: Int] (let [e: Map(Str Entry) {}] (->Store e now)))
+
+(defn- unit-ms Int [unit: &Str]
+  (let [u (str/upper-case (str/trim unit))]
+    (cond (= u "MILLISECONDS") 1 (= u "SECONDS") 1000 (= u "MINUTES") 60000 (= u "HOURS") 3600000 (= u "DAYS") 86400000 :else 0)))
+
+(defn- lit Str [ps: &Vec(m/Param) name: &Str default: Str]
+  (loop [i 0] (if (>= i (count ps)) default (if (= (:name (nth ps i)) name) (match (:v (nth ps i)) (m/PLit s) (str s) _ default) (recur (+ i 1))))))
+
+(defn- num Int [s: &Str] (let [[n e] (parse-long (str/trim s))] (if (= e "") n 0)))
+
+(defn cfg-of Cfg [ps: &Vec(m/Param)]
+  (let [ttl (num (lit ps "entryTtl" "0"))
+        tu (unit-ms (lit ps "entryTtlUnit" "SECONDS"))
+        iv (num (lit ps "expirationInterval" "1"))
+        iu (unit-ms (lit ps "expirationIntervalUnit" "MINUTES"))]
+    (->Cfg (* ttl tu) (num (lit ps "maxEntries" "0")) (* iv iu) (not= (str/lower-case (lit ps "persistent" "true")) "false"))))
+
+(defn cfg-for Cfg [store: &Str]
+  (let [cs (deref (:cfgs ST))] (if (contains? cs store) (get! cs store) (default-cfg))))
+
+(defn- file-of Str [store: &Str] (fs/join (deref (:dir ST)) (ps/safe-name (if (= store "") "_defaultPersistentObjectStore" store))))
+
+(defn- swept Store [s: Store cfg: &Cfg now: Int]
+  (if (or (<= (:interval-ms cfg) 0) (and (<= (:ttl-ms cfg) 0) (<= (:max cfg) 0)) (< now (+ (:sweep s) (:interval-ms cfg)))) s
+    (let [es (:entries s)
+          ks (keys es)
+          live (loop [i 0 m es]
+                 (if (or (>= i (count ks)) (<= (:ttl-ms cfg) 0)) m
+                   (let [k (nth ks i)]
+                     (recur (+ i 1) (if (<= (+ (:at (get! es k)) (:ttl-ms cfg)) now) (dissoc m k) m)))))
+          lk (keys live)
+          over (if (> (:max cfg) 0) (- (count lk) (:max cfg)) 0)
+          kept (loop [i 0 m live] (if (>= i over) m (recur (+ i 1) (dissoc m (nth lk i)))))]
+      (->Store kept now))))
+
+(defn update-store Store [store: &Str f: Fn(Store Store)]
+  (let [cfg (cfg-for store)
+        now (epoch-ms)
+        m (swap! (:stores ST) (fn Map(Str Store) [o: Map(Str Store)]
+                                  (let [s (if (contains? o store) (get! o store) (new-store now))]
+                                    (assoc o store (f (swept s cfg now))))))]
+    (get! m store)))
+
+(defn- ident Store [s: Store] s)
+
+(defn entries Map(Str Entry) [store: &Str] (:entries (update-store store ident)))
+
+(defn with-turn a [f: Fn(a)]
+  (let [t (swap! (:ticket ST) (fn Int [n: Int] (+ n 1)))
+        z0 (loop [] (if (= (+ (deref (:serving ST)) 1) t) 0 (let [z (host/pause-ms 1)] (recur))))]
+    (with-cleanup f (fn Int [] (swap! (:serving ST) (fn Int [n: Int] (+ n 1)))))))
+
+(defn save Int [store: &Str]
+  (if (not (:persistent (cfg-for store))) 0
+    (let [we (with-turn (fn Str []
+                          (let [snap (deref (:stores ST))
+                                lines (if (not (contains? snap store)) []
+                                        (let [es (:entries (get! snap store)) ks (keys es)]
+                                          (loop [i 0 acc: Vec(Str) []]
+                                            (if (>= i (count ks)) acc
+                                              (let [e (get! es (nth ks i))]
+                                                (recur (+ i 1) (conj acc (str (ps/b64e (nth ks i)) " " (:at e) " " (ps/tv-fields (:value e))))))))))]
+                            (ps/save (file-of store) lines))))]
+      (if (= we "") 0 (let [z (eprintln (str "mulay: object store '" store "': " we))] 1)))))
+
+(defn init! Int [dir: &Str cfgs: Map(Str Cfg)]
+  (let [z0 (reset! (:dir ST) (str dir))
+        z1 (reset! (:cfgs ST) cfgs)
+        names (conj (keys cfgs) "")
+        now (epoch-ms)
+        stores (loop [i 0 acc: Map(Str Store) {}]
+                 (if (>= i (count names)) acc
+                   (let [n (nth names i)]
+                     (if (not (:persistent (cfg-for n))) (recur (+ i 1) acc)
+                       (let [lines (ps/load (file-of n))
+                             es (loop [j 0 m: Map(Str Entry) {}]
+                                  (if (>= j (count lines)) m
+                                    (let [f (str/split (nth lines j) " ")]
+                                      (recur (+ j 1) (if (< (count f) 5) m
+                                                       (assoc m (ps/b64d (nth f 0)) (->Entry (ps/tv-of (nth f 2) (nth f 3) (nth f 4)) (num (nth f 1)) [])))))))]
+                         (recur (+ i 1) (if (= (count es) 0) acc (assoc acc n (->Store es now)))))))))
+        z2 (reset! (:stores ST) stores)]
+    0))
+
+(defn put! Int [store: &Str key: &Str t: ev/TV]
+  (let [now (epoch-ms)
+        z (update-store store (fn Store [s: Store] (->Store (assoc (:entries s) key (->Entry t now [])) (:sweep s))))]
+    (save store)))
+
+(defn remove! Int [store: &Str key: &Str]
+  (let [z (update-store store (fn Store [s: Store] (->Store (dissoc (:entries s) key) (:sweep s))))]
+    (save store)))
+
+(defn clear! Int [store: &Str]
+  (let [z (update-store store (fn Store [s: Store] (let [e: Map(Str Entry) {}] (->Store e (:sweep s)))))]
+    (save store)))
+
+(defn put-val Int [store: &Str key: &Str x: v/Val] (put! store key (ev/settle (ev/tv-val x ev/JAVA))))
+
+(defn get-val Vec(v/Val) [store: &Str key: &Str]
+  (let [es (entries store)]
+    (if (contains? es key)
+      (let [t (:value (get! es key))] [(if (= (:state t) ev/VAL) (:val t) (v/->VStr (:raw t)))])
+      [])))
+
+(defn rm-val Int [store: &Str key: &Str] (remove! store key))
+
+(defn define! Int [store: &Str cfg: Cfg]
+  (let [k (str store)
+        z (swap! (:cfgs ST) (fn Map(Str Cfg) [o: Map(Str Cfg)] (if (contains? o k) o (assoc o k cfg))))]
+    0))
+
+(defn put-new! Bool [store: &Str key: &Str t: ev/TV]
+  (let [now (epoch-ms)
+        k (str key)
+        had (atom false)
+        z (update-store store (fn Store [s: Store]
+                                (let [es (:entries s) seen (contains? es k) z0 (reset! had seen)]
+                                  (if seen s (->Store (assoc es k (->Entry t now [])) (:sweep s))))))
+        added (not (deref had))
+        z2 (if added (save store) 0)]
+    added))
+
+(defn put-with! Int [store: &Str key: &Str t: ev/TV attrs: ev/TV]
+  (let [now (epoch-ms)
+        k (str key)
+        z (update-store store (fn Store [s: Store] (->Store (assoc (:entries s) k (->Entry t now [attrs])) (:sweep s))))]
+    (save store)))
+
+(def LOCKS: Atom(Map(Str Bool)) (atom (let [m: Map(Str Bool) {}] m)))
+
+(defn lock! Int [k: &Str]
+  (let [key (str k)]
+    (loop []
+      (let [had (atom false)
+            z (swap! LOCKS (fn Map(Str Bool) [o: Map(Str Bool)] (let [h (contains? o key) z0 (reset! had h)] (if h o (assoc o key true)))))]
+        (if (deref had) (let [z1 (host/pause-ms 1)] (recur)) 0)))))
+
+(defn unlock! Int [k: &Str]
+  (let [key (str k) z (swap! LOCKS (fn Map(Str Bool) [o: Map(Str Bool)] (dissoc o key)))] 0))

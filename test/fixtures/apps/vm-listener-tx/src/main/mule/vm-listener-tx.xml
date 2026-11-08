@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18160"/>
+    </http:listener-config>
+
+    <vm:config name="V">
+        <vm:queues>
+            <vm:queue queueName="retryQ"/>
+            <vm:queue queueName="contQ"/>
+            <vm:queue queueName="noTxQ"/>
+            <vm:queue queueName="sideQ"/>
+            <vm:queue queueName="doneQ"/>
+        </vm:queues>
+    </vm:config>
+
+    <os:object-store name="Counts" persistent="false"/>
+
+    <!-- 何回目か (キーごとに数える) -->
+    <sub-flow name="count">
+        <os:retrieve key="#[vars.key]" objectStore="Counts" target="n"><os:default-value>#[0]</os:default-value></os:retrieve>
+        <set-variable variableName="n" value="#[vars.n + 1]"/>
+        <os:store key="#[vars.key]" objectStore="Counts"><os:value>#[vars.n]</os:value></os:store>
+    </sub-flow>
+
+    <sub-flow name="reset">
+        <os:clear objectStore="Counts"/>
+    </sub-flow>
+
+    <!-- doneQ の結果を待ち、sideQ に commit された数を数える -->
+    <sub-flow name="collect">
+        <try>
+            <vm:consume config-ref="V" queueName="doneQ" timeout="10" timeoutUnit="SECONDS"/>
+            <set-variable variableName="done" value="#[payload]"/>
+            <error-handler><on-error-continue><set-variable variableName="done" value="#['none: ' ++ error.errorType.identifier]"/></on-error-continue></error-handler>
+        </try>
+        <set-variable variableName="side" value="#[[]]"/>
+        <try>
+            <foreach collection="#[1 to 10]">
+                <vm:consume config-ref="V" queueName="sideQ" timeout="300" timeoutUnit="MILLISECONDS"/>
+                <set-variable variableName="side" value="#[vars.side + payload]"/>
+            </foreach>
+            <error-handler><on-error-continue><logger level="DEBUG"/></on-error-continue></error-handler>
+        </try>
+        <set-payload value="#[output application/json --- {done: vars.done, side: vars.side}]"/>
+    </sub-flow>
+
+    <!-- 失敗すると rollback されて同じ message がもう一度来る。3 回目で成功する -->
+    <flow name="start-retry">
+        <http:listener config-ref="L" path="/retry"/>
+        <flow-ref name="reset"/>
+        <vm:publish config-ref="V" queueName="retryQ"><vm:content>#["m1"]</vm:content></vm:publish>
+        <flow-ref name="collect"/>
+    </flow>
+
+    <flow name="retry-listener">
+        <vm:listener config-ref="V" queueName="retryQ" transactionalAction="ALWAYS_BEGIN" numberOfConsumers="1"/>
+        <set-variable variableName="key" value="retry"/>
+        <set-variable variableName="msg" value="#[payload]"/>
+        <flow-ref name="count"/>
+        <vm:publish config-ref="V" queueName="sideQ"><vm:content>#["side " ++ (vars.n as String)]</vm:content></vm:publish>
+        <choice>
+            <when expression="#[vars.n &lt; 3]">
+                <raise-error type="APP:AGAIN" description="#['attempt ' ++ (vars.n as String)]"/>
+            </when>
+        </choice>
+        <vm:publish config-ref="V" queueName="doneQ"><vm:content>#[vars.msg ++ " done at attempt " ++ (vars.n as String)]</vm:content></vm:publish>
+    </flow>
+
+    <!-- on-error-continue なら commit (もう来ない) -->
+    <flow name="start-cont">
+        <http:listener config-ref="L" path="/cont"/>
+        <flow-ref name="reset"/>
+        <vm:publish config-ref="V" queueName="contQ"><vm:content>#["m2"]</vm:content></vm:publish>
+        <flow-ref name="collect"/>
+    </flow>
+
+    <flow name="cont-listener">
+        <vm:listener config-ref="V" queueName="contQ" transactionalAction="ALWAYS_BEGIN" numberOfConsumers="1"/>
+        <set-variable variableName="key" value="cont"/>
+        <flow-ref name="count"/>
+        <vm:publish config-ref="V" queueName="sideQ"><vm:content>#["side " ++ (vars.n as String)]</vm:content></vm:publish>
+        <raise-error type="APP:FAIL" description="always"/>
+        <error-handler>
+            <on-error-continue>
+                <vm:publish config-ref="V" queueName="doneQ"><vm:content>#["continued at attempt " ++ (vars.n as String)]</vm:content></vm:publish>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- トランザクション無し: 失敗した message は戻らない。publish は (トランザクションが無いので) すぐ入る -->
+    <flow name="start-notx">
+        <http:listener config-ref="L" path="/notx"/>
+        <flow-ref name="reset"/>
+        <vm:publish config-ref="V" queueName="noTxQ"><vm:content>#["m3"]</vm:content></vm:publish>
+        <flow-ref name="collect"/>
+        <os:retrieve key="notx" objectStore="Counts" target="n"><os:default-value>#[0]</os:default-value></os:retrieve>
+        <set-payload value="#[output application/json --- payload ++ {attempts: vars.n}]"/>
+    </flow>
+
+    <flow name="notx-listener">
+        <vm:listener config-ref="V" queueName="noTxQ" numberOfConsumers="1"/>
+        <set-variable variableName="key" value="notx"/>
+        <flow-ref name="count"/>
+        <vm:publish config-ref="V" queueName="sideQ"><vm:content>#["side " ++ (vars.n as String)]</vm:content></vm:publish>
+        <raise-error type="APP:FAIL" description="always"/>
+    </flow>
+</mule>

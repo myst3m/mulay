@@ -1,0 +1,28 @@
+(ns yaml-fuzz-test (:require [mulay.lib.yaml :as y] [clay.string :as str]))
+(def DOC (str "%YAML 1.2\n---\n# c\na: &x {k: [1, 2, \"q\\n\", 'it''s']}\nb: *x\nc: |+\n  lit\n\n"
+              "d: >-\n  fold\n  ed\ne:\n- - x\n  - y\n- ? k\n  : v\n- !!str 12\nf: \"multi\n  line\"\n"
+              "g: plain\n  cont\n...\n--- [x, {y: z}]\n"))
+(defn- lcg Int [x: Int] (bit-and (+ (* x 1103515245) 12345) 2147483647))
+(deftest prefixes
+  (is (loop [i 0 ok 0]
+        (if (> i (count DOC)) (> ok 0)
+          (let [[d err] (y/parse-all (subs DOC 0 i))]
+            (recur (+ i 1) (if (= err "") (+ ok 1) ok)))))))
+(deftest mutations
+  (is (loop [k 0 seed 11 errs 0]
+        (if (>= k 3000) (> errs 10)
+          (let [s1 (lcg seed) s2 (lcg s1) s3 (lcg s2)
+                pos (mod s1 (count DOC))
+                chars " -:?#&*!|>'\"%[]{},\n\tax0"
+                b (nth chars (mod s2 (count chars)))
+                mode (mod s3 3)
+                doc (cond (= mode 0) (str (subs DOC 0 pos) (chr b) (subs DOC (+ pos 1) (count DOC)))
+                          (= mode 1) (str (subs DOC 0 pos) (subs DOC (+ pos 1) (count DOC)))
+                          :else (str (subs DOC 0 pos) (chr b) (subs DOC pos (count DOC))))
+                [d err] (y/parse-all doc)
+                ;; whatever parsed must dump and re-parse
+                dumped (loop [i 0 ok true] (if (>= i (count d)) ok
+                                             (let [t (y/dump (nth d i) (y/default-dump-opts)) [v e2] (y/parse t)]
+                                               (recur (+ i 1) (and ok (= e2 ""))))))]
+            (if (not dumped) (do (println (str "dump/reparse failed for: " doc)) false)
+              (recur (+ k 1) s3 (if (= err "") errs (+ errs 1)))))))))

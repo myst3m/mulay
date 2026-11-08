@@ -1,0 +1,1008 @@
+(ns mulay.conn.mcp
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.mule.model :as m] [mulay.rt.conn :as conn] [mulay.lib.xml :as xml]
+            [mulay.dw.fmt.json :as json] [mulay.conn.mcp_schema :as sch] [mulay.dw.lib.core_misc :as misc] [clay.base64 :as b64]
+            [mulay.rt.event :as ev] [mulay.conn.http :as h] [mulay.conn.httpmsg :as hx] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/mcp")
+
+(def LATEST "2025-06-18")
+(def VERSIONS ["2024-11-05" "2025-03-26" "2025-06-18"])
+
+(defrecord Tool [name: Str desc: Str schema: Str flow: Int])
+
+(defrecord Resource [name: Str desc: Str uri: Str mime: Str flow: Int])
+
+(defrecord PArg [name: Str desc: Str required: Bool])
+(defrecord Prompt [name: Str title: Str desc: Str args: Vec(PArg) flow: Int])
+
+(defrecord Server [name: Str listener: Str path: Str sse: Bool sname: Str sversion: Str tools: Vec(Tool) resources: Vec(Resource) prompts: Vec(Prompt)
+                       headers: Vec(hm/Header) idle-ms: Int newsess: Vec(Int) msgpath: Str sse-hdrs: Vec(hm/Header)])
+
+(defrecord Answer [status: Int headers: Vec(hm/Header) body: Str])
+
+(defrecord Step [kind: Str answer: Answer tool: Int args: v/Val id: Str rid: Str sid: Str ver: Str])
+
+(defrecord Item [kind: Str text: Str mime: Str uri: Str data: Str audience: Vec(Str) priority: Str])
+
+(defrecord PMsg [role: Str item: Item name: Str desc: Str size: Str])
+
+(defn- cfg-child Vec(xml/XNode) [c: &m/Config local: &Str] (conn/child-elem (:children c) local))
+
+(defn- node-text Str [n: &xml/XNode local: &Str]
+  (let [k (conn/child-elem (xml/child-elems n) local)] (if (= (count k) 0) "" (str/trim (xml/text-content (nth k 0))))))
+
+(defn- param-str Str [ps: &Vec(m/Param) name: &Str]
+  (let [p (conn/param ps name)] (if (= (count p) 0) "" (match (nth p 0) (m/PLit s) (str s) _ ""))))
+
+(defn- tools-of Vec(Tool) [fs: &Vec(m/Flow) cfg: &Str]
+  (loop [i 0 acc: Vec(Tool) []]
+    (if (>= i (count fs)) acc
+      (let [srcs (:source (nth fs i))]
+        (recur (+ i 1)
+               (if (= (count srcs) 0) acc
+                 (match (nth srcs 0)
+                   (m/SrcConnector cn nm cref ps ch ex sch loc)
+                   (if (and (= cn "mcp") (= nm "tool-listener") (= cref cfg))
+                     (let [d (conn/child-elem ch "description") sc (conn/child-elem ch "parameters-schema")]
+                       (conj acc (->Tool (param-str ps "name") (if (= (count d) 0) "" (str/trim (xml/text-content (nth d 0))))
+                                         (if (= (count sc) 0) "" (str/trim (xml/text-content (nth sc 0)))) i)))
+                     acc)
+                   _ acc)))))))
+
+(defn- listener-flows Vec(Int) [fs: &Vec(m/Flow) cfg: &Str kind: &Str]
+  (loop [i 0 acc: Vec(Int) []]
+    (if (>= i (count fs)) acc
+      (let [srcs (:source (nth fs i))]
+        (recur (+ i 1)
+               (if (= (count srcs) 0) acc
+                 (match (nth srcs 0)
+                   (m/SrcConnector cn nm cref ps ch ex sch loc) (if (and (= cn "mcp") (= nm kind) (= cref cfg)) (conj acc i) acc)
+                   _ acc)))))))
+
+(defn- src-params Vec(m/Param) [f: &m/Flow] (match (nth (:source f) 0) (m/SrcConnector cn nm cref ps ch ex sch loc) ps _ (let [e: Vec(m/Param) []] e)))
+(defn- src-children Vec(xml/XNode) [f: &m/Flow] (match (nth (:source f) 0) (m/SrcConnector cn nm cref ps ch ex sch loc) ch _ (let [e: Vec(xml/XNode) []] e)))
+
+(defn- child-text Str [ch: &Vec(xml/XNode) local: &Str]
+  (let [d (conn/child-elem ch local)] (if (= (count d) 0) "" (str/trim (xml/text-content (nth d 0))))))
+
+(defn- resources-of Vec(Resource) [fs: &Vec(m/Flow) cfg: &Str]
+  (let [is (listener-flows fs cfg "resource-listener")]
+    (loop [k 0 acc: Vec(Resource) []]
+      (if (>= k (count is)) acc
+        (let [i (nth is k) f (nth fs i) ps (src-params f) ch (src-children f)]
+          (recur (+ k 1) (conj acc (->Resource (param-str ps "name") (child-text ch "description") (param-str ps "uri") (param-str ps "resourceMimeType") i))))))))
+
+(defn- pargs-of Vec(PArg) [ch: &Vec(xml/XNode)]
+  (let [pa (conn/child-elem ch "prompt-arguments")]
+    (if (= (count pa) 0) (let [e: Vec(PArg) []] e)
+      (let [kids (xml/child-elems (nth pa 0))]
+        (loop [i 0 acc: Vec(PArg) []]
+          (if (>= i (count kids)) acc
+            (let [k (nth kids i)]
+              (recur (+ i 1) (conj acc (->PArg (xml/attr k "" "name" "") (xml/attr k "" "description" "") (= (xml/attr k "" "required" "false") "true")))))))))))
+
+(defn- prompts-of Vec(Prompt) [fs: &Vec(m/Flow) cfg: &Str]
+  (let [is (listener-flows fs cfg "prompt-listener")]
+    (loop [k 0 acc: Vec(Prompt) []]
+      (if (>= k (count is)) acc
+        (let [i (nth is k) f (nth fs i) ps (src-params f) ch (src-children f)]
+          (recur (+ k 1) (conj acc (->Prompt (param-str ps "name") (param-str ps "title") (child-text ch "description") (pargs-of ch) i))))))))
+
+(defn check Vec(Str) [app: &m/App]
+  (let [cs (:configs app) fs (:flows app)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count cs))
+        (loop [j 0 a2 acc]
+          (if (>= j (count fs)) a2
+            (let [srcs (:source (nth fs j))]
+              (recur (+ j 1)
+                     (if (= (count srcs) 0) a2
+                       (match (nth srcs 0)
+                         (m/SrcConnector cn nm cref ps ch ex sch loc)
+                         (if (and (= cn "mcp") (or (= nm "tool-listener") (= nm "resource-listener") (= nm "prompt-listener") (= nm "on-new-session-listener")))
+                           (let [hit (conn/find-config cs "mcp:server-config" cref)
+                                 a3 (if (= (count hit) 0) (conj a2 (stereotype-err loc cref "MCP:SERVER")) a2)
+                                 sc (conn/child-elem ch "parameters-schema")]
+                             (if (= (count sc) 0) a3
+                               (let [txt (str/trim (xml/text-content (nth sc 0))) [sx se] (json/read txt)]
+                                 (if (= se "") a3 (conj a3 (parse-fail txt))))))
+                           a2)
+                         _ a2))))))
+        (let [c (nth cs i)
+              cn0 (if (= (:kind c) "mcp:server-config") (cfg-child c "streamable-http-server-connection") [])
+              cn (if (and (= (:kind c) "mcp:server-config") (= (count cn0) 0)) (cfg-child c "sse-server-connection") cn0)
+              lc (if (= (count cn) 0) "" (xml/attr (nth cn 0) "" "listenerConfig" ""))
+              bad (and (> (count cn) 0) (= (count (conn/find-config cs "http:listener-config" lc)) 0))]
+          (recur (+ i 1) (if bad (conj acc (stereotype-err (:loc c) lc "HTTP:LISTENER_CONFIG")) acc)))))))
+
+(defn- stereotype-err Str [loc: &m/Loc ref: &Str st: &Str]
+  (str "[" (:file loc) ":" (:line loc) "]: Referenced component '" ref "' must be one of stereotypes [" st "]."))
+
+(defn servers Vec(Server) [app: &m/App]
+  (let [cs (:configs app) fs (:flows app)]
+    (loop [i 0 acc: Vec(Server) []]
+      (if (>= i (count cs)) acc
+        (let [c (nth cs i)
+              st (if (= (:kind c) "mcp:server-config") (cfg-child c "streamable-http-server-connection") [])
+              lg (if (and (= (:kind c) "mcp:server-config") (= (count st) 0)) (cfg-child c "sse-server-connection") [])]
+          (recur (+ i 1)
+                 (cond
+                   (> (count st) 0)
+                   (let [n (nth st 0)]
+                     (conj acc (->Server (:name c) (xml/attr n "" "listenerConfig" "") (xml/attr n "" "mcpEndpointPath" "/mcp")
+                                         (not= (str/upper-case (xml/attr n "" "responseContentType" "SSE")) "JSON")
+                                         (param-str (:params c) "serverName") (param-str (:params c) "serverVersion")
+                                         (tools-of fs (:name c)) (resources-of fs (:name c)) (prompts-of fs (:name c))
+                                         (default-headers n "default-response-headers" "default-response-header") (idle-ms-of n)
+                                         (listener-flows fs (:name c) "on-new-session-listener") "" (let [e: Vec(hm/Header) []] e))))
+                   (> (count lg) 0)
+                   (let [n (nth lg 0)]
+                     (conj acc (->Server (:name c) (xml/attr n "" "listenerConfig" "") (xml/attr n "" "sseEndpointPath" "/sse") true
+                                         (param-str (:params c) "serverName") (param-str (:params c) "serverVersion")
+                                         (tools-of fs (:name c)) (resources-of fs (:name c)) (prompts-of fs (:name c))
+                                         (default-headers n "default-message-response-headers" "default-message-response-header") 0
+                                         (listener-flows fs (:name c) "on-new-session-listener") (xml/attr n "" "messagesPath" "/message")
+                                         (default-headers n "default-sse-response-headers" "default-sse-response-header"))))
+                   :else acc)))))))
+
+(defn- default-headers Vec(hm/Header) [n: &xml/XNode box: &Str item: &Str]
+  (let [b (conn/child-elem (xml/child-elems n) box)]
+    (if (= (count b) 0) (let [e: Vec(hm/Header) []] e)
+      (let [kids (xml/child-elems (nth b 0))]
+        (loop [i 0 acc: Vec(hm/Header) []]
+          (if (>= i (count kids)) acc
+            (recur (+ i 1) (conj acc (hm/->Header (xml/attr (nth kids i) "" "key" "") (xml/attr (nth kids i) "" "value" ""))))))))))
+
+(defn- idle-ms-of Int [n: &xml/XNode]
+  (let [b (conn/child-elem (xml/child-elems n) "session-handling")
+        amount (if (= (count b) 0) "5" (xml/attr (nth b 0) "" "sessionIdleTimeout" "5"))
+        unit (if (= (count b) 0) "MINUTES" (str/upper-case (xml/attr (nth b 0) "" "sessionIdleTimeoutUnit" "MINUTES")))
+        [k err] (parse-long amount)
+        per (cond (= unit "MILLISECONDS") 1 (= unit "SECONDS") 1000 (= unit "MINUTES") 60000 (= unit "HOURS") 3600000 (= unit "DAYS") 86400000 :else 0)]
+    (if (not= err "") 300000 (* k per))))
+
+(defn- jstr Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (cond (= c 34) (str out "\\\"") (= c 92) (str out "\\\\")
+                     (= c 10) (str out "\\n") (= c 9) (str out "\\t") (= c 13) (str out "\\r")
+                     (= c 8) (str out "\\b") (= c 12) (str out "\\f")
+                     (< c 32) (str out "\\u00" (hex2 c))
+                     :else (str out (subs s i (+ i 1)))))))))
+
+(defn- hex2 Str [c: Int] (let [d "0123456789abcdef"] (str (subs d (quot c 16) (+ (quot c 16) 1)) (subs d (mod c 16) (+ (mod c 16) 1)))))
+
+(defn compact Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VNull) "null"
+    (v/VBool b) (if b "true" "false")
+    (v/VInt i) (str i)
+    (v/VNum n) (num/to-string n)
+    (v/VStr s) (jstr s)
+    (v/VArr xs) (loop [i 0 out "["] (if (>= i (count xs)) (str out "]") (recur (+ i 1) (str out (if (= i 0) "" ",") (compact (nth xs i))))))
+    (v/VObj fs) (loop [i 0 out "{"]
+                  (if (>= i (count fs)) (str out "}")
+                    (recur (+ i 1) (str out (if (= i 0) "" ",") (jstr (:name (:key (nth fs i)))) ":" (compact (:value (nth fs i)))))))
+    _ "null"))
+
+(defn- id-out Str [id: &Str] (if (= id "") "" (str ",\"id\":" id)))
+
+(defn- error-body Str [id: &Str code: Int msg: &Str data: &Str]
+  (str "{\"jsonrpc\":\"2.0\"" (id-out id) ",\"error\":{\"code\":" code ",\"message\":" (jstr msg) (if (= data "") "" (str ",\"data\":" (jstr data))) "}}"))
+
+(defn- result-body Str [id: &Str result: &Str] (str "{\"jsonrpc\":\"2.0\"" (id-out id) ",\"result\":" result "}"))
+
+(defn- no-headers Vec(hm/Header) [] (let [h: Vec(hm/Header) []] h))
+(defn- hdr hm/Header [k: Str v: Str] (hm/->Header k v))
+
+(defn- plain Answer [status: Int body: Str] (->Answer status (no-headers) body))
+
+(defn- json-answer Answer [status: Int sid: &Str ver: &Str body: Str]
+  (->Answer status (let [h [(hdr "Content-Type" "application/json")]
+                         h1 (if (= sid "") h (conj h (hdr "Mcp-Session-Id" sid)))]
+                     (conj h1 (hdr "Mcp-Protocol-Version" ver))) body))
+
+(defn- sse-answer Answer [sid: &Str body: &Str]
+  (->Answer 200 [(hdr "Content-Type" "text/event-stream")
+                 (hdr "Cache-Control" "no-cache, no-store, max-age=0, must-revalidate")
+                 (hdr "Pragma" "no-cache")
+                 (hdr "Access-Control-Allow-Origin" "*")
+                 (hdr "Mcp-Session-Id" sid)]
+            (str "event: message\ndata: " body "\n\n")))
+
+(defn- rpc-answer Answer [srv: &Server sid: &Str ver: &Str init: Bool body: Str]
+  (with-defaults srv (if (:sse srv) (sse-answer sid body) (json-answer 200 (if init sid "") ver body))))
+
+(defn- with-defaults Answer [srv: &Server a: Answer]
+  (if (and (> (count (:headers srv)) 0) (or (= (:status a) 200) (= (:status a) 202)))
+    (->Answer (:status a)
+              (if (:sse srv)
+                (let [n (count (:headers a)) last? (and (> n 0) (= (str/lower-case (:hd-name (nth (:headers a) (- n 1)))) "mcp-session-id"))
+                      cut (if last? (- n 1) n)
+                      h1 (loop [i 0 acc: Vec(hm/Header) []] (if (>= i cut) acc (recur (+ i 1) (conj acc (nth (:headers a) i)))))
+                      h2 (loop [i (- (count (:headers srv)) 1) acc h1] (if (< i 0) acc (recur (- i 1) (conj acc (nth (:headers srv) i)))))]
+                  (if last? (conj h2 (nth (:headers a) (- n 1))) h2))
+                (loop [i 0 acc (:headers srv)] (if (>= i (count (:headers a))) acc (recur (+ i 1) (conj acc (nth (:headers a) i))))))
+              (:body a))
+    a))
+
+(defn- err-ans Answer [srv: &Server sid: &Str ver: &Str id: &Str code: Int msg: &Str data: &Str]
+  (rpc-answer srv sid ver false (error-body id code msg data)))
+
+(defn- ok-ans Answer [srv: &Server sid: &Str ver: &Str id: &Str r: &Str]
+  (rpc-answer srv sid ver false (result-body id r)))
+
+(defn- accepted Answer [srv: &Server ver: &Str]
+  (with-defaults srv (if (:sse srv) (plain 202 "") (->Answer 202 [(hdr "Mcp-Protocol-Version" ver)] ""))))
+
+(def SESSIONS: Atom(Map(Str Str)) (atom (let [m: Map(Str Str) {}] m)))
+
+(defrecord Seen [at: Int idle: Int])
+
+(def SEEN: Atom(Map(Str Seen)) (atom (let [m: Map(Str Seen) {}] m)))
+
+(def SESSIONS-MAX 10000)
+
+(defn- skey Str [srv: &Server sid: &Str] (str (:name srv) "/" sid))
+
+(defn- expired? Bool [s: &Seen now: Int] (and (> (:idle s) 0) (> (- now (:at s)) (:idle s))))
+
+(defn stale-sessions Vec(Str) [seen: &Map(Str Seen) pinned: &Map(Str Bool) now: Int cap: Int]
+  (let [m seen
+        ks (sort-by (fn Int [k: &Str] (:at (get! m k))) (keys seen))
+        old (loop [i 0 acc: Vec(Str) []] (if (>= i (count ks)) acc (recur (+ i 1) (if (expired? (get! seen (nth ks i)) now) (conj acc (nth ks i)) acc))))
+        over (- (- (count ks) (count old)) cap)]
+    (loop [i 0 acc old]
+      (if (or (>= i (count ks)) (>= (- (count acc) (count old)) over)) acc
+        (let [k (nth ks i)]
+          (recur (+ i 1) (if (or (expired? (get! seen k) now) (contains? pinned k)) acc (conj acc k))))))))
+
+(defn- drop-sessions Int [ks: &Vec(Str)]
+  (let [z1 (swap! SESSIONS (fn Map(Str Str) [o: Map(Str Str)] (loop [i 0 m o] (if (>= i (count ks)) m (recur (+ i 1) (dissoc m (nth ks i)))))))
+        z2 (swap! SEEN (fn Map(Str Seen) [o: Map(Str Seen)] (loop [i 0 m o] (if (>= i (count ks)) m (recur (+ i 1) (dissoc m (nth ks i)))))))
+        z3 (swap! LEGACY-SINKS (fn Map(Str hm/Sink) [o: Map(Str hm/Sink)] (loop [i 0 m o] (if (>= i (count ks)) m (recur (+ i 1) (dissoc m (nth ks i)))))))]
+    0))
+
+(defn- open-sinks Map(Str Bool) []
+  (let [m (deref LEGACY-SINKS) ks (keys m)]
+    (loop [i 0 acc: Map(Str Bool) {}]
+      (if (>= i (count ks)) acc (recur (+ i 1) (if (hm/sink-open? (get! m (nth ks i))) (assoc acc (nth ks i) true) acc))))))
+
+(defn- sweep-sessions Int []
+  (let [full (> (count (deref SESSIONS)) SESSIONS-MAX)
+        ks (stale-sessions (deref SEEN) (open-sinks) (epoch-ms) (if full (quot (* SESSIONS-MAX 9) 10) SESSIONS-MAX))]
+    (if (= (count ks) 0) 0 (drop-sessions ks))))
+
+(defn- session-ver Vec(Str) [srv: &Server sid: &Str]
+  (let [m (deref SESSIONS) k (skey srv sid) now (epoch-ms)]
+    (if (not (contains? m k)) []
+      (let [sn (deref SEEN)]
+        (if (and (contains? sn k) (expired? (get! sn k) now) (not (contains? (open-sinks) k)))
+          (let [z (drop-sessions [(str k)])] [])
+          (let [z (swap! SEEN (fn Map(Str Seen) [o: Map(Str Seen)] (if (contains? o k) (assoc o k (->Seen now (:idle (get! o k)))) o)))]
+            [(get! m k)]))))))
+
+(defn- open-session-as Str [srv: &Server sid: &Str ver: &Str]
+  (let [k (skey srv sid)
+        fresh (not (contains? (deref SESSIONS) k))
+        z (swap! SESSIONS (fn Map(Str Str) [o: Map(Str Str)] (assoc o k (str ver))))
+        z1 (swap! SEEN (fn Map(Str Seen) [o: Map(Str Seen)] (assoc o k (->Seen (epoch-ms) (:idle-ms srv)))))
+        z2 (if (and fresh (or (> (count (deref SESSIONS)) SESSIONS-MAX) (= (mod (count (deref SESSIONS)) 256) 0))) (sweep-sessions) 0)]
+    sid))
+
+(defn new-sid Str [] (misc/uuid4))
+
+(defn- open-session Str [srv: &Server ver: &Str] (open-session-as srv (misc/uuid4) ver))
+
+(defn- close-session Int [srv: &Server sid: &Str]
+  (let [k (skey srv sid) z (swap! SESSIONS (fn Map(Str Str) [o: Map(Str Str)] (dissoc o k))) z1 (swap! SEEN (fn Map(Str Seen) [o: Map(Str Seen)] (dissoc o k)))] 0))
+
+(def SRC-REDACTED "REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled)")
+
+(defn- has-token? Bool [accept: &Str tok: &Str] (str/includes? accept tok))
+
+(defn- first-nonspace Int [s: &Str]
+  (loop [i 0] (if (>= i (count s)) -1 (let [c (nth s i)] (if (or (= c 32) (= c 9) (= c 10) (= c 13)) (recur (+ i 1)) i)))))
+
+(defn- parse-fail Str [body: &Str]
+  (let [i (first-nonspace body)]
+    (cond
+      (< i 0) (str "No content to map due to end-of-input\n at [Source: " SRC-REDACTED "; line: 1]")
+      (= (nth body i) 91)
+      (str "Cannot deserialize value of type `java.util.HashMap<java.lang.String,java.lang.Object>` from Array value (token `JsonToken.START_ARRAY`)\n at [Source: "
+           SRC-REDACTED "; line: 1, column: " (+ i 1) "]")
+      (and (= (nth body i) 123) (< (+ i 1) (count body)) (not= (nth body (+ i 1)) 34) (not= (nth body (+ i 1)) 125))
+      (str "Unexpected character ('" (subs body (+ i 1) (+ i 2)) "' (code " (nth body (+ i 1)) ")): was expecting double-quote to start field name\n at [Source: "
+           SRC-REDACTED "; line: 1, column: " (+ i 2) "]")
+      :else (str "Unexpected end-of-input\n at [Source: " SRC-REDACTED "; line: 1]"))))
+
+(defn- field-val Vec(v/Val) [fs: &Vec(v/Field) k: &Str] (v/obj-get fs k))
+
+(defn- vstr Str [x: &v/Val] (match (v/unmeta x) (v/VStr s) (str s) _ ""))
+
+(defn- id-text Str [fs: &Vec(v/Field)]
+  (let [r (field-val fs "id")]
+    (if (= (count r) 0) ""
+      (match (v/unmeta (nth r 0))
+        (v/VStr s) (jstr s)
+        (v/VInt i) (str i)
+        (v/VNum n) (num/to-string n)
+        _ ""))))
+
+(defn- request-id-str Str [fs: &Vec(v/Field)]
+  (let [r (field-val fs "id")]
+    (if (= (count r) 0) ""
+      (match (v/unmeta (nth r 0))
+        (v/VStr s) (str s)
+        (v/VInt i) (str i)
+        (v/VNum n) (num/to-string n)
+        _ ""))))
+
+(defn- obj-fields Vec(v/Field) [x: &v/Val] (match (v/unmeta x) (v/VObj fs) fs _ (let [e: Vec(v/Field) []] e)))
+
+(def CAPS "{\"experimental\":{},\"logging\":{},\"prompts\":{\"listChanged\":false},\"resources\":{\"subscribe\":false,\"listChanged\":false},\"tools\":{\"listChanged\":false}}")
+
+(defn- chosen-version Str [asked: &Str]
+  (if (loop [i 0] (if (>= i (count VERSIONS)) false (if (= (nth VERSIONS i) asked) true (recur (+ i 1))))) (str asked) LATEST))
+
+(defn- tools-list-json Str [srv: &Server]
+  (let [ts (:tools srv)]
+    (loop [i 0 out "{\"tools\":["]
+      (if (>= i (count ts)) (str out "]}")
+        (let [t (nth ts i)
+              [s se] (if (= (:schema t) "") (values (v/->VObj []) "") (json/read (:schema t)))]
+          (recur (+ i 1) (str out (if (= i 0) "" ",") "{\"name\":" (jstr (:name t)) ",\"description\":" (jstr (:desc t))
+                              ",\"inputSchema\":" (if (= se "") (compact s) "{}") "}")))))))
+
+(defn- tool-index Vec(Int) [srv: &Server name: &Str]
+  (let [ts (:tools srv)] (loop [i 0] (if (>= i (count ts)) [] (if (= (:name (nth ts i)) name) [i] (recur (+ i 1)))))))
+
+(defn- args-mismatch Str [x: &v/Val cls: &Str]
+  (let [tail "\n at [Source: UNKNOWN; byte offset: #UNKNOWN] (through reference chain: io.modelcontextprotocol.spec.McpSchema$"
+        what (match (v/unmeta x)
+               (v/VArr xs) "Cannot deserialize value of type `java.util.LinkedHashMap<java.lang.String,java.lang.Object>` from Array value (token `JsonToken.START_ARRAY`)"
+               (v/VStr s) (str "Cannot construct instance of `java.util.LinkedHashMap` (although at least one Creator exists): no String-argument constructor/factory method to deserialize from String value ('" s "')")
+               (v/VInt i) "Cannot deserialize value of type `java.util.LinkedHashMap<java.lang.String,java.lang.Object>` from Integer value (token `JsonToken.VALUE_NUMBER_INT`)"
+               (v/VNum n) "Cannot deserialize value of type `java.util.LinkedHashMap<java.lang.String,java.lang.Object>` from Floating-point value (token `JsonToken.VALUE_NUMBER_FLOAT`)"
+               (v/VBool b) (str "Cannot deserialize value of type `java.util.LinkedHashMap<java.lang.String,java.lang.Object>` from Boolean value (token `JsonToken." (if b "VALUE_TRUE" "VALUE_FALSE") "`)")
+               _ "")
+        msg (str what tail cls "[\"arguments\"])")]
+    msg))
+
+(defn- done Step [a: Answer] (->Step "done" a 0 (v/null-v) "" "" "" ""))
+
+(defn- begin-call Step [srv: &Server params: &Vec(v/Field) has-params: Bool id: &Str rid: &Str sid: &Str ver: &Str]
+  (let [dummy 0]
+    (cond
+      (not has-params)
+      (done (err-ans srv sid ver id -32603 "Cannot invoke \"io.modelcontextprotocol.spec.McpSchema$CallToolRequest.name()\" because \"callToolRequest\" is null"
+                 "NullPointerException: Cannot invoke \"io.modelcontextprotocol.spec.McpSchema$CallToolRequest.name()\" because \"callToolRequest\" is null"))
+      :else
+      (let [nm (field-val params "name")
+            ar (field-val params "arguments")
+            bad (if (and (> (count ar) 0) (not (v/null? (nth ar 0))))
+                  (match (v/unmeta (nth ar 0)) (v/VObj fs) "" _ (args-mismatch (nth ar 0) "CallToolRequest"))
+                  "")]
+        (cond
+          (or (= (count nm) 0) (v/null? (nth nm 0)))
+          (done (err-ans srv sid ver id -32603 "Cannot invoke \"String.equals(Object)\" because the return value of \"io.modelcontextprotocol.spec.McpSchema$CallToolRequest.name()\" is null"
+                     "NullPointerException: Cannot invoke \"String.equals(Object)\" because the return value of \"io.modelcontextprotocol.spec.McpSchema$CallToolRequest.name()\" is null"))
+          (not= bad "") (done (err-ans srv sid ver id -32603 bad (str "IllegalArgumentException: " bad "\n  Caused by: MismatchedInputException: " bad)))
+          :else
+          (let [name (vstr (nth nm 0)) ti (tool-index srv name)]
+            (cond
+              (= (count ti) 0) (done (err-ans srv sid ver id -32602 "Unknown tool: invalid_tool_name" (str "Tool not found: " name)))
+              (or (= (count ar) 0) (v/null? (nth ar 0))) (done (err-ans srv sid ver id -32602 "Invalid tool parameters: Parameters cannot be null" ""))
+              :else
+              (let [t (nth (:tools srv) (nth ti 0))
+                    [s se] (if (= (:schema t) "") (values (v/->VObj []) "") (json/read (:schema t)))
+                    errs (if (= se "") (sch/validate s (nth ar 0)) [])]
+                (if (> (count errs) 0)
+                  (done (err-ans srv sid ver id -32602 (str "Invalid tool parameters: " (join-semi errs)) ""))
+                  (->Step "call" (plain 0 "") (nth ti 0) (nth ar 0) id rid sid ver))))))))))
+
+(defn- join-semi Str [xs: &Vec(Str)]
+  (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (if (= i 0) (str (nth xs i)) (str out "; " (nth xs i)))))))
+
+(defn- npe-ans Answer [srv: &Server sid: &Str ver: &Str id: &Str msg: &Str]
+  (err-ans srv sid ver id -32603 msg (str "NullPointerException: " msg)))
+
+(defn- vtext Str [x: &v/Val] (match (v/unmeta x) (v/VStr s) (str s) (v/VInt i) (str i) _ (compact x)))
+
+(defn- resources-list-json Str [srv: &Server]
+  (let [rs (:resources srv)]
+    (loop [i 0 out "{\"resources\":["]
+      (if (>= i (count rs)) (str out "]}")
+        (let [r (nth rs i)]
+          (recur (+ i 1) (str out (if (= i 0) "" ",") "{\"uri\":" (jstr (:uri r)) ",\"name\":" (jstr (:name r))
+                              (if (= (:desc r) "") "" (str ",\"description\":" (jstr (:desc r))))
+                              (if (= (:mime r) "") "" (str ",\"mimeType\":" (jstr (:mime r)))) "}")))))))
+
+(defn- pargs-json Str [as: &Vec(PArg)]
+  (loop [i 0 out "["]
+    (if (>= i (count as)) (str out "]")
+      (let [a (nth as i)]
+        (recur (+ i 1) (str out (if (= i 0) "" ",") "{\"name\":" (jstr (:name a))
+                            (if (= (:desc a) "") "" (str ",\"description\":" (jstr (:desc a))))
+                            ",\"required\":" (if (:required a) "true" "false") "}"))))))
+
+(defn- prompts-list-json Str [srv: &Server]
+  (let [ps (:prompts srv)]
+    (loop [i 0 out "{\"prompts\":["]
+      (if (>= i (count ps)) (str out "]}")
+        (let [p (nth ps i)]
+          (recur (+ i 1) (str out (if (= i 0) "" ",") "{\"name\":" (jstr (:name p))
+                              (if (= (:title p) "") "" (str ",\"title\":" (jstr (:title p))))
+                              (if (= (:desc p) "") "" (str ",\"description\":" (jstr (:desc p))))
+                              ",\"arguments\":" (pargs-json (:args p)) "}")))))))
+
+(defn- resource-index Vec(Int) [srv: &Server uri: &Str]
+  (let [rs (:resources srv)] (loop [i 0] (if (>= i (count rs)) [] (if (= (:uri (nth rs i)) uri) [i] (recur (+ i 1)))))))
+
+(defn- prompt-index Vec(Int) [srv: &Server name: &Str]
+  (let [ps (:prompts srv)] (loop [i 0] (if (>= i (count ps)) [] (if (= (:name (nth ps i)) name) [i] (recur (+ i 1)))))))
+
+(defn- begin-read Step [srv: &Server params: &Vec(v/Field) has-params: Bool id: &Str rid: &Str sid: &Str ver: &Str]
+  (let [u (field-val params "uri")]
+    (cond
+      (not has-params)
+      (done (npe-ans srv sid ver id "Cannot invoke \"io.modelcontextprotocol.spec.McpSchema$ReadResourceRequest.uri()\" because \"resourceRequest\" is null"))
+      (or (= (count u) 0) (v/null? (nth u 0)))
+      (done (npe-ans srv sid ver id "Cannot invoke \"String.equals(Object)\" because \"uri\" is null"))
+      :else
+      (let [uri (vtext (nth u 0)) ri (resource-index srv uri)]
+        (if (= (count ri) 0)
+          (done (rpc-answer srv sid ver false (str "{\"jsonrpc\":\"2.0\"" (id-out id) ",\"error\":{\"code\":-32002,\"message\":\"Resource not found\",\"data\":{\"uri\":" (jstr uri) "}}}")))
+          (->Step "read" (plain 0 "") (nth ri 0) (v/null-v) id rid sid ver))))))
+
+(defn- missing-args Vec(Str) [as: &Vec(PArg) args: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count as)) acc
+      (let [a (nth as i) hit (field-val args (:name a))]
+        (recur (+ i 1) (if (and (:required a) (or (= (count hit) 0) (v/null? (nth hit 0)))) (conj acc (str (:name a))) acc))))))
+
+(defn- begin-get Step [srv: &Server params: &Vec(v/Field) has-params: Bool id: &Str rid: &Str sid: &Str ver: &Str]
+  (let [nm (field-val params "name")
+        ar (field-val params "arguments")
+        bad (if (and (> (count ar) 0) (not (v/null? (nth ar 0))))
+              (match (v/unmeta (nth ar 0)) (v/VObj fs) "" _ (args-mismatch (nth ar 0) "GetPromptRequest"))
+              "")]
+    (cond
+      (not has-params)
+      (done (npe-ans srv sid ver id "Cannot invoke \"io.modelcontextprotocol.spec.McpSchema$GetPromptRequest.name()\" because \"promptRequest\" is null"))
+      (not= bad "") (done (err-ans srv sid ver id -32603 bad (str "IllegalArgumentException: " bad "\n  Caused by: MismatchedInputException: " bad)))
+      (or (= (count nm) 0) (v/null? (nth nm 0)))
+      (done (npe-ans srv sid ver id "Cannot invoke \"Object.hashCode()\" because \"key\" is null"))
+      :else
+      (let [name (vtext (nth nm 0)) pi (prompt-index srv name)]
+        (if (= (count pi) 0)
+          (done (err-ans srv sid ver id -32602 "Invalid prompt name" (str "Prompt not found: " name)))
+          (let [p (nth (:prompts srv) (nth pi 0))
+                args (if (> (count ar) 0) (v/unmeta (nth ar 0)) (v/->VObj []))
+                miss (missing-args (:args p) (obj-fields args))]
+            (if (> (count miss) 0)
+              (done (err-ans srv sid ver id -32602 (str "Missing required prompt arguments: " (join-comma miss)) ""))
+              (->Step "prompt" (plain 0 "") (nth pi 0) (if (v/null? args) (v/->VObj []) args) id rid sid ver))))))))
+
+(defn- join-comma Str [xs: &Vec(Str)]
+  (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (if (= i 0) (str (nth xs i)) (str out ", " (nth xs i)))))))
+
+(defn- initialized Answer [srv: &Server sid: &Str ver: &Str id: &Str]
+  (let [r (str "{\"protocolVersion\":" (jstr ver) ",\"capabilities\":" CAPS ",\"serverInfo\":{\"name\":" (jstr (:sname srv))
+               ",\"version\":" (jstr (:sversion srv)) "}}")]
+    (rpc-answer srv sid ver true (result-body id r))))
+
+(defn- begin-post Step [srv: &Server accept: &Str sid: &Str body: &Str]
+  (let [need (if (:sse srv) "text/event-stream" "application/json")]
+    (if (not (has-token? accept need))
+      (done (plain 400 (error-body "" -32600 "Client MUST accept either application/json, text/event-stream or both mediaTypes" "")))
+      (let [[x xe] (json/read body)
+            fs (obj-fields x)
+            is-obj (and (= xe "") (match (v/unmeta x) (v/VObj f) true _ false))]
+        (if (not is-obj)
+          (done (plain 400 (error-body "" -32700 (parse-fail body) "")))
+          (let [meth (let [r (field-val fs "method")] (if (= (count r) 0) "" (vstr (nth r 0))))
+                id (id-text fs)
+                pr (field-val fs "params")
+                pf (if (> (count pr) 0) (obj-fields (nth pr 0)) (let [e: Vec(v/Field) []] e))]
+            (cond
+              (= meth "initialize")
+              (let [pv (field-val pf "protocolVersion")]
+                (if (or (= (count pv) 0) (v/null? (nth pv 0)))
+                  (done (with-defaults srv (->Answer 200 [(hdr "Content-Type" "application/json")] (str "{\"jsonrpc\":\"2.0\"" (id-out id) ",\"error\":{\"code\":-32603,\"data\":\"NullPointerException\"}}"))))
+                  (let [ver (chosen-version (vstr (nth pv 0)))]
+                    (cond
+                      (not= (:msgpath srv) "") (done (initialized srv (open-session-as srv sid ver) ver id))
+                      (> (count (:newsess srv)) 0) (->Step "session" (plain 0 "") (nth (:newsess srv) 0) (v/null-v) id "" (misc/uuid4) ver)
+                      :else (done (initialized srv (open-session srv ver) ver id))))))
+              (= sid "")
+              (let [a (if (= id "") (with-defaults srv (plain 202 ""))
+                        (->Answer 500 [(hdr "Content-Type" "application/json")] (error-body id -32000 "Cannot process message because this session hasn't been initialized yet" "")))]
+                (if (> (count (:newsess srv)) 0) (->Step "session" a (nth (:newsess srv) 0) (v/null-v) id "" (misc/uuid4) "")
+                  (done a)))
+              :else
+              (let [sv (session-ver srv sid)]
+                (if (= (count sv) 0)
+                  (done (->Answer 404 [(hdr "Mcp-Session-Id" sid)] (error-body "" -32603 "Session not found" "")))
+                  (let [ver (nth sv 0)]
+                    (cond
+                      (or (= id "") (= meth "")) (done (accepted srv ver))
+                      (and (not= (:msgpath srv) "") (= ver ""))
+                      (done (->Answer 500 [(hdr "Content-Type" "application/json")] (error-body id -32000 "Cannot process message because this session hasn't been initialized yet" "")))
+                      (= meth "ping") (done (ok-ans srv sid ver id "{}"))
+                      (= meth "logging/setLevel") (done (ok-ans srv sid ver id "{}"))
+                      (= meth "tools/list") (done (ok-ans srv sid ver id (tools-list-json srv)))
+                      (= meth "resources/list") (done (ok-ans srv sid ver id (resources-list-json srv)))
+                      (= meth "resources/templates/list") (done (ok-ans srv sid ver id "{\"resourceTemplates\":[]}"))
+                      (= meth "prompts/list") (done (ok-ans srv sid ver id (prompts-list-json srv)))
+                      (= meth "resources/read") (begin-read srv pf (> (count pr) 0) id (request-id-str fs) sid ver)
+                      (= meth "prompts/get") (begin-get srv pf (> (count pr) 0) id (request-id-str fs) sid ver)
+                      (= meth "tools/call") (begin-call srv pf (> (count pr) 0) id (request-id-str fs) sid ver)
+                      :else (done (err-ans srv sid ver id -32601 (str "Method not found: " meth) "")))))))))))))
+
+(defn begin Step [srv: &Server method: &Str headers: &Vec(hm/Header) body: &Str]
+  (let [sido (hm/header-of headers "mcp-session-id")
+        sid: Str (match sido (Some s) s (None) "")
+        has-sid (match sido (Some s) true (None) false)
+        accept: Str (match (hm/header-of headers "accept") (Some s) s (None) "")]
+    (cond
+      (= method "POST") (begin-post srv accept sid body)
+      (= method "DELETE")
+      (cond (not has-sid) (done (plain 400 "Invalid SessionId"))
+            (= (count (session-ver srv sid)) 0) (done (plain 404 ""))
+            :else (let [z (close-session srv sid)] (done (plain 202 ""))))
+      :else (done (plain 405 "")))))
+
+(defn- annotations Str [it: &Item]
+  (let [a (:audience it)
+        p (:priority it)]
+    (if (and (= (count a) 0) (= p "")) ""
+      (let [aud (if (= (count a) 0) "" (str "\"audience\":[" (loop [i 0 out ""] (if (>= i (count a)) out (recur (+ i 1) (str out (if (= i 0) "" ",") (jstr (str/lower-case (nth a i))))))) "]"))
+            pri (if (= p "") "" (str (if (= aud "") "" ",") "\"priority\":" p))]
+        (str ",\"annotations\":{" aud pri "}")))))
+
+(defn- item-json Str [it: &Item]
+  (let [k (:kind it) ann (annotations it)
+        mt (if (= (:mime it) "") "" (str ",\"mimeType\":" (jstr (:mime it))))]
+    (cond
+      (= k "text") (str "{\"type\":\"text\"" ann ",\"text\":" (jstr (:text it)) "}")
+      (= k "image") (str "{\"type\":\"image\"" ann ",\"data\":" (jstr (:data it)) mt "}")
+      (= k "res-text") (str "{\"type\":\"resource\"" ann ",\"resource\":{\"uri\":" (jstr (:uri it)) mt ",\"text\":" (jstr (:text it)) "}}")
+      :else (str "{\"type\":\"resource\"" ann ",\"resource\":{\"uri\":" (jstr (:uri it)) mt ",\"blob\":" (jstr (:data it)) "}}"))))
+
+(defn finish Answer [srv: &Server st: &Step items: &Vec(Item) is-error: Bool]
+  (let [ver (let [sv (session-ver srv (:sid st))] (if (= (count sv) 0) LATEST (nth sv 0)))
+        body (loop [i 0 out "{\"content\":["]
+               (if (>= i (count items)) (str out "],\"isError\":" (if is-error "true" "false") "}")
+                 (recur (+ i 1) (str out (if (= i 0) "" ",") (item-json (nth items i))))))]
+    (rpc-answer srv (:sid st) ver false (result-body (:id st) body))))
+
+(defn- ver-of Str [srv: &Server sid: &Str] (let [sv (session-ver srv sid)] (if (or (= (count sv) 0) (= (nth sv 0) "")) LATEST (nth sv 0))))
+
+(defn finish-resource Answer [srv: &Server st: &Step res: &Resource kind: &Str data: &Str]
+  (let [mt (if (= (:mime res) "") "" (str ",\"mimeType\":" (jstr (:mime res))))
+        body (str "{\"contents\":[{\"uri\":" (jstr (:uri res)) mt
+                  (if (= kind "text") (str ",\"text\":" (jstr data)) (str ",\"blob\":" (jstr (b64/encode data)))) "}]}")]
+    (rpc-answer srv (:sid st) (ver-of srv (:sid st)) false (result-body (:id st) body))))
+
+(defn- pmsg-json Str [m: &PMsg]
+  (let [it (:item m)]
+    (str "{\"role\":" (jstr (:role m)) ",\"content\":"
+         (if (= (:kind it) "link")
+           (str "{\"type\":\"resource_link\"" (annotations it) ",\"name\":" (jstr (:name m)) ",\"uri\":" (jstr (:uri it))
+                (if (= (:desc m) "") "" (str ",\"description\":" (jstr (:desc m))))
+                (if (= (:mime it) "") "" (str ",\"mimeType\":" (jstr (:mime it))))
+                (if (= (:size m) "") "" (str ",\"size\":" (:size m))) "}")
+           (item-json it))
+         "}")))
+
+(defn finish-prompt Answer [srv: &Server st: &Step p: &Prompt msgs: &Vec(PMsg)]
+  (let [body (loop [i 0 out (str "{" (if (= (:desc p) "") "" (str "\"description\":" (jstr (:desc p)) ",")) "\"messages\":[")]
+               (if (>= i (count msgs)) (str out "]}")
+                 (recur (+ i 1) (str out (if (= i 0) "" ",") (pmsg-json (nth msgs i))))))]
+    (rpc-answer srv (:sid st) (ver-of srv (:sid st)) false (result-body (:id st) body))))
+
+(defn finish-failure Answer [srv: &Server st: &Step desc: &Str]
+  (err-ans srv (:sid st) (ver-of srv (:sid st)) (:id st) -32603 desc (str "DefaultMuleException: " desc)))
+
+(defn request-attributes v/Val [sid: &Str rid: &Str headers: &Vec(hm/Header)]
+  (let [hs (loop [i 0 acc: Vec(v/Field) []]
+             (if (>= i (count headers)) acc
+               (recur (+ i 1) (conj acc (v/field (str/lower-case (:hd-name (nth headers i))) (v/->VStr (str (:hd-value (nth headers i)))))))))]
+    (v/->VMeta (v/->VObj [(v/field "clientCertificate" (v/null-v)) (v/field "sessionId" (v/->VStr (str sid)))
+                          (v/field "requestId" (v/->VStr (str rid)))
+                          (v/field "additionalProperties" (v/->VMeta (v/->VObj hs) [(v/field "class" (v/->VStr "java.util.HashMap"))]))])
+               [(v/field "class" (v/->VStr "com.mulesoft.connectors.mcp.api.server.RequestAttributes"))])))
+
+(defn args-payload v/Val [args: &v/Val]
+  (v/->VMeta (v/unmeta args) [(v/field "class" (v/->VStr "java.util.Collections$UnmodifiableMap"))]))
+
+(defn read-payload v/Val [uri: &Str]
+  (v/->VMeta (v/->VObj [(v/field "requestedUri" (v/->VStr (str uri)))])
+             [(v/field "class" (v/->VStr "com.mulesoft.connectors.mcp.api.server.resource.ResourceRequest"))]))
+
+(defn prompt-payload v/Val [name: &Str args: &v/Val]
+  (v/->VMeta (v/->VObj [(v/field "promptName" (v/->VStr (str name))) (v/field "arguments" (v/->VMeta (v/unmeta args) [(v/field "class" (v/->VStr "java.util.Collections$UnmodifiableMap"))]))])
+             [(v/field "class" (v/->VStr "com.mulesoft.connectors.mcp.api.server.prompt.PromptRequest"))]))
+
+(defn session-payload v/Val [sid: &Str headers: &Vec(hm/Header)]
+  (let [hs (loop [i 0 acc: Vec(v/Field) []]
+             (if (>= i (count headers)) acc
+               (recur (+ i 1) (conj acc (v/field (str/lower-case (:hd-name (nth headers i))) (v/->VStr (str (:hd-value (nth headers i)))))))))]
+    (v/->VMeta (v/->VObj [(v/field "clientCertificate" (v/null-v)) (v/field "sessionId" (v/->VStr (str sid)))
+                          (v/field "additionalProperties" (v/->VMeta (v/->VObj hs) [(v/field "class" (v/->VStr "java.util.HashMap"))]))])
+               [(v/field "class" (v/->VStr "com.mulesoft.connectors.mcp.api.server.RequestAttributes"))])))
+
+(defn finish-session Answer [srv: &Server st: &Step]
+  (cond
+    (not= (:status (:answer st)) 0) (:answer st)
+    (not= (:msgpath srv) "") (->Answer 0 (let [h: Vec(hm/Header) []] h) "")
+    :else (let [sid (open-session-as srv (:sid st) (:ver st))] (initialized srv sid (:ver st) (:id st)))))
+
+(defn reject-answer Answer [status: Int headers: Vec(hm/Header) body: Str] (->Answer status headers body))
+
+(defn session-failure Answer [desc: &Str]
+  (->Answer 500 (let [h: Vec(hm/Header) [] ] h) (str "org.mule.runtime.api.exception.DefaultMuleException: " desc)))
+
+(def LEGACY-SINKS: Atom(Map(Str hm/Sink)) (atom (let [m: Map(Str hm/Sink) {}] m)))
+
+(defn session-ver-of Vec(Str) [srv: &Server sid: &Str] (session-ver srv sid))
+
+(defn- has-sink Bool [srv: &Server sid: &Str]
+  (let [m (deref LEGACY-SINKS) k (skey srv sid)] (and (contains? m k) (hm/sink-open? (get! m k)))))
+
+(defn legacy-connect Values(hm/Response Str) [srv: &Server] (legacy-connect-as srv (misc/uuid4)))
+
+(defn legacy-session Step [srv: &Server sid: &Str]
+  (->Step "session" (plain 0 "") (nth (:newsess srv) 0) (v/null-v) "" "" (str sid) ""))
+
+(defn legacy-connect-as Values(hm/Response Str) [srv: &Server sid: &Str]
+  (let [hs0 [(hdr "Content-Type" "text/event-stream") (hdr "Cache-Control" "no-cache, no-store, max-age=0, must-revalidate")
+             (hdr "Pragma" "no-cache") (hdr "Access-Control-Allow-Origin" "*")]
+        hs (loop [i 0 acc hs0] (if (>= i (count (:sse-hdrs srv))) acc (recur (+ i 1) (conj acc (nth (:sse-hdrs srv) i)))))
+        [resp sk] (hm/stream-response 200 hs)
+        z (open-session-as srv sid "")
+        k (skey srv sid)
+        z1 (swap! LEGACY-SINKS (fn Map(Str hm/Sink) [o: Map(Str hm/Sink)] (assoc o k sk)))
+        e (hm/sink-write sk (str "event: endpoint\ndata: " (:msgpath srv) "?sessionId=" sid "\n\n"))]
+    (values resp sid)))
+
+(defn- message? Bool [body: &Str]
+  (let [[x e] (json/read body)
+        fs (obj-fields x)
+        is-obj (and (= e "") (match (v/unmeta x) (v/VObj f) true _ false))]
+    (and is-obj (> (count (field-val fs "jsonrpc")) 0)
+         (or (> (count (field-val fs "method")) 0) (> (count (field-val fs "result")) 0) (> (count (field-val fs "error")) 0)))))
+
+(defn- accepted-legacy Answer [srv: &Server sid: &Str]
+  (->Answer 202 (conj (:headers srv) (hdr "Mcp-Protocol-Version" (ver-of srv sid))) "Accepted"))
+
+(defn legacy-reply Answer [srv: &Server sid: &Str a: Answer]
+  (cond
+    (= (:status a) 200)
+    (let [m (deref LEGACY-SINKS) k (skey srv sid)]
+      (if (not (contains? m k)) (plain 503 (str "No active SSE connection for sessionId: " sid))
+        (let [e (hm/sink-write (get! m k) (:body a))]
+          (accepted-legacy srv sid))))
+    (= (:status a) 202) (accepted-legacy srv sid)
+    :else a))
+
+(defn legacy-begin Step [srv: &Server method: &Str sid: &Str ctype: &Str body: &Str]
+  (cond
+    (not= method "POST") (done (->Answer 405 [(hdr "Content-Type" "text/plain")] (str "Method not allowed for endpoint: " (:msgpath srv))))
+    (= sid "") (done (plain 400 "Missing session id"))
+    (not (str/starts-with? (str/lower-case ctype) "application/json")) (done (plain 400 (str "Unsupported content type: " (if (= ctype "") "null" ctype))))
+    (or (= (count (session-ver srv sid)) 0) (not (has-sink srv sid))) (done (plain 503 (str "No active SSE connection for sessionId: " sid)))
+    (not (message? body)) (done (plain 400 "Invalid message format"))
+    :else
+    (let [st (begin-post srv "text/event-stream" sid body)]
+      (if (= (:kind st) "done") (assoc st :answer (legacy-reply srv sid (:answer st))) st))))
+
+(def ROUTED ["tool-listener" "resource-listener" "prompt-listener" "on-new-session-listener"])
+
+(defn- ipv4-loopback? Bool [h: &Str]
+  (let [ps (str/split h ".")]
+    (and (= (count ps) 4) (= (nth ps 0) "127")
+         (loop [i 0] (if (>= i 4) true
+                       (let [p (nth ps i) [n e] (parse-long p)]
+                         (if (and (= e "") (> (count p) 0) (<= (count p) 3) (>= n 0) (<= n 255)) (recur (+ i 1)) false)))))))
+
+(defn- origin-host Str [o: &Str]
+  (let [k (str/index-of o "://")]
+    (if (< k 0) ""
+      (let [rest (subs o (+ k 3) (count o))
+            end (if (str/starts-with? rest "[")
+                  (let [b (str/index-of rest "]")] (if (< b 0) (count rest) (+ b 1)))
+                  (let [c (str/index-of rest ":") sl (str/index-of rest "/")]
+                    (cond (and (>= c 0) (or (< sl 0) (< c sl))) c (>= sl 0) sl :else (count rest))))]
+        (str/lower-case (subs rest 0 end))))))
+
+(defn origin-ok? Bool [headers: &Vec(hm/Header) allowed: &Vec(Str)]
+  (match (hm/header-of headers "origin")
+    (None) true
+    (Some o) (let [h (origin-host o)]
+               (or (= h "localhost") (= h "[::1]") (ipv4-loopback? h)
+                   (loop [i 0] (if (>= i (count allowed)) false (if (or (= (nth allowed i) "*") (= (nth allowed i) o)) true (recur (+ i 1)))))))))
+
+(defn origin-refused Answer [o: &Str]
+  (->Answer 403 [(hdr "Content-Type" "application/json")]
+            (str "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":" (jstr (str "Origin not allowed: " o " (mulay.mcp.allowedOrigins)")) "}}")))
+
+(defn- allowed-origins Vec(Str) [app: &m/App]
+  (let [ps (str/split (conn/prop-lit app "mulay.mcp.allowedOrigins" "") ",")]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count ps)) acc (let [t (str/trim (nth ps i))] (recur (+ i 1) (if (= t "") acc (conj acc t))))))))
+
+(defrecord SrvEnv [h: conn/Host flows: Vec(m/Flow) origins: Vec(Str)])
+
+(defn server-mounts Values(Vec(conn/Mount) Vec(Str)) [app: m/App]
+  (let [ss (servers app)
+        pre (check app)
+        flows (:flows app)
+        origins (allowed-origins app)]
+    (if (> (count pre) 0) (let [z: Vec(conn/Mount) []] (values z pre))
+      (loop [i 0 acc: Vec(conn/Mount) []]
+        (if (>= i (count ss)) (let [e: Vec(Str) []] (values acc e))
+          (let [s (nth ss i)
+                mp (:path s)
+                mg (:msgpath s)]
+            (if (not= mg "")
+              (recur (+ i 1) (conj (conj acc (conn/->Mount (:listener s) mp [] true false
+                                                           (fn hm/Response [h: conn/Host at: conn/At q: hm/Request] (srv-respond (->SrvEnv h flows origins) s mp q))))
+                                   (conn/->Mount (:listener s) mg ["POST"] true false
+                                                 (fn hm/Response [h: conn/Host at: conn/At q: hm/Request] (srv-respond (->SrvEnv h flows origins) s mg q)))))
+              (recur (+ i 1) (conj acc (conn/->Mount (:listener s) mp ["POST" "GET" "DELETE"] true false
+                                                     (fn hm/Response [h: conn/Host at: conn/At q: hm/Request] (srv-respond (->SrvEnv h flows origins) s mp q))))))))))))
+
+(defn- srv-sse-open hm/Response [c: &SrvEnv s: &Server req: &hm/Request]
+  (let [sid (new-sid)]
+    (if (= (count (:newsess s)) 0)
+      (let [[resp x] (legacy-connect-as s sid)] resp)
+      (let [a (srv-session-answer c s (legacy-session s sid) req)]
+        (if (= (:status a) 0)
+          (let [[resp x] (legacy-connect-as s sid)] resp)
+          (srv-http (reject-answer (:status a) (let [h: Vec(hm/Header) []] h) "")))))))
+
+(defn- srv-respond hm/Response [c: &SrvEnv s: &Server path: &Str req: &hm/Request]
+  (let [dummy 0]
+    (cond
+      (not (origin-ok? (:headers req) (:origins c))) (srv-http (origin-refused (hm/header req "origin" "")))
+      (and (not= (:msgpath s) "") (not= path (:msgpath s))) (srv-sse-open c s req)
+      (not= (:msgpath s) "")
+      (srv-dispatch c s req (legacy-begin s (:method req) (hx/qparam (:uri req) "sessionId") (hm/header req "content-type" "") (:body req)))
+      :else (srv-dispatch c s req (begin s (:method req) (:headers req) (:body req))))))
+
+(defn- srv-dispatch hm/Response [c: &SrvEnv s: &Server req: &hm/Request st: Step]
+  (let [dummy 0]
+    (cond (= (:kind st) "call") (srv-call c s st req)
+          (= (:kind st) "read") (srv-read c s st req)
+          (= (:kind st) "prompt") (srv-prompt c s st req)
+          (= (:kind st) "session") (srv-session c s st req)
+          :else (srv-http (:answer st)))))
+
+(defn- srv-out hm/Response [s: &Server st: &Step a: Answer]
+  (if (= (:msgpath s) "") (srv-http a) (srv-http (legacy-reply s (:sid st) a))))
+
+(defn- srv-http hm/Response [a: &Answer]
+  (assoc (hm/response (:status a) (:headers a) (:body a) false) :reason ""))
+
+(defn- srv-call hm/Response [c: &SrvEnv s: &Server st: &Step req: &hm/Request]
+  (let [tool (nth (:tools s) (:tool st))
+        f (nth (:flows c) (:flow tool))
+        attrs (request-attributes (:sid st) (:rid st) (:headers req))
+        e0 (ev/new-event (ev/tv-val (args-payload (:args st)) ev/JAVA) (ev/tv-val attrs ev/ANY) (conn/corr-id (:flow tool)) (:name f))
+        [e x] ((:run (:h c)) (:flow tool) e0)
+        failed (> (count x) 0)
+        e1 (if failed (ev/with-error e x) e)
+        ch (match (nth (:source f) 0) (m/SrcConnector cn nm cref ps ch ex sch loc) ch _ [])
+        exs (match (nth (:source f) 0) (m/SrcConnector cn nm cref ps ch ex sch loc) ex _ [])
+        section (if failed "on-error-responses" "responses")
+        [items ierr] (srv-items c ch exs section e1)]
+    (if (and failed (= (count (conn/child-elem ch "on-error-responses")) 0))
+      (srv-out s st (finish s st [(->Item "text" (:description (nth x 0)) "" "" "" [] "")] true))
+      (if (not= ierr "")
+        (srv-out s st (finish s st [(->Item "text" ierr "" "" "" [] "")] true))
+        (srv-out s st (finish s st items failed))))))
+
+(defn- srv-read hm/Response [c: &SrvEnv s: &Server st: &Step req: &hm/Request]
+  (let [res (nth (:resources s) (:tool st))
+        f (nth (:flows c) (:flow res))
+        attrs (request-attributes (:sid st) (:rid st) (:headers req))
+        e0 (ev/new-event (ev/tv-val (read-payload (:uri res)) ev/JAVA) (ev/tv-val attrs ev/ANY) (conn/corr-id (:flow res)) (:name f))
+        [e x] ((:run (:h c)) (:flow res) e0)]
+    (if (> (count x) 0)
+      (srv-out s st (finish-failure s st (:description (nth x 0))))
+      (let [ch (srv-src-children f)
+            exs (srv-src-exprs f)
+            box (conn/child-elem ch "resource-listener-content")
+            kids (if (= (count box) 0) (let [z: Vec(xml/XNode) []] z) (xml/child-elems (nth box 0)))]
+        (if (= (count kids) 0)
+          (srv-out s st (finish-failure s st "resource-listener-content is empty"))
+          (let [k (nth kids 0)
+                local (xml/elem-local k)
+                blob (= local "blob-resource")
+                path (str "resource-listener-content/" local)
+                [d de] (srv-text c k path (if blob "blob" "text") exs e "")]
+            (if (not= de "") (srv-out s st (finish-failure s st de))
+              (srv-out s st (finish-resource s st res (if blob "blob" "text") d)))))))))
+
+(defn- srv-src-children Vec(xml/XNode) [f: &m/Flow] (match (nth (:source f) 0) (m/SrcConnector cn nm cref ps ch ex sch loc) ch _ (let [z: Vec(xml/XNode) []] z)))
+(defn- srv-src-exprs Vec(m/Param) [f: &m/Flow] (match (nth (:source f) 0) (m/SrcConnector cn nm cref ps ch ex sch loc) ex _ (let [z: Vec(m/Param) []] z)))
+
+(defn- srv-session hm/Response [c: &SrvEnv s: &Server st: &Step req: &hm/Request] (srv-http (srv-session-answer c s st req)))
+
+(defn- srv-session-answer Answer [c: &SrvEnv s: &Server st: &Step req: &hm/Request]
+  (let [f (nth (:flows c) (:tool st))
+        e0 (ev/new-event (ev/tv-val (session-payload (:sid st) (:headers req)) ev/JAVA) (ev/tv-null) (conn/corr-id (:tool st)) (:name f))
+        [e x] ((:run (:h c)) (:tool st) e0)]
+    (if (> (count x) 0)
+      (session-failure (:description (nth x 0)))
+      (let [rj (conn/child-elem (srv-src-children f) "rejection")]
+        (if (= (count rj) 0) (finish-session s st)
+          (srv-reject c s st (nth rj 0) (srv-src-exprs f) e))))))
+
+(defn- srv-reject Answer [c: &SrvEnv s: &Server st: &Step r: &xml/XNode exs: &Vec(m/Param) e: ev/Event]
+  (let [[codes ce] (srv-attr c r "rejection" "rejectWithStatusCode" exs e)
+        [msgs me] (srv-attr c r "rejection" "rejectWithMessage" exs e)
+        [hs he] (srv-reject-headers c r exs e)]
+    (cond
+      (not= ce "") (session-failure ce)
+      (not= me "") (session-failure me)
+      (not= he "") (session-failure he)
+      (or (= (count codes) 0) (v/null? (:val (nth codes 0)))) (finish-session s st)
+      :else
+      (let [[ct cerr] (srv-tv-text (nth codes 0))
+            [code perr] (parse-long ct)
+            [body be] (if (or (= (count msgs) 0) (v/null? (:val (nth msgs 0)))) (values "null" "") (srv-tv-text (nth msgs 0)))]
+        (if (not= perr "") (session-failure (str "Cannot convert '" ct "' to an Integer"))
+          (reject-answer code hs body))))))
+
+(defn- srv-reject-headers Values(Vec(hm/Header) Str) [c: &SrvEnv r: &xml/XNode exs: &Vec(m/Param) e: ev/Event]
+  (let [box (conn/child-elem (xml/child-elems r) "reject-with-headers")
+        kids (if (= (count box) 0) (let [z: Vec(xml/XNode) []] z) (xml/child-elems (nth box 0)))
+        none: Vec(hm/Header) []]
+    (loop [i 0 acc none]
+      (if (>= i (count kids)) (values acc "")
+        (let [k (nth kids i)
+              local (xml/elem-local k)
+              dup (loop [j 0 n 0] (if (>= j (count kids)) (> n 1) (recur (+ j 1) (if (= (xml/elem-local (nth kids j)) local) (+ n 1) n))))
+              idx (loop [j 0 n 0] (if (>= j i) n (recur (+ j 1) (if (= (xml/elem-local (nth kids j)) local) (+ n 1) n))))
+              path (str "rejection/reject-with-headers/" local (if dup (str "[" idx "]") ""))
+              [kk ke] (srv-text c k path "key" exs e "")
+              [vv ve] (srv-text c k path "value" exs e "")]
+          (if (not= ke "") (values none ke)
+            (if (not= ve "") (values none ve)
+              (recur (+ i 1) (conj acc (hm/->Header kk vv))))))))))
+
+(defn- srv-prompt hm/Response [c: &SrvEnv s: &Server st: &Step req: &hm/Request]
+  (let [p (nth (:prompts s) (:tool st))
+        f (nth (:flows c) (:flow p))
+        attrs (request-attributes (:sid st) (:rid st) (:headers req))
+        e0 (ev/new-event (ev/tv-val (prompt-payload (:name p) (:args st)) ev/JAVA) (ev/tv-val attrs ev/ANY) (conn/corr-id (:flow p)) (:name f))
+        [e x] ((:run (:h c)) (:flow p) e0)]
+    (if (> (count x) 0)
+      (srv-out s st (finish-failure s st (:description (nth x 0))))
+      (let [[ms me] (srv-messages c (srv-src-children f) (srv-src-exprs f) e)]
+        (if (not= me "") (srv-out s st (finish-failure s st me))
+          (srv-out s st (finish-prompt s st p ms)))))))
+
+(defn- srv-messages Values(Vec(PMsg) Str) [c: &SrvEnv ch: &Vec(xml/XNode) exs: &Vec(m/Param) e: ev/Event]
+  (let [box (conn/child-elem ch "messages")]
+    (if (= (count box) 0) (let [z: Vec(PMsg) []] (values z ""))
+      (let [kids (xml/child-elems (nth box 0))]
+        (loop [i 0 acc: Vec(PMsg) []]
+          (if (>= i (count kids)) (values acc "")
+            (let [k (nth kids i)
+                  local (xml/elem-local k)
+                  dup (loop [j 0 n 0] (if (>= j (count kids)) (> n 1) (recur (+ j 1) (if (= (xml/elem-local (nth kids j)) local) (+ n 1) n))))
+                  idx (loop [j 0 n 0] (if (>= j i) n (recur (+ j 1) (if (= (xml/elem-local (nth kids j)) local) (+ n 1) n))))
+                  path (str "messages/" local (if dup (str "[" idx "]") ""))
+                  [m me] (srv-pmsg c k path exs e)]
+              (if (not= me "") (let [z: Vec(PMsg) []] (values z me))
+                (recur (+ i 1) (conj acc m))))))))))
+
+(defn- srv-only-child Vec(xml/XNode) [k: &xml/XNode local: &Str]
+  (let [b (conn/child-elem (xml/child-elems k) local)]
+    (if (= (count b) 0) (let [z: Vec(xml/XNode) []] z)
+      (let [kids (xml/child-elems (nth b 0))] (if (= (count kids) 0) kids [(nth kids 0)])))))
+
+(defn- srv-pmsg Values(PMsg Str) [c: &SrvEnv k: &xml/XNode path: &Str exs: &Vec(m/Param) e: ev/Event]
+  (let [local (xml/elem-local k)
+        aud (let [a (conn/child-elem (xml/child-elems k) "audience")]
+              (if (= (count a) 0) (let [z: Vec(Str) []] z)
+                (loop [kids (xml/child-elems (nth a 0)) i 0 acc: Vec(Str) []]
+                  (if (>= i (count kids)) acc (recur kids (+ i 1) (conj acc (xml/attr (nth kids i) "" "value" "")))))))
+        [pri pe] (srv-text c k path "priority" exs e "")
+        [role re] (srv-text c k path "role" exs e "USER")
+        z0 (->PMsg (str/lower-case role) (->Item "text" "" "" "" "" aud pri) "" "" "")
+        item (->Item "text" "" "" "" "" aud pri)]
+    (cond
+      (not= pe "") (values z0 pe)
+      (not= re "") (values z0 re)
+      (= local "text-prompt-message-content")
+      (let [[t te] (srv-text c k path "text" exs e "")] (values (assoc z0 :item (assoc item :text t)) te))
+      (= local "image-prompt-message-content")
+      (let [[mt me] (srv-text c k path "mimeType" exs e "")
+            ic (srv-only-child k "image-data")]
+        (if (= (count ic) 0) (values z0 "image-data is required")
+          (let [ik (nth ic 0)
+                ip (str path "/image-data/" (xml/elem-local ik))]
+            (if (not= (xml/elem-local ik) "inline-image-data") (values z0 "file-image-data is not supported")
+              (let [[d de] (srv-text c ik ip "imageData" exs e "")]
+                (values (assoc z0 :item (assoc (assoc (assoc item :kind "image") :data (b64/encode d)) :mime mt)) (if (not= me "") me de)))))))
+      (= local "resource-link-prompt-message-content")
+      (let [[u ue] (srv-text c k path "uri" exs e "") [nm ne] (srv-text c k path "name" exs e "") [ds de] (srv-text c k path "description" exs e "")
+            [mt me] (srv-text c k path "mimeType" exs e "") [sz se] (srv-text c k path "size" exs e "")]
+        (values (->PMsg (str/lower-case role) (assoc (assoc (assoc item :kind "link") :uri u) :mime mt) nm ds sz)
+                (if (not= ue "") ue (if (not= ne "") ne (if (not= de "") de (if (not= me "") me se))))))
+      :else
+      (let [[u ue] (srv-text c k path "uri" exs e "") [mt me] (srv-text c k path "mimeType" exs e "")
+            rc (srv-only-child k "resource-content")]
+        (if (= (count rc) 0) (values z0 "resource-content is required")
+          (let [rk (nth rc 0)
+                blob (= (xml/elem-local rk) "blob-embedded-resource")
+                rp (str path "/resource-content/" (xml/elem-local rk))
+                [d de] (srv-text c rk rp (if blob "blob" "text") exs e "")]
+            (values (assoc z0 :item (let [base (assoc (assoc item :uri u) :mime mt)]
+                                      (if blob (assoc (assoc base :kind "res-blob") :data (b64/encode d)) (assoc (assoc base :kind "res-text") :text d))))
+                    (if (not= ue "") ue (if (not= me "") me de)))))))))
+
+(defn- srv-items Values(Vec(Item) Str) [c: &SrvEnv ch: &Vec(xml/XNode) exs: &Vec(m/Param) section: &Str e: ev/Event]
+  (let [sc (conn/child-elem ch section)]
+    (if (= (count sc) 0) (let [z: Vec(Item) []] (values z ""))
+      (let [kids (xml/child-elems (nth sc 0))]
+        (loop [i 0 acc: Vec(Item) []]
+          (if (>= i (count kids)) (values acc "")
+            (let [k (nth kids i)
+                  local (xml/elem-local k)
+                  dup (loop [j 0 n 0] (if (>= j (count kids)) (> n 1) (recur (+ j 1) (if (= (xml/elem-local (nth kids j)) local) (+ n 1) n))))
+                  idx (loop [j 0 n 0] (if (>= j i) n (recur (+ j 1) (if (= (xml/elem-local (nth kids j)) local) (+ n 1) n))))
+                  path (str section "/" local (if dup (str "[" idx "]") ""))
+                  [it ie] (srv-item c k path exs e)]
+              (if (not= ie "") (let [z: Vec(Item) []] (values z ie))
+                (recur (+ i 1) (conj acc it))))))))))
+
+(defn- srv-attr Values(Vec(ev/TV) Str) [c: &SrvEnv k: &xml/XNode path: &Str name: &Str exs: &Vec(m/Param) e: ev/Event]
+  (let [p (conn/param exs (str path "@" name))]
+    (if (> (count p) 0)
+      (let [[t e2 x] ((:eval-str (:h c)) (nth p 0) e)]
+        (if (> (count x) 0) (let [z: Vec(ev/TV) []] (values z (:description (nth x 0)))) (values [t] "")))
+      (if (not (xml/has-attr? k "" name)) (let [z: Vec(ev/TV) []] (values z ""))
+        (values [(ev/tv-val (v/->VStr (xml/attr k "" name "")) ev/ANY)] "")))))
+
+(defn- srv-text Values(Str Str) [c: &SrvEnv k: &xml/XNode path: &Str name: &Str exs: &Vec(m/Param) e: ev/Event default: Str]
+  (let [[ts te] (srv-attr c k path name exs e)]
+    (cond (not= te "") (values "" te)
+          (= (count ts) 0) (values default "")
+          :else (let [[b be] (srv-tv-text (nth ts 0))] (if (not= be "") (values "" be) (values b ""))))))
+
+(defn- srv-tv-text Values(Str Str) [t: &ev/TV]
+  (match (v/unmeta (:val t))
+    (v/VInt i) (values (str i) "")
+    (v/VNum n) (values (num/to-string n) "")
+    _ (ev/bytes t)))
+
+(defn- srv-item Values(Item Str) [c: &SrvEnv k: &xml/XNode path: &Str exs: &Vec(m/Param) e: ev/Event]
+  (let [local (xml/elem-local k)
+        aud (let [a (conn/child-elem (xml/child-elems k) "audience")]
+              (if (= (count a) 0) (let [z: Vec(Str) []] z)
+                (loop [kids (xml/child-elems (nth a 0)) i 0 acc: Vec(Str) []]
+                  (if (>= i (count kids)) acc (recur kids (+ i 1) (conj acc (xml/attr (nth kids i) "" "value" "")))))))
+        [pri pe] (srv-text c k path "priority" exs e "")
+        none: Vec(Item) []
+        z0 (->Item "text" "" "" "" "" aud pri)]
+    (cond
+      (not= pe "") (values z0 pe)
+      (= local "text-tool-response-content")
+      (let [[t te] (srv-text c k path "text" exs e "")] (values (assoc z0 :text t) te))
+      (= local "image-tool-response-content")
+      (let [[d de] (srv-text c k path "data" exs e "") [mt me] (srv-text c k path "mimeType" exs e "")]
+        (values (assoc (assoc (assoc z0 :kind "image") :data (b64/encode d)) :mime mt) (if (not= de "") de me)))
+      (= local "text-resource-tool-response-content")
+      (let [[u ue] (srv-text c k path "uri" exs e "") [mt me] (srv-text c k path "mimeType" exs e "text/plain") [t te] (srv-text c k path "text" exs e "")]
+        (values (assoc (assoc (assoc (assoc z0 :kind "res-text") :uri u) :mime mt) :text t) (if (not= ue "") ue (if (not= me "") me te))))
+      :else
+      (let [[u ue] (srv-text c k path "uri" exs e "") [mt me] (srv-text c k path "mimeType" exs e "") [d de] (srv-text c k path "blob" exs e "")]
+        (values (assoc (assoc (assoc (assoc z0 :kind "res-blob") :uri u) :mime mt) :data (b64/encode d)) (if (not= ue "") ue (if (not= me "") me de)))))))

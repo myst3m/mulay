@@ -1,0 +1,350 @@
+(ns mulay.dw.lib.url
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.lib.uni :as uni]))
+
+(def M "dw::core::URL")
+
+(defn- alnum? Bool [c: Int]
+  (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+
+(defn- in-set? Bool [c: Int set: &Str]
+  (loop [i 0] (if (>= i (count set)) false (if (= (nth set i) c) true (recur (+ i 1))))))
+
+(def COMPONENT-KEEP "-_.!~*'()")
+(def URI-KEEP "-_.!~*'();,/?:@&=+$#")
+
+(defn- pct Str [b: Int]
+  (let [d "0123456789ABCDEF" hi (bit-shift-right b 4) lo (bit-and b 15)]
+    (str "%" (subs d hi (+ hi 1)) (subs d lo (+ lo 1)))))
+
+(defn percent-encode Str [s0: &Str keep: &Str]
+  (let [s (uni/sanitize (str s0))]
+    (loop [i 0 out ""]
+      (if (>= i (count s)) out
+        (let [c (nth s i)]
+          (recur (+ i 1) (if (and (< c 0x80) (or (alnum? c) (in-set? c keep))) (str out (chr c)) (str out (pct c)))))))))
+
+(defn- hexv Int [c: Int]
+  (if (and (>= c 48) (<= c 57)) (- c 48)
+    (if (and (>= c 65) (<= c 70)) (- c 55)
+      (if (and (>= c 97) (<= c 102)) (- c 87) -1))))
+
+(defn url-decode Values(Str Bool) [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 out ""]
+      (if (>= i n) (values (uni/sanitize out) true)
+        (let [c (nth s i)]
+          (if (= c 43) (recur (+ i 1) (str out " "))
+            (if (not= c 37) (recur (+ i 1) (str out (chr c)))
+              (if (> (+ i 3) n) (values "" false)
+                (let [a (nth s (+ i 1)) b (hexv (nth s (+ i 2)))
+                      h (if (= a 43) 0 (hexv a))]
+                  (if (or (< h 0) (< b 0)) (values "" false)
+                    (recur (+ i 3) (str out (chr (+ (* h 16) b))))))))))))))
+
+(def MARK "-_.!~*'()")
+(def RESERVED ";/?:@&=+$,[]")
+
+(defn- cls? Bool [c: Int k: &Str]
+  (if (>= c 128) false
+    (if (= k "digit") (and (>= c 48) (<= c 57))
+      (if (= k "alnum") (alnum? c)
+        (if (= k "alnum-") (or (alnum? c) (= c 45))
+          (if (= k "scheme") (or (alnum? c) (in-set? c "+-."))
+            (let [unres (or (alnum? c) (in-set? c MARK))]
+              (if (= k "uric") (or unres (in-set? c RESERVED))
+                (if (= k "path") (or unres (in-set? c ":@&=+$,;/"))
+                  (if (= k "userinfo") (or unres (in-set? c ";:&=+$,"))
+                    (if (= k "reg") (or unres (in-set? c "$,;:@&=+"))
+                      (if (= k "server") (or unres (in-set? c ";:&=+$,") (in-set? c ".:@[]"))
+                        (if (= k "server%") (or unres (in-set? c ";:&=+$,") (in-set? c ".:@[]%"))
+                          false)))))))))))))
+
+(defn- escapes? Bool [k: &Str]
+  (or (= k "uric") (= k "path") (= k "userinfo") (= k "reg") (= k "server") (= k "server%")))
+
+(defn- hex? Bool [c: Int] (>= (hexv c) 0))
+
+(defn- scan-escape Values(Int Bool) [cs: &Vec(Int) p: Int n: Int]
+  (let [c (nth cs p)]
+    (if (= c 37)
+      (if (and (<= (+ p 3) n) (hex? (nth cs (+ p 1))) (hex? (nth cs (+ p 2)))) (values (+ p 3) false) (values p true))
+      (if (and (> c 128) (not (uni/space-char? c)) (not (and (>= c 0x80) (<= c 0x9F))))
+        (values (+ p 1) false)
+        (values p false)))))
+
+(defn- scan-cls Values(Int Bool) [cs: &Vec(Int) p0: Int n: Int k: &Str]
+  (loop [p p0]
+    (if (>= p n) (values p false)
+      (let [c (nth cs p)]
+        (if (cls? c k) (recur (+ p 1))
+          (if (escapes? k)
+            (let [[q bad] (scan-escape cs p n)]
+              (if bad (values p true) (if (> q p) (recur q) (values p false))))
+            (values p false)))))))
+
+(defn- scan-stop Int [cs: &Vec(Int) p0: Int n: Int err: &Str stop: &Str]
+  (loop [p p0]
+    (if (>= p n) p
+      (let [c (nth cs p)]
+        (if (and (< c 128) (in-set? c err)) -1
+          (if (and (< c 128) (in-set? c stop)) p (recur (+ p 1))))))))
+
+(defn- at? Bool [cs: &Vec(Int) p: Int n: Int c: Int] (and (< p n) (= (nth cs p) c)))
+
+(defn- all-cls? Bool [cs: &Vec(Int) p: Int q: Int k: &Str]
+  (let [[e bad] (scan-cls cs p q k)] (and (not bad) (= e q))))
+
+(defn- sub-cps Str [cs: &Vec(Int) p: Int q: Int]
+  (loop [i p out ""] (if (>= i q) out (recur (+ i 1) (str out (uni/encode (nth cs i)))))))
+
+(defrecord Uri [ok: Bool scheme: Str has-scheme: Bool ssp-opaque: Bool
+                authority: Str has-auth: Bool user: Str has-user: Bool host: Str has-host: Bool port: Int
+                path: Str has-path: Bool query: Str has-query: Bool fragment: Str has-frag: Bool])
+
+(defn- empty-uri Uri [] (->Uri true "" false false "" false "" false "" false -1 "" false "" false "" false))
+(defn- bad-uri Uri [] (assoc (empty-uri) :ok false))
+
+(defn- scan-byte Int [cs: &Vec(Int) p: Int m: Int]
+  (let [[q bad] (scan-cls cs p m "digit")]
+    (if (<= q p) q
+      (let [v (loop [i p acc 0] (if (>= i q) acc (recur (+ i 1) (if (> acc 1000) acc (+ (* acc 10) (- (nth cs i) 48))))))]
+        (if (> v 255) p q)))))
+
+(defn- scan-ipv4 Int [cs: &Vec(Int) start: Int n: Int]
+  (let [m (loop [p start] (if (and (< p n) (or (cls? (nth cs p) "digit") (= (nth cs p) 46))) (recur (+ p 1)) p))]
+    (if (<= m start) -1
+      (let [q1 (scan-byte cs start m)]
+        (if (<= q1 start) -2
+          (if (not (at? cs q1 m 46)) -2
+            (let [q2 (scan-byte cs (+ q1 1) m)]
+              (if (<= q2 (+ q1 1)) -2
+                (if (not (at? cs q2 m 46)) -2
+                  (let [q3 (scan-byte cs (+ q2 1) m)]
+                    (if (<= q3 (+ q2 1)) -2
+                      (if (not (at? cs q3 m 46)) -2
+                        (let [q4 (scan-byte cs (+ q3 1) m)]
+                          (if (<= q4 (+ q3 1)) -2
+                            (if (< q4 m) -2 q4)))))))))))))))
+
+(defn- parse-ipv4 Int [cs: &Vec(Int) start: Int n: Int]
+  (let [p (scan-ipv4 cs start n)]
+    (if (< p 0) -1
+      (if (and (> p start) (< p n) (not= (nth cs p) 58)) -1 p))))
+
+(defn- alpha? Bool [c: Int] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+
+(defn- parse-hostname Values(Int Bool Bool) [cs: &Vec(Int) start: Int n: Int skip: Bool]
+  (let [[p l bad]
+        (loop [p start l -1]
+          (let [[q b0] (scan-cls cs p n "alnum")]
+            (if (<= q p) (values p l false)
+              (let [[q2 b1] (scan-cls cs q n "alnum-")]
+                (if (and (> q2 q) (= (nth cs (- q2 1)) 45)) (values p l true)
+                  (let [p2 (if (> q2 q) q2 q)]
+                    (if (at? cs p2 n 46)
+                      (if (< (+ p2 1) n) (recur (+ p2 1) p) (values (+ p2 1) p false))
+                      (values p2 p false))))))))]
+    (if bad (values p false true)
+      (if (and (< p n) (not (at? cs p n 58)))
+        (if skip (values p false false) (values p false true))
+        (if (< l 0) (values p false true)
+          (if (and (> l start) (not (alpha? (nth cs l)))) (values p false true)
+            (values p true false)))))))
+
+(defn- scan-hex-end Int [cs: &Vec(Int) p: Int n: Int]
+  (loop [q p] (if (and (< q n) (hex? (nth cs q))) (recur (+ q 1)) q)))
+
+(defn- scan-hex-seq Values(Int Int Bool) [cs: &Vec(Int) start: Int n: Int cnt0: Int]
+  (let [q (scan-hex-end cs start n)]
+    (if (or (<= q start) (at? cs q n 46)) (values -1 cnt0 false)
+      (if (> q (+ start 4)) (values start cnt0 true)
+        (loop [p q cnt (+ cnt0 2)]
+          (if (or (>= p n) (not (at? cs p n 58)) (at? cs (+ p 1) n 58)) (values p cnt false)
+            (let [p1 (+ p 1) q1 (scan-hex-end cs p1 n)]
+              (if (<= q1 p1) (values p1 cnt true)
+                (if (at? cs q1 n 46) (values p cnt false)
+                  (if (> q1 (+ p1 4)) (values p1 cnt true)
+                    (recur q1 (+ cnt 2))))))))))))
+
+(defn- take-ipv4 Values(Int Bool) [cs: &Vec(Int) start: Int n: Int]
+  (let [m (loop [p start] (if (and (< p n) (or (cls? (nth cs p) "digit") (= (nth cs p) 46))) (recur (+ p 1)) p))]
+    (if (or (<= m start) (not= m n)) (values start true)
+      (let [q (scan-ipv4 cs start n)]
+        (if (< q 0) (values start true) (values q false))))))
+
+(defn- scan-hex-post Values(Int Int Bool) [cs: &Vec(Int) start: Int n: Int cnt: Int]
+  (if (= start n) (values start cnt false)
+    (let [[q c2 bad] (scan-hex-seq cs start n cnt)]
+      (if bad (values q c2 true)
+        (if (> q start)
+          (if (at? cs q n 58)
+            (let [[r b2] (take-ipv4 cs (+ q 1) n)] (values r (+ c2 4) b2))
+            (values q c2 false))
+          (let [[r b2] (take-ipv4 cs start n)] (values r (+ c2 4) b2)))))))
+
+(defn- ipv6-ok? Bool [cs: &Vec(Int) start: Int n: Int]
+  (let [[q c1 bad] (scan-hex-seq cs start n 0)]
+    (if bad false
+      (let [[p cnt comp bad2]
+            (if (> q start)
+              (if (and (at? cs q n 58) (at? cs (+ q 1) n 58))
+                (let [[r c2 b] (scan-hex-post cs (+ q 2) n c1)] (values r c2 true b))
+                (if (at? cs q n 58)
+                  (let [[r b] (take-ipv4 cs (+ q 1) n)] (values r (+ c1 4) false b))
+                  (values q c1 false false)))
+              (if (and (at? cs start n 58) (at? cs (+ start 1) n 58))
+                (let [[r c2 b] (scan-hex-post cs (+ start 2) n c1)] (values r c2 true b))
+                (values start c1 false false)))]
+        (and (not bad2) (>= p n) (<= cnt 16) (or comp (>= cnt 16)) (not (and comp (= cnt 16))))))))
+
+(defn- scope-ok? Bool [cs: &Vec(Int) p: Int q: Int]
+  (loop [i p] (if (>= i q) true (let [c (nth cs i)] (if (or (alnum? c) (= c 95) (= c 46)) (recur (+ i 1)) false)))))
+
+(defn- parse-port Values(Uri Int Bool) [u: Uri cs: &Vec(Int) p0: Int n: Int skip: Bool]
+  (if (at? cs p0 n 58)
+    (let [p (+ p0 1) q (scan-stop cs p n "" "/")]
+      (if (> q p)
+        (if (not (all-cls? cs p q "digit")) (values u q true)
+          (let [v (loop [i p acc 0] (if (>= i q) acc (recur (+ i 1) (if (> acc 3000000000) acc (+ (* acc 10) (- (nth cs i) 48))))))]
+            (if (> v 2147483647) (values u q true)
+              (if (< q n) (values u q true) (values (assoc u :port v) q false)))))
+        (if (< p n) (values u p true) (values u p false))))
+    (if (and (< p0 n) skip) (values u p0 false)
+      (if (< p0 n) (values u p0 true) (values u p0 false)))))
+
+(defn- parse-server Values(Uri Int Bool) [u0: Uri cs: &Vec(Int) start: Int n: Int skip: Bool]
+  (let [q0 (scan-stop cs start n "/?#" "@")
+        has-user (and (>= q0 start) (at? cs q0 n 64))]
+    (if (and has-user (not (all-cls? cs start q0 "userinfo"))) (values u0 start true)
+      (let [u1 (if has-user (assoc (assoc u0 :user (sub-cps cs start q0)) :has-user true) u0)
+            p (if has-user (+ q0 1) start)]
+        (if (at? cs p n 91)
+          (let [p1 (+ p 1) q (scan-stop cs p1 n "/?#" "]")]
+            (if (and (> q p1) (at? cs q n 93))
+              (let [r (scan-stop cs p1 q "" "%")]
+                (if (and (ipv6-ok? cs p1 r) (not= (+ r 1) q) (scope-ok? cs (if (< r q) (+ r 1) q) q))
+                  (parse-port (assoc (assoc u1 :host (sub-cps cs p (+ q 1))) :has-host true) cs (+ q 1) n skip)
+                  (values u1 p true)))
+              (values u1 p true)))
+          (let [q4 (parse-ipv4 cs p n)]
+            (if (> q4 p) (parse-port (assoc (assoc u1 :host (sub-cps cs p q4)) :has-host true) cs q4 n skip)
+              (let [[qh got bad] (parse-hostname cs p n skip)]
+                (if bad (values u1 qh true)
+                  (parse-port (if got (assoc (assoc u1 :host (sub-cps cs p qh)) :has-host true) u1) cs qh n skip))))))))))
+
+(defn- parse-authority Values(Uri Bool) [u: Uri cs: &Vec(Int) p: Int n: Int]
+  (let [has-br (> (scan-stop cs p n "" "]") p)
+        [se sbad] (scan-cls cs p n (if has-br "server%" "server"))
+        [re rbad] (scan-cls cs p n "reg")]
+    (if (or sbad rbad) (values u true)
+      (let [server-chars (= se n) reg-chars (= re n)
+            auth (assoc (assoc u :authority (sub-cps cs p n)) :has-auth true)]
+        (if (and reg-chars (not server-chars)) (values auth false)
+          (if server-chars
+            (let [[u2 q bad] (parse-server u cs p n reg-chars)]
+              (if (and (not bad) (>= q n)) (values (assoc (assoc u2 :authority (sub-cps cs p n)) :has-auth true) false)
+                (if reg-chars (values auth false) (values u true))))
+            (values u true)))))))
+
+(defn- parse-hier Values(Uri Int Bool) [u0: Uri cs: &Vec(Int) start: Int n: Int]
+  (let [[u1 p bad]
+        (if (and (at? cs start n 47) (at? cs (+ start 1) n 47))
+          (let [p2 (+ start 2) q (scan-stop cs p2 n "" "/?#")]
+            (if (> q p2) (let [[u2 b] (parse-authority u0 cs p2 q)] (values u2 q b))
+              (if (< q n) (values u0 q false) (values u0 q true))))
+          (values u0 start false))]
+    (if bad (values u1 p true)
+      (let [q (scan-stop cs p n "" "?#")]
+        (if (not (all-cls? cs p q "path")) (values u1 p true)
+          (let [u2 (assoc (assoc u1 :path (sub-cps cs p q)) :has-path true)]
+            (if (at? cs q n 63)
+              (let [q2 (scan-stop cs (+ q 1) n "" "#")]
+                (if (not (all-cls? cs (+ q 1) q2 "uric")) (values u2 q true)
+                  (values (assoc (assoc u2 :query (sub-cps cs (+ q 1) q2)) :has-query true) q2 false)))
+              (values u2 q false))))))))
+
+(defn parse-uri Uri [s: &Str]
+  (let [cs (uni/cps s) n (count cs)
+        p (scan-stop cs 0 n "/?#" ":")]
+    (let [[u q bad]
+          (if (and (>= p 0) (at? cs p n 58))
+            (if (or (= p 0) (not (and (< (nth cs 0) 128) (or (and (>= (nth cs 0) 65) (<= (nth cs 0) 90)) (and (>= (nth cs 0) 97) (<= (nth cs 0) 122)))))
+                    (not (all-cls? cs 1 p "scheme")))
+              (values (empty-uri) 0 true)
+              (let [u1 (assoc (assoc (empty-uri) :scheme (sub-cps cs 0 p)) :has-scheme true)
+                    p1 (+ p 1)]
+                (if (at? cs p1 n 47) (parse-hier u1 cs p1 n)
+                  (let [q (scan-stop cs p1 n "" "#")]
+                    (if (or (<= q p1) (not (all-cls? cs p1 q "uric"))) (values u1 q true)
+                      (values (assoc u1 :ssp-opaque true) q false))))))
+            (parse-hier (empty-uri) cs 0 n))]
+      (if bad (bad-uri)
+        (if (at? cs q n 35)
+          (if (all-cls? cs (+ q 1) n "uric") (assoc (assoc u :fragment (sub-cps cs (+ q 1) n)) :has-frag true) (bad-uri))
+          (if (< q n) (bad-uri) u))))))
+
+(defn- uri-decode Str [s: &Str brackets: Bool]
+  (let [n (count s)]
+    (loop [i 0 out "" inb false]
+      (if (>= i n) (uni/sanitize out)
+        (let [c (nth s i)
+              inb2 (if (= c 91) true (if (and inb (= c 93)) false inb))]
+          (if (and (= c 37) (not (and inb2 brackets)) (<= (+ i 3) n) (>= (hexv (nth s (+ i 1))) 0) (>= (hexv (nth s (+ i 2))) 0))
+            (recur (+ i 3) (str out (chr (+ (* (hexv (nth s (+ i 1))) 16) (hexv (nth s (+ i 2)))))) inb2)
+            (recur (+ i 1) (str out (chr c)) inb2)))))))
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- sv v/Val [s: &Str] (v/->VStr (str s)))
+
+(defn- encode-uri Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (sv (percent-encode (core/arg-str a 0) URI-KEEP))))
+(defn- encode-comp Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (sv (percent-encode (core/arg-str a 0) COMPONENT-KEEP))))
+(defn- decode-any Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) [d good] (url-decode s)]
+    (if good (ok (sv d)) (rt/failure "InvalidUrlEncoding" (str "Invalid Encoded URL format: " s)))))
+
+(defn uri-object v/Val [s: &Str]
+  (let [u (parse-uri s)
+        f (fn Vec(v/Field) [acc: Vec(v/Field) name: Str has: Bool val: Str]
+            (if has (conj acc (v/field name (v/->VStr (uri-decode val (or (= name "authority") (= name "path") (= name "user")))))) acc))]
+    (if (not (:ok u))
+      (v/->VObj [(v/field "isValid" (v/bool-v false)) (v/field "raw" (sv s))])
+      (let [opaque (:ssp-opaque u)
+            f0: Vec(v/Field) [(v/field "isValid" (v/bool-v true)) (v/field "raw" (sv s))]
+            f1 (if (:has-host u) (conj f0 (v/field "host" (sv (:host u)))) f0)
+            f2 (f f1 "authority" (:has-auth u) (:authority u))
+            f3 (f f2 "fragment" (:has-frag u) (:fragment u))
+            f4 (f f3 "path" (and (not opaque) (:has-path u)) (:path u))
+            f5 (if (>= (:port u) 0) (conj f4 (v/field "port" (v/int-v (:port u)))) f4)
+            f6 (f f5 "query" (:has-query u) (:query u))
+            f7 (if (:has-scheme u) (conj f6 (v/field "scheme" (sv (:scheme u)))) f6)
+            f8 (f f7 "user" (:has-user u) (:user u))]
+        (v/->VObj (conj (conj f8 (v/field "isAbsolute" (v/bool-v (:has-scheme u))))
+                        (v/field "isOpaque" (v/bool-v opaque))))))))
+
+(defn- parse-uri-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (uri-object (core/arg-str a 0))))
+
+(defn- plus-err Values(v/Val dwe/DwErr) [] (rt/failure "InvalidFunctionArgs" "You called the function '++' with these arguments: "))
+
+(defn- compose Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [parts (core/arg-items a 0) xs (core/arg-items a 1)]
+    (loop [i 0 out ""]
+      (if (>= i (count xs))
+        (if (= (count parts) 0) (plus-err)
+          (let [[p0 e0] (rt/to-text (nth parts 0))]
+            (if (dwe/ok? e0) (ok (v/->VStr (str p0 out))) (plus-err))))
+        (let [[x e] (rt/to-text (nth xs i))]
+          (if (not (dwe/ok? e)) (rt/failure "InvalidFunctionArgs" (str "Expecting Type: `String`, but got: `" (v/type-name (v/unmeta (nth xs i))) "`."))
+            (if (>= (+ i 1) (count parts)) (plus-err)
+              (let [[p e2] (rt/to-text (nth parts (+ i 1)))]
+                (if (dwe/ok? e2) (recur (+ i 1) (str out (percent-encode x COMPONENT-KEEP) p)) (plus-err))))))))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "encodeURI" [(rt/b1 "String" encode-uri)])
+   (B "decodeURI" [(rt/b1 "String" decode-any)])
+   (B "encodeURIComponent" [(rt/b1 "String" encode-comp)])
+   (B "decodeURIComponent" [(rt/b1 "String" decode-any)])
+   (B "parseURI" [(rt/b1 "String" parse-uri-fn)])
+   (B "compose" [(rt/b2 "Array" "Array" compose)])])

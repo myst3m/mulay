@@ -1,0 +1,106 @@
+(ns mulay.dw.fmt.dwread
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.ast :as a] [mulay.dw.parse :as ps]
+            [mulay.dw.fmt.props :as p] [clay.base64 :as b64] [clay.string :as str]))
+
+(defrecord Ctx [nss: Vec(v/Ns)])
+
+(defn- err-val Values(v/Val Str) [msg: Str] (values (v/null-v) msg))
+
+(defn- ns-of Values(Vec(v/Ns) Str) [c: &Ctx pre: &Str]
+  (if (= pre "") (values [] "")
+    (loop [i (- (count (:nss c)) 1)]
+      (if (< i 0) (values [] (str "Unable to resolve namespace `" pre "`"))
+        (if (= (:prefix (nth (:nss c) i)) pre) (values [(nth (:nss c) i)] "") (recur (- i 1)))))))
+
+(defn- text-of Values(Str Bool) [parts: &Vec(a/StrPart)]
+  (loop [i 0 out ""]
+    (if (>= i (count parts)) (values out true)
+      (match (nth parts i)
+        (a/SPText t) (recur (+ i 1) (str out t))
+        _ (values out false)))))
+
+(defn- with-decls Ctx [c: &Ctx ds: &Vec(a/DeclAt)]
+  (loop [i 0 nss (:nss c)]
+    (if (>= i (count ds)) (->Ctx nss)
+      (match (:d (nth ds i))
+        (a/DNs pre uri) (recur (+ i 1) (conj nss (v/->Ns (str pre) (str uri))))
+        _ (recur (+ i 1) nss)))))
+
+(defn- data Values(v/Val Str) [n: &a/Node c: &Ctx]
+  (match (:e n)
+    (a/ENull) (values (v/null-v) "")
+    (a/EBool b) (values (v/bool-v b) "")
+    (a/ENum t) (let [[x e] (num/parse-lit t)] (if (= e "") (values (v/num-v x) "") (err-val e)))
+    (a/EStr parts) (let [[t ok] (text-of parts)] (if ok (values (v/->VStr t) "") (err-val "String interpolation is not data")))
+    (a/ERegex pat fl) (values (v/->VRegex (str pat) (str fl)) "")
+    (a/EUnary op e) (if (= op "-")
+                      (let [[x er] (data e c)]
+                        (match x (v/VNum m) (values (v/num-v (num/neg m)) er) (v/VInt m-i) (let [m (num/from-int m-i)] (values (v/num-v (num/neg m)) er)) _ (err-val "Unary minus on a non number")))
+                      (err-val (str "Operator `" op "` is not data")))
+    (a/EArr els) (loop [i 0 acc: Vec(v/Val) []]
+                   (if (>= i (count els)) (values (v/->VArr acc) "")
+                     (let [[x er] (data (:value (nth els i)) c)]
+                       (if (not= er "") (values x er) (recur (+ i 1) (conj acc x))))))
+    (a/EObj es) (loop [i 0 acc: Vec(v/Field) []]
+                  (if (>= i (count es)) (values (v/->VObj acc) "")
+                    (match (nth es i)
+                      (a/EKV k attrs value cnd)
+                      (let [[kns name ke] (match k
+                                            (a/KName pre nm) (let [[q e] (ns-of c pre)] (values q (str nm) e))
+                                            (a/KStr parts) (let [[t ok] (text-of parts)] (values [] t (if ok "" "Interpolated keys are not data")))
+                                            _ (values [] "" "Dynamic keys are not data"))
+                            [as ae] (loop [j 0 b: Vec(v/Attr) []]
+                                      (if (>= j (count attrs)) (values b "")
+                                        (let [at (nth attrs j)
+                                              [ans e1] (ns-of c (:ns at))
+                                              [x e2] (data (:value at) c)]
+                                          (if (not= e1 "") (values b e1)
+                                            (if (not= e2 "") (values b e2)
+                                              (recur (+ j 1) (conj b (v/->Attr ans (str (:name at)) x))))))))
+                            [x ve] (data value c)
+                            e (if (not= ke "") ke (if (not= ae "") ae ve))]
+                        (if (not= e "") (err-val e) (recur (+ i 1) (conj acc (v/->Field (v/->Key kns name as) x)))))
+                      _ (err-val "Spread entries are not data"))))
+    (a/EDo decls body) (data body (with-decls c decls))
+    (a/EAs e ty) (as-chain n c)
+    (a/ETemporal kind t) (err-val (str "Date and time values are not supported yet: |" t "|"))
+    _ (err-val "The application/dw reader of mulay only reads data (literals), not expressions")))
+
+(defn- as-chain Values(v/Val Str) [n: &a/Node c: &Ctx]
+  (let [[tys inner] (loop [m (:e n) sp (:sp n) acc: Vec(a/Ty) []]
+                      (match m
+                        (a/EAs e ty) (recur (:e e) (:sp e) (conj acc ty))
+                        _ (values acc (a/->Node m sp))))
+        [x0 er] (data inner c)]
+    (if (not= er "") (values x0 er)
+      (loop [i (- (count tys) 1) x x0]
+        (if (< i 0) (values x "")
+          (let [[y e] (as-type x (:t (nth tys i)) c)]
+            (if (not= e "") (values y e) (recur (- i 1) y))))))))
+
+(defn- as-type Values(v/Val Str) [x: v/Val t: &a/TyE c: &Ctx]
+  (match t
+    (a/TName name args) (values (coerce-to x name) "")
+    (a/TMeta base schema)
+    (let [[m me] (data schema c)
+          bname (match (:t base) (a/TName n args) (str n) _ "")]
+      (if (not= me "") (values x me)
+        (match m
+          (v/VObj fs) (let [b64? (and (= bname "Binary") (let [r (v/obj-get fs "base")] (and (> (count r) 0) (match (v/unmeta (nth r 0)) (v/VStr s) (= s "64") _ false))))
+                            y (if b64? (match (v/unmeta x) (v/VStr s) (let [[b be] (b64/decode (str s))] (v/->VBin b)) _ x) (coerce-to x bname))
+                            rest (if b64? (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count fs)) acc (recur (+ i 1) (if (= (:name (:key (nth fs i))) "base") acc (conj acc (nth fs i)))))) fs)]
+                        (values (p/with-meta y rest) ""))
+          _ (values x ""))))
+    _ (values x "")))
+
+(defn- coerce-to v/Val [x: v/Val name: &Str]
+  (if (= name "String")
+    (match (v/unmeta x) (v/VNum n) (v/->VStr (num/to-string n)) (v/VInt n-i) (let [n (num/from-int n-i)] (v/->VStr (num/to-string n))) (v/VBool b) (v/->VStr (if b "true" "false")) _ x)
+    x))
+
+(defn read Values(v/Val Str) [text: &Str mime: &Str]
+  (let [[sc diags] (ps/parse text)]
+    (if (> (count diags) 0) (values (v/null-v) (:msg (nth diags 0)))
+      (let [c (with-decls (->Ctx []) (:decls sc))
+            [x e] (data (:body sc) c)]
+        (if (not= e "") (values (v/null-v) e) (values x ""))))))

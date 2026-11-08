@@ -1,0 +1,455 @@
+(ns mulay.dw.fmt.json
+  (:require [mulay.lib.uni :as uni] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.lib.bigint :as bi]
+            [mulay.dw.fmt.scalar :as sc] [mulay.dw.fmt.out :as fo] [mulay.dw.err :as dwe]))
+
+(defrecord Opts [indent: Bool skip-arrays: Bool skip-objects: Bool write-attrs: Bool dup-array: Bool])
+
+(defn default-opts Opts [] (->Opts true false false false false))
+
+(defn opts-of Opts [indent: Bool skip-null-on: &Str]
+  (->Opts indent
+          (or (= skip-null-on "arrays") (= skip-null-on "everywhere"))
+          (or (= skip-null-on "objects") (= skip-null-on "everywhere"))
+          false false))
+
+(defn opts-full Opts [indent: Bool skip-null-on: &Str write-attrs: Bool dup-array: Bool]
+  (->Opts indent
+          (or (= skip-null-on "arrays") (= skip-null-on "everywhere"))
+          (or (= skip-null-on "objects") (= skip-null-on "everywhere"))
+          write-attrs dup-array))
+
+(defn- hex1 Str [n: Int] (subs "0123456789abcdef" n (+ n 1)))
+
+(defn escape-into Str [out: Str s: &Str]
+  (let [n (count s)]
+    (loop [acc out i 0 run 0]
+      (if (>= i n)
+        (if (< run i) (str acc (subs s run i)) acc)
+        (let [c (nth s i)
+              [e w] (if (and (= c 239) (< (+ i 2) n) (= (nth s (+ i 1)) 191) (= (nth s (+ i 2)) 189)) (values "\\ufffd" 3)
+                      (if (and (= c 194) (< (+ i 1) n) (= (nth s (+ i 1)) 133)) (values "\\u0085" 2)
+                        (values (case c
+                                  34 "\\\""
+                                  92 "\\\\"
+                                  8 "\\b"
+                                  12 "\\f"
+                                  10 "\\n"
+                                  13 "\\r"
+                                  9 "\\t"
+                                  127 "\\u007f"
+                                  (if (< c 32) (str "\\u00" (hex1 (quot c 16)) (hex1 (mod c 16))) ""))
+                                1)))]
+          (if (= (count e) 0) (recur acc (+ i 1) run)
+            (let [a2 (if (< run i) (str acc (subs s run i)) acc)
+                  a3 (str a2 e)]
+              (recur a3 (+ i w) (+ i w)))))))))
+
+(defn- pad Str [out: Str depth: Int]
+  (loop [acc out i 0] (if (>= i depth) acc (recur (str acc "  ") (+ i 1)))))
+
+(defn- skip? Bool [x: &v/Val] (v/null? x))
+
+(defn- werr Values(Str dwe/DwErr) [out: Str msg: Str] (values out (fo/writer-err msg)))
+
+(defn- quoted Values(Str dwe/DwErr) [out: Str s: &Str] (let [a (str out "\"") b (escape-into a s)] (values (str b "\"") (dwe/ok))))
+
+(defn write-into Values(Str dwe/DwErr) [out: Str x: &v/Val o: &Opts depth: Int snk: &fo/Sink]
+  (match x
+    (v/VNull) (values (str out "null") (dwe/ok))
+    (v/VBool b) (values (str out (if b "true" "false")) (dwe/ok))
+    (v/VNum n) (let [t (num/to-string n)] (values (str out t) (dwe/ok)))
+    (v/VInt n-i) (let [n (num/from-int n-i)] (let [t (num/to-string n)] (values (str out t) (dwe/ok))))
+    (v/VStr s) (quoted out s)
+    (v/VArr xs) (write-arr out xs o depth snk)
+    (v/VSeq q) (write-seq out q o depth snk)
+    (v/VRange a b) (write-arr out (v/items x) o depth snk)
+    (v/VObj fs) (write-obj out fs o depth snk)
+    (v/VOSeq q) (if (:dup-array o)
+                  (let [[fs e] (v/fseq-vec q)] (if (dwe/ok? e) (write-obj out fs o depth snk) (values out e)))
+                  (write-oseq out q o depth snk))
+    (v/VKey k) (quoted out (:name k))
+    (v/VRegex s f) (quoted out s)
+    (v/VMeta y m) (let [[ts tt te] (sc/temporal-text x true)]
+                    (cond (not tt) (write-into out y o depth snk)
+                          (not= te "") (werr out te)
+                          :else (quoted out ts)))
+    (v/VBin b) (quoted out (uni/sanitize (str b)))
+    (v/VType t) (quoted out (v/type-display t))
+    (v/VFn f) (werr out "Cannot coerce Function to String")
+    (v/VNsV n) (quoted out (:uri n))
+    _ (let [[t ok] (v/temporal-str x)]
+        (if ok (quoted out t) (werr out (str "Cannot write " (v/type-name x) " as application/json"))))))
+
+(defn- write-arr Values(Str dwe/DwErr) [out: Str xs: &Vec(v/Val) o: &Opts depth: Int snk: &fo/Sink]
+  (loop [acc (arr-open out) i 0 n 0]
+    (if (>= i (count xs)) (values (arr-close acc o depth n) (dwe/ok))
+      (let [[a1 err wrote] (arr-elem acc (nth xs i) o depth n snk)]
+        (if (dwe/ok? err) (recur a1 (+ i 1) (if wrote (+ n 1) n)) (values a1 err))))))
+
+(defn- write-seq Values(Str dwe/DwErr) [out: Str q: &v/Seq o: &Opts depth: Int snk: &fo/Sink]
+  (let [nx ((:open q) 0)]
+    (loop [acc (arr-open out) n 0]
+      (let [[x done e] (nx 0)]
+        (cond (not (dwe/ok? e)) (values acc e)
+              done (values (arr-close acc o depth n) (dwe/ok))
+              :else (let [[a1 err wrote] (arr-elem acc x o depth n snk)]
+                      (if (dwe/ok? err) (recur a1 (if wrote (+ n 1) n)) (values a1 err))))))))
+
+(defn arr-open Str [out: Str] (str out "["))
+
+(defn arr-elem Values(Str dwe/DwErr Bool) [out: Str x: &v/Val o: &Opts depth: Int n: Int snk: &fo/Sink]
+  (if (and (:skip-arrays o) (skip? x)) (values out (dwe/ok) false)
+    (let [a1 (if (= n 0) out (str out ","))
+          a2 (if (:indent o) (pad (str a1 "\n") (+ depth 1)) a1)
+          [a3 err] (write-into a2 x o (+ depth 1) snk)]
+      (if (not (dwe/ok? err)) (values a3 err true)
+        (let [[a4 fe] (fo/flush a3 snk)] (values a4 fe true))))))
+
+(defn arr-close Str [out: Str o: &Opts depth: Int n: Int]
+  (cond
+    (not (:indent o)) (str out "]")
+    (= n 0) (let [a1 (str out "\n") a2 (pad a1 (+ depth 1)) a3 (str a2 "\n") a4 (pad a3 depth)] (str a4 "]"))
+    :else (let [a1 (str out "\n") a2 (pad a1 depth)] (str a2 "]"))))
+
+(defn- write-obj Values(Str dwe/DwErr) [out: Str fs0: &Vec(v/Field) o: &Opts depth: Int snk: &fo/Sink]
+  (let [ind (:indent o)
+        [fs pe] (prep-fields fs0 o)
+        a0 (str out "{")]
+    (if (not (dwe/ok? pe)) (values out pe)
+    (loop [acc a0 i 0 first true]
+      (if (>= i (count fs))
+        (if ind
+          (if first
+            (let [a1 (str acc "\n") a2 (pad a1 (+ depth 1)) a3 (str a2 "\n") a4 (pad a3 depth)] (values (str a4 "}") (dwe/ok)))
+            (let [a1 (str acc "\n") a2 (pad a1 depth)] (values (str a2 "}") (dwe/ok))))
+          (values (str acc "}") (dwe/ok)))
+        (let [f (nth fs i)
+              name (:name (:key f))
+              dups: Vec(v/Val) (if (:dup-array o) (dup-values fs i name) [])]
+          (if (and (:dup-array o) (seen-before? fs i name)) (recur acc (+ i 1) first)
+              (let [a1 (if first acc (str acc ","))
+                    a2 (if ind (pad (str a1 "\n") (+ depth 1)) a1)
+                    a3 (str a2 "\"")
+                    a4 (escape-into a3 name)
+                    a5 (str a4 "\": ")
+                    [a6 err] (if (> (count dups) 1) (write-dup-arr a5 dups o (+ depth 1) snk)
+                               (write-into a5 (:value f) o (+ depth 1) snk))]
+                (if (not (dwe/ok? err)) (values a6 err)
+                  (let [[a7 fe] (fo/flush a6 snk)] (if (dwe/ok? fe) (recur a7 (+ i 1) false) (values a7 fe))))))))))))
+
+(defn- obj-close Str [acc: Str o: &Opts depth: Int first: Bool]
+  (if (:indent o)
+    (if first
+      (let [a1 (str acc "\n") a2 (pad a1 (+ depth 1)) a3 (str a2 "\n") a4 (pad a3 depth)] (str a4 "}"))
+      (let [a1 (str acc "\n") a2 (pad a1 depth)] (str a2 "}")))
+    (str acc "}")))
+
+(defn- write-oseq Values(Str dwe/DwErr) [out: Str q: &v/FSeq o: &Opts depth: Int snk: &fo/Sink]
+  (let [nx ((:open q) 0)]
+    (loop [acc (str out "{") first true]
+      (let [[f0 done e] (nx 0)]
+        (cond (not (dwe/ok? e)) (values acc e)
+              done (values (obj-close acc o depth first) (dwe/ok))
+              :else
+              (let [[pf pe] (prep-field f0 o)]
+                (cond (not (dwe/ok? pe)) (values acc pe)
+                      (= (count pf) 0) (recur acc first)
+                      :else
+                  (let [f (nth pf 0)
+                        a1 (if first acc (str acc ","))
+                        a2 (if (:indent o) (pad (str a1 "\n") (+ depth 1)) a1)
+                        a3 (str a2 "\"")
+                        a4 (escape-into a3 (:name (:key f)))
+                        a5 (str a4 "\": ")
+                        [a6 err] (write-into a5 (:value f) o (+ depth 1) snk)]
+                    (if (not (dwe/ok? err)) (values a6 err)
+                      (let [[a7 fe] (fo/flush a6 snk)] (if (dwe/ok? fe) (recur a7 false) (values a7 fe))))))))))))
+
+(defn- prep-fields Values(Vec(v/Field) dwe/DwErr) [fs: &Vec(v/Field) o: &Opts]
+  (loop [i 0 acc: Vec(v/Field) []]
+    (if (>= i (count fs)) (values acc (dwe/ok))
+      (let [[pf pe] (prep-field (nth fs i) o)]
+        (if (not (dwe/ok? pe)) (values acc pe)
+          (recur (+ i 1) (if (= (count pf) 0) acc (conj acc (nth pf 0)))))))))
+
+(defn- prep-field Values(Vec(v/Field) dwe/DwErr) [f: &v/Field o: &Opts]
+  (let [e (:value f)]
+    (if (and (:skip-objects o) (skip? e)) (values [] (dwe/ok))
+      (let [k (:key f) as (:attrs k)]
+        (if (or (not (:write-attrs o)) (= (count as) 0)) (values [f] (dwe/ok))
+          (let [afs (loop [j 0 b: Vec(v/Field) []]
+                      (if (>= j (count as)) b
+                        (let [a (nth as j)] (recur (+ j 1) (conj b (v/field (str "@" (:name a)) (:value a)))))))
+                [gs obj ge] (match (v/unmeta e)
+                              (v/VObj gs) (values gs true (dwe/ok))
+                              (v/VOSeq gq) (let [[gs ge] (v/fseq-vec gq)] (values gs true ge))
+                              _ (let [none: Vec(v/Field) []] (values none false (dwe/ok))))
+                body (if obj (loop [j 0 b afs] (if (>= j (count gs)) b (recur (+ j 1) (conj b (nth gs j))))) (conj afs (v/field "__text" e)))]
+            (values [(v/->Field (v/simple-key (:name k)) (v/->VObj body))] ge)))))))
+
+(defn- dup-values Vec(v/Val) [fs: &Vec(v/Field) i: Int name: &Str]
+  (loop [j i acc: Vec(v/Val) []]
+    (if (>= j (count fs)) acc
+      (recur (+ j 1) (if (= (:name (:key (nth fs j))) name) (conj acc (:value (nth fs j))) acc)))))
+
+(defn- seen-before? Bool [fs: &Vec(v/Field) i: Int name: &Str]
+  (loop [j 0] (if (>= j i) false (if (= (:name (:key (nth fs j))) name) true (recur (+ j 1))))))
+
+(defn- write-dup-arr Values(Str dwe/DwErr) [out: Str xs: &Vec(v/Val) o: &Opts depth: Int snk: &fo/Sink]
+  (let [ind (:indent o)]
+    (loop [acc (str out "[") i 0]
+      (if (>= i (count xs))
+        (if ind (let [a1 (pad (str acc "\n") depth)] (values (str a1 "]") (dwe/ok))) (values (str acc "]") (dwe/ok)))
+        (let [a1 (if (> i 0) (str acc ",") acc)
+              a2 (if ind (pad (str a1 "\n") depth) a1)
+              [a3 err] (write-into a2 (nth xs i) o depth snk)]
+          (if (dwe/ok? err) (recur a3 (+ i 1)) (values a3 err)))))))
+
+(defn write Values(Str dwe/DwErr) [x: &v/Val o: &Opts]
+  (write-into "" x o 0 (fo/whole)))
+
+(defn write-to Values(Str dwe/DwErr) [x: &v/Val o: &Opts snk: &fo/Sink]
+  (write-into "" x o 0 snk))
+
+(defn- ws? Bool [c: Int] (or (= c 32) (= c 9) (= c 10) (= c 13)))
+
+(defn- skip-ws Int [s: &Str i: Int]
+  (loop [j i] (if (and (< j (count s)) (ws? (nth s j))) (recur (+ j 1)) j)))
+
+(defn- hexv Int [c: Int]
+  (if (and (>= c 48) (<= c 57)) (- c 48)
+    (if (and (>= c 97) (<= c 102)) (- c 87)
+      (if (and (>= c 65) (<= c 70)) (- c 55) -1))))
+
+(defn- hex4 Int [s: &Str i: Int]
+  (if (> (+ i 4) (count s)) -1
+    (let [a (hexv (nth s i)) b (hexv (nth s (+ i 1))) c (hexv (nth s (+ i 2))) d (hexv (nth s (+ i 3)))]
+      (if (or (< a 0) (< b 0) (< c 0) (< d 0)) -1
+        (+ (* a 4096) (* b 256) (* c 16) d)))))
+
+(defn utf8-into Str [out: Str cp: Int]
+  (if (< cp 128) (str out (chr cp))
+    (if (< cp 2048) (str out (chr (+ 192 (quot cp 64))) (chr (+ 128 (mod cp 64))))
+      (if (< cp 65536) (str out (chr (+ 224 (quot cp 4096))) (chr (+ 128 (mod (quot cp 64) 64))) (chr (+ 128 (mod cp 64))))
+        (str out (chr (+ 240 (quot cp 262144))) (chr (+ 128 (mod (quot cp 4096) 64)))
+             (chr (+ 128 (mod (quot cp 64) 64))) (chr (+ 128 (mod cp 64))))))))
+
+(defrecord PErr [msg: Str at: Int kind: Int])
+
+(def VALUE-EXP "false or true or null or {...} or [...] or number")
+
+(defn- perr Values(v/Val Int PErr) [msg: Str at: Int] (values (v/null-v) at (->PErr msg at 0)))
+(defn- perr-k Values(v/Val Int PErr) [msg: Str at: Int k: Int] (values (v/null-v) at (->PErr msg at k)))
+(defn- ok-err PErr [] (->PErr "" 0 0))
+
+(defn- read-str Values(Str Int PErr) [s: &Str i0: Int]
+  (let [n (count s)]
+    (loop [acc "" i i0 run i0]
+      (if (>= i n) (values acc i (->PErr "'\"'" i 0))
+        (let [c (nth s i)]
+          (if (= c 34) (values (if (< run i) (str acc (subs s run i)) acc) (+ i 1) (ok-err))
+            (if (< c 32) (values acc i (->PErr (str "Unexpected character " (chr c)) i 2))
+              (if (not= c 92) (recur acc (+ i 1) run)
+                (let [a (if (< run i) (str acc (subs s run i)) acc)
+                      e (if (< (+ i 1) n) (nth s (+ i 1)) -1)]
+                  (case e
+                    34 (recur (str a "\"") (+ i 2) (+ i 2))
+                    92 (recur (str a "\\") (+ i 2) (+ i 2))
+                    47 (recur (str a "/") (+ i 2) (+ i 2))
+                    98 (recur (str a (chr 8)) (+ i 2) (+ i 2))
+                    102 (recur (str a (chr 12)) (+ i 2) (+ i 2))
+                    110 (recur (str a "\n") (+ i 2) (+ i 2))
+                    114 (recur (str a "\r") (+ i 2) (+ i 2))
+                    116 (recur (str a "\t") (+ i 2) (+ i 2))
+                    117 (let [u (hex4 s (+ i 2))]
+                          (if (< u 0) (values a i (->PErr "Invalid unicode escape" (+ i 1) 2))
+                            (if (and (>= u 55296) (<= u 56319))
+                              (let [lo (if (and (< (+ i 7) n) (= (nth s (+ i 6)) 92) (= (nth s (+ i 7)) 117)) (hex4 s (+ i 8)) -1)]
+                                (if (and (>= lo 56320) (<= lo 57343))
+                                  (recur (utf8-into a (+ 65536 (* (- u 55296) 1024) (- lo 56320))) (+ i 12) (+ i 12))
+                                  (recur (utf8-into a 65533) (+ i 6) (+ i 6))))
+                              (if (and (>= u 56320) (<= u 57343))
+                                (recur (utf8-into a 65533) (+ i 6) (+ i 6))
+                                (recur (utf8-into a u) (+ i 6) (+ i 6))))))
+                    (values a i (->PErr (str "Unexpected character " (if (< (+ i 1) n) (subs s (+ i 1) (+ i 2)) "")) (+ i 1) 2))))))))))))
+
+(def MAX-DEPTH 2000)
+
+(defn- read-val Values(v/Val Int PErr) [s: &Str i0: Int depth: Int]
+  (if (> depth MAX-DEPTH) (perr-k "Maximum nesting depth exceeded" i0 2)
+    (let [i (skip-ws s i0)
+          n (count s)]
+      (if (>= i n) (perr-k VALUE-EXP i 1)
+        (let [c (nth s i)]
+          (case c
+            123 (read-obj s (+ i 1) depth)
+            91 (read-arr s (+ i 1) depth)
+            34 (let [[t j e] (read-str s (+ i 1))] (values (v/->VStr t) j e))
+            116 (read-lit s i "true" (v/bool-v true))
+            102 (read-lit s i "false" (v/bool-v false))
+            110 (read-lit s i "null" (v/null-v))
+            (if (or (= c 45) (and (>= c 48) (<= c 57))) (read-num s i)
+              (perr-k VALUE-EXP i 1))))))))
+
+(defn- read-lit Values(v/Val Int PErr) [s: &Str i: Int w: &Str x: v/Val]
+  (loop [k 0]
+    (if (>= k (count w)) (values x (+ i k) (ok-err))
+      (if (and (< (+ i k) (count s)) (= (nth s (+ i k)) (nth w k))) (recur (+ k 1))
+        (perr (str "'" (subs w k (+ k 1)) "'") (+ i k))))))
+
+(defn- digit-at? Bool [s: &Str j: Int] (and (< j (count s)) (>= (nth s j) 48) (<= (nth s j) 57)))
+(defn- digits-end Int [s: &Str j0: Int] (loop [j j0] (if (digit-at? s j) (recur (+ j 1)) j)))
+
+(defn- read-num Values(v/Val Int PErr) [s: &Str i0: Int]
+  (let [n (count s)
+        i1 (if (= (nth s i0) 45) (+ i0 1) i0)]
+    (if (not (digit-at? s i1)) (perr "readDigit" i1)
+      (let [i2 (if (= (nth s i1) 48) (+ i1 1) (digits-end s i1))
+            frac (and (< i2 n) (= (nth s i2) 46))]
+        (if (and frac (not (digit-at? s (+ i2 1)))) (perr "readDigit" (+ i2 1))
+          (let [i3 (if frac (digits-end s (+ i2 1)) i2)
+                ex (and (< i3 n) (or (= (nth s i3) 101) (= (nth s i3) 69)))
+                k0 (if (and ex (< (+ i3 1) n) (or (= (nth s (+ i3 1)) 43) (= (nth s (+ i3 1)) 45))) (+ i3 2) (+ i3 1))]
+            (if (and ex (not (digit-at? s k0))) (perr "readDigit" k0)
+              (let [i4 (if ex (digits-end s k0) i3)
+                    nf (if frac (- i3 (+ i2 1)) 0)]
+                (if (and (not ex) (<= (+ (- i2 i1) nf) 18))
+                  (let [m0 (loop [k i1 m 0] (if (>= k i2) m (recur (+ k 1) (+ (* m 10) (- (nth s k) 48)))))
+                        m1 (loop [k (+ i2 1) m m0] (if (>= k i3) m (recur (+ k 1) (+ (* m 10) (- (nth s k) 48)))))
+                        m (if (> i1 i0) (- 0 m1) m1)]
+                    (values (v/num-v (num/of-scaled m nf)) i4 (ok-err)))
+                  (let [[x err] (num/parse-lit (subs s i0 i4))]
+                    (if (= err "") (values (v/num-v x) i4 (ok-err)) (perr-k err i0 2))))))))))))
+
+(defn- read-arr Values(v/Val Int PErr) [s: &Str i0: Int depth: Int]
+  (let [i (skip-ws s i0)]
+    (if (and (< i (count s)) (= (nth s i) 93)) (values (v/->VArr []) (+ i 1) (ok-err))
+      (loop [acc: Vec(v/Val) [] j i]
+        (let [[x k e] (read-val s j (+ depth 1))]
+          (if (not= (:msg e) "") (values (v/null-v) k e)
+            (let [k2 (skip-ws s k)]
+              (if (>= k2 (count s)) (perr "']'" k2)
+                (let [c (nth s k2)]
+                  (if (= c 44) (recur (conj acc x) (+ k2 1))
+                    (if (= c 93) (values (v/->VArr (conj acc x)) (+ k2 1) (ok-err))
+                      (perr "']'" k2))))))))))))
+
+(defn- read-obj Values(v/Val Int PErr) [s: &Str i0: Int depth: Int]
+  (let [i (skip-ws s i0)]
+    (if (and (< i (count s)) (= (nth s i) 125)) (values (v/->VObj []) (+ i 1) (ok-err))
+      (loop [acc: Vec(v/Field) [] j i]
+        (let [j1 (skip-ws s j)]
+          (if (or (>= j1 (count s)) (not= (nth s j1) 34)) (perr "'\"'" j1)
+            (let [[k j2 ke] (read-str s (+ j1 1))]
+              (if (not= (:msg ke) "") (values (v/null-v) j2 ke)
+                (let [j3 (skip-ws s j2)]
+                  (if (or (>= j3 (count s)) (not= (nth s j3) 58)) (perr "':'" j3)
+                    (let [[x j4 e] (read-val s (+ j3 1) (+ depth 1))]
+                      (if (not= (:msg e) "") (values (v/null-v) j4 e)
+                        (let [j5 (skip-ws s j4)
+                              acc2 (conj acc (v/field k x))]
+                          (if (>= j5 (count s)) (perr "'}'" j5)
+                            (let [c (nth s j5)]
+                              (if (= c 44) (recur acc2 (+ j5 1))
+                                (if (= c 125) (values (v/->VObj acc2) (+ j5 1) (ok-err))
+                                  (perr "'}'" j5))))))))))))))))))
+
+(defn read Values(v/Val Str) [s: &Str] (read-named s "root"))
+
+(defn read-named Values(v/Val Str) [s: &Str name: &Str]
+  (let [start (if (and (>= (count s) 3) (= (nth s 0) 239) (= (nth s 1) 187) (= (nth s 2) 191)) 3 0)]
+    (if (>= (skip-ws s start) (count s))
+      (values (v/null-v) (str "Unable to parse empty input, while reading `" name "` as Json.\n \n1| \n   ^"))
+      (let [[x j e] (read-val s start 0)]
+        (if (not= (:msg e) "") (values x (err-text s e name))
+          (let [k (skip-ws s j)]
+            (if (< k (count s)) (values x (err-text s (->PErr (str "Expecting end of input but got `" (char-at s k)) k 0) name))
+              (values x ""))))))))
+
+(defn array-start Values(Int Bool) [s: &Str]
+  (let [start (if (and (>= (count s) 3) (= (nth s 0) 239) (= (nth s 1) 187) (= (nth s 2) 191)) 3 0)
+        i (skip-ws s start)]
+    (if (and (< i (count s)) (= (nth s i) 91)) (values (+ i 1) true) (values 0 false))))
+
+(defn array-next Values(v/Val Int Bool Str) [s: &Str i0: Int name: &Str]
+  (let [i1 (skip-ws s i0)
+        i2 (if (and (< i1 (count s)) (= (nth s i1) 44)) (skip-ws s (+ i1 1)) i1)]
+    (cond
+      (>= i2 (count s)) (values (v/null-v) i2 true (err-text s (->PErr "']'" i2 0) name))
+      (= (nth s i2) 93) (values (v/null-v) (+ i2 1) true "")
+      :else (let [[x j e] (read-val s i2 1)]
+              (if (not= (:msg e) "") (values (v/null-v) j true (err-text s e name))
+                (values x j false ""))))))
+
+(defn- char-at Str [s: &Str at: Int]
+  (if (>= at (count s)) ""
+    (let [c (nth s at)
+          len (cond (< c 128) 1 (< c 224) 2 (< c 240) 3 :else 4)]
+      (subs s at (if (> (+ at len) (count s)) (count s) (+ at len))))))
+
+(defn- line-end Int [s: &Str at: Int]
+  (loop [i at] (if (or (>= i (count s)) (= (nth s i) 10)) i (recur (+ i 1)))))
+
+(defn- err-text Str [s: &Str e: &PErr name: &Str]
+  (let [at (:at e)
+        [line col ls] (loop [i 0 l 1 c 1 st 0]
+                        (if (or (>= i at) (>= i (count s))) (values l c st)
+                          (if (= (nth s i) 10) (recur (+ i 1) (+ l 1) 1 (+ i 1)) (recur (+ i 1) l (+ c 1) st))))
+        le (line-end s ls)
+        lt0 (subs s ls le)
+        lt (if (and (> (count lt0) 0) (= (nth lt0 (- (count lt0) 1)) 13)) (subs lt0 0 (- (count lt0) 1)) lt0)
+        ln (str line)
+        head (if (= (:kind e) 2) (str (:msg e))
+               (str (if (>= at (count s)) "Unexpected end-of-input" (str "Unexpected character '" (char-at s at) "'"))
+                    " at " name "@[" line ":" col "] (line:column), expected " (:msg e)
+                    (if (= (:kind e) 1) " but was " "")))]
+    (str head ", while reading `" name "` as Json.\n \n" ln "| " lt "\n" (rep-sp (+ (count ln) 2 (- col 1))) "^")))
+
+(defn- rep-sp Str [n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out " ")))))
+
+(defrecord ArrRd [buf: Str pos: Int eof: Bool])
+
+(def ARR-BLOCK 1024)
+(def ARR-TAIL 16)
+
+(defn- rd-more Values(ArrRd Str) [rd: &ArrRd fetch: &Fn(Int Values(Str Bool Str))]
+  (let [b (:buf rd)
+        rest (subs b (:pos rd) (count b))
+        want (count rest)]
+    (loop [out rest added 0]
+      (let [[piece eof e] (fetch 1)
+            o2 (str out piece)
+            a2 (+ added (count piece))]
+        (cond (not= e "") (values (->ArrRd o2 0 true) e)
+              (or eof (>= a2 want)) (values (->ArrRd o2 0 eof) "")
+              :else (recur o2 a2))))))
+
+(defn arr-open Values(ArrRd Bool Str) [fetch: &Fn(Int Values(Str Bool Str))]
+  (loop [rd (->ArrRd "" 0 false)]
+    (let [b (:buf rd)
+          bom (and (>= (count b) 3) (= (nth b 0) 239) (= (nth b 1) 187) (= (nth b 2) 191))
+          i (skip-ws b (if bom 3 0))]
+      (cond (and (< (count b) 3) (not (:eof rd))) (let [[r2 e] (rd-more rd fetch)] (if (not= e "") (values r2 false e) (recur r2)))
+            (< i (count b)) (if (= (nth b i) 91) (values (->ArrRd b (+ i 1) (:eof rd)) true "") (values rd false ""))
+            (:eof rd) (values rd false "")
+            :else (let [[r2 e] (rd-more (->ArrRd b i false) fetch)] (if (not= e "") (values r2 false e) (recur r2)))))))
+
+(defn arr-next Values(Vec(v/Val) ArrRd Bool Str) [rd0: ArrRd fetch: &Fn(Int Values(Str Bool Str)) name: &Str]
+  (loop [rd rd0 acc: Vec(v/Val) []]
+    (if (>= (count acc) ARR-BLOCK) (values acc rd false "")
+      (let [b (:buf rd)
+            i1 (skip-ws b (:pos rd))
+            i2 (if (and (< i1 (count b)) (= (nth b i1) 44)) (skip-ws b (+ i1 1)) i1)]
+        (cond
+          (and (>= i2 (count b)) (not (:eof rd)))
+          (if (> (count acc) 0) (values acc rd false "")
+            (let [[r2 e] (rd-more rd fetch)] (if (not= e "") (values acc r2 true e) (recur r2 acc))))
+          (>= i2 (count b)) (values acc rd true (err-text b (->PErr "']'" i2 0) name))
+          (= (nth b i2) 93) (values acc (->ArrRd b (+ i2 1) (:eof rd)) true "")
+          :else
+          (let [[x j e] (read-val b i2 1)]
+            (cond
+              (and (not (:eof rd)) (or (>= j (count b)) (and (not= (:msg e) "") (>= (:at e) (- (count b) ARR-TAIL)))))
+              (let [[r2 fe] (rd-more rd fetch)] (if (not= fe "") (values acc r2 true fe) (recur r2 acc)))
+              (not= (:msg e) "") (values acc rd true (err-text b e name))
+              :else (recur (->ArrRd b j (:eof rd)) (conj acc x)))))))))

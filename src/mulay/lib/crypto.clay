@@ -1,0 +1,128 @@
+(ns mulay.lib.crypto (:require [clay.string :as str] [mulay.lib.random :as rnd] [mulay.lib.hash :as hash] [clay.crypto :as cc] [clay.bytes :as bytes] [clay.pkix :as pkix] [clay.base64 :as b64]))
+
+(defn- le-int Int [b: &Str n: Int]
+  (loop [i (- n 1) acc 0] (if (< i 0) acc (recur (- i 1) (+ (* acc 256) (nth b i))))))
+
+(defn digest Values(Str Bool) [ossl: &Str data: &Str]
+  (if (= ossl "MD2") (values (md2 data) true) (hash/digest ossl data)))
+
+(defn hmac Values(Str Bool) [ossl: &Str key: &Str data: &Str] (hash/hmac ossl key data))
+
+(def MD2-S [41 46 67 201 162 216 124 1 61 54 84 161 236 240 6 19 98 167 5 243 192 199 115 140 152 147 43 217 188 76 130 202
+            30 155 87 60 253 212 224 22 103 66 111 24 138 23 229 18 190 78 196 214 218 158 222 73 160 251 245 142 187 47 238 122
+            169 104 121 145 21 178 7 63 148 194 16 137 11 34 95 33 128 127 93 154 90 144 50 39 53 62 204 231 191 247 151 3
+            255 25 48 179 72 165 181 209 215 94 146 42 172 86 170 198 79 184 56 210 150 164 125 182 118 252 107 226 156 116 4 241
+            69 157 112 89 100 113 135 32 134 91 207 101 230 45 168 2 27 96 37 173 174 176 185 246 28 70 97 105 52 64 126 15
+            85 71 163 35 221 81 175 58 195 92 249 206 186 197 234 38 44 83 13 110 133 40 132 9 211 223 205 244 65 129 77 82
+            106 220 55 200 108 193 171 250 36 225 123 8 12 189 177 74 120 136 149 139 227 99 232 109 233 203 213 254 59 0 29 57
+            242 239 183 14 102 88 208 228 166 119 114 248 235 117 75 10 49 68 80 180 143 237 31 26 219 153 141 51 159 17 131 20])
+
+(defn- zeros Vec(Int) [n: Int] (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc 0)))))
+
+(defn md2 Str [data: &Str]
+  (let [padn (- 16 (mod (count data) 16))
+        padded (loop [i 0 out (str data)] (if (>= i padn) out (recur (+ i 1) (str out (chr padn)))))
+        nblk (quot (count padded) 16)
+        csum (loop [b 0 c (zeros 16) l 0]
+               (if (>= b nblk) c
+                 (let [[c2 l2] (loop [j 0 c1 c l1 l]
+                                 (if (>= j 16) (values c1 l1)
+                                   (let [x (bit-xor (nth c1 j) (nth MD2-S (bit-xor (nth padded (+ (* b 16) j)) l1)))]
+                                     (recur (+ j 1) (assoc c1 j x) x))))]
+                   (recur (+ b 1) c2 l2))))
+        msg (loop [j 0 out padded] (if (>= j 16) out (recur (+ j 1) (str out (chr (nth csum j))))))
+        nb (quot (count msg) 16)
+        x (loop [b 0 x0 (zeros 48)]
+            (if (>= b nb) x0
+              (let [x1 (loop [j 0 xx x0]
+                         (if (>= j 16) xx
+                           (let [m (nth msg (+ (* b 16) j))
+                                 y (bit-xor m (nth xx j))]
+                             (recur (+ j 1) (assoc (assoc xx (+ 16 j) m) (+ 32 j) y)))))
+                    x2 (loop [j 0 t 0 xx x1]
+                         (if (>= j 18) xx
+                           (let [[xx2 t2] (loop [k 0 xk xx tk t]
+                                            (if (>= k 48) (values xk tk)
+                                              (let [nv (bit-xor (nth xk k) (nth MD2-S tk))]
+                                                (recur (+ k 1) (assoc xk k nv) nv))))]
+                             (recur (+ j 1) (mod (+ t2 j) 256) xx2))))]
+                (recur (+ b 1) x2))))]
+    (loop [j 0 out ""] (if (>= j 16) out (recur (+ j 1) (str out (chr (nth x j))))))))
+
+(defn pbkdf2 Values(Str Bool) [ossl: &Str pwd: &Str salt: &Str iters: Int n: Int] (hash/pbkdf2 ossl pwd salt iters n))
+
+(defn aes-cbc Values(Str Bool) [enc?: Bool key: &Str iv: &Str data: &Str]
+  (let [[k ke] (cc/aes-key key)]
+    (cond
+      (or (not= ke "") (not= (count iv) 16) (not= (mod (count data) 16) 0)) (values "" false)
+      (= (count data) 0) (values "" true)
+      :else (let [[x e] (if enc? (cc/aes-cbc-encrypt k iv data) (cc/aes-cbc-decrypt k iv data))]
+              (if (= e "") (values x true) (values "" false))))))
+
+(defn- aes-cfb-encrypt Values(Str Bool) [k: &cc/AesKey iv: &Str data: &Str]
+  (let [n (count data)]
+    (loop [i 0 prev (str iv) out ""]
+      (if (>= i n) (values out true)
+        (let [[ks e] (cc/aes-ecb-encrypt k prev)]
+          (if (not= e "") (values "" false)
+            (let [x (bytes/xor (subs data i (min n (+ i 16))) ks)]
+              (recur (+ i 16) x (str out x)))))))))
+
+(defn- xor-stream Values(Str Bool) [data: &Str ks: &Str e: &Str]
+  (if (= e "") (values (bytes/xor data ks) true) (values "" false)))
+
+(defn- aes-cfb-decrypt Values(Str Bool) [k: &cc/AesKey iv: &Str data: &Str]
+  (let [nb (quot (+ (count data) 15) 16)
+        [ks e] (cc/aes-ecb-encrypt k (str iv (subs data 0 (* 16 (- nb 1)))))]
+    (xor-stream data ks e)))
+
+(defn- zero-bytes Str [n: Int]
+  (loop [z (str (chr 0) (chr 0) (chr 0) (chr 0) (chr 0) (chr 0) (chr 0) (chr 0))]
+    (if (>= (count z) n) (subs z 0 n) (recur (str z z)))))
+
+(defn- aes-ofb Values(Str Bool) [k: &cc/AesKey iv: &Str data: &Str]
+  (let [nb (quot (+ (count data) 15) 16)
+        [ks e] (cc/aes-cbc-encrypt k iv (zero-bytes (* 16 nb)))]
+    (xor-stream data ks e)))
+
+(defn aes-raw Values(Str Bool) [mode: &Str enc?: Bool key: &Str iv: &Str data: &Str]
+  (let [[k ke] (cc/aes-key key)
+        ecb (= mode "ECB")
+        block-mode (or ecb (= mode "CBC"))]
+    (cond
+      (or (not= ke "") (= (count data) 0) (and (not ecb) (not= (count iv) 16))) (values "" false)
+      (and block-mode (not= (mod (count data) 16) 0)) (values "" false)
+      ecb (let [[x e] (if enc? (cc/aes-ecb-encrypt k data) (cc/aes-ecb-decrypt k data))]
+            (if (= e "") (values x true) (values "" false)))
+      (= mode "CBC") (let [[x e] (if enc? (cc/aes-cbc-encrypt k iv data) (cc/aes-cbc-decrypt k iv data))]
+                       (if (= e "") (values x true) (values "" false)))
+      (= mode "CFB") (if enc? (aes-cfb-encrypt k iv data) (aes-cfb-decrypt k iv data))
+      (= mode "OFB") (aes-ofb k iv data)
+      :else (values "" false))))
+
+(defn random-bytes Values(Str Bool) [n: Int] (rnd/random-bytes n))
+
+(defn sign Values(Str Bool) [ossl: &Str key-der: &Str data: &Str]
+  (let [h (str/lower-case ossl)
+        [k e] (pkix/pkcs8-private key-der "")
+        [k2 e2] (if (= e "") (values k "") (pkcs1-private key-der))]
+    (if (or (not= e2 "") (not (or (= h "sha256") (= h "sha384") (= h "sha512")))) (values "" false)
+      (match k2
+        (pkix/RsaKey key) (let [[sig se] (cc/rsa-sign key data h)] (if (= se "") (values sig true) (values "" false)))
+        _ (values "" false)))))
+
+(defn- pkcs1-private Values(pkix/PrivateKey Str) [der: &Str]
+  (let [b (b64/encode der)
+        text (str "-----BEGIN RSA PRIVATE KEY-----\n" b "\n-----END RSA PRIVATE KEY-----\n")]
+    (pkix/pem-private text "")))
+
+(defn pkcs12-key Values(Str Str) [data: &Str pwd: &Str]
+  (let [[p e] (pkix/pkcs12-decode data pwd "")]
+    (cond
+      (str/includes? e "wrong password") (values "" "keystore password was incorrect")
+      (not= e "") (values "" (str "not a PKCS#12 keystore: " e))
+      (= (count (:keys p)) 0) (values "" "no private key in the PKCS#12 keystore")
+      :else (values (pkix/pkcs8-der (nth (:keys p) 0)) ""))))
+
+(defn- le-bytes Str [n: Int k: Int]
+  (loop [i 0 x n out ""] (if (>= i k) out (recur (+ i 1) (quot x 256) (str out (chr (mod x 256)))))))

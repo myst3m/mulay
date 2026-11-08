@@ -1,0 +1,428 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18195"/>
+    </http:listener-config>
+
+    <file:config name="F">
+        <file:connection workingDir="/tmp/mulay-oracle-dw-deferred"/>
+    </file:config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description, step: vars.step default "none"}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="seed">
+        <http:listener config-ref="HTTP" path="/seed"/>
+        <file:write config-ref="F" path="arr.json"><file:content>[{"id": 1, "v": "a"}, {"id": 2, "v": "b"}, {"id": 3, "v": "c"}, {"id": 4, "v": "d"}]</file:content></file:write>
+        <file:write config-ref="F" path="empty.json"><file:content>[]</file:content></file:write>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- そのまま応答にする -->
+    <flow name="basic">
+        <http:listener config-ref="HTTP" path="/basic"/>
+        <set-payload value='[{"id": 1, "v": "a"}, {"id": 2, "v": "b"}, {"id": 3, "v": "c"}]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true
+---
+payload map {id: $.id, x: $.v ++ "!"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 型と、2 回読むこと -->
+    <flow name="meta">
+        <http:listener config-ref="HTTP" path="/meta"/>
+        <set-payload value='[{"id": 1, "v": "a"}, {"id": 2, "v": "b"}, {"id": 3, "v": "c"}]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true
+---
+payload map {id: $.id, x: $.v ++ "!"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="first" value="#[output application/java --- {&quot;type&quot;: typeOf(payload) as String, mime: payload.^mimeType default 'none', cls: payload.^class default 'none', n: sizeOf(payload)}]"/>
+        <set-payload value="#[output application/json --- {first: vars.first}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 途中の要素でエラー: 変換のときではなく、読んだときに出る -->
+    <flow name="error-read">
+        <http:listener config-ref="HTTP" path="/error-read"/>
+        <set-payload value='[1, 2, 0, 4]' mimeType="application/json"/>
+        <set-variable variableName="step" value="transform"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true
+---
+payload map (10 / $)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="step" value="read"/>
+        <set-payload value="#[output application/json --- {n: sizeOf(payload)}]"/>
+        <set-variable variableName="step" value="done"/>
+        <!-- 読む側に届くのは、失敗した所までのテキストか空 (実 Mule は書き手が別のスレッドなので回によって違う) -->
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {&quot;type&quot;: error.errorType.namespace ++ ':' ++ error.errorType.identifier, step: vars.step, json: error.description contains 'while reading `payload` as Json'}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- deferred でなければ変換のときに出る -->
+    <flow name="error-eager">
+        <http:listener config-ref="HTTP" path="/error-eager"/>
+        <set-payload value='[1, 2, 0, 4]' mimeType="application/json"/>
+        <set-variable variableName="step" value="transform"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map (10 / $)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="step" value="read"/>
+        <set-payload value="#[output application/json --- {n: sizeOf(payload)}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- ファイルへ書く。途中で失敗しても書き込みは失敗にならず、失敗した所までか空のファイルになる (回によって違う)。
+         bad のときは text を見ず、正しい出力の先頭部分であること (prefix) だけを確かめる -->
+    <flow name="file">
+        <http:listener config-ref="HTTP" path="/file"/>
+        <set-variable variableName="bad" value="#[attributes.queryParams.bad default '0']"/>
+        <file:read config-ref="F" path="arr.json" outputMimeType="#[attributes.queryParams.mime default 'application/json']"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true, indent=false
+---
+payload map {id: $.id, x: if ($.id == (vars.bad as Number)) (1 / 0) else upper($.v)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="step" value="write"/>
+        <file:write config-ref="F" path="out.json"/>
+        <set-variable variableName="step" value="written"/>
+        <file:read config-ref="F" path="out.json" outputMimeType="text/plain"/>
+        <set-payload value="#[output application/json --- {text: if (vars.bad == '0') payload else 'n/a', prefix: '[{&quot;id&quot;: 1,&quot;x&quot;: &quot;A&quot;},{&quot;id&quot;: 2,&quot;x&quot;: &quot;B&quot;}' startsWith payload}]"/>
+        <error-handler>
+            <on-error-continue>
+                <file:read config-ref="F" path="out.json" outputMimeType="text/plain"/>
+                <set-payload value="#[output application/json --- {&quot;type&quot;: error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description, step: vars.step, left: payload}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- CSV -->
+    <flow name="csv">
+        <http:listener config-ref="HTTP" path="/csv"/>
+        <set-payload value='[{"id": 1, "v": "a"}, {"id": 2, "v": "b"}]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/csv deferred=true
+---
+payload map {id: $.id, v: upper($.v)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 変数にも deferred -->
+    <flow name="var">
+        <http:listener config-ref="HTTP" path="/var"/>
+        <set-payload value='[1, 2, 3]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="d"><![CDATA[%dw 2.0
+output application/json deferred=true
+---
+payload map ($ * 2)]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <set-payload value="#[output application/json --- {d: vars.d, mime: vars.d.^mimeType default 'none', t: typeOf(vars.d) as String}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 配列でない結果 -->
+    <flow name="object">
+        <http:listener config-ref="HTTP" path="/object"/>
+        <set-payload value='{"a": 1}' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true
+---
+{b: payload.a + 1, list: [1, 2]}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 読み手の streaming=true と合わせる -->
+    <flow name="stream">
+        <http:listener config-ref="HTTP" path="/stream"/>
+        <file:read config-ref="F" path="arr.json" outputMimeType="application/json; streaming=true"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true
+---
+payload map {id: $.id * 10}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <file:write config-ref="F" path="out2.json"/>
+        <file:read config-ref="F" path="out2.json"/>
+    </flow>
+
+    <!-- 1 回読んだ後でもう一度読む -->
+    <flow name="twice">
+        <http:listener config-ref="HTTP" path="/twice"/>
+        <set-payload value='[1, 2, 3]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true
+---
+payload map ($ * 2)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="step" value="first"/>
+        <set-variable variableName="a" value="#[sizeOf(payload)]"/>
+        <set-variable variableName="step" value="second"/>
+        <set-variable variableName="b" value="#[sizeOf(payload)]"/>
+        <set-payload value="#[output application/json --- {a: vars.a, b: vars.b}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {a: vars.a default 'none', step: vars.step, &quot;type&quot;: error.errorType.namespace ++ ':' ++ error.errorType.identifier, pipe: error.description contains 'Pipe closed'}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- logger で読んだ後 (表示は読むか) -->
+    <flow name="after-logger">
+        <http:listener config-ref="HTTP" path="/after-logger"/>
+        <set-payload value='[1, 2, 3]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true
+---
+payload map ($ * 2)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <logger level="INFO" message="#[payload]"/>
+        <set-payload value="#[output application/json --- {n: sizeOf(payload)}]"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="#[output application/json --- {&quot;type&quot;: error.errorType.namespace ++ ':' ++ error.errorType.identifier, pipe: error.description contains 'Pipe closed'}]"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+    <flow name="empty">
+        <http:listener config-ref="HTTP" path="/empty"/>
+        <set-payload value='[]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true
+---
+payload map ($ * 2)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="skipnull">
+        <http:listener config-ref="HTTP" path="/skipnull"/>
+        <set-payload value='[1, 2, 3]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true, skipNullOn="arrays"
+---
+payload map (if ($ == 2) null else {v: $, n: null})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="stream-plain">
+        <http:listener config-ref="HTTP" path="/stream-plain"/>
+        <file:read config-ref="F" path="#[attributes.queryParams.path default 'arr.json']" outputMimeType="application/json; streaming=true"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map {id: $.id, v: upper($.v)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="stream-plain-err">
+        <http:listener config-ref="HTTP" path="/stream-plain-err"/>
+        <file:read config-ref="F" path="arr.json" outputMimeType="application/json; streaming=true"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map {id: $.id, q: 10 / ($.id - 3)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+    <flow name="indent-d">
+        <http:listener config-ref="HTTP" path="/indent-d"/>
+        <set-payload value='[1, 2]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json deferred=true, indent=false
+---
+payload map ($ + 1)]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="mt" value="#[payload.^mimeType]"/>
+    </flow>
+    <flow name="skipnull-plain">
+        <http:listener config-ref="HTTP" path="/skipnull-plain"/>
+        <set-payload value='[1, 2, 3]' mimeType="application/json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json skipNullOn="arrays", duplicateKeyAsArray=true, writeAttributes=true
+---
+payload map (if ($ == 2) null else {v: $})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+    <flow name="mt-a">
+        <http:listener config-ref="HTTP" path="/mt-a"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json indent=false, skipNullOn="arrays"
+---
+[{a: 1}]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="mt-b">
+        <http:listener config-ref="HTTP" path="/mt-b"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json skipNullOn="everywhere"
+---
+[{a: 1}]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="mt-c">
+        <http:listener config-ref="HTTP" path="/mt-c"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json writeAttributes=true
+---
+[{a: 1}]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="mt-d">
+        <http:listener config-ref="HTTP" path="/mt-d"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json writeAttributes=true, duplicateKeyAsArray=true
+---
+[{a: 1}]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="mt-e">
+        <http:listener config-ref="HTTP" path="/mt-e"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json indent=false, writeAttributes=true
+---
+[{a: 1}]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="mt-f">
+        <http:listener config-ref="HTTP" path="/mt-f"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/csv header=false, separator=";"
+---
+[{a: 1}]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="mt-g">
+        <http:listener config-ref="HTTP" path="/mt-g"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/xml indent=false, writeDeclaration=false
+---
+{root: {a: 1}}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="mt-h">
+        <http:listener config-ref="HTTP" path="/mt-h"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json bufferSize=1000
+---
+[{a: 1}]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="mt-i">
+        <http:listener config-ref="HTTP" path="/mt-i"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json indent=false, deferred=true, skipNullOn="arrays"
+---
+[{a: 1}]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+</mule>

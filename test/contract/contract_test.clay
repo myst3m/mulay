@@ -1,0 +1,90 @@
+(ns contract-test (:require [mulay.note.run :as nr] [mulay.note.contract :as ct] [mulay.mule.amodel :as am] [clay.string :as str]))
+
+(def LINKED "test/fixtures/livenote/linked")
+
+(def SPEC-POST "openapi: 3.0.0\ninfo: {title: customer, version: '1'}\npaths:\n  /customers/{id}:\n    post:\n      parameters:\n        - {name: id, in: path, required: true, schema: {type: string}}\n      responses:\n        '200': {description: ok}\n")
+(def SPEC-GET "openapi: 3.0.0\ninfo: {title: customer, version: '1'}\npaths:\n  /customers/{id}:\n    get:\n      responses:\n        '200': {description: ok}\n")
+
+(defn- link-json Str [spec: &Str]
+  (str "[{\"name\":\"customer-sys\",\"url\":\"http://customer-sys:8082/api\",\"spec\":{\"main\":\"customer.yaml\",\"files\":{\"customer.yaml\":" (ct/jq spec) "}}}]"))
+
+(defn- warns Vec(am/ADiag) [md: &am/AModel] (filterv (fn Bool [d: am/ADiag] (= (:severity d) "warning")) (:diags md)))
+
+(deftest links-parse
+  (let [[ls e] (ct/links-json (link-json SPEC-GET))
+        [l2 e2] (ct/links-json "{}")]
+    (is (= e ""))
+    (is (= (count ls) 1))
+    (is (= (:name (nth ls 0)) "customer-sys"))
+    (is (= (:main (nth ls 0)) "customer.yaml"))
+    (is (= e2 "@links must be a JSON array"))))
+
+(deftest http-request-without-the-operation
+  (let [md (nr/load-dir-full LINKED [] (link-json SPEC-GET))
+        ws (warns md)]
+    (is (= (count ws) 1))
+    (is (= (:code (nth ws 0)) "contract.no-operation"))
+    (is (= (:path (nth ws 0)) "orders/processors/0"))
+    (is (= (:message (nth ws 0)) "customer-sys (customer.yaml) has no operation POST /customers/{cid}"))
+    (is (= (:data (nth ws 0)) "{\"link\":\"customer-sys\",\"spec\":\"customer.yaml\",\"method\":\"POST\",\"path\":\"/customers/{cid}\"}"))
+    (is (= (count (:span (nth ws 0))) 2))
+    (is (str/includes? (am/to-json md) "\"severity\":\"warning\""))))
+
+(deftest http-request-uri-param-name
+  (let [md (nr/load-dir-full LINKED [] (link-json SPEC-POST))
+        ws (warns md)]
+    (is (= (count ws) 1))
+    (is (= (:code (nth ws 0)) "contract.uri-param"))
+    (is (= (:message (nth ws 0)) "the URI parameter 'cid' is called 'id' in customer-sys (customer.yaml): POST /customers/{id}"))
+    (is (= (:data (nth ws 0)) "{\"link\":\"customer-sys\",\"spec\":\"customer.yaml\",\"method\":\"POST\",\"path\":\"/customers/{id}\",\"param\":\"cid\",\"expected\":\"id\"}"))))
+
+(deftest no-links-no-warnings
+  (let [md (nr/load-dir-full LINKED [] "")
+        md2 (nr/load-dir-full "test/fixtures/livenote/dbapp" [] "")]
+    (is (= (count (warns md)) 0))
+    (is (= (count (warns md2)) 0))))
+
+(deftest sql-against-the-seed
+  (let [md (nr/load-dir-full "test/fixtures/livenote/dbcontract" [] "")
+        ws (warns md)]
+    (is (= (mapv (fn Str [d: am/ADiag] (str (:path d) " " (:code d) " " (:data d))) ws)
+           ["f/processors/0 sql.unknown-column {\"config\":\"orders-db\",\"table\":\"\",\"column\":\"tierr\"}"
+            "f/processors/1 sql.unknown-table {\"config\":\"orders-db\",\"table\":\"orderz\"}"
+            "f/processors/5 sql.unknown-column {\"config\":\"pg-db\",\"table\":\"\",\"column\":\"tier\"}"]))
+    (is (= (:message (nth ws 0)) "the column 'tierr' is not in livenote/db/orders-db.sql"))
+    (is (= (:message (nth ws 1)) "the table 'orderz' is not in livenote/db/orders-db.sql"))))
+
+(def SPEC-EX "openapi: 3.0.0\ninfo: {title: customer, version: '1'}\npaths:\n  /customers/{cid}:\n    post:\n      responses:\n        '400': {description: bad, content: {application/json: {example: {error: x}}}}\n        '201': {description: made, content: {application/json: {example: {id: 42, name: Ann}}}}\n")
+
+(defn- ex-of nr/NTrace [id: Str]
+  (let [xs (nr/examples LINKED)]
+    (nr/run-example-val (loop [i 0] (if (= (nr/example-id (nth xs i)) id) (nth xs i) (recur (+ i 1)))) "")))
+
+(deftest answers-with-the-spec-example
+  (let [md (nr/load-dir-full LINKED [] (link-json SPEC-EX))
+        t (ex-of "ok")
+        st (nth (:steps t) 1)
+        j (nr/trace-json t)]
+    (is (= (:status st) "example"))
+    (is (= (:example st) "{\"link\":\"customer-sys\",\"spec\":\"customer.yaml\",\"method\":\"POST\",\"path\":\"/customers/{cid}\",\"status\":201,\"mediaType\":\"application/json\"}"))
+    (is (= (nr/value-text (:out-payload st)) "{\"id\":42,\"name\":\"Ann\"}"))
+    (is (not= (:request st) ""))
+    (is (str/includes? j ",\"example\":{\"link\":\"customer-sys\""))
+    (is (str/includes? (nr/value-text (:out-payload (nth (:steps t) 2))) "\"st\": 201"))))
+
+(deftest no-example-stays-held
+  (let [md (nr/load-dir-full LINKED [] (link-json SPEC-GET))
+        t (ex-of "ok")]
+    (is (= (:status (nth (:steps t) 1)) "held"))))
+
+(deftest raml-with-includes
+  (let [main "#%RAML 1.0\ntitle: customer\n/customers:\n  /{cid}:\n    post:\n      body:\n        application/json:\n          type: !include types/order.raml\n      responses:\n        201:\n          body:\n            application/json:\n              example: !include examples/made.json\n"
+        lj (str "[{\"name\":\"customer-sys\",\"url\":\"http://customer-sys:8082/api\",\"spec\":{\"main\":\"customer.raml\",\"files\":{\"customer.raml\":" (ct/jq main)
+                ",\"types/order.raml\":" (ct/jq "#%RAML 1.0 DataType\ntype: object\nproperties:\n  order: string\n")
+                ",\"examples/made.json\":" (ct/jq "{\"id\": 7}") "}}}]")
+        md (nr/load-dir-full LINKED [] lj)
+        t (ex-of "ok")
+        st (nth (:steps t) 1)]
+    (is (= (count (warns md)) 0))
+    (is (= (:status st) "example"))
+    (is (str/includes? (nr/value-text (:out-payload st)) "7"))))

@@ -1,0 +1,36 @@
+(ns mulay.cli.dwpath (:require [clay.string :as str] [mulay.lib.fs :as fs] [mulay.dw.engine :as eng]))
+
+(defn module-file Str [m: &Str] (eng/module-path m))
+
+(defn- absolute Str [p: &Str cwd: &Str] (if (str/starts-with? p "/") (str p) (fs/join cwd p)))
+
+(defn- project-resources Vec(Str) [dir: &Str]
+  (loop [d (str dir)]
+    (let [r (fs/join d "src/main/resources")]
+      (cond (fs/dir? r) [r]
+            (or (= d "/") (= d "")) []
+            :else (recur (fs/parent d))))))
+
+(defn- add-new Vec(Str) [acc: Vec(Str) xs: &Vec(Str)]
+  (loop [i 0 out acc]
+    (if (>= i (count xs)) out
+      (let [x (nth xs i)
+            seen (loop [k 0] (if (>= k (count out)) false (if (= (nth out k) x) true (recur (+ k 1)))))]
+        (recur (+ i 1) (if seen out (conj out x)))))))
+
+(defn roots Vec(Str) [paths: &Vec(Str) script: &Str cwd: &Str]
+  (let [sdir (fs/parent (absolute script cwd))
+        r1 (add-new [] paths)
+        r2 (add-new r1 [sdir])
+        r3 (add-new r2 (project-resources sdir))]
+    (add-new r3 (project-resources (str cwd)))))
+
+(defn loader Fn(Str Values(Str Bool)) [rs: Vec(Str)]
+  (fn Values(Str Bool) [m: Str]
+    (let [f (module-file m)]
+      (loop [i 0]
+        (if (>= i (count rs)) (values "" false)
+          (let [p (fs/join (nth rs i) f)]
+            (if (fs/exists? p)
+              (let [[t e] (read-file p)] (if (= e "") (values t true) (recur (+ i 1))))
+              (recur (+ i 1)))))))))

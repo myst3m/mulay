@@ -1,0 +1,82 @@
+(ns mulay.dw.javaobj
+  (:require [mulay.dw.val :as v] [clay.string :as str]))
+
+(def TAB "   ")
+(def TAB2 "      ")
+
+(defn- class-name Str [x: &v/Val]
+  (match x
+    (v/VMeta y m) (let [c (v/obj-get m "class")]
+                    (if (> (count c) 0) (match (v/unmeta (nth c 0)) (v/VStr s) (str s) _ "") (class-name y)))
+    _ ""))
+
+(defn- fields Vec(v/Field) [x: &v/Val] (match (v/unmeta x) (v/VObj fs) fs _ []))
+
+(defn- text Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VNull) "null"
+    (v/VStr s) (str s)
+    (v/VBool b) (if b "true" "false")
+    (v/VInt i) (str i)
+    _ ""))
+
+(defn- get-text Str [fs: &Vec(v/Field) name: &Str]
+  (let [r (v/obj-get fs name)] (if (= (count r) 0) "null" (text (nth r 0)))))
+
+(defn- secret-header? Bool [k: &Str]
+  (or (= k "password") (= k "pass") (str/includes? k "secret") (str/includes? k "authorization")))
+
+(defn- table Str [out: Str name: &Str x: &v/Val]
+  (let [fs (fields x)]
+    (if (= (count fs) 0) (str out TAB name "=[]\n")
+      (loop [i 0 acc (str out TAB name "=[\n")]
+        (if (>= i (count fs)) (str acc TAB "]\n")
+          (let [f (nth fs i)
+                k (:name (:key f))
+                val (if (secret-header? k) "****" (text (:value f)))]
+            (recur (+ i 1) (str acc TAB2 k "=" val "\n"))))))))
+
+(defn- line Str [out: Str name: &Str val: &Str] (str out TAB name "=" val "\n"))
+
+(defn- request-attrs Str [c: &Str x: &v/Val]
+  (let [fs (fields x)
+        qs (let [q (v/obj-get fs "queryParams")] (if (= (count q) 0) (let [z: Vec(v/Field) []] z) (fields (nth q 0))))
+        hide-qs (loop [i 0] (if (>= i (count qs)) false
+                              (let [k (:name (:key (nth qs i)))]
+                                (if (or (= k "pass") (= k "password") (str/includes? k "secret")) true (recur (+ i 1))))))
+        o0 (str c "\n{\n")
+        o1 (line o0 "Request path" (get-text fs "requestPath"))
+        o2 (line o1 "Raw request path" (get-text fs "rawRequestPath"))
+        o3 (line o2 "Method" (get-text fs "method"))
+        o4 (line o3 "Listener path" (get-text fs "listenerPath"))
+        o5 (line o4 "Local Address" (get-text fs "localAddress"))
+        o6 (line o5 "Query String" (if hide-qs "****" (get-text fs "queryString")))
+        o7 (line o6 "Relative Path" (get-text fs "relativePath"))
+        o8 (line o7 "Masked Request Path" (get-text fs "maskedRequestPath"))
+        o9 (line o8 "Remote Address" (get-text fs "remoteAddress"))
+        o10 (line o9 "Request Uri" (get-text fs "requestUri"))
+        o11 (line o10 "Raw request Uri" (get-text fs "rawRequestUri"))
+        o12 (line o11 "Scheme" (get-text fs "scheme"))
+        o13 (line o12 "Version" (get-text fs "version"))
+        o14 (table o13 "Headers" (or-empty fs "headers"))
+        o15 (table o14 "Query Parameters" (or-empty fs "queryParams"))
+        o16 (table o15 "URI Parameters" (or-empty fs "uriParams"))]
+    (str o16 "}")))
+
+(defn- or-empty v/Val [fs: &Vec(v/Field) name: &Str]
+  (let [r (v/obj-get fs name)] (if (= (count r) 0) (v/->VObj []) (nth r 0))))
+
+(defn- response-attrs Str [c: &Str x: &v/Val]
+  (let [fs (fields x)
+        o0 (str c "\n{\n")
+        o1 (line o0 "Status Code" (get-text fs "statusCode"))
+        o2 (line o1 "Reason Phrase" (get-text fs "reasonPhrase"))
+        o3 (table o2 "Headers" (or-empty fs "headers"))]
+    (str o3 "}")))
+
+(defn to-string Values(Str Bool) [x: &v/Val]
+  (let [c (class-name x)]
+    (cond
+      (= c "org.mule.extension.http.api.HttpRequestAttributes") (values (request-attrs c x) true)
+      (= c "org.mule.extension.http.api.HttpResponseAttributes") (values (response-attrs c x) true)
+      :else (values "" false))))

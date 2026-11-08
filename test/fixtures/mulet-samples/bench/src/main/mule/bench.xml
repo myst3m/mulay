@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="httpConfig">
+        <http:listener-connection host="0.0.0.0" port="8098"/>
+    </http:listener-config>
+
+    <!-- Test 1: Simple echo with small transform -->
+    <flow name="bench-echo">
+        <http:listener config-ref="httpConfig" path="/echo"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "ok",
+  timestamp: now() as String,
+  method: attributes.method
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Test 2: Data transformation with map/filter -->
+    <flow name="bench-transform">
+        <http:listener config-ref="httpConfig" path="/transform"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  items: (1 to 100) map {
+    id: $,
+    name: "item-" ++ ($ as String),
+    price: $ * 10.5,
+    category: if (($ mod 3) == 0) "A" else if (($ mod 3) == 1) "B" else "C"
+  },
+  summary: {
+    total: sizeOf(1 to 100),
+    avgPrice: avg((1 to 100) map ($ * 10.5))
+  }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Test 3: Multi-step flow with variables and flow-ref -->
+    <flow name="bench-pipeline">
+        <http:listener config-ref="httpConfig" path="/pipeline"/>
+        <set-variable variableName="inputSize" value="#[50]"/>
+        <flow-ref name="generate-data"/>
+        <flow-ref name="process-data"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  processed: payload,
+  metadata: {
+    inputSize: vars.inputSize,
+    outputSize: sizeOf(payload),
+    highValueCount: vars.highValueCount
+  }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <sub-flow name="generate-data">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(1 to vars.inputSize) map {
+  id: $,
+  name: "product-" ++ ($ as String),
+  price: ($ * 7.3) + 0.99,
+  quantity: ($ mod 20) + 1,
+  active: ($ mod 5) != 0
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <sub-flow name="process-data">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload filter $.active map {
+  id: $.id,
+  name: upper($.name),
+  total: $.price * $.quantity,
+  tier: if ($.price > 200) "premium" else if ($.price > 100) "standard" else "basic"
+}]]></ee:set-payload>
+            </ee:message>
+            <ee:variables>
+                <ee:set-variable variableName="highValueCount"><![CDATA[%dw 2.0
+output application/json
+---
+sizeOf(payload filter ($.price * $.quantity > 500))]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- Test 4: Choice routing with multiple branches -->
+    <flow name="bench-routing">
+        <http:listener config-ref="httpConfig" path="/routing"/>
+        <set-variable variableName="routeType" value="#[attributes.queryParams.routeType default 'default']"/>
+        <choice>
+            <when expression="#[vars.routeType == 'array']">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+(1 to 50) map {
+  index: $,
+  value: $ * $ ,
+  sqrt: sqrt($ as Number)
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <when expression="#[vars.routeType == 'object']">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  squares: (1 to 26) map ($ * $),
+  numbers: (1 to 10) reduce ((item, acc = 0) -> acc + item)
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  message: "default route",
+  routeType: vars.routeType
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Test 5: Pure compute - heavy DW, tiny response -->
+    <flow name="bench-compute">
+        <http:listener config-ref="httpConfig" path="/compute"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var data = (1 to 2000) map {
+  id: $,
+  val: $ * $ * 0.37,
+  cat: if (($ mod 7) == 0) "x" else if (($ mod 5) == 0) "y" else "z"
+}
+var filtered = data filter $.cat != "z"
+var totals = filtered reduce ((item, acc = {sum: 0, count: 0}) -> {
+  sum: acc.sum + item.val,
+  count: acc.count + 1
+})
+var sorted = filtered orderBy $.val
+---
+{
+  avg: totals.sum / totals.count,
+  count: totals.count,
+  min: sorted[0].val,
+  max: sorted[-1].val
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Test 6: Nested reduce/filter - heavy compute, tiny response -->
+    <flow name="bench-nested">
+        <http:listener config-ref="httpConfig" path="/nested"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var s1 = (1 to 5000) reduce ((item, acc = 0) -> acc + item * item)
+var s2 = (1 to 5000) reduce ((item, acc = 0) -> acc + item * 3)
+var s3 = (1 to 5000) reduce ((item, acc = 0) -> acc + (if ((item mod 3) == 0) item else 0))
+var s4 = sizeOf((1 to 5000) filter (($ mod 7) == 0))
+var s5 = sizeOf((1 to 5000) filter (($ mod 11) == 0))
+var s6 = (1 to 3000) map ($ * $ + $ * 3 + 7)
+var s7 = s6 reduce ((item, acc = 0) -> acc + item)
+---
+{
+  sum1: s1,
+  sum2: s2,
+  sum3: s3,
+  count4: s4,
+  count5: s5,
+  sum7: s7
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- HTTP request config for outbound calls (external dummy server) -->
+    <http:request-config name="upstreamConfig">
+        <http:request-connection host="localhost" port="18099"/>
+    </http:request-config>
+
+    <!-- Test 7: HTTP outbound - calls external upstream (I/O flow) -->
+    <flow name="bench-io-simple">
+        <http:listener config-ref="httpConfig" path="/io-simple"/>
+        <http:request config-ref="upstreamConfig" method="GET" path="/echo"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  source: "io-simple",
+  upstream: payload
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Test 8: Transform + HTTP outbound + Transform (I/O pipeline) -->
+    <flow name="bench-io-pipeline">
+        <http:listener config-ref="httpConfig" path="/io-pipeline"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  request: "prepared",
+  items: (1 to 50) map { id: $, val: $ * 3.14 }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <http:request config-ref="upstreamConfig" method="GET" path="/echo"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  source: "io-pipeline",
+  upstream: payload,
+  processed: true
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Test 9: Flow-ref to sub-flow with HTTP outbound (I/O via sub-flow) -->
+    <flow name="bench-io-subflow">
+        <http:listener config-ref="httpConfig" path="/io-subflow"/>
+        <set-variable variableName="tag" value="#['from-subflow']"/>
+        <flow-ref name="call-upstream"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  source: "io-subflow",
+  tag: vars.tag,
+  upstream: payload
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <sub-flow name="call-upstream">
+        <http:request config-ref="upstreamConfig" method="GET" path="/echo"/>
+    </sub-flow>
+
+</mule>

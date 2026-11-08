@@ -1,0 +1,109 @@
+(ns spool-out-test (:require [mulay.rt.engine :as en] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.stream :as stream]
+                             [mulay.mule.model :as m] [mulay.lib.res :as res] [mulay.mule.parse :as ps] [mulay.dw.engine :as eng]
+                             [mulay.lib.fs :as fs] [clay.io :as io] [mulay.rt.persist :as pst] [mulay.lib.host :as host] [clay.string :as str]))
+
+
+(defn- loc m/Loc [] (m/->Loc "t.xml" 1 "f/processors/0" "<x></x>" "" []))
+(defn- ex m/PVal [s: Str]
+  (m/->PExpr (str "#[" s "]") (eng/compile s m/BINDINGS) (m/->ExprSrc s s 0 "anonymous::main" false (ps/refs s) "" -1)))
+(defn- no-res Values(Str Bool) [p: Str] (values "" false))
+(defn- no-res-url Str [p: Str] "")
+(defn- app m/App [dir: Str] (m/->App "t" [] [] [] "" [(m/->Param "mulay.work.dir" (m/->PLit dir))] [] [] no-res no-res-url [] (let [mp: Map(Str Str) {}] mp) [] (res/res-none)))
+(defn- ctx en/Ctx [dir: Str] (en/new-ctx (app dir) [] 5))
+(defn- ev0 ev/Event [rid: Str] (ev/with-rid (ev/new-event (ev/tv-raw "{}" "application/json") (ev/tv-null) rid "main") rid))
+(defn- spool-files Int [dir: &Str] (let [[ns e] (io/list-dir (str dir "/t/spool/" (host/pid)))] (count ns)))
+(defn- set-payload Vec(m/Proc) [script: Str] [(m/->PrSetPayload (ex script) "" "" (loc))])
+(defn- bytes-of Str [e: &ev/Event] (let [[b be] (ev/bytes (:payload e))] b))
+
+(defn- objs Str [n: Int]
+  (loop [i 1 out "["] (if (> i n) (str out "]") (recur (+ i 1) (str out (if (> i 1) "," "") "{\"i\": " i "}")))))
+
+(deftest a-big-output-goes-to-a-spool-and-reads-twice
+  (let [d "target/t-spool-out-1"
+        z (fs/remove-tree d)
+        [e x] (en/run-procs (ctx d) (set-payload "output application/json indent=false --- (1 to 100000) map {i: $}") (ev0 "r1"))
+        b1 (bytes-of e)
+        b2 (bytes-of e)
+        during (spool-files d)
+        z2 (stream/leave "r1")
+        after (spool-files d)
+        z3 (fs/remove-tree d)]
+    (is (= (count x) 0))
+    (is (= (:state (:payload e)) ev/PIPE))
+    (is (= (ev/content-type (:payload e)) "application/json; charset=UTF-8; indent=\"false\""))
+    (is (= b1 (objs 100000)))
+    (is (= b2 b1))
+    (is (= during 1))
+    (is (= after 0))))
+
+(deftest a-small-output-stays-in-memory
+  (let [d "target/t-spool-out-2"
+        [e x] (en/run-procs (ctx d) (set-payload "output application/json indent=false --- (1 to 10) map {i: $}") (ev0 "r2"))
+        z (fs/remove-tree d)]
+    (is (= (count x) 0))
+    (is (not= (:state (:payload e)) ev/PIPE))
+    (is (= (bytes-of e) (objs 10)))))
+
+(deftest a-failure-partway-leaves-no-spool
+  (let [d "target/t-spool-out-3"
+        z (fs/remove-tree d)
+        [e x] (en/run-procs (ctx d) (set-payload "output application/json indent=false --- (1 to 100000) map (if ($ == 90000) fail('boom') else {i: $})") (ev0 "r3"))
+        files (spool-files d)
+        z2 (stream/leave "r3")
+        z3 (fs/remove-tree d)]
+    (is (= (count x) 1))
+    (is (= (err/type-str (nth x 0)) "MULE:EXPRESSION"))
+    (is (str/includes? (:description (nth x 0)) "boom"))
+    (is (= files 0))))
+
+(deftest a-small-json-output-of-a-sequence-keeps-its-value
+  (let [d "target/t-spool-out-4"
+        [e x] (en/run-procs (ctx d) [(m/->PrSetPayload (ex "output application/json indent=false --- (1 to 100000) map {i: $}") "" "" (loc))
+                                    (m/->PrSetPayload (ex "output application/json indent=false --- payload filter ($.i < 3)") "" "" (loc))] (ev0 "r4"))
+        z (stream/leave "r4")
+        z2 (fs/remove-tree d)]
+    (is (= (count x) 0))
+    (is (= (:state (:payload e)) ev/BOTH))
+    (is (= (bytes-of e) "[{\"i\": 1},{\"i\": 2}]"))))
+
+(deftest clearing-spools-keeps-live-processes
+  (let [d "target/t-spool-out-5"
+        z (fs/remove-tree d)
+        a (app d)
+        root (str d "/t/spool")
+        own (pst/spool-dir a)
+        z1 (fs/mkdirs (str root "/1"))
+        z2 (fs/mkdirs (str root "/999999999"))
+        z3 (fs/mkdirs own)
+        z4 (host/file-write (str own "/out-1") "x")
+        z5 (host/file-write (str root "/body-3") "y")
+        ce (pst/clear-spools a)
+        [names le] (io/list-dir root)
+        [mine me] (io/list-dir own)
+        live (fs/dir? (str root "/1"))
+        dead (fs/exists? (str root "/999999999"))
+        body (fs/exists? (str root "/body-3"))
+        kept (fs/dir? own)
+        z6 (fs/remove-tree d)]
+    (is (= ce ""))
+    (is (= own (str root "/" (host/pid))))
+    (is live)
+    (is (not dead))
+    (is (not body))
+    (is kept)
+    (is (= (count mine) 0))))
+
+(defn- xml-of Str [n: Int]
+  (loop [i 1 out "<?xml version='1.0' encoding='UTF-8'?>\n<r>"] (if (> i n) (str out "\n</r>") (recur (+ i 1) (str out "\n  <e>" i "</e>")))))
+
+(deftest a-big-xml-output-of-a-lazy-object-goes-to-a-spool
+  (let [d "target/t-spool-out-6"
+        z (fs/remove-tree d)
+        [e x] (en/run-procs (ctx d) [(m/->PrSetPayload (ex "output application/json indent=false --- (1 to 60000) map {i: $}") "" "" (loc))
+                                    (m/->PrSetPayload (ex "output application/xml --- {r: {(payload map {e: $.i})}}") "" "" (loc))] (ev0 "r5"))
+        b (bytes-of e)
+        z2 (stream/leave "r5")
+        z3 (fs/remove-tree d)]
+    (is (= (count x) 0))
+    (is (= (:state (:payload e)) ev/PIPE))
+    (is (= b (xml-of 60000)))))

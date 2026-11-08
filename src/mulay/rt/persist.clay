@@ -1,0 +1,82 @@
+(ns mulay.rt.persist
+  (:require [mulay.lib.host :as host] [mulay.dw.val :as v] [mulay.dw.fmt.dw :as dwf] [mulay.dw.fmt.dwread :as dwr] [mulay.mule.model :as m]
+            [mulay.rt.event :as ev] [mulay.lib.fs :as fs] [clay.base64 :as b64] [clay.string :as str]))
+
+
+(defn b64e Str [s: &Str] (if (= (count s) 0) "-" (b64/encode (str s))))
+(defn b64d Str [s: &Str] (if (= s "-") "" (let [[b e] (b64/decode (str s))] b)))
+
+(defn- prop Str [app: &m/App key: &Str default: Str]
+  (let [ps (:properties app)]
+    (loop [i 0]
+      (if (>= i (count ps)) default
+        (if (= (:name (nth ps i)) key)
+          (match (:v (nth ps i)) (m/PLit s) (str s) _ default)
+          (recur (+ i 1)))))))
+
+(defn safe-name Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) (if (= out "") "_" out)
+      (let [c (nth s i)
+            ok (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 45) (= c 95) (= c 46))]
+        (recur (+ i 1) (str out (if ok (subs s i (+ i 1)) "_")))))))
+
+(defn dir Str [app: &m/App kind: &Str]
+  (fs/join (fs/join (prop app "mulay.work.dir" ".mulay") (safe-name (:name app))) kind))
+
+(defn spool-dir Str [app: &m/App] (fs/join (dir app "spool") (str (host/pid))))
+
+(defn- live-pid? Bool [name: &Str]
+  (and (> (count name) 0)
+       (loop [i 0] (if (>= i (count name)) true (if (and (>= (nth name i) 48) (<= (nth name i) 57)) (recur (+ i 1)) false)))
+       (not= name (str (host/pid)))
+       (host/file-exists? (str "/proc/" name))))
+
+(defn clear-spools Str [app: &m/App]
+  (let [root (dir app "spool")
+        [names le] (host/file-list root)
+        e (loop [i 0 err ""]
+            (if (>= i (count names)) err
+              (let [n (nth names i)]
+                (if (live-pid? n) (recur (+ i 1) err)
+                  (let [r (fs/remove-tree (fs/join root n))] (recur (+ i 1) (if (= err "") r err)))))))
+        own (spool-dir app)
+        me (fs/mkdirs-private own)]
+    (if (not= e "") e me)))
+
+(defn tv-fields Str [t0: &ev/TV]
+  (let [t (ev/settle t0)]
+  (if (not= (:state t) ev/VAL)
+    (str "r " (b64e (:mime t)) " " (b64e (:raw t)))
+    (let [[text e] (dwf/write (:val t) [])]
+      (str "v " (b64e (:mime t)) " " (b64e text))))))
+
+(defn tv-of ev/TV [kind: &Str mime64: &Str data64: &Str]
+  (let [mime (b64d mime64)
+        data (b64d data64)]
+    (if (= kind "r") (ev/tv-raw data mime)
+      (let [[x e] (dwr/read data "application/dw")]
+        (ev/tv-val (if (= e "") x (v/->VStr data)) mime)))))
+
+(def TMP-SEQ (atom 0))
+
+(defn save Str [path: &Str lines: &Vec(Str)]
+  (let [d (fs/parent path)
+        me (fs/mkdirs-private d)
+        n (swap! TMP-SEQ (fn Int [x: Int] (+ x 1)))
+        tmp (str path ".tmp." (host/pid) "." n)
+        body (loop [i 0 o ""] (if (>= i (count lines)) o (recur (+ i 1) (str o (nth lines i) "\n"))))
+        [ex ce] (if (= me "") (fs/create-new-private tmp) (values false me))
+        we (cond (not= ce "") ce
+                 ex (str tmp ": already exists")
+                 :else (host/file-write tmp body))]
+    (if (not= we "") (let [z (if ex "" (fs/remove-tree tmp))] we)
+      (let [mv (fs/move tmp path)] (if (= mv "") "" (let [z (fs/remove-tree tmp)] mv))))))
+
+(defn load Vec(Str) [path: &Str]
+  (let [[s e] (host/file-read path)]
+    (if (not= e "") []
+      (loop [i 0 start 0 acc: Vec(Str) []]
+        (if (>= i (count s)) (if (> i start) (conj acc (subs s start i)) acc)
+          (if (= (nth s i) 10) (recur (+ i 1) (+ i 1) (if (> i start) (conj acc (subs s start i)) acc))
+            (recur (+ i 1) start acc)))))))

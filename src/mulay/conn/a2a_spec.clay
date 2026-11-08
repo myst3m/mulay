@@ -1,0 +1,484 @@
+(ns mulay.conn.a2a_spec
+  (:require [mulay.lib.dec :as dec] [mulay.lib.time.iso :as iso] [mulay.lib.time.zoned :as zt] [mulay.lib.time.tz :as tz]
+            [mulay.lib.time.types :as tt] [clay.string :as str]))
+
+(defvariant JN
+  (JObj keys: Vec(Str) vals: Vec(JN) l: Int c: Int el: Int ec: Int)
+  (JArr items: Vec(JN) l: Int c: Int el: Int ec: Int)
+  (JStr s: Str l: Int c: Int)
+  (JNum raw: Str l: Int c: Int)
+  (JBool b: Bool l: Int c: Int)
+  (JNull l: Int c: Int))
+
+(def SRC "[Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); ")
+
+(defn- loc Str [l: Int c: Int] (str "\n at " SRC "line: " l ", column: " c "]"))
+
+(defrecord P [s: Str i: Int line: Int ls: Int stream: Bool lc: Int])
+
+(defn- chars-in Int [s: &Str a: Int b: Int]
+  (loop [k a n 0] (if (>= k b) n (recur (+ k 1) (if (= (bit-and (nth s k) 192) 128) n (+ n 1))))))
+
+(defn- col Int [p: &P i: Int]
+  (cond
+    (:stream p) (+ (- i (:ls p)) 1)
+    (>= i (:i p)) (+ (:lc p) (chars-in (:s p) (:i p) i) 1)
+    :else (+ (chars-in (:s p) (:ls p) i) 1)))
+
+(defn- skip-ws P [p: P]
+  (let [s (:s p)]
+    (loop [i (:i p) line (:line p) ls (:ls p) lc (:lc p)]
+      (if (>= i (count s)) (->P s i line ls (:stream p) lc)
+        (let [c (nth s i)]
+          (cond (= c 10) (recur (+ i 1) (+ line 1) (+ i 1) 0)
+                (or (= c 32) (= c 9) (= c 13)) (recur (+ i 1) line ls (+ lc 1))
+                :else (->P s i line ls (:stream p) lc)))))))
+
+(defn- at P [p: &P i: Int]
+  (->P (:s p) i (:line p) (:ls p) (:stream p) (+ (:lc p) (chars-in (:s p) (:i p) (min i (count (:s p)))))))
+
+(defn- ident-char? Bool [c: Int]
+  (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57)) (= c 95) (= c 36) (>= c 128)))
+
+(defn- bad-token Values(JN P Str) [p: &P]
+  (let [s (:s p) i0 (:i p)
+        e (loop [i i0] (if (and (< i (count s)) (ident-char? (nth s i))) (recur (+ i 1)) i))
+        e2 (if (= e i0) (+ i0 1) e)
+        tok (subs s i0 (min e2 (count s)))
+        c (+ (col p e2) (if (and (:stream p) (< e2 (count s))) 1 0))]
+    (values (->JNull 0 0) p (str "Unrecognized token '" tok "': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')" (loc (:line p) c)))))
+
+(defn- eof-in Str [what: &Str p: &P sl: Int sc: Int]
+  (str "Unexpected end-of-input: expected close marker for " what " (start marker at " SRC "line: " sl ", column: " sc "])"
+       (loc (:line p) (col p (count (:s p))))))
+
+(defn- unexpected Str [p: &P what: &Str]
+  (let [c (nth (:s p) (:i p))]
+    (str "Unexpected character ('" (subs (:s p) (:i p) (+ (:i p) 1)) "' (code " c ")): " what (loc (:line p) (col p (:i p))))))
+
+(defn- hexv Int [c: Int] (cond (<= c 57) (- c 48) (>= c 97) (- c 87) :else (- c 55)))
+
+(defn- read-str Values(Str Int Str) [p: &P]
+  (let [s (:s p)]
+    (loop [i (+ (:i p) 1) out ""]
+      (if (>= i (count s)) (values out i "eof")
+        (let [c (nth s i)]
+          (cond
+            (= c 34) (values out (+ i 1) "")
+            (= c 92)
+            (if (>= (+ i 1) (count s)) (values out i "eof")
+              (let [d (nth s (+ i 1))]
+                (cond (= d 110) (recur (+ i 2) (str out "\n")) (= d 116) (recur (+ i 2) (str out "\t"))
+                      (= d 114) (recur (+ i 2) (str out "\r")) (= d 98) (recur (+ i 2) (str out (chr 8)))
+                      (= d 102) (recur (+ i 2) (str out (chr 12)))
+                      (= d 117) (if (> (+ i 6) (count s)) (values out i "eof")
+                                  (let [cp (+ (* 4096 (hexv (nth s (+ i 2)))) (* 256 (hexv (nth s (+ i 3)))) (* 16 (hexv (nth s (+ i 4)))) (hexv (nth s (+ i 5))))]
+                                    (recur (+ i 6) (str out (utf8 cp)))))
+                      :else (recur (+ i 2) (str out (subs s (+ i 1) (+ i 2)))))))
+            :else (recur (+ i 1) (str out (subs s i (+ i 1))))))))))
+
+(defn- utf8 Str [cp: Int]
+  (cond (< cp 128) (chr cp)
+        (< cp 2048) (str (chr (+ 192 (bit-shift-right cp 6))) (chr (+ 128 (bit-and cp 63))))
+        :else (str (chr (+ 224 (bit-shift-right cp 12))) (chr (+ 128 (bit-and (bit-shift-right cp 6) 63))) (chr (+ 128 (bit-and cp 63))))))
+
+(defn- num-char? Bool [c: Int] (or (and (>= c 48) (<= c 57)) (= c 45) (= c 43) (= c 46) (= c 101) (= c 69)))
+
+(defn- read-val Values(JN P Str) [p0: P depth: Int]
+  (let [p (skip-ws p0) s (:s p) i (:i p)]
+    (if (>= i (count s)) (values (->JNull 0 0) p "eof")
+      (let [c (nth s i) l (:line p) cc (col p i)]
+        (cond
+          (> depth 1000) (values (->JNull l cc) p (str "Document nesting depth exceeds the maximum allowed" (loc l cc)))
+          (= c 123) (read-obj (at p (+ i 1)) l cc depth)
+          (= c 91) (read-arr (at p (+ i 1)) l cc depth)
+          (= c 34) (let [[t j e] (read-str p)]
+                     (if (not= e "") (values (->JNull l cc) (at p (count s)) "eof") (values (->JStr t l cc) (at p j) "")))
+          (or (and (>= c 48) (<= c 57)) (= c 45))
+          (let [e (loop [k i] (if (and (< k (count s)) (num-char? (nth s k))) (recur (+ k 1)) k))]
+            (values (->JNum (subs s i e) l cc) (at p e) ""))
+          (and (<= (+ i 4) (count s)) (= (subs s i (+ i 4)) "true") (or (= (+ i 4) (count s)) (not (ident-char? (nth s (+ i 4))))))
+          (values (->JBool true l cc) (at p (+ i 4)) "")
+          (and (<= (+ i 5) (count s)) (= (subs s i (+ i 5)) "false") (or (= (+ i 5) (count s)) (not (ident-char? (nth s (+ i 5))))))
+          (values (->JBool false l cc) (at p (+ i 5)) "")
+          (and (<= (+ i 4) (count s)) (= (subs s i (+ i 4)) "null") (or (= (+ i 4) (count s)) (not (ident-char? (nth s (+ i 4))))))
+          (values (->JNull l cc) (at p (+ i 4)) "")
+          :else (bad-token p))))))
+
+(defn- read-obj Values(JN P Str) [p0: P sl: Int sc: Int depth: Int]
+  (loop [p p0 ks: Vec(Str) [] vs: Vec(JN) [] first true]
+    (let [q (skip-ws p) s (:s q) i (:i q)]
+      (cond
+        (>= i (count s)) (values (->JNull sl sc) q (eof-in "Object" q sl sc))
+        (and first (= (nth s i) 125)) (values (->JObj ks vs sl sc (:line q) (col q i)) (at q (+ i 1)) "")
+        (not= (nth s i) 34) (values (->JNull sl sc) q (unexpected q "was expecting double-quote to start field name"))
+        :else
+        (let [[k j e] (read-str q)
+              q2 (skip-ws (at q j))
+              i2 (:i q2)]
+          (cond
+            (not= e "") (values (->JNull sl sc) q2 (eof-in "Object" q2 sl sc))
+            (>= i2 (count s)) (values (->JNull sl sc) q2 (eof-in "Object" q2 sl sc))
+            (not= (nth s i2) 58) (values (->JNull sl sc) q2 (unexpected q2 "was expecting a colon to separate field name and value"))
+            :else
+            (let [[v q3 ve] (read-val (at q2 (+ i2 1)) (+ depth 1))]
+              (if (not= ve "") (values (->JNull sl sc) q3 (if (= ve "eof") (eof-in "Object" q3 sl sc) ve))
+                (let [q4 (skip-ws q3) i4 (:i q4)]
+                  (cond
+                    (>= i4 (count s)) (values (->JNull sl sc) q4 (eof-in "Object" q4 sl sc))
+                    (= (nth s i4) 44) (recur (at q4 (+ i4 1)) (conj ks k) (conj vs v) false)
+                    (= (nth s i4) 125) (values (->JObj (conj ks k) (conj vs v) sl sc (:line q4) (col q4 i4)) (at q4 (+ i4 1)) "")
+                    :else (values (->JNull sl sc) q4 (unexpected q4 "was expecting comma to separate Object entries"))))))))))))
+
+(defn- read-arr Values(JN P Str) [p0: P sl: Int sc: Int depth: Int]
+  (loop [p p0 xs: Vec(JN) [] first true]
+    (let [q (skip-ws p) s (:s q) i (:i q)]
+      (cond
+        (>= i (count s)) (values (->JNull sl sc) q (eof-in "Array" q sl sc))
+        (and first (= (nth s i) 93)) (values (->JArr xs sl sc (:line q) (col q i)) (at q (+ i 1)) "")
+        :else
+        (let [[v q2 ve] (read-val q (+ depth 1))]
+          (if (not= ve "") (values (->JNull sl sc) q2 (if (= ve "eof") (eof-in "Array" q2 sl sc) ve))
+            (let [q3 (skip-ws q2) i3 (:i q3)]
+              (cond
+                (>= i3 (count s)) (values (->JNull sl sc) q3 (eof-in "Array" q3 sl sc))
+                (= (nth s i3) 44) (recur (at q3 (+ i3 1)) (conj xs v) false)
+                (= (nth s i3) 93) (values (->JArr (conj xs v) sl sc (:line q3) (col q3 i3)) (at q3 (+ i3 1)) "")
+                :else (values (->JNull sl sc) q3 (unexpected q3 "was expecting comma to separate Array entries"))))))))))
+
+(defn- parse-in Values(JN Str) [s: &Str stream: Bool]
+  (let [p (skip-ws (->P (str s) 0 1 0 stream 0))]
+    (if (>= (:i p) (count s)) (values (->JNull 0 0) (str "No content to map due to end-of-input\n at " SRC "line: " (:line p) "]"))
+      (let [[v q e] (read-val p 0)]
+        (values v e)))))
+
+(defn parse Values(JN Str) [s: &Str] (parse-in s false))
+
+(defn json-str Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (cond (= c 34) (str out "\\\"") (= c 92) (str out "\\\\")
+                     (= c 10) (str out "\\n") (= c 9) (str out "\\t") (= c 13) (str out "\\r")
+                     (= c 8) (str out "\\b") (= c 12) (str out "\\f")
+                     (< c 32) (str out "\\u00" (hex2 c))
+                     :else (str out (subs s i (+ i 1)))))))))
+
+(defn- hex2 Str [c: Int] (let [d "0123456789ABCDEF"] (str (subs d (quot c 16) (+ (quot c 16) 1)) (subs d (mod c 16) (+ (mod c 16) 1)))))
+
+(defn- num-out Str [raw: &Str]
+  (let [frac (or (str/includes? raw ".") (str/includes? raw "e") (str/includes? raw "E"))]
+    (if (not frac) (if (= raw "-0") "0" (str raw))
+      (let [[x e] (parse-double raw)] (dec/float->shortest-str x)))))
+
+(defn- any-out Str [n: &JN]
+  (match n
+    (JObj ks vs l c el ec) (str "{" (str/join "," (loop [i 0 acc: Vec(Str) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (str (json-str (nth ks i)) ":" (any-out (nth vs i)))))))) "}")
+    (JArr xs l c el ec) (str "[" (str/join "," (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (any-out (nth xs i))))))) "]")
+    (JStr s l c) (json-str s)
+    (JNum r l c) (num-out r)
+    (JBool b l c) (if b "true" "false")
+    (JNull l c) "null"))
+
+(defrecord Prop [name: Str kind: Str def: Str])
+(defrecord Spec [java: Str props: Vec(Prop) checks: Vec(Str) nulls: Bool])
+
+(defn- pr Prop [n: Str k: Str] (->Prop n k ""))
+(defn- prd Prop [n: Str k: Str d: Str] (->Prop n k d))
+(defn- sp Spec [j: Str ps: Vec(Prop) cs: Vec(Str)] (->Spec (str "io.a2a.spec." j) ps cs false))
+
+(defn- spec-of Values(Spec Bool) [t: &Str]
+  (cond
+    (= t "Message") (values (sp "Message" [(pr "role" "role") (pr "parts" "L:Part") (pr "messageId" "s") (pr "contextId" "s") (pr "taskId" "s")
+                                           (pr "referenceTaskIds" "ls") (pr "metadata" "map") (pr "extensions" "ls") (pr "kind" "kind:message")]
+                                ["nn:parts" "ne:parts" "nn:role" "nn:messageId"]) true)
+    (= t "TextPart") (values (sp "TextPart" [(pr "text" "s") (pr "metadata" "map") (pr "kind" "kind:text")] ["nn:text"]) true)
+    (= t "FilePart") (values (sp "FilePart" [(pr "file" "file") (pr "metadata" "map") (pr "kind" "kind:file")] ["nn:file"]) true)
+    (= t "DataPart") (values (sp "DataPart" [(pr "data" "map") (pr "metadata" "map") (pr "kind" "kind:data")] ["nn:data"]) true)
+    (= t "Task") (values (sp "Task" [(pr "id" "s") (pr "contextId" "s") (pr "status" "O:TaskStatus") (prd "artifacts" "L:Artifact" "[]")
+                                     (prd "history" "L:Message" "[]") (pr "metadata" "map") (pr "kind" "kind:task")]
+                             ["nn:id" "nn:contextId" "nn:status"]) true)
+    (= t "TaskStatus") (values (sp "TaskStatus" [(pr "state" "state") (pr "message" "O:Message") (prd "timestamp" "dt" "now")] ["nn:state"]) true)
+    (= t "Artifact") (values (sp "Artifact" [(pr "artifactId" "s") (pr "name" "s") (pr "description" "s") (pr "parts" "L:Part") (pr "metadata" "map") (pr "extensions" "ls")]
+                                 ["nn:artifactId" "nn:parts" "ne:parts"]) true)
+    (= t "TaskStatusUpdateEvent") (values (sp "TaskStatusUpdateEvent" [(pr "taskId" "s") (pr "status" "O:TaskStatus") (pr "contextId" "s") (prd "final" "b" "false") (pr "metadata" "map") (pr "kind" "kind:status-update")]
+                                              ["nn:taskId" "nn:status" "nn:contextId"]) true)
+    (= t "TaskArtifactUpdateEvent") (values (sp "TaskArtifactUpdateEvent" [(pr "taskId" "s") (pr "artifact" "O:Artifact") (pr "contextId" "s") (pr "append" "B") (pr "lastChunk" "B") (pr "metadata" "map") (pr "kind" "kind:artifact-update")]
+                                                ["nn:taskId" "nn:artifact" "nn:contextId"]) true)
+    (= t "MessageSendParams") (values (sp "MessageSendParams" [(pr "message" "O:Message") (pr "configuration" "O:MessageSendConfiguration") (pr "metadata" "map")] ["nn:message"]) true)
+    (= t "MessageSendConfiguration") (values (sp "MessageSendConfiguration" [(pr "acceptedOutputModes" "ls") (pr "historyLength" "I") (pr "pushNotificationConfig" "O:PushNotificationConfig") (pr "blocking" "B")] ["hist:historyLength"]) true)
+    (= t "PushNotificationConfig") (values (sp "PushNotificationConfig" [(pr "url" "s") (pr "token" "s") (pr "authentication" "O:PushNotificationAuthenticationInfo") (pr "id" "s")] ["nn:url"]) true)
+    (= t "PushNotificationAuthenticationInfo") (values (sp "PushNotificationAuthenticationInfo" [(pr "schemes" "ls") (pr "credentials" "s")] ["nn:schemes"]) true)
+    (= t "TaskPushNotificationConfig") (values (sp "TaskPushNotificationConfig" [(pr "taskId" "s") (pr "pushNotificationConfig" "O:PushNotificationConfig")] ["nn:taskId" "nn:pushNotificationConfig"]) true)
+    (= t "TaskQueryParams") (values (sp "TaskQueryParams" [(pr "id" "s") (prd "historyLength" "i" "0") (pr "metadata" "map")] ["nn:id" "hist:historyLength"]) true)
+    (= t "TaskIdParams") (values (sp "TaskIdParams" [(pr "id" "s") (pr "metadata" "map")] ["nn:id"]) true)
+    (= t "GetTaskPushNotificationConfigParams") (values (sp "GetTaskPushNotificationConfigParams" [(pr "id" "s") (pr "pushNotificationConfigId" "s") (pr "metadata" "map")] ["nn:id"]) true)
+    (= t "ListTaskPushNotificationConfigParams") (values (sp "ListTaskPushNotificationConfigParams" [(pr "id" "s") (pr "metadata" "map")] ["nn:id"]) true)
+    (= t "DeleteTaskPushNotificationConfigParams") (values (sp "DeleteTaskPushNotificationConfigParams" [(pr "id" "s") (pr "pushNotificationConfigId" "s") (pr "metadata" "map")] ["nn:id" "nn:pushNotificationConfigId"]) true)
+    (= t "AgentCard") (values (sp "AgentCard" [(pr "name" "s") (pr "description" "s") (pr "url" "s") (pr "provider" "O:AgentProvider") (pr "version" "s")
+                                               (pr "documentationUrl" "s") (pr "capabilities" "O:AgentCapabilities") (pr "defaultInputModes" "ls")
+                                               (pr "defaultOutputModes" "ls") (pr "skills" "L:AgentSkill") (prd "supportsAuthenticatedExtendedCard" "b" "false")
+                                               (pr "securitySchemes" "any") (pr "security" "any") (pr "iconUrl" "s") (pr "additionalInterfaces" "L:AgentInterface")
+                                               (prd "preferredTransport" "s" "\"JSONRPC\"") (prd "protocolVersion" "s" "\"0.3.0\"") (pr "signatures" "L:AgentCardSignature")]
+                                  ["nn:capabilities" "nn:defaultInputModes" "nn:defaultOutputModes" "nn:description" "nn:name" "nn:skills" "nn:url" "nn:version"]) true)
+    (= t "AgentCapabilities") (values (sp "AgentCapabilities" [(prd "streaming" "b" "false") (prd "pushNotifications" "b" "false") (prd "stateTransitionHistory" "b" "false") (pr "extensions" "L:AgentExtension")] []) true)
+    (= t "AgentExtension") (values (->Spec "io.a2a.spec.AgentExtension" [(pr "description" "s") (pr "params" "map") (prd "required" "b" "false") (pr "uri" "s")] ["nn:uri"] true) true)
+    (= t "AgentSkill") (values (sp "AgentSkill" [(pr "id" "s") (pr "name" "s") (pr "description" "s") (pr "tags" "ls") (pr "examples" "ls") (pr "inputModes" "ls") (pr "outputModes" "ls") (pr "security" "any")]
+                                   ["nn:description" "nn:id" "nn:name" "nn:tags"]) true)
+    (= t "AgentProvider") (values (sp "AgentProvider" [(pr "organization" "s") (pr "url" "s")] ["nn:organization" "nn:url"]) true)
+    (= t "AgentInterface") (values (sp "AgentInterface" [(pr "transport" "s") (pr "url" "s")] ["nn:transport" "nn:url"]) true)
+    (= t "AgentCardSignature") (values (sp "AgentCardSignature" [(pr "protectedHeader" "s") (pr "signature" "s") (pr "header" "map")] ["nn:protectedHeader" "nn:signature"]) true)
+    :else (values (sp "" [] []) false)))
+
+(defn- poly Values(Str Vec(Str) Vec(Str) Bool) [t: &Str]
+  (cond
+    (= t "EventKind") (values "io.a2a.spec.EventKind" ["message" "task"] ["Message" "Task"] true)
+    (= t "StreamingEventKind") (values "io.a2a.spec.StreamingEventKind" ["artifact-update" "message" "status-update" "task"]
+                                       ["TaskArtifactUpdateEvent" "Message" "TaskStatusUpdateEvent" "Task"] true)
+    (= t "Part") (values "io.a2a.spec.Part" ["data" "file" "text"] ["DataPart" "FilePart" "TextPart"] true)
+    (= t "Message") (values "io.a2a.spec.Message" ["message"] ["Message"] true)
+    (= t "Task") (values "io.a2a.spec.Task" ["task"] ["Task"] true)
+    (= t "TaskStatusUpdateEvent") (values "io.a2a.spec.TaskStatusUpdateEvent" ["status-update"] ["TaskStatusUpdateEvent"] true)
+    (= t "TaskArtifactUpdateEvent") (values "io.a2a.spec.TaskArtifactUpdateEvent" ["artifact-update"] ["TaskArtifactUpdateEvent"] true)
+    :else (values "" [] [] false)))
+
+(defrecord Fail [msg: Str chain: Vec(Str)])
+
+(defn- ok-fail Fail [] (->Fail "" []))
+(defn- fail? Bool [f: &Fail] (not= (:msg f) ""))
+(defn- with-chain Fail [f: Fail seg: Str] (->Fail (:msg f) (let [c0: Vec(Str) [seg]] (loop [i 0 acc c0] (if (>= i (count (:chain f))) acc (recur (+ i 1) (conj acc (nth (:chain f) i))))))))
+
+(defn- fail-text Str [f: &Fail]
+  (if (= (count (:chain f)) 0) (str (:msg f))
+    (str (:msg f) " (through reference chain: " (str/join "->" (:chain f)) ")")))
+
+(defn- pos-l Int [n: &JN] (match n (JObj a b l c el ec) l (JArr a l c el ec) l (JStr a l c) l (JNum a l c) l (JBool a l c) l (JNull l c) l))
+(defn- pos-c Int [n: &JN] (match n (JObj a b l c el ec) c (JArr a l c el ec) c (JStr a l c) c (JNum a l c) c (JBool a l c) c (JNull l c) c))
+(defn- end-l Int [n: &JN] (match n (JObj a b l c el ec) el (JArr a l c el ec) el _ (pos-l n)))
+(defn- end-c Int [n: &JN] (match n (JObj a b l c el ec) ec (JArr a l c el ec) ec _ (pos-c n)))
+(defn- null? Bool [n: &JN] (match n (JNull l c) true _ false))
+
+(defn- obj-get Vec(JN) [ks: &Vec(Str) vs: &Vec(JN) k: &Str]
+  (loop [i (- (count ks) 1)] (if (< i 0) [] (if (= (nth ks i) k) [(nth vs i)] (recur (- i 1))))))
+
+(defn- token-name Str [n: &JN]
+  (match n
+    (JObj a b l c el ec) "Object value (token `JsonToken.START_OBJECT`)"
+    (JArr a l c el ec) "Array value (token `JsonToken.START_ARRAY`)"
+    (JStr a l c) "String value (token `JsonToken.VALUE_STRING`)"
+    (JNum r l c) (if (or (str/includes? r ".") (str/includes? r "e") (str/includes? r "E")) "Floating-point value (token `JsonToken.VALUE_NUMBER_FLOAT`)" "Integer value (token `JsonToken.VALUE_NUMBER_INT`)")
+    (JBool b l c) (if b "Boolean value (token `JsonToken.VALUE_TRUE`)" "Boolean value (token `JsonToken.VALUE_FALSE`)")
+    (JNull l c) "Null value (token `JsonToken.VALUE_NULL`)"))
+
+(defn- cannot Fail [jt: &Str n: &JN]
+  (->Fail (str "Cannot deserialize value of type `" jt "` from " (token-name n) (loc (pos-l n) (pos-c n))) []))
+
+(defn- resolve-kind Values(Str Fail) [t: &Str n: &JN prop: &Str]
+  (let [[jt ids tys ok] (poly t)
+        for-prop (if (= prop "") "" (str " (for POJO property '" prop "')"))]
+    (match n
+      (JObj ks vs l c el ec)
+      (let [k (obj-get ks vs "kind")]
+        (if (= (count k) 0)
+          (values "" (->Fail (str "Could not resolve subtype of [simple type, class " jt "]: missing type id property 'kind'" for-prop (loc el ec)) []))
+          (let [kv (nth k 0)
+                id (match kv (JStr s l2 c2) (str s) (JNum r l2 c2) (str r) (JBool b l2 c2) (if b "true" "false") _ "")
+                i (loop [x 0] (if (>= x (count ids)) -1 (if (= (nth ids x) id) x (recur (+ x 1)))))]
+            (if (< i 0)
+              (values "" (->Fail (str "Could not resolve type id '" id "' as a subtype of `" jt "`: known type ids = [" (str/join ", " ids) "]" for-prop (loc (pos-l kv) (pos-c kv))) []))
+              (values (nth tys i) (ok-fail))))))
+      (JArr xs l c el ec)
+      (let [id (if (= (count xs) 0) "" (match (nth xs 0) (JStr s l2 c2) (str s) (JNum r l2 c2) (str r) _ ""))
+            nx (if (> (count xs) 1) (nth xs 1) (->JNull el ec))]
+        (values "" (->Fail (str "Could not resolve type id '" id "' as a subtype of `" jt "`: known type ids = [" (str/join ", " ids) "]" for-prop (loc (pos-l nx) (pos-c nx))) [])))
+      _ (values "" (cannot jt n)))))
+
+(defn- de Values(Str Bool Fail) [t: &Str n: &JN now: &Str prop: &Str]
+  (let [[pj ids tys is-poly] (poly t)]
+    (cond
+      (null? n) (values "" true (ok-fail))
+      is-poly (let [[ct f] (resolve-kind t n prop)]
+                (if (fail? f) (values "" false f) (de-obj ct n now)))
+      :else (de-obj t n now))))
+
+(defn- de-obj Values(Str Bool Fail) [t: &Str n: &JN now: &Str]
+  (let [[spec ok] (spec-of t)]
+    (match n
+      (JObj ks vs l c el ec)
+      (let [props (:props spec)
+            [outs f] (loop [i 0 outs: Vec(Str) (empty-outs props)]
+                       (if (>= i (count ks)) (values outs (ok-fail))
+                         (let [k (nth ks i)
+                               pi (loop [x 0] (if (>= x (count props)) -1 (if (= (:name (nth props x)) k) x (recur (+ x 1)))))]
+                           (if (< pi 0) (recur (+ i 1) outs)
+                             (let [p (nth props pi)
+                                   [o absent f1] (de-val (:kind p) (nth vs i) now k)]
+                               (if (fail? f1) (values outs (with-chain f1 (str (:java spec) "[\"" k "\"]")))
+                                 (recur (+ i 1) (assoc outs pi (if absent "" o)))))))))]
+        (if (fail? f) (values "" false f)
+          (let [ce (check spec outs)]
+            (if (not= ce "") (values "" false (->Fail (str "Cannot construct instance of `" (:java spec) "`, problem: " ce (loc el ec)) []))
+              (values (emit spec outs now) false (ok-fail))))))
+      _ (values "" false (cannot (:java spec) n)))))
+
+(defn- empty-outs Vec(Str) [ps: &Vec(Prop)] (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc "")))))
+
+(defn- check Str [spec: &Spec outs: &Vec(Str)]
+  (let [props (:props spec) cs (:checks spec)]
+    (loop [i 0]
+      (if (>= i (count cs)) ""
+        (let [c (nth cs i)
+              k (str/index-of c ":")
+              what (subs c 0 k)
+              name (subs c (+ k 1) (count c))
+              pi (loop [x 0] (if (>= x (count props)) -1 (if (= (:name (nth props x)) name) x (recur (+ x 1)))))
+              v (if (< pi 0) "" (nth outs pi))]
+          (cond
+            (and (= what "nn") (= v "")) (str "Parameter '" name "' may not be null")
+            (and (= what "ne") (= v "[]")) "Parts cannot be empty"
+            (and (= what "hist") (str/starts-with? v "-")) "Invalid history length"
+            :else (recur (+ i 1))))))))
+
+(defn- emit Str [spec: &Spec outs: &Vec(Str) now: &Str]
+  (let [props (:props spec)]
+    (str "{" (str/join "," (loop [i 0 acc: Vec(Str) []]
+                             (if (>= i (count props)) acc
+                               (let [p (nth props i)
+                                     kd (:kind p)
+                                     v0 (nth outs i)
+                                     v (cond (str/starts-with? kd "kind:") (json-str (subs kd 5 (count kd)))
+                                             (not= v0 "") v0
+                                             (= (:def p) "now") (json-str now)
+                                             (not= (:def p) "") (:def p)
+                                             (:nulls spec) "null"
+                                             :else "")]
+                                 (recur (+ i 1) (if (= v "") acc (conj acc (str (json-str (:name p)) ":" v)))))))) "}")))
+
+(defn- de-val Values(Str Bool Fail) [kd: &Str n: &JN now: &Str prop: &Str]
+  (cond
+    (null? n) (values "" true (ok-fail))
+    (str/starts-with? kd "kind:") (values "" true (ok-fail))
+    (= kd "s") (match n
+                 (JStr s l c) (values (json-str s) false (ok-fail))
+                 (JNum r l c) (values (json-str r) false (ok-fail))
+                 (JBool b l c) (values (json-str (if b "true" "false")) false (ok-fail))
+                 _ (values "" false (cannot "java.lang.String" n)))
+    (or (= kd "b") (= kd "B")) (match n
+                                 (JBool b l c) (values (if b "true" "false") false (ok-fail))
+                                 (JStr s l c) (if (or (= s "true") (= s "false")) (values s false (ok-fail)) (values "" false (cannot (if (= kd "b") "boolean" "java.lang.Boolean") n)))
+                                 _ (values "" false (cannot (if (= kd "b") "boolean" "java.lang.Boolean") n)))
+    (or (= kd "i") (= kd "I")) (match n
+                                 (JNum r l c) (values (if (str/includes? r ".") (subs r 0 (str/index-of r ".")) (str r)) false (ok-fail))
+                                 _ (values "" false (cannot (if (= kd "i") "int" "java.lang.Integer") n)))
+    (or (= kd "map") (= kd "any")) (values (any-out n) false (ok-fail))
+    (= kd "ls") (match n
+                  (JArr xs l c el ec)
+                  (loop [i 0 acc: Vec(Str) []]
+                    (if (>= i (count xs)) (values (str "[" (str/join "," acc) "]") false (ok-fail))
+                      (let [[o absent f] (de-val "s" (nth xs i) now "")]
+                        (if (fail? f) (values "" false (with-chain f (str "java.util.ArrayList[" i "]")))
+                          (recur (+ i 1) (conj acc (if absent "null" o)))))))
+                  _ (values "" false (cannot "java.util.ArrayList<java.lang.String>" n)))
+    (str/starts-with? kd "L:")
+    (let [et (subs kd 2 (count kd))]
+      (match n
+        (JArr xs l c el ec)
+        (loop [i 0 acc: Vec(Str) []]
+          (if (>= i (count xs)) (values (str "[" (str/join "," acc) "]") false (ok-fail))
+            (let [[o absent f] (de et (nth xs i) now "")]
+              (if (fail? f) (values "" false (with-chain f (str "java.util.ArrayList[" i "]")))
+                (recur (+ i 1) (conj acc (if absent "null" o)))))))
+        _ (values "" false (cannot (str "java.util.ArrayList<io.a2a.spec." et ">") n))))
+    (str/starts-with? kd "O:") (de (subs kd 2 (count kd)) n now prop)
+    (= kd "role") (enum-val n "io.a2a.spec.Message$Role" ["user" "agent"] "")
+    (= kd "state") (enum-val n "io.a2a.spec.TaskState" ["submitted" "working" "input-required" "auth-required" "completed" "canceled" "failed" "rejected" "unknown"] "state")
+    (= kd "dt") (match n
+                  (JStr s l c) (let [[u ok] (iso-utc s)]
+                                 (if ok (values (json-str u) false (ok-fail))
+                                   (values "" false (->Fail (str "Cannot deserialize value of type `java.time.OffsetDateTime` from String \"" s "\": Failed to deserialize java.time.OffsetDateTime: (java.time.format.DateTimeParseException) Text '" s "' could not be parsed at index 0" (loc l c)) []))))
+                  _ (values "" false (cannot "java.time.OffsetDateTime" n)))
+    (= kd "file") (file-val n)
+    :else (values (any-out n) false (ok-fail))))
+
+(defn- enum-val Values(Str Bool Fail) [n: &JN jt: &Str vals: Vec(Str) creator: &Str]
+  (match n
+    (JStr s l c)
+    (if (loop [i 0] (if (>= i (count vals)) false (if (= (nth vals i) s) true (recur (+ i 1)))))
+      (values (json-str s) false (ok-fail))
+      (if (= creator "")
+        (values "" false (->Fail (str "Cannot deserialize value of type `" jt "` from String \"" s "\": not one of the values accepted for Enum class: [" (str/join ", " vals) "]" (loc l c)) []))
+        (values "" false (->Fail (str "Cannot construct instance of `" jt "`, problem: Invalid TaskState: " s (loc l c)) []))))
+    _ (values "" false (cannot jt n))))
+
+(defn- file-val Values(Str Bool Fail) [n: &JN]
+  (match n
+    (JObj ks vs l c el ec)
+    (let [mt (file-txt ks vs "mimeType") nm (file-txt ks vs "name") by (file-txt ks vs "bytes") ur (file-txt ks vs "uri")
+          head (str (if (= mt "") "" (str "\"mimeType\":" mt)) (if (= nm "") "" (str (if (= mt "") "" ",") "\"name\":" nm)))
+          sep (if (= head "") "" ",")]
+      (cond
+        (> (count (obj-get ks vs "bytes")) 0) (values (str "{" head sep "\"bytes\":" (if (= by "") "null" by) "}") false (ok-fail))
+        (> (count (obj-get ks vs "uri")) 0) (values (str "{" head sep "\"uri\":" (if (= ur "") "null" ur) "}") false (ok-fail))
+        :else (values "" false (->Fail (str "Invalid file format: missing 'bytes' or 'uri'") []))))
+    _ (values "" false (cannot "io.a2a.spec.FileContent" n))))
+
+(defn- file-txt Str [ks: &Vec(Str) vs: &Vec(JN) k: &Str]
+  (let [r (obj-get ks vs k)]
+    (if (= (count r) 0) "" (match (nth r 0) (JStr s l c) (json-str s) (JNull l c) "" _ (json-str (any-out (nth r 0)))))))
+
+(defn iso-utc Values(Str Bool) [s: &Str]
+  (let [[z e] (iso/parse-zdt s)]
+    (if (not= e "") (values "" false) (values (utc-str z) true))))
+
+(defn- utc-str Str [z: &tt/ZonedDateTime]
+  (let [u (zt/zdt-with-zone-same-instant z (tt/utc))
+        dt (:dt u)
+        d (:date dt) t (:time dt)
+        ns (:nano t)
+        frac (if (= ns 0) "" (str "." (trim-zeros (pad9 ns))))]
+    (str (iso/date-str d) "T" (p2 (:hour t)) ":" (p2 (:minute t)) ":" (p2 (:second t)) frac "Z")))
+
+(defn now-utc Str [] (let [[s ns] (tz/now-instant-ns)] (utc-str (zt/zdt-of-instant s ns (tt/utc)))))
+
+(defn- p2 Str [n: Int] (if (< n 10) (str "0" n) (str n)))
+(defn- pad9 Str [n: Int] (let [s (str n)] (loop [o s] (if (>= (count o) 9) o (recur (str "0" o))))))
+(defn- trim-zeros Str [s: &Str] (loop [e (count s)] (if (and (> e 0) (= (nth s (- e 1)) 48)) (recur (- e 1)) (subs s 0 e))))
+
+(defn key-json Str [json: &Str key: &Str]
+  (let [[n e] (parse json)]
+    (match n
+      (JObj ks vs l c el ec) (let [r (obj-get ks vs key)] (if (= (count r) 0) "" (any-out (nth r 0))))
+      _ "")))
+
+(defn with-key Str [json: &Str key: &Str v: &Str]
+  (let [[n e] (parse json)]
+    (match n
+      (JObj ks vs l c el ec)
+      (let [[parts found] (loop [i 0 acc: Vec(Str) [] f false]
+                            (if (>= i (count ks)) (values acc f)
+                              (let [k (nth ks i)]
+                                (recur (+ i 1) (conj acc (str (json-str k) ":" (if (= k key) (str v) (any-out (nth vs i))))) (or f (= k key))))))
+            all (if found parts (conj parts (str (json-str key) ":" v)))]
+        (str "{" (str/join "," all) "}"))
+      _ (str json))))
+
+(defn array-items Vec(Str) [json: &Str]
+  (let [[n e] (parse json)]
+    (match n
+      (JArr xs l c el ec) (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (any-out (nth xs i))))))
+      _ (let [z: Vec(Str) []] z))))
+
+(defn canon-node Values(Str Str) [t: &Str n: &JN now: &Str]
+  (let [[o absent f] (de t n now "")]
+    (cond (fail? f) (values "" (fail-text f))
+          absent (values "null" "")
+          :else (values o ""))))
+
+(defn canon Values(Str Str) [t: &Str json: &Str now: &Str]
+  (let [[n e] (parse-in json false)]
+    (if (not= e "") (values "" e) (canon-node t n now))))
+
+(defn canon-stream Values(Str Str) [t: &Str json: &Str now: &Str]
+  (let [[n e] (parse-in json true)]
+    (if (not= e "") (values "" e) (canon-node t n now))))

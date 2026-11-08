@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18590"/>
+    </http:listener-config>
+
+    <db:config name="Pg">
+        <db:generic-connection url="jdbc:postgresql://localhost:15432/mulay" driverClassName="org.postgresql.Driver" user="mulay" password="mulay"/>
+    </db:config>
+
+    <flow name="reset">
+        <http:listener config-ref="L" path="/reset"/>
+        <db:execute-ddl config-ref="Pg">
+            <db:sql>DROP TABLE IF EXISTS otel_t</db:sql>
+        </db:execute-ddl>
+        <db:execute-ddl config-ref="Pg">
+            <db:sql>CREATE TABLE otel_t (id INT PRIMARY KEY, name VARCHAR(20))</db:sql>
+        </db:execute-ddl>
+        <set-payload value="ok"/>
+    </flow>
+
+    <flow name="insert">
+        <http:listener config-ref="L" path="/insert"/>
+        <db:insert config-ref="Pg">
+            <db:sql>INSERT INTO otel_t (id, name) VALUES (:id, :name)</db:sql>
+            <db:input-parameters>#[{id: (attributes.queryParams.id default "1") as Number, name: "a"}]</db:input-parameters>
+        </db:insert>
+        <set-payload value="#[output text/plain --- payload.affectedRows]"/>
+    </flow>
+
+    <flow name="select">
+        <http:listener config-ref="L" path="/select"/>
+        <db:select config-ref="Pg">
+            <db:sql>SELECT id, name FROM otel_t WHERE id &gt;= :id ORDER BY id</db:sql>
+            <db:input-parameters>#[{id: 0}]</db:input-parameters>
+        </db:select>
+        <set-payload value="#[output text/plain --- sizeOf(payload)]"/>
+    </flow>
+
+    <flow name="single">
+        <http:listener config-ref="L" path="/single"/>
+        <db:query-single config-ref="Pg">
+            <db:sql>SELECT count(*) AS n FROM otel_t</db:sql>
+        </db:query-single>
+        <set-payload value="#[output text/plain --- payload.n]"/>
+    </flow>
+
+    <flow name="update">
+        <http:listener config-ref="L" path="/update"/>
+        <db:update config-ref="Pg">
+            <db:sql>UPDATE otel_t SET name = 'b' WHERE id = 1</db:sql>
+        </db:update>
+        <set-payload value="#[output text/plain --- payload.affectedRows]"/>
+    </flow>
+
+    <flow name="bulk">
+        <http:listener config-ref="L" path="/bulk"/>
+        <db:bulk-insert config-ref="Pg">
+            <db:bulk-input-parameters>#[[{id: 10, name: "x"}, {id: 11, name: "y"}]]</db:bulk-input-parameters>
+            <db:sql>INSERT INTO otel_t (id, name) VALUES (:id, :name)</db:sql>
+        </db:bulk-insert>
+        <set-payload value="#[output text/plain --- sizeOf(payload)]"/>
+    </flow>
+
+    <flow name="delete">
+        <http:listener config-ref="L" path="/delete"/>
+        <db:delete config-ref="Pg">
+            <db:sql>DELETE FROM otel_t WHERE id &gt;= 10</db:sql>
+        </db:delete>
+        <set-payload value="#[output text/plain --- payload]"/>
+    </flow>
+
+    <flow name="dup-caught">
+        <http:listener config-ref="L" path="/dup-caught"/>
+        <db:insert config-ref="Pg">
+            <db:sql>INSERT INTO otel_t (id, name) VALUES (1, 'dup')</db:sql>
+        </db:insert>
+        <error-handler>
+            <on-error-continue type="DB:QUERY_EXECUTION">
+                <set-payload value="dup"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="bad-sql">
+        <http:listener config-ref="L" path="/bad-sql"/>
+        <db:select config-ref="Pg">
+            <db:sql>SELECT nope FROM otel_t</db:sql>
+        </db:select>
+    </flow>
+</mule>

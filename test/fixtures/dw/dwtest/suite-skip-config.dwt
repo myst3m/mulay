@@ -1,0 +1,75 @@
+%%% note
+dw::test の .^skip (テストと suite)、withConfig (setup の結果をテストに渡し、teardown を呼ぶ。setup が失敗したら SKIP)。location は伏せる (実 DW で記録)。
+%%% mask
+"time": ([0-9]+)
+%%% script
+%dw 2.0
+import * from dw::test::Tests
+import * from dw::test::Asserts
+output application/json
+fun clean(r) = r mapObject (v, k) -> if (k as String == "location") {} else if (k as String == "tests") {(k): (v as Array) map clean($)} else {(k): v}
+---
+clean("S" describedBy [
+  ("skipme" <~ {skip: {reason: "later"}}) in do { 1 must equalTo(2) },
+  "cfg" withConfig {setup: () -> {a: 1}, teardown: (c) -> c} in ((c) -> c.a must equalTo(1)),
+  "cfgfail" withConfig {setup: () -> {a: 1}, teardown: (c) -> c} in ((c) -> c.a must equalTo(2)),
+  "cfgerr" withConfig {setup: () -> {a: 1 / 0}, teardown: (c) -> c} in ((c) -> c.a must equalTo(2)),
+  "cfgmany" withConfig {setup: () -> {a: 1}, teardown: (c) -> c} in [((c) -> c.a must equalTo(1)), ((c) -> c.a must equalTo(3))],
+  ("Inner" <~ {skip: {reason: "suite"}}) describedBy [ "x" in do { 1 must equalTo(1) }, "y" in do { 1 must equalTo(2) } ]
+])
+%%% output application/json
+{
+  "name": "S",
+  "time": 71,
+  "status": "OK",
+  "tests": [
+    {
+      "name": "skipme",
+      "time": 0,
+      "status": "SKIP",
+      "skipReason": "later"
+    },
+    {
+      "name": "cfg",
+      "time": 12,
+      "status": "OK",
+      "errorMessage": ""
+    },
+    {
+      "name": "cfgfail",
+      "time": 4,
+      "status": "FAIL",
+      "errorMessage": "Expected value to be 2 but was 1 at (root). From `\"cfgfail\" withConfig {setup: () -> {a: 1}, teardown: (c) -> c} in ((c) -> c.a must equalTo(2)),` at line 10 of anonymous.dwl."
+    },
+    {
+      "name": "cfgerr",
+      "time": 0,
+      "status": "SKIP",
+      "skipReason": "Setup failed with: Division by zero"
+    },
+    {
+      "name": "cfgmany",
+      "time": 2,
+      "status": "FAIL",
+      "errorMessage": "Expected value to be 3 but was 1 at (root). From `\"cfgmany\" withConfig {setup: () -> {a: 1}, teardown: (c) -> c} in [((c) -> c.a must equalTo(1)), ((c) -> c.a must equalTo(3))],` at line 12 of anonymous.dwl."
+    },
+    {
+      "name": "Inner",
+      "time": 0,
+      "status": "SKIP",
+      "skipReason": "suite",
+      "tests": [
+        {
+          "name": "",
+          "time": 0,
+          "status": "SKIP"
+        },
+        {
+          "name": "",
+          "time": 0,
+          "status": "SKIP"
+        }
+      ]
+    }
+  ]
+}

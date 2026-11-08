@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <!-- JWT (接続アプリ "mulay oracle" の証明書と、sf-jwt.jks の鍵) -->
+    <salesforce:sfdc-config name="Jwt">
+        <salesforce:jwt-connection consumerKey="${sf.consumerKey}" keyStore="sf-jwt.jks" storePassword="${sf.jwtStorePassword}"
+                                   certificateAlias="mulay" principal="${sf.principal}"/>
+    </salesforce:sfdc-config>
+
+    <!-- 同じ鍵を PKCS12 に入れたもの (keytool -importkeystore で sf-jwt.jks から作る) -->
+    <salesforce:sfdc-config name="JwtP12">
+        <salesforce:jwt-connection consumerKey="${sf.consumerKey}" keyStore="sf-jwt.p12" storePassword="${sf.jwtStorePassword}"
+                                   certificateAlias="mulay" principal="${sf.principal}"/>
+    </salesforce:sfdc-config>
+
+    <!-- PKCS12 のパスワードが違う -->
+    <salesforce:sfdc-config name="JwtP12Bad">
+        <salesforce:jwt-connection consumerKey="${sf.consumerKey}" keyStore="sf-jwt.p12" storePassword="not-the-password"
+                                   certificateAlias="mulay" principal="${sf.principal}"/>
+    </salesforce:sfdc-config>
+
+    <!-- 知らない利用者 -->
+    <salesforce:sfdc-config name="JwtBad">
+        <salesforce:jwt-connection consumerKey="${sf.consumerKey}" keyStore="sf-jwt.jks" storePassword="${sf.jwtStorePassword}"
+                                   certificateAlias="mulay" principal="nobody.mulay@example.com"/>
+    </salesforce:sfdc-config>
+
+    <error-handler name="report">
+        <on-error-continue>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="user">
+        <http:listener config-ref="HTTP" path="/user"/>
+        <salesforce:get-user-info config-ref="Jwt"/>
+        <set-payload value="#[output application/json --- {userName: payload.userName, organizationName: typeOf(payload.organizationName)}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="user-p12">
+        <http:listener config-ref="HTTP" path="/user-p12"/>
+        <salesforce:get-user-info config-ref="JwtP12"/>
+        <set-payload value="#[output application/json --- {userName: payload.userName}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="p12-bad-password">
+        <http:listener config-ref="HTTP" path="/p12-bad-password"/>
+        <salesforce:get-user-info config-ref="JwtP12Bad"/>
+        <set-payload value="#[output application/json --- {userName: payload.userName}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="query">
+        <http:listener config-ref="HTTP" path="/query"/>
+        <salesforce:query config-ref="Jwt">
+            <salesforce:salesforce-query>SELECT Username FROM User WHERE Username = '${sf.principal}'</salesforce:salesforce-query>
+        </salesforce:query>
+        <set-payload value="#[output application/json --- payload map $.Username]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bad">
+        <http:listener config-ref="HTTP" path="/bad"/>
+        <salesforce:get-user-info config-ref="JwtBad"/>
+        <set-payload value="#[output application/json --- payload.userName]"/>
+        <!-- error_description は Salesforce 側で変わる ("invalid assertion" → "user hasn't approved this consumer") ので、その手前まで比べる -->
+        <error-handler>
+            <on-error-continue>
+                <set-payload value='#[output application/json --- {"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: (error.description splitBy ",\"error_description\"")[0]}]'/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>

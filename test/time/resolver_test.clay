@@ -1,0 +1,28 @@
+(ns resolver-test (:require [mulay.lib.time.fmt :as fm] [mulay.lib.time.types :as t] [mulay.lib.time.iso :as iso]))
+
+;; 期待値は JDK 17 の DateTimeFormatter.ofPattern(p).withResolverStyle(..).parse(..)
+
+(defn- ldt Str [p: &Str style: Int text: &Str]
+  (let [[f0 e] (fm/compile p)
+        f (fm/with-resolver f0 style)
+        [pr e2] (fm/parse f text)]
+    (if (not= e2 "") e2
+      (let [[d dok] (fm/parsed-date pr) [x tok] (fm/parsed-time pr)]
+        (str (if dok (iso/date-str d) "-") "T" (if tok (iso/time-str x) "-"))))))
+
+(deftest smart
+  (is (= (ldt "MM/dd/uuuu" fm/SMART "02/31/2020") "2020-02-29T-"))
+  (is (= (ldt "MM/dd/yyyy" fm/SMART "02/28/2020") "2020-02-28T-"))
+  (is (= (ldt "HH:mm" fm/SMART "24:00") "-T00:00")))
+
+(deftest lenient
+  (is (= (ldt "MM/dd/uuuu" fm/LENIENT "02/31/2020") "2020-03-02T-"))
+  (is (= (ldt "MM/dd/uuuu" fm/LENIENT "13/40/2020") "2021-02-09T-"))
+  (is (= (ldt "MM/dd/uuuu HH:mm" fm/LENIENT "13/40/2020 25:61") "2021-02-10T02:01")))
+
+(deftest strict
+  (is (= (ldt "MM/dd/uuuu" fm/STRICT "02/31/2020") "Text '02/31/2020' could not be parsed: Invalid date 'FEBRUARY 31'"))
+  (is (= (ldt "MM/dd/uuuu" fm/STRICT "02/29/2019") "Text '02/29/2019' could not be parsed: Invalid date 'February 29' as '2019' is not a leap year"))
+  ;; yyyy (year-of-era) は紀元が無いと年にならない
+  (is (= (ldt "MM/dd/yyyy" fm/STRICT "02/28/2020") "-T-"))
+  (is (= (ldt "MM/dd/uuuu" fm/STRICT "02/28/2020") "2020-02-28T-")))

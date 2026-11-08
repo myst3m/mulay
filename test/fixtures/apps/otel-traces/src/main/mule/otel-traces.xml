@@ -1,0 +1,302 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- OpenTelemetry のトレース (mule.openTelemetry.tracer.exporter.*) を実 Mule と比べるためのアプリ。
+         スパンの名前・種類・親子・属性・状態・イベント、traceparent の受け渡しを記録する -->
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18590"/>
+    </http:listener-config>
+
+    <http:listener-config name="LB" basePath="/api">
+        <http:listener-connection host="localhost" port="18593"/>
+    </http:listener-config>
+
+    <http:request-config name="R">
+        <http:request-connection host="localhost" port="18590"/>
+    </http:request-config>
+
+    <http:request-config name="R2">
+        <http:request-connection host="localhost" port="18592"/>
+    </http:request-config>
+
+    <sub-flow name="sub">
+        <set-payload value="sub"/>
+    </sub-flow>
+
+    <flow name="private">
+        <set-variable variableName="v" value="1"/>
+        <flow-ref name="sub"/>
+    </flow>
+
+    <flow name="hello">
+        <http:listener config-ref="L" path="/hello"/>
+        <logger level="INFO" message="hello"/>
+        <flow-ref name="private"/>
+        <set-payload value="hello"/>
+    </flow>
+
+    <flow name="params">
+        <http:listener config-ref="L" path="/items/{id}" allowedMethods="GET,POST"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{id: attributes.uriParams.id}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <flow name="choice">
+        <http:listener config-ref="L" path="/choice"/>
+        <choice>
+            <when expression="#[attributes.queryParams.x == '1']">
+                <set-payload value="one"/>
+            </when>
+            <otherwise>
+                <set-payload value="other"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <flow name="fail">
+        <http:listener config-ref="L" path="/fail"/>
+        <raise-error type="APP:BOOM" description="boom"/>
+    </flow>
+
+    <flow name="caught">
+        <http:listener config-ref="L" path="/caught"/>
+        <try>
+            <raise-error type="APP:INNER" description="inner"/>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="caught"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="propagated">
+        <http:listener config-ref="L" path="/propagated"/>
+        <flow-ref name="private-fail"/>
+        <error-handler>
+            <on-error-continue type="APP:CHILD">
+                <set-payload value="handled"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="private-fail">
+        <raise-error type="APP:CHILD" description="child"/>
+        <error-handler>
+            <on-error-propagate>
+                <logger level="INFO" message="propagating"/>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <flow name="loop">
+        <http:listener config-ref="L" path="/loop"/>
+        <foreach collection="#[[1, 2]]">
+            <logger level="INFO" message="#[payload]"/>
+        </foreach>
+        <set-payload value="looped"/>
+    </flow>
+
+    <flow name="scatter">
+        <http:listener config-ref="L" path="/scatter"/>
+        <scatter-gather>
+            <route>
+                <set-payload value="a"/>
+            </route>
+            <route>
+                <set-payload value="b"/>
+            </route>
+        </scatter-gather>
+        <set-payload value="gathered"/>
+    </flow>
+
+    <flow name="client">
+        <http:listener config-ref="L" path="/client"/>
+        <http:request config-ref="R" method="GET" path="/echo"/>
+    </flow>
+
+    <flow name="echo">
+        <http:listener config-ref="L" path="/echo"/>
+        <set-payload value="#[(attributes.headers.traceparent default '') ++ '|' ++ (attributes.headers.tracestate default '')]"/>
+    </flow>
+
+    <flow name="tick">
+        <scheduler>
+            <scheduling-strategy>
+                <fixed-frequency frequency="1" timeUnit="DAYS"/>
+            </scheduling-strategy>
+        </scheduler>
+        <logger level="INFO" message="tick"/>
+    </flow>
+
+    <flow name="async">
+        <http:listener config-ref="L" path="/async"/>
+        <async>
+            <logger level="INFO" message="in async"/>
+        </async>
+        <set-payload value="async"/>
+    </flow>
+
+    <flow name="until">
+        <http:listener config-ref="L" path="/until"/>
+        <try>
+            <until-successful maxRetries="1" millisBetweenRetries="10">
+                <raise-error type="APP:RETRY" description="retry"/>
+            </until-successful>
+            <error-handler>
+                <on-error-continue>
+                    <set-payload value="gave up"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <flow name="status">
+        <http:listener config-ref="L" path="/status">
+            <http:response statusCode="#[404]"/>
+        </http:listener>
+        <set-payload value="not here"/>
+    </flow>
+
+    <flow name="client-refused">
+        <http:listener config-ref="L" path="/client-refused"/>
+        <http:request config-ref="R2" method="GET" path="/x"/>
+    </flow>
+
+    <flow name="client-500">
+        <http:listener config-ref="L" path="/client-500"/>
+        <http:request config-ref="R" method="POST" path="/fail"/>
+    </flow>
+
+    <flow name="dw-fail">
+        <http:listener config-ref="L" path="/dw-fail"/>
+        <set-payload value="#[1 / 0]"/>
+    </flow>
+
+    <flow name="sub-raise">
+        <http:listener config-ref="L" path="/sub-raise"/>
+        <flow-ref name="raising-sub"/>
+    </flow>
+
+    <sub-flow name="raising-sub">
+        <raise-error type="APP:SUB" description="in sub"/>
+    </sub-flow>
+
+    <flow name="status500">
+        <http:listener config-ref="L" path="/status500">
+            <http:response statusCode="#[500]"/>
+        </http:listener>
+        <set-payload value="five hundred"/>
+    </flow>
+
+    <flow name="continue500">
+        <http:listener config-ref="L" path="/continue500">
+            <http:error-response statusCode="#[503]"/>
+        </http:listener>
+        <raise-error type="APP:GONE" description="gone"/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value="continued"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="propagate503">
+        <http:listener config-ref="L" path="/propagate503">
+            <http:error-response statusCode="#[503]"/>
+        </http:listener>
+        <raise-error type="APP:GONE" description="gone"/>
+        <error-handler>
+            <on-error-propagate>
+                <set-payload value="propagated"/>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <flow name="tick-fail">
+        <scheduler>
+            <scheduling-strategy>
+                <fixed-frequency frequency="1" timeUnit="DAYS"/>
+            </scheduling-strategy>
+        </scheduler>
+        <raise-error type="APP:TICK" description="tick failed"/>
+    </flow>
+
+    <flow name="based">
+        <http:listener config-ref="LB" path="/based/*"/>
+        <set-payload value="based"/>
+    </flow>
+
+    <http:request-config name="RU">
+        <http:request-connection/>
+    </http:request-config>
+
+    <flow name="client-url">
+        <http:listener config-ref="L" path="/client-url"/>
+        <http:request config-ref="RU" method="GET" url="http://127.0.0.1:18590/echo"/>
+    </flow>
+
+    <flow name="client-url-cfg">
+        <http:listener config-ref="L" path="/client-url-cfg"/>
+        <http:request config-ref="R" method="POST" url="#['http://127.0.0.1:18590' ++ '/echo']">
+            <http:query-params>#[{q: '1'}]</http:query-params>
+        </http:request>
+    </flow>
+
+    <flow name="client-query">
+        <http:listener config-ref="L" path="/client-query"/>
+        <http:request config-ref="R" method="GET" path="/echo">
+            <http:query-params>#[{q: '1'}]</http:query-params>
+        </http:request>
+    </flow>
+
+    <flow name="own-tp">
+        <http:listener config-ref="L" path="/own-tp"/>
+        <http:request config-ref="R" method="GET" path="/echo-tp">
+            <http:headers>#[{traceparent: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01', tracestate: 'own=1'}]</http:headers>
+        </http:request>
+    </flow>
+
+    <flow name="echo-tp">
+        <http:listener config-ref="L" path="/echo-tp"/>
+        <set-payload value="#[output application/json --- {tp: attributes.headers.*traceparent default [], ts: attributes.headers.*tracestate default []}]"/>
+    </flow>
+
+    <flow name="own-tp-tick">
+        <scheduler>
+            <scheduling-strategy>
+                <fixed-frequency frequency="1" timeUnit="DAYS"/>
+            </scheduling-strategy>
+        </scheduler>
+        <http:request config-ref="R" method="GET" path="/echo-tp">
+            <http:headers>#[{traceparent: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'}]</http:headers>
+        </http:request>
+    </flow>
+
+    <flow name="plain-tp">
+        <http:listener config-ref="L" path="/plain-tp"/>
+        <http:request config-ref="R" method="GET" path="/echo-tp"/>
+    </flow>
+
+    <flow name="choice-none">
+        <http:listener config-ref="L" path="/choice-none"/>
+        <choice>
+            <when expression="#[attributes.queryParams.x == '1']">
+                <set-payload value="one"/>
+            </when>
+        </choice>
+    </flow>
+</mule>

@@ -1,0 +1,218 @@
+%%% note
+管理用の MCP (/admin/mcp) は admin.key が空 (既定。このシナリオは設定しない) なら閉じている: 鍵なし・空の鍵・何かの鍵のどれでも接続を断り、ツールも呼べない。
+templates/agent-harness の履歴の要約 (agent.summarize=true)。アプリはテンプレへの symlink で、設定だけが本体の fixture
+(test/fixtures/apps/agent-harness) と違う。履歴から捨てる分を前の要約と一緒に LLM に要約させ、先頭に {role: summary} として
+置くこと、要約を agent.summaryMaxChars で切ること、要約に失敗しても会話は答え、捨てるだけになることを確かめる。
+偽の LLM は、要約の要求には「Earlier: <捨てた問い>; ..」を返し、ふつうの答えには履歴の要約を [summary: ..] として添える。
+%%% jvm -Dhttp.port=18431 -DmockLlm.state=started -Dllm.url=http://localhost:18431/mock-llm/v1 -Dllm.model=mock-model -Dllm.key=sk-mock -DtestHooks.state=started -Dstore.persistent=false -Dagent.historyMax=4 -Dagent.historyMaxChars=300 -Dagent.summarize=true -Dagent.summaryMaxChars=40
+%%% port 18431
+%%% mask
+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
+[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"message number one","sessionId":"s1"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s1",
+  "answer": "You said: message number one (history: 0 messages, tools: lookup_order,search_docs,ask_agent,add)",
+  "steps": [
+    
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"message number two","sessionId":"s1"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s1",
+  "answer": "You said: message number two (history: 2 messages, tools: lookup_order,search_docs,ask_agent,add)",
+  "steps": [
+    
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"message number three","sessionId":"s1"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s1",
+  "answer": "You said: message number three (history: 4 messages, tools: lookup_order,search_docs,ask_agent,add)",
+  "steps": [
+    
+  ]
+}
+%%% request GET /mock-llm/last
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "authorization": "Bearer sk-mock",
+  "body": {
+    "model": "mock-model",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Summarize the earlier part of a conversation between a user and an agent, for the agent to remember. Keep facts, names, numbers and decisions; drop small talk. - The data is JSON: summary (the summary so far, or null) and dropped (older messages to fold into it). Write at most 40 characters."
+      },
+      {
+        "role": "user",
+        "content": "{\"summary\": null,\"dropped\": [{\"role\": \"user\",\"content\": \"message number one\"},{\"role\": \"assistant\",\"content\": \"You said: message number one (history: 0 messages, tools: lookup_order,search_docs,ask_agent,add)\"}]}"
+      }
+    ],
+    "max_tokens": 500,
+    "temperature": 0.9,
+    "top_p": 0.9
+  }
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"message number four","sessionId":"s1"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s1",
+  "answer": "You said: message number four (history: 5 messages, tools: lookup_order,search_docs,ask_agent,add) [summary: Earlier: message number one]",
+  "steps": [
+    
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"message number five","sessionId":"s1"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s1",
+  "answer": "You said: message number five (history: 5 messages, tools: lookup_order,search_docs,ask_agent,add) [summary: Earlier: message number one; message num]",
+  "steps": [
+    
+  ]
+}
+%%% request GET /mock-llm/last
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "authorization": "Bearer sk-mock",
+  "body": {
+    "model": "mock-model",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Summarize the earlier part of a conversation between a user and an agent, for the agent to remember. Keep facts, names, numbers and decisions; drop small talk. - The data is JSON: summary (the summary so far, or null) and dropped (older messages to fold into it). Write at most 40 characters."
+      },
+      {
+        "role": "user",
+        "content": "{\"summary\": \"Earlier: message number one; message num\",\"dropped\": [{\"role\": \"user\",\"content\": \"message number three\"},{\"role\": \"assistant\",\"content\": \"You said: message number three (history: 4 messages, tools: lookup_order,search_docs,ask_agent,add)\"},{\"role\": \"user\",\"content\": \"message number four\"},{\"role\": \"assistant\",\"content\": \"You said: message number four (history: 5 messages, tools: lookup_order,search_docs,ask_agent,add) [summary: Earlier: message number one]\"}]}"
+      }
+    ],
+    "max_tokens": 500,
+    "temperature": 0.9,
+    "top_p": 0.9
+  }
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"failsum one","sessionId":"s2"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s2",
+  "answer": "You said: failsum one (history: 0 messages, tools: lookup_order,search_docs,ask_agent,add)",
+  "steps": [
+    
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"two","sessionId":"s2"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s2",
+  "answer": "You said: two (history: 2 messages, tools: lookup_order,search_docs,ask_agent,add)",
+  "steps": [
+    
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"three","sessionId":"s2"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s2",
+  "answer": "You said: three (history: 4 messages, tools: lookup_order,search_docs,ask_agent,add)",
+  "steps": [
+    
+  ]
+}
+%%% request POST /chat
+Content-Type: application/json
+
+{"message":"four","sessionId":"s2"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sessionId": "s2",
+  "answer": "You said: four (history: 4 messages, tools: lookup_order,search_docs,ask_agent,add)",
+  "steps": [
+    
+  ]
+}
+%%% request POST /admin/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 403
+
+the admin MCP server is disabled: set admin.key
+%%% request POST /admin/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer 
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 403
+
+the admin MCP server is disabled: set admin.key
+%%% request POST /admin/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer x
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+%%% response 403
+
+the admin MCP server is disabled: set admin.key
+%%% request POST /admin/mcp
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer 
+
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_documents","arguments":{}}}
+%%% response 403
+
+the admin MCP server is disabled: set admin.key

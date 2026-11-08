@@ -1,0 +1,84 @@
+(ns packet-err-test (:require [mulay.lib.sshpkt :as p] [mulay.lib.sshwire :as w]))
+
+;; 壊れたパケットは BAD、足りなければ NEED-MORE。方式ごとに 1 バイトを書き換えて MAC (タグ) の不一致を見る
+
+(defn- pat Str [n: Int m: Int a: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out (chr (mod (+ (* i m) a) 256)))))))
+
+(defn- flip Str [s: &Str i: Int] (str (subs s 0 i) (chr (bit-xor (nth s i) 1)) (subs s (+ i 1) (count s))))
+
+;; 封じて、i バイト目を書き換えて取り出した状態
+(defn- tampered Int [cipher: Str mac: Str klen: Int ivlen: Int mlen: Int i: Int]
+  (let [[d err] (p/new-dir cipher mac (pat klen 11 5) (pat ivlen 13 7) (pat mlen 17 9))
+        [x d2] (p/seal d (pat 40 3 1))
+        [st pl n d3 why] (p/unseal d (flip x (if (< i 0) (+ (count x) i) i)))]
+    st))
+
+(defn- roundtrip Bool [cipher: Str mac: Str klen: Int ivlen: Int mlen: Int]
+  (let [[d err] (p/new-dir cipher mac (pat klen 11 5) (pat ivlen 13 7) (pat mlen 17 9))
+        [x d2] (p/seal d (pat 40 3 1))
+        [st pl n d3 why] (p/unseal d x)]
+    (and (= st p/OK) (= pl (pat 40 3 1)) (= n (count x)) (= (p/seq-of d3) 1))))
+
+(deftest seal-random-roundtrip
+  (is (roundtrip "chacha20-poly1305@openssh.com" "" 64 0 0))
+  (is (roundtrip "aes128-ctr" "hmac-sha2-256" 16 16 32))
+  (is (roundtrip "aes256-ctr" "hmac-sha2-512-etm@openssh.com" 32 16 64))
+  (is (roundtrip "aes256-gcm@openssh.com" "" 32 12 0)))
+
+(deftest tamper-body
+  (is (= (tampered "chacha20-poly1305@openssh.com" "" 64 0 0 10) p/BAD))
+  (is (= (tampered "aes128-ctr" "hmac-sha2-256" 16 16 32 10) p/BAD))
+  (is (= (tampered "aes256-ctr" "hmac-sha2-512-etm@openssh.com" 32 16 64 10) p/BAD))
+  (is (= (tampered "aes128-gcm@openssh.com" "" 16 12 0 10) p/BAD)))
+
+(deftest tamper-tag
+  (is (= (tampered "chacha20-poly1305@openssh.com" "" 64 0 0 -1) p/BAD))
+  (is (= (tampered "aes128-ctr" "hmac-sha2-256" 16 16 32 -1) p/BAD))
+  (is (= (tampered "aes256-ctr" "hmac-sha2-512-etm@openssh.com" 32 16 64 -1) p/BAD))
+  (is (= (tampered "aes128-gcm@openssh.com" "" 16 12 0 -1) p/BAD)))
+
+;; 暗号の無いパケットの長さの欄: 上限 (256 KB) を超えるもの、ブロックの境目に揃わないもの、詰め物が 4 バイトより短いものは BAD。
+;; 長さが上限の内なら、本体が届くまで NEED-MORE
+(deftest none-lengths
+  (let [d (p/none-dir)
+        [s1 a1 n1 d1 e1] (p/unseal d (w/u32 262148))
+        [s2 a2 n2 d2 e2] (p/unseal d (str (w/u32 13) (pat 13 1 0)))
+        [s3 a3 n3 d3 e3] (p/unseal d (str (w/u32 12) (chr 3) (pat 11 1 0)))
+        [s4 a4 n4 d4 e4] (p/unseal d (w/u32 262140))
+        [s5 a5 n5 d5 e5] (p/unseal d "")]
+    (is (= s1 p/BAD))
+    (is (= s2 p/BAD))
+    (is (= s3 p/BAD))
+    (is (= s4 p/NEED-MORE))
+    (is (= s5 p/NEED-MORE))))
+
+(deftest new-dir-errors
+  (let [[d1 e1] (p/new-dir "aes128-ctr" "hmac-md5" (pat 16 1 0) (pat 16 1 0) "")
+        [d2 e2] (p/new-dir "aes128-ctr" "hmac-sha2-256" (pat 15 1 0) (pat 16 1 0) "")
+        [d3 e3] (p/new-dir "chacha20-poly1305@openssh.com" "" (pat 32 1 0) "" "")
+        [d4 e4] (p/new-dir "3des-cbc" "hmac-sha2-256" (pat 24 1 0) (pat 8 1 0) "")]
+    (is (not= e1 ""))
+    (is (not= e2 ""))
+    (is (not= e3 ""))
+    (is (not= e4 ""))))
+
+;; unseal-at: 前に別のバイトがあるバッファから、at の位置のパケットを続けて取り出す (使ったバイト数は at から数える)
+(defn- at-roundtrip Bool [cipher: Str mac: Str klen: Int ivlen: Int mlen: Int]
+  (let [[d err] (p/new-dir cipher mac (pat klen 11 5) (pat ivlen 13 7) (pat mlen 17 9))
+        [x1 d2] (p/seal d (pat 40 3 1))
+        [x2 d3] (p/seal d2 (pat 300 5 2))
+        junk (pat 7 1 9)
+        buf (str junk x1 x2)
+        [s1 p1 n1 e1 w1] (p/unseal-at d buf 7)
+        [s2 p2 n2 e2 w2] (p/unseal-at e1 buf (+ 7 n1))
+        [s3 p3 n3 e3 w3] (p/unseal-at e2 buf (+ (+ 7 n1) n2))]
+    (and (= s1 p/OK) (= p1 (pat 40 3 1)) (= n1 (count x1))
+         (= s2 p/OK) (= p2 (pat 300 5 2)) (= n2 (count x2))
+         (= s3 p/NEED-MORE))))
+
+(deftest unseal-at-offset
+  (is (at-roundtrip "none" "" 0 0 0))
+  (is (at-roundtrip "chacha20-poly1305@openssh.com" "" 64 0 0))
+  (is (at-roundtrip "aes128-ctr" "hmac-sha2-256" 16 16 32))
+  (is (at-roundtrip "aes256-ctr" "hmac-sha2-512-etm@openssh.com" 32 16 64))
+  (is (at-roundtrip "aes256-gcm@openssh.com" "" 32 12 0)))

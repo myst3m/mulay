@@ -1,0 +1,44 @@
+(ns yaml-samples-test (:require [mulay.lib.yaml :as y] [clay.string :as str] [clay.io :as io]))
+
+(defn- env Str [k: Str] (getenv k ""))
+;; canonical text of a value, matching the Python generator's canon()
+(defn jstr Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (cond (= c 34) (str out "\\\"") (= c 92) (str out "\\\\") (= c 10) (str out "\\n")
+                     (= c 9) (str out "\\t") (= c 13) (str out "\\r") (= c 8) (str out "\\b") (= c 12) (str out "\\f")
+                     (< c 32) (str out (if (< c 16) "\\u000" "\\u001") (subs "0123456789abcdef" (mod c 16) (+ (mod c 16) 1)))
+                     :else (str out (chr c))))))))
+(defn canon Str [v: &y/YVal]
+  (match v
+    (y/YNull) "~"
+    (y/YBool b) (if b "true" "false")
+    (y/YInt t) (let [[i ok] (y/int-value v)] (str "i:" i))
+    (y/YFloat t) (let [[f ok] (y/float-value v)]
+                   (cond (not (= f f)) "f:nan" (= f (exp 1000.0)) "f:inf" (= f (- 0.0 (exp 1000.0))) "f:-inf" :else (str "f:" (fmt-fixed f 6))))
+    (y/YStr s) (jstr s)
+    (y/YSeq xs) (loop [i 0 out "["] (if (>= i (count xs)) (str out "]") (recur (+ i 1) (str out (if (= i 0) "" ",") (canon (nth xs i))))))
+    (y/YMap ks vs) (loop [i 0 out "{"] (if (>= i (count ks)) (str out "}") (recur (+ i 1) (str out (if (= i 0) "" ",") (canon (nth ks i)) ":" (canon (nth vs i))))))
+    (y/YTagged t x) (str t " " (canon x))))
+(defn canon-doc Str [src: Str] (let [[v err] (y/parse src)] (if (= err "") (canon v) (str "ERR " err))))
+(defn canon-docs Str [src: Str]
+  (let [[ds err] (y/parse-all src)]
+    (if (not (= err "")) (str "ERR " err)
+      (loop [i 0 out ""] (if (>= i (count ds)) out (recur (+ i 1) (str out (if (= i 0) "" "|") (canon (nth ds i)))))))))
+
+(defn canon-file Str [rel: Str] (let [[src err] (read-file rel)] (if (= err "") (canon-doc src) (str "IOERR " err))))
+(deftest mulet-sample-yaml
+  (is (= (canon-file "test/fixtures/mulet-samples/db-test-oracle/src/main/resources/config.yaml") "{\"http.port\":\"9088\",\"db\":{\"host\":\"172.23.0.7\",\"port\":i:1521,\"service\":\"FREEPDB1\",\"user\":\"mulet\",\"password\":\"mulepassword\"}}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/db-test-postgres/src/main/resources/config.yaml") "{\"http.port\":\"9087\",\"db\":{\"host\":\"172.23.0.8\",\"port\":i:5432,\"database\":\"muledb\",\"user\":\"mule\",\"password\":\"mulepassword\"}}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/file-test/src/main/resources/config.yaml") "{\"http.port\":\"9082\"}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/http-test/src/main/resources/config.yaml") "{\"http.port\":\"9085\"}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/objectstore-test/src/main/resources/config.yaml") "{\"http.port\":\"9084\"}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/products-api/src/main/resources/api/products-api.yaml") "{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"Products API\",\"version\":\"1.0.0\",\"description\":\"Sample Products API with OAS validation\"},\"servers\":[{\"url\":\"http://localhost:8084/api\"}],\"paths\":{\"/products\":{\"get\":{\"summary\":\"List all products\",\"operationId\":\"getProducts\",\"parameters\":[{\"name\":\"category\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"List of products\",\"content\":{\"application/json\":{\"schema\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}}}}}},\"post\":{\"summary\":\"Create a new product\",\"operationId\":\"createProduct\",\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"required\":[\"name\",\"price\"],\"properties\":{\"name\":{\"type\":\"string\"},\"price\":{\"type\":\"number\"},\"category\":{\"type\":\"string\"}}}}}},\"responses\":{\"201\":{\"description\":\"Product created\"},\"400\":{\"description\":\"Invalid input\"}}}},\"/products/{productId}\":{\"get\":{\"summary\":\"Get product by ID\",\"operationId\":\"getProductById\",\"parameters\":[{\"name\":\"productId\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"Product details\"},\"404\":{\"description\":\"Product not found\"}}}}}}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/products-api/src/main/resources/config.yaml") "{\"http\":{\"port\":i:8084}}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/quotations-api/src/main/resources/config.yaml") "{\"http\":{\"port\":i:8082},\"db\":{\"host\":\"localhost\",\"port\":i:1521,\"service\":\"FREEPDB1\",\"user\":\"${db.user}\",\"password\":\"${db.password}\"}}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/quotations-search-api/src/main/resources/config.yaml") "{\"http\":{\"port\":i:8083},\"db\":{\"host\":\"localhost\",\"port\":i:1521,\"service\":\"FREEPDB1\",\"user\":\"${db.user}\",\"password\":\"${db.password}\"}}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/salesforce-test/src/main/resources/config.yaml") "{\"http.port\":\"8081\",\"sf.tokenUrl\":\"https://example.my.salesforce.com/services/oauth2/token\",\"sf.clientId\":\"dummy-client-id\",\"sf.clientSecret\":\"dummy-client-secret\"}"))
+  (is (= (canon-file "test/fixtures/mulet-samples/vm-test/src/main/resources/config.yaml") "{\"http.port\":\"9083\"}"))
+  (is true))

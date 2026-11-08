@@ -1,0 +1,319 @@
+(ns amodel-test (:require [mulay.conn.registry :as creg] [mulay.conn.apikit :as apikit] [mulay.conn.catalog :as cat] [mulay.conn.catalog_gen :as cg] [mulay.rt.conn :as conn] [mulay.mule.load :as ld] [mulay.mule.model :as m] [mulay.mule.amodel :as am]
+                          [mulay.lib.xml :as xml] [mulay.lib.res :as res] [clay.string :as str] [clay.json :as json] [clay.io :as io]))
+
+(def ORDERS "test/fixtures/livenote/orders-api")
+
+(defn- opts ld/LoadOpts [] (ld/->LoadOpts [] false (creg/hints)))
+
+(defn- model am/AModel [l: &ld/Loaded pre: &Str] (am/build l (creg/hints) cat/component-info pre))
+
+(defn- orders am/AModel [] (let [l (ld/load-path ORDERS (opts))] (model l "src/main/mule/")))
+
+(defn- text Str [] (let [[t e] (read-file (str ORDERS "/src/main/mule/orders.xml"))] t))
+
+(defn- slice Str [t: &Str s: &xml/XSpan]
+  (let [e (if (>= (:close-end s) 0) (:close-end s) (:open-end s))] (subs t (:open s) e)))
+
+(defn- one Str [v: &Vec(Str)] (if (= (count v) 0) "<none>" (nth v 0)))
+
+(defn- step am/ANode [f: &am/AFlow i: Int] (nth (:steps f) i))
+
+(deftest orders-flow
+  (let [a (orders) f (nth (:flows a) 0) t (text)]
+    (is (= (count (:flows a)) 1))
+    (is (= (:name f) "post-orders"))
+    (is (= (:element f) "flow"))
+    (is (= (:file f) "src/main/mule/orders.xml"))
+    (is (str/starts-with? (slice t (:span f)) "<flow name=\"post-orders\""))
+    (is (str/ends-with? (slice t (:span f)) "</flow>"))
+    (is (= (count (:source f)) 1))
+    (is (= (:path (nth (:source f) 0)) "post-orders/source"))
+    (is (= (:element (nth (:source f) 0)) "http:listener"))
+    (is (= (:support (nth (:source f) 0)) "browser"))
+    (is (= (:effect (nth (:source f) 0)) "none"))
+    (is (= (:body-start f) (:close-end (:span (nth (:source f) 0)))))
+    (is (= (count (:steps f)) 6))
+    (is (= (str/join "," (loop [i 0 acc: Vec(Str) []] (if (>= i 6) acc (recur (+ i 1) (conj acc (:element (step f i)))))))
+           "validation:is-not-null,db:select,ee:transform,choice,salesforce:create,ee:transform"))
+    (is (= (:path (step f 5)) "post-orders/processors/5"))))
+
+(deftest orders-steps
+  (let [a (orders) f (nth (:flows a) 0) t (text) db (step f 1)]
+    (is (= (one (:doc-id db)) "5df09612-3918-431b-b73e-5a8a8ad97631"))
+    (is (= (one (:label db)) "顧客を探す"))
+    (is (= (:kind db) "processor"))
+    (is (= (:support db) "relay"))
+    (is (= (:effect db) "read"))
+    (is (str/starts-with? (slice t (:span db)) "<db:select doc:name=\"顧客を探す\""))
+    (is (str/ends-with? (slice t (:span db)) "</db:select>"))
+    (is (= (:support (step f 0)) "browser"))
+    (is (= (:effect (step f 0)) "none"))
+    (is (= (:support (step f 4)) "relay"))
+    (is (= (:effect (step f 4)) "write"))
+    (is (= (:effect (step f 2)) "none"))
+    (is (= (:support (step f 2)) "browser"))
+    (is (= (:quote (nth (:attrs (:span db)) 0)) 34))
+    (is (= (subs t (:vstart (nth (:attrs (:span db)) 0)) (:vend (nth (:attrs (:span db)) 0))) "顧客を探す"))))
+
+(deftest orders-choice
+  (let [a (orders) f (nth (:flows a) 0) t (text) c (step f 3) w (nth (:kids c) 0) o (nth (:kids c) 1)]
+    (is (= (:kind c) "router"))
+    (is (= (count (am/routes-of c)) 2))
+    (is (= (:kind w) "when"))
+    (is (= (:path w) "post-orders/processors/3/route/0"))
+    (is (= (one (:cond w)) "#[payload.tier == \"gold\"]"))
+    (is (:has-span w))
+    (is (str/starts-with? (slice t (:span w)) "<when expression="))
+    (is (= (count (:kids w)) 1))
+    (is (= (:path (nth (:kids w) 0)) "post-orders/processors/3/route/0/processors/0"))
+    (is (= (:kind o) "otherwise"))
+    (is (= (:path o) "post-orders/processors/3/route/1"))
+    (is (not (:has-span o)))
+    (is (= (count (:kids o)) 0))))
+
+(deftest orders-handlers
+  (let [a (orders) f (nth (:flows a) 0) t (text) h (nth (:entries f) 1)]
+    (is (= (count (:eh f)) 1))
+    (is (str/starts-with? (slice t (nth (:eh f) 0)) "<error-handler>"))
+    (is (= (count (:entries f)) 2))
+    (is (= (:path h) "post-orders/errorHandler/1"))
+    (is (= (:element h) "on-error-propagate"))
+    (is (= (str/join "," (:types h)) "DB:CONNECTIVITY"))
+    (is (= (one (:label h)) "DB につながらない"))
+    (is (= (count (:kids h)) 2))
+    (is (= (:path (nth (:kids h) 1)) "post-orders/errorHandler/1/processors/1"))))
+
+(deftest orders-globals-files
+  (let [a (orders)]
+    (is (= (count (:globals a)) 4))
+    (is (= (:element (nth (:globals a) 1)) "http:listener-config"))
+    (is (= (one (:name (nth (:globals a) 1))) "HTTP_Listener_config"))
+    (is (= (count (:name (nth (:globals a) 0))) 0))
+    (is (= (count (:files a)) 1))
+    (is (= (:path (nth (:files a) 0)) "src/main/mule/orders.xml"))
+    (is (= (count (:root (nth (:files a) 0))) 1))
+    (is (= (count (:diags a)) 0))))
+
+(def UNKNOWN (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:doc=\"http://www.mulesoft.org/schema/mule/documentation\""
+                  " xmlns:foo=\"http://example.com/foo\">\n"
+                  "<sub-flow name=\"s\">\n<logger message=\"a\"/>\n<bogus-core doc:id=\"b1\"/>\n<foo:bar x=\"1\"/>\n"
+                  "<foreach><logger message=\"x\"/></foreach>\n</sub-flow>\n</mule>"))
+
+(deftest unknown-elements
+  (let [l (ld/load-texts "t" ["a.xml"] [UNKNOWN] (res/res-none) (opts))
+        a (model l "")
+        f (nth (:flows a) 0)
+        d (nth (:diags a) 0)]
+    (is (= (:element f) "sub-flow"))
+    (is (= (count (:source f)) 0))
+    (is (= (:body-start f) (+ (str/index-of UNKNOWN "<sub-flow name=\"s\">") 19)))
+    (is (= (count (:steps f)) 4))
+    (is (= (:kind (step f 1)) "unknown"))
+    (is (= (:support (step f 1)) "unsupported"))
+    (is (= (:kind (step f 2)) "processor"))
+    (is (= (:support (step f 2)) "unsupported"))
+    (is (= (:kind (step f 3)) "scope"))
+    (is (= (:kind (nth (:kids (step f 3)) 0)) "body"))
+    (is (= (:path (nth (:kids (step f 3)) 0)) "s/processors/3"))
+    (is (= (:path (nth (:kids (nth (:kids (step f 3)) 0)) 0)) "s/processors/3/processors/0"))
+    (is (= (count (:diags a)) 1))
+    (is (= (:file d) "a.xml"))
+    (is (= (:path d) "s/processors/1"))
+    (is (= (count (:span d)) 2))
+    (is (= (subs UNKNOWN (nth (:span d) 0) (nth (:span d) 1)) "<bogus-core doc:id=\"b1\"/>"))))
+
+(deftest json-shape
+  (let [a (orders)
+        j (am/to-json a)
+        [d e] (json/parse j)]
+    (is (= e ""))
+    (is (str/includes? j "\"path\":\"post-orders/processors/3/route/1\",\"spans\":null"))
+    (is (str/includes? j "\"diagnostics\":[]"))
+    (is (str/includes? j "\"bodyStart\":"))
+    (is (str/includes? j "\"quote\":\"\\\"\""))))
+
+(defn- app-dirs Vec(Str) []
+  (let [[ns e] (io/list-dir "test/fixtures/apps")
+        sorted (sort ns)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count sorted)) acc
+        (let [d (str "test/fixtures/apps/" (nth sorted i))]
+          (recur (+ i 1) (if (io/exists? (str d "/src/main/mule")) (conj acc d) acc)))))))
+
+(deftest every-model-path-has-a-step
+  (let [ds (app-dirs)
+        missing (loop [i 0 out ""]
+                  (if (>= i (count ds)) out
+                    (let [l (ld/load-path (nth ds i) (opts))
+                          a (model l "")
+                          have (am/step-paths a)
+                          want (am/model-paths (:app l))
+                          miss (loop [k 0 o out] (if (>= k (count want)) o
+                                                   (recur (+ k 1) (if (contains? have (nth want k)) o (str o (nth ds i) ": " (nth want k) "\n")))))]
+                      (recur (+ i 1) miss))))]
+    (is (> (count ds) 50))
+    (is (= missing ""))))
+
+(def TRY (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\">\n"
+              "<flow name=\"t\">\n<try>\n<logger message=\"a\"/>\n<error-handler>\n"
+              "<on-error-continue type=\"ANY\" when=\"#[true]\"><logger message=\"h\"/></on-error-continue>\n"
+              "</error-handler>\n</try>\n</flow>\n</mule>"))
+
+(deftest try-error-handler
+  (let [l (ld/load-texts "t" ["a.xml"] [TRY] (res/res-none) (opts))
+        a (model l "")
+        f (nth (:flows a) 0)
+        t (step f 0)
+        j (am/to-json a)]
+    (is (= (count (:diags a)) 0))
+    (is (= (:kind t) "scope"))
+    (is (= (count (am/routes-of t)) 1))
+    (is (= (count (am/handlers-of t)) 1))
+    (is (= (:path (nth (am/handlers-of t) 0)) "t/processors/0/errorHandler/0"))
+    (is (= (:path (nth (:kids (nth (am/handlers-of t) 0)) 0)) "t/processors/0/errorHandler/0/processors/0"))
+    (is (str/includes? j "\"errorHandler\":{\"spans\":{\"element\":"))
+    (is (str/includes? j "\"path\":\"t/processors/0/errorHandler/0\",\"element\":\"on-error-continue\",\"types\":[\"ANY\"],\"when\":\"#[true]\""))))
+
+(def BROKEN "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\">\n<flow name=\"日本\" a=\"1\"b=\"2\"/>\n</mule>")
+
+(deftest unreadable-file
+  (let [l (ld/load-texts "t" ["a.xml" "b.xml"] [TRY BROKEN] (res/res-none) (opts))
+        a (model l "src/main/mule/")
+        d (nth (:diags a) 0)
+        k (str/index-of BROKEN "b=")]
+    (is (= (count (:files a)) 2))
+    (is (= (:path (nth (:files a) 1)) "src/main/mule/b.xml"))
+    (is (= (count (:root (nth (:files a) 1))) 0))
+    (is (= (count (:diags a)) 1))
+    (is (= (:file d) "src/main/mule/b.xml"))
+    (is (str/starts-with? (:message d) "XML: line 2, column "))
+    (is (= (count (:span d)) 2))
+    (is (= (nth (:span d) 0) k))
+    (is (= (nth (:span d) 1) (+ k 1)))))
+
+(deftest effects
+  (is (= (cat/op-effect "mcp" "list-tools" []) "read"))
+  (is (= (cat/op-effect "mcp" "call-tool" []) "write")))
+
+(deftest catalog-matches-registry
+  (let [cs (creg/all)
+        h (creg/hints)
+        g (cg/hints)
+        names (str/join "," (loop [i 0 acc: Vec(Str) []] (if (>= i (count cs)) acc (recur (+ i 1) (conj acc (str (:name (nth cs i)) " " (:uri (nth cs i))))))))
+        gnames (str/join "," (loop [i 0 acc: Vec(Str) []] (if (>= i (count cg/CONNS)) acc (recur (+ i 1) (conj acc (str (nth (nth cg/CONNS i) 0) " " (nth (nth cg/CONNS i) 1)))))))
+        ch (fn Str [x: m/Hints] (str/join ";" (loop [i 0 acc: Vec(Str) []] (if (>= i (count (:chains x))) acc (recur (+ i 1) (conj acc (str (:op (nth (:chains x) i)) "=" (str/join "," (:names (nth (:chains x) i))))))))))]
+    (is (= names gnames))
+    (is (= (str/join "," (:source-uris h)) (str/join "," (:source-uris g))))
+    (is (= (str/join "," (:sources h)) (str/join "," (:sources g))))
+    (is (= (ch h) (ch g)))
+    (is (= (str/join "," (:each h)) (str/join "," (:each g))))
+    (is (= (str/join "," (:raw-sources h)) (str/join "," (:raw-sources g))))
+    (is (= (str/join "," (:modules h)) (str/join "," (:modules g))))
+    (is (= (str/join "," (conn/error-parents cs)) (str/join "," cg/PARENTS)))
+    (is (= (str/join "," (conn/error-classes cs)) (str/join "," cg/CLASSES)))))
+
+(def ENTRIES (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\" xmlns:vm=\"http://www.mulesoft.org/schema/mule/vm\">\n"
+                  "<http:listener-config name=\"L\" basePath=\"/v1\"><http:listener-connection host=\"0.0.0.0\" port=\"8081\"/></http:listener-config>\n"
+                  "<vm:config name=\"V\"><vm:queues><vm:queue queueName=\"q\"/></vm:queues></vm:config>\n"
+                  "<flow name=\"orders\"><http:listener config-ref=\"L\" path=\"/orders\" allowedMethods=\"GET, POST\"/><logger/></flow>\n"
+                  "<flow name=\"any\"><http:listener config-ref=\"L\" path=\"/any/*\"/><logger/></flow>\n"
+                  "<flow name=\"nightly\"><scheduler><scheduling-strategy><cron expression=\"0 0 2 * * ?\" timeZone=\"Asia/Tokyo\"/></scheduling-strategy></scheduler><logger/></flow>\n"
+                  "<flow name=\"tick\"><scheduler><scheduling-strategy><fixed-frequency frequency=\"5\" timeUnit=\"SECONDS\"/></scheduling-strategy></scheduler><logger/></flow>\n"
+                  "<flow name=\"recv\"><vm:listener config-ref=\"V\" queueName=\"q\"/><logger/></flow>\n"
+                  "<flow name=\"plain\"><logger/></flow>\n"
+                  "<sub-flow name=\"s\"><logger/></sub-flow>\n"
+                  "</mule>"))
+
+(defn- entry-line Str [e: &am/AEntry]
+  (str (:kind e) " " (:flow e) " " (:source e) " " (:element e) " " (:method e) " " (:path e) " " (:frequency-ms e) " " (:cron e) " " (:tz e)))
+
+(deftest entries-of-sources
+  (let [l (ld/load-texts "t" ["a.xml"] [ENTRIES] (res/res-none) (opts))
+        a (model l "")
+        es (:entries a)
+        j (am/to-json a)]
+    (is (= (str/join "\n" (mapv (fn Str [e: am/AEntry] (entry-line e)) es))
+           (str/join "\n" ["http orders orders/source http:listener GET /v1/orders -1  "
+                           "http orders orders/source http:listener POST /v1/orders -1  "
+                           "http any any/source http:listener * /v1/any/* -1  "
+                           "scheduler nightly nightly/source scheduler   -1 0 0 2 * * ? Asia/Tokyo"
+                           "scheduler tick tick/source scheduler   5000  "
+                           "connector recv recv/source vm:listener   -1  "])))
+    (is (str/includes? j ",\"entries\":[{\"kind\":\"http\",\"flow\":\"orders\",\"source\":\"orders/source\",\"element\":\"http:listener\",\"method\":\"GET\",\"path\":\"/v1/orders\"}"))
+    (is (str/includes? j "{\"kind\":\"scheduler\",\"flow\":\"nightly\",\"source\":\"nightly/source\",\"element\":\"scheduler\",\"schedule\":{\"cron\":\"0 0 2 * * ?\",\"timeZone\":\"Asia/Tokyo\"}}"))
+    (is (str/includes? j "{\"kind\":\"scheduler\",\"flow\":\"tick\",\"source\":\"tick/source\",\"element\":\"scheduler\",\"schedule\":{\"frequencyMs\":5000}}"))
+    (is (str/includes? j "{\"kind\":\"connector\",\"flow\":\"recv\",\"source\":\"recv/source\",\"element\":\"vm:listener\"}]"))
+    (is (str/includes? j ",\"apis\":[]"))))
+
+(def APIKIT "test/fixtures/livenote/apikit")
+
+(defn- api-model am/AModel []
+  (let [l (ld/load-path APIKIT (opts))]
+    (am/with-apis (model l "src/main/mule/") (:app l) (apikit/api-models (:app l) "src/main/resources/"))))
+
+(deftest apis-and-apikit-entries
+  (let [a (api-model)
+        j (am/to-json a)
+        ap (nth (:apis a) 0)
+        ops (:ops ap)
+        [t te] (read-file (str APIKIT "/src/main/resources/api/orders.yaml"))
+        g (nth ops 0)
+        p (nth ops 1)]
+    (is (= (count (:apis a)) 1))
+    (is (= (:config ap) "orders-config"))
+    (is (= (:file ap) "src/main/resources/api/orders.yaml"))
+    (is (= (:format ap) "oas3"))
+    (is (= (str/join "," (mapv (fn Str [o: am/AOp] (str (:method o) " " (:path o) " " (:flow o) " " (:implemented o))) ops))
+           "GET /orders get:\\orders:orders-config true,POST /orders post:\\orders:application\\json:orders-config true,GET /orders/{id} get:\\orders\\(id):orders-config true"))
+    (is (= (subs t (nth (:key g) 0) (nth (:key g) 1)) "get"))
+    (is (str/starts-with? (subs t (nth (:block p) 0) (nth (:block p) 1)) "    post:\n      requestBody:"))
+    (is (str/ends-with? (subs t (nth (:block p) 0) (nth (:block p) 1)) "description: created\n"))
+    (is (= (str (:name (nth (:params g) 0)) " " (:in (nth (:params g) 0)) " " (:required (nth (:params g) 0)) " " (:type (nth (:params g) 0))) "status query false string"))
+    (is (= (:type (nth (:params (nth ops 2)) 0)) "integer"))
+    (is (= (str/join "," (:media p)) "application/json"))
+    (is (= (str/join "," (:codes p)) "201"))
+    (is (str/includes? j "{\"kind\":\"http\",\"flow\":\"orders-main\",\"source\":\"orders-main/source\",\"element\":\"http:listener\",\"method\":\"*\",\"path\":\"/api/*\"}"))
+    (is (str/includes? j "{\"kind\":\"apikit\",\"flow\":\"post:\\\\orders:application\\\\json:orders-config\",\"source\":null,\"element\":\"apikit:router\",\"method\":\"POST\",\"path\":\"/api/orders\",\"main\":\"orders-main\",\"router\":\"orders-main/processors/0\",\"api\":\"orders-config\",\"operation\":1,\"implemented\":true}"))
+    (is (str/includes? j ",\"apis\":[{\"config\":\"orders-config\",\"file\":\"src/main/resources/api/orders.yaml\",\"format\":\"oas3\",\"error\":null,\"operations\":[{\"method\":\"GET\",\"path\":\"/orders\",\"key\":{\"start\":"))
+    (is (str/includes? j "\"params\":[{\"name\":\"status\",\"in\":\"query\",\"required\":false,\"type\":\"string\"}],\"requestMediaTypes\":[],\"responses\":[\"200\"],\"flow\":\"get:\\\\orders:orders-config\",\"implemented\":true,\"responseExamples\":"))))
+
+(def RAML (str "#%RAML 1.0\ntitle: t\n/orders:\n  get:\n  /{id}:\n    delete:\n"))
+(def RAML-XML (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:apikit=\"http://www.mulesoft.org/schema/mule/mule-apikit\">\n"
+                   "<apikit:config name=\"c\" api=\"api.raml\"/>\n"
+                   "<flow name=\"get:\\orders:c\"><logger/></flow>\n</mule>"))
+
+(deftest raml-ops-and-missing-flows
+  (let [rs (res/res-mem ["api.raml"] [RAML])
+        l (ld/load-texts "t" ["a.xml"] [RAML-XML] rs (opts))
+        a (am/with-apis (model l "") (:app l) (apikit/api-models (:app l) ""))
+        ap (nth (:apis a) 0)
+        d (nth (:ops ap) 1)
+        j (am/to-json a)]
+    (is (= (:format ap) "raml"))
+    (is (= (str (:method d) " " (:path d) " " (:flow d) " " (:implemented d)) "DELETE /orders/{id} delete:\\orders\\(id):c false"))
+    (is (= (subs RAML (nth (:block d) 0) (nth (:block d) 1)) "    delete:\n"))
+    (is (str/includes? j "{\"kind\":\"apikit\",\"flow\":\"delete:\\\\orders\\\\(id):c\",\"source\":null,\"element\":\"apikit:router\",\"method\":\"DELETE\",\"path\":\"/orders/{id}\",\"main\":null,\"router\":null,\"api\":\"c\",\"operation\":1,\"implemented\":false}"))))
+
+(def EXAPP "test/fixtures/livenote/apikit-examples")
+
+(deftest operations-carry-the-spec-examples
+  (let [l (ld/load-path EXAPP (opts))
+        a (am/with-apis (model l "src/main/mule/") (:app l) (apikit/api-models (:app l) "src/main/resources/"))
+        j (am/to-json a)]
+    (is (str/includes? j "\"params\":[{\"name\":\"limit\",\"in\":\"query\",\"required\":false,\"type\":\"integer\",\"example\":\"10\"},{\"name\":\"q\",\"in\":\"query\",\"required\":false,\"type\":\"string\",\"example\":\"pen\"},{\"name\":\"sort\",\"in\":\"query\",\"required\":false,\"type\":\"string\"}]"))
+    (is (str/includes? j "\"responseExamples\":[{\"status\":\"200\",\"mediaType\":\"application/json\",\"body\":\"[{\\\"id\\\":1}]\"},{\"status\":\"404\",\"mediaType\":\"application/json\",\"body\":\"{\\\"error\\\":\\\"missing\\\"}\"}],\"requestExample\":null,"))
+    (is (str/includes? j "\"responseExamples\":[{\"status\":\"201\",\"mediaType\":\"application/json\",\"body\":\"{\\\"id\\\":2,\\\"name\\\":\\\"ink\\\"}\"},{\"status\":\"400\",\"mediaType\":\"text/plain\",\"body\":\"bad request\"}],\"requestExample\":{\"mediaType\":\"application/json\",\"body\":\"{\\\"id\\\":2,\\\"name\\\":\\\"ink\\\"}\"},"))
+    (is (str/includes? j "\"params\":[{\"name\":\"limit\",\"in\":\"query\",\"required\":true,\"type\":\"integer\",\"example\":\"5\"},{\"name\":\"sort\",\"in\":\"query\",\"required\":true,\"type\":\"string\"}]"))
+    (is (str/includes? j "\"responseExamples\":[{\"status\":\"200\",\"mediaType\":\"application/json\",\"body\":\"[{\\\"id\\\":4}]\"}],\"requestExample\":null,"))
+    (is (str/includes? j "\"responseExamples\":[{\"status\":\"201\",\"mediaType\":\"application/json\",\"body\":\"{\\\"id\\\":3}\"},{\"status\":\"400\",\"mediaType\":\"text/plain\",\"body\":\"bad request\"}],\"requestExample\":{\"mediaType\":\"application/json\",\"body\":\"{\\\"id\\\":3}\"},"))))
+
+(deftest operations-carry-a-minimal-request-sample
+  (let [l (ld/load-path EXAPP (opts))
+        a (am/with-apis (model l "src/main/mule/") (:app l) (apikit/api-models (:app l) "src/main/resources/"))
+        j (am/to-json a)]
+    (is (str/includes? j "\"params\":[{\"name\":\"X-Tenant\",\"in\":\"header\",\"required\":true,\"type\":\"string\"}],\"requestMediaTypes\":[\"application/json\"],\"responses\":[\"201\"],\"flow\":\"post:\\\\orders:application\\\\json:oas-config\""))
+    (is (str/includes? j "\"requestExample\":null,\"requestSample\":{\"mediaType\":\"application/json\",\"body\":\"{\\\"orderId\\\":\\\"00000000-0000-4000-8000-000000000000\\\",\\\"qty\\\":3,\\\"when\\\":\\\"2024-01-01T00:00:00Z\\\"}\"},\"requestRequired\":[\"orderId\",\"qty\",\"when\"]}"))
+    (is (str/includes? j "\"params\":[{\"name\":\"X-Tenant\",\"in\":\"header\",\"required\":true,\"type\":\"string\"}],\"requestMediaTypes\":[\"application/json\"],\"responses\":[\"201\"],\"flow\":\"post:\\\\orders:application\\\\json:raml-config\""))
+    (is (str/includes? j "\"requestExample\":null,\"requestSample\":{\"mediaType\":\"application/json\",\"body\":\"{\\\"orderId\\\":\\\"ORD-0000\\\",\\\"when\\\":\\\"2024-01-01T00:00:00\\\",\\\"tags\\\":[\\\"sample\\\"]}\"},\"requestRequired\":[\"orderId\",\"when\",\"tags\"]}"))
+    (is (str/includes? j "\"requestExample\":{\"mediaType\":\"application/json\",\"body\":\"{\\\"id\\\":3}\"},\"requestSample\":{\"mediaType\":\"application/json\",\"body\":\"{\\\"id\\\":1}\"},\"requestRequired\":[\"id\"]}"))
+    (is (str/includes? j "\"requestExample\":null,\"requestSample\":null,\"requestRequired\":[]}"))))

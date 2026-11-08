@@ -1,0 +1,186 @@
+(ns mulay.cli.dwt (:require [mulay.dw.engine :as eng] [mulay.dw.val :as v] [mulay.dw.gen :as gen] [mulay.dw.gencode :as gc] [mulay.cli.aot :as aot]
+                            [mulay.dw.lib.system :as sys] [mulay.dw.lib.runtime :as l-runtime] [mulay.lib.regex :as rx] [clay.string :as str]))
+(defextern clearenv clearenv)
+
+(c-include "<stdlib.h>")
+
+(defrecord Sec [head: Str body: Str])
+
+(defn- parse-dwt Vec(Sec) [text: &Str]
+  (let [lines: Vec(Str) (str/split (if (str/ends-with? text "\n") (subs text 0 (- (count text) 1)) (str text)) "\n")]
+    (loop [i 0 acc: Vec(Sec) [] head "" body "" in false first true]
+      (if (>= i (count lines))
+        (if in (conj acc (->Sec head body)) acc)
+        (let [ln (nth lines i)]
+          (if (str/starts-with? ln "%%% ")
+            (recur (+ i 1) (if in (conj acc (->Sec head body)) acc) (str/trim (subs ln 4 (count ln))) "" true true)
+            (if in (recur (+ i 1) acc head (if first (str ln) (str body "\n" ln)) true false)
+              (recur (+ i 1) acc head body in first))))))))
+
+(defn- words Vec(Str) [s: &Str]
+  (let [ps: Vec(Str) (str/split s " ")]
+    (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (if (= (nth ps i) "") acc (conj acc (nth ps i))))))))
+
+(defn- first-line Str [s: &Str] (let [i (str/index-of s "\n")] (str/trimr (if (< i 0) (str s) (subs s 0 i)))))
+
+(defn- input-props Vec(v/Field) [ws: &Vec(Str)]
+  (loop [i 3 acc: Vec(v/Field) []]
+    (if (>= i (count ws)) acc
+      (let [w (nth ws i) eq (str/index-of w "=")]
+        (recur (+ i 1) (if (< eq 0) acc (conj acc (v/field (subs w 0 eq) (v/->VStr (subs w (+ eq 1) (count w)))))))))))
+
+(defn- apply-masks Str [s: &Str masks: &Vec(rx/Pattern)]
+  (loop [k 0 cur (str s)]
+    (if (>= k (count masks)) cur
+      (let [re (nth masks k)
+            [ms e] (rx/find-all re cur)
+            out (loop [i 0 pos 0 acc ""]
+                  (if (>= i (count ms)) (str acc (subs cur pos (count cur)))
+                    (let [m (nth ms i)
+                          g (if (and (> (rx/groups m) 0) (rx/group-matched? m 1)) 1 0)
+                          a (rx/start m g) b (rx/end m g)]
+                      (if (< a pos) (recur (+ i 1) pos acc)
+                        (recur (+ i 1) b (str acc (subs cur pos a) "***"))))))]
+        (recur (+ k 1) (if (= e "") out cur))))))
+
+(defn- masks-of Values(Vec(rx/Pattern) Str) [secs: &Vec(Sec)]
+  (loop [i 0 acc: Vec(rx/Pattern) []]
+    (if (>= i (count secs)) (values acc "")
+      (if (not= (:head (nth secs i)) "mask") (recur (+ i 1) acc)
+        (let [ls: Vec(Str) (str/split (:body (nth secs i)) "\n")
+              [ps e] (loop [k 0 a2 acc]
+                       (if (>= k (count ls)) (values a2 "")
+                         (if (= (nth ls k) "") (recur (+ k 1) a2)
+                           (let [[re err] (rx/compile (nth ls k) 0)] (if (not= err "") (values a2 err) (recur (+ k 1) (conj a2 re)))))))]
+          (if (not= e "") (values ps e) (recur (+ i 1) ps)))))))
+
+(defn- set-env Int [vars: &Vec(Str)]
+  (let [z (unsafe (clearenv))]
+    (loop [i 0]
+      (if (>= i (count vars)) 0
+        (let [kv (nth vars i) eq (str/index-of kv "=")
+              z2 (if (> eq 0) (setenv (subs kv 0 eq) (subs kv (+ eq 1) (count kv))) "")]
+          (recur (+ i 1)))))))
+
+(defn- sysprops-of Vec(v/Field) [secs: &Vec(Sec)]
+  (loop [i 0]
+    (if (>= i (count secs)) []
+      (if (= (:head (nth secs i)) "sysprops")
+        (let [ls: Vec(Str) (str/split (:body (nth secs i)) "\n")]
+          (loop [k 0 acc: Vec(v/Field) []]
+            (if (>= k (count ls)) acc
+              (let [l (nth ls k) eq (str/index-of l "=")]
+                (recur (+ k 1) (if (> eq 0) (conj acc (v/field (subs l 0 eq) (v/->VStr (subs l (+ eq 1) (count l))))) acc))))))
+        (recur (+ i 1))))))
+
+(defn- env-of Vec(Vec(Str)) [secs: &Vec(Sec)]
+  (loop [i 0]
+    (if (>= i (count secs)) []
+      (if (= (:head (nth secs i)) "env")
+        [(let [ls: Vec(Str) (str/split (:body (nth secs i)) "\n")] (loop [k 0 acc: Vec(Str) []] (if (>= k (count ls)) acc (recur (+ k 1) (if (= (nth ls k) "") acc (conj acc (nth ls k)))))))]
+        (recur (+ i 1))))))
+
+(defn- run-one Values(Int Str) [path: &Str strict: Bool]
+  (let [[text re] (read-file path)]
+    (if (not= re "") (values 1 (str "cannot read: " re))
+      (let [secs (parse-dwt text)
+            [masks me] (masks-of secs)
+            env (env-of secs)
+            saved (if (= (count env) 0) [] (sys/environ))
+            z0 (if (= (count env) 0) 0 (set-env (nth env 0)))
+            zp (l-runtime/set-sys-props! (sysprops-of secs))
+            [rc detail] (if (not= me "") (values 1 (str "bad mask: " me)) (run-secs secs masks strict))
+            zq (l-runtime/set-sys-props! [])
+            z1 (if (= (count env) 0) 0 (set-env saved))]
+        (values rc detail)))))
+
+(def REPEAT (atom 0))
+
+(defn- bench Int [script: &Str ins: &Vec(eng/Input)]
+  (let [n (deref REPEAT)
+        ts (loop [i 0 acc: Vec(Int) []]
+             (if (>= i n) acc
+               (let [t0 (mono-us) [m o e] (eng/run-text script ins) t1 (mono-us)] (recur (+ i 1) (conj acc (- t1 t0))))))
+        sorted (sort ts)
+        z (println (str "bench median " (quot (nth sorted (quot n 2)) 1000) " ms, min " (quot (nth sorted 0) 1000) " ms (" n " runs)"))]
+    0))
+
+(defn- run-secs Values(Int Str) [secs: &Vec(Sec) masks: &Vec(rx/Pattern) strict: Bool]
+  (let [[script ins] (loop [i 0 sc "" ins: Vec(eng/Input) []]
+                       (if (>= i (count secs)) (values sc ins)
+                         (let [s (nth secs i) ws (words (:head s)) k (nth ws 0)]
+                           (cond (= k "script") (recur (+ i 1) (:body s) ins)
+                                 (= k "input") (recur (+ i 1) sc (conj ins (eng/->Input (nth ws 1) (if (> (count ws) 2) (nth ws 2) "application/json") (input-props ws) (:body s))))
+                                 :else (recur (+ i 1) sc ins)))))
+        [mime out0 err0] (eng/run-text script ins)
+        zb (if (> (deref REPEAT) 0) (bench script ins) 0)
+        out (apply-masks out0 masks)
+        err (if (= err0 "") "" (apply-masks err0 masks))]
+    (loop [i 0 best-rc 1 best "" seen false]
+      (if (>= i (count secs)) (if seen (values best-rc best) (values 1 "no expected output or error"))
+        (let [s (nth secs i) k (nth (words (:head s)) 0)]
+          (if (and (not= k "output") (not= k "error")) (recur (+ i 1) best-rc best seen)
+            (let [[rc d] (compare-exp k (apply-masks (:body s) masks) out err strict)]
+              (if (= rc 0) (values 0 "") (recur (+ i 1) (if (= rc 2) 2 best-rc) (if (or (= best "") (= rc 2)) d best) true)))))))))
+
+(defn- compare-exp Values(Int Str) [kind: &Str want: &Str out: &Str err: &Str strict: Bool]
+  (if (= kind "error")
+    (if (= err "") (values 1 (str "want error: " want "\n  got output:\n" out))
+      (if (or (not strict) (= (first-line err) (first-line want))) (values 0 "")
+        (values 2 (str "want error: " want "\n  got error:  " (first-line err)))))
+    (if (not= err "") (values 1 (str "got error: " err))
+      (if (= out want) (values 0 "")
+        (values 1 (str "want:\n" want "\n  got:\n" out))))))
+
+(defn- gen-one Str [path: &Str root: &Str]
+  (let [text (read-file-or path "")
+        secs (parse-dwt text)
+        [script names] (loop [i 0 sc "" ns: Vec(Str) []]
+                         (if (>= i (count secs)) (values sc ns)
+                           (let [sct (nth secs i) ws (words (:head sct)) k (nth ws 0)]
+                             (if (= k "script") (recur (+ i 1) (:body sct) ns)
+                               (if (= k "input") (recur (+ i 1) sc (conj ns (nth ws 1))) (recur (+ i 1) sc ns))))))
+        c (eng/compile script names)]
+    (if (or (= script "") (not (eng/ok? c))) ""
+      (let [h (gen/script-hash script names)
+            z (write-file (str root "/mulay/cli/aot_s" h ".clay") (gc/module (str "mulay.cli.aot_s" h) (:prog c) (:builtins c)))]
+        h))))
+
+(defn- gen-all Int [files: &Vec(Str) root: &Str]
+  (let [hs (loop [i 0 acc: Vec(Str) []]
+             (if (>= i (count files)) acc
+               (let [h (gen-one (nth files i) root)]
+                 (recur (+ i 1) (if (or (= h "") (loop [k 0] (if (>= k (count acc)) false (if (= (nth acc k) h) true (recur (+ k 1)))))) acc (conj acc h))))))
+        src (gc/aot-module (aot/aot) hs false)
+        z (write-file (str root "/mulay/cli/aot.clay") src)
+        z2 (println (str "dwt: generated " (count hs) " module(s)"))]
+    0))
+
+(defn main Int []
+  (let [z0 (eng/set-generated! (:table (aot/aot)))
+        n (argv-len)
+        [verbose strict files groot]
+        (loop [i 1 vb false st false fs: Vec(Str) [] gr ""]
+          (if (>= i n) (values vb st fs gr)
+            (let [a (argv-nth i)]
+              (if (and (= a "-g") (< (+ i 1) n)) (recur (+ i 2) vb st fs (argv-nth (+ i 1)))
+              (if (and (= a "-r") (< (+ i 1) n)) (let [[k ke] (parse-long (argv-nth (+ i 1))) z (reset! REPEAT k)] (recur (+ i 2) vb st fs gr))
+              (if (= a "-v") (recur (+ i 1) true st fs gr)
+                (if (= a "-e") (recur (+ i 1) vb true fs gr)
+                  (if (str/starts-with? a "@")
+                    (let [lst (read-file-or (subs a 1 (count a)) "")
+                          ls: Vec(Str) (str/split lst "\n")]
+                      (recur (+ i 1) vb st (loop [k 0 acc fs] (if (>= k (count ls)) acc (recur (+ k 1) (if (= (str/trim (nth ls k)) "") acc (conj acc (str/trim (nth ls k))))))) gr))
+                    (recur (+ i 1) vb st (conj fs a) gr)))))))))
+        zg (if (not= groot "") (gen-all files groot) 0)
+        [pass fail msgdiff skip]
+        (if (not= groot "") (values 0 0 0 0)
+        (loop [i 0 p 0 f 0 m 0 k 0]
+          (if (>= i (count files)) (values p f m k)
+            (let [path (nth files i)
+                  [rc detail] (run-one path strict)
+                  z (if (and verbose (not= rc 0)) (println (str "FAIL " path "\n  " detail)) 0)]
+              (recur (+ i 1) (if (= rc 0) (+ p 1) p) (if (= rc 1) (+ f 1) f) (if (= rc 2) (+ m 1) m) (if (= rc 3) (+ k 1) k))))))]
+    (if (not= groot "") 0
+    (let [z (println (str "dwt: " pass " pass, " fail " fail" (if strict (str ", " msgdiff " error-message mismatch") "") ", " skip " skipped (" (count files) " files)"))]
+      (if (= (+ fail msgdiff) 0) 0 1)))))

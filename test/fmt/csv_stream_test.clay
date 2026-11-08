@@ -1,0 +1,80 @@
+(ns csv-stream-test (:require [mulay.dw.fmt.csv :as csv] [mulay.dw.fmt.registry :as reg] [mulay.dw.val :as v] [mulay.dw.err :as dwe]))
+
+(defn- json Str [x: &v/Val] (let [[t e] (reg/write-fmt "application/json" [(v/field "indent" (v/bool-v false))] x)] t))
+
+(defn- whole Str [text: &Str props: &Vec(v/Field)]
+  (let [[x e] (csv/read text props "application/csv")] (if (not= e "") (str "ERR " e) (json (v/unmeta x)))))
+
+(defn- pieces Fn(Int Values(Str Bool Str)) [text: Str size: Int]
+  (let [pos (atom 0) t text n size]
+    (fn Values(Str Bool Str) [k: Int]
+      (let [p (deref pos)
+            end (if (> (+ p n) (count t)) (count t) (+ p n))
+            z (reset! pos end)]
+        (values (subs t p end) (>= end (count t)) "")))))
+
+(defn- streamed Str [text: &Str props: &Vec(v/Field) size: Int]
+  (let [[rd0 oe] (csv/stream-open props)]
+    (if (not= oe "") (str "ERR " oe)
+      (let [f (pieces (str text) size)]
+        (loop [rd rd0 acc: Vec(v/Val) []]
+          (let [[xs r2 done e] (csv/stream-next rd f)
+                acc2 (loop [i 0 a acc] (if (>= i (count xs)) a (recur (+ i 1) (conj a (nth xs i)))))]
+            (cond (not= e "") (str "ERR " e)
+                  done (json (v/->VArr acc2))
+                  :else (recur r2 acc2))))))))
+
+(defn- same-at-all-sizes Bool [text: Str props: Vec(v/Field)]
+  (let [w (whole text props)]
+    (loop [i 0]
+      (if (>= i 7) true
+        (let [size (nth [1 2 3 5 7 64 100000] i)]
+          (if (= (streamed text props size) w) (recur (+ i 1)) false))))))
+
+(def DOCS ["a,b,c\n1,2,3\n4,5,6\n"
+           "a,b\r\n1,2\r\n3,4"
+           "a,b\r1,2\r3,4\r"
+           "a,b\n\"x,y\",\"say \"\"hi\"\"\"\n"
+           "a,b\n\"multi\nline\",2\n\"cr\r\nlf\",4\n"
+           "a,b\n\"esc \\\" q\",\"back\\\\slash\"\n"
+           "a,b\n,\n1,\n,2\n"
+           "a,b\n\n1,2\n\n\n3,4\n\n"
+           (str (chr 239) (chr 187) (chr 191) "a,b\n1,2\n")
+           "a\n"
+           ""
+           "\n\n"
+           "x,y,z\n1,2\n1,2,3,4\n"
+           "h1,\"h 2\",h3\r\n1,\"a,b\",\"say \"\"x\"\"\"\n\"multi\nline\",\\\"e,\n\n\"q\\\"\",x,y\n"])
+
+(defn- all-docs Bool [props: Vec(v/Field)]
+  (loop [i 0] (if (>= i (count DOCS)) true (if (same-at-all-sizes (nth DOCS i) props) (recur (+ i 1)) false))))
+
+(deftest stream-equals-whole-default
+  (is (all-docs [])))
+
+(deftest stream-equals-whole-options
+  (is (all-docs [(v/field "header" (v/bool-v false))]))
+  (is (all-docs [(v/field "ignoreEmptyLine" (v/bool-v false))]))
+  (is (all-docs [(v/field "headerLineNumber" (v/->VStr "2"))]))
+  (is (all-docs [(v/field "bodyStartLineNumber" (v/->VStr "3"))]))
+  (is (all-docs [(v/field "separator" (v/->VStr ";"))]))
+  (is (all-docs [(v/field "quote" (v/->VStr "'")) (v/field "escape" (v/->VStr "'"))])))
+
+(defn- lcg Int [x: Int] (bit-and (+ (* x 1103515245) 12345) 2147483647))
+
+(deftest stream-equals-whole-mutations
+  (is (loop [k 0 seed 7]
+        (if (>= k 600) true
+          (let [s1 (lcg seed) s2 (lcg s1) s3 (lcg s2) s4 (lcg s3)
+                d (nth DOCS 13)
+                pos (mod s1 (count d))
+                chars ",\"\\\n\r x"
+                b (nth chars (mod s2 (count chars)))
+                doc (if (= (mod s3 2) 0) (str (subs d 0 pos) (chr b) (subs d (+ pos 1) (count d)))
+                      (str (subs d 0 pos) (subs d (+ pos 1) (count d))))
+                size (+ 1 (mod s4 9))]
+            (if (= (streamed doc [] size) (whole doc [])) (recur (+ k 1) s4) false))))))
+
+(deftest stream-reports-bad-options
+  (let [[rd e] (csv/stream-open [(v/field "separator" (v/->VStr ""))])]
+    (is (not= e ""))))

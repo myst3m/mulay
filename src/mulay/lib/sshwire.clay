@@ -1,0 +1,54 @@
+(ns mulay.lib.sshwire (:require [clay.bytes :as bytes] [clay.string :as cs]))
+
+(defn byte Str [n: Int] (chr (bit-and n 255)))
+(defn flag Str [b: Bool] (chr (if b 1 0)))
+(defn u32 Str [n: Int] (bytes/pack n 4 true))
+(defn u64 Str [n: Int] (bytes/pack n 8 true))
+
+(defn string Str [s: &Str] (let [h (u32 (count s))] (str h s)))
+
+(defn name-list Str [xs: &Vec(Str)]
+  (let [joined (loop [i 0 out ""]
+                 (if (>= i (count xs)) out
+                   (recur (+ i 1) (if (= i 0) (str out (nth xs i)) (str out "," (nth xs i))))))]
+    (string joined)))
+
+(defn mpint Str [be: &Str]
+  (let [n (count be)
+        start (loop [i 0] (if (and (< i n) (= (nth be i) 0)) (recur (+ i 1)) i))]
+    (if (= start n) (u32 0)
+      (let [mag (subs be start n)
+            body (if (>= (nth mag 0) 128) (str (chr 0) mag) mag)]
+        (string body)))))
+
+(defn get-byte Values(Int Int Bool) [s: &Str pos: Int]
+  (if (or (< pos 0) (>= pos (count s))) (values 0 pos false) (values (nth s pos) (+ pos 1) true)))
+
+(defn get-bool Values(Bool Int Bool) [s: &Str pos: Int]
+  (let [[b p ok] (get-byte s pos)] (values (not= b 0) p ok)))
+
+(defn get-u32 Values(Int Int Bool) [s: &Str pos: Int]
+  (if (or (< pos 0) (> (+ pos 4) (count s))) (values 0 pos false) (values (bytes/unpack s pos 4 true) (+ pos 4) true)))
+
+(defn get-u64 Values(Int Int Bool) [s: &Str pos: Int]
+  (if (or (< pos 0) (> (+ pos 8) (count s))) (values 0 pos false) (values (bytes/unpack s pos 8 true) (+ pos 8) true)))
+
+(defn get-string Values(Str Int Bool) [s: &Str pos: Int]
+  (let [[n p ok] (get-u32 s pos)]
+    (if (or (not ok) (> n (- (count s) p))) (values "" pos false)
+      (values (subs s p (+ p n)) (+ p n) true))))
+
+(defn get-name-list Values(Vec(Str) Int Bool) [s: &Str pos: Int]
+  (let [[x p ok] (get-string s pos)]
+    (cond (not ok) (values [] pos false)
+          (= (count x) 0) (values [] p true)
+          :else (values (cs/split x ",") p true))))
+
+(defn get-mpint Values(Str Int Bool) [s: &Str pos: Int]
+  (let [[x p ok] (get-string s pos)
+        n (count x)]
+    (cond (not ok) (values "" pos false)
+          (= n 0) (values "" p true)
+          (>= (nth x 0) 128) (values "" pos false)
+          (= (nth x 0) 0) (if (and (> n 1) (>= (nth x 1) 128)) (values (subs x 1 n) p true) (values "" pos false))
+          :else (values x p true))))

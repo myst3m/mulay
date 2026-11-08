@@ -1,0 +1,1 @@
+{id: payload.id, name: payload.name, timestamp: now()}

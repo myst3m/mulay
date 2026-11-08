@@ -1,0 +1,188 @@
+(ns mulay.conn.sf_pubsub_avro
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.lib.avro :as av] [mulay.lib.dec :as dec] [mulay.dw.lib.core_coll :as cc]
+            [clay.string :as str]))
+
+(def MAP-CLASS "com.google.gson.internal.LinkedTreeMap")
+(def LIST-CLASS "java.util.ArrayList")
+(def DOUBLE-CLASS "java.lang.Double")
+(def NO-FIELD-NPE "Cannot invoke \"org.apache.avro.Schema$Field.schema()\" because the return value of \"org.apache.avro.Schema.getField(String)\" is null")
+
+(defn- cmeta v/Val [x: v/Val cls: &Str] (v/->VMeta x [(v/field "class" (v/->VStr (str cls)))]))
+
+(defn- num-of Values(num/Num Bool) [x: &v/Val]
+  (match (v/unmeta x) (v/VInt i) (values (num/from-int i) true) (v/VNum n) (values n true) _ (values (num/from-int 0) false)))
+
+(defn- field-index Int [fs: &Vec(av/SField) name: &Str]
+  (loop [i 0] (cond (>= i (count fs)) -1 (= (:name (nth fs i)) name) i :else (recur (+ i 1)))))
+
+(defn- target-kind Int [sch: &av/Schema idx: Int]
+  (if (not= (av/node-kind sch idx) av/K-UNION) (av/node-kind sch idx)
+    (let [bs (av/node-branches sch idx)]
+      (loop [i 0] (cond (>= i (count bs)) av/K-NULL
+                        (= (av/node-kind sch (nth bs i)) av/K-NULL) (recur (+ i 1))
+                        :else (av/node-kind sch (nth bs i)))))))
+
+(defn- wrap32 Int [n: Int] (let [m (bit-and n 4294967295)] (if (>= m 2147483648) (- m 4294967296) m)))
+
+(defn- plain-num av/AVal [n: &num/Num]
+  (if (num/integer? n)
+    (let [[k e] (num/to-int n)] (if (and (>= k -2147483648) (<= k 2147483647)) (av/->AInt k) (av/->ALong k)))
+    (av/->ADouble (num/to-float n))))
+
+(defn- as-avro av/AVal [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VNull) (av/->ANull)
+    (v/VBool b) (av/->ABool b)
+    (v/VStr s) (av/->AStr s)
+    (v/VInt i) (plain-num (num/from-int i))
+    (v/VNum n) (plain-num n)
+    (v/VBin b) (av/->ABytes b)
+    (v/VArr xs) (av/->AArr (loop [i 0 acc: Vec(av/AVal) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (as-avro (nth xs i)))))))
+    (v/VObj fs) (av/->AMap (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (:name (:key (nth fs i)))))))
+                           (loop [i 0 acc: Vec(av/AVal) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (as-avro (:value (nth fs i))))))))
+    _ (av/->AStr "")))
+
+(defn- by-kind av/AVal [kind: Int n: &num/Num x: &v/Val]
+  (cond (= kind av/K-INT) (av/->AInt (wrap32 (cc/trunc-int n)))
+        (= kind av/K-LONG) (av/->ALong (cc/trunc-int n))
+        (= kind av/K-DOUBLE) (av/->ADouble (num/to-float n))
+        (= kind av/K-FLOAT) (av/->AFloat (num/to-float n))
+        :else (as-avro x)))
+
+(defn encode-event Values(Str Str Str) [sch: &av/Schema x: &v/Val]
+  (let [r (av/root sch)
+        fs (av/node-fields sch r)]
+    (match (v/unmeta x)
+      (v/VObj kvs)
+      (let [[keys vals err] (loop [i 0 ks: Vec(Str) [] vs: Vec(av/AVal) []]
+                              (if (>= i (count kvs)) (values ks vs "")
+                                (let [k (:name (:key (nth kvs i)))
+                                      val (:value (nth kvs i))
+                                      fi (field-index fs k)
+                                      [n isnum] (num-of val)]
+                                  (cond
+                                    (and (< fi 0) isnum) (values ks vs NO-FIELD-NPE)
+                                    (< fi 0) (values ks vs (str "Not a valid schema field: " k))
+                                    isnum (recur (+ i 1) (conj ks k) (conj vs (by-kind (target-kind sch (:schema (nth fs fi))) n val)))
+                                    :else (recur (+ i 1) (conj ks k) (conj vs (as-avro val)))))))]
+        (if (not= err "") (values "" "UNKNOWN" err)
+          (let [[b e] (av/encode sch (av/->ARec (av/node-fullname sch r) keys vals))]
+            (cond (= e "") (values b "" "")
+                  (str/starts-with? e "null value for (non-nullable)") (values "" "INVALID_INPUT" e)
+                  :else (values "" "UNKNOWN" e)))))
+      _ (values "" "UNKNOWN" "class java.lang.Object cannot be cast to class java.util.Map"))))
+
+(defn hex-bits Str [s: &Str]
+  (let [u (str/upper-case s)
+        fwd (loop [i 0 out ""]
+              (if (>= i (count u)) out
+                (let [c (nth u i)
+                      d (cond (and (>= c 48) (<= c 57)) (- c 48) (and (>= c 65) (<= c 70)) (- c 55) :else -1)]
+                  (recur (+ i 1) (if (< d 0) (str out "null")
+                                   (str out (if (= (bit-and d 8) 0) "0" "1") (if (= (bit-and d 4) 0) "0" "1")
+                                        (if (= (bit-and d 2) 0) "0" "1") (if (= (bit-and d 1) 0) "0" "1")))))))]
+    (loop [i (- (count fwd) 1) out ""] (if (< i 0) out (recur (- i 1) (str out (subs fwd i (+ i 1))))))))
+
+(defn names-of-bits Vec(Str) [bits: &Str sch: &av/Schema rec: Int]
+  (let [fs (av/node-fields sch rec)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count bits)) acc
+        (recur (+ i 1) (if (and (= (nth bits i) 49) (< i (count fs))) (conj acc (:name (nth fs i))) acc))))))
+
+(defn- value-schema Int [sch: &av/Schema idx: Int]
+  (if (not= (av/node-kind sch idx) av/K-UNION) idx
+    (let [bs (av/node-branches sch idx)
+          k0 (if (> (count bs) 0) (av/node-kind sch (nth bs 0)) -1)]
+      (cond (and (= (count bs) 2) (or (= k0 av/K-NULL) (= k0 av/K-STRING))) (nth bs 1)
+            (and (= (count bs) 3) (= k0 av/K-NULL) (= (av/node-kind sch (nth bs 1)) av/K-STRING)) (nth bs 2)
+            :else idx))))
+
+(defn- nested-names Vec(Str) [sch: &av/Schema rec: Int part: &Str]
+  (let [parts (str/split part "-")
+        fs (av/node-fields sch rec)
+        [pi pe] (parse-long (if (> (count parts) 0) (nth parts 0) ""))]
+    (if (or (not= pe "") (< pi 0) (>= pi (count fs)) (< (count parts) 2)) []
+      (let [pf (nth fs pi)
+            child (value-schema sch (:schema pf))]
+        (if (not= (av/node-kind sch child) av/K-RECORD) []
+          (let [full (names-of-bits (hex-bits (nth parts 1)) sch child)
+                nested (count (av/node-fields sch child))]
+            (cond (= (count full) 0) []
+                  (= (count full) nested) [(:name pf)]
+                  :else (loop [i 0 acc: Vec(Str) []] (if (>= i (count full)) acc (recur (+ i 1) (conj acc (str (:name pf) "_" (nth full i)))))))))))))
+
+(defn process-bitmap Vec(Str) [sch: &av/Schema rec: Int xs: &Vec(Str)]
+  (if (= (count xs) 0) []
+    (let [first-part (nth xs 0)
+          a (if (str/starts-with? first-part "0x") (names-of-bits (hex-bits first-part) sch rec) [])]
+      (if (not (str/includes? (nth xs (- (count xs) 1)) "-")) a
+        (loop [i 0 acc a]
+          (if (>= i (count xs)) acc
+            (recur (+ i 1) (if (str/includes? (nth xs i) "-")
+                             (let [ns (nested-names sch rec (nth xs i))] (loop [k 0 a2 acc] (if (>= k (count ns)) a2 (recur (+ k 1) (conj a2 (nth ns k))))))
+                             acc))))))))
+
+(def BITMAP-FIELDS ["changedFields" "diffFields" "nulledFields"])
+
+(defn- strs-of Vec(Str) [x: &av/AVal]
+  (match x (av/AArr items) (loop [i 0 acc: Vec(Str) []] (if (>= i (count items)) acc (recur (+ i 1) (match (nth items i) (av/AStr s) (conj acc s) _ acc)))) _ []))
+
+(defn- with-bitmaps av/AVal [sch: &av/Schema rec: Int hdr: &av/AVal]
+  (match hdr
+    (av/ARec rn keys vals)
+    (av/->ARec rn keys (loop [i 0 acc: Vec(av/AVal) []]
+                         (if (>= i (count keys)) acc
+                           (recur (+ i 1) (conj acc (if (> (count (filterv (fn Bool [n: Str] (= n (nth keys i))) BITMAP-FIELDS)) 0)
+                                                      (let [ns (process-bitmap sch rec (strs-of (nth vals i)))]
+                                                        (av/->AArr (loop [k 0 a: Vec(av/AVal) []] (if (>= k (count ns)) a (recur (+ k 1) (conj a (av/->AStr (nth ns k))))))))
+                                                      (nth vals i)))))))
+    _ hdr))
+
+(defn expand-header av/AVal [sch: &av/Schema x: av/AVal]
+  (match x
+    (av/ARec rn keys vals)
+    (let [r (av/root sch)]
+      (av/->ARec rn keys (loop [i 0 acc: Vec(av/AVal) []]
+                           (if (>= i (count keys)) acc
+                             (recur (+ i 1) (conj acc (if (= (nth keys i) "ChangeEventHeader") (with-bitmaps sch r (nth vals i)) (nth vals i))))))))
+    _ x))
+
+(def STRING-CLASS "java.lang.String")
+(def BOOLEAN-CLASS "java.lang.Boolean")
+
+(defn- dbl v/Val [f: Float]
+  (let [[n e] (num/from-float f)] (if (= e "") (cmeta (v/num-v n) DOUBLE-CLASS) (v/null-v))))
+
+(defn- latin1 Str [b: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count b)) out
+      (let [c (nth b i)]
+        (recur (+ i 1) (if (< c 128) (str out (subs b i (+ i 1))) (str out (chr (+ 192 (quot c 64))) (chr (+ 128 (mod c 64))))))))))
+
+(defn- gson-map v/Val [keys: &Vec(Str) vals: &Vec(av/AVal)]
+  (cmeta (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count keys)) acc (recur (+ i 1) (conj acc (v/field (nth keys i) (gson (nth vals i))))))))
+         MAP-CLASS))
+
+(defn gson v/Val [x: &av/AVal]
+  (match x
+    (av/ANull) (v/null-v)
+    (av/ABool b) (cmeta (v/bool-v b) BOOLEAN-CLASS)
+    (av/AInt i) (dbl (float i))
+    (av/ALong l) (dbl (float l))
+    (av/AFloat f) (let [[d de] (parse-double (dec/float32->shortest-str f))] (dbl d))
+    (av/ADouble f) (dbl f)
+    (av/AStr t) (cmeta (v/->VStr t) STRING-CLASS)
+    (av/AEnum en sy) (cmeta (v/->VStr sy) STRING-CLASS)
+    (av/ABytes b) (cmeta (v/->VStr (latin1 b)) STRING-CLASS)
+    (av/AFixed fnm fb) (cmeta (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                                          (if (>= i (count fb)) acc
+                                            (let [c (nth fb i)] (recur (+ i 1) (conj acc (dbl (float (if (>= c 128) (- c 256) c)))))))))
+                              LIST-CLASS)
+    (av/AArr items) (cmeta (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count items)) acc (recur (+ i 1) (conj acc (gson (nth items i)))))))
+                           LIST-CLASS)
+    (av/ARec rn keys vals) (gson-map keys vals)
+    (av/AMap keys vals) (gson-map keys vals)))
+
+(defn decode-event Values(v/Val Str) [sch: &av/Schema b: &Str]
+  (let [[a pos e] (av/decode sch b 0)]
+    (if (not= e "") (values (v/null-v) e) (values (gson (expand-header sch a)) ""))))

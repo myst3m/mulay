@@ -1,0 +1,94 @@
+(ns oracle-test (:require [mulay.db.oracle :as o] [mulay.db.oraproto :as op] [mulay.db.sql :as sql]))
+
+;; DB に繋がずに確かめられる部分。文言と SQLState の期待値は実 Mule (ojdbc11 23.8) の db-oracle の記録と
+;; ojdbc の SQLStateMapping
+
+(defn- url Str [u: Str] (let [[h p s sid e] (o/parse-url u)] (if (= e "") (str h "|" p "|" s "|" sid) (str "ERR " e))))
+
+(defn- st Str [n: Int] (let [[s e] (o/ora-state n)] (str s " " e)))
+
+(defn- bind Str [x: sql/Cell] (let [[b v] (o/bind-of x)] (str (:typ b) "/" (:csfrm b) "/" (:size b) "/" (count v))))
+
+(deftest urls
+  (is (= (url "@//172.23.0.6:31521/FREEPDB1") "172.23.0.6|31521|FREEPDB1|"))
+  (is (= (url "@db:1521:ORCL") "db|1521||ORCL"))
+  (is (= (url "@db/svc") "db|1521|svc|"))
+  (is (= (url "@//db:0/x") "ERR Invalid Oracle URL: jdbc:oracle:thin:@//db:0/x"))
+  (is (= (url "@(DESCRIPTION=(ADDRESS=))") "ERR Connect descriptors in the URL are not supported yet")))
+
+(deftest sql-text
+  (is (= (o/number-params "SELECT id FROM p WHERE a > ? AND b <> ? AND c = '?'") "SELECT id FROM p WHERE a > :1 AND b <> :2 AND c = '?'"))
+  (is (= (o/stmt-kind "  select 1 from dual") "query"))
+  (is (= (o/stmt-kind "WITH a AS (SELECT 1 FROM dual) SELECT * FROM a") "query"))
+  (is (= (o/stmt-kind "BEGIN NULL; END;") "plsql"))
+  (is (= (o/stmt-kind "INSERT INTO t VALUES (1)") "dml"))
+  (is (= (o/stmt-kind "CREATE TABLE t (a NUMBER)") "dml"))
+  (is (= (o/insert-table "INSERT INTO person (name, age) VALUES (:1, :2)") "person"))
+  (is (= (o/insert-table "insert into app.\"My T\"(a) values (1)") "app.\"My T\""))
+  (is (= (o/insert-table "UPDATE t SET a = 1") "")))
+
+(deftest errors
+  (is (= (o/ora-message 942 "ORA-00942: table or view \"MULAY\".\"NOTHING_HERE\" does not exist\n")
+         "ORA-00942: table or view \"MULAY\".\"NOTHING_HERE\" does not exist\n\nhttps://docs.oracle.com/error-help/db/ora-00942/"))
+  (is (= (o/ora-message 1438 "ORA-01438: value 12345 greater than specified precision (3, 0) for column \n")
+         "ORA-01438: value 12345 greater than specified precision (3, 0) for column \n\nhttps://docs.oracle.com/error-help/db/ora-01438/"))
+  (is (= (o/ora-message 20001 "ORA-20001: custom\n") "ORA-20001: custom\n\nhttps://docs.oracle.com/error-help/db/ora-20001/"))
+  (is (= (st 942) "42000 java.sql.SQLSyntaxErrorException"))
+  (is (= (st 1400) "23000 java.sql.SQLIntegrityConstraintViolationException"))
+  (is (= (st 1476) "22012 java.sql.SQLDataException"))
+  (is (= (st 65000) "99999 java.sql.SQLException")))
+
+(deftest binds
+  ;; 型 / csfrm / 緩衝の大きさ / 値のバイト数 (python-oracledb の記録と同じ形)
+  (is (= (bind (sql/->CInt 42)) "2/0/22/3"))
+  (is (= (bind (sql/->CStr "hé")) "1/1/12/4"))
+  (is (= (bind (sql/->CBool true)) "252/0/4/3"))
+  (is (= (bind (sql/->CBool false)) "252/0/4/2"))
+  (is (= (bind (sql/->CNull)) "1/1/4/1"))
+  (is (= (bind (sql/->CTimestamp "2026-09-30T01:02:03")) "180/0/11/8"))
+  (is (= (bind (sql/->CBytes (str (chr 1) (chr 2)))) "23/0/2/3")))
+
+(deftest call-sql
+  (is (= (o/call-sql "{call add_one(?, ?)}") "BEGIN add_one(?, ?); END;"))
+  (is (= (o/call-sql "{ ? = call twice(?) }") "BEGIN ? := twice(?); END;"))
+  (is (= (o/call-sql "{call touch_bob()}") "BEGIN touch_bob(); END;"))
+  (is (= (o/call-sql "BEGIN x; END;") "BEGIN x; END;"))
+  (is (= (:typ (o/out-bind "REF_CURSOR")) op/T-CURSOR))
+  (is (= (:typ (o/out-bind "NUMERIC")) op/T-NUMBER))
+  (is (= (:size (o/out-bind "VARCHAR")) 32767)))
+
+;; 認証の 2 段目: サーバの AUTH_SESSKEY などが壊れていればエラー (以前は短い値を切り出すところで落ちた)
+(defn- vf-err Str [sk: Str vfr: Int]
+  (let [[pairs combo e] (o/verifier ["AUTH_VFR_DATA" "0011223344556677" "AUTH_SESSKEY" sk "AUTH_PBKDF2_VGEN_COUNT" "4096"
+                                      "AUTH_PBKDF2_SDER_COUNT" "3" "AUTH_PBKDF2_CSK_SALT" "00112233445566778899AABBCCDDEEFF"] vfr "pw")]
+    (if (= e "") (str (count pairs) " pairs") e)))
+
+(defn- hexs Str [n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out "A5")))))
+
+(deftest verifier-malformed
+  (is (= (vf-err "" 18453) "malformed AUTH_SESSKEY from the server"))
+  (is (= (vf-err "00" 18453) "malformed AUTH_SESSKEY from the server"))
+  (is (= (vf-err (hexs 20) 6949) "malformed AUTH_SESSKEY from the server"))
+  (is (= (vf-err (hexs 32) 18453) "7 pairs"))
+  (is (= (vf-err (hexs 48) 6949) "6 pairs")))
+
+;; サーバーが告げる PBKDF2 の繰り返し回数は 1 から 1 千万まで (極端な値で接続が終わらなかった)
+(deftest pbkdf2-count-range
+  (let [[a ae] (o/pbkdf2-count "4096")
+        [b be] (o/pbkdf2-count "9223372036854775807")
+        [c ce] (o/pbkdf2-count "0")
+        [d de] (o/pbkdf2-count "x")]
+    (is (= a 4096))
+    (is (= ae ""))
+    (is (= be "the server's PBKDF2 iteration count is out of range: 9223372036854775807"))
+    (is (= ce "the server's PBKDF2 iteration count is out of range: 0"))
+    (is (= de "the server's PBKDF2 iteration count is out of range: x"))))
+
+;; tcps:// などの書き方は誤読せず (前はホスト名 tcps、平文で 1521 番につないだ)、対応していないと失敗する
+(deftest url-with-protocol
+  (is (= (url "@tcps://db.example.com:2484/svc") "ERR TCPS is not supported yet (jdbc:oracle:thin:@tcps://db.example.com:2484/svc)"))
+  (is (= (url "@tcp://db.example.com:1521/svc") "db.example.com|1521|svc|"))
+  (is (= (url "@db.example.com:1521/svc") "db.example.com|1521|svc|")))
+
+(deftest url-with-other-schemes
+  (is (= (url "@ldap://dir.example.com/svc") "ERR Invalid Oracle URL: jdbc:oracle:thin:@ldap://dir.example.com/svc")))

@@ -1,0 +1,69 @@
+(ns dwdump.main
+  (:require [clay.core] [clay.string :as str] [clay.io :as io]
+            [mulay.dw.parse :as p] [mulay.dw.astdump :as d] [mulay.dw.src :as src] [mulay.dw.ast :as a]))
+
+;; 開発用: DataWeave のファイルを parse して AST のダンプか診断を出す。
+;;   dwdump [-m] FILE..      ダンプ (-m はモジュールとして読む)
+;;   dwdump -c FILE..        診断の有無だけ: "OK path" / "ERR path<TAB>最初の診断"
+;;   dwdump -t N FILE        N 回 parse して 1 回あたりの時間 (us) を出す
+;;   dwdump -e 'EXPR'        引数の文字列を parse してダンプ
+;;   dwdump -b FILE          FILE はレコードを "\x01\n" で区切ったもの。各レコードの 1 行目が e (マッピング)
+;;                           か m (モジュール)、残りがソース。1 レコード 1 行で "<番号>\tOK <dump>" / "<番号>\tERR <診断>"
+;; ファイル名が .mod.dwl で終わればモジュールとして読む。
+
+(defn- l-at Int [s: &Str i: Int] (if (< i (count s)) (nth s i) -1))
+
+(defn- mod-file? Bool [f: &Str] (str/ends-with? f ".mod.dwl"))
+
+(defn- run1 Values(a/Script Vec(a/Diag)) [txt: &Str m: Bool] (if m (p/parse-module txt) (p/parse txt)))
+
+(defn main Int []
+  (let [n (argv-len)
+        flag (if (> n 1) (argv-nth 1) "")]
+    (cond
+      (= flag "-e")
+      (let [txt (argv-nth 2)
+            [sc ds] (p/parse txt)
+            z (if (= (count ds) 0) (println (d/dump-script sc))
+                (println (src/render-diags txt "expr" ds)))]
+        (if (= (count ds) 0) 0 1))
+      (= flag "-b")
+      (let [[txt err] (read-file (argv-nth 2))
+            n (count txt)]
+        (loop [i 0 idx 0]
+          (if (>= i n) 0
+            (let [e (loop [j i] (if (or (>= j n) (and (= (nth txt j) 1) (= (l-at txt (+ j 1)) 10))) j (recur (+ j 1))))
+                  nl (loop [j i] (if (or (>= j e) (= (nth txt j) 10)) j (recur (+ j 1))))
+                  m (= (subs txt i nl) "m")
+                  body (subs txt (if (< nl e) (+ nl 1) e) e)
+                  [sc ds] (run1 body m)
+                  z (if (= (count ds) 0) (println (str idx "\tOK " (d/dump-script sc)))
+                      (let [[ln col] (src/line-col body (:start (:sp (nth ds 0))))]
+                        (println (str idx "\tERR " (:msg (nth ds 0)) " @" ln ":" col))))]
+              (recur (+ e 2) (+ idx 1))))))
+      (= flag "-t")
+      (let [[times te] (parse-long (argv-nth 2))
+            f (argv-nth 3)
+            [txt err] (read-file f)
+            t0 (mono-us)
+            nd (loop [i 0 acc 0] (if (>= i times) acc (let [[sc ds] (p/parse txt)] (recur (+ i 1) (+ acc (count ds))))))
+            t1 (mono-us)
+            z (println (str f ": " (count txt) " bytes, " (quot (- t1 t0) times) " us/parse, diags " (quot nd times)))]
+        0)
+      :else
+      (let [check (= flag "-c")
+            m0 (= flag "-m")
+            start (if (or check m0) 2 1)]
+        (loop [i start bad 0]
+          (if (>= i n) (if (= bad 0) 0 1)
+            (let [f (argv-nth i)
+                  [txt err] (read-file f)
+                  [sc ds] (run1 txt (or m0 (mod-file? f)))]
+              (if check
+                (let [z (if (= (count ds) 0) (println (str "OK\t" f))
+                          (let [[ln col] (src/line-col txt (:start (:sp (nth ds 0))))]
+                            (println (str "ERR\t" f "\t" (:msg (nth ds 0)) " @" ln ":" col))))]
+                  (recur (+ i 1) (if (= (count ds) 0) bad (+ bad 1))))
+                (let [z (if (= (count ds) 0) (println (d/dump-script sc))
+                          (println (src/render-diags txt f ds)))]
+                  (recur (+ i 1) (if (= (count ds) 0) bad (+ bad 1))))))))))))

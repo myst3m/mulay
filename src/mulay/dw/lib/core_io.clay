@@ -1,0 +1,56 @@
+(ns mulay.dw.lib.core_io
+  (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.fmt.registry :as reg] [mulay.dw.urls :as urls] [mulay.lib.uni :as uni] [clay.string :as str]))
+
+(def M "dw::Core")
+
+(defn- props-of Vec(v/Field) [args: &Vec(v/Val) i: Int]
+  (if (> (count args) i) (core/arg-fields args i) []))
+
+(defn- mime-of Str [args: &Vec(v/Val) i: Int]
+  (if (> (count args) i) (core/arg-str args i) "application/dw"))
+
+(defn- bytes-of Str [x: &v/Val]
+  (match (v/unmeta x) (v/VStr s) s (v/VBin b) b _ ""))
+
+(defn- read-impl Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [bin (match (v/unmeta (nth a 0)) (v/VBin b) true _ false)
+        mime (mime-of a 1)
+        props (props-of a 2)]
+    (if (and (not bin) (= (reg/format-id (reg/norm-mime mime)) "multipart") (= (count (v/obj-get props "boundary")) 0))
+      (rt/failure "ReaderException" (str "Exception while reading '" (abbrev (bytes-of (nth a 0))) "' as '" mime "' cause by:\n'boundary' configuration property is missing.\nTrace:\n  at main (Unknown)"))
+      (read-labeled (bytes-of (nth a 0)) (if bin "Binary Content" "") mime props))))
+
+(defn read-text Values(v/Val dwe/DwErr) [text: &Str mime: &Str props: &Vec(v/Field)] (read-labeled text "" mime props))
+
+(defn- read-labeled Values(v/Val dwe/DwErr) [text: &Str label: &Str mime: &Str props: &Vec(v/Field)]
+  (let [m (reg/norm-mime mime)
+        ve (reg/validate m props false)]
+    (if (not= ve "") (rt/failure "ReaderException" ve)
+      (let [[x e] (reg/read-valid m props text)]
+        (if (= e "") (rt/ret (v/lazy-input x))
+          (rt/failure "ReaderException" (str "Exception while reading '" (if (= label "") (abbrev text) label) "' as '" mime "' cause by:\n" e)))))))
+
+(defn- abbrev Str [s: &Str]
+  (if (<= (u8/codepoint-count s) 25) (str s) (str (uni/sub-cp s 0 23) "...")))
+
+(defn- write-impl Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [mime (mime-of a 1)
+        [t e] (reg/write-fmt mime (props-of a 2) (nth a 0))]
+    (cond (dwe/ok? e) (rt/ret (if (reg/binary-format? mime) (v/->VBin t) (v/->VStr t)))
+          (not= (:kind e) "WriterException") (values (v/null-v) e)
+          :else (rt/failure (if (str/starts-with? (:msg e) "Cannot coerce ") "CoercionException" "WriterException") (:msg e)))))
+
+(defn- read-url Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[t e] (urls/load-url (core/arg-str a 0))]
+    (if (not= e "") (rt/failure "ResourceNotFound" e)
+      (read-text t (mime-of a 1) (props-of a 2)))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "read" [(rt/overload ["String"] read-impl) (rt/overload ["Binary"] read-impl)
+              (rt/overload ["String" "String"] read-impl) (rt/overload ["Binary" "String"] read-impl)
+              (rt/overload ["String" "String" "Object"] read-impl) (rt/overload ["Binary" "String" "Object"] read-impl)])
+   (B "write" [(rt/overload ["Any"] write-impl) (rt/overload ["Any" "String"] write-impl) (rt/overload ["Any" "String" "Object"] write-impl)])
+   (B "readUrl" [(rt/overload ["String"] read-url) (rt/overload ["String" "String"] read-url) (rt/overload ["String" "String" "Object"] read-url)])])

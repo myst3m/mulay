@@ -1,0 +1,35 @@
+(ns schema-test (:require [mulay.conn.mcp_schema :as sc] [mulay.dw.fmt.json :as json] [clay.string :as str]))
+
+;; parametersSchema の検査。期待する文言は実 Mule (mcp 1.5.0) の記録 (test/fixtures/apps/mcp-tools) のもの。
+
+(def SCHEMA "{\"type\":\"object\",\"properties\":{\"s\":{\"type\":\"string\",\"minLength\":2,\"maxLength\":4,\"pattern\":\"^[a-z]+$\"},\"n\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":10},\"e\":{\"enum\":[\"a\",\"b\"]},\"arr\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1},\"o\":{\"type\":\"object\",\"properties\":{\"k\":{\"type\":\"boolean\"}},\"required\":[\"k\"]}},\"required\":[\"s\"],\"additionalProperties\":false}")
+
+(defn- check Str [args: &Str]
+  (let [[s se] (json/read SCHEMA)
+        [x xe] (json/read args)
+        r (sc/validate s x)]
+    (loop [i 0 out ""] (if (>= i (count r)) out (recur (+ i 1) (if (= i 0) (str (nth r i)) (str out "; " (nth r i))))))))
+
+(deftest valid-is-empty (is (= (check "{\"s\":\"ab\"}") "")))
+(deftest min-length (is (= (check "{\"s\":\"a\"}") "/s: must be at least 2 characters long")))
+(deftest max-length (is (= (check "{\"s\":\"abcde\"}") "/s: must be at most 4 characters long")))
+(deftest pattern (is (= (check "{\"s\":\"AB\"}") "/s: does not match the regex pattern ^[a-z]+$")))
+(deftest wrong-type (is (= (check "{\"s\":1}") "/s: integer found, string expected")))
+(deftest minimum (is (= (check "{\"s\":\"ab\",\"n\":0}") "/n: must have a minimum value of 1")))
+(deftest maximum (is (= (check "{\"s\":\"ab\",\"n\":11}") "/n: must have a maximum value of 10")))
+(deftest number-for-integer (is (= (check "{\"s\":\"ab\",\"n\":1.5}") "/n: number found, integer expected")))
+(deftest enum (is (= (check "{\"s\":\"ab\",\"e\":\"c\"}") "/e: does not have a value in the enumeration [\"a\", \"b\"]")))
+(deftest min-items (is (= (check "{\"s\":\"ab\",\"arr\":[]}") "/arr: must have at least 1 items but found 0")))
+(deftest items-by-index (is (= (check "{\"s\":\"ab\",\"arr\":[1,\"a\",2]}") "/arr/0: integer found, string expected; /arr/2: integer found, string expected")))
+(deftest string-for-array (is (= (check "{\"s\":\"ab\",\"arr\":\"x\"}") "/arr: string found, array expected")))
+(deftest nested-required (is (= (check "{\"s\":\"ab\",\"o\":{}}") "/o: required property 'k' not found")))
+(deftest nested-type (is (= (check "{\"s\":\"ab\",\"o\":{\"k\":\"x\"}}") "/o/k: string found, boolean expected")))
+(deftest integer-for-object (is (= (check "{\"s\":\"ab\",\"o\":5}") "/o: integer found, object expected")))
+(deftest additional-in-input-order
+  (is (= (check "{\"s\":\"ab\",\"zzz\":1,\"yyy\":2}")
+         ": property 'zzz' is not defined in the schema and the schema does not allow additional properties; : property 'yyy' is not defined in the schema and the schema does not allow additional properties")))
+(deftest root-required (is (= (check "{}") ": required property 's' not found")))
+(deftest keyword-order
+  (is (= (check "{\"n\":\"x\",\"e\":\"c\",\"zzz\":1}")
+         "/n: string found, integer expected; /e: does not have a value in the enumeration [\"a\", \"b\"]; : required property 's' not found; : property 'zzz' is not defined in the schema and the schema does not allow additional properties")))
+(deftest null-value (is (= (check "{\"s\":null}") "/s: null found, string expected")))

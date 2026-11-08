@@ -1,0 +1,428 @@
+(ns mulay.app.otel
+  (:require [mulay.mule.model :as m] [mulay.rt.meter :as mt] [mulay.rt.trace :as tr] [mulay.rt.log :as log] [mulay.lib.otlp :as o]
+            [mulay.lib.inflate :as z] [mulay.lib.procstat :as ps] [mulay.dw.lib.core_misc :as misc] [mulay.rt.ops :as ops] [mulay.conn.http :as ch] [mulay.conn.httpmsg :as hx]
+            [clay.io :as io] [clay.http :as http] [clay.httpmsg :as hm] [clay.tls :as tls] [clay.string :as str]))
+
+(def P "mule.openTelemetry.meter.exporter.")
+(def PE "mule.openTelemetry.exporter.")
+
+(defrecord Exporter [on: Bool stats: Bool endpoint: Str headers: Vec(hm/Header) gzip: Bool timeout-ms: Int interval-ms: Int
+                     resource: Vec(o/Attr) tls: tls/Config start-ns: Int jvm: Bool container: Vec(o/Attr) grpc: Bool
+                     what: Str path: Str])
+
+(defrecord Inventory [declared-trigger: Int active-trigger: Int declared-private: Int active-private: Int
+                      declared-apikit: Int active-apikit: Int])
+
+(defn- off Exporter []
+  (let [hs: Vec(hm/Header) [] rs: Vec(o/Attr) []]
+    (->Exporter false false "" hs false 10000 60000 rs (tls/default-config) 0 false rs false "metrics" GRPC-PATH)))
+
+(defn- prop Values(Str Bool) [app: &m/App key: &Str]
+  (let [ps (:properties app)]
+    (loop [i 0]
+      (if (>= i (count ps)) (values "" false)
+        (if (= (:name (nth ps i)) key)
+          (match (:v (nth ps i)) (m/PLit s) (values (str/trim s) true) _ (values "" false))
+          (recur (+ i 1)))))))
+
+(defn- prop-or Str [app: &m/App key: &Str default: Str] (let [[v found] (prop app key)] (if found v default)))
+
+(defn- prop2 Str [app: &m/App pre: &Str k: &Str default: Str]
+  (let [[a fa] (prop app (str pre k))]
+    (if fa a (let [[b fb] (prop app (str PE k))] (if fb b default)))))
+
+(defn- yes? Bool [s: &Str] (= (str/lower-case s) "true"))
+
+(defn- pairs Values(Vec(o/Attr) Str) [s: &Str what: &Str]
+  (let [parts (if (= s "") [] (str/split s ","))]
+    (loop [i 0 acc: Vec(o/Attr) []]
+      (if (>= i (count parts)) (values acc "")
+        (let [p (str/trim (nth parts i))
+              k (str/index-of p "=")]
+          (cond (= p "") (recur (+ i 1) acc)
+                (<= k 0) (values acc (str what ": '" p "' is not name=value"))
+                :else (recur (+ i 1) (conj acc (o/attr (str/trim (subs p 0 k)) (str/trim (subs p (+ k 1) (count p))))))))))))
+
+(defn- sval Str [v: &o/AVal] (match v (o/AStr s) (str s) (o/ABool b) (if b "true" "false")))
+
+(defn- headers-of Vec(hm/Header) [as: &Vec(o/Attr)]
+  (loop [i 0 acc: Vec(hm/Header) []] (if (>= i (count as)) acc (recur (+ i 1) (conj acc (hm/->Header (:key (nth as i)) (sval (:val (nth as i)))))))))
+
+(defn- pos-int Values(Int Str) [app: &m/App pre: &Str k: &Str default: Int]
+  (let [[s found] (prop app (str pre k))]
+    (if (not found) (values default "")
+      (let [[n e] (parse-long s)]
+        (if (or (not= e "") (<= n 0)) (values 0 (str pre k ": '" s "' is not a positive whole number")) (values n ""))))))
+
+(defn- put-attr Vec(o/Attr) [as: Vec(o/Attr) a: o/Attr]
+  (let [k (loop [i 0] (if (>= i (count as)) -1 (if (= (:key (nth as i)) (:key a)) i (recur (+ i 1)))))]
+    (if (>= k 0) (assoc as k a) (conj as a))))
+
+(defn- sort-attrs Vec(o/Attr) [as: Vec(o/Attr)]
+  (let [ks (sort (loop [i 0 acc: Vec(Str) []] (if (>= i (count as)) acc (recur (+ i 1) (conj acc (:key (nth as i)))))))]
+    (loop [i 0 acc: Vec(o/Attr) []]
+      (if (>= i (count ks)) acc
+        (let [k (nth ks i)
+              j (loop [q 0] (if (= (:key (nth as q)) k) q (recur (+ q 1))))]
+          (recur (+ i 1) (conj acc (nth as j))))))))
+
+(defn- read-pem Values(Str Str) [app: &m/App pre: &Str k: &Str]
+  (let [[path found] (prop app (str pre k))]
+    (if (or (not found) (= path "")) (values "" "")
+      (let [[t e] (read-file path)] (if (= e "") (values t "") (values "" (str pre k ": " path ": " e)))))))
+
+(defn- tls-of Values(tls/Config Str) [app: &m/App pre: &Str]
+  (if (not (yes? (prop-or app (str pre "tls.enabled") "false"))) (values (tls/default-config) "")
+    (let [[ca e1] (read-pem app pre "tls.caFileLocation")
+          [cert e2] (read-pem app pre "tls.certFileLocation")
+          [key e3] (read-pem app pre "tls.keyFileLocation")
+          c (assoc (assoc (assoc (tls/default-config) :ca ca) :cert cert) :key key)]
+      (values c (str e1 (if (and (not= e1 "") (not= e2 "")) "; " "") e2 (if (and (not= (str e1 e2) "") (not= e3 "")) "; " "") e3)))))
+
+(defn- resource-of Values(Vec(o/Attr) Str) [app: &m/App pre: &Str]
+  (let [[custom err] (pairs (prop2 app pre "resource.attributes" "") (str pre "resource.attributes"))
+        base [(o/attr "service.instance.id" (misc/uuid4))
+              (o/attr "service.name" (prop2 app pre "resource.service.name" (:name app)))
+              (o/attr "service.namespace" (prop2 app pre "resource.service.namespace" "mule"))
+              (o/attr "telemetry.sdk.language" "clay")
+              (o/attr "telemetry.sdk.name" "mulay")]
+        all (loop [i 0 acc base] (if (>= i (count custom)) acc (recur (+ i 1) (put-attr acc (nth custom i)))))]
+    (values (sort-attrs all) err)))
+
+(defn- container-of Vec(o/Attr) [app: &m/App]
+  (let [[ns found] (prop app (str PE "resource.container.service.namespace"))
+        base [(o/attr "service.instance.id" (misc/uuid4))
+              (o/attr "service.name" (prop-or app (str PE "resource.container.service.name") "mule-container"))
+              (o/attr "telemetry.sdk.language" "clay")
+              (o/attr "telemetry.sdk.name" "mulay")]]
+    (sort-attrs (if found (conj base (o/attr "service.namespace" ns)) base))))
+
+(defn configure Values(Exporter Str) [app: &m/App] (configure-at app P "metrics" "/v1/metrics" GRPC-PATH))
+
+(defn configure-at Values(Exporter Str) [app: &m/App pre: &Str what: &Str http-path: &Str grpc-path: &Str]
+  (if (not (yes? (prop-or app (str pre "enabled") "false"))) (values (assoc (assoc (off) :what (str what)) :path (str grpc-path)) "")
+    (let [type (str/upper-case (prop-or app (str pre "type") "GRPC"))
+          [hl herr] (pairs (prop-or app (str pre "headers") "") (str pre "headers"))
+          comp (str/lower-case (prop-or app (str pre "compression") "none"))
+          [iv ierr] (pos-int app pre "interval" 60)
+          [to terr] (pos-int app pre "timeout" 10000)
+          endpoint (prop-or app (str pre "endpoint") (if (= type "GRPC") "http://localhost:4317" (str "http://localhost:4318" http-path)))
+          [rs rerr] (resource-of app pre)
+          [tc tlerr] (tls-of app pre)
+          err (cond (not (or (= type "GRPC") (= type "HTTP"))) (str pre "type: '" type "' is not GRPC or HTTP")
+                    (not (or (str/starts-with? endpoint "http://") (str/starts-with? endpoint "https://"))) (str pre "endpoint: '" endpoint "' is not an http:// or https:// URL")
+                    (not (or (= comp "none") (= comp "gzip"))) (str pre "compression: '" comp "' is not none or gzip")
+                    (not= herr "") herr (not= ierr "") ierr (not= terr "") terr (not= rerr "") rerr (not= tlerr "") tlerr
+                    :else "")]
+      (values (->Exporter true (yes? (prop-or app "mule.enable.statistics" "false")) endpoint (headers-of hl) (= comp "gzip")
+                          to (* iv 1000) rs tc (* (epoch-ms) 1000000)
+                          (yes? (prop-or app (str pre "jvmMetrics.enabled") "false")) (container-of app) (= type "GRPC")
+                          (str what) (str grpc-path))
+              err))))
+
+(defn- apikit-configs Vec(Str) [app: &m/App]
+  (let [cs (:configs app)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count cs)) acc
+        (let [c (nth cs i)] (recur (+ i 1) (if (= (:kind c) "mule-apikit:config") (conj acc (:name c)) acc)))))))
+
+(defn- member? Bool [xs: &Vec(Str) x: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) x) true (recur (+ i 1))))))
+
+(defn- apikit-flow? Bool [name: &Str cfgs: &Vec(Str)]
+  (let [i (str/index-of name ":\\")
+        j (str/last-index-of name ":")]
+    (and (> i 0) (> (count cfgs) 0)
+         (let [last0 (subs name (+ j 1) (count name))
+               last (if (str/starts-with? last0 "\\") (subs last0 1 (count last0)) last0)]
+           (member? cfgs last)))))
+
+(defn inventory Inventory [app: &m/App]
+  (let [fs (:flows app)
+        cfgs (apikit-configs app)]
+    (loop [i 0 dt 0 at 0 dp 0 ap 0 dk 0 ak 0]
+      (if (>= i (count fs)) (->Inventory dt at dp ap dk ak)
+        (let [f (nth fs i)
+              act (if (= (:initial-state f) "stopped") 0 1)]
+          (cond (:sub f) (recur (+ i 1) dt at dp ap dk ak)
+                (> (count (:source f)) 0) (recur (+ i 1) (+ dt 1) (+ at act) dp ap dk ak)
+                (apikit-flow? (:name f) cfgs) (recur (+ i 1) dt at dp ap (+ dk 1) (+ ak act))
+                :else (recur (+ i 1) dt at (+ dp 1) (+ ap act) dk ak)))))))
+
+(defn- one Vec(o/Point) [app: &m/App v: Int] [(o/ipoint [(o/attr "mule.artifact.id" (:name app))] v)])
+
+(defn- inv-sums Vec(o/Metric) [app: &m/App inv: &Inventory suffix: &Str]
+  [(o/->Metric (str "declared-private-flows" suffix) "Declared Private Flows" "" o/MONOTONIC (one app (:declared-private inv)))
+   (o/->Metric (str "active-private-flows" suffix) "Activate Private Flows" "" o/MONOTONIC (one app (:active-private inv)))
+   (o/->Metric (str "declared-trigger-flows" suffix) "Declared Trigger Flows" "" o/MONOTONIC (one app (:declared-trigger inv)))
+   (o/->Metric (str "active-trigger-flows" suffix) "Active Trigger Flows" "" o/MONOTONIC (one app (:active-trigger inv)))
+   (o/->Metric (str "declared-apikit-flows" suffix) "Declared ApiKit Flows" "" o/MONOTONIC (one app (:declared-apikit inv)))
+   (o/->Metric (str "active-apikit-flows" suffix) "Active Apikit Flows" "" o/MONOTONIC (one app (:active-apikit inv)))])
+
+(defn- flow-points Vec(o/Point) [app: &m/App what: Int]
+  (let [fs (:flows app)]
+    (loop [i 0 acc: Vec(o/Point) []]
+      (if (>= i (count fs)) acc
+        (let [f (nth fs i)]
+          (if (:sub f) (recur (+ i 1) acc)
+            (let [c (mt/flow-count (:name f))
+                  v (cond (= what 0) (:received c) (= what 1) (:dispatched c) (= what 2) (:errors c) :else 0)]
+              (recur (+ i 1) (conj acc (o/ipoint [(o/attr "mule.artifact.id" (:name app)) (o/attr "mule.flow.name" (:name f))] v))))))))))
+
+(defn- error-points Vec(o/Point) [app: &m/App]
+  (let [ts (mt/error-types)]
+    (loop [i 0 acc: Vec(o/Point) []]
+      (if (>= i (count ts)) acc
+        (let [t (nth ts i)]
+          (recur (+ i 1) (conj acc (o/ipoint [(o/attr "mule.artifact.id" (:name app)) (o/attr "mule.error.type" t)] (mt/error-count t)))))))))
+
+(defn- cat-sums Vec(o/Metric) [a: Vec(o/Metric) b: Vec(o/Metric)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn scopes Vec(o/Scope) [app: &m/App inv: &Inventory]
+  (let [eps (error-points app)
+        flows (cat-sums (cat-sums (inv-sums app inv "") (inv-sums app inv "-v2"))
+                        [(o/->Metric "received.events" "Received Events" "" o/MONOTONIC (flow-points app 0))
+                         (o/->Metric "dispatched.messages" "Dispatched Messages" "" o/MONOTONIC (flow-points app 1))
+                         (o/->Metric "dispatched.primary.messages" "Dispatched Primary Messages" "" o/MONOTONIC (flow-points app 1))
+                         (o/->Metric "execution.errors" "Execution Errors" "" o/MONOTONIC (flow-points app 2))
+                         (o/->Metric "fatal.errors" "Fatal Errors" "" o/MONOTONIC (flow-points app 3))])
+        fs (o/->Scope "org.mule.runtime.flow.statistics" "" flows)]
+    (if (= (count eps) 0) [fs]
+      [(o/->Scope "org.mule.runtime.errors" "" [(o/->Metric "error-count" "Mule runtime error count" "" o/MONOTONIC eps)]) fs])))
+
+(def CPU-PREV (atom [0 (ps/start-ms)]))
+
+(defn- set-prev Vec(Int) [old: Vec(Int) now: Vec(Int)] now)
+
+(defn- recent-utilization Float [cpu-ns: Int now-ms: Int ncpu: Int]
+  (let [prev (deref CPU-PREV)
+        z (swap! CPU-PREV set-prev [cpu-ns now-ms])
+        dc (- cpu-ns (nth prev 0))
+        dw (* (- now-ms (nth prev 1)) 1000000)]
+    (if (or (<= dw 0) (<= ncpu 0)) 0.0
+      (let [u (/ (float dc) (* (float dw) (float ncpu)))] (if (< u 0.0) 0.0 (if (> u 1.0) 1.0 u))))))
+
+(defn- pool Vec(o/Attr) [name: Str type: Str] [(o/attr "jvm.memory.pool.name" name) (o/attr "jvm.memory.type" type)])
+
+(defn- nz Int [n: Int] (if (< n 0) 0 n))
+
+(defn- add-threads Vec(o/Point) [acc: Vec(o/Point) d: Bool st: &Str n: Int]
+  (if (= n 0) acc (conj acc (o/ipoint [(o/battr "jvm.thread.daemon" d) (o/attr "jvm.thread.state" st)] n))))
+
+(defn- thread-points Vec(o/Point) []
+  (let [ts (ps/self-task-states)
+        [mr mw dr dw] (loop [i 0 mr 0 mw 0 dr 0 dw 0]
+                        (if (>= i (count ts)) (values mr mw dr dw)
+                          (let [run (= (nth ts i) "R")]
+                            (if (= i 0) (recur (+ i 1) (if run 1 0) (if run 0 1) dr dw)
+                              (recur (+ i 1) mr mw (if run (+ dr 1) dr) (if run dw (+ dw 1)))))))
+        none: Vec(o/Point) []]
+    (add-threads (add-threads (add-threads (add-threads none true "runnable" dr) true "waiting" dw) false "runnable" mr) false "waiting" mw)))
+
+(defn- with-points Vec(o/Metric) [ms: &Vec(o/Metric)]
+  (loop [i 0 acc: Vec(o/Metric) []]
+    (if (>= i (count ms)) acc (recur (+ i 1) (if (= (count (:points (nth ms i))) 0) acc (conj acc (nth ms i)))))))
+
+(defn jvm-scope o/Scope []
+  (let [[st se] (read-file "/proc/self/status")
+        cpu-ns (ps/self-cpu-ns)
+        ncpu (io/cpu-count)
+        [limit cur] (ops/cgroup-memory)
+        none: Vec(o/Attr) []
+        lim: Vec(o/Point) (if (> limit 0) [(o/ipoint (pool "anonymous" "heap") limit)] [])]
+    (o/->Scope "io.opentelemetry.runtime-telemetry" ""
+               (with-points
+               [(o/->Metric "jvm.cpu.count" "Number of processors available to the Java virtual machine." "{cpu}" o/UPDOWN [(o/ipoint none ncpu)])
+                (o/->Metric "jvm.cpu.time" "CPU time used by the process as reported by the JVM." "s" o/MONOTONIC
+                            [(o/dpoint none (/ (float cpu-ns) 1000000000.0))])
+                (o/->Metric "jvm.cpu.recent_utilization" "Recent CPU utilization for the process as reported by the JVM." "1" o/GAUGE
+                            [(o/dpoint none (recent-utilization cpu-ns (epoch-ms) ncpu))])
+                (o/->Metric "jvm.memory.used" "Measure of memory used." "By" o/UPDOWN
+                            [(o/ipoint (pool "anonymous" "heap") (nz (ps/status-field st "RssAnon")))
+                             (o/ipoint (pool "file-backed" "non_heap") (nz (ps/status-field st "RssFile")))])
+                (o/->Metric "jvm.memory.committed" "Measure of memory committed." "By" o/UPDOWN
+                            [(o/ipoint (pool "anonymous" "heap") (nz (ps/status-field st "RssAnon")))
+                             (o/ipoint (pool "file-backed" "non_heap") (nz (ps/status-field st "RssFile")))])
+                (o/->Metric "jvm.memory.limit" "Measure of max obtainable memory." "By" o/UPDOWN lim)
+                (o/->Metric "jvm.thread.count" "Number of executing platform threads." "{thread}" o/UPDOWN (thread-points))]))))
+
+(def CATEGORY "io.opentelemetry.exporter.internal.http.HttpExporter")
+
+(defn- retryable? Bool [st: Int] (or (= st 429) (= st 502) (= st 503) (= st 504)))
+
+(defn http-failure Values(Int Str) [what: &Str st: Int body: &Str reason: &Str]
+  (let [[m ok] (o/status-message body)]
+    (values log/WARN (str "Failed to export " what ". Server responded with HTTP status code " st ". Error message: "
+                          (if ok m (str "Unable to parse response body, HTTP status message: " reason))))))
+
+(defn- post Values(Int Str Str Str) [x: &Exporter body: &Str]
+  (let [hs0 [(hm/->Header "Content-Type" "application/x-protobuf")]
+        hs1 (if (:gzip x) (conj hs0 (hm/->Header "Content-Encoding" "gzip")) hs0)
+        hs (loop [i 0 acc hs1] (if (>= i (count (:headers x))) acc (recur (+ i 1) (conj acc (nth (:headers x) i)))))
+        o (assoc (assoc (assoc (assoc (assoc (http/request-opts (:endpoint x)) :method "POST") :headers hs) :body (str body))
+                        :timeout-ms (:timeout-ms x)) :tls (:tls x))
+        [r err] (http/request o)]
+    (values (:status r) (str (:body r)) (str (:reason r)) err)))
+
+(def GRPC-CATEGORY "io.opentelemetry.exporter.internal.grpc.GrpcExporter")
+(def GRPC-PATH "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export")
+(def UNIMPLEMENTED-LOGGED (atom false))
+
+(defn grpc-url Str [endpoint: &Str path: &Str]
+  (let [k (str/index-of endpoint "://")
+        from (if (< k 0) 0 (+ k 3))
+        j (str/index-of-after endpoint "/" from)]
+    (str (if (< j 0) endpoint (subs endpoint 0 j)) path)))
+
+(defn grpc-frame Str [msg: &Str gz: Bool]
+  (let [n (count msg)]
+    (str (chr (if gz 1 0)) (chr (bit-and (bit-shift-right n 24) 255)) (chr (bit-and (bit-shift-right n 16) 255))
+         (chr (bit-and (bit-shift-right n 8) 255)) (chr (bit-and n 255)) msg)))
+
+(defn grpc-status-of Values(Int Str) [r: &hm/Resp]
+  (let [st (match (hm/header-of (:trailers r) "grpc-status") (Some t) [t]
+             (None) (match (hm/header-of (:headers r) "grpc-status") (Some h) [h] (None) (let [e: Vec(Str) []] e)))
+        code (if (= (count st) 0) 2 (let [[n nerr] (parse-long (nth st 0))] (if (= nerr "") n 2)))
+        msg (match (hm/header-of (:trailers r) "grpc-message") (Some t) (hx/url-decode-path t)
+              (None) (match (hm/header-of (:headers r) "grpc-message") (Some h) (hx/url-decode-path h) (None) ""))]
+    (values code msg)))
+
+(defn grpc-retryable? Bool [c: Int] (or (= c 1) (= c 4) (= c 8) (= c 10) (= c 11) (= c 14) (= c 15)))
+
+(defn grpc-failure Values(Int Str) [what: &Str code: Int msg: &Str]
+  (cond (= code 14) (values log/ERROR (str "Failed to export " what ". Server is UNAVAILABLE. Make sure your collector is running and reachable from this network. Full error message:" msg))
+        (= code 12) (values log/ERROR (str "Failed to export " what ". Server responded with UNIMPLEMENTED. This usually means that your collector is not configured with an otlp receiver in the \"pipelines\" section of the configuration. If export is not desired and you are using OpenTelemetry autoconfiguration or the javaagent, disable export by setting OTEL_" (if (= what "spans") "TRACES" "METRICS") "_EXPORTER=none. Full error message: " msg))
+        :else (values log/WARN (str "Failed to export " what ". Server responded with gRPC status code " code ". Error message: " msg))))
+
+(defn grpc-headers Vec(hm/Header) [x: &Exporter]
+  (let [hs0 [(hm/->Header "te" "trailers") (hm/->Header "Content-Type" "application/grpc")]
+        hs1 (if (:gzip x) (conj hs0 (hm/->Header "grpc-encoding" "gzip")) hs0)]
+    (loop [i 0 acc hs1] (if (>= i (count (:headers x))) acc (recur (+ i 1) (conj acc (nth (:headers x) i)))))))
+
+(defn- post-grpc Values(Int Str Str) [x: &Exporter pb: &Str]
+  (let [msg (if (:gzip x) (z/gzip pb) (str pb))
+        hs (grpc-headers x)
+        url (grpc-url (:endpoint x) (:path x))
+        o (assoc (assoc (assoc (assoc (assoc (assoc (http/request-opts url) :method "POST") :headers hs) :body (grpc-frame msg (:gzip x)))
+                               :timeout-ms (:timeout-ms x)) :tls (:tls x)) :h2c (str/starts-with? url "http://"))
+        [r err] (http/request o)]
+    (if (not= err "") (values 0 "" err)
+      (let [[code m] (grpc-status-of r)] (values code m "")))))
+
+(defn- export-grpc Int [x: &Exporter pb: &Str log-level: Int attempts: Int]
+  (loop [attempt 1 backoff 1000]
+    (let [[code msg err] (post-grpc x pb)
+          again (and (< attempt attempts) (or (not= err "") (grpc-retryable? code)))]
+      (cond (and (= err "") (= code 0)) 0
+            again (let [z (sleep-ms (rand-int (+ backoff 1)))] (recur (+ attempt 1) (min 5000 (quot (* backoff 3) 2))))
+            (not= err "") (let [z (log/emit log/ERROR log-level "mulay" GRPC-CATEGORY (str "Failed to export " (:what x) ". The request could not be executed. Error message: " err))] 1)
+            (and (= code 12) (deref UNIMPLEMENTED-LOGGED)) 1
+            :else (let [z (if (= code 12) (reset! UNIMPLEMENTED-LOGGED true) false)
+                        [lv text] (grpc-failure (:what x) code msg)
+                        z2 (log/emit lv log-level "mulay" GRPC-CATEGORY text)]
+                    1)))))
+
+(defn- export-http Int [x: &Exporter pb: &Str log-level: Int attempts: Int]
+  (let [body (if (:gzip x) (z/gzip pb) (str pb))]
+    (loop [attempt 1 backoff 1000]
+      (let [[st rbody reason err] (post x body)
+            again (and (< attempt attempts) (or (not= err "") (retryable? st)))]
+        (cond (and (= err "") (>= st 200) (< st 300)) 0
+              again (let [z (sleep-ms (rand-int (+ backoff 1)))] (recur (+ attempt 1) (min 5000 (quot (* backoff 3) 2))))
+              (not= err "") (let [z (log/emit log/ERROR log-level "mulay" CATEGORY (str "Failed to export " (:what x) ". The request could not be executed. Full error message: " err))] 1)
+              :else (let [[lv text] (http-failure (:what x) st rbody reason)
+                          z (log/emit lv log-level "mulay" CATEGORY text)]
+                      1))))))
+
+(defn export-once Int [x: &Exporter app: &m/App inv: &Inventory log-level: Int attempts: Int]
+  (let [rs0 [(o/->Resource (:resource x) (scopes app inv))]
+        rs (if (:jvm x) (conj rs0 (o/->Resource (:container x) [(jvm-scope)])) rs0)
+        pb (o/export-request rs (:start-ns x) (* (epoch-ms) 1000000))]
+    (if (:grpc x) (export-grpc x pb log-level attempts) (export-http x pb log-level attempts))))
+
+(defrecord Running [x: Exporter app: m/App inv: Inventory log-level: Int])
+(def RUNNING (atom (let [z: Vec(Running) []] z)))
+
+(defn- tick Int [r: Running]
+  (loop [] (let [z (sleep-ms (:interval-ms (:x r))) e (export-once (:x r) (:app r) (:inv r) (:log-level r) 5)] (recur))))
+
+(defn start Int [x: &Exporter app: &m/App inv: &Inventory log-level: Int]
+  (if (not (:on x)) 0
+    (let [z0 (mt/enable! true (:stats x))
+          r (->Running x app inv log-level)
+          z1 (reset! RUNNING [r])
+          z2 (future-detach (future (fn Int [q: Int] (tick (nth (deref RUNNING) 0))) 0))]
+      (log/emit log/INFO log-level "mulay" "mulay.app"
+                (str "Exporting OpenTelemetry metrics to " (:endpoint x) " every " (quot (:interval-ms x) 1000) " s")))))
+
+(defn shutdown Int []
+  (let [rs (deref RUNNING)]
+    (if (= (count rs) 0) 0
+      (let [r (nth rs 0)] (export-once (:x r) (:app r) (:inv r) (:log-level r) 1)))))
+
+(def TP "mule.openTelemetry.tracer.exporter.")
+(def TRACE-GRPC-PATH "/opentelemetry.proto.collector.trace.v1.TraceService/Export")
+(def BATCH-CATEGORY "org.mule.runtime.tracer.exporter.impl.export.batch.BlockingBatchSpanProcessor$Worker")
+(def SAMPLERS ["always_on" "always_off" "traceidratio" "parentbased_always_on" "parentbased_always_off" "parentbased_traceidratio"])
+
+(defrecord Tracer [x: Exporter delay-ms: Int max-size: Int conf: tr/Conf])
+
+(defn- ratio-of Values(Float Str) [app: &m/App]
+  (let [[s found] (prop app (str TP "sampler.arg"))]
+    (if (not found) (values 0.1 "")
+      (let [[x e] (parse-double s)]
+        (if (or (not= e "") (< x 0.0) (> x 1.0)) (values 0.0 (str TP "sampler.arg: '" s "' is not a number from 0 to 1")) (values x ""))))))
+
+(defn- level-of Values(Int Str) [app: &m/App]
+  (let [k "mule.openTelemetry.tracer.level"
+        v (str/upper-case (prop-or app k "MONITORING"))]
+    (cond (= v "OVERVIEW") (values tr/OVERVIEW "")
+          (= v "MONITORING") (values tr/MONITORING "")
+          (= v "DEBUG") (values tr/DEBUG "")
+          :else (values tr/MONITORING (str k ": '" v "' is not OVERVIEW, MONITORING or DEBUG")))))
+
+(defn configure-tracer Values(Tracer Str) [app: &m/App]
+  (let [[x err] (configure-at app TP "spans" "/v1/traces" TRACE-GRPC-PATH)
+        [delay e1] (pos-int app TP "batch.scheduledDelay" 5000)
+        [mx e2] (pos-int app TP "batch.maxSize" 512)
+        [qs e3] (pos-int app TP "batch.queueSize" 2048)
+        st (str/lower-case (prop-or app (str TP "sampler.type") "parentbased_traceidratio"))
+        e4 (if (member? SAMPLERS st) "" (str TP "sampler.type: '" st "' is not one of " (str/join ", " SAMPLERS)))
+        [ratio e5] (ratio-of app)
+        [lv e6] (level-of app)
+        es [err e1 e2 e3 e4 e5 e6]
+        first (loop [i 0] (if (>= i (count es)) "" (if (not= (nth es i) "") (nth es i) (recur (+ i 1)))))]
+    (values (->Tracer x delay mx (tr/->Conf (:on x) lv st ratio (:name app) qs)) (if (:on x) first ""))))
+
+(defrecord TraceRun [t: Tracer log-level: Int])
+(def TRACING (atom (let [z: Vec(TraceRun) []] z)))
+
+(defn- export-spans Int [r: &TraceRun spans: &Vec(o/Span) attempts: Int]
+  (let [x (:x (:t r))
+        pb (o/trace-request (:resource x) "mule" "1.0.0" spans)
+        rc (if (:grpc x) (export-grpc x pb (:log-level r) attempts) (export-http x pb (:log-level r) attempts))]
+    (if (= rc 0) 0 (log/emit log/WARN (:log-level r) "mulay" BATCH-CATEGORY "Batch span export failed."))))
+
+(defn- flush-spans Int [r: &TraceRun attempts: Int]
+  (loop []
+    (let [b (tr/take-batch (:max-size (:t r)))]
+      (if (= (count b) 0) 0 (let [z (export-spans r b attempts)] (recur))))))
+
+(defn- trace-loop Int [r: TraceRun]
+  (let [delay (:delay-ms (:t r)) mx (:max-size (:t r))]
+    (loop [last (quot (mono-us) 1000)]
+      (let [z (sleep-ms 100)
+            now (quot (mono-us) 1000)]
+        (if (or (>= (- now last) delay) (>= (tr/queued) mx))
+          (let [z2 (flush-spans r 5)] (recur now))
+          (recur last))))))
+
+(defn start-tracer Int [t: &Tracer log-level: Int]
+  (if (not (:on (:x t))) 0
+    (let [z0 (tr/configure! (:conf t))
+          z1 (reset! TRACING [(->TraceRun t log-level)])
+          z2 (future-detach (future (fn Int [q: Int] (trace-loop (nth (deref TRACING) 0))) 0))]
+      (log/emit log/INFO log-level "mulay" "mulay.app" (str "Exporting OpenTelemetry traces to " (:endpoint (:x t)))))))
+
+(defn shutdown-tracer Int []
+  (let [rs (deref TRACING)]
+    (if (= (count rs) 0) 0 (flush-spans (nth rs 0) 1))))

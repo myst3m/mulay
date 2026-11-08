@@ -1,0 +1,198 @@
+(ns mulay.lib.jsonskema
+  (:require [mulay.lib.yaml :as y] [mulay.lib.jsonschema :as js] [mulay.lib.dec :as d] [mulay.lib.regex :as rx]
+            [clay.utf8 :as u8] [clay.string :as str]))
+
+(defn- at Str [ptr: &Str msg: Str] (if (= ptr "") msg (str ptr " " msg)))
+
+(defn- key Values(y/YVal Bool) [m: &y/YVal k: &Str] (y/get-key m k))
+
+(defn- text Str [v: &y/YVal] (match v (y/YStr s) (str s) _ (y/scalar-text v)))
+
+(defn- dec-of Values(d/Dec Bool) [v: &y/YVal]
+  (match v
+    (y/YInt t) (let [[x e] (d/parse t)] (values x (= e "")))
+    (y/YFloat t) (let [[x e] (d/parse t)] (values x (= e "")))
+    _ (values (d/zero) false)))
+
+(defn- int-of Values(Int Bool) [v: &y/YVal] (match v (y/YInt t) (y/int-value v) _ (values 0 false)))
+
+(defn- cat Vec(Str) [a: Vec(Str) b: &Vec(Str)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- esc-ptr Str [k: &Str] (str/replace (str/replace k "~" "~0") "/" "~1"))
+
+(defn kind Str [x: &y/YVal]
+  (match x
+    (y/YNull) "null"
+    (y/YBool b) "boolean"
+    (y/YInt t) "integer"
+    (y/YFloat t) "number"
+    (y/YStr s) "string"
+    (y/YSeq xs) "array"
+    (y/YMap ks vs) "object"
+    (y/YTagged t z) (kind z)))
+
+(defn- type-ok? Bool [t: &Str x: &y/YVal]
+  (let [k (kind x)] (or (= t k) (and (= t "number") (= k "integer")))))
+
+(defn- num? Bool [x: &y/YVal] (match x (y/YInt t) true (y/YFloat t) true _ false))
+
+(defn- same? Bool [a: &y/YVal b: &y/YVal] (= (js/to-json a) (js/to-json b)))
+
+(defn- type-fails Vec(Str) [t: &y/YVal x: &y/YVal ptr: &Str]
+  (match t
+    (y/YSeq ts)
+    (if (loop [i 0] (if (>= i (count ts)) false (if (type-ok? (text (nth ts i)) x) true (recur (+ i 1))))) []
+      (loop [i 0 acc: Vec(Str) []]
+        (if (>= i (count ts)) acc
+          (recur (+ i 1) (conj acc (at ptr (str "expected type: " (text (nth ts i)) ", actual: " (kind x))))))))
+    _ (if (type-ok? (text t) x) [] [(at ptr (str "expected type: " (text t) ", actual: " (kind x)))])))
+
+(defn- enum-fails Vec(Str) [vs: &y/YVal x: &y/YVal ptr: &Str]
+  (match vs
+    (y/YSeq xs) (if (loop [i 0] (if (>= i (count xs)) false (if (same? (nth xs i) x) true (recur (+ i 1))))) []
+                  [(at ptr "the instance is not equal to any enum values")])
+    _ []))
+
+(defn- bound-fail Vec(Str) [kw: &Str lim: &y/YVal x: &y/YVal ptr: &Str]
+  (let [[xv xok] (dec-of x) [m mok] (dec-of lim)]
+    (if (or (not xok) (not mok)) []
+      (let [c (d/cmp xv m) xt (y/scalar-text x) mt (y/scalar-text lim)]
+        (cond
+          (and (= kw "minimum") (< c 0)) [(at ptr (str xt " is lower than minimum " mt))]
+          (and (= kw "exclusiveMinimum") (<= c 0)) [(at ptr (str xt " is lower than or equal to minimum " mt))]
+          (and (= kw "maximum") (> c 0)) [(at ptr (str xt " is greater than maximum " mt))]
+          (and (= kw "exclusiveMaximum") (>= c 0)) [(at ptr (str xt " is greater than or equal to maximum " mt))]
+          :else [])))))
+
+(defn- multiple-fail Vec(Str) [m0: &y/YVal x: &y/YVal ptr: &Str]
+  (let [[xv xok] (dec-of x) [m mok] (dec-of m0)]
+    (if (or (not xok) (not mok) (d/is-zero? m)) []
+      (let [[r e] (d/rem-dec xv m)]
+        (if (or (not= e "") (not (d/is-zero? r))) [(at ptr (str (y/scalar-text x) " is not a multiple of " (y/scalar-text m0)))] [])))))
+
+(defn- pattern-fail Vec(Str) [p0: &y/YVal x: &Str ptr: &Str bud: &Atom(js/RxBudget)]
+  (let [p (text p0) [re e] (rx/compile p 0)]
+    (if (not= e "") []
+      (let [[hit me] (js/rx-find bud re x)]
+        (cond (not= me "") [(at ptr me)]
+              hit []
+              :else [(at ptr (str "instance value did not match pattern " p))])))))
+
+(defn- unique-fail Vec(Str) [xs: &Vec(y/YVal) ptr: &Str]
+  (loop [j 0 first: Map(Str Int) {}]
+    (if (>= j (count xs)) []
+      (let [c (js/to-json (nth xs j))]
+        (match (get first c)
+          (Some i) [(at ptr (str "the same array element occurs at positions " i ", " j))]
+          (None) (recur (+ j 1) (assoc first c j)))))))
+
+(defn- prop-names Vec(Str) [ps: &y/YVal] (match ps (y/YMap ks vs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (text (nth ks i)))))) _ []))
+
+(defn- in? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn- pattern-hit? Bool [pp: &y/YVal k: &Str bud: &Atom(js/RxBudget)]
+  (match pp
+    (y/YMap ks vs) (loop [i 0] (if (>= i (count ks)) false
+                                 (let [[re e] (rx/compile (text (nth ks i)) 0)]
+                                   (if (and (= e "") (let [[hit me] (js/rx-find bud re k)] hit)) true (recur (+ i 1))))))
+    _ false))
+
+(defn- seq-of Vec(y/YVal) [x: &y/YVal] (match x (y/YSeq xs) xs _ []))
+
+(defn- branches Vec(Vec(Str)) [bs: &y/YVal root: &y/YVal x: &y/YVal ptr: &Str depth: Int bud: &Atom(js/RxBudget)]
+  (let [xs (seq-of bs)]
+    (loop [i 0 acc: Vec(Vec(Str)) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (check (nth xs i) root x ptr depth bud)))))))
+
+(defn- all-of Vec(Str) [rs: &Vec(Vec(Str))] (loop [i 0 acc: Vec(Str) []] (if (>= i (count rs)) acc (recur (+ i 1) (cat acc (nth rs i))))))
+
+(defn- passing Int [rs: &Vec(Vec(Str))] (loop [i 0 n 0] (if (>= i (count rs)) n (recur (+ i 1) (if (= (count (nth rs i)) 0) (+ n 1) n)))))
+
+(defn- object-kw Vec(Str) [kw: &Str v: &y/YVal s: &y/YVal root: &y/YVal x: &y/YVal ks: &Vec(y/YVal) xv: &Vec(y/YVal) ptr: &Str depth: Int bud: &Atom(js/RxBudget)]
+  (cond
+    (= kw "required")
+    (let [want (seq-of v)
+          miss (loop [i 0 acc: Vec(Str) []]
+                 (if (>= i (count want)) acc
+                   (let [n (text (nth want i)) [z f] (y/get-key x n)] (recur (+ i 1) (if f acc (conj acc n))))))]
+      (if (= (count miss) 0) [] [(at ptr (str "required properties are missing: " (str/join ", " miss)))]))
+    (= kw "properties")
+    (match v
+      (y/YMap pk pv) (loop [i 0 acc: Vec(Str) []]
+                       (if (>= i (count pk)) acc
+                         (let [n (text (nth pk i)) [xi f] (y/get-key x n)]
+                           (recur (+ i 1) (if f (cat acc (check (nth pv i) root xi (str ptr "/" (esc-ptr n)) (+ depth 1) bud)) acc)))))
+      _ [])
+    (= kw "patternProperties")
+    (match v
+      (y/YMap pk pv) (loop [i 0 acc: Vec(Str) []]
+                       (if (>= i (count pk)) acc
+                         (let [[re e] (rx/compile (text (nth pk i)) 0)]
+                           (recur (+ i 1)
+                                  (if (not= e "") acc
+                                    (loop [k 0 a acc]
+                                      (if (>= k (count ks)) a
+                                        (let [n (text (nth ks k)) [hit me] (js/rx-find bud re n)]
+                                          (recur (+ k 1) (if hit (cat a (check (nth pv i) root (nth xv k) (str ptr "/" (esc-ptr n)) (+ depth 1) bud)) a))))))))))
+      _ [])
+    (= kw "additionalProperties")
+    (let [[ps hp] (key s "properties") [pp hpp] (key s "patternProperties") named (prop-names ps)]
+      (loop [k 0 acc: Vec(Str) []]
+        (if (>= k (count ks)) acc
+          (let [n (text (nth ks k))]
+            (recur (+ k 1) (if (or (in? named n) (and hpp (pattern-hit? pp n bud))) acc
+                             (cat acc (check v root (nth xv k) (str ptr "/" (esc-ptr n)) (+ depth 1) bud))))))))
+    (= kw "minProperties") (let [[m ok] (int-of v)] (if (and ok (< (count ks) m)) [(at ptr (str "expected minimum properties: " m ", found only " (count ks)))] []))
+    (= kw "maxProperties") (let [[m ok] (int-of v)] (if (and ok (> (count ks) m)) [(at ptr (str "expected maximum properties: " m ", found " (count ks)))] []))
+    :else []))
+
+(defn- array-kw Vec(Str) [kw: &Str v: &y/YVal root: &y/YVal xs: &Vec(y/YVal) ptr: &Str depth: Int bud: &Atom(js/RxBudget)]
+  (cond
+    (= kw "items") (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (cat acc (check v root (nth xs i) (str ptr "/" i) (+ depth 1) bud)))))
+    (= kw "minItems") (let [[m ok] (int-of v)] (if (and ok (< (count xs) m)) [(at ptr (str "expected minimum items: " m ", found only " (count xs)))] []))
+    (= kw "maxItems") (let [[m ok] (int-of v)] (if (and ok (> (count xs) m)) [(at ptr (str "expected maximum items: " m ", found " (count xs)))] []))
+    (= kw "uniqueItems") (if (match v (y/YBool b) b _ false) (unique-fail xs ptr) [])
+    :else []))
+
+(defn- string-kw Vec(Str) [kw: &Str v: &y/YVal x: &Str ptr: &Str bud: &Atom(js/RxBudget)]
+  (cond
+    (= kw "minLength") (let [[m ok] (int-of v) n (u8/codepoint-count x)] (if (and ok (< n m)) [(at ptr (str "actual string length " n " is lower than minLength " m))] []))
+    (= kw "maxLength") (let [[m ok] (int-of v) n (u8/codepoint-count x)] (if (and ok (> n m)) [(at ptr (str "actual string length " n " exceeds maxLength " m))] []))
+    (= kw "pattern") (pattern-fail v x ptr bud)
+    (= kw "format") (let [f (text v)] (if (js/format-ok? f x) [] [(at ptr (str "instance does not match format '" f "'"))]))
+    :else []))
+
+(defn- keyword-fails Vec(Str) [kw: &Str v: &y/YVal s: &y/YVal root: &y/YVal x: &y/YVal ptr: &Str depth: Int bud: &Atom(js/RxBudget)]
+  (cond
+    (= kw "$ref") (let [[t found] (js/deref-ptr root (text v))] (if found (check t root x ptr (+ depth 1) bud) []))
+    (= kw "type") (type-fails v x ptr)
+    (= kw "enum") (enum-fails v x ptr)
+    (= kw "allOf") (all-of (branches v root x ptr (+ depth 1) bud))
+    (= kw "anyOf") (let [rs (branches v root x ptr (+ depth 1) bud)] (if (> (passing rs) 0) [] (all-of rs)))
+    (= kw "oneOf") (let [rs (branches v root x ptr (+ depth 1) bud)] (if (> (passing rs) 0) [] (all-of rs)))
+    (= kw "not") (if (= (count (check v root x ptr (+ depth 1) bud)) 0) [(at ptr "negated subschema did not fail")] [])
+    :else
+    (match x
+      (y/YMap ks xv) (object-kw kw v s root x ks xv ptr depth bud)
+      (y/YSeq xs) (array-kw kw v root xs ptr depth bud)
+      (y/YStr t) (string-kw kw v t ptr bud)
+      (y/YTagged tg z) (keyword-fails kw v s root z ptr depth bud)
+      _ (cond
+          (not (num? x)) []
+          (or (= kw "minimum") (= kw "exclusiveMinimum") (= kw "maximum") (= kw "exclusiveMaximum")) (bound-fail kw v x ptr)
+          (= kw "multipleOf") (multiple-fail v x ptr)
+          :else []))))
+
+(defn check Vec(Str) [s: &y/YVal root: &y/YVal x: &y/YVal ptr: &Str depth: Int bud: &Atom(js/RxBudget)]
+  (if (> depth 64) []
+    (match s
+      (y/YBool b) (if b [] [(at ptr "false schema always fails")])
+      (y/YMap ks vs) (loop [i 0 acc: Vec(Str) []]
+                       (if (>= i (count ks)) acc
+                         (recur (+ i 1) (cat acc (keyword-fails (text (nth ks i)) (nth vs i) s root x ptr depth bud)))))
+      _ [])))
+
+(defn validate Vec(Str) [schema: &y/YVal root: &y/YVal x: &y/YVal]
+  (let [bud (js/rx-budget)
+        out (check schema root x "" 0 bud)
+        re (js/rx-error bud)]
+    (if (and (= (count out) 0) (not= re "")) [re] out)))

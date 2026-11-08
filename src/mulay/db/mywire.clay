@@ -1,0 +1,358 @@
+(ns mulay.db.mywire
+  (:require [mulay.db.sql :as sql] [mulay.lib.crypto :as crypto] [clay.string :as str]
+            [mulay.lib.time.tz :as tz] [mulay.lib.time.zoned :as zt] [mulay.lib.time.iso :as iso] [mulay.lib.dec :as dec]))
+
+(def SHORT -1)
+
+(def LONG-PASSWORD 1)
+(def FOUND-ROWS 2)
+(def LONG-FLAG 4)
+(def CONNECT-WITH-DB 8)
+(def PROTOCOL-41 512)
+(def SSL 2048)
+(def TRANSACTIONS 8192)
+(def SECURE-CONNECTION 32768)
+(def MULTI-RESULTS 131072)
+(def PS-MULTI-RESULTS 262144)
+(def PLUGIN-AUTH 524288)
+(def PLUGIN-AUTH-LENENC 2097152)
+(def DEPRECATE-EOF 16777216)
+
+(def MORE-RESULTS 8)
+
+(def T-DECIMAL 0)
+(def T-TINY 1)
+(def T-SHORT 2)
+(def T-LONG 3)
+(def T-FLOAT 4)
+(def T-DOUBLE 5)
+(def T-NULL 6)
+(def T-TIMESTAMP 7)
+(def T-LONGLONG 8)
+(def T-INT24 9)
+(def T-DATE 10)
+(def T-TIME 11)
+(def T-DATETIME 12)
+(def T-YEAR 13)
+(def T-VARCHAR 15)
+(def T-BIT 16)
+(def T-JSON 245)
+(def T-NEWDECIMAL 246)
+(def T-ENUM 247)
+(def T-SET 248)
+(def T-GEOMETRY 255)
+
+(def F-UNSIGNED 32)
+
+(def UTF8MB4 255)
+(def BINARY 63)
+
+(defn w8 Str [out: Str x: Int] (str out (chr (bit-and x 255))))
+(defn w16 Str [out: Str x: Int] (let [o (w8 out x)] (w8 o (bit-shift-right x 8))))
+(defn w24 Str [out: Str x: Int] (let [o (w16 out x)] (w8 o (bit-shift-right x 16))))
+(defn w32 Str [out: Str x: Int] (let [o (w16 out x)] (w16 o (bit-shift-right x 16))))
+(defn w64 Str [out: Str x: Int] (let [o (w32 out x)] (w32 o (bit-shift-right x 32))))
+
+(defn wlenenc Str [out: Str n: Int]
+  (cond (< n 251) (w8 out n)
+        (< n 65536) (w16 (w8 out 252) n)
+        (< n 16777216) (w24 (w8 out 253) n)
+        :else (w64 (w8 out 254) n)))
+
+(defn wlenstr Str [out: Str s: &Str] (let [o (wlenenc out (count s))] (str o s)))
+
+(defn wnul Str [out: Str s: &Str] (let [o (str out s)] (w8 o 0)))
+
+(defn packets Values(Str Int) [seq0: Int body: &Str]
+  (let [n (count body) mx 16777215]
+    (loop [pos 0 seq seq0 out ""]
+      (let [len (if (> (- n pos) mx) mx (- n pos))
+            o1 (w24 out len) o2 (w8 o1 seq)
+            o3 (str o2 (subs body pos (+ pos len)))]
+        (if (= len mx) (recur (+ pos len) (bit-and (+ seq 1) 255) o3) (values o3 (bit-and (+ seq 1) 255)))))))
+
+(defn r8 Values(Int Int) [b: &Str p: Int] (if (or (< p 0) (>= p (count b))) (values 0 SHORT) (values (nth b p) (+ p 1))))
+
+(defn- rle Values(Int Int) [b: &Str p: Int n: Int]
+  (if (or (< p 0) (> (+ p n) (count b))) (values 0 SHORT)
+    (values (loop [i (- n 1) acc 0] (if (< i 0) acc (recur (- i 1) (+ (* acc 256) (nth b (+ p i)))))) (+ p n))))
+
+(defn r16 Values(Int Int) [b: &Str p: Int] (rle b p 2))
+(defn r24 Values(Int Int) [b: &Str p: Int] (rle b p 3))
+(defn r32 Values(Int Int) [b: &Str p: Int] (rle b p 4))
+(defn r64 Values(Int Int) [b: &Str p: Int] (rle b p 8))
+
+(defn rlenenc Values(Int Int) [b: &Str p: Int]
+  (let [[x p1] (r8 b p)]
+    (cond (< p1 0) (values 0 SHORT)
+          (< x 251) (values x p1)
+          (= x 251) (values -1 p1)
+          (= x 252) (r16 b p1)
+          (= x 253) (r24 b p1)
+          :else (r64 b p1))))
+
+(defn rlenstr Values(Str Int Bool) [b: &Str p: Int]
+  (let [[n p1] (rlenenc b p)]
+    (cond (< p1 0) (values "" SHORT false)
+          (= n -1) (values "" p1 true)
+          (or (< n 0) (> n (- (count b) p1))) (values "" SHORT false)
+          :else (values (subs b p1 (+ p1 n)) (+ p1 n) false))))
+
+(defn rnul Values(Str Int) [b: &Str p: Int]
+  (if (< p 0) (values "" SHORT)
+    (let [e (loop [i p] (if (or (>= i (count b)) (= (nth b i) 0)) i (recur (+ i 1))))]
+      (values (subs b p e) (if (< e (count b)) (+ e 1) e)))))
+
+(defn take-packet Values(Str Int Int) [buf: &Str p: Int]
+  (if (> (+ p 4) (count buf)) (values "" 0 SHORT)
+    (let [[len p1] (r24 buf p) [seq p2] (r8 buf p1)]
+      (if (> (+ p2 len) (count buf)) (values "" 0 SHORT) (values (subs buf p2 (+ p2 len)) seq (+ p2 len))))))
+
+(defrecord Hello [version: Str thread: Int caps: Int nonce: Str plugin: Str])
+
+(defn parse-hello Values(Hello Str) [b: &Str]
+  (let [none (->Hello "" 0 0 "" "")]
+    (cond
+      (= (count b) 0) (values none "empty handshake")
+      (= (nth b 0) 255) (let [[code msg st] (parse-err b)] (values none msg))
+      (not= (nth b 0) 10) (values none (str "unsupported protocol version " (nth b 0)))
+      :else
+      (let [[ver p1] (rnul b 1)
+            [thread p2] (r32 b p1)
+            part1 (if (and (>= p2 0) (<= (+ p2 8) (count b))) (subs b p2 (+ p2 8)) "")
+            p3 (if (< p2 0) SHORT (+ p2 9))
+            [lo p4] (r16 b p3)
+            [cs p5] (r8 b p4)
+            [stat p6] (r16 b p5)
+            [hi p7] (r16 b p6)
+            [alen p8] (r8 b p7)
+            p9 (if (< p8 0) SHORT (+ p8 10))
+            caps (+ lo (* hi 65536))
+            n2 (if (> (- alen 8) 13) (- alen 8) 13)
+            part2 (if (and (>= p9 0) (<= (+ p9 n2) (count b))) (subs b p9 (+ p9 n2)) "")
+            part2b (if (and (> (count part2) 0) (= (nth part2 (- (count part2) 1)) 0)) (subs part2 0 (- (count part2) 1)) part2)
+            [plugin p10] (if (or (< p9 0) (> (+ p9 n2) (count b))) (values "" SHORT) (rnul b (+ p9 n2)))]
+        (if (< p4 0) (values none "malformed handshake")
+          (values (->Hello ver thread caps (str part1 part2b) plugin) ""))))))
+
+(defn parse-err Values(Int Str Str) [b: &Str]
+  (let [[code p1] (r16 b 1)]
+    (if (< p1 0) (values 0 "malformed error packet" "HY000")
+      (if (and (< p1 (count b)) (= (nth b p1) 35))
+        (if (> (+ p1 6) (count b)) (values code "malformed error packet" "HY000")
+          (values code (subs b (+ p1 6) (count b)) (subs b (+ p1 1) (+ p1 6))))
+        (values code (subs b p1 (count b)) "HY000")))))
+
+(defn parse-ok Values(Int Int Int) [b: &Str]
+  (let [[aff p1] (rlenenc b 1) [id p2] (rlenenc b p1) [st p3] (r16 b p2)]
+    (values (if (< aff 0) 0 aff) (if (< id 0) 0 id) (if (< p3 0) 0 st))))
+
+(defn- sha Str [name: &Str data: &Str] (let [[d ok] (crypto/digest name data)] d))
+
+(defn- xor-bytes Str [a: &Str b: &Str]
+  (loop [i 0 out ""] (if (>= i (count a)) out (recur (+ i 1) (w8 out (bit-xor (nth a i) (nth b (mod i (count b)))))))))
+
+(defn scramble-sha2 Str [password: &Str nonce: &Str]
+  (if (= password "") ""
+    (let [h1 (sha "SHA256" password) h2 (sha "SHA256" h1) h3 (sha "SHA256" (str h2 nonce))] (xor-bytes h1 h3))))
+
+(defn scramble-native Str [password: &Str nonce: &Str]
+  (if (= password "") ""
+    (let [h1 (sha "SHA1" password) h2 (sha "SHA1" h1) h3 (sha "SHA1" (str nonce h2))] (xor-bytes h1 h3))))
+
+(defn auth-response Str [plugin: &Str password: &Str nonce: &Str]
+  (cond (= plugin "caching_sha2_password") (scramble-sha2 password nonce)
+        (= plugin "mysql_native_password") (scramble-native password nonce)
+        :else ""))
+
+(defn client-caps Int [server: Int db: Bool tls: Bool]
+  (let [base (bit-or (bit-or (bit-or LONG-PASSWORD FOUND-ROWS) (bit-or LONG-FLAG PROTOCOL-41))
+                     (bit-or (bit-or TRANSACTIONS SECURE-CONNECTION) (bit-or MULTI-RESULTS PS-MULTI-RESULTS)))
+        c1 (bit-or base (bit-and server (bit-or (bit-or PLUGIN-AUTH PLUGIN-AUTH-LENENC) DEPRECATE-EOF)))
+        c2 (if db (bit-or c1 CONNECT-WITH-DB) c1)]
+    (if tls (bit-or c2 SSL) c2)))
+
+(defn ssl-request Str [caps: Int]
+  (let [o1 (w32 "" caps) o2 (w32 o1 16777215) o3 (w8 o2 UTF8MB4)]
+    (loop [i 0 o o3] (if (>= i 23) o (recur (+ i 1) (w8 o 0))))))
+
+(defn handshake-response Str [caps: Int user: &Str auth: &Str db: &Str plugin: &Str]
+  (let [o0 (ssl-request caps)
+        o1 (wnul o0 user)
+        o2 (if (not= (bit-and caps PLUGIN-AUTH-LENENC) 0) (wlenstr o1 auth) (str (w8 o1 (count auth)) auth))
+        o3 (if (not= (bit-and caps CONNECT-WITH-DB) 0) (wnul o2 db) o2)]
+    (if (not= (bit-and caps PLUGIN-AUTH) 0) (wnul o3 plugin) o3)))
+
+(defrecord Col [name: Str type: Int flags: Int charset: Int length: Int decimals: Int])
+
+(defn parse-col Values(Col Str) [b: &Str]
+  (let [[cat p1 n1] (rlenstr b 0) [schema p2 n2] (rlenstr b p1) [table p3 n3] (rlenstr b p2)
+        [otable p4 n4] (rlenstr b p3) [name p5 n5] (rlenstr b p4) [oname p6 n6] (rlenstr b p5)
+        [fixed p7] (rlenenc b p6) [cs p8] (r16 b p7) [len p9] (r32 b p8) [ty p10] (r8 b p9)
+        [fl p11] (r16 b p10) [dec p12] (r8 b p11)]
+    (if (< p12 0) (values (->Col "" 0 0 0 0 0) "malformed column definition")
+      (values (->Col name ty fl cs len dec) ""))))
+
+(defn- iso-ldt Str [s: &Str] (if (and (> (count s) 10) (= (nth s 10) 32)) (str (subs s 0 10) "T" (subs s 11 (count s))) (str s)))
+
+(defn- int-cell sql/Cell [s: &Str long: Bool]
+  (let [[n e] (parse-long s)] (if (not= e "") (sql/->CDecimal s) (if long (sql/->CLong n) (sql/->CInt n)))))
+
+(defn cell-of sql/Cell [c: &Col s: &Str]
+  (let [t (:type c)
+        unsigned (not= (bit-and (:flags c) F-UNSIGNED) 0)]
+    (cond
+      (= t T-NULL) (sql/->CNull)
+      (and (= t T-TINY) (= (:length c) 1)) (sql/->CBool (not= s "0"))
+      (or (= t T-TINY) (= t T-SHORT) (= t T-INT24)) (int-cell s false)
+      (= t T-LONG) (int-cell s unsigned)
+      (= t T-LONGLONG) (if unsigned (sql/->CBigInt s) (int-cell s true))
+      (or (= t T-DECIMAL) (= t T-NEWDECIMAL)) (sql/->CDecimal s)
+      (= t T-FLOAT) (sql/->CFloat s)
+      (= t T-DOUBLE) (let [[f e] (parse-double s)] (if (= e "") (sql/->CDouble f) (sql/->CStr s)))
+      (= t T-DATE) (sql/->CDate s)
+      (= t T-YEAR) (sql/->CDate (str s "-01-01"))
+      (= t T-DATETIME) (sql/->CLdt (iso-ldt s))
+      (= t T-TIMESTAMP) (sql/->CTimestamp (iso-ldt s))
+      (= t T-TIME) (sql/->CTime s)
+      (= t T-BIT) (if (= (:length c) 1) (sql/->CBool (loop [i 0] (if (>= i (count s)) false (if (not= (nth s i) 0) true (recur (+ i 1))))))
+                    (sql/->CBytes s))
+      (= t T-JSON) (sql/->CStr s)
+      (= t T-GEOMETRY) (sql/->CBytes s)
+      (= (:charset c) BINARY) (sql/->CBytes s)
+      :else (sql/->CStr s))))
+
+(defn parse-row Values(Vec(sql/Cell) Str) [b: &Str cols: &Vec(Col)]
+  (loop [i 0 p 0 acc: Vec(sql/Cell) []]
+    (if (>= i (count cols)) (values acc "")
+      (let [[s p1 null] (rlenstr b p)]
+        (if (< p1 0) (values acc "malformed row")
+          (recur (+ i 1) p1 (conj acc (if null (sql/->CNull) (cell-of (nth cols i) s)))))))))
+
+(defn quote-str Str [s: &Str] (str "_utf8mb4 " (hex-lit s)))
+
+(def HEX "0123456789ABCDEF")
+
+(defn- hex-lit Str [b: &Str]
+  (loop [i 0 out "X'"]
+    (if (>= i (count b)) (str out "'")
+      (let [x (nth b i)] (recur (+ i 1) (str out (subs HEX (bit-shift-right x 4) (+ (bit-shift-right x 4) 1)) (subs HEX (bit-and x 15) (+ (bit-and x 15) 1))))))))
+
+(defn- trim-frac Str [s: &Str]
+  (let [d (str/index-of s ".")]
+    (if (< d 0) (str s)
+      (let [e (loop [i (count s)] (if (and (> i (+ d 1)) (= (nth s (- i 1)) 48)) (recur (- i 1)) i))]
+        (if (= e (+ d 1)) (subs s 0 d) (subs s 0 e))))))
+
+(defn- ldt-lit Str [s: &Str]
+  (quote-str (trim-frac (if (and (> (count s) 10) (= (nth s 10) 84)) (str (subs s 0 10) " " (subs s 11 (count s))) (str s)))))
+
+(defn zoned-lit Str [s: &Str]
+  (let [[z e] (iso/parse-zdt s)]
+    (if (not= e "") (quote-str s)
+      (let [lz (zt/zdt-with-zone-same-instant z (tz/system-zone))] (ldt-lit (iso/ldt-str (zt/zdt-ldt lz)))))))
+
+(defn literal Str [x: &sql/Cell]
+  (match x
+    (sql/CNull) "null"
+    (sql/CInt n) (str n)
+    (sql/CLong n) (str n)
+    (sql/CBigInt s) (str s)
+    (sql/CDecimal s) (str s)
+    (sql/CFloat s) (str s)
+    (sql/CDouble f) (dec/float->shortest-str f)
+    (sql/CBool b) (if b "1" "0")
+    (sql/CStr s) (quote-str s)
+    (sql/CClob s) (quote-str s)
+    (sql/CBytes b) (hex-lit b)
+    (sql/CDatum c b z) (hex-lit b)
+    (sql/CDate s) (quote-str s)
+    (sql/CTimestamp s) (ldt-lit s)
+    (sql/CLdt s) (ldt-lit s)
+    (sql/CTime s) (quote-str s)
+    (sql/CZoned s) (zoned-lit s)))
+
+(defn fill-params Str [q: &Str lits: &Vec(Str)]
+  (let [n (count q)]
+    (loop [i 0 k 0 out ""]
+      (if (>= i n) out
+        (let [ch (nth q i)]
+          (cond
+            (or (= ch 39) (= ch 34) (= ch 96))
+            (let [e (loop [j (+ i 1)]
+                      (cond (>= j n) n
+                            (and (= (nth q j) 92) (not= ch 96)) (recur (+ j 2))
+                            (= (nth q j) ch) (if (and (< (+ j 1) n) (= (nth q (+ j 1)) ch)) (recur (+ j 2)) (+ j 1))
+                            :else (recur (+ j 1))))
+                  e2 (if (> e n) n e)]
+              (recur e2 k (str out (subs q i e2))))
+            (or (= ch 35) (and (= ch 45) (< (+ i 2) n) (= (nth q (+ i 1)) 45) (let [c3 (nth q (+ i 2))] (or (= c3 32) (= c3 9) (= c3 10)))))
+            (let [e (loop [j i] (if (or (>= j n) (= (nth q j) 10)) j (recur (+ j 1))))] (recur e k (str out (subs q i e))))
+            (and (= ch 47) (< (+ i 1) n) (= (nth q (+ i 1)) 42))
+            (let [e (loop [j (+ i 2)] (cond (>= (+ j 1) n) n (and (= (nth q j) 42) (= (nth q (+ j 1)) 47)) (+ j 2) :else (recur (+ j 1))))]
+              (recur e k (str out (subs q i e))))
+            (and (= ch 63) (< k (count lits))) (recur (+ i 1) (+ k 1) (str out (nth lits k)))
+            :else (recur (+ i 1) k (w8 out ch))))))))
+
+(defn first-word Values(Str Bool) [q: &Str]
+  (let [n (count q)
+        p (loop [i 0]
+            (cond (>= i n) n
+                  (let [ch (nth q i)] (or (= ch 32) (= ch 9) (= ch 10) (= ch 13))) (recur (+ i 1))
+                  (and (= (nth q i) 47) (< (+ i 1) n) (= (nth q (+ i 1)) 42))
+                  (recur (loop [j (+ i 2)] (cond (>= (+ j 1) n) n (and (= (nth q j) 42) (= (nth q (+ j 1)) 47)) (+ j 2) :else (recur (+ j 1)))))
+                  (or (= (nth q i) 35) (and (= (nth q i) 45) (< (+ i 1) n) (= (nth q (+ i 1)) 45)))
+                  (recur (loop [j i] (if (or (>= j n) (= (nth q j) 10)) j (recur (+ j 1)))))
+                  :else i))]
+    (if (>= p n) (values "" false)
+      (if (= (nth q p) 40) (values "" true)
+        (let [e (loop [j p] (if (and (< j n) (let [ch (nth q j)] (or (and (>= ch 65) (<= ch 90)) (and (>= ch 97) (<= ch 122)) (= ch 95)))) (recur (+ j 1)) j))]
+          (values (str/upper-case (subs q p e)) false))))))
+
+(def RESULT-WORDS ["SELECT" "WITH" "SHOW" "EXPLAIN" "DESC" "DESCRIBE" "VALUES" "TABLE" "CHECK" "ANALYZE" "OPTIMIZE" "REPAIR" "CHECKSUM"])
+
+(defn result-set-query? Bool [q: &Str]
+  (let [[w paren] (first-word q)]
+    (or paren (loop [i 0] (if (>= i (count RESULT-WORDS)) false (if (= (nth RESULT-WORDS i) w) true (recur (+ i 1))))))))
+
+(defn server-err sql/DbErr [code: Int msg: &Str state: &Str]
+  (cond
+    (or (= code 1406) (= code 1264)) (sql/->DbErr (str "Data truncation: " msg) "22001" code "com.mysql.cj.jdbc.exceptions.MysqlDataTruncation")
+    :else
+    (let [cls (cond (str/starts-with? state "42") "java.sql.SQLSyntaxErrorException"
+                    (str/starts-with? state "23") "java.sql.SQLIntegrityConstraintViolationException"
+                    (str/starts-with? state "22") "java.sql.SQLDataException"
+                    (str/starts-with? state "08") "java.sql.SQLNonTransientConnectionException"
+                    (str/starts-with? state "40") "com.mysql.cj.jdbc.exceptions.MySQLTransactionRollbackException"
+                    :else "java.sql.SQLException")]
+      (sql/->DbErr (str msg) (str state) code cls))))
+
+(def COMM-FAIL "Communications link failure\n\nThe last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.")
+
+(defn comm-err sql/DbErr [msg: &Str] (sql/->DbErr (str msg) "08S01" 0 "com.mysql.cj.jdbc.exceptions.CommunicationsException"))
+
+(defn parse-url Values(Str Int Str Vec(Str) Str) [u: &Str]
+  (if (not (str/starts-with? u "//")) (values "" 0 "" [] (str "Invalid MySQL URL: jdbc:mysql:" u))
+    (let [rest (subs u 2 (count u))
+          q (str/index-of rest "?")
+          main (if (< q 0) rest (subs rest 0 q))
+          query (if (< q 0) "" (subs rest (+ q 1) (count rest)))
+          sl (str/index-of main "/")
+          hostport (if (< sl 0) main (subs main 0 sl))
+          db (if (< sl 0) "" (subs main (+ sl 1) (count main)))
+          co (str/index-of hostport ":")
+          host0 (if (< co 0) hostport (subs hostport 0 co))
+          host (if (= host0 "") "localhost" host0)
+          port-s (if (< co 0) "3306" (subs hostport (+ co 1) (count hostport)))
+          [port pe] (parse-long port-s)
+          kvs (if (= query "") [] (str/split query "&"))]
+      (cond (>= (str/index-of hostport ",") 0) (values "" 0 "" [] (str "mulay does not support multiple MySQL hosts: jdbc:mysql:" u))
+            (not= pe "") (values "" 0 "" [] (str "Invalid MySQL URL: jdbc:mysql:" u))
+            :else (values host port db kvs "")))))
+
+(defn prop Str [kvs: &Vec(Str) k: &Str default: Str]
+  (let [lk (str/lower-case k)]
+    (loop [i 0]
+      (if (>= i (count kvs)) default
+        (let [kv (nth kvs i) e (str/index-of kv "=")]
+          (if (and (> e 0) (= (str/lower-case (subs kv 0 e)) lk)) (subs kv (+ e 1) (count kv)) (recur (+ i 1))))))))

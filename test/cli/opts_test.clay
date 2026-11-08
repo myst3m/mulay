@@ -1,0 +1,154 @@
+(ns opts-test (:require [mulay.cli.opts :as o] [mulay.lib.fs :as fs] [mulay.mule.model :as m] [clay.string :as str]))
+
+;; run / validate / build / 組み込んだ実行ファイルが受け取るオプションと、解決できないプロパティの案内。
+
+(defn- val-of Str [ps: &Vec(m/Param) k: &Str]
+  (loop [i 0] (if (>= i (count ps)) "<none>"
+                (if (= (:name (nth ps i)) k) (match (:v (nth ps i)) (m/PLit s) (str s) _ "<expr>") (recur (+ i 1))))))
+
+(deftest key-value-and-dash-p-are-properties
+  (let [as ["run" "app" "http.port=8081" "-p" "greeting=hi" "-p" "path=a=b" "extra"]
+        [ps lvl rest] (o/parse as 2)]
+    (is (= (count ps) 3))
+    (is (= (val-of ps "http.port") "8081"))
+    (is (= (val-of ps "greeting") "hi"))
+    (is (= (val-of ps "path") "a=b"))
+    (is (= rest ["extra"]))))
+
+(deftest dash-p-without-equals-is-not-a-property
+  (let [[ps lvl rest] (o/parse ["-p" "flag" "x"] 0)]
+    (is (= (count ps) 0))
+    (is (= rest ["-p" "flag" "x"]))))
+
+(deftest dash-d-is-not-special
+  (let [[ps lvl rest] (o/parse ["-Dgreeting=hi"] 0)]
+    (is (= (count ps) 0))
+    (is (= rest ["-Dgreeting=hi"]))))
+
+(deftest dash-l-still-sets-the-level
+  (let [[ps lvl rest] (o/parse ["-l" "DEBUG" "a=b"] 0)]
+    (is (= (count ps) 1))
+    (is (= (count rest) 0))))
+
+(deftest unresolved-keys-are-collected-once-in-order
+  (let [ds ["a.xml:2: Couldn't find configuration property value for key ${http.port}"
+            "a.xml:3: Couldn't find configuration property value for key ${greeting}"
+            "a.xml:4: something else went wrong"
+            "b.xml:9: Couldn't find configuration property value for key ${http.port}"]
+        ks (o/unresolved-keys ds)]
+    (is (= ks ["http.port" "greeting"]))))
+
+(deftest unresolved-keys-ignore-other-diagnostics
+  (is (= (count (o/unresolved-keys ["a.xml:1: unsupported core element <x>"])) 0)))
+
+(deftest hint-names-the-keys-and-the-command
+  (let [h (o/missing-hint "mulay run <app>" ["http.port" "who"])]
+    (is (str/includes? h "2 configuration properties are not set: http.port, who"))
+    (is (str/includes? h "mulay run <app> http.port=<value> who=<value>"))
+    (is (str/includes? h "-p key=value"))))
+
+(deftest hint-for-one-property-is-singular
+  (let [h (o/missing-hint "mulay build <app> -o <out>" ["who"])]
+    (is (str/includes? h "1 configuration property is not set: who"))))
+
+(deftest take-key-removes-dash-k-and-long-form
+  (let [as ["build" "app" "-k" "s3cret" "-o" "out" "--key" "other"]
+        [key rest] (o/take-key as)]
+    (is (= key "other"))
+    (is (= (count rest) 4))
+    (is (= (nth rest 2) "-o"))))
+
+(deftest take-key-without-a-key-leaves-the-arguments
+  (let [as ["app" "a=b" "-k"]
+        [key rest] (o/take-key as)]
+    (is (= key ""))
+    (is (= (count rest) 3))))
+
+(deftest take-flag-removes-every-occurrence
+  (let [as ["build" "--encrypt" "app" "--encrypt"]
+        [on rest] (o/take-flag as "--encrypt")
+        [off rest2] (o/take-flag rest "--encrypt")]
+    (is on)
+    (is (= (count rest) 2))
+    (is (not off))
+    (is (= (count rest2) 2))))
+
+(deftest props-encode-and-decode-round-trip
+  (let [ps [(m/->Param "a" (m/->PLit "1")) (m/->Param "b.c" (m/->PLit "x\ny=z")) (m/->Param "e" (m/->PLit ""))]
+        [back err] (o/decode-props (o/encode-props ps))]
+    (is (= err ""))
+    (is (= (count back) 3))
+    (is (= (val-of back "b.c") "x\ny=z"))
+    (is (= (val-of back "e") ""))))
+
+(deftest decode-props-rejects-garbage
+  (let [[back err] (o/decode-props "9:ab")]
+    (is (not= err ""))))
+
+(deftest merge-lets-the-runtime-options-win
+  (let [emb [(m/->Param "a" (m/->PLit "1")) (m/->Param "b" (m/->PLit "2"))]
+        run [(m/->Param "b" (m/->PLit "9"))]
+        out (o/merge-props emb run)]
+    (is (= (count out) 2))
+    (is (= (val-of out "a") "1"))
+    (is (= (val-of out "b") "9"))))
+
+(deftest missing-key-hint-names-the-way-to-pass-it
+  (is (str/includes? (o/need-key-hint "./app") "./app -k <key>"))
+  (is (str/includes? (o/need-key-hint "./app") "MULAY_KEY")))
+
+(deftest default-app-is-the-current-directory
+  (let [a (o/with-default-app ["run"])
+        b (o/with-default-app ["run" "http.port=8081"])
+        c (o/with-default-app ["run" "-p" "k=v"])
+        d (o/with-default-app ["run" "app" "x=1"])
+        e (o/with-default-app ["build" "-o" "out"])
+        f (o/with-default-app ["version"])
+        g (o/with-default-app ["run" "--help"])
+        h (o/with-default-app ["dw" "s.dwl"])]
+    (is (= (str/join " " a) "run ."))
+    (is (= (str/join " " b) "run . http.port=8081"))
+    (is (= (str/join " " c) "run . -p k=v"))
+    (is (= (str/join " " d) "run app x=1"))
+    (is (= (str/join " " e) "build . -o out"))
+    (is (= (str/join " " f) "version"))
+    (is (= (str/join " " g) "run . --help"))
+    (is (= (str/join " " h) "dw s.dwl"))))
+
+(deftest serves-app
+  ;; main の前に計算される def (BOOT、clay 0.80.0 の ADR 092) がアプリを読み込むのは、main が起動に進む引数のときだけ
+  (is (o/serves-app? ["run" "."] false))
+  (is (o/serves-app? ["run" "app" "k=v" "-l" "DEBUG"] false))
+  (is (not (o/serves-app? ["run" "." "--help"] false)))
+  (is (not (o/serves-app? ["run"] false)))
+  (is (not (o/serves-app? ["version"] false)))
+  (is (not (o/serves-app? ["dw" "s.dwl"] false)))
+  (is (not (o/serves-app? ["validate" "."] false)))
+  (is (not (o/serves-app? ["help" "run"] false)))
+  (is (not (o/serves-app? [] false)))
+  ;; mulay build で作った実行ファイル: version と help のほかは起動
+  (is (o/serves-app? [] true))
+  (is (o/serves-app? ["k=v" "-l" "DEBUG"] true))
+  (is (o/serves-app? ["run"] true))
+  (is (not (o/serves-app? ["version"] true)))
+  (is (not (o/serves-app? ["help"] true)))
+  (is (not (o/serves-app? ["k=v" "--help"] true))))
+
+(deftest dash-big-p-reads-nul-separated-properties-in-place
+  (let [f "/tmp/mulay-opts-test-props"
+        w (write-file f (str "db.password=s3cr" (chr 10) "et" (chr 0) "url=a=b" (chr 0)))
+        [as err] (o/expand-props-files ["run" "app" "http.port=1" "-P" f "x=2"])
+        d (fs/remove-tree f)]
+    (is (= err ""))
+    (is (= as ["run" "app" "http.port=1" "-p" (str "db.password=s3cr" (chr 10) "et") "-p" "url=a=b" "x=2"]))))
+
+(deftest dash-big-p-errors
+  (let [[as1 e1] (o/expand-props-files ["run" "app" "-P" "/nonexistent/mulay-props"])
+        f "/tmp/mulay-opts-test-props2"
+        w (write-file f (str "ok=1" (chr 0) "noequals" (chr 0)))
+        [as2 e2] (o/expand-props-files ["run" "app" "-P" f])
+        d (fs/remove-tree f)
+        [as3 e3] (o/expand-props-files ["run" "app" "-P"])]
+    (is (str/starts-with? e1 "-P /nonexistent/mulay-props: "))
+    (is (= e2 (str "-P " f ": entry 2 is not key=value")))
+    (is (= e3 "-P needs a file"))))

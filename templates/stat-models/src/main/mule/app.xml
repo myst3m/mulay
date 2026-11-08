@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  統計的なモデル (ニューラルネットを使わない) を API として出す。embed.hash512.stat と llm.tfidf.stat の 2 つに分けて置ける
+  (stat.serve で口を選ぶ)。計算は agent-harness の stat/*.dwl (symlink で同じファイル)、応答の形は statsvc/api.dwl。
+  鍵: api.key (keys.file のファイル、既定は資源の keys.properties で空)。空なら全部の要求を 401 で断る。
+      Bearer、api-key ヘッダ、?api-key=、パスの前置き /k/<鍵> のどれでも通る (前置きは base URL しか設定できない客のため)。
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <global-property name="keys.file" value="keys.properties"/>
+    <configuration-properties file="config.yaml"/>
+    <configuration-properties file="${keys.file}"/>
+
+    <http:listener-config name="Http">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <flow name="api">
+        <http:listener config-ref="Http" path="/*">
+            <http:response statusCode="#[vars.out.status default 200]"/>
+            <http:error-response statusCode="#[vars.out.status default 500]">
+                <http:body>#[payload]</http:body>
+            </http:error-response>
+        </http:listener>
+        <!-- 道筋と鍵: /k/<鍵> の前置きを外し、// を / にする。kind は誤りの形 (openai / azure / ollama) -->
+        <set-variable variableName="r" value="#[%dw 2.0
+output application/java
+var raw = attributes.requestPath as String
+var m = raw scan /^\/k\/([^\/]+)(\/.*)?$/
+var pathKey = if (isEmpty(m)) '' else m[0][1]
+var p0 = if (isEmpty(m)) raw else (m[0][2] default '/')
+var path = p0 replace /^\/\/+/ with '/'
+var h = attributes.headers
+var auth = h.authorization default ''
+var bearer = if ((auth startsWith 'Bearer ') and (sizeOf(auth) > 7)) auth[7 to -1] else ''
+var given = if (bearer != '') bearer
+            else if ((h.'api-key' default '') != '') h.'api-key'
+            else if (pathKey != '') pathKey
+            else (attributes.queryParams.'api-key' default '')
+var key = p('api.key') default ''
+var serve = p('stat.serve')
+---
+{path: path, method: attributes.method, ok: (key != '') and (given == key), serve: serve,
+ kind: if (path startsWith '/api/') 'ollama' else if (path startsWith '/openai/') 'azure' else 'openai',
+ embed: serve != 'llm', llm: serve != 'embed',
+ deployment: ((path scan /^\/openai\/deployments\/([^\/]+)\/embeddings$/)[0][1]) default null}]"/>
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="out"><![CDATA[%dw 2.0
+import * from statsvc::api
+output application/java
+var r = vars.r
+var dims = p('stat.dims') as Number
+---
+if (r.method == 'GET' and r.path == '/') describe(r.serve)
+else if (r.method == 'GET' and r.path == '/health') ok({status: 'ok'})
+else if (not r.ok) fail(r.kind, 401, if (r.kind == 'ollama') 'unauthorized'
+                                     else if (r.kind == 'azure') 'Access denied due to invalid subscription key or wrong API endpoint.'
+                                     else 'Incorrect API key provided.')
+else if (r.embed and r.method == 'POST' and (['/v1/embeddings', '/embeddings', '/openai/v1/embeddings'] contains r.path))
+    openaiEmbed(payload, payload.model default 'hash512', dims, r.kind)
+else if (r.embed and r.method == 'POST' and r.deployment != null) openaiEmbed(payload, r.deployment, dims, 'azure')
+else if (r.embed and r.method == 'POST' and r.path == '/api/embeddings') ollamaLegacy(payload)
+else if (r.embed and r.method == 'POST' and r.path == '/api/embed') ollamaEmbed(payload, dims)
+else if (r.embed and r.method == 'GET' and r.path == '/api/tags') ollamaTags()
+else if (r.llm and r.method == 'POST' and (['/v1/chat/completions', '/chat/completions'] contains r.path))
+    chat(payload, {threshold: p('stat.threshold') as Number, noAnswer: p('stat.noAnswer')},
+         'chatcmpl-stat-' ++ uuid(), now() as Number {unit: 'seconds'})
+else if (r.method == 'GET' and (['/v1/models', '/models'] contains r.path)) models(r.serve)
+else fail(r.kind, 404, 'Unknown request URL: ' ++ r.method ++ ' ' ++ r.path)]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        <set-payload value="#[output application/json --- vars.out.body]"/>
+    </flow>
+</mule>

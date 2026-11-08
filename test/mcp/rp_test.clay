@@ -1,0 +1,109 @@
+(ns rp-test (:require [mulay.conn.mcp :as mcp] [mulay.dw.val :as v] [clay.httpmsg :as hm] [clay.string :as str]))
+
+;; MCP サーバーの resource-listener と prompt-listener のプロトコル。期待値は実 Mule (mcp 1.5.0) の記録 (test/fixtures/apps/mcp-rp)。
+
+(def RES [(mcp/->Resource "greeting" "A greeting" "mule://greeting" "text/plain" 3)
+          (mcp/->Resource "bare" "" "mule://bare" "text/markdown" 4)])
+(def PROMPTS [(mcp/->Prompt "review" "Code review" "Review some code"
+                            [(mcp/->PArg "code" "The code" true) (mcp/->PArg "lang" "" false)] 5)
+              (mcp/->Prompt "plain" "" "" [] 6)])
+(def SRV (mcp/->Server "S" "L" "/mcp" false "RP" "1.0.0" [] RES PROMPTS [] 0 [] "" []))
+
+(def ACCEPT [(hm/->Header "Accept" "application/json, text/event-stream")])
+(def INIT "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}")
+
+(defn- sid-of Str [] (let [st (mcp/begin SRV "POST" ACCEPT INIT)] (match (hm/header-of (:headers (:answer st)) "mcp-session-id") (Some v) v (None) "")))
+
+(defn- rpc mcp/Step [sid: &Str body: &Str]
+  (mcp/begin SRV "POST" [(hm/->Header "Accept" "application/json, text/event-stream") (hm/->Header "Mcp-Session-Id" sid)] body))
+
+(defn- body Str [st: &mcp/Step] (:body (:answer st)))
+
+(deftest resources-list-in-declaration-order
+  (let [sid (sid-of)]
+    (is (= (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/list\"}"))
+           "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resources\":[{\"uri\":\"mule://greeting\",\"name\":\"greeting\",\"description\":\"A greeting\",\"mimeType\":\"text/plain\"},{\"uri\":\"mule://bare\",\"name\":\"bare\",\"mimeType\":\"text/markdown\"}]}}"))))
+
+(deftest prompts-list-omits-empty-title-and-description
+  (let [sid (sid-of)]
+    (is (= (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"prompts/list\"}"))
+           "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"prompts\":[{\"name\":\"review\",\"title\":\"Code review\",\"description\":\"Review some code\",\"arguments\":[{\"name\":\"code\",\"description\":\"The code\",\"required\":true},{\"name\":\"lang\",\"required\":false}]},{\"name\":\"plain\",\"arguments\":[]}]}}"))))
+
+(deftest resources-read-known-uri-runs-the-flow
+  (let [sid (sid-of)
+        st (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/read\",\"params\":{\"uri\":\"mule://bare\"}}")]
+    (is (= (:kind st) "read"))
+    (is (= (:tool st) 1))
+    (is (= (:id st) "5"))))
+
+(deftest resources-read-unknown-uri
+  (let [sid (sid-of)]
+    (is (= (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/read\",\"params\":{\"uri\":\"mule://nope\"}}"))
+           "{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-32002,\"message\":\"Resource not found\",\"data\":{\"uri\":\"mule://nope\"}}}"))
+    (is (= (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/read\",\"params\":{\"uri\":5}}"))
+           "{\"jsonrpc\":\"2.0\",\"id\":6,\"error\":{\"code\":-32002,\"message\":\"Resource not found\",\"data\":{\"uri\":\"5\"}}}"))))
+
+(deftest resources-read-without-uri-is-a-null-pointer
+  (let [sid (sid-of)]
+    (is (str/starts-with? (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/read\"}"))
+                          "{\"jsonrpc\":\"2.0\",\"id\":6,\"error\":{\"code\":-32603,\"message\":\"Cannot invoke \\\"io.modelcontextprotocol.spec.McpSchema$ReadResourceRequest.uri()\\\" because \\\"resourceRequest\\\" is null\""))
+    (is (str/starts-with? (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/read\",\"params\":{}}"))
+                          "{\"jsonrpc\":\"2.0\",\"id\":6,\"error\":{\"code\":-32603,\"message\":\"Cannot invoke \\\"String.equals(Object)\\\" because \\\"uri\\\" is null\""))))
+
+(deftest prompts-get-known-name-runs-the-flow
+  (let [sid (sid-of)
+        st (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"prompts/get\",\"params\":{\"name\":\"review\",\"arguments\":{\"code\":\"x\"}}}")]
+    (is (= (:kind st) "prompt"))
+    (is (= (:tool st) 0))))
+
+(deftest prompts-get-checks-required-arguments
+  (let [sid (sid-of)]
+    (is (= (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"prompts/get\",\"params\":{\"name\":\"review\"}}"))
+           "{\"jsonrpc\":\"2.0\",\"id\":10,\"error\":{\"code\":-32602,\"message\":\"Missing required prompt arguments: code\"}}"))
+    (is (= (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"prompts/get\",\"params\":{\"name\":\"review\",\"arguments\":{\"code\":null}}}"))
+           "{\"jsonrpc\":\"2.0\",\"id\":10,\"error\":{\"code\":-32602,\"message\":\"Missing required prompt arguments: code\"}}"))))
+
+(deftest prompts-get-unknown-name
+  (let [sid (sid-of)]
+    (is (= (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"prompts/get\",\"params\":{\"name\":\"nope\"}}"))
+           "{\"jsonrpc\":\"2.0\",\"id\":10,\"error\":{\"code\":-32602,\"message\":\"Invalid prompt name\",\"data\":\"Prompt not found: nope\"}}"))
+    (is (= (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"prompts/get\",\"params\":{\"name\":5}}"))
+           "{\"jsonrpc\":\"2.0\",\"id\":10,\"error\":{\"code\":-32602,\"message\":\"Invalid prompt name\",\"data\":\"Prompt not found: 5\"}}"))))
+
+(deftest prompts-get-without-name-is-a-null-pointer
+  (let [sid (sid-of)]
+    (is (= (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"prompts/get\",\"params\":{}}"))
+           "{\"jsonrpc\":\"2.0\",\"id\":10,\"error\":{\"code\":-32603,\"message\":\"Cannot invoke \\\"Object.hashCode()\\\" because \\\"key\\\" is null\",\"data\":\"NullPointerException: Cannot invoke \\\"Object.hashCode()\\\" because \\\"key\\\" is null\"}}"))
+    (is (str/starts-with? (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"prompts/get\"}"))
+                          "{\"jsonrpc\":\"2.0\",\"id\":11,\"error\":{\"code\":-32603,\"message\":\"Cannot invoke \\\"io.modelcontextprotocol.spec.McpSchema$GetPromptRequest.name()\\\" because \\\"promptRequest\\\" is null\""))))
+
+(deftest prompts-get-arguments-must-be-an-object
+  (let [sid (sid-of)
+        b (body (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"prompts/get\",\"params\":{\"name\":\"review\",\"arguments\":\"x\"}}"))]
+    (is (str/includes? b "(through reference chain: io.modelcontextprotocol.spec.McpSchema$GetPromptRequest[\\\"arguments\\\"])"))
+    (is (str/includes? b "from String value ('x')"))))
+
+(deftest finish-resource-text-and-blob
+  (let [sid (sid-of)
+        st (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/read\",\"params\":{\"uri\":\"mule://greeting\"}}")]
+    (is (= (:body (mcp/finish-resource SRV st (nth RES 0) "text" "hello"))
+           "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"contents\":[{\"uri\":\"mule://greeting\",\"mimeType\":\"text/plain\",\"text\":\"hello\"}]}}"))
+    (is (= (:body (mcp/finish-resource SRV st (nth RES 0) "blob" "mule://blob"))
+           "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"contents\":[{\"uri\":\"mule://greeting\",\"mimeType\":\"text/plain\",\"blob\":\"bXVsZTovL2Jsb2I=\"}]}}"))))
+
+(deftest finish-prompt-messages
+  (let [sid (sid-of)
+        st (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"prompts/get\",\"params\":{\"name\":\"plain\"}}")
+        ms [(mcp/->PMsg "assistant" (mcp/->Item "text" "first" "" "" "" [] "") "" "" "")
+            (mcp/->PMsg "user" (mcp/->Item "image" "" "image/png" "" "YUdrPQ==" [] "") "" "" "")
+            (mcp/->PMsg "user" (mcp/->Item "link" "" "text/plain" "mule://greeting" "" [] "") "greeting" "d" "5")
+            (mcp/->PMsg "user" (mcp/->Item "res-text" "emb" "text/plain" "mule://e" "" [] "") "" "" "")]]
+    (is (= (:body (mcp/finish-prompt SRV st (nth PROMPTS 1) ms))
+           "{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":{\"messages\":[{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"first\"}},{\"role\":\"user\",\"content\":{\"type\":\"image\",\"data\":\"YUdrPQ==\",\"mimeType\":\"image/png\"}},{\"role\":\"user\",\"content\":{\"type\":\"resource_link\",\"name\":\"greeting\",\"uri\":\"mule://greeting\",\"description\":\"d\",\"mimeType\":\"text/plain\",\"size\":5}},{\"role\":\"user\",\"content\":{\"type\":\"resource\",\"resource\":{\"uri\":\"mule://e\",\"mimeType\":\"text/plain\",\"text\":\"emb\"}}}]}}"))
+    (is (str/includes? (:body (mcp/finish-prompt SRV st (nth PROMPTS 0) [])) "\"result\":{\"description\":\"Review some code\",\"messages\":[]}"))))
+
+(deftest flow-failure-is-a-json-rpc-error
+  (let [sid (sid-of)
+        st (rpc sid "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/read\",\"params\":{\"uri\":\"mule://greeting\"}}")]
+    (is (= (:body (mcp/finish-failure SRV st "resource boom"))
+           "{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-32603,\"message\":\"resource boom\",\"data\":\"DefaultMuleException: resource boom\"}}"))))

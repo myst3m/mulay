@@ -1,0 +1,221 @@
+(ns mulay.lib.time.zoned
+  (:require [mulay.lib.time.types :as t]
+            [mulay.lib.time.civil :as cv]
+            [mulay.lib.time.num :as n]
+            [mulay.lib.time.amount :as am]
+            [mulay.lib.time.local :as l]
+            [mulay.lib.time.tz :as tz]))
+
+(defn- valid-offset? Bool [kind: Int ob: Int oa: Int off: Int]
+  (if (= kind 0) (= off ob) (if (= kind 2) (or (= off ob) (= off oa)) false)))
+
+(defn zdt-of-local t/ZonedDateTime [x: &t/LocalDateTime zone: &t/TimeZone prefs: &Vec(Int)]
+  (match zone
+    (t/TzOffset o) (t/->ZonedDateTime x o (t/->TzOffset o))
+    (t/TzRegion id)
+    (let [r (tz/rules-of zone)
+          ls (l/ldt-to-epoch-second x 0)
+          [kind ob oa tt] (tz/local-info r ls)
+          z2 (t/->TzRegion id)]
+      (if (= kind 0) (t/->ZonedDateTime x ob z2)
+        (if (= kind 1)
+          (let [[x2 e] (l/ldt-plus-seconds x (- oa ob) 0)] (t/->ZonedDateTime x2 oa z2))
+          (let [off (if (and (> (count prefs) 0) (or (= (nth prefs 0) ob) (= (nth prefs 0) oa))) (nth prefs 0) ob)]
+            (t/->ZonedDateTime x off z2)))))))
+
+(defn zdt-of-instant t/ZonedDateTime [secs: Int nanos: Int zone: &t/TimeZone]
+  (match zone
+    (t/TzOffset o) (t/->ZonedDateTime (l/ldt-of-epoch-second secs nanos o) o (t/->TzOffset o))
+    (t/TzRegion id)
+    (let [r (tz/rules-of zone)
+          off (tz/offset-at r secs)]
+      (t/->ZonedDateTime (l/ldt-of-epoch-second secs nanos off) off (t/->TzRegion id)))))
+
+(defn zdt-of-epoch-second t/ZonedDateTime [secs: Int zone: &t/TimeZone] (zdt-of-instant secs 0 zone))
+
+(defn zdt-of-epoch-milli t/ZonedDateTime [ms: Int zone: &t/TimeZone]
+  (zdt-of-instant (cv/fdiv ms 1000) (* (mod ms 1000) 1000000) zone))
+
+(defn zdt-of-offset t/ZonedDateTime [x: t/LocalDateTime off: Int]
+  (t/->ZonedDateTime x off (t/->TzOffset off)))
+
+(defn zdt-of-strict Values(t/ZonedDateTime Str) [x: &t/LocalDateTime off: Int zone: &t/TimeZone]
+  (let [r (tz/rules-of zone)
+        [kind ob oa tt] (tz/local-info r (l/ldt-to-epoch-second x 0))
+        z (t/->ZonedDateTime (t/->LocalDateTime (:date x) (:time x)) off (zone-copy zone))]
+    (if (valid-offset? kind ob oa off) (values z "")
+      (values z (if (= kind 1)
+                  (str "LocalDateTime '" (ldt-brief x) "' does not exist in zone '" (t/zone-id zone) "' due to a gap in the local time-line, typically caused by daylight savings")
+                  (str "ZoneOffset '" (t/offset-id off) "' is not valid for LocalDateTime '" (ldt-brief x) "' in zone '" (t/zone-id zone) "'"))))))
+
+(defn- zone-copy t/TimeZone [z: &t/TimeZone]
+  (match z (t/TzOffset o) (t/->TzOffset o) (t/TzRegion id) (t/->TzRegion id)))
+
+(defn- p2 Str [k: Int] (n/pad-num k 2))
+(defn- ldt-brief Str [x: &t/LocalDateTime]
+  (let [d (:date x) tm (:time x)]
+    (str (n/pad-num (:year d) 4) "-" (p2 (:month d)) "-" (p2 (:day d)) "T"
+         (p2 (:hour tm)) ":" (p2 (:minute tm))
+         (if (or (> (:second tm) 0) (> (:nano tm) 0)) (str ":" (p2 (:second tm))) ""))))
+
+(defn zdt-ldt t/LocalDateTime [z: &t/ZonedDateTime] (:dt z))
+(defn zdt-date t/LocalDate [z: &t/ZonedDateTime] (:date (:dt z)))
+(defn zdt-time t/LocalTime [z: &t/ZonedDateTime] (:time (:dt z)))
+(defn zdt-offset Int [z: &t/ZonedDateTime] (:offset z))
+(defn zdt-zone t/TimeZone [z: &t/ZonedDateTime] (:zone z))
+
+(defn zdt-epoch-second Int [z: &t/ZonedDateTime]
+  (l/ldt-to-epoch-second (:dt z) (:offset z)))
+
+(defn zdt-nano Int [z: &t/ZonedDateTime] (:nano (zdt-time z)))
+
+(defn zdt-epoch-milli Values(Int Str) [z: &t/ZonedDateTime]
+  (let [[a o1] (n/mul-exact (zdt-epoch-second z) 1000)
+        [b o2] (n/add-exact a (/ (zdt-nano z) 1000000))]
+    (if (and o1 o2) (values b "") (values 0 "long overflow"))))
+
+(defn zdt-instant t/Instant [z: &t/ZonedDateTime] (t/->Instant (zdt-epoch-second z) (zdt-nano z)))
+
+(defn zdt-with-zone-same-instant t/ZonedDateTime [z: &t/ZonedDateTime zone: &t/TimeZone]
+  (zdt-of-instant (zdt-epoch-second z) (zdt-nano z) zone))
+
+(defn zdt-with-zone-same-local t/ZonedDateTime [z: &t/ZonedDateTime zone: &t/TimeZone]
+  (zdt-of-local (:dt z) zone [(:offset z)]))
+
+(defn- overlap-offsets Values(Int Int Int) [z: &t/ZonedDateTime]
+  (let [r (tz/rules-of (:zone z))
+        [kind ob oa tt] (tz/local-info r (l/ldt-to-epoch-second (:dt z) 0))]
+    (values kind ob oa)))
+
+(defn zdt-with-earlier-offset t/ZonedDateTime [z: &t/ZonedDateTime]
+  (let [[kind ob oa] (overlap-offsets z)]
+    (t/->ZonedDateTime (:dt z) (if (= kind 2) ob (:offset z)) (zone-copy (:zone z)))))
+
+(defn zdt-with-later-offset t/ZonedDateTime [z: &t/ZonedDateTime]
+  (let [[kind ob oa] (overlap-offsets z)]
+    (t/->ZonedDateTime (:dt z) (if (= kind 2) oa (:offset z)) (zone-copy (:zone z)))))
+
+(defn zdt-with-ldt t/ZonedDateTime [z: &t/ZonedDateTime x: &t/LocalDateTime]
+  (zdt-of-local x (:zone z) [(:offset z)]))
+
+(defn zdt-plus-period Values(t/ZonedDateTime Str) [z: &t/ZonedDateTime p: &t/Period]
+  (let [tm (am/period-total-months p)
+        [z1 e1] (if (= tm 0) (values (zdt-with-ldt z (:dt z)) "")
+                  (let [d (:date (:dt z))
+                        [d2 e] (l/date-plus-months d tm)]
+                    (values (zdt-with-ldt z (t/->LocalDateTime d2 (:time (:dt z)))) e)))]
+    (if (not= e1 "") (values z1 e1)
+      (if (= (:days p) 0) (values z1 "")
+        (let [[d3 e2] (l/date-plus-days (:date (:dt z1)) (:days p))]
+          (values (zdt-with-ldt z1 (t/->LocalDateTime d3 (:time (:dt z1)))) e2))))))
+
+(defn zdt-minus-period Values(t/ZonedDateTime Str) [z: &t/ZonedDateTime p: &t/Period]
+  (zdt-plus-period z (am/period-negated p)))
+
+(defn zdt-plus-duration Values(t/ZonedDateTime Str) [z: &t/ZonedDateTime d: &t/Duration]
+  (let [[x e] (l/ldt-plus-seconds (:dt z) (:seconds d) (:nanos d))]
+    (if (not= e "") (values (zdt-with-ldt z (:dt z)) e)
+      (let [secs (l/ldt-to-epoch-second x (:offset z))]
+        (values (zdt-of-instant secs (:nano (:time x)) (:zone z)) "")))))
+
+(defn zdt-minus-duration Values(t/ZonedDateTime Str) [z: &t/ZonedDateTime d: &t/Duration]
+  (zdt-plus-duration z (am/duration-negated d)))
+
+(defn zdt-plus-dw Values(t/ZonedDateTime Str) [z: &t/ZonedDateTime p: &t/DwPeriod]
+  (match p
+    (t/PerDate q) (zdt-plus-period z q)
+    (t/PerTime d) (zdt-plus-duration z d)))
+
+(defn zdt-minus-dw Values(t/ZonedDateTime Str) [z: &t/ZonedDateTime p: &t/DwPeriod]
+  (match p
+    (t/PerDate q) (zdt-minus-period z q)
+    (t/PerTime d) (zdt-minus-duration z d)))
+
+(defn- cmp Int [a: Int b: Int] (if (< a b) -1 (if (> a b) 1 0)))
+
+(defn zdt-instant-compare Int [a: &t/ZonedDateTime b: &t/ZonedDateTime]
+  (let [c (cmp (zdt-epoch-second a) (zdt-epoch-second b))]
+    (if (not= c 0) c (cmp (zdt-nano a) (zdt-nano b)))))
+
+(defn- str-cmp Int [a: &Str b: &Str]
+  (let [n (if (< (count a) (count b)) (count a) (count b))]
+    (loop [i 0]
+      (if (>= i n) (cmp (count a) (count b))
+        (let [x (nth a i) y (nth b i)]
+          (if (= x y) (recur (+ i 1)) (cmp x y)))))))
+
+(defn zdt-compare Int [a: &t/ZonedDateTime b: &t/ZonedDateTime]
+  (let [c (zdt-instant-compare a b)]
+    (if (not= c 0) c
+      (let [c2 (l/ldt-compare (:dt a) (:dt b))]
+        (if (not= c2 0) c2 (str-cmp (t/zone-id (:zone a)) (t/zone-id (:zone b))))))))
+
+(defn duration-between-zdts t/Duration [a: &t/ZonedDateTime b: &t/ZonedDateTime]
+  (am/duration (- (zdt-epoch-second b) (zdt-epoch-second a)) (- (zdt-nano b) (zdt-nano a))))
+
+(defn zdt-until Values(Int Str) [a: &t/ZonedDateTime b: &t/ZonedDateTime unit: &Str]
+  (let [b2 (zdt-with-zone-same-instant b (:zone a))]
+    (if (= (l/unit-nanos unit) 0)
+      (l/ldt-until (:dt a) (:dt b2) unit)
+      (l/ldt-until (l/ldt-of-epoch-second (zdt-epoch-second a) (zdt-nano a) 0)
+                   (l/ldt-of-epoch-second (zdt-epoch-second b) (zdt-nano b) 0) unit))))
+
+(defn zdt-dst? Bool [z: &t/ZonedDateTime]
+  (tz/dst-at? (tz/rules-of (:zone z)) (zdt-epoch-second z)))
+
+(defn ot-plus-duration t/OffsetTime [o: &t/OffsetTime d: &t/Duration]
+  (t/->OffsetTime (l/time-plus-duration (:time o) d) (:offset o)))
+
+(defn ot-minus-duration t/OffsetTime [o: &t/OffsetTime d: &t/Duration]
+  (ot-plus-duration o (am/duration-negated d)))
+
+(defn ot-with-offset-same-instant t/OffsetTime [o: &t/OffsetTime off: Int]
+  (t/->OffsetTime (l/time-plus-seconds (:time o) (- off (:offset o))) off))
+
+(defn- ot-epoch-nano Int [o: &t/OffsetTime]
+  (- (l/time-nano-of-day (:time o)) (* (:offset o) t/NANOS-PER-SECOND)))
+
+(defn ot-compare Int [a: &t/OffsetTime b: &t/OffsetTime]
+  (let [c (cmp (ot-epoch-nano a) (ot-epoch-nano b))]
+    (if (not= c 0) c (l/time-compare (:time a) (:time b)))))
+
+(defn duration-between-ots t/Duration [a: &t/OffsetTime b: &t/OffsetTime]
+  (am/duration 0 (- (ot-epoch-nano b) (ot-epoch-nano a))))
+
+(defn ot-until Values(Int Str) [a: &t/OffsetTime b: &t/OffsetTime unit: &Str]
+  (let [u (l/unit-nanos unit)]
+    (if (= u 0) (values 0 (str "Unsupported unit: " (l/unit-display unit)))
+      (values (/ (- (ot-epoch-nano b) (ot-epoch-nano a)) u) ""))))
+
+(defn instant t/Instant [secs: Int nanos: Int]
+  (let [d (am/duration secs nanos)] (t/->Instant (:seconds d) (:nanos d))))
+
+(defn instant-of-epoch-milli t/Instant [ms: Int]
+  (t/->Instant (cv/fdiv ms 1000) (* (mod ms 1000) 1000000)))
+
+(defn instant-epoch-milli Values(Int Str) [i: &t/Instant]
+  (let [s (:seconds i) ns (:nanos i)
+        [a o1] (n/mul-exact (if (and (< s 0) (> ns 0)) (+ s 1) s) 1000)
+        adj (if (and (< s 0) (> ns 0)) (- (/ ns 1000000) 1000) (/ ns 1000000))
+        [b o2] (n/add-exact a adj)]
+    (if (and o1 o2) (values b "") (values 0 "long overflow"))))
+
+(defn instant-plus-duration t/Instant [i: &t/Instant d: &t/Duration]
+  (instant (+ (:seconds i) (:seconds d)) (+ (:nanos i) (:nanos d))))
+
+(defn instant-compare Int [a: &t/Instant b: &t/Instant]
+  (let [c (cmp (:seconds a) (:seconds b))]
+    (if (not= c 0) c (cmp (:nanos a) (:nanos b)))))
+
+(defn duration-between-instants t/Duration [a: &t/Instant b: &t/Instant]
+  (am/duration (- (:seconds b) (:seconds a)) (- (:nanos b) (:nanos a))))
+
+(defn now-instant-rec t/Instant []
+  (let [[s ns] (tz/now-instant)] (t/->Instant s ns)))
+
+(defn now-zdt-in t/ZonedDateTime [zone: &t/TimeZone]
+  (let [[s ns] (tz/now-instant)] (zdt-of-instant s ns zone)))
+
+(defn now-zdt t/ZonedDateTime [] (now-zdt-in (tz/system-zone)))
+
+(defn today t/LocalDate [] (zdt-date (now-zdt)))

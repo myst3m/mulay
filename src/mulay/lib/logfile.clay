@@ -1,0 +1,97 @@
+(ns mulay.lib.logfile
+  (:require [mulay.lib.fs :as fs] [mulay.lib.uni :as uni] [clay.string :as str] [clay.io :as io]))
+(c-include "<stdio.h>")
+(defextern c-fopen fopen)
+(defextern c-fseek fseek)
+(defextern c-fclose fclose)
+
+(defrecord FileInfo [name: Str size: Int mtime-ms: Int])
+
+(defn- read-range Values(Str Str) [path: &Str off: Int len: Int]
+  (unsafe
+    (match (c-fopen path "rb")
+      (Some f) (let [a (c-fseek f off 0)
+                     b: Str (prim/file-read f len)
+                     z (c-fclose f)]
+                 (values b ""))
+      (None) (values "" (str path ": cannot open")))))
+
+(defn- count-nl Int [s: &Str end: Int]
+  (loop [i 0 n 0] (if (>= i end) n (recur (+ i 1) (if (= (nth s i) 10) (+ n 1) n)))))
+
+(defn- tail-window Values(Str Bool Str) [path: &Str size: Int lines: Int]
+  (loop [win 65536]
+    (let [off (if (> size win) (- size win) 0)
+          [buf e] (read-range path off (- size off))]
+      (cond
+        (not= e "") (values "" false e)
+        (= off 0) (values buf true "")
+        (>= (count-nl buf (if (and (> (count buf) 0) (= (nth buf (- (count buf) 1)) 10)) (- (count buf) 1) (count buf))) lines) (values buf false "")
+        :else (recur (* win 4))))))
+
+(defn tail Values(Vec(Str) Str) [path: &Str lines: Int]
+  (let [st (fs/stat path)
+        none: Vec(Str) []]
+    (if (<= lines 0) (values none "")
+      (if (= (:size st) 0) (values none "")
+        (let [[buf from-start e] (tail-window path (:size st) lines)]
+          (if (not= e "") (values none e) (values (tail-lines buf from-start lines) "")))))))
+
+(defn tail-lines Vec(Str) [buf: &Str from-start: Bool lines: Int]
+  (if (= (count buf) 0) []
+    (let [end (if (= (nth buf (- (count buf) 1)) 10) (- (count buf) 1) (count buf))
+          segs (loop [i 0 start 0 acc: Vec(Str) []]
+                 (if (>= i end) (conj acc (subs buf start end))
+                   (if (= (nth buf i) 10) (recur (+ i 1) (+ i 1) (conj acc (subs buf start i))) (recur (+ i 1) start acc))))
+          lo (if (and from-start (> (count (nth segs 0)) 0)) 0 1)
+          all (loop [i lo acc: Vec(Str) []] (if (>= i (count segs)) acc (recur (+ i 1) (conj acc (nth segs i)))))
+          k (if (> (count all) lines) (- (count all) lines) 0)]
+      (loop [i k acc: Vec(Str) []] (if (>= i (count all)) acc (recur (+ i 1) (conj acc (nth all i))))))))
+
+(defn latin1->utf8 Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [b (nth s i)]
+        (recur (+ i 1) (if (< b 128) (str out (chr b)) (str out (chr (+ 192 (bit-shift-right b 6))) (chr (+ 128 (bit-and b 63))))))))))
+
+(defn- split-lines Vec(Str) [s: &Str]
+  (loop [i 0 start 0 acc: Vec(Str) []]
+    (if (>= i (count s)) (if (> (count s) start) (conj acc (subs s start (count s))) acc)
+      (let [c (nth s i)]
+        (cond
+          (= c 10) (recur (+ i 1) (+ i 1) (conj acc (subs s start i)))
+          (= c 13) (let [nx (if (and (< (+ i 1) (count s)) (= (nth s (+ i 1)) 10)) (+ i 2) (+ i 1))]
+                     (recur nx nx (conj acc (subs s start i))))
+          :else (recur (+ i 1) start acc))))))
+
+(defn search Values(Vec(Str) Str Bool) [path: &Str pattern: &Str max: Int]
+  (let [[data e] (read-file path)
+        none: Vec(Str) []]
+    (cond
+      (not= e "") (values none e false)
+      (not (uni/valid? data)) (values none "Input length = 1" false)
+      :else
+      (let [pat (uni/lower pattern)
+            ls (split-lines data)
+            hits (loop [i 0 acc: Vec(Str) []]
+                   (if (>= i (count ls)) acc
+                     (recur (+ i 1) (if (str/includes? (uni/lower (nth ls i)) pat) (conj acc (nth ls i)) acc))))]
+        (cond
+          (and (< max 0) (> (count hits) 0)) (values none (str "fromIndex(" (+ 1 (- 0 max)) ") > toIndex(1)") true)
+          (< max 0) (values none (str "fromIndex(" (- 0 max) ") > toIndex(0)") true)
+          (= max 0) (values none "" false)
+          (> (count hits) max) (values (loop [i (- (count hits) max) acc: Vec(Str) []] (if (>= i (count hits)) acc (recur (+ i 1) (conj acc (nth hits i))))) "" false)
+          :else (values hits "" false))))))
+
+(defn list-files Vec(FileInfo) [dir: &Str]
+  (let [[names e] (io/list-dir dir)
+        none: Vec(FileInfo) []]
+    (if (not= e "") none
+      (let [sorted (sort names)]
+        (loop [i 0 acc: Vec(FileInfo) []]
+          (if (>= i (count sorted)) acc
+            (let [name (nth sorted i)
+                  st (fs/stat (fs/join dir name))]
+              (recur (+ i 1) (if (= (:kind st) fs/FILE)
+                               (conj acc (->FileInfo name (:size st) (+ (* (:mtime-s st) 1000) (/ (:mtime-ns st) 1000000))))
+                               acc)))))))))

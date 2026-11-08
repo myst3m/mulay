@@ -1,0 +1,1 @@
+{id: attributes.queryParams.id, name: attributes.queryParams.name, price: attributes.queryParams.price}

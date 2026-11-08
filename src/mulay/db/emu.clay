@@ -1,0 +1,548 @@
+(ns mulay.db.emu
+  (:require [mulay.db.sql :as sql] [mulay.db.sqlite :as sqlite] [mulay.lib.sqlparse :as sp] [mulay.lib.sqlfile :as sf] [mulay.db.oraproto :as op]
+            [mulay.lib.dec :as dec] [clay.string :as str]))
+
+(defrecord Emu [kind: Str schema: Str h: Int tables: Atom(Map(Str Vec(Vec(Str)))) cons: Atom(Map(Str Str)) seq: Atom(Int)])
+
+(def UNSUPPORTED "EMU01")
+
+(defn- emu-err sql/DbErr [msg: Str] (sql/->DbErr (str "emulator: " msg) UNSUPPORTED 0 "mulay.emulator"))
+
+(defn- word? Bool [c: Int] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)) (= c 95) (= c 36)))
+
+(defn- skip-ws Int [s: &Str i: Int] (loop [j i] (if (and (< j (count s)) (let [c (nth s j)] (or (= c 32) (= c 9) (= c 10) (= c 13)))) (recur (+ j 1)) j)))
+
+(defn- word-end Int [s: &Str i: Int] (loop [j i] (if (and (< j (count s)) (word? (nth s j))) (recur (+ j 1)) j)))
+
+(defn- quote-end Int [s: &Str i: Int q: Int]
+  (loop [j (+ i 1)]
+    (cond (>= j (count s)) (count s)
+          (and (= (nth s j) q) (< (+ j 1) (count s)) (= (nth s (+ j 1)) q)) (recur (+ j 2))
+          (= (nth s j) q) (+ j 1)
+          :else (recur (+ j 1)))))
+
+(defn split-statements Vec(Str) [s: &Str]
+  (loop [i 0 start 0 acc: Vec(Str) []]
+    (if (>= i (count s))
+      (let [t (str/trim (subs s start (count s)))] (if (= t "") acc (conj acc t)))
+      (let [c (nth s i)]
+        (cond
+          (or (= c 39) (= c 34) (= c 96)) (recur (quote-end s i c) start acc)
+          (and (= c 45) (< (+ i 1) (count s)) (= (nth s (+ i 1)) 45))
+          (let [nl (str/index-of-after s "\n" i)] (recur (if (< nl 0) (count s) nl) start acc))
+          (= c 59) (let [t (str/trim (subs s start i))] (recur (+ i 1) (+ i 1) (if (= t "") acc (conj acc t))))
+          :else (recur (+ i 1) start acc))))))
+
+(defn- strip-comments Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (cond (or (= c 39) (= c 34) (= c 96)) (let [e (quote-end s i c)] (recur e (str out (subs s i e))))
+              (and (= c 45) (< (+ i 1) (count s)) (= (nth s (+ i 1)) 45))
+              (let [nl (str/index-of-after s "\n" i)] (recur (if (< nl 0) (count s) nl) out))
+              :else (recur (+ i 1) (str out (subs s i (+ i 1)))))))))
+
+(defn- next-word Str [s: &Str i: Int] (let [j (skip-ws s i) e (word-end s j)] (str/upper-case (subs s j e))))
+
+(defn- cast-start Int [out: &Str]
+  (let [n (count out)]
+    (cond (= n 0) -1
+          (= (nth out (- n 1)) 39) (loop [j (- n 2)] (cond (< j 0) -1 (= (nth out j) 39) j :else (recur (- j 1))))
+          (= (nth out (- n 1)) 34) (loop [j (- n 2)] (cond (< j 0) -1 (= (nth out j) 34) j :else (recur (- j 1))))
+          (word? (nth out (- n 1))) (loop [j (- n 1)] (if (and (>= j 0) (or (word? (nth out j)) (= (nth out j) 46))) (recur (- j 1)) (+ j 1)))
+          :else -1)))
+
+(defn rewrite Str [kind: &Str s: &Str]
+  (let [ora (= kind "oracle") pg (= kind "postgresql") my (= kind "mysql")]
+    (loop [i 0 out ""]
+      (if (>= i (count s)) out
+        (let [c (nth s i)]
+          (cond
+            (= c 39) (let [e (quote-end s i 39)] (recur e (if (and ora (= e (+ i 2))) (str out "NULL") (str out (subs s i e)))))
+            (= c 34) (let [e (quote-end s i 34)] (recur e (str out (subs s i e))))
+            (and my (= c 96)) (let [e (quote-end s i 96)] (recur e (str out "\"" (subs s (+ i 1) (- e 1)) "\"")))
+            (and pg (= c 58) (< (+ i 1) (count s)) (= (nth s (+ i 1)) 58))
+            (let [t0 (skip-ws s (+ i 2))
+                  j (word-end s t0)
+                  k (if (and (< j (count s)) (= (nth s j) 40)) (let [cl (str/index-of-after s ")" j)] (if (< cl 0) j (+ cl 1))) j)
+                  ts (cast-start out)]
+              (recur k (if (< ts 0) out (str (subs out 0 ts) "CAST(" (subs out ts (count out)) " AS " (subs s t0 k) ")"))))
+            (and (or pg ora) (or (= c 36) (= c 58)) (< (+ i 1) (count s)) (>= (nth s (+ i 1)) 48) (<= (nth s (+ i 1)) 57)
+                 (or (= i 0) (not (word? (nth s (- i 1))))))
+            (let [e (word-end s (+ i 1))] (recur e (str out "?" (subs s (+ i 1) e))))
+            (and (word? c) (or (= i 0) (not (word? (nth s (- i 1))))))
+            (let [e (word-end s i)
+                  w (subs s i e)
+                  u (str/upper-case w)
+                  after (skip-ws s e)
+                  call (and (< after (count s)) (= (nth s after) 40))
+                  empty-call (and call (< (+ after 1) (count s)) (= (nth s (skip-ws s (+ after 1))) 41))
+                  past-call (if empty-call (+ (skip-ws s (+ after 1)) 1) e)]
+              (cond
+                (and ora (= u "NVL") call) (recur e (str out "IFNULL"))
+                (and ora (or (= u "SYSDATE") (= u "SYSTIMESTAMP"))) (recur e (str out "CURRENT_TIMESTAMP"))
+                (and ora (= u "FROM") (= (next-word s e) "DUAL")) (recur (word-end s (skip-ws s e)) out)
+                (and pg (= u "ILIKE")) (recur e (str out "LIKE"))
+                (and (or pg my) (= u "NOW") empty-call) (recur past-call (str out "CURRENT_TIMESTAMP"))
+                (and my (= u "LIMIT"))
+                (let [a0 (skip-ws s e) a1 (word-end s a0) cm (skip-ws s a1)]
+                  (if (and (> a1 a0) (< cm (count s)) (= (nth s cm) 44))
+                    (let [b0 (skip-ws s (+ cm 1)) b1 (word-end s b0)]
+                      (recur b1 (str out "LIMIT " (subs s b0 b1) " OFFSET " (subs s a0 a1))))
+                    (recur e (str out w))))
+                :else (recur e (str out w))))
+            :else (recur (+ i 1) (str out (subs s i (+ i 1))))))))))
+
+(defn- split-top Vec(Str) [s: &Str]
+  (loop [i 0 d 0 start 0 acc: Vec(Str) []]
+    (if (>= i (count s)) (conj acc (subs s start (count s)))
+      (let [c (nth s i)]
+        (cond (or (= c 39) (= c 34)) (recur (quote-end s i c) d start acc)
+              (= c 40) (recur (+ i 1) (+ d 1) start acc)
+              (= c 41) (recur (+ i 1) (- d 1) start acc)
+              (and (= c 44) (= d 0)) (recur (+ i 1) d (+ i 1) (conj acc (subs s start i)))
+              :else (recur (+ i 1) d start acc))))))
+
+(defn- has-word? Bool [s: &Str w: &Str]
+  (let [u (str/upper-case s)]
+    (loop [k (str/index-of u w)]
+      (cond (< k 0) false
+            (and (or (= k 0) (not (word? (nth u (- k 1))))) (or (>= (+ k (count w)) (count u)) (not (word? (nth u (+ k (count w))))))) true
+            :else (recur (str/index-of-after u w (+ k 1)))))))
+
+(defn- unquote-id Str [s: &Str] (let [t (str/trim s)] (if (and (>= (count t) 2) (= (nth t 0) 34)) (subs t 1 (- (count t) 1)) t)))
+
+(defrecord- Col [name: Str type: Str ident: Bool])
+
+(defn- col-of Col [kind: &Str d: &Str]
+  (let [t (str/trim d)
+        ne (if (and (> (count t) 0) (= (nth t 0) 34)) (quote-end t 0 34) (word-end t 0))
+        name (unquote-id (subs t 0 ne))
+        rest (str/trim (subs t ne (count t)))
+        te (loop [j 0 d0 0] (cond (>= j (count rest)) j
+                                  (= (nth rest j) 40) (recur (+ j 1) (+ d0 1))
+                                  (= (nth rest j) 41) (recur (+ j 1) (- d0 1))
+                                  (and (= d0 0) (= (nth rest j) 32)
+                                       (let [nw (next-word rest j)] (not (or (= nw "PRECISION") (= nw "VARYING") (= nw "WITH") (= nw "WITHOUT") (= nw "TIME") (= nw "ZONE") (= nw "LOCAL"))))) j
+                                  :else (recur (+ j 1) d0)))
+        ty (str/upper-case (str/trim (subs rest 0 te)))
+        ident (or (has-word? rest "AUTO_INCREMENT") (has-word? rest "IDENTITY") (= ty "SERIAL") (= ty "BIGSERIAL") (= ty "SMALLSERIAL"))]
+    (->Col name (cond (= ty "SERIAL") "INTEGER" (= ty "BIGSERIAL") "BIGINT" (= ty "SMALLSERIAL") "SMALLINT" :else ty) ident)))
+
+(defn- constraint? Bool [d: &Str]
+  (let [w (next-word d 0)] (or (= w "PRIMARY") (= w "UNIQUE") (= w "CONSTRAINT") (= w "FOREIGN") (= w "CHECK") (= w "KEY") (= w "INDEX"))))
+
+(defrecord- Create [text: Str table: Str cols: Vec(Col) defs: Vec(Str)])
+
+(defn- rewrite-create Vec(Create) [kind: &Str s: &Str]
+  (let [u (str/upper-case s)]
+    (if (not (and (str/starts-with? u "CREATE") (has-word? (subs u 0 (min (count u) 40)) "TABLE"))) []
+      (let [op (str/index-of s "(")
+            cl (loop [j (- (count s) 1)] (cond (< j 0) -1 (= (nth s j) 41) j :else (recur (- j 1))))]
+        (if (or (< op 0) (< cl op)) []
+          (let [head (subs s 0 op)
+                tw (loop [j (- (count head) 1)] (if (and (>= j 0) (or (= (nth head j) 32) (= (nth head j) 10))) (recur (- j 1)) j))
+                ts (loop [j tw] (if (and (>= j 0) (or (word? (nth head j)) (= (nth head j) 34) (= (nth head j) 46))) (recur (- j 1)) (+ j 1)))
+                tname (let [t (unquote-id (subs head ts (+ tw 1))) d (str/last-index-of t ".")] (if (< d 0) t (subs t (+ d 1) (count t))))
+                defs (split-top (subs s (+ op 1) cl))
+                cols (loop [i 0 acc: Vec(Col) []] (if (>= i (count defs)) acc (recur (+ i 1) (if (constraint? (nth defs i)) acc (conj acc (col-of kind (nth defs i)))))))
+                body (loop [i 0 acc: Vec(Str) [] ci 0]
+                       (if (>= i (count defs)) acc
+                         (let [d (nth defs i)]
+                           (if (constraint? d)
+                             (let [pk (has-word? d "PRIMARY")
+                                   cs (let [a (str/index-of d "(") b (str/index-of d ")")] (if (or (< a 0) (< b a)) "" (subs d (+ a 1) b)))
+                                   ident-pk (and pk (loop [k 0] (if (>= k (count cols)) false (if (and (:ident (nth cols k)) (= (str/lower-case (unquote-id cs)) (str/lower-case (:name (nth cols k))))) true (recur (+ k 1))))))]
+                               (recur (+ i 1) (if (or ident-pk (= (next-word d 0) "INDEX") (= (next-word d 0) "KEY")) acc (conj acc d)) ci))
+                             (let [c (nth cols ci)]
+                               (recur (+ i 1)
+                                      (conj acc (if (:ident c)
+                                                  (str "\"" (:name c) "\" INTEGER PRIMARY KEY AUTOINCREMENT"
+                                                       (if (has-word? d "NOT NULL") "" "")
+                                                       (if (has-word? d "UNIQUE") " UNIQUE" ""))
+                                                  (let [x (str/replace (str/replace d "AUTO_INCREMENT" "") "auto_increment" "")] x)))
+                                      (+ ci 1)))))))]
+            [(->Create (str "CREATE TABLE \"" tname "\" (" (str/join "," body) ")") tname cols defs)]))))))
+
+(defn- pad7 Str [n: Int] (let [s (str n)] (loop [t s] (if (>= (count t) 7) t (recur (str "0" t))))))
+
+(defn- key-of Str [t: &Str c: &Str] (str (str/lower-case t) "." (str/lower-case c)))
+
+(defn- cons-name Str [e: &Emu table: &Str col: &Str pk: Bool label: &Str]
+  (cond
+    (= (:kind e) "oracle") (if (not= label "") (str/upper-case label) (str "SYS_C" (pad7 (swap! (:seq e) (fn Int [n: Int] (+ n 1))))))
+    (= (:kind e) "postgresql") (if (not= label "") (str/lower-case label) (if pk (str (str/lower-case table) "_pkey") (str (str/lower-case table) "_" (str/lower-case col) "_key")))
+    :else (if pk "PRIMARY" (if (not= label "") (str label) (str col)))))
+
+(defn- remember Int [e: &Emu cr: &Create]
+  (let [cols (mapv (fn Vec(Str) [c: Col] [(str (:name c)) (str (:type c))]) (:cols cr))
+        z (swap! (:tables e) (fn Map(Str Vec(Vec(Str))) [m: Map(Str Vec(Vec(Str)))] (assoc m (str/lower-case (:table cr)) cols)))
+        defs (:defs cr)]
+    (loop [i 0 ci 0]
+      (if (>= i (count defs)) 0
+        (let [d (nth defs i)]
+          (if (constraint? d)
+            (let [label (if (= (next-word d 0) "CONSTRAINT") (let [j (word-end d (skip-ws d 0)) k (skip-ws d j)] (unquote-id (subs d k (word-end d k)))) "")
+                  pk (has-word? d "PRIMARY")
+                  uq (or pk (has-word? d "UNIQUE"))
+                  a (str/index-of d "(") b (str/index-of d ")")
+                  cs (if (or (< a 0) (< b a)) [] (mapv (fn Str [x: Str] (unquote-id x)) (str/split (subs d (+ a 1) b) ",")))]
+              (if (and uq (> (count cs) 0))
+                (let [nm (cons-name e (:table cr) (nth cs 0) pk label)
+                      z2 (swap! (:cons e) (fn Map(Str Str) [m: Map(Str Str)] (loop [k 0 m2 m] (if (>= k (count cs)) m2 (recur (+ k 1) (assoc m2 (key-of (:table cr) (nth cs k)) nm))))))]
+                  (recur (+ i 1) ci))
+                (recur (+ i 1) ci)))
+            (let [c (nth (:cols cr) ci)
+                  pk (has-word? d "PRIMARY")
+                  uq (or pk (has-word? d "UNIQUE") (:ident c))
+                  z3 (if uq (swap! (:cons e) (fn Map(Str Str) [m: Map(Str Str)] (assoc m (key-of (:table cr) (:name c)) (cons-name e (:table cr) (:name c) (or pk (:ident c)) ""))))
+                       (deref (:cons e)))]
+              (recur (+ i 1) (+ ci 1)))))))))
+
+(defn- base-type Str [t: &Str] (let [k (str/index-of t "(")] (str/trim (if (< k 0) (str t) (subs t 0 k)))))
+
+(defn- int-text Str [c: &sql/Cell]
+  (match c (sql/CInt i) (str i) (sql/CLong i) (str i) (sql/CDouble f) (dec/float->shortest-str f) (sql/CStr s) (str s) (sql/CDecimal s) (str s) _ ""))
+
+(defn- dec-text Str [s: &Str]
+  (if (and (str/includes? s ".") (not (str/includes? s "e")) (not (str/includes? s "E")))
+    (let [t (loop [x (str s)] (if (str/ends-with? x "0") (recur (subs x 0 (- (count x) 1))) x))] (if (str/ends-with? t ".") (subs t 0 (- (count t) 1)) t))
+    (str s)))
+
+(defn- iso Str [s: &Str] (let [t (if (= (count s) 10) (str s " 00:00:00") (str s))] (if (and (> (count t) 10) (= (nth t 10) 32)) (str (subs t 0 10) "T" (subs t 11 (count t))) t)))
+
+(defn- int-val Values(Int Bool) [c: &sql/Cell]
+  (match c (sql/CInt i) (values i true) (sql/CLong i) (values i true)
+         (sql/CStr s) (let [[n e] (parse-long s)] (values n (= e ""))) _ (values 0 false)))
+
+(defn- truthy Bool [c: &sql/Cell]
+  (match c (sql/CInt i) (not= i 0) (sql/CLong i) (not= i 0) (sql/CStr s) (let [u (str/lower-case s)] (or (= u "t") (= u "true") (= u "1") (= u "y") (= u "yes"))) _ false))
+
+(defn- shape-cell sql/Cell [kind: &Str t: &Str c: sql/Cell]
+  (let [b (base-type t)]
+    (match c
+      (sql/CNull) c
+      _ (cond
+          (= kind "oracle")
+          (cond (or (= b "NUMBER") (= b "INTEGER") (= b "INT") (= b "SMALLINT") (= b "DECIMAL") (= b "NUMERIC") (= b "FLOAT") (= b ""))
+                (match c (sql/CStr s) (if (= b "") c (sql/->CDecimal (dec-text s))) (sql/CBytes x) c _ (sql/->CDecimal (dec-text (int-text c))))
+                (= b "DATE") (match c (sql/CStr s) (sql/->CTimestamp (let [x (iso s)] (if (> (count x) 19) (subs x 0 19) x))) _ c)
+                (and (str/starts-with? b "TIMESTAMP") (not (str/includes? t "TIME ZONE")))
+                (match c (sql/CStr s) (sql/->CDatum "oracle.sql.TIMESTAMP" (op/date-bytes (iso s) true) "") _ c)
+                (= b "CLOB") (match c (sql/CStr s) (sql/->CClob s) _ c)
+                (or (= b "BLOB") (= b "RAW")) (match c (sql/CStr s) (sql/->CBytes s) _ c)
+                (= b "BINARY_DOUBLE") (match c (sql/CInt i) (sql/->CDouble (float i)) _ c)
+                (= b "BOOLEAN") (sql/->CBool (truthy c))
+                :else (match c (sql/CStr s) c _ (sql/->CStr (int-text c))))
+          (= kind "postgresql")
+          (cond (or (= b "SMALLINT") (= b "INT2") (= b "INTEGER") (= b "INT") (= b "INT4")) (let [[n ok] (int-val c)] (if ok (sql/->CInt n) c))
+                (or (= b "BIGINT") (= b "INT8")) (let [[n ok] (int-val c)] (if ok (sql/->CLong n) c))
+                (or (= b "NUMERIC") (= b "DECIMAL")) (sql/->CDecimal (dec-text (int-text c)))
+                (or (= b "REAL") (= b "FLOAT4")) (sql/->CFloat (int-text c))
+                (or (= b "DOUBLE PRECISION") (= b "FLOAT8") (= b "FLOAT")) (match c (sql/CInt i) (sql/->CDouble (float i)) _ c)
+                (or (= b "BOOLEAN") (= b "BOOL")) (sql/->CBool (truthy c))
+                (= b "DATE") (match c (sql/CStr s) (sql/->CDate (subs s 0 (min 10 (count s)))) _ c)
+                (str/starts-with? b "TIMESTAMP") (match c (sql/CStr s) (sql/->CTimestamp (iso s)) _ c)
+                (= b "BYTEA") (match c (sql/CStr s) (sql/->CBytes s) _ c)
+                (= b "") c
+                :else (match c (sql/CStr s) c _ (sql/->CStr (int-text c))))
+          :else
+          (cond (or (and (= b "TINYINT") (str/includes? t "(1)")) (= b "BOOL") (= b "BOOLEAN")) (sql/->CBool (truthy c))
+                (or (= b "TINYINT") (= b "SMALLINT") (= b "MEDIUMINT") (= b "INT") (= b "INTEGER")) (let [[n ok] (int-val c)] (if ok (sql/->CInt n) c))
+                (= b "BIGINT") (let [[n ok] (int-val c)] (if ok (sql/->CLong n) c))
+                (or (= b "DECIMAL") (= b "NUMERIC")) (sql/->CDecimal (dec-text (int-text c)))
+                (= b "FLOAT") (sql/->CFloat (int-text c))
+                (or (= b "DOUBLE") (= b "REAL")) (match c (sql/CInt i) (sql/->CDouble (float i)) _ c)
+                (= b "DATE") (match c (sql/CStr s) (sql/->CDate (subs s 0 (min 10 (count s)))) _ c)
+                (= b "DATETIME") (match c (sql/CStr s) (sql/->CLdt (iso s)) _ c)
+                (= b "TIMESTAMP") (match c (sql/CStr s) (sql/->CTimestamp (iso s)) _ c)
+                (= b "TIME") (match c (sql/CStr s) (sql/->CTime s) _ c)
+                (or (str/includes? b "BLOB") (str/includes? b "BINARY")) (match c (sql/CStr s) (sql/->CBytes s) _ c)
+                (= b "") c
+                :else (match c (sql/CStr s) c _ (sql/->CStr (int-text c))))))))
+
+(defn- table-cols Vec(Vec(Str)) [e: &Emu t: &Str] (let [m: Map(Str Vec(Vec(Str))) (deref (:tables e))] (get m (str/lower-case t) [])))
+
+(defn- from-tables Vec(Vec(Str)) [fs: &Vec(sp/FromN)]
+  (loop [i 0 acc: Vec(Vec(Str)) []]
+    (if (>= i (count fs)) acc
+      (recur (+ i 1)
+             (match (:f (nth fs i))
+               (sp/FTable n a) (conj acc [(str n) (if (= a "") (str n) (str a))])
+               (sp/FJoin l r k on u nat) (let [x (from-tables [l r])] (loop [j 0 a2 acc] (if (>= j (count x)) a2 (recur (+ j 1) (conj a2 (nth x j))))))
+               _ acc)))))
+
+(defn- col-type Str [e: &Emu ts: &Vec(Vec(Str)) table: &Str name: &Str]
+  (loop [i 0]
+    (if (>= i (count ts)) ""
+      (let [t (nth ts i)]
+        (if (and (not= table "") (not= (str/lower-case table) (str/lower-case (nth t 1))) (not= (str/lower-case table) (str/lower-case (nth t 0)))) (recur (+ i 1))
+          (let [cs (table-cols e (nth t 0))
+                k (loop [j 0] (if (>= j (count cs)) -1 (if (= (str/lower-case (nth (nth cs j) 0)) (str/lower-case name)) j (recur (+ j 1)))))]
+            (if (>= k 0) (str (nth (nth cs k) 1)) (recur (+ i 1)))))))))
+
+(defn- count-type Str [kind: &Str] (if (= kind "oracle") "NUMBER" "BIGINT"))
+
+(defn- wider Str [kind: &Str a: &Str b: &Str]
+  (let [na (base-type a) nb (base-type b)]
+    (cond (or (= na "NUMERIC") (= na "DECIMAL") (= na "NUMBER")) a (or (= nb "NUMERIC") (= nb "DECIMAL") (= nb "NUMBER")) b
+          (or (= na "BIGINT") (= nb "BIGINT")) "BIGINT" (= na "") b :else a)))
+
+(defn- expr-type Str [e: &Emu ts: &Vec(Vec(Str)) n: &sp/Node]
+  (let [kind (:kind e)]
+    (match (:ex n)
+      (sp/ECol t nm dq) (col-type e ts t nm)
+      (sp/EInt x) (cond (= kind "oracle") "NUMBER" (= kind "mysql") "BIGINT" :else "INTEGER")
+      (sp/EReal x) (if (= kind "oracle") "NUMBER" "NUMERIC")
+      (sp/ECast x ty) (str/upper-case ty)
+      (sp/EBin o a b) (if (= o "||") "TEXT" (wider kind (expr-type e ts a) (expr-type e ts b)))
+      (sp/EFn nm args star dist)
+      (let [u (str/upper-case nm) a0 (if (> (count args) 0) (expr-type e ts (nth args 0)) "")]
+        (cond (= u "COUNT") (count-type kind)
+              (= u "SUM") (cond (= kind "oracle") "NUMBER" (= kind "mysql") "DECIMAL" :else (let [b (base-type a0)] (if (or (= b "INTEGER") (= b "INT") (= b "INT4") (= b "SMALLINT")) "BIGINT" (if (= b "") "NUMERIC" a0))))
+              (= u "AVG") (if (= kind "oracle") "NUMBER" (if (= kind "mysql") "DECIMAL" "NUMERIC"))
+              (or (= u "MIN") (= u "MAX") (= u "IFNULL") (= u "COALESCE") (= u "ABS") (= u "ROUND")) a0
+              (or (= u "UPPER") (= u "LOWER") (= u "SUBSTR") (= u "TRIM") (= u "REPLACE") (= u "CONCAT")) "TEXT"
+              (or (= u "LENGTH")) (count-type kind)
+              :else ""))
+      (sp/ECase b ws ths els) (if (> (count ths) 0) (expr-type e ts (nth ths 0)) "")
+      _ "")))
+
+(defn- quoted-in? Bool [orig: &Str name: &Str] (str/includes? orig (str "\"" name "\"")))
+
+(defn- label Str [e: &Emu orig: &Str rc: &sp/ResultCol raw: &Str]
+  (let [kind (:kind e)]
+    (cond
+      (not= (:alias rc) "") (cond (quoted-in? orig (:alias rc)) (str (:alias rc))
+                                  (= kind "oracle") (str/upper-case (:alias rc))
+                                  (= kind "postgresql") (str/lower-case (:alias rc))
+                                  :else (str (:alias rc)))
+      (= kind "mysql") (if (> (count (:e rc)) 0) (match (:ex (nth (:e rc) 0)) (sp/ECol t nm dq) (str nm) _ (str raw)) (str raw))
+      :else
+      (let [ex (if (> (count (:e rc)) 0) (:ex (nth (:e rc) 0)) (sp/->EInt "0"))]
+        (match ex
+          (sp/ECol t nm dq) (cond dq (str nm) (= kind "oracle") (str/upper-case nm) :else (str/lower-case nm))
+          (sp/EFn nm args star dist) (if (= kind "oracle") (str/replace (str/upper-case raw) " " "") (str/lower-case nm))
+          (sp/ECast x ty) (match (:ex x) (sp/ECol t nm dq) (if (= kind "oracle") (str/upper-case nm) (str/lower-case nm)) _ (if (= kind "oracle") (str/replace (str/upper-case raw) " " "") "?column?"))
+          _ (if (= kind "oracle") (str/replace (str/upper-case raw) " " "") "?column?"))))))
+
+(defn- shape-rows sql/Rows [e: &Emu orig: &Str text: &Str r: sql/Rows]
+  (let [[st pe] (sp/parse text)
+        kind (:kind e)
+        [ts rcs] (match st
+                   (sp/SSelect q) (if (= (count (:cores q)) 0) (let [a: Vec(Vec(Str)) [] b: Vec(sp/ResultCol) []] (values a b))
+                                    (let [c (nth (:cores q) 0)] (values (from-tables (:from c)) (:cols c))))
+                   _ (let [a: Vec(Vec(Str)) [] b: Vec(sp/ResultCol) []] (values a b)))
+        star (loop [i 0] (if (>= i (count rcs)) false (if (:star (nth rcs i)) true (recur (+ i 1)))))
+        types (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count (:cols r))) acc
+                  (recur (+ i 1) (conj acc (if (or star (>= i (count rcs)) (= (count (:e (nth rcs i))) 0))
+                                             (col-type e ts "" (nth (:cols r) i))
+                                             (expr-type e ts (nth (:e (nth rcs i)) 0)))))))
+        names (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count (:cols r))) acc
+                  (let [raw (nth (:cols r) i)]
+                    (recur (+ i 1) (conj acc (cond (or star (>= i (count rcs))) (cond (= kind "oracle") (str/upper-case raw) (= kind "postgresql") (str/lower-case raw) :else (str raw))
+                                                   :else (label e orig (nth rcs i) raw)))))))
+        rows (mapv (fn Vec(sql/Cell) [row: Vec(sql/Cell)]
+                     (loop [j 0 out: Vec(sql/Cell) []] (if (>= j (count row)) out (recur (+ j 1) (conj out (shape-cell kind (if (< j (count types)) (nth types j) "") (nth row j)))))))
+                   (:rows r))]
+    (sql/->Rows names rows)))
+
+(defn- first-word Str [s: &Str] (next-word s 0))
+
+(defn- insert-value Str [text: &Str ps: &Vec(sql/Cell) table: &Str col: &Str]
+  (let [[st pe] (sp/parse text)]
+    (match st
+      (sp/SInsert t cols src d cf)
+      (let [k (loop [i 0] (if (>= i (count cols)) -1 (if (= (str/lower-case (nth cols i)) (str/lower-case col)) i (recur (+ i 1)))))
+            vs (if (> (count (:cores src)) 0) (:values (nth (:cores src) 0)) [])]
+        (if (or (< k 0) (= (count vs) 0) (>= k (count (nth vs 0)))) ""
+          (match (:ex (nth (nth vs 0) k))
+            (sp/EInt x) (str x)
+            (sp/EReal x) (str x)
+            (sp/EParam i nm) (if (and (> i 0) (<= i (count ps))) (int-text (nth ps (- i 1))) "")
+            (sp/ELit v) (match v (sf/VText x) (str x) (sf/VInt n) (str n) (sf/VReal f) (dec/float->shortest-str f) _ "")
+            _ "")))
+      _ "")))
+
+(defn- after Str [msg: &Str marker: &Str]
+  (let [k (str/index-of msg marker)]
+    (if (< k 0) ""
+      (let [r (subs msg (+ k (count marker)) (count msg))
+            e (loop [j 0] (if (or (>= j (count r)) (= (nth r j) 41) (= (nth r j) 10) (= (nth r j) 44)) j (recur (+ j 1))))]
+        (str/trim (subs r 0 e))))))
+
+(defn- split-tc Vec(Str) [tc: &Str] (let [d (str/index-of tc ".")] (if (< d 0) ["" (str tc)] [(subs tc 0 d) (subs tc (+ d 1) (count tc))])))
+
+(defn- ora-doc Str [code: &Str] (str "\n\nhttps://docs.oracle.com/error-help/db/ora-" code "/"))
+
+(defn- table-pos Int [orig: &Str t: &Str]
+  (let [u (str/lower-case orig) k (str/index-of u (str/lower-case t))] (if (< k 0) 0 (+ k 1))))
+
+(defn- map-error sql/DbErr [e: &Emu orig: &Str text: &Str ps: &Vec(sql/Cell) er: &sql/DbErr]
+  (let [m (:msg er) kind (:kind e) sch (:schema e)
+        uq (after m "UNIQUE constraint failed:")
+        nn (after m "NOT NULL constraint failed:")
+        nt (let [x (after m "no such table:")] (if (str/starts-with? x "main.") (subs x 5 (count x)) x))
+        nc (after m "no such column:")
+        nf (after m "no such function:")]
+    (cond
+      (not= uq "")
+      (let [tc (split-tc uq) t (nth tc 0) c (nth tc 1)
+            cmap: Map(Str Str) (deref (:cons e))
+            cn (get cmap (key-of t c) (cons-name e t c false ""))
+            v (insert-value text ps t c)]
+        (cond (= kind "oracle") (sql/->DbErr (str "ORA-00001: unique constraint (" sch "." cn ") violated on table " sch "." (str/upper-case t) " columns (" (str/upper-case c) ")" (ora-doc "00001")) "23000" 1 "java.sql.SQLIntegrityConstraintViolationException")
+              (= kind "postgresql") (sql/->DbErr (str "ERROR: duplicate key value violates unique constraint \"" cn "\"\n  Detail: Key (" c ")=(" v ") already exists.") "23505" 0 "org.postgresql.util.PSQLException")
+              :else (sql/->DbErr (str "Duplicate entry '" v "' for key '" t "." cn "'") "23000" 1062 "java.sql.SQLIntegrityConstraintViolationException")))
+      (not= nn "")
+      (let [tc (split-tc nn) t (nth tc 0) c (nth tc 1)]
+        (cond (= kind "oracle") (sql/->DbErr (str "ORA-01400: cannot insert NULL into (\"" sch "\".\"" (str/upper-case t) "\".\"" (str/upper-case c) "\")" (ora-doc "01400")) "23000" 1400 "java.sql.SQLIntegrityConstraintViolationException")
+              (= kind "postgresql") (sql/->DbErr (str "ERROR: null value in column \"" c "\" of relation \"" t "\" violates not-null constraint") "23502" 0 "org.postgresql.util.PSQLException")
+              :else (sql/->DbErr (str "Column '" c "' cannot be null") "23000" 1048 "java.sql.SQLIntegrityConstraintViolationException")))
+      (not= nt "")
+      (cond (= kind "oracle") (sql/->DbErr (str "ORA-00942: table or view \"" sch "\".\"" (str/upper-case nt) "\" does not exist" (ora-doc "00942")) "42000" 942 "java.sql.SQLSyntaxErrorException")
+            (= kind "postgresql") (sql/->DbErr (str "ERROR: relation \"" nt "\" does not exist\n  Position: " (table-pos orig nt)) "42P01" 0 "org.postgresql.util.PSQLException")
+            :else (sql/->DbErr (str "Table '" sch "." nt "' doesn't exist") "42S02" 1146 "java.sql.SQLSyntaxErrorException"))
+      (not= nc "")
+      (let [c (nth (split-tc nc) 1)]
+        (cond (= kind "oracle") (sql/->DbErr (str "ORA-00904: \"" (str/upper-case c) "\": invalid identifier" (ora-doc "00904")) "42000" 904 "java.sql.SQLSyntaxErrorException")
+              (= kind "postgresql") (sql/->DbErr (str "ERROR: column \"" c "\" does not exist\n  Position: " (table-pos orig c)) "42703" 0 "org.postgresql.util.PSQLException")
+              :else (sql/->DbErr (str "Unknown column '" c "' in 'field list'") "42S22" 1054 "java.sql.SQLSyntaxErrorException")))
+      (str/includes? m "has no column named ")
+      (let [u (unknown-of m) t (nth u 1) c (nth u 2)]
+        (cond (= kind "oracle") (sql/->DbErr (str "ORA-00904: \"" (str/upper-case c) "\": invalid identifier" (ora-doc "00904")) "42000" 904 "java.sql.SQLSyntaxErrorException")
+              (= kind "postgresql") (sql/->DbErr (str "ERROR: column \"" c "\" of relation \"" t "\" does not exist\n  Position: " (table-pos orig c)) "42703" 0 "org.postgresql.util.PSQLException")
+              :else (sql/->DbErr (str "Unknown column '" c "' in 'field list'") "42S22" 1054 "java.sql.SQLSyntaxErrorException")))
+      (not= nf "") (emu-err (str "the function " (str/upper-case nf) " is not available in the " kind " emulator"))
+      (or (str/includes? m "syntax error") (str/includes? m "incomplete input")) (emu-err (str "this SQL could not be read by the " kind " emulator: " m))
+      :else (sql/->DbErr (str m) (:state er) (:code er) (:exc er)))))
+
+(defn- unsupported? Bool [kind: &Str s: &Str]
+  (let [w (first-word s)]
+    (or (= w "DECLARE") (= w "CALL") (= w "EXEC") (= w "EXECUTE") (= w "MERGE")
+        (and (= w "BEGIN") (let [n (next-word s (word-end s (skip-ws s 0)))] (not (or (= n "") (= n "TRANSACTION"))))))))
+
+(defn run Values(sql/Outcome sql/DbErr) [e: &Emu text0: &Str ps0: &Vec(sql/Cell) keys: Bool]
+  (let [kind (:kind e)
+        orig (str/trim (strip-comments text0))
+        none (sql/->Outcome (sql/no-rows) 0 (sql/no-rows))
+        ps (if (= kind "oracle") (mapv (fn sql/Cell [c: sql/Cell] (match c (sql/CStr s) (if (= s "") (sql/->CNull) c) _ c)) ps0) (copy-cells ps0))]
+    (if (unsupported? kind orig) (values none (emu-err (str "stored procedures and PL/SQL blocks cannot run in the " kind " emulator")))
+      (let [pre (if (= kind "mysql") (backticks orig) orig)
+            crs (rewrite-create kind pre)
+            text0 (if (> (count crs) 0) (:text (nth crs 0)) (rewrite kind orig))
+            fw (first-word text0)
+            rk (if (or (= fw "INSERT") (= fw "UPDATE") (= fw "DELETE")) (returning-at text0) -1)
+            text (if (< rk 0) text0 (str/trim (subs text0 0 rk)))]
+        (if (and (>= rk 0) (not= fw "INSERT")) (returning-dml e orig fw text (str/trim (subs text0 (+ rk 9) (count text0))) ps)
+        (let [[o er] (sqlite/run (:h e) text ps (or keys (>= rk 0)))]
+        (cond
+          (not (sql/ok? er)) (values none (map-error e orig text ps er))
+          (>= rk 0) (returning e orig text (str/trim (subs text0 (+ rk 9) (count text0))) o)
+          :else
+          (let [z (if (> (count crs) 0) (remember e (nth crs 0)) 0)
+                rows (if (> (count (:cols (:rows o))) 0) (shape-rows e orig text (:rows o)) (:rows o))]
+            (values (sql/->Outcome rows (:count o) (:keys o)) er)))))))))
+
+(defn- where-at Int [s: &Str]
+  (loop [i 0]
+    (if (>= i (count s)) -1
+      (let [c (nth s i)]
+        (cond (or (= c 39) (= c 34)) (recur (quote-end s i c))
+              (and (word? c) (or (= i 0) (not (word? (nth s (- i 1))))))
+              (let [e (word-end s i)] (if (= (str/upper-case (subs s i e)) "WHERE") i (recur e)))
+              :else (recur (+ i 1)))))))
+
+(defn- returning-dml Values(sql/Outcome sql/DbErr) [e: &Emu orig: &Str fw: &Str text: &Str cols: &Str ps: &Vec(sql/Cell)]
+  (let [[st pe] (sp/parse text)
+        table (match st (sp/SUpdate t cs vs w cf) (str t) (sp/SDelete t w) (str t) _ "")
+        wa (where-at text)
+        where (if (< wa 0) "" (str " " (subs text wa (count text))))
+        none (sql/->Outcome (sql/no-rows) 0 (sql/no-rows))]
+    (if (= table "") (values none (emu-err (str "this SQL could not be read by the " (:kind e) " emulator: " (if (= pe "") "RETURNING" pe))))
+      (if (= fw "DELETE")
+        (let [q (str "SELECT " cols " FROM \"" table "\"" where)
+              [o1 e1] (sqlite/run (:h e) q ps false)]
+          (if (not (sql/ok? e1)) (values none (map-error e orig q ps e1))
+            (let [[o2 e2] (sqlite/run (:h e) text ps false)]
+              (if (not (sql/ok? e2)) (values none (map-error e orig text ps e2))
+                (values (sql/->Outcome (shape-rows e orig q (:rows o1)) (:count o2) (sql/no-rows)) e2)))))
+        (let [[o1 e1] (sqlite/run (:h e) (str "SELECT rowid FROM \"" table "\"" where) ps false)]
+          (if (not (sql/ok? e1)) (values none (map-error e orig text ps e1))
+            (let [[o2 e2] (sqlite/run (:h e) text ps false)]
+              (if (not (sql/ok? e2)) (values none (map-error e orig text ps e2))
+                (let [ids (str/join ", " (mapv (fn Str [r: Vec(sql/Cell)] (int-text (nth r 0))) (:rows (:rows o1))))
+                      q (str "SELECT " cols " FROM \"" table "\" WHERE rowid IN (" ids ") ORDER BY rowid")
+                      [o3 e3] (sqlite/run (:h e) q [] false)]
+                  (if (not (sql/ok? e3)) (values none (map-error e orig q [] e3))
+                    (values (sql/->Outcome (shape-rows e orig q (:rows o3)) (:count o2) (sql/no-rows)) e3)))))))))))
+
+(defn- backticks Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (cond (or (= c 39) (= c 34)) (let [e (quote-end s i c)] (recur e (str out (subs s i e))))
+              (= c 96) (let [e (quote-end s i 96)] (recur e (str out "\"" (subs s (+ i 1) (- e 1)) "\"")))
+              :else (recur (+ i 1) (str out (subs s i (+ i 1)))))))))
+
+(defn- returning-at Int [s: &Str]
+  (loop [i 0]
+    (if (>= i (count s)) -1
+      (let [c (nth s i)]
+        (cond (or (= c 39) (= c 34)) (recur (quote-end s i c))
+              (and (word? c) (or (= i 0) (not (word? (nth s (- i 1))))))
+              (let [e (word-end s i)] (if (= (str/upper-case (subs s i e)) "RETURNING") i (recur e)))
+              :else (recur (+ i 1)))))))
+
+(defn- returning Values(sql/Outcome sql/DbErr) [e: &Emu orig: &Str text: &Str cols: &Str o: &sql/Outcome]
+  (let [[st pe] (sp/parse text)
+        table (match st (sp/SInsert t cs src d cf) (str t) _ "")
+        id (if (= (count (:rows (:keys o))) 0) "" (int-text (nth (nth (:rows (:keys o)) 0) 0)))
+        q (str "SELECT " cols " FROM \"" table "\" WHERE rowid = " id)
+        [o2 er2] (sqlite/run (:h e) q [] false)]
+    (if (not (sql/ok? er2)) (values (sql/->Outcome (sql/no-rows) 0 (sql/no-rows)) (map-error e orig q [] er2))
+      (values (sql/->Outcome (shape-rows e orig q (:rows o2)) (:count o) (sql/no-rows)) er2))))
+
+(defn- copy-cells Vec(sql/Cell) [ps: &Vec(sql/Cell)] (mapv (fn sql/Cell [c: sql/Cell] c) ps))
+
+(defn open Values(Emu sql/DbErr) [kind: &Str schema: &Str seed: &Str]
+  (let [[h er] (sqlite/open ":memory:")
+        z: Map(Str Vec(Vec(Str))) {}
+        z2: Map(Str Str) {}
+        e (->Emu (str kind) (if (= kind "oracle") (str/upper-case schema) (str schema)) h (atom z) (atom z2) (atom 0))]
+    (if (not (sql/ok? er)) (values e er)
+      (let [ss (split-statements seed)]
+        (loop [i 0]
+          (if (>= i (count ss)) (values e (sql/ok-err))
+            (let [[o er2] (run e (nth ss i) [] false)]
+              (if (sql/ok? er2) (recur (+ i 1))
+                (values e (sql/->DbErr (str "emulator: the seed statement " (+ i 1) " failed: " (:msg er2)) UNSUPPORTED 0 "mulay.emulator"))))))))))
+
+(defn close Int [e: &Emu] (sqlite/close (:h e)))
+
+(defn- unknown-of Vec(Str) [m: &Str]
+  (let [nt (let [x (after m "no such table:")] (if (str/starts-with? x "main.") (subs x 5 (count x)) x))
+        nc (after m "no such column:")
+        hk (str/index-of m "has no column named ")
+        tk (str/index-of m "table ")]
+    (cond (not= nt "") ["table" (str nt) ""]
+          (not= nc "") (let [tc (split-tc nc)] ["column" (nth tc 0) (nth tc 1)])
+          (and (>= hk 0) (>= tk 0) (< tk hk)) ["column" (str/trim (subs m (+ tk 6) hk)) (let [r (subs m (+ hk 20) (count m)) j (str/index-of r ")")] (str/trim (if (< j 0) r (subs r 0 j))))]
+          :else ["" "" ""])))
+
+(defn check Values(Str Str Str) [e: &Emu text0: &Str]
+  (let [kind (:kind e)
+        orig (str/trim (strip-comments text0))]
+    (if (unsupported? kind orig) (values "" "" "")
+      (let [pre (if (= kind "mysql") (backticks orig) orig)
+            text1 (rewrite kind pre)
+            fw (first-word text1)
+            rk (if (or (= fw "INSERT") (= fw "UPDATE") (= fw "DELETE")) (returning-at text1) -1)
+            text (if (< rk 0) text1 (str/trim (subs text1 0 rk)))
+            n (loop [i 0 k 0] (if (>= i (count text)) k (recur (+ i 1) (if (= (nth text i) 63) (+ k 1) k))))
+            ps (loop [i 0 acc: Vec(sql/Cell) []] (if (>= i n) acc (recur (+ i 1) (conj acc (sql/->CNull)))))
+            [o er] (sqlite/run (:h e) text ps false)
+            u (if (sql/ok? er) ["" "" ""] (unknown-of (:msg er)))]
+        (values (nth u 0) (nth u 1) (nth u 2))))))

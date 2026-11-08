@@ -1,0 +1,386 @@
+(ns mulay.lib.sqlfunc (:require [mulay.lib.sqlfile :as sf] [mulay.lib.sqlnum :as num] [mulay.lib.sqlval :as sv]
+                               [mulay.lib.random :as rnd] [mulay.lib.libm :as lm] [clay.bytes :as bytes] [clay.string :as str]))
+
+(def SQLITE-VERSION "3.50.3")
+
+(def MAX-LENGTH 1000000000)
+
+(def ARITY: Vec(Vec(Str))
+  [["abs" "1" "1"] ["length" "1" "1"] ["octet_length" "1" "1"] ["typeof" "1" "1"] ["lower" "1" "1"] ["upper" "1" "1"]
+   ["instr" "2" "2"] ["substr" "2" "3"] ["substring" "2" "3"] ["round" "1" "2"] ["trim" "1" "2"] ["ltrim" "1" "2"]
+   ["rtrim" "1" "2"] ["replace" "3" "3"] ["hex" "1" "1"] ["unhex" "1" "2"] ["quote" "1" "1"] ["char" "0" "-1"]
+   ["unicode" "1" "1"] ["zeroblob" "1" "1"] ["nullif" "2" "2"] ["max" "2" "-1"] ["min" "2" "-1"] ["sign" "1" "1"]
+   ["concat" "1" "-1"] ["concat_ws" "2" "-1"] ["like" "2" "3"] ["glob" "2" "2"] ["likely" "1" "1"] ["unlikely" "1" "1"]
+   ["likelihood" "2" "2"] ["coalesce" "2" "-1"] ["ifnull" "2" "2"] ["iif" "2" "3"]
+   ["ceil" "1" "1"] ["ceiling" "1" "1"] ["floor" "1" "1"] ["trunc" "1" "1"] ["sqrt" "1" "1"] ["exp" "1" "1"]
+   ["ln" "1" "1"] ["log" "1" "2"] ["log10" "1" "1"] ["pow" "2" "2"] ["power" "2" "2"] ["pi" "0" "0"]
+   ["degrees" "1" "1"] ["radians" "1" "1"] ["sin" "1" "1"] ["cos" "1" "1"] ["tan" "1" "1"] ["unistr" "1" "1"]
+   ["random" "0" "0"] ["randomblob" "1" "1"] ["sqlite_version" "0" "0"]
+   ["log2" "1" "1"] ["mod" "2" "2"] ["atan2" "2" "2"] ["acos" "1" "1"] ["asin" "1" "1"] ["atan" "1" "1"]
+   ["acosh" "1" "1"] ["asinh" "1" "1"] ["atanh" "1" "1"] ["cosh" "1" "1"] ["sinh" "1" "1"] ["tanh" "1" "1"]])
+
+(defn arity-ok? Int [name: &Str n: Int]
+  (loop [i 0]
+    (if (>= i (count ARITY)) -1
+      (let [row (nth ARITY i)]
+        (if (not= (nth row 0) name) (recur (+ i 1))
+          (let [[lo e1] (parse-long (nth row 1)) [hi e2] (parse-long (nth row 2))]
+            (if (and (>= n lo) (or (< hi 0) (<= n hi))) 1 0)))))))
+
+(defn- null Values(sf/Val Str) [] (values (sf/->VNull) ""))
+(defn- ok Values(sf/Val Str) [x: sf/Val] (values x ""))
+(defn- failure Values(sf/Val Str) [msg: Str] (values (sf/->VNull) msg))
+
+(defn- skip-utf8 Int [z: &Str i: Int]
+  (if (< (nth z i) 192) (+ i 1)
+    (loop [j (+ i 1)] (if (and (< j (count z)) (= (bit-and (nth z j) 192) 128)) (recur (+ j 1)) j))))
+
+(defn- utf8-read Values(Int Int) [z: &Str i: Int]
+  (let [c (nth z i)]
+    (if (< c 192) (values c (+ i 1))
+      (let [lead (cond (< c 224) (bit-and c 31) (< c 240) (bit-and c 15) (< c 248) (bit-and c 7) (< c 252) (bit-and c 3) (< c 254) (bit-and c 1) :else 0)
+            [v j] (loop [j (+ i 1) v lead]
+                    (if (and (< j (count z)) (= (bit-and (nth z j) 192) 128)) (recur (+ j 1) (+ (bit-shift-left v 6) (bit-and (nth z j) 63))) (values v j)))
+            bad (or (< v 128) (= (bit-and v 0xFFFFF800) 0xD800) (= (bit-and v 0xFFFFFFFE) 0xFFFE))]
+        (values (if bad 0xFFFD v) j)))))
+
+(defn- cstr Str [s: &Str] (let [i (str/index-of s (chr 0))] (if (< i 0) (str s) (subs s 0 i))))
+
+(defn- utf8-char Str [c: Int]
+  (cond (< c 128) (chr c)
+        (< c 2048) (str (chr (+ 192 (bit-and (bit-shift-right c 6) 31))) (chr (+ 128 (bit-and c 63))))
+        (< c 65536) (str (chr (+ 224 (bit-and (bit-shift-right c 12) 15))) (chr (+ 128 (bit-and (bit-shift-right c 6) 63))) (chr (+ 128 (bit-and c 63))))
+        :else (str (chr (+ 240 (bit-and (bit-shift-right c 18) 7))) (chr (+ 128 (bit-and (bit-shift-right c 12) 63)))
+                   (chr (+ 128 (bit-and (bit-shift-right c 6) 63))) (chr (+ 128 (bit-and c 63))))))
+
+(def MATCH 0)
+(def NOMATCH 1)
+(def NOWILD 2)
+
+(defn- lower-c Int [c: Int] (if (and (>= c 65) (<= c 90)) (+ c 32) c))
+(defn- upper-c Int [c: Int] (if (and (>= c 97) (<= c 122)) (- c 32) c))
+
+(defn- rd Values(Int Int) [z: &Str i: Int] (if (>= i (count z)) (values 0 i) (utf8-read z i)))
+
+(defn- pcompare Int [p: &Str pi0: Int s: &Str si0: Int all: Int one: Int other: Int set: Bool nocase: Bool]
+  (loop [pi pi0 si si0 escaped -1]
+    (let [[c pi2] (rd p pi)]
+      (if (= c 0) (if (>= si (count s)) MATCH NOMATCH)
+        (cond
+          (= c all)
+          (let [[c2 pi3 si3 dead] (loop [pj pi2 sj si]
+                                     (let [[c3 pj2] (rd p pj)]
+                                       (cond (= c3 all) (recur pj2 sj)
+                                             (and (= c3 one) (not= one 0))
+                                             (let [[x sj2] (rd s sj)] (if (= x 0) (values 0 pj2 sj2 true) (recur pj2 sj2)))
+                                             :else (values c3 pj2 sj false))))]
+            (cond
+              dead NOWILD
+              (= c2 0) MATCH
+              (and (= c2 other) set)
+              (loop [sj si3]
+                (if (>= sj (count s)) NOWILD
+                  (let [r (pcompare p (- pi3 1) s sj all one other set nocase)]
+                    (if (not= r NOMATCH) r (recur (skip-utf8 s sj))))))
+              :else
+              (let [[c4 pi4 bad] (if (= c2 other) (let [[e pe] (rd p pi3)] (values e pe (= e 0))) (values c2 pi3 false))]
+                (if bad NOWILD
+                  (loop [sj si3]
+                    (if (>= sj (count s)) NOWILD
+                      (let [[x sj2] (rd s sj)]
+                        (if (or (= x c4) (and nocase (< c4 128) (= (lower-c x) (lower-c c4))))
+                          (let [r (pcompare p pi4 s sj2 all one other set nocase)] (if (not= r NOMATCH) r (recur sj2)))
+                          (recur sj2)))))))))
+          (and (= c other) set)
+          (let [[x si2] (rd s si)]
+            (if (= x 0) NOMATCH
+              (let [[c2 pa] (rd p pi2)
+                    invert (= c2 94)
+                    [c3 pb] (if invert (rd p pa) (values c2 pa))
+                    seen0 (and (= c3 93) (= x 93))
+                    [c4 pc] (if (= c3 93) (rd p pb) (values c3 pb))
+                    [seen pend c5] (loop [cc c4 pp pc seen seen0 prior 0]
+                                     (if (or (= cc 0) (= cc 93)) (values seen pp cc)
+                                       (if (and (= cc 45) (< pp (count p)) (not= (nth p pp) 93) (> prior 0))
+                                         (let [[hi pq] (rd p pp) [nx pr] (rd p pq)]
+                                           (recur nx pr (or seen (and (>= x prior) (<= x hi))) 0))
+                                         (let [[nx pq] (rd p pp)] (recur nx pq (or seen (= x cc)) cc)))))]
+                (if (or (= c5 0) (= seen invert)) NOMATCH (recur pend si2 escaped)))))
+          :else
+          (let [[c1 pi3 esc] (if (and (= c other) (not set))
+                               (let [[e pe] (rd p pi2)] (values e pe true))
+                               (values c pi2 false))]
+            (if (and esc (= c1 0)) NOMATCH
+              (let [[x si2] (rd s si)]
+                (cond (= c1 x) (recur pi3 si2 (if esc pi3 escaped))
+                      (and nocase (= (lower-c c1) (lower-c x)) (< c1 128) (< x 128)) (recur pi3 si2 (if esc pi3 escaped))
+                      (and (= c1 one) (not esc) (not= x 0)) (recur pi3 si2 escaped)
+                      :else NOMATCH)))))))))
+
+(defn like Bool [pat: &Str s: &Str esc: Int glob: Bool]
+  (if glob (= (pcompare (cstr pat) 0 (cstr s) 0 42 63 91 true false) MATCH)
+    (let [all (if (= esc 37) 0 37) one (if (= esc 95) 0 95)]
+      (= (pcompare (cstr pat) 0 (cstr s) 0 all one esc false true) MATCH))))
+
+(defn- text-of Str [x: &sf/Val] (sv/to-text x))
+
+(defn- len-chars Int [z0: &Str]
+  (let [z (cstr z0)] (loop [i 0 n 0] (if (>= i (count z)) n (recur (skip-utf8 z i) (+ n 1))))))
+
+(defn- numeric? Bool [x: &sf/Val] (sv/num? (sv/numeric-type x)))
+
+(defn- real-fn Values(sf/Val Str) [x: &sf/Val r: Float] (if (not= r r) (null) (ok (sf/->VReal r))))
+
+(defn- trunc Float [x: Float]
+  (if (or (>= x 4503599627370496.0) (<= x -4503599627370496.0) (not= x x) (= x 0.0)) x
+    (let [t (float (int x))] (if (and (= t 0.0) (< x 0.0)) -0.0 t))))
+
+(defn call Values(sf/Val Str) [name: &Str args: &Vec(sf/Val) coll: &Str]
+  (let [a0 (if (> (count args) 0) (nth args 0) (sf/->VNull))
+        a1 (if (> (count args) 1) (nth args 1) (sf/->VNull))
+        a2 (if (> (count args) 2) (nth args 2) (sf/->VNull))]
+    (cond
+      (= name "typeof") (ok (sf/->VText (match a0 (sf/VNull) "null" (sf/VInt n) "integer" (sf/VReal x) "real" (sf/VText s) "text" _ "blob")))
+      (= name "length") (match a0 (sf/VNull) (null) (sf/VText s) (ok (sf/->VInt (len-chars s))) _ (ok (sf/->VInt (count (text-of a0)))))
+      (= name "octet_length") (if (sv/null? a0) (null) (ok (sf/->VInt (count (text-of a0)))))
+      (= name "abs")
+      (match a0
+        (sf/VNull) (null)
+        (sf/VInt n) (cond (= n num/I64-MIN) (failure "integer overflow") (< n 0) (ok (sf/->VInt (- 0 n))) :else (ok (sf/->VInt n)))
+        _ (let [r (sv/to-real a0)] (ok (sf/->VReal (if (<= r 0.0) (- 0.0 r) r)))))
+      (or (= name "lower") (= name "upper"))
+      (if (sv/null? a0) (null)
+        (let [z (text-of a0)]
+          (ok (sf/->VText (loop [i 0 out ""] (if (>= i (count z)) out
+                                                (recur (+ i 1) (str out (chr (if (= name "lower") (lower-c (nth z i)) (upper-c (nth z i))))))))))))
+      (= name "instr") (instr a0 a1)
+      (or (= name "substr") (= name "substring")) (substr args)
+      (= name "round") (round-fn args)
+      (or (= name "trim") (= name "ltrim") (= name "rtrim")) (trim-fn name args)
+      (= name "replace") (replace-fn a0 a1 a2)
+      (= name "hex") (if (sv/null? a0) (ok (sf/->VText "")) (ok (sf/->VText (hex-upper (text-of a0)))))
+      (= name "unhex") (unhex-fn args)
+      (= name "quote") (ok (sf/->VText (quote-val a0)))
+      (= name "char") (ok (sf/->VText (loop [i 0 out ""] (if (>= i (count args)) out
+                                                           (let [x (sv/to-int (nth args i)) c (if (or (< x 0) (> x 0x10ffff)) 0xfffd x) u (utf8-char c)]
+                                                             (recur (+ i 1) (str out u)))))))
+      (= name "unicode") (if (sv/null? a0) (null) (let [z (cstr (text-of a0))] (if (= (count z) 0) (null) (let [[c j] (utf8-read z 0)] (ok (sf/->VInt c))))))
+      (= name "zeroblob") (let [n (max 0 (sv/to-int a0))] (if (> n MAX-LENGTH) (failure "string or blob too big") (ok (sf/->VBlob (zero-bytes n)))))
+      (= name "nullif") (if (= (sv/compare-vals a0 a1 coll) 0) (null) (ok (copy a0)))
+      (or (= name "max") (= name "min")) (minmax (= name "max") args coll)
+      (= name "sign") (if (not (numeric? a0)) (null) (let [x (sv/to-real a0)] (ok (sf/->VInt (cond (< x 0.0) -1 (> x 0.0) 1 :else 0)))))
+      (= name "concat") (ok (sf/->VText (concat-ws "" args 0)))
+      (= name "concat_ws") (if (sv/null? a0) (null) (ok (sf/->VText (concat-ws (text-of a0) args 1))))
+      (or (= name "like") (= name "glob")) (like-fn name args)
+      (or (= name "ceil") (= name "ceiling") (= name "floor") (= name "trunc"))
+      (let [x (sv/numeric-type a0)]
+        (match x
+          (sf/VInt n) (ok (sf/->VInt n))
+          (sf/VReal r) (ok (sf/->VReal (cond (= name "floor") (floor r) (= name "trunc") (trunc r) :else (ceil r))))
+          _ (null)))
+      (and (or (= name "ln") (= name "log10")) (numeric? a0) (<= (sv/to-real a0) 0.0)) (null)
+      (or (= name "sqrt") (= name "exp") (= name "ln") (= name "log10") (= name "degrees") (= name "radians")
+          (= name "sin") (= name "cos") (= name "tan"))
+      (if (not (numeric? a0)) (null)
+        (let [x (sv/to-real a0)]
+          (real-fn a0 (cond (= name "sqrt") (sqrt x) (= name "exp") (lm/exp* x) (= name "ln") (lm/log* x) (= name "log10") (lm/log10* x)
+                            (= name "degrees") (* x (/ 180.0 3.141592653589793)) (= name "radians") (* x (/ 3.141592653589793 180.0))
+                            (= name "sin") (lm/sin* x) (= name "cos") (lm/cos* x) :else (lm/tan* x)))))
+      (= name "log")
+      (cond (not (numeric? a0)) (null)
+            (= (count args) 1) (let [x (sv/to-real a0)] (if (<= x 0.0) (null) (real-fn a0 (lm/log10* x))))
+            :else (let [b (sv/to-real a0)]
+                    (cond (<= b 0.0) (null)
+                          (<= (lm/log* b) 0.0) (null)
+                          (not (numeric? a1)) (null)
+                          (<= (sv/to-real a1) 0.0) (null)
+                          :else (real-fn a0 (/ (lm/log* (sv/to-real a1)) (lm/log* b))))))
+      (or (= name "pow") (= name "power"))
+      (if (or (not (numeric? a0)) (not (numeric? a1))) (null) (real-fn a0 (prim/fpow (sv/to-real a0) (sv/to-real a1))))
+      (= name "pi") (ok (sf/->VReal 3.141592653589793))
+      (= name "unistr") (unistr a0)
+      (= name "sqlite_version") (ok (sf/->VText SQLITE-VERSION))
+      (= name "random") (let [[b okr] (rnd/seeded-bytes 8) r (bytes/unpack b 0 8 true)] (ok (sf/->VInt (if (< r 0) (bit-and r num/I64-MAX) r))))
+      (= name "randomblob") (let [n (max 1 (sv/to-int a0))] (if (> n MAX-LENGTH) (failure "string or blob too big") (let [[b okr] (rnd/seeded-bytes n)] (ok (sf/->VBlob b)))))
+      (or (= name "likely") (= name "unlikely")) (ok (copy a0))
+      (= name "likelihood") (ok (copy a0))
+      :else (failure (str "unsupported: " name "()")))))
+
+(defn- zero-bytes Str [n: Int] (loop [out ""] (if (>= (count out) n) (subs out 0 n) (recur (if (= out "") (chr 0) (str out out))))))
+
+(defn- instr Values(sf/Val Str) [h: &sf/Val nd: &sf/Val]
+  (if (or (sv/null? h) (sv/null? nd)) (null)
+    (let [hay (text-of h) needle (text-of nd)
+          is-text (not (and (sv/blob? h) (sv/blob? nd)))
+          hz (if is-text (cstr hay) (str hay))
+          nz (if is-text (cstr needle) (str needle))]
+      (if (= (count needle) 0) (ok (sf/->VInt 1))
+        (loop [i 0 n 1]
+          (cond (> (+ i (count nz)) (count hz)) (ok (sf/->VInt 0))
+                (= (subs hz i (+ i (count nz))) nz) (ok (sf/->VInt n))
+                :else (recur (if is-text (skip-utf8 hz i) (+ i 1)) (+ n 1))))))))
+
+(defn- substr Values(sf/Val Str) [args: &Vec(sf/Val)]
+  (let [x (nth args 0) blob (sv/blob? x)]
+    (if (or (sv/null? x) (and blob (= (count (sv/to-text x)) 0))) (null)
+      (let [z0 (text-of x)
+            z (if blob z0 (cstr z0))
+            p1a (sv/to-int (nth args 1))
+            len (if blob (count z) (if (< p1a 0) (len-chars z) 0))
+            has3 (= (count args) 3)]
+        (cond
+          (and has3 (sv/null? (nth args 2)) (= (sv/to-int (nth args 2)) 0)) (null)
+          (and (= p1a 0) (sv/null? (nth args 1))) (null)
+          :else
+          (let [p2a (if has3 (sv/to-int (nth args 2)) 1000000000)
+                [p1b p2b] (cond (< p1a 0) (let [q (+ p1a len)] (if (< q 0) (values 0 (if (< p2a 0) 0 (+ p2a q))) (values q p2a)))
+                                (> p1a 0) (values (- p1a 1) p2a)
+                                (> p2a 0) (values p1a (- p2a 1))
+                                :else (values p1a p2a))
+                [p1 p2] (if (< p2b 0) (let [q (if (< p2b (- 0 p1b)) p1b (- 0 p2b))] (values (- p1b q) q)) (values p1b p2b))]
+            (if blob
+              (let [[s n] (if (>= p1 len) (values 0 0) (values p1 (if (> p2 (- len p1)) (- len p1) p2)))] (ok (sf/->VBlob (subs z s (+ s n)))))
+              (let [st (loop [i 0 k p1] (if (or (>= i (count z)) (= k 0)) i (recur (skip-utf8 z i) (- k 1))))
+                    en (loop [i st k p2] (if (or (>= i (count z)) (= k 0)) i (recur (skip-utf8 z i) (- k 1))))]
+                (ok (sf/->VText (subs z st en)))))))))))
+
+(defn- round-fn Values(sf/Val Str) [args: &Vec(sf/Val)]
+  (let [x (nth args 0)]
+    (cond
+      (and (= (count args) 2) (sv/null? (nth args 1))) (null)
+      (sv/null? x) (null)
+      :else
+      (let [n (if (= (count args) 2) (min 30 (max 0 (sv/to-int (nth args 1)))) 0)
+            r (sv/to-real x)]
+        (ok (sf/->VReal
+              (cond (or (< r -4503599627370496.0) (> r 4503599627370496.0)) r
+                    (= n 0) (float (int (+ r (if (< r 0.0) -0.5 0.5))))
+                    :else (let [t (num/printf-double r 102 n) [y k] (num/atof t)] y))))))))
+
+(defn- trim-fn Values(sf/Val Str) [name: &Str args: &Vec(sf/Val)]
+  (let [x (nth args 0)]
+    (cond
+      (sv/null? x) (null)
+      (and (= (count args) 2) (sv/null? (nth args 1))) (null)
+      :else
+      (let [z (text-of x)
+            cs (if (= (count args) 2) (cstr (text-of (nth args 1))) " ")
+            chars (loop [i 0 acc: Vec(Str) []] (if (>= i (count cs)) acc (let [j (skip-utf8 cs i)] (recur j (conj acc (subs cs i j))))))
+            left (or (= name "trim") (= name "ltrim"))
+            right (or (= name "trim") (= name "rtrim"))
+            st (if (not left) 0
+                 (loop [i 0] (let [m (match-at z i chars)] (if (or (= m 0) (>= i (count z))) i (recur (+ i m))))))
+            en (if (not right) (count z)
+                 (loop [e (count z)] (let [m (match-end z st e chars)] (if (or (= m 0) (<= e st)) e (recur (- e m))))))]
+        (if (= (count chars) 0) (ok (sf/->VText z)) (ok (sf/->VText (subs z st (max st en)))))))))
+
+(defn- match-at Int [z: &Str i: Int chars: &Vec(Str)]
+  (loop [k 0]
+    (if (>= k (count chars)) 0
+      (let [c (nth chars k)]
+        (if (and (<= (+ i (count c)) (count z)) (= (subs z i (+ i (count c))) c)) (count c) (recur (+ k 1)))))))
+(defn- match-end Int [z: &Str st: Int e: Int chars: &Vec(Str)]
+  (loop [k 0]
+    (if (>= k (count chars)) 0
+      (let [c (nth chars k)]
+        (if (and (<= (count c) (- e st)) (= (subs z (- e (count c)) e) c)) (count c) (recur (+ k 1)))))))
+
+(defn- replace-fn Values(sf/Val Str) [a: &sf/Val b: &sf/Val c: &sf/Val]
+  (cond
+    (or (sv/null? a) (sv/null? b)) (null)
+    :else
+    (let [z (text-of a) p (text-of b)]
+      (cond (= (count (cstr p)) 0) (ok (sf/->VText z))
+            (sv/null? c) (null)
+            :else
+            (let [r (text-of c)]
+              (ok (sf/->VText (loop [i 0 out ""]
+                                (cond (> (+ i (count p)) (count z)) (str out (subs z i (count z)))
+                                      (= (subs z i (+ i (count p))) p) (recur (+ i (count p)) (str out r))
+                                      :else (recur (+ i 1) (str out (chr (nth z i)))))))))))))
+
+(def HEXD "0123456789ABCDEF")
+(defn- hex-upper Str [z: &Str]
+  (loop [i 0 out ""] (if (>= i (count z)) out (let [c (nth z i)] (recur (+ i 1) (str out (chr (nth HEXD (bit-shift-right c 4))) (chr (nth HEXD (bit-and c 15)))))))))
+
+(defn- hexd? Bool [c: Int] (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)) (and (>= c 65) (<= c 70))))
+(defn- hexv Int [c: Int] (cond (<= c 57) (- c 48) (>= c 97) (- c 87) :else (- c 55)))
+
+(defn- unhex-fn Values(sf/Val Str) [args: &Vec(sf/Val)]
+  (let [x (nth args 0)]
+    (if (or (sv/null? x) (and (= (count args) 2) (sv/null? (nth args 1)))) (null)
+      (let [z (cstr (text-of x))
+            pass (if (= (count args) 2) (text-of (nth args 1)) "")]
+        (loop [i 0 out ""]
+          (cond
+            (>= i (count z)) (ok (sf/->VBlob out))
+            (hexd? (nth z i))
+            (if (and (< (+ i 1) (count z)) (hexd? (nth z (+ i 1))))
+              (recur (+ i 2) (str out (chr (+ (* 16 (hexv (nth z i))) (hexv (nth z (+ i 1)))))))
+              (null))
+            :else
+            (let [[c j] (utf8-read z i)]
+              (if (pass-has? pass c) (recur j out) (null)))))))))
+
+(defn- pass-has? Bool [p: &Str c: Int]
+  (loop [i 0] (if (>= i (count p)) false (let [[x j] (utf8-read p i)] (if (= x c) true (recur j))))))
+
+(defn quote-val Str [x: &sf/Val]
+  (match x
+    (sf/VNull) "NULL"
+    (sf/VInt n) (str n)
+    (sf/VReal r)
+    (cond (not= r r) "NULL"
+          (> r 1.7976931348623157e308) "9.0e+999"
+          (< r -1.7976931348623157e308) "-9.0e+999"
+          :else
+          (let [t (if (= r 0.0) "0.0" (num/printf-double r 103 15)) [r2 k] (num/atof t)]
+            (if (= r r2) t (num/printf-double r 101 20))))
+    (sf/VText s) (let [z (cstr s)] (str "'" (str/replace z "'" "''") "'"))
+    (sf/VBlob s) (str "X'" (hex-upper s) "'")))
+
+(defn- minmax Values(sf/Val Str) [is-max: Bool args: &Vec(sf/Val) coll: &Str]
+  (loop [i 1 best 0]
+    (cond (sv/null? (nth args 0)) (null)
+          (>= i (count args)) (ok (copy (nth args best)))
+          (sv/null? (nth args i)) (null)
+          :else (let [c (sv/compare-vals (nth args best) (nth args i) coll)]
+                  (recur (+ i 1) (if (if is-max (< c 0) (>= c 0)) i best))))))
+
+(defn- concat-ws Str [sep: &Str args: &Vec(sf/Val) from: Int]
+  (loop [i from out ""]
+    (if (>= i (count args)) out
+      (let [x (nth args i)]
+        (if (sv/null? x) (recur (+ i 1) out)
+          (let [t (text-of x)] (recur (+ i 1) (if (> (count out) 0) (str out sep t) (str out t)))))))))
+
+(defn- like-fn Values(sf/Val Str) [name: &Str args: &Vec(sf/Val)]
+  (let [pat (nth args 0) s (nth args 1)]
+    (cond
+      (> (count (text-of pat)) 50000) (failure "LIKE or GLOB pattern too complex")
+      (and (= (count args) 3) (sv/null? (nth args 2))) (null)
+      (and (= (count args) 3) (not= (len-chars (text-of (nth args 2))) 1)) (failure "ESCAPE expression must be a single character")
+      (or (sv/null? pat) (sv/null? s)) (null)
+      :else
+      (let [esc (if (= (count args) 3) (let [[c j] (utf8-read (text-of (nth args 2)) 0)] c) 0)]
+        (ok (sf/->VInt (if (like (text-of pat) (text-of s) esc (= name "glob")) 1 0)))))))
+
+(defn- unistr Values(sf/Val Str) [x: &sf/Val]
+  (if (sv/null? x) (null)
+    (let [z (text-of x)]
+      (loop [i 0 out ""]
+        (cond
+          (>= i (count z)) (ok (sf/->VText out))
+          (not= (nth z i) 92) (recur (+ i 1) (str out (chr (nth z i))))
+          :else
+          (let [c1 (if (< (+ i 1) (count z)) (nth z (+ i 1)) 0)
+                [n skip] (cond (= c1 92) (values -1 2) (hexd? c1) (values 4 1) (= c1 43) (values 6 2) (= c1 117) (values 4 2) (= c1 85) (values 8 2) :else (values 0 0))]
+            (cond
+              (= n -1) (recur (+ i 2) (str out "\\"))
+              (= n 0) (failure "invalid Unicode escape")
+              (> (+ (+ i skip) n) (count z)) (failure "invalid Unicode escape")
+              :else
+              (let [h (subs z (+ i skip) (+ (+ i skip) n))]
+                (if (not (loop [k 0] (cond (>= k n) true (hexd? (nth h k)) (recur (+ k 1)) :else false))) (failure "invalid Unicode escape")
+                  (let [v (loop [k 0 v 0] (if (>= k n) v (recur (+ k 1) (+ (* 16 v) (hexv (nth h k))))))]
+                    (recur (+ (+ i skip) n) (str out (utf8-char v)))))))))))))

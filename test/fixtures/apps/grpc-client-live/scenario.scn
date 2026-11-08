@@ -1,0 +1,223 @@
+%%% note
+gRPC コネクタ (mule-grpc-connector 1.0.4) のクライアントのストリーミングを、gRPC として正しく流す mulay の振る舞い (ADR 080)。
+実 Mule のコネクタは client-streaming と双方向を endClientStreaming まで送らず、応答も全部届いてから渡すので、この期待は
+実 Mule ではなく mulay で記録した (%%% oracle mulay)。メッセージが届くたびに listener に渡ること (1 つ目の要求の窓に
+echo 1 が出る)、相手が先に答える client-streaming、間の空く server-streaming、途中の失敗、Deadline を確かめる。
+%%% oracle mulay
+%%% port 18295
+%%% grpcserver 18294
+%%% mask
+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
+%%% request GET /bidi/Chat?id=q1&name=p log logwait=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": "q1",
+  "attrs": {
+    "endOfStream": false,
+    "messageSent": true,
+    "requestId": "q1"
+  }
+}
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"bidi": {"message": "echo","n": 1},"attrs": {"routingId": "B","endOfStream": false,"errorMessage": null,"error": false,"requestId": "q1"}}
+%%% request GET /bidi/Chat?id=q1&name=q log logwait=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": "q1",
+  "attrs": {
+    "endOfStream": false,
+    "messageSent": true,
+    "requestId": "q1"
+  }
+}
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"bidi": {"message": "echo","n": 2},"attrs": {"routingId": "B","endOfStream": false,"errorMessage": null,"error": false,"requestId": "q1"}}
+%%% request GET /bidi/Chat?id=q1&end=true log logwait=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": "q1",
+  "attrs": {
+    "endOfStream": true,
+    "messageSent": false,
+    "requestId": "q1"
+  }
+}
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"bidi": {"message": "","n": 0},"attrs": {"routingId": "B","endOfStream": true,"errorMessage": null,"error": false,"requestId": "q1"}}
+%%% request GET /bidi/ChatFail?id=q2&name=a log logwait=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": "q2",
+  "attrs": {
+    "endOfStream": false,
+    "messageSent": true,
+    "requestId": "q2"
+  }
+}
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"bidi": {"message": "echo","n": 1},"attrs": {"routingId": "B","endOfStream": false,"errorMessage": null,"error": false,"requestId": "q2"}}
+%%% request GET /bidi/ChatFail?id=q2&name=b log logwait=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": "q2",
+  "attrs": {
+    "endOfStream": false,
+    "messageSent": true,
+    "requestId": "q2"
+  }
+}
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"bidi": {"message": "","n": 0},"attrs": {"routingId": "B","endOfStream": false,"errorMessage": "ABORTED: chat stopped","error": true,"requestId": "q2"}}
+%%% request GET /bidi/ChatFail?id=q2&name=c&end=true log logwait=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": "q2",
+  "attrs": {
+    "endOfStream": true,
+    "messageSent": true,
+    "requestId": "q2"
+  }
+}
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"bidi": {"message": "echo","n": 1},"attrs": {"routingId": "B","endOfStream": false,"errorMessage": null,"error": false,"requestId": "q2"}}
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"bidi": {"message": "","n": 0},"attrs": {"routingId": "B","endOfStream": true,"errorMessage": null,"error": false,"requestId": "q2"}}
+%%% request GET /cs/SumWait?id=e1&name=a
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "GRPC:FAILED_PRECONDITION",
+  "description": "gRPC operation 'CLIENT_STREAMING' failed with status FAILED_PRECONDITION: too early\nAdditional Details:\n  Method: cs.C/SumEarly\n  RequestId: e1",
+  "acc": null
+}
+%%% request GET /cs/Sum?id=s1&name=x
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": {
+    "message": "",
+    "n": 0
+  },
+  "attrs": {
+    "endOfStream": false,
+    "messageSent": true,
+    "requestId": "s1"
+  }
+}
+%%% request GET /cs/Sum?id=s1&name=y&end=true
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": {
+    "message": "sum",
+    "n": 2
+  },
+  "attrs": {
+    "endOfStream": true,
+    "messageSent": true,
+    "requestId": "s1"
+  }
+}
+%%% request GET /iter/TicksSlow
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "acc": [
+    {
+      "message": "slow",
+      "n": 1
+    },
+    {
+      "message": "slow",
+      "n": 2
+    }
+  ]
+}
+%%% request GET /iter/TicksFail
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "GRPC:ABORTED",
+  "description": "gRPC operation 'SERVER_STREAMING' failed with status ABORTED: stopped\nMethod: cs.C/TicksFail",
+  "acc": [
+    {
+      "message": "tick",
+      "n": 1
+    },
+    {
+      "message": "tick",
+      "n": 2
+    }
+  ]
+}
+%%% request GET /iter/TicksDeny
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "GRPC:PERMISSION_DENIED",
+  "description": "gRPC operation 'SERVER_STREAMING' failed with status PERMISSION_DENIED: denied\nMethod: cs.C/TicksDeny",
+  "acc": [
+    
+  ]
+}
+%%% request GET /iter/Hang
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "GRPC:DEADLINE_EXCEEDED",
+  "description": "gRPC operation 'SERVER_STREAMING' failed with status DEADLINE_EXCEEDED: Deadline exceeded\nMethod: cs.C/Hang",
+  "acc": [
+    
+  ]
+}
+%%% request GET /cs/Hang?id=h1&name=a&end=true
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "GRPC:DEADLINE_EXCEEDED",
+  "description": "gRPC operation 'CLIENT_STREAMING' failed with status DEADLINE_EXCEEDED: Deadline exceeded\nAdditional Details:\n  Method: cs.C/HangSum\n  RequestId: h1",
+  "acc": null
+}
+%%% request GET /deleg log logwait=0.6
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": 36
+}
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"deleg": {"message": "slow","n": 1},"end": false,"error": false}
+%%% request GET /noop log logwait=1.5
+%%% response 200
+
+ok
+%%% log
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"deleg": {"message": "slow","n": 2},"end": false,"error": false}
+INFO org.mule.runtime.core.internal.processor.LoggerMessageProcessor: {"deleg": {"message": "","n": 0},"end": true,"error": false}
+%%% request GET /headers
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "message": ":authority: localhost:18294\n:method: POST\n:path: /cs.C/Headers\n:scheme: http\naccept: */*\ncontent-length: 8\ncontent-type: application/grpc\ngrpc-timeout: 1000m\nte: trailers\nuser-agent: Mule HTTP Client",
+  "n": 0
+}

@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""OTLP のメトリクス (ExportMetricsServiceRequest、protobuf) を読む道具。実 Mule と mulay の送るものを比べるのに使う。
+
+  otlp decode <file.bin>...      JSON にして出す (時刻も ID もそのまま)
+  otlp norm <file.bin>...        比べるための形: 時刻と service.instance.id と telemetry.sdk.* を除き、
+                                 OTel の SDK 自身の計測 (scope が io.opentelemetry.) を除き、scope・metric・点を並べ替える
+  otlp spans <file.bin>...       ExportTraceServiceRequest を JSON にして出す (ID は 16 進、時刻はそのまま)
+  otlp tree <file.bin>...        比べるための形: トレースごとにスパンを親子の木にして 1 行ずつ出す (トレースは中身の順)。ID と時刻、
+                                 スレッドと correlation.id の値は出さず、木の中の兄弟は始まりの順 (同じ名前が並ぶ所は
+                                 中身の順。scatter-gather の route は同時に走るため)
+  otlp serve <port> <dir>        POST /v1/metrics (と /v1/traces など、どのパスでも) を受けて <dir>/NNN.bin に保存し 200 を返す (HTTP/1.1)
+  otlp serve-grpc <port> <dir> [status [message]]
+                                 OTLP/gRPC (h2c) の Export を受けて <dir>/NNN.bin (枠を外し、gzip なら戻したもの) と
+                                 NNN.hdr (パス・ヘッダ・枠の圧縮の印) に保存する。status が 0 (既定) なら空の応答と
+                                 grpc-status 0 の trailer、それ以外は Trailers-Only (grpc-status と grpc-message) で返す
+
+.proto を使わず、opentelemetry-proto の field 番号で直接読む (metrics/v1/metrics.proto、trace/v1/trace.proto、common/v1、resource/v1)。
+"""
+import http.server
+import json
+import os
+import struct
+import sys
+
+
+def varint(b, i):
+    r = s = 0
+    while True:
+        c = b[i]
+        i += 1
+        r |= (c & 0x7f) << s
+        s += 7
+        if c < 0x80:
+            return r, i
+
+
+def fields(b):
+    i = 0
+    while i < len(b):
+        k, i = varint(b, i)
+        f, t = k >> 3, k & 7
+        if t == 0:
+            v, i = varint(b, i)
+        elif t == 1:
+            v = b[i:i + 8]
+            i += 8
+        elif t == 5:
+            v = b[i:i + 4]
+            i += 4
+        elif t == 2:
+            n, i = varint(b, i)
+            v = b[i:i + n]
+            i += n
+        else:
+            raise ValueError("wire type %d" % t)
+        yield f, t, v
+
+
+def any_value(b):
+    for f, t, v in fields(b):
+        if f == 1:
+            return v.decode()
+        if f == 2:
+            return bool(v)
+        if f == 3:
+            return v - (1 << 64) if v >= 1 << 63 else v
+        if f == 4:
+            return struct.unpack("<d", v)[0]
+        return "?%d" % f
+    return None
+
+
+def key_values(lst):
+    out = {}
+    for b in lst:
+        k, val = None, None
+        for f, t, v in fields(b):
+            if f == 1:
+                k = v.decode()
+            elif f == 2:
+                val = any_value(v)
+        out[k] = val
+    return out
+
+
+def number_point(b):
+    d, attrs = {}, []
+    for f, t, v in fields(b):
+        if f == 7:
+            attrs.append(v)
+        elif f == 2:
+            d["start"] = struct.unpack("<Q", v)[0]
+        elif f == 3:
+            d["time"] = struct.unpack("<Q", v)[0]
+        elif f == 6:
+            d["int"] = struct.unpack("<q", v)[0]
+        elif f == 4:
+            d["double"] = struct.unpack("<d", v)[0]
+        else:
+            d["f%d" % f] = v if t == 0 else v.hex()
+    d["attrs"] = key_values(attrs)
+    return d
+
+
+def histogram_point(b):
+    d, attrs = {}, []
+    for f, t, v in fields(b):
+        if f == 9:
+            attrs.append(v)
+        elif f == 2:
+            d["start"] = struct.unpack("<Q", v)[0]
+        elif f == 3:
+            d["time"] = struct.unpack("<Q", v)[0]
+        elif f == 4:
+            d["count"] = struct.unpack("<Q", v)[0]
+        elif f in (5, 11, 12):
+            d[{5: "sum", 11: "min", 12: "max"}[f]] = struct.unpack("<d", v)[0]
+        elif f == 6:
+            d["buckets"] = list(struct.unpack("<%dQ" % (len(v) // 8), v))
+        elif f == 7:
+            d["bounds"] = list(struct.unpack("<%dd" % (len(v) // 8), v))
+        else:
+            d["f%d" % f] = v if t == 0 else v.hex()
+    d["attrs"] = key_values(attrs)
+    return d
+
+
+def metric(b):
+    m = {}
+    for f, t, v in fields(b):
+        if f in (1, 2, 3):
+            m[{1: "name", 2: "description", 3: "unit"}[f]] = v.decode()
+        elif f in (5, 7, 9):
+            kind = {5: "gauge", 7: "sum", 9: "histogram"}[f]
+            s = {"kind": kind, "points": []}
+            for g, u, w in fields(v):
+                if g == 1:
+                    s["points"].append(histogram_point(w) if f == 9 else number_point(w))
+                elif g == 2:
+                    s["temporality"] = {1: "DELTA", 2: "CUMULATIVE"}.get(w, w)
+                elif g == 3:
+                    s["monotonic"] = bool(w)
+            m["data"] = s
+        else:
+            m["f%d" % f] = "?"
+    return m
+
+
+def request(b):
+    out = []
+    for f, t, rm in fields(b):
+        r = {"resource": {}, "scopes": []}
+        for g, u, w in fields(rm):
+            if g == 1:
+                r["resource"] = key_values([v for h, _, v in fields(w) if h == 1])
+            elif g == 2:
+                sc = {"scope": {}, "metrics": []}
+                for h, _, x in fields(w):
+                    if h == 1:
+                        sc["scope"] = {({1: "name", 2: "version"}.get(a, "f%d" % a)): (y.decode() if a in (1, 2) else y)
+                                       for a, _, y in fields(x)}
+                    elif h == 2:
+                        sc["metrics"].append(metric(x))
+                r["scopes"].append(sc)
+        out.append(r)
+    return out
+
+
+SPAN_KINDS = {0: "UNSPECIFIED", 1: "INTERNAL", 2: "SERVER", 3: "CLIENT", 4: "PRODUCER", 5: "CONSUMER"}
+STATUS_CODES = {0: "UNSET", 1: "OK", 2: "ERROR"}
+
+
+def span(b):
+    s = {"attrs": {}, "events": [], "links": []}
+    attrs = []
+    for f, t, v in fields(b):
+        if f == 1:
+            s["trace_id"] = v.hex()
+        elif f == 2:
+            s["span_id"] = v.hex()
+        elif f == 3:
+            s["trace_state"] = v.decode()
+        elif f == 4:
+            s["parent_span_id"] = v.hex()
+        elif f == 5:
+            s["name"] = v.decode()
+        elif f == 6:
+            s["kind"] = SPAN_KINDS.get(v, v)
+        elif f == 7:
+            s["start"] = struct.unpack("<Q", v)[0]
+        elif f == 8:
+            s["end"] = struct.unpack("<Q", v)[0]
+        elif f == 9:
+            attrs.append(v)
+        elif f == 11:
+            e = {"attrs": {}}
+            ea = []
+            for g, _, w in fields(v):
+                if g == 1:
+                    e["time"] = struct.unpack("<Q", w)[0]
+                elif g == 2:
+                    e["name"] = w.decode()
+                elif g == 3:
+                    ea.append(w)
+                else:
+                    e["f%d" % g] = w if isinstance(w, int) else w.hex()
+            e["attrs"] = key_values(ea)
+            s["events"].append(e)
+        elif f == 13:
+            ln = {}
+            for g, _, w in fields(v):
+                ln[{1: "trace_id", 2: "span_id", 3: "trace_state"}.get(g, "f%d" % g)] = w.hex() if g in (1, 2) else (w.decode() if g == 3 else w)
+            s["links"].append(ln)
+        elif f == 15:
+            st = {}
+            for g, _, w in fields(v):
+                if g == 2:
+                    st["message"] = w.decode()
+                elif g == 3:
+                    st["code"] = STATUS_CODES.get(w, w)
+            s["status"] = st
+        elif f == 16:
+            s["flags"] = struct.unpack("<I", v)[0]
+        else:
+            s["f%d" % f] = v if isinstance(v, int) else v.hex()
+    s["attrs"] = key_values(attrs)
+    return s
+
+
+def trace_request(b):
+    out = []
+    for f, t, rs in fields(b):
+        r = {"resource": {}, "scopes": []}
+        for g, u, w in fields(rs):
+            if g == 1:
+                r["resource"] = key_values([v for h, _, v in fields(w) if h == 1])
+            elif g == 2:
+                sc = {"scope": {}, "spans": []}
+                for h, _, x in fields(w):
+                    if h == 1:
+                        sc["scope"] = {({1: "name", 2: "version"}.get(a, "f%d" % a)): (y.decode() if a in (1, 2) else y)
+                                       for a, _, y in fields(x)}
+                    elif h == 2:
+                        sc["spans"].append(span(x))
+                r["scopes"].append(sc)
+            elif g == 3:
+                r["schema_url"] = w.decode()
+        out.append(r)
+    return out
+
+
+VOLATILE_SPAN_ATTRS = ("thread.start.name", "thread.end.name", "thread.start.id", "correlation.id")
+
+
+def tree_lines(reqs):
+    spans = [sp for r in reqs for sc in r["scopes"] for sp in sc["spans"]]
+    ids = {sp["span_id"] for sp in spans}
+    by_parent = {}
+    for sp in spans:
+        by_parent.setdefault(sp.get("parent_span_id", ""), []).append(sp)
+    for v in by_parent.values():
+        v.sort(key=lambda sp: (sp["start"], -sp["end"]))
+    roots = sorted([sp for sp in spans if sp.get("parent_span_id", "") not in ids], key=lambda sp: sp["start"])
+    out = []
+
+    def render(sp, depth):
+        a = {k: v for k, v in sp["attrs"].items() if k not in VOLATILE_SPAN_ATTRS}
+        has = [k for k in VOLATILE_SPAN_ATTRS if k in sp["attrs"]]
+        st = sp.get("status", {})
+        line = "  " * depth + "%s [%s]" % (sp["name"], sp["kind"])
+        if st:
+            line += " status=%s" % json.dumps(st, ensure_ascii=False, sort_keys=True)
+        line += " " + json.dumps(a, ensure_ascii=False, sort_keys=True)
+        if has:
+            line += " +" + ",".join(has)
+        lines = [line]
+        for e in sp["events"]:
+            lines.append("  " * depth + "  ! %s %s" % (e.get("name"), json.dumps(e["attrs"], ensure_ascii=False, sort_keys=True)))
+        for ln in sp["links"]:
+            lines.append("  " * depth + "  ~ link")
+        kids = [(c["name"], render(c, depth + 1)) for c in by_parent.get(sp["span_id"], [])]
+        i = 0
+        while i < len(kids):
+            j = i
+            while j < len(kids) and kids[j][0] == kids[i][0]:
+                j += 1
+            kids[i:j] = sorted(kids[i:j], key=lambda k: k[1])
+            i = j
+        for _, ls in kids:
+            lines += ls
+        return lines
+
+    blocks = []
+    for r in roots:
+        remote = r.get("parent_span_id", "")
+        head = "%s flags=%s%s" % (" remote-parent" if remote else "", r.get("flags"),
+                                  " state=" + r["trace_state"] if r.get("trace_state") else "")
+        blocks.append((render(r, 1), head))
+    blocks.sort()
+    for n, (ls, head) in enumerate(blocks):
+        out.append("# trace %d%s" % (n + 1, head))
+        out += ls
+    return out
+
+
+def normalize(reqs):
+    out = []
+    for r in reqs:
+        res = {k: v for k, v in r["resource"].items()
+               if k != "service.instance.id" and not k.startswith("telemetry.sdk.")}
+        scopes = []
+        for sc in r["scopes"]:
+            if sc["scope"].get("name", "").startswith("io.opentelemetry."):
+                continue
+            ms = []
+            for m in sc["metrics"]:
+                m = dict(m)
+                if "data" in m:
+                    d = dict(m["data"])
+                    pts = []
+                    for p in d["points"]:
+                        pts.append({k: v for k, v in p.items() if k not in ("start", "time")})
+                    d["points"] = sorted(pts, key=lambda p: json.dumps(p["attrs"], sort_keys=True))
+                    m["data"] = d
+                ms.append(m)
+            scopes.append({"scope": sc["scope"], "metrics": sorted(ms, key=lambda m: m.get("name", ""))})
+        if scopes:
+            out.append({"resource": res, "scopes": sorted(scopes, key=lambda s: s["scope"].get("name", ""))})
+    return out
+
+
+def serve(port, d):
+    os.makedirs(d, exist_ok=True)
+    n = [len([f for f in os.listdir(d) if f.endswith(".bin")])]
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            b = self.rfile.read(int(self.headers.get("content-length", 0)))
+            n[0] += 1
+            p = os.path.join(d, "%03d" % n[0])
+            with open(p + ".bin", "wb") as f:
+                f.write(b)
+            with open(p + ".hdr", "w") as f:
+                f.write(self.path + "\n" + str(self.headers))
+            self.send_response(200)
+            self.send_header("content-type", "application/x-protobuf")
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+
+
+def serve_grpc(port, d, status=0, message=""):
+    import gzip, socket, threading
+    import h2.config, h2.connection, h2.events
+    os.makedirs(d, exist_ok=True)
+    n = [len([f for f in os.listdir(d) if f.endswith(".bin")])]
+    lock = threading.Lock()
+
+    def save(path, hs, body):
+        flag, ln = body[0], struct.unpack(">I", body[1:5])[0]
+        msg = body[5:5 + ln]
+        if flag == 1:
+            msg = gzip.decompress(msg)
+        with lock:
+            n[0] += 1
+            p = os.path.join(d, "%03d" % n[0])
+        with open(p + ".bin", "wb") as f:
+            f.write(msg)
+        with open(p + ".hdr", "w") as f:
+            f.write(path + "\n" + "".join("%s: %s\n" % (k, v) for k, v in hs if not k.startswith(":"))
+                    + "frame-compressed: %d\nframe-length: %d\nbody-length: %d\n" % (flag, ln, len(body)))
+
+    def handle(sock):
+        conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False, header_encoding="utf-8"))
+        conn.initiate_connection()
+        sock.sendall(conn.data_to_send())
+        streams = {}
+        try:
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    return
+                for ev in conn.receive_data(data):
+                    if isinstance(ev, h2.events.RequestReceived):
+                        streams[ev.stream_id] = [list(ev.headers), b""]
+                    elif isinstance(ev, h2.events.DataReceived):
+                        streams[ev.stream_id][1] += ev.data
+                        conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                    elif isinstance(ev, h2.events.StreamEnded):
+                        hs, body = streams.pop(ev.stream_id)
+                        save(dict(hs).get(":path", ""), hs, body)
+                        base = [(":status", "200"), ("content-type", "application/grpc")]
+                        if status == 0:
+                            conn.send_headers(ev.stream_id, base)
+                            conn.send_data(ev.stream_id, b"\x00\x00\x00\x00\x00")
+                            conn.send_headers(ev.stream_id, [("grpc-status", "0")], end_stream=True)
+                        else:
+                            conn.send_headers(ev.stream_id, base + [("grpc-status", str(status)), ("grpc-message", message)],
+                                              end_stream=True)
+                sock.sendall(conn.data_to_send())
+        finally:
+            sock.close()
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(16)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] in ("decode", "norm"):
+        for p in argv[1:]:
+            with open(p, "rb") as f:
+                reqs = request(f.read())
+            print(json.dumps(normalize(reqs) if argv[0] == "norm" else reqs, ensure_ascii=False, indent=1, sort_keys=argv[0] == "norm"))
+        return 0
+    if len(argv) >= 2 and argv[0] == "tree":
+        reqs = []
+        for p in argv[1:]:
+            with open(p, "rb") as f:
+                reqs += trace_request(f.read())
+        print("\n".join(tree_lines(reqs)))
+        return 0
+    if len(argv) >= 2 and argv[0] == "spans":
+        for p in argv[1:]:
+            with open(p, "rb") as f:
+                print(json.dumps(trace_request(f.read()), ensure_ascii=False, indent=1))
+        return 0
+    if len(argv) == 3 and argv[0] == "serve":
+        serve(int(argv[1]), argv[2])
+        return 0
+    if 3 <= len(argv) <= 5 and argv[0] == "serve-grpc":
+        serve_grpc(int(argv[1]), argv[2], int(argv[3]) if len(argv) > 3 else 0, argv[4] if len(argv) > 4 else "")
+        return 0
+    sys.stderr.write(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

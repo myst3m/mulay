@@ -1,0 +1,202 @@
+(ns avro-test (:require [mulay.lib.avro :as a] [mulay.lib.ieee :as ieee] [avro-golden-data :as g]))
+
+(def HEXD "0123456789abcdef")
+
+(defn- hexb Str [n: Int]
+  (str (subs HEXD (quot n 16) (+ (quot n 16) 1)) (subs HEXD (mod n 16) (+ (mod n 16) 1))))
+
+(defn- hex Str [s: &Str]
+  (loop [i 0 o ""] (if (>= i (count s)) o (recur (+ i 1) (str o (hexb (nth s i)))))))
+
+(defn- hexn Str [n: Int digits: Int]
+  (loop [i (- digits 1) o ""]
+    (if (< i 0) o (recur (- i 1) (let [d (bit-and (unsigned-bit-shift-right n (* 4 i)) 15)] (str o (subs HEXD d (+ d 1))))))))
+
+(defn- plain? Bool [s: &Str]
+  (loop [i 0] (cond (>= i (count s)) true
+                    (let [c (nth s i)] (or (< c 32) (> c 126) (= c 34) (= c 92))) false
+                    :else (recur (+ i 1)))))
+
+(defn- dump-str Str [s: &Str] (if (plain? s) (str "\"" s "\"") (str "x:" (hex s))))
+
+(defn- dump Str [out: Str v: &a/AVal]
+  (match v
+    (a/ANull) (str out "null")
+    (a/ABool b) (str out (if b "true" "false"))
+    (a/AInt i) (str out i "i")
+    (a/ALong l) (str out l "L")
+    (a/AFloat f) (let [h (hexn (ieee/float32->bits f) 8)] (str out "f" h))
+    (a/ADouble x) (let [h (hexn (float->bits x) 16)] (str out "d" h))
+    (a/AStr s) (let [t (dump-str s)] (str out t))
+    (a/ABytes bs) (let [h (hex bs)] (str out "b:" h))
+    (a/AFixed n bs) (let [h (hex bs)] (str out "F:" h))
+    (a/AEnum n sy) (str out "E:" sy)
+    (a/AArr items) (let [o (loop [i 0 o (str out "[")] (if (>= i (count items)) o (recur (+ i 1) (dump (if (= i 0) o (str o ",")) (nth items i)))))] (str o "]"))
+    (a/AMap ks vs) (let [o (loop [i 0 o (str out "{")]
+                            (if (>= i (count ks)) o
+                              (let [k (dump-str (nth ks i)) o1 (str (if (= i 0) o (str o ",")) k "=")]
+                                (recur (+ i 1) (dump o1 (nth vs i))))))]
+                    (str o "}"))
+    (a/ARec n ks vs) (let [o (loop [i 0 o (str out "{")] (if (>= i (count vs)) o (recur (+ i 1) (dump (if (= i 0) o (str o ",")) (nth vs i)))))] (str o "}"))))
+
+(defn- schema-of a/Schema [text: &Str]
+  (let [[s e] (a/parse-schema text)] s))
+
+(defn- check-encode Vec(Str) []
+  (loop [i 0 bad: Vec(Str) []]
+    (if (>= i (count g/CASES)) bad
+      (let [c: g/GCase (nth g/CASES i)
+            [s pe] (a/parse-schema (:schema c))
+            [out oe] (a/encode s (:value c))
+            h (hex out)]
+        (recur (+ i 1) (cond (not= pe "") (conj bad (str (:name c) ": parse " pe))
+                             (not= oe "") (conj bad (str (:name c) ": encode " oe))
+                             (not= h (:hex c)) (conj bad (str (:name c) ": got " h " want " (:hex c)))
+                             :else bad))))))
+
+(defn- check-decode Vec(Str) []
+  (loop [i 0 bad: Vec(Str) []]
+    (if (>= i (count g/CASES)) bad
+      (let [c: g/GCase (nth g/CASES i)
+            [s pe] (a/parse-schema (:schema c))
+            bytes (g/bx (:hex c))
+            [v p de] (a/decode s bytes 0)
+            d (dump "" v)]
+        (recur (+ i 1) (cond (not= de "") (conj bad (str (:name c) ": decode " de))
+                             (not= p (count bytes)) (conj bad (str (:name c) ": end " p " of " (count bytes)))
+                             (not= d (:dump c)) (conj bad (str (:name c) ": got " d " want " (:dump c)))
+                             :else bad))))))
+
+(defn- check-prefixes Vec(Str) []
+  (loop [i 0 bad: Vec(Str) []]
+    (if (>= i (count g/CASES)) bad
+      (let [c: g/GCase (nth g/CASES i)
+            s (schema-of (:schema c))
+            bytes (g/bx (:hex c))
+            nb (loop [k 0 acc: Vec(Str) bad]
+                 (if (>= k (count bytes)) acc
+                   (let [[v p de] (a/decode s (subs bytes 0 k) 0)]
+                     (recur (+ k 1) (if (not= de "") acc (conj acc (str (:name c) ": prefix " k " decoded")))))))]
+        (recur (+ i 1) nb)))))
+
+(defn- check-errors Vec(Str) []
+  (loop [i 0 bad: Vec(Str) []]
+    (if (>= i (count g/ECASES)) bad
+      (let [c: g/ECase (nth g/ECASES i)
+            [s pe] (a/parse-schema (:schema c))
+            [out oe] (a/encode s (:value c))]
+        (recur (+ i 1) (cond (not= pe "") (conj bad (str (:name c) ": parse " pe))
+                             (not= oe (:err c)) (conj bad (str (:name c) ":\n   got  " oe "\n   want " (:err c)))
+                             :else bad))))))
+
+(defn- check-dcases Vec(Str) []
+  (loop [i 0 bad: Vec(Str) []]
+    (if (>= i (count g/DCASES)) bad
+      (let [c (nth g/DCASES i)
+            s (schema-of (nth c 1))
+            bytes (g/bx (nth c 2))
+            [v p de] (a/decode s bytes 0)
+            d (dump "" v)]
+        (recur (+ i 1) (cond (not= de (nth c 3)) (conj bad (str (nth c 0) ": err got " de " want " (nth c 3)))
+                             (and (= de "") (not= d (nth c 4))) (conj bad (str (nth c 0) ": got " d " want " (nth c 4)))
+                             :else bad))))))
+
+(defn- check-parse Vec(Str) []
+  (loop [i 0 bad: Vec(Str) []]
+    (if (>= i (count g/PCASES)) bad
+      (let [c (nth g/PCASES i)
+            [s pe] (a/parse-schema (nth c 0))
+            j (if (= pe "") (a/schema->json s) "")]
+        (recur (+ i 1) (cond (not= pe (nth c 1)) (conj bad (str (nth c 0) ":\n   got  " pe "\n   want " (nth c 1)))
+                             (not= j (nth c 2)) (conj bad (str (nth c 0) ":\n   got  " j "\n   want " (nth c 2)))
+                             :else bad))))))
+
+(deftest encode-matches-java
+  (let [bad (check-encode)] (is (= bad []))))
+
+(deftest decode-matches-java
+  (let [bad (check-decode)] (is (= bad []))))
+
+(deftest truncated-input-is-an-error
+  (let [bad (check-prefixes)] (is (= bad []))))
+
+(deftest encode-errors-match-java
+  (let [bad (check-errors)] (is (= bad []))))
+
+(deftest decode-cases-match-java
+  (let [bad (check-dcases)] (is (= bad []))))
+
+(deftest schema-parse-matches-java
+  (let [bad (check-parse)] (is (= bad []))))
+
+(deftest case-counts
+  (let [n (count g/CASES)]
+    (is (> n 130))
+    (is (> (count g/ECASES) 80))
+    (is (> (count g/DCASES) 49))
+    (is (> (count g/PCASES) 70))))
+
+(deftest accessors
+  (let [[s e] (a/parse-schema "{\"type\":\"record\",\"name\":\"R\",\"namespace\":\"n\",\"fields\":[{\"name\":\"a\",\"type\":[\"null\",\"string\"]},{\"name\":\"b\",\"type\":{\"type\":\"array\",\"items\":\"long\"}},{\"name\":\"c\",\"type\":\"R\"}]}")
+        r (a/root s)
+        fs (a/node-fields s r)]
+    (is (= e ""))
+    (is (= (a/node-kind s r) a/K-RECORD))
+    (is (= (a/node-name s r) "R"))
+    (is (= (a/node-fullname s r) "n.R"))
+    (is (= (count fs) 3))
+    (is (= (:name (nth fs 0)) "a"))
+    (is (= (:name (nth fs 2)) "c"))
+    (is (= (:schema (nth fs 2)) r))
+    (is (= (a/node-kind s (:schema (nth fs 0))) a/K-UNION))
+    (is (= (count (a/node-branches s (:schema (nth fs 0)))) 2))
+    (is (= (a/node-kind s (nth (a/node-branches s (:schema (nth fs 0))) 1)) a/K-STRING))
+    (is (= (a/node-kind s (a/node-items s (:schema (nth fs 1)))) a/K-LONG))
+    (is (= (a/find-named s "n.R") r))
+    (is (= (a/find-named s "R") -1))))
+
+(deftest decode-at-offset
+  (let [s (schema-of "\"string\"")
+        bytes (str "xx" (g/bx "0261") "yy")
+        [v p e] (a/decode s bytes 2)]
+    (is (= e ""))
+    (is (= p 4))
+    (is (= (dump "" v) "\"a\""))
+    (is (= (let [[v2 p2 e2] (a/decode s bytes 9)] e2) a/EOF-MSG))
+    (is (= (let [[v2 p2 e2] (a/decode s bytes -1)] e2) a/EOF-MSG))))
+
+(deftest hostile-lengths-do-not-abort
+  (let [s (schema-of "\"string\"")
+        t (schema-of "{\"type\":\"array\",\"items\":\"string\"}")
+        m (schema-of "{\"type\":\"map\",\"values\":\"bytes\"}")]
+    (is (not= (let [[v p e] (a/decode s (g/bx "feffffff0f") 0)] e) ""))
+    (is (not= (let [[v p e] (a/decode s (g/bx "ffffffff0f") 0)] e) ""))
+    (is (not= (let [[v p e] (a/decode s (g/bx "808080808010") 0)] e) ""))
+    (is (not= (let [[v p e] (a/decode t (g/bx "feffffffffffffffff01") 0)] e) ""))
+    (is (not= (let [[v p e] (a/decode t (g/bx "ffffffffffffffff7f") 0)] e) ""))
+    (is (not= (let [[v p e] (a/decode m (g/bx "0201fe") 0)] e) ""))
+    (is (not= (let [[v p e] (a/decode m (g/bx "ffffffffffffffffff01") 0)] e) ""))))
+
+(deftest recursion-is-bounded
+  (let [s (schema-of "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"r\",\"type\":\"R\"}]}")
+        [v p e] (a/decode s "" 0)
+        deep (loop [i 0 x (a/->ARec "R" [] [])] (if (>= i 3000) x (recur (+ i 1) (a/->ARec "R" ["r"] [x]))))
+        [out oe] (a/encode s deep)]
+    (is (= e a/DEEP-MSG))
+    (is (= oe a/DEEP-MSG))))
+
+(deftest zero-width-items-are-capped
+  (let [s (schema-of "{\"type\":\"array\",\"items\":\"null\"}")
+        [v p e] (a/decode s (g/bx "feffffff0f00") 0)]
+    (is (not= e ""))))
+
+(deftest schema-text-edge-cases
+  (let [[s1 e1] (a/parse-schema "")
+        [s2 e2] (a/parse-schema "  ")
+        [s3 e3] (a/parse-schema "{\"type\":")
+        [s4 e4] (a/parse-schema "[\"null\",\"int\"]")]
+    (is (= e1 "Cannot parse <null> schema"))
+    (is (= e2 "Cannot parse <null> schema"))
+    (is (not= e3 ""))
+    (is (= e4 ""))
+    (is (= (a/schema->json s4) "[\"null\",\"int\"]"))))

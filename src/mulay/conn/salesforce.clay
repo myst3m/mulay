@@ -1,0 +1,915 @@
+(ns mulay.conn.salesforce
+  (:require [mulay.dw.val :as v] [mulay.conn.sf_headers :as sh] [mulay.dw.rt :as drt] [mulay.dw.fmt.registry :as reg] [mulay.mule.model :as m]
+            [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.rt.stream :as stream] [mulay.lib.xml :as xml]
+            [mulay.lib.jhash :as jh] [mulay.lib.time.types :as tt] [mulay.lib.time.zoned :as zt] [mulay.lib.time.iso :as iso]
+            [mulay.lib.numparse :as npz] [mulay.dw.coerce_time :as ct] [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]
+            [mulay.conn.sf_core :as sc] [mulay.conn.http :as h] [mulay.conn.httpmsg :as hx] [mulay.conn.sf_meta :as sm] [mulay.conn.sf_apex :as sa] [mulay.conn.sf_stream :as ss]))
+
+(def ITEM-KEYS ["exception" "message" "payload" "id" "successful" "statusCode"])
+(def EXC-KEYS ["localizedMessage" "cause" "message" "stackTrace" "suppressed"])
+
+(defn- bulk-item-of v/Val [r: &xml/XNode upsert: Bool bulk1: Bool]
+  (let [ok (= (sc/text-of r "success") "true")
+        es (sc/kids r "errors")
+        errs (loop [i 0 acc: Vec(v/Val) []]
+               (if (>= i (count es)) acc
+                 (let [e (nth es i)] (recur (+ i 1) (conj acc (sc/obj-in sc/ERROR-KEYS [(v/null-v) (sc/sval e "message") (sc/texts e "fields") (sc/sval e "statusCode")]))))))
+        id (if (and bulk1 (= (sc/text-of r "id") "")) (v/null-v) (sc/sval r "id"))
+        errv (if (and bulk1 (= (count errs) 0)) (v/null-v) (v/->VArr errs))
+        payload (if upsert (sc/obj-in ["created" "success" "id" "errors"] [(sc/bval r "created") (v/bool-v ok) id errv])
+                  (sc/obj-in ["success" "id" "errors"] [(v/bool-v ok) id errv]))
+        first-msg (if (= (count es) 0) "" (sc/text-of (nth es 0) "message"))
+        first-code (if (= (count es) 0) "" (sc/text-of (nth es 0) "statusCode"))
+        exc (if ok (v/null-v)
+              (let [m (v/->VStr (str first-msg " " first-code))]
+                (sc/obj-in EXC-KEYS [m (v/null-v) m (v/->VArr []) (v/->VArr [])])))]
+    (sc/obj-in ITEM-KEYS [exc (if ok (v/null-v) (v/->VStr first-msg)) payload id (v/bool-v ok) (if ok (v/null-v) (v/->VStr first-code))])))
+
+(defn- bulk-item v/Val [r: &xml/XNode upsert: Bool]
+  (bulk-item-of r upsert false))
+
+(defn- bulk-result-of v/Val [resp: &xml/XNode upsert: Bool bulk1: Bool]
+  (let [rs (sc/kids resp "result")
+        items (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count rs)) acc (recur (+ i 1) (conj acc (bulk-item-of (nth rs i) upsert bulk1)))))
+        all-ok (loop [i 0] (if (>= i (count rs)) true (if (= (sc/text-of (nth rs i) "success") "true") (recur (+ i 1)) false)))]
+    (sc/obj-in ["id" "items" "successful"] [(v/null-v) (v/->VArr items) (v/bool-v all-ok)])))
+
+(defn- bulk-result v/Val [resp: &xml/XNode upsert: Bool]
+  (bulk-result-of resp upsert false))
+
+(def TOP-KEYS ["updateable" "mruEnabled" "childRelationships" "recordTypeInfos" "deprecatedAndHidden" "searchLayoutable" "deletable"
+               "replicateable" "actionOverrides" "urlEdit" "mergeable" "feedEnabled" "compactLayoutable" "networkScopeFieldName"
+               "customSetting" "urlDetail" "layoutable" "custom" "undeletable" "activateble" "label" "keyPrefix" "searchable"
+               "namedLayoutInfos" "urlNew" "queryable" "createable" "retrieveable" "name" "fields" "labelPlural" "triggerable"])
+
+(def FIELD-KEYS ["nullable" "defaultValue" "precision" "nameField" "required" "relationshipName" "deprecateAndHidden" "controllerName"
+                 "namePointing" "defaultValueFormula" "calculated" "writeRequiresMasterRead" "inlineHelpText" "picklistValues"
+                 "filterable" "maskType" "caseSensitive" "referenceTo" "unique" "name" "highScaleNumber" "fieldType" "idLookup"
+                 "displayLocationInDecimal" "defaultedOnCreate" "updateable" "searchFilterable" "byteLength" "scale" "permissinable"
+                 "polymorphicForeignKey" "htmlFormatted" "dependentPickList" "referenceTargetField" "mask" "relationshipOrder" "custom"
+                 "length" "label" "sortable" "filteredLookupInfo" "restrictedPicklist" "createable" "encrypted" "autonumber" "groupable"
+                 "extraTypeInfo" "formula" "digits"])
+
+(defn- soap-name Str [k: &Str]
+  (cond (= k "nullable") "nillable" (= k "deprecateAndHidden") "deprecatedAndHidden" (= k "fieldType") "type"
+        (= k "searchFilterable") "searchPrefilterable" (= k "permissinable") "permissionable" (= k "dependentPickList") "dependentPicklist"
+        (= k "autonumber") "autoNumber" (= k "formula") "calculatedFormula" (= k "activateble") "activateable" (= k "undeleteable") "undeletable"
+        :else (str k)))
+
+(def NUM-KEYS ["precision" "byteLength" "scale" "relationshipOrder" "length" "digits" "maxBatchSize"])
+(def STR-KEYS ["relationshipName" "controllerName" "defaultValueFormula" "inlineHelpText" "maskType" "name" "referenceTargetField" "mask"
+               "label" "extraTypeInfo" "formula" "urlEdit" "networkScopeFieldName" "urlDetail" "keyPrefix" "urlNew" "labelPlural" "encoding"
+               "defaultValue" "filteredLookupInfo"])
+
+(defn- in? Bool [xs: &Vec(Str) k: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) k) true (recur (+ i 1))))))
+
+(defn- pojo-val v/Val [n: &xml/XNode k: &Str]
+  (let [sk (soap-name k)]
+    (cond
+      (= k "required") (v/bool-v false)
+      (= k "fieldType") (let [t (sc/text-of n sk)] (if (= t "") (v/null-v) (v/->VStr (str/upper-case t))))
+      (= k "referenceTo") (sc/texts n sk)
+      (= k "picklistValues") (picklist n)
+      (= k "childRelationships") (list-of n sk ["deprecatedAndHidden" "junctionReferenceTo" "junctionIdListNames" "childSObject" "relationshipName" "field" "cascadeDelete"])
+      (= k "recordTypeInfos") (list-of n sk ["defaultRecordTypeMapping" "available" "master" "name" "id"])
+      (or (= k "junctionReferenceTo") (= k "junctionIdListNames")) (sc/texts n sk)
+      (or (= k "actionOverrides") (= k "namedLayoutInfos")) (plain-list n sk)
+      (= k "id") (sc/sval n "recordTypeId")
+      (= k "validFor") (sc/sval n sk)
+      (in? NUM-KEYS k) (sc/ival n sk)
+      (in? STR-KEYS k) (sc/sval n sk)
+      (or (= k "childSObject") (= k "field")) (sc/sval n sk)
+      :else (sc/bval n sk))))
+
+(defn- picklist v/Val [n: &xml/XNode]
+  (let [es (sc/kids n "picklistValues")]
+    (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                (if (>= i (count es)) acc
+                  (let [e (nth es i)]
+                    (recur (+ i 1) (conj acc (sc/obj-in ["validFor" "defaultValue" "active" "label" "value"]
+                                                     [(sc/sval e "validFor") (sc/bval e "defaultValue") (sc/bval e "active") (sc/sval e "label") (sc/sval e "value")])))))))))
+
+(defn- list-of v/Val [n: &xml/XNode local: &Str keys: Vec(Str)]
+  (let [es (sc/kids n local)]
+    (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                (if (>= i (count es)) acc
+                  (recur (+ i 1) (conj acc (pojo-obj (nth es i) keys))))))))
+
+(defn- plain-list v/Val [n: &xml/XNode local: &Str]
+  (let [es (sc/kids n local)] (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count es)) acc (recur (+ i 1) (conj acc (sc/sobject-val (nth es i)))))))))
+
+(defn- pojo-obj v/Val [n: &xml/XNode keys: &Vec(Str)]
+  (sc/obj-in keys (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count keys)) acc (recur (+ i 1) (conj acc (pojo-val n (nth keys i))))))))
+
+(defn- describe-val v/Val [r: &xml/XNode]
+  (let [vals (loop [i 0 acc: Vec(v/Val) []]
+               (if (>= i (count TOP-KEYS)) acc
+                 (let [k (nth TOP-KEYS i)]
+                   (recur (+ i 1) (conj acc (if (= k "fields") (list-of r "fields" FIELD-KEYS) (pojo-val r k)))))))]
+    (v/->VMeta (sc/obj-in TOP-KEYS vals) [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.metadata.DescribeSObjectResult"))])))
+
+(def GLOBAL-KEYS ["mruEnabled" "updateable" "activateable" "deprecatedAndHidden" "layoutable" "custom" "deletable" "replicateable" "label"
+                  "keyPrefix" "searchable" "queryable" "mergeable" "createable" "feedEnabled" "retrieveable" "undeleteable" "name"
+                  "customSetting" "labelPlural" "triggerable"])
+
+(defn- global-val v/Val [r: &xml/XNode]
+  (let [ss (sc/kids r "sobjects")
+        objs (loop [i 0 acc: Vec(v/Val) []]
+               (if (>= i (count ss)) acc
+                 (let [s (nth ss i)
+                       vals (loop [k 0 a: Vec(v/Val) []]
+                              (if (>= k (count GLOBAL-KEYS)) a
+                                (let [key (nth GLOBAL-KEYS k)]
+                                  (recur (+ k 1) (conj a (if (in? STR-KEYS key) (sc/sval s key) (sc/bval s (soap-name key))))))))]
+                   (recur (+ i 1) (conj acc (sc/obj-in GLOBAL-KEYS vals))))))]
+    (v/->VMeta (sc/obj-in ["encoding" "maxBatchSize" "sobjects"] [(sc/sval r "encoding") (sc/ival r "maxBatchSize") (v/->VArr objs)])
+               [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.metadata.DescribeGlobalResult"))])))
+
+(def USER-KEYS ["accessibilityMode" "userLocale" "organizationName" "roleId" "userFullName" "currencySymbol" "userName" "userId"
+                "userTimeZone" "userLanguage" "organizationId" "organizationMultiCurrency" "sessionSecondsValid" "orgAttachmentFileSizeLimit"
+                "profileId" "userDefaultCurrencyIsoCode" "orgDefaultCurrencyIsoCode" "orgDefaultCurrencyLocale" "orgDisallowHtmlAttachments"
+                "userEmail" "userUiSkin" "orgHasPersonAccounts" "userType"])
+
+(defn- user-val v/Val [r: &xml/XNode]
+  (let [vals (loop [i 0 acc: Vec(v/Val) []]
+               (if (>= i (count USER-KEYS)) acc
+                 (let [k (nth USER-KEYS i)]
+                   (recur (+ i 1) (conj acc (cond (in? ["accessibilityMode" "organizationMultiCurrency" "orgDisallowHtmlAttachments" "orgHasPersonAccounts"] k) (sc/bval r k)
+                                                  (in? ["sessionSecondsValid" "orgAttachmentFileSizeLimit"] k) (sc/ival r k)
+                                                  :else (sc/sval r k)))))))]
+    (v/->VMeta (sc/obj-in USER-KEYS vals) [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.utility.GetUserInfoResult"))])))
+
+(defn- text-val Str [x: &v/Val] (sc/field-text x))
+
+(defn bind-params Str [q: &Str ps: &v/Val esc: Bool]
+  (match ps
+    (v/VObj fs)
+    (let [idx (loop [i 0 acc: Vec(Int) []]
+                (if (>= i (count fs)) acc
+                  (let [n (count (:name (:key (nth fs i))))
+                        k (loop [j (count acc)] (if (and (> j 0) (< (count (:name (:key (nth fs (nth acc (- j 1)))))) n)) (recur (- j 1)) j))]
+                    (recur (+ i 1) (ins acc k i)))))]
+      (loop [i 0 out (str q)]
+        (if (>= i (count idx)) out
+          (let [f (nth fs (nth idx i))]
+            (recur (+ i 1) (str/replace out (str ":" (:name (:key f)))
+                                        (let [t (text-val (:value f))] (if esc (sc/escape-param t) t))))))))
+    _ (str q)))
+
+(defn- escape? Bool [c: &conn/OpCall] (= (lit c "escapeSpecialCharactersForParametersValue" "false") "true"))
+
+(defn- ins Vec(Int) [v: Vec(Int) k: Int x: Int]
+  (loop [i 0 out: Vec(Int) []]
+    (cond (> i (count v)) out
+          (= i k) (recur (+ i 1) (if (< i (count v)) (conj (conj out x) (nth v i)) (conj out x)))
+          :else (recur (+ i 1) (if (< i (count v)) (conj out (nth v i)) out)))))
+
+(defn- run-query conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config all: Bool hdr: &Str]
+  (let [[qv x1] (sc/child-val c "salesforce-query")
+        [pv x2] (let [p (conn/param (:exprs c) "parameters")]
+                  (if (= (count p) 0) (values (v/null-v) [])
+                    (let [[x e] ((:eval c) (nth p 0) (:event c))] (if (not= e "") (values (v/null-v) [(err/mk "MULE" "EXPRESSION" e)]) (values (v/unmeta x) [])))))]
+    (cond
+      (> (count x1) 0) (conn/fail-result (nth x1 0))
+      (> (count x2) 0) (conn/fail-result (nth x2 0))
+      :else
+      (let [q (bind-params (text-val qv) pv (escape? c))
+            [r x] (sc/soap-h cache cfg hdr (str "<urn:" (if all "queryAll" "query") "><urn:queryString>" (sc/xml-esc q) "</urn:queryString></urn:" (if all "queryAll" "query") ">"))]
+        (if (> (count x) 0) (conn/fail-result (nth x 0))
+          (let [[recs ex] (collect-records cache cfg r [] hdr)]
+            (if (> (count ex) 0) (conn/fail-result (nth ex 0))
+              (conn/ok-result (ev/tv-val (v/->VMeta (v/->VArr recs) [(v/field "class" (v/->VStr "org.mule.runtime.core.internal.streaming.object.ManagedCursorIteratorProvider"))]) ev/JAVA) (ev/tv-null)))))))))
+
+(defn- collect-records Values(Vec(v/Val) Vec(err/MErr)) [cache: &Atom cfg: &m/Config resp: &xml/XNode acc0: Vec(v/Val) hdr: &Str]
+  (let [res (sc/kid resp "result")]
+    (if (= (count res) 0) (values acc0 [])
+      (let [r (nth res 0)
+            rs (sc/kids r "records")
+            acc (loop [i 0 a acc0] (if (>= i (count rs)) a (recur (+ i 1) (conj a (sc/sobject-val (nth rs i))))))
+            loc (sc/text-of r "queryLocator")]
+        (if (or (= (sc/text-of r "done") "true") (= loc "")) (values acc [])
+          (let [[r2 x] (sc/soap-h cache cfg hdr (str "<urn:queryMore><urn:queryLocator>" (sc/xml-esc loc) "</urn:queryLocator></urn:queryMore>"))]
+            (if (> (count x) 0) (values acc x) (collect-records cache cfg r2 acc hdr))))))))
+
+(defn- records Values(Vec(v/Val) Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [[x0 src e] (sc/child-val-src c local)
+        x (v/unmeta x0)]
+    (cond (> (count e) 0) (values [] e)
+          :else (match x
+                  (v/VArr xs) (values xs [])
+                  (v/VNull) (values [] [])
+                  _ (values [] [(err/mk "MULE" "EXPRESSION" (str "\"Cannot coerce " (v/type-name x) " (" (ct/show-val x0) ") to Array\" evaluating expression: \"" src "\"."))])))))
+
+(defn- send-null Bool [cfg: &m/Config] (= (conn/param-lit (:params cfg) "sendNullValues" "false") "true"))
+
+(defn- run-save conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config op: &Str hdr: &Str]
+  (let [[rs x] (records c "records")
+        [type tx] (conn/attr-str c (if (= op "upsert") "objectType" "type") "")
+        [ext ex] (conn/attr-str c "externalIdFieldName" "")]
+    (cond
+      (> (count x) 0) (conn/fail-result (nth x 0))
+      (> (count tx) 0) (conn/fail-result (nth tx 0))
+      (> (count (sc/records-err rs)) 0) (conn/fail-result (nth (sc/records-err rs) 0))
+      :else
+      (let [sn (send-null cfg)
+            objs (loop [i 0 out ""] (if (>= i (count rs)) out (recur (+ i 1) (sc/sobject-xml out "sObjects" type (nth rs i) sn))))
+            body (if (= op "upsert") (str "<urn:upsert><urn:externalIDFieldName>" (sc/xml-esc ext) "</urn:externalIDFieldName>" objs "</urn:upsert>")
+                   (str "<urn:" op ">" objs "</urn:" op ">"))
+            [r e] (sc/soap-h cache cfg hdr body)]
+        (if (> (count e) 0) (conn/fail-result (nth e 0))
+          (sc/java (v/->VMeta (bulk-result r (= op "upsert")) [(v/field "class" (v/->VStr "org.mule.runtime.api.bulk.BulkOperationResult"))])))))))
+
+(defn- id-list Values(Vec(Str) Vec(err/MErr)) [x: &v/Val]
+  (match x
+    (v/VArr xs) (values (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (text-val (nth xs i)))))) [])
+    (v/VNull) (values [] [])
+    _ (values [(text-val x)] [])))
+
+(defn- ids-xml Str [ids: &Vec(Str) tag: &Str] (loop [i 0 out ""] (if (>= i (count ids)) out (recur (+ i 1) (str out "<urn:" tag ">" (sc/xml-esc (nth ids i)) "</urn:" tag ">")))))
+
+(defn- run-delete conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config hdr: &Str]
+  (let [[x e] (sc/child-val c "ids")
+        [ids ie] (id-list x)]
+    (if (> (count e) 0) (conn/fail-result (nth e 0))
+      (let [[r se] (sc/soap-h cache cfg hdr (str "<urn:delete>" (ids-xml ids "ids") "</urn:delete>"))]
+        (if (> (count se) 0) (conn/fail-result (nth se 0))
+          (sc/java (v/->VMeta (bulk-result r false) [(v/field "class" (v/->VStr "org.mule.runtime.api.bulk.BulkOperationResult"))])))))))
+
+(defn- run-retrieve conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config hdr: &Str]
+  (let [[req e] (sc/child-val c "retrieve-request")
+        [type tx] (conn/attr-str c "type" "")]
+    (if (> (count e) 0) (conn/fail-result (nth e 0))
+      (let [fs (match req (v/VObj xs) xs _ [])
+            [ids ie] (id-list (let [r (v/obj-get fs "ids")] (if (= (count r) 0) (v/null-v) (v/unmeta (nth r 0)))))
+            [fields fe] (id-list (let [r (v/obj-get fs "fields")] (if (= (count r) 0) (v/null-v) (v/unmeta (nth r 0)))))
+            [r se] (sc/soap-h cache cfg hdr (str "<urn:retrieve><urn:fieldList>" (sc/xml-esc (str/join ", " fields)) "</urn:fieldList><urn:sObjectType>" (sc/xml-esc type) "</urn:sObjectType>" (ids-xml ids "ids") "</urn:retrieve>"))]
+        (if (> (count se) 0) (conn/fail-result (nth se 0))
+          (let [rs (sc/kids r "result")]
+            (sc/java (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count rs)) acc (recur (+ i 1) (conj acc (if (sc/xnil? (nth rs i)) (v/null-v) (sc/sobject-val (nth rs i)))))))))))))))
+
+(defn- params-val Values(v/Val Vec(err/MErr)) [c: &conn/OpCall]
+  (let [p (conn/param (:exprs c) "parameters")]
+    (if (= (count p) 0) (values (v/null-v) [])
+      (let [[x e] ((:eval c) (nth p 0) (:event c))] (if (not= e "") (values (v/null-v) [(err/mk "MULE" "EXPRESSION" e)]) (values (v/unmeta x) []))))))
+
+(defn- run-search conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config hdr: &Str]
+  (let [[sv e] (sc/child-val c "search-string")
+        [pv pe] (params-val c)]
+    (if (> (count e) 0) (conn/fail-result (nth e 0))
+      (let [[r se] (sc/soap-h cache cfg hdr (str "<urn:search><urn:searchString>" (sc/xml-esc (bind-params (text-val sv) pv false)) "</urn:searchString></urn:search>"))]
+        (if (> (count se) 0) (conn/fail-result (nth se 0))
+          (let [res (sc/kid r "result")
+                rr (if (= (count res) 0) r (nth res 0))
+                srs (sc/kids rr "searchRecords")
+                recs (loop [i 0 acc: Vec(v/Val) []]
+                       (if (>= i (count srs)) acc
+                         (let [rec (sc/kid (nth srs i) "record")] (recur (+ i 1) (if (= (count rec) 0) acc (conj acc (sc/sobject-val (nth rec 0))))))))]
+            (sc/java (v/->VMeta (sc/obj-in ["searchRecords" "queryId" "searchResultsMetadata"] [(v/->VArr recs) (sc/sval rr "queryId") (v/null-v)])
+                             [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.search.SearchResult"))]))))))))
+
+(defn- run-simple conn/OpResult [cache: &Atom cfg: &m/Config body: &Str conv: Fn(xml/XNode v/Val) hdr: &Str]
+  (let [[r se] (sc/soap-h cache cfg hdr body)]
+    (if (> (count se) 0) (conn/fail-result (nth se 0))
+      (let [res (sc/kid r "result")] (sc/java (conv (if (= (count res) 0) r (nth res 0))))))))
+
+(defn- date-attr Values(Str Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [[xs x] (conn/attr-val c name)]
+    (cond (> (count x) 0) (values "" x)
+          (= (count xs) 0) (values "" [(err/mk "MULE" "VALIDATION" (str "Required parameter '" name "' was not provided"))])
+          :else (let [[t e] (drt/to-text (nth xs 0))] (values (if (str/ends-with? t "Z") t (str t "Z")) [])))))
+
+(defn- run-changes conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config deleted: Bool]
+  (let [[ot ox] (conn/attr-str c "objectType" "")
+        [sd sx] (date-attr c "startDate")
+        [ed ex] (date-attr c "endDate")]
+    (cond (> (count sx) 0) (conn/fail-result (nth sx 0))
+          (> (count ex) 0) (conn/fail-result (nth ex 0))
+          :else
+          (let [op (if deleted "getDeleted" "getUpdated")
+                [r se] (sc/soap cache cfg (str "<urn:" op "><urn:sObjectType>" (sc/xml-esc ot) "</urn:sObjectType><urn:startDate>" sd "</urn:startDate><urn:endDate>" ed "</urn:endDate></urn:" op ">"))]
+            (if (> (count se) 0) (conn/fail-result (nth se 0))
+              (let [res (sc/kid r "result") rr (if (= (count res) 0) r (nth res 0))]
+                (if deleted
+                  (let [ds (sc/kids rr "deletedRecords")
+                        recs (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count ds)) acc (recur (+ i 1) (conj acc (sc/obj-in ["deletedDate" "id"] [(sc/ldt-utc (sc/text-of (nth ds i) "deletedDate")) (sc/sval (nth ds i) "id")])))))]
+                    (sc/java (v/->VMeta (sc/obj-in ["earliestDateAvailable" "deletedRecords" "latestDateCovered"] [(sc/ldt-utc (sc/text-of rr "earliestDateAvailable")) (v/->VArr recs) (sc/ldt-utc (sc/text-of rr "latestDateCovered"))])
+                                     [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.utility.GetDeletedResult"))])))
+                  (sc/java (v/->VMeta (sc/obj-in ["ids" "latestDateCovered"] [(sc/texts rr "ids") (sc/ldt-utc (sc/text-of rr "latestDateCovered"))])
+                                   [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.utility.GetUpdatedResult"))])))))))))
+
+(def BULK "org.mule.extension.salesforce.api.bulk.")
+(def BULK-JOB-STATE ["lineEnding" "numberRecordsFailed" "externalIdFieldName" "numberRecordsProcessed" "systemModstamp" "errorMessage"
+                     "apiActiveProcessingTime" "concurrencyMode" "apexProcessingTime" "retries" "apiVersion" "createdDate" "id" "state"
+                     "totalProcessingTime" "jobType" "operation" "contentType" "createdById" "columnDelimiter" "object"])
+(def QUERY-JOB-STATE ["lineEnding" "systemModstamp" "concurrencyMode" "apiVersion" "createdDate" "id" "state" "operation" "contentType"
+                      "createdById" "columnDelimiter" "object"])
+(def QUERY-JOB-INFO ["lineEnding" "numberRecordsProcessed" "systemModstamp" "concurrencyMode" "retries" "apiVersion" "createdDate"
+                     "pkChunkingSupported" "id" "state" "totalProcessingTime" "jobType" "operation" "contentType" "createdById"
+                     "columnDelimiter" "object"])
+(def QUERY-JOB-INFO-ABORTED ["lineEnding" "numberRecordsProcessed" "systemModstamp" "concurrencyMode" "retries" "createdDate" "apiVersion"
+                             "pkChunkingSupported" "id" "state" "jobType" "totalProcessingTime" "operation" "contentType" "createdById"
+                             "columnDelimiter" "object"])
+(def BULK-JOB-V2-RESULT ["lineEnding" "externalIdFieldName" "systemModstamp" "concurrencyMode" "contentUrl" "apiVersion" "createdDate" "id"
+                         "state" "jobType" "operation" "contentType" "createdById" "columnDelimiter" "object"])
+(def QUERY-JOBS-INFO-RESULT ["lineEnding" "systemModstamp" "concurrencyMode" "apiVersion" "createdDate" "id" "state" "jobType" "operation"
+                             "contentType" "createdById" "columnDelimiter" "object"])
+(def V2-NUMS ["numberRecordsFailed" "numberRecordsProcessed" "apiActiveProcessingTime" "apexProcessingTime" "retries" "totalProcessingTime"])
+
+(defn- cls-of v/Val [x: v/Val cls: &Str] (v/->VMeta x [(v/field "class" (v/->VStr (str cls)))]))
+
+(defn- api-text Str [x: &v/Val dbl: Bool]
+  (let [t (sc/field-text x)] (if (and dbl (< (str/index-of t ".") 0) (< (str/index-of t "E") 0)) (str t ".0") t)))
+
+(defn- v2-obj v/Val [j: &v/Val keys: &Vec(Str) cls: &Str dbl: Bool]
+  (let [fs (match j (v/VObj xs) xs _ [])]
+    (cls-of (sc/obj-in keys (loop [i 0 acc: Vec(v/Val) []]
+                              (if (>= i (count keys)) acc
+                                (let [k (nth keys i)
+                                      r (v/obj-get fs (if (= k "pkChunkingSupported") "isPkChunkingSupported" k))
+                                      x (if (= (count r) 0) (v/null-v) (v/unmeta (nth r 0)))]
+                                  (recur (+ i 1) (conj acc (cond (in? V2-NUMS k) (match x (v/VNull) (v/int-v 0) _ x)
+                                                                 (= k "pkChunkingSupported") (match x (v/VNull) (v/bool-v false) _ x)
+                                                                 (= k "apiVersion") (match x (v/VNull) x _ (v/->VStr (api-text x dbl)))
+                                                                 :else x)))))))
+            (str BULK cls))))
+
+(defn- v2-status-err err/MErr [st: Int body: &Str]
+  (let [msg (str "Invalid status code: " st ", response body: " body)]
+    (cond (= st 404) (sc/sferr "NOT_FOUND" msg)
+          (and (>= st 400) (< st 500)) (sc/sferr "INVALID_INPUT" msg)
+          :else (err/mk "MULE" "UNKNOWN" msg))))
+
+(defn- v2-h Values(Str Vec(hm/Header) Vec(err/MErr)) [cache: &Atom cfg: &m/Config method: &Str path: &Str ct: &Str body: &Str xh: &Vec(hm/Header)]
+  (let [[st b hs x] (sc/rest-raw cache cfg method path ct body xh)]
+    (cond (> (count x) 0) (values "" hs x)
+          (or (< st 200) (>= st 300)) (values "" hs [(v2-status-err st b)])
+          :else (values b hs []))))
+
+(defn- v2 Values(Str Vec(hm/Header) Vec(err/MErr)) [cache: &Atom cfg: &m/Config method: &Str path: &Str ct: &Str body: &Str]
+  (let [none: Vec(hm/Header) []] (v2-h cache cfg method path ct body none)))
+
+(defn- v2-job-h conn/OpResult [cache: &Atom cfg: &m/Config method: &Str path: &Str body: &Str keys: &Vec(Str) cls: &Str dbl: Bool xh: &Vec(hm/Header)]
+  (let [[b hs x] (v2-h cache cfg method path (if (= body "") "" "application/json") body xh)]
+    (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (v2-obj (sc/json-val b) keys cls dbl)))))
+
+(defn- v2-job conn/OpResult [cache: &Atom cfg: &m/Config method: &Str path: &Str body: &Str keys: &Vec(Str) cls: &Str dbl: Bool]
+  (let [none: Vec(hm/Header) []] (v2-job-h cache cfg method path body keys cls dbl none)))
+
+(defn- v2-list conn/OpResult [cache: &Atom cfg: &m/Config path0: &Str keys: &Vec(Str) cls: &Str]
+  (loop [path (str path0) acc: Vec(v/Val) []]
+    (let [[b hs x] (v2 cache cfg "GET" path "" "")]
+      (if (> (count x) 0) (conn/fail-result (nth x 0))
+        (let [j (sc/json-val b)
+              recs (match j (v/VObj fs) (let [r (v/obj-get fs "records")] (if (= (count r) 0) [] (match (v/unmeta (nth r 0)) (v/VArr xs) xs _ []))) _ [])
+              acc2 (loop [i 0 a acc] (if (>= i (count recs)) a (recur (+ i 1) (conj a (v2-obj (v/unmeta (nth recs i)) keys cls false)))))
+              next (sc/vfield j "nextRecordsUrl")]
+          (if (or (= next "") (= (sc/vfield j "done") "true")) (sc/java (cls-of (v/->VArr acc2) "java.util.ArrayList"))
+            (recur next acc2)))))))
+
+(defn- query-params Str [c: &conn/OpCall names: &Vec(Str)]
+  (loop [i 0 out ""]
+    (if (>= i (count names)) out
+      (let [n (nth names i) x (lit c n "")]
+        (recur (+ i 1) (if (= x "") out (str out (if (= out "") "?" "&") n "=" (sc/form-enc x))))))))
+
+(defn- csv-rows Vec(v/Val) [text: &Str]
+  (if (= (str/trim text) "") []
+    (let [[x e] (reg/read-fmt "application/csv" [] text)] (if (not= e "") [] (match (v/unmeta x) (v/VArr xs) xs _ [])))))
+
+(defn- row-get Str [fs: &Vec(v/Field) k: &Str] (let [r (v/obj-get fs k)] (if (= (count r) 0) "" (sc/field-text (nth r 0)))))
+
+(defn- v2-results v/Val [text: &Str kind: &Str]
+  (let [rows (csv-rows text)]
+    (cls-of (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                        (if (>= i (count rows)) acc
+                          (let [fs (match (v/unmeta (nth rows i)) (v/VObj xs) xs _ [])
+                                orig (v/->VObj (loop [k 0 a: Vec(v/Field) []]
+                                                 (if (>= k (count fs)) a
+                                                   (recur (+ k 1) (if (str/starts-with? (:name (:key (nth fs k))) "sf__") a (conj a (nth fs k)))))))
+                                rec (cond
+                                      (= kind "successful")
+                                      (cls-of (v/->VObj [(v/field "originalFields" orig) (v/field "created" (v/bool-v (= (row-get fs "sf__Created") "true")))
+                                                         (v/field "id" (v/->VStr (row-get fs "sf__Id")))]) (str BULK "JobSuccessfulRecordResult"))
+                                      (= kind "failed")
+                                      (cls-of (v/->VObj [(v/field "originalFields" orig) (v/field "errorMessage" (v/->VStr (row-get fs "sf__Error")))
+                                                         (v/field "id" (v/->VStr (row-get fs "sf__Id")))]) (str BULK "JobFailedRecordResults"))
+                                      :else (cls-of (v/->VObj [(v/field "originalFields" orig)]) (str BULK "JobUnprocessedRecordResult")))]
+                            (recur (+ i 1) (conj acc rec))))))
+            "java.util.ArrayList")))
+
+(def RESULTS-CLASS "org.mule.runtime.core.internal.streaming.object.ManagedCursorIteratorProvider")
+
+(defn- v2-page Values(Vec(v/Val) Str Vec(err/MErr)) [cache: &Atom cfg: &m/Config id: &Str max: &Str loc: &Str]
+  (let [qs (str (if (= max "") "" (str "maxRecords=" max)) (if (= loc "") "" (str (if (= max "") "" "&") "locator=" (sc/form-enc loc))))
+        [b hs x] (v2 cache cfg "GET" (str "/jobs/query/" id "/results" (if (= qs "") "" (str "?" qs))) "" "")]
+    (if (> (count x) 0) (values [] "" x)
+      (let [rows (csv-rows b)
+            out (loop [i 0 a: Vec(v/Val) []] (if (>= i (count rows)) a (recur (+ i 1) (conj a (cls-of (v/unmeta (nth rows i)) "java.util.LinkedHashMap")))))
+            nx: Str (match (hm/header-of hs "sforce-locator") (Some x) (if (= x "null") "" x) (None) "")]
+        (values out nx [])))))
+
+(defn- v2-query-results conn/OpResult [cache: &Atom cfg: &m/Config c: &conn/OpCall id: &Str max: &Str]
+  (let [[rows nx x] (v2-page cache cfg id max "")]
+    (if (> (count x) 0) (conn/fail-result (nth x 0))
+      (let [ca cache cf cfg id1 (str id) mx (str max)
+            src (stream/paged rows nx
+                              (fn Values(Vec(v/Val) Str Str) [loc: Str]
+                                (let [[rs n2 x2] (v2-page ca cf id1 mx loc)]
+                                  (if (> (count x2) 0) (values [] "" (str (:ns (nth x2 0)) ":" (:id (nth x2 0)) "\n" (:description (nth x2 0))))
+                                    (values rs n2 ""))))
+                              (fn Int [broken: Bool] 0))
+            cid (stream/open (:rid (:event c)) src)]
+        (conn/ok-result (ev/tv-cursor-of cid ev/JAVA RESULTS-CLASS "SALESFORCE" "*") (ev/tv-null))))))
+
+(defn- lit Str [c: &conn/OpCall k: &Str default: Str] (let [[s x] (conn/attr-str c k default)] s))
+
+(defn- run-bulk conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config op: &Str xh: &Vec(hm/Header)]
+  (let [id (lit c "id" "")]
+    (cond
+      (= op "create-job-bulk-api-v2")
+      (let [[dv de] (conn/child-tv c "s-objects")
+            data-tv (if (= (count dv) 0) (:payload (:event c)) (nth dv 0))
+            [data be] (ev/bytes data-tv)
+            ext (lit c "externalIdFieldName" "")
+            ar (lit c "assignmentRuleId" "")
+            spec (str "{\"object\":\"" (lit c "objectType" "") "\",\"operation\":\"" (str/lower-case (lit c "operation" "insert")) "\",\"contentType\":\"CSV\",\"lineEnding\":\""
+                      (lit c "lineEnding" "LF") "\",\"columnDelimiter\":\"" (lit c "columnDelimiter" "COMMA") "\""
+                      (if (= ext "") "" (str ",\"externalIdFieldName\":\"" ext "\"")) (if (= ar "") "" (str ",\"assignmentRuleId\":\"" ar "\"")) "}")
+            [b x] (let [[b hs x] (v2-h cache cfg "POST" "/jobs/ingest" "application/json" spec xh)] (values b x))]
+        (if (> (count x) 0) (conn/fail-result (nth x 0))
+          (let [jid (sc/vfield (sc/json-val b) "id")
+                [b2 hs2 x2] (v2 cache cfg "PUT" (str "/jobs/ingest/" jid "/batches") "text/csv" data)]
+            (if (> (count x2) 0) (conn/fail-result (nth x2 0))
+              (let [[b3 hs3 x3] (v2 cache cfg "PATCH" (str "/jobs/ingest/" jid) "application/json" "{\"state\":\"UploadComplete\"}")]
+                (if (> (count x3) 0) (conn/fail-result (nth x3 0))
+                  (v2-job cache cfg "GET" (str "/jobs/ingest/" jid) "" BULK-JOB-STATE "BulkJobState" true)))))))
+      (= op "get-job-state-bulk-api-v2") (v2-job cache cfg "GET" (str "/jobs/ingest/" id) "" BULK-JOB-STATE "BulkJobState" true)
+      (= op "abort-job-bulk-api-v2") (v2-job cache cfg "PATCH" (str "/jobs/ingest/" id) "{\"state\":\"Aborted\"}" BULK-JOB-STATE "BulkJobState" true)
+      (= op "delete-job-bulk-api-v2")
+      (let [[b hs x] (v2 cache cfg "DELETE" (str "/jobs/ingest/" id) "" "")]
+        (if (> (count x) 0) (conn/fail-result (nth x 0)) (conn/ok-result (ev/tv-raw "Deleted" "text/plain; charset=UTF-8") (ev/tv-null))))
+      (= op "get-all-jobs-bulk-api-v2")
+      (v2-list cache cfg (str "/jobs/ingest" (query-params c ["concurrencyMode" "isPkChunkingEnabled"])) BULK-JOB-V2-RESULT "BulkJobV2Result")
+      (or (= op "retrieve-job-successful-results-bulk-v2") (= op "retrieve-job-failed-results-bulk-v2") (= op "retrieve-job-unprocessed-results-bulk-v2"))
+      (let [kind (cond (str/includes? op "successful") "successful" (str/includes? op "failed") "failed" :else "unprocessed")
+            part (cond (= kind "successful") "successfulResults" (= kind "failed") "failedResults" :else "unprocessedrecords")
+            [b hs x] (v2 cache cfg "GET" (str "/jobs/ingest/" id "/" part) "" "")]
+        (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (v2-results b kind))))
+      (= op "create-query-job-bulk-api-v2")
+      (let [[qv qx] (let [p (conn/param (:params c) "query")]
+                      (if (> (count p) 0) (let [[s x] (conn/attr-str c "query" "")] (values s x))
+                        (let [[x e] (sc/child-val c "query")] (values (text-val x) e))))
+            spec (str "{\"operation\":\"" (if (= (str/lower-case (lit c "operation" "QUERY")) "queryall") "queryAll" "query") "\",\"query\":" (json-str qv)
+                      ",\"columnDelimiter\":\"" (lit c "columnDelimiter" "COMMA") "\",\"lineEnding\":\"" (lit c "lineEnding" "CRLF") "\"}")]
+        (if (> (count qx) 0) (conn/fail-result (nth qx 0))
+          (v2-job-h cache cfg "POST" "/jobs/query" spec QUERY-JOB-STATE "QueryJobState" false xh)))
+      (= op "get-query-job-info-bulk-api-v2") (v2-job cache cfg "GET" (str "/jobs/query/" id) "" QUERY-JOB-INFO "QueryJobInfo" false)
+      (= op "abort-query-job-bulk-api-v2") (v2-job cache cfg "PATCH" (str "/jobs/query/" id) "{\"state\":\"Aborted\"}" QUERY-JOB-INFO-ABORTED "QueryJobInfo" true)
+      (= op "delete-query-job-bulk-api-v2")
+      (let [[b hs x] (v2 cache cfg "DELETE" (str "/jobs/query/" id) "" "")] (if (> (count x) 0) (conn/fail-result (nth x 0)) (conn/keep-result c)))
+      (= op "get-all-query-jobs-bulk-api-v2")
+      (v2-list cache cfg (str "/jobs/query" (query-params c ["jobType" "concurrencyMode" "isPkChunkingEnabled"])) QUERY-JOBS-INFO-RESULT "QueryJobsInfoResult")
+      (= op "get-query-job-results-bulk-api-v2") (v2-query-results cache cfg c id (lit c "maxRecordsPerPage" ""))
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation salesforce:" op))))))
+
+(defn- json-str Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [ch (nth s i)]
+        (recur (+ i 1) (cond (= ch 34) (str out "\\\"") (= ch 92) (str out "\\\\") (= ch 10) (str out "\\n") (= ch 13) (str out "\\r") (= ch 9) (str out "\\t")
+                             :else (str out (subs s i (+ i 1)))))))))
+
+(defn- xml-record v/Val [n: &xml/XNode]
+  (let [cs (xml/child-elems n)]
+    (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                (if (>= i (count cs)) acc
+                  (let [ch (nth cs i) k (xml/elem-local ch)
+                        dup (loop [j 0] (if (>= j (count acc)) false (if (= (:name (:key (nth acc j))) k) true (recur (+ j 1)))))]
+                    (recur (+ i 1) (if dup acc (conj acc (v/field k (cond (sc/xnil? ch) (v/null-v)
+                                                                          (> (count (xml/child-elems ch)) 0) (xml-record ch)
+                                                                          :else (v/->VStr (xml/text-content ch)))))))))))))
+
+(defn- run-xml-stream conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config hdr: &Str]
+  (let [[qv x1] (sc/child-val c "salesforce-query")
+        [pv x2] (params-val c)]
+    (cond
+      (> (count x1) 0) (conn/fail-result (nth x1 0))
+      (> (count x2) 0) (conn/fail-result (nth x2 0))
+      :else
+      (let [[r x] (sc/soap-h cache cfg hdr (str "<urn:query><urn:queryString>" (sc/xml-esc (bind-params (text-val qv) pv (escape? c))) "</urn:queryString></urn:query>"))]
+        (if (> (count x) 0) (conn/fail-result (nth x 0))
+          (let [res (sc/kid r "result")
+                rs (if (= (count res) 0) [] (sc/kids (nth res 0) "records"))
+                msgs (loop [i 0 acc: Vec(v/Val) []]
+                       (if (>= i (count rs)) acc
+                         (recur (+ i 1) (conj acc (sc/obj-in ["payload" "attributes"] [(v/->VObj [(v/field "records" (xml-record (nth rs i)))]) (v/null-v)])))))]
+            (sc/java (v/->VMeta (v/->VArr msgs) [(v/field "mimeType" (v/->VStr (lit c "outputMimeType" "application/java")))]))))))))
+
+(defn- run-merge conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config hdr: &Str]
+  (let [[type tx] (conn/attr-str c "type" "")
+        [idv ie] (sc/child-val c "ids")
+        [ids ie2] (id-list idv)
+        [mr me] (sc/child-val c "master-record")]
+    (cond
+      (> (count ie) 0) (conn/fail-result (nth ie 0))
+      (> (count me) 0) (conn/fail-result (nth me 0))
+      (> (count (sc/records-err [mr])) 0) (conn/fail-result (nth (sc/records-err [mr]) 0))
+      :else
+      (let [body (str "<urn:merge><urn:request>" (sc/sobject-xml "" "masterRecord" type mr (send-null cfg)) (ids-xml ids "recordToMergeIds") "</urn:request></urn:merge>")
+            [r se] (sc/soap-h cache cfg hdr body)]
+        (if (> (count se) 0) (conn/fail-result (nth se 0))
+          (let [res (sc/kid r "result") rr (if (= (count res) 0) r (nth res 0))]
+            (sc/java (merge-result rr))))))))
+
+(defn- merge-result v/Val [rr: &xml/XNode]
+  (v/->VMeta (sc/obj-in ["id" "success" "errors" "mergedRecordIds" "updatedRelatedIds"]
+                        [(sc/sval rr "id") (sc/bval rr "success") (sc/errors-val rr) (sc/texts rr "mergedRecordIds") (sc/texts rr "updatedRelatedIds")])
+             [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.core.MergeResult"))]))
+
+(defn- key-ci Vec(v/Val) [fs: &Vec(v/Field) k: &Str]
+  (loop [i 0] (if (>= i (count fs)) []
+                (if (= (str/lower-case (:name (:key (nth fs i)))) k) [(:value (nth fs i))] (recur (+ i 1))))))
+
+(defn- merge-request Values(Str Vec(err/MErr)) [x: &v/Val sn: Bool]
+  (let [fs (match (v/unmeta x) (v/VObj a) a _ [])
+        ids-v (let [r (v/obj-get fs "recordToMergeIds")] (if (= (count r) 0) (v/null-v) (nth r 0)))
+        [ids ie] (id-list ids-v)
+        master (let [r (v/obj-get fs "masterRecord")] (if (= (count r) 0) (v/null-v) (v/unmeta (nth r 0))))
+        mfs (match master (v/VObj a) a _ [])
+        tv (key-ci mfs "type")
+        info (let [r (v/obj-get fs "additionalInformationMap")] (if (= (count r) 0) [] (match (v/unmeta (nth r 0)) (v/VObj a) a _ [])))]
+    (cond
+      (or (> (count ie) 0) (= (count ids) 0)) (values "" [(sc/sferr "INVALID_INPUT" "Given IDs fields contain at least one invalid/missing IDs field.")])
+      (or (= (count mfs) 0) (= (count (key-ci mfs "id")) 0) (= (count tv) 0))
+      (values "" [(sc/sferr "INVALID_INPUT" "Primary Record should contain at least the Id and Type.")])
+      :else
+      (let [rest (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count mfs)) acc (recur (+ i 1) (if (= (str/lower-case (:name (:key (nth mfs i)))) "type") acc (conj acc (nth mfs i))))))
+            re (sc/records-err [(v/->VObj rest)])
+            m (sc/sobject-xml "" "masterRecord" (sc/field-text (nth tv 0)) (v/->VObj rest) sn)
+            add (if (= (count info) 0) ""
+                  (str "<urn:additionalInformationMap><urn:name>" (sc/xml-esc (let [n (v/obj-get info "name")] (if (= (count n) 0) "" (sc/field-text (nth n 0)))))
+                       "</urn:name><urn:value>" (sc/xml-esc (let [n (v/obj-get info "value")] (if (= (count n) 0) "" (sc/field-text (nth n 0))))) "</urn:value></urn:additionalInformationMap>"))]
+        (if (> (count re) 0) (values "" re)
+          (values (str "<urn:request>" m (ids-xml ids "recordToMergeIds") add "</urn:request>") []))))))
+
+(defn- run-merge-multiple conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config hdr: &Str]
+  (let [[recs re] (sc/child-val c "merge-records")
+        xs (match recs (v/VArr a) a _ [])]
+    (if (> (count re) 0) (conn/fail-result (nth re 0))
+      (let [[body be] (loop [i 0 out ""]
+                        (if (>= i (count xs)) (values out [])
+                          (let [[r e] (merge-request (nth xs i) (send-null cfg))] (if (> (count e) 0) (values "" e) (recur (+ i 1) (str out r))))))]
+        (if (> (count be) 0) (conn/fail-result (nth be 0))
+          (let [[r se] (sc/soap-h cache cfg hdr (str "<urn:merge>" body "</urn:merge>"))]
+            (if (> (count se) 0) (conn/fail-result (nth se 0))
+              (let [rs (sc/kids r "result")]
+                (if (= (count rs) 0) (conn/fail-result (sc/sferr "INVALID_RESPONSE" "Something went wrong while retrieving results from Salesforce"))
+                  (sc/java (v/->VMeta (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count rs)) acc (recur (+ i 1) (conj acc (merge-result (nth rs i)))))))
+                                      [(v/field "class" (v/->VStr "java.util.ArrayList"))])))))))))))
+
+(def CONVERT-FIELDS [["accountId" "accountId"] ["bypassAccountDedupeCheck" "bypassAccountDedupeCheck"] ["bypassContactDedupeCheck" "bypassContactDedupeCheck"]
+                     ["contactId" "contactId"] ["convertedStatus" "convertedStatus"] ["doNotCreateOpportunity" "doNotCreateOpportunity"]
+                     ["leadId" "leadId"] ["opportunityId" "opportunityId"] ["opportunityName" "opportunityName"]
+                     ["overWriteLeadSource" "overwriteLeadSource"] ["ownerId" "ownerId"] ["relatedPersonAccountId" "relatedPersonAccountId"]
+                     ["sendEmailToOwner" "sendNotificationEmail"]])
+
+(defn- run-convert conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config hdr: &Str]
+  (let [[req e] (sc/child-val c "lead-convert-request")]
+    (if (> (count e) 0) (conn/fail-result (nth e 0))
+      (let [fs (match req (v/VObj xs) xs _ [])
+            inner (loop [i 0 out ""]
+                    (if (>= i (count CONVERT-FIELDS)) out
+                      (let [pair (nth CONVERT-FIELDS i)
+                            r (v/obj-get fs (nth pair 0))]
+                        (recur (+ i 1) (if (or (= (count r) 0) (v/null? (nth r 0))) out
+                                         (str out "<urn:" (nth pair 1) ">" (sc/xml-esc (sc/field-text (nth r 0))) "</urn:" (nth pair 1) ">"))))))
+            [r se] (sc/soap-h cache cfg hdr (str "<urn:convertLead><urn:leadConverts>" inner "</urn:leadConverts></urn:convertLead>"))]
+        (if (> (count se) 0) (conn/fail-result (nth se 0))
+          (let [res (sc/kid r "result") rr (if (= (count res) 0) r (nth res 0))]
+            (sc/java (v/->VMeta (sc/obj-in ["accountId" "contactId" "leadId" "opportunityId" "success" "errors"]
+                                     [(sc/sval rr "accountId") (sc/sval rr "contactId") (sc/sval rr "leadId") (sc/sval rr "opportunityId") (sc/bval rr "success") (sc/errors-val rr)])
+                             [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.core.LeadConvertResult"))]))))))))
+
+(defn- match-record v/Val [n: &xml/XNode]
+  (let [rec (sc/kid n "record")]
+    (sc/obj-in ["additionalInformation" "fieldDiffs" "matchConfidence" "record"]
+            [(plain-list n "additionalInformation") (plain-list n "fieldDiffs")
+             (let [t (sc/text-of n "matchConfidence")] (if (= t "") (v/int-v 0) (let [[x e] (reg/read-fmt "application/json" [] t)] (if (= e "") (v/unmeta x) (v/int-v 0)))))
+             (if (= (count rec) 0) (v/null-v) (sc/sobject-val (nth rec 0)))])))
+
+(defn- match-result v/Val [n: &xml/XNode]
+  (let [mrs (sc/kids n "matchRecords")]
+    (sc/obj-in ["entityType" "errors" "matchEngine" "matchRecords" "rule" "size" "success"]
+            [(sc/sval n "entityType") (sc/errors-val n) (sc/sval n "matchEngine")
+             (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count mrs)) acc (recur (+ i 1) (conj acc (match-record (nth mrs i)))))))
+             (sc/sval n "rule") (sc/ival n "size") (sc/bval n "success")])))
+
+(defn- dup-result v/Val [n: &xml/XNode]
+  (let [ms (sc/kids n "matchResults")]
+    (sc/obj-in ["allowSave" "duplicateRule" "duplicateRuleEntityType" "errorMessage" "matchResults"]
+            [(sc/bval n "allowSave") (sc/sval n "duplicateRule") (sc/sval n "duplicateRuleEntityType") (sc/sval n "errorMessage")
+             (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count ms)) acc (recur (+ i 1) (conj acc (match-result (nth ms i)))))))])))
+
+(defn- run-dups conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config by-ids: Bool hdr: &Str]
+  (let [[type tx] (conn/attr-str c "type" "")
+        [x e] (sc/child-val c (if by-ids "ids" "criteria"))]
+    (cond
+      (> (count e) 0) (conn/fail-result (nth e 0))
+      (and (not by-ids) (> (count (sc/records-err (match x (v/VArr xs) xs (v/VNull) [] _ [x]))) 0))
+      (conn/fail-result (nth (sc/records-err (match x (v/VArr xs) xs (v/VNull) [] _ [x])) 0))
+      :else
+      (let [body (if by-ids
+                   (let [[ids ie] (id-list x)] (str "<urn:findDuplicatesByIds>" (ids-xml ids "ids") "</urn:findDuplicatesByIds>"))
+                   (let [recs (match x (v/VArr xs) xs (v/VNull) [] _ [x])]
+                     (str "<urn:findDuplicates>" (loop [i 0 out ""] (if (>= i (count recs)) out (recur (+ i 1) (sc/sobject-xml out "sObjects" type (nth recs i) false)))) "</urn:findDuplicates>")))
+            [r se] (sc/soap-h cache cfg hdr body)]
+        (if (> (count se) 0) (conn/fail-result (nth se 0))
+          (let [rs (sc/kids r "result")]
+            (sc/java (v/->VMeta (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                                         (if (>= i (count rs)) acc
+                                           (let [n (nth rs i) ds (sc/kids n "duplicateResults")]
+                                             (recur (+ i 1) (conj acc (sc/obj-in ["duplicateResults" "errors" "success"]
+                                                                              [(v/->VArr (loop [k 0 a: Vec(v/Val) []] (if (>= k (count ds)) a (recur (+ k 1) (conj a (dup-result (nth ds k)))))))
+                                                                               (sc/errors-val n) (sc/bval n "success")])))))))
+                             [(v/field "class" (v/->VStr "java.util.ArrayList"))]))))))))
+
+(def BULK1-OPS ["create-job" "close-job" "abort-job" "job-info" "create-batch" "create-batch-for-query" "create-batch-stream"
+                "batch-info" "batch-info-list" "batch-result" "batch-result-stream" "query-result-list" "query-result-stream-by-id"])
+
+(def ASYNC-NS "http://www.force.com/2009/06/asyncapi/dataload")
+
+(defn- async-call Values(xml/XNode Str Vec(err/MErr)) [cache: &Atom cfg: &m/Config method: &Str path: &Str ct: &Str body: &Str xh: &Vec(hm/Header)]
+  (let [[s se] (sc/session cache cfg false)]
+    (if (not= se "") (values (xml/->XnText "") "" [(sc/session-err se)])
+      (let [url (str (:instance s) "/services/async/" (sc/api-of cfg) path)
+            hs0: Vec(hm/Header) [(sc/hpair "X-SFDC-Session" (:token s)) (sc/hpair "Content-Type" (str ct))]
+            hs (loop [i 0 a hs0] (if (>= i (count xh)) a (recur (+ i 1) (conj a (nth xh i)))))
+            [st rb e] (sc/send method url hs body)]
+        (cond
+          (not= e "") (values (xml/->XnText "") "" [(sc/sferr "CONNECTIVITY" e)])
+          (not (str/starts-with? (str/trim rb) "<")) (if (and (>= st 200) (< st 300)) (values (xml/->XnText "") rb []) (values (xml/->XnText "") "" [(sc/sferr "INVALID_INPUT" (str "HTTP " st ": " rb))]))
+          :else
+          (let [[doc pe] (xml/parse rb)]
+            (if (not= pe "") (values (xml/->XnText "") rb [(sc/sferr "CONNECTIVITY" pe)])
+              (let [root (xml/doc-root doc)]
+                (if (= (xml/elem-local root) "error")
+                  (values root "" [(sc/bulk1-fault (sc/text-of root "exceptionCode") (sc/text-of root "exceptionMessage"))])
+                  (values root rb []))))))))))
+
+(defn- num-val v/Val [n: &xml/XNode k: &Str]
+  (let [t (sc/text-of n k)] (if (= t "") (v/int-v 0) (let [[x e] (reg/read-fmt "application/json" [] t)] (if (= e "") (v/unmeta x) (v/int-v 0))))))
+
+(defn- job-info-val v/Val [n: &xml/XNode]
+  (v/->VMeta
+    (sc/obj-in ["id" "operation" "object" "createdById" "createdDate" "systemModstamp" "state" "externalIdFieldName" "concurrencyMode"
+             "fastPathEnabled" "numberBatchesQueued" "numberBatchesInProgress" "numberBatchesCompleted" "numberBatchesFailed"
+             "numberBatchesTotal" "numberRecordsProcessed" "numberRetries" "contentType" "apiVersion" "assignmentRuleId"
+             "numberRecordsFailed" "totalProcessingTime" "apiActiveProcessingTime" "apexProcessingTime"]
+            [(sc/sval n "id") (sc/sval n "operation") (sc/sval n "object") (sc/sval n "createdById") (sc/ldt-utc (sc/text-of n "createdDate")) (sc/ldt-utc (sc/text-of n "systemModstamp"))
+             (sc/sval n "state") (sc/sval n "externalIdFieldName") (sc/sval n "concurrencyMode") (sc/bval n "fastPathEnabled")
+             (num-val n "numberBatchesQueued") (num-val n "numberBatchesInProgress") (num-val n "numberBatchesCompleted") (num-val n "numberBatchesFailed")
+             (num-val n "numberBatchesTotal") (num-val n "numberRecordsProcessed") (num-val n "numberRetries") (sc/sval n "contentType") (num-val n "apiVersion")
+             (sc/sval n "assignmentRuleId") (num-val n "numberRecordsFailed") (num-val n "totalProcessingTime") (num-val n "apiActiveProcessingTime") (num-val n "apexProcessingTime")])
+    [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.bulk.JobInfo"))]))
+
+(defn- batch-info-val v/Val [n: &xml/XNode]
+  (v/->VMeta
+    (sc/obj-in ["id" "jobId" "state" "stateMessage" "createdDate" "systemModstamp" "numberRecordsProcessed" "numberRecordsFailed"
+             "totalProcessingTime" "apiActiveProcessingTime" "apexProcessingTime"]
+            [(sc/sval n "id") (sc/sval n "jobId") (sc/sval n "state") (sc/sval n "stateMessage") (sc/ldt-utc (sc/text-of n "createdDate")) (sc/ldt-utc (sc/text-of n "systemModstamp"))
+             (num-val n "numberRecordsProcessed") (num-val n "numberRecordsFailed") (num-val n "totalProcessingTime") (num-val n "apiActiveProcessingTime") (num-val n "apexProcessingTime")])
+    [(v/field "class" (v/->VStr "org.mule.extension.salesforce.api.bulk.BatchInfo"))]))
+
+(defn- vget Str [x: &v/Val k: &Str] (sc/vfield (v/unmeta x) k))
+
+(defn- attr-or-child Values(v/Val Vec(err/MErr)) [c: &conn/OpCall attr: &Str child: &Str]
+  (let [[xs x] (conn/attr-val c attr)]
+    (cond (> (count x) 0) (values (v/null-v) x)
+          (> (count xs) 0) (values (v/unmeta (nth xs 0)) [])
+          :else (sc/child-val c child))))
+
+(defn- async-objects Str [recs: &Vec(v/Val)]
+  (loop [i 0 out (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?><sObjects xmlns=\"" ASYNC-NS "\">")]
+    (if (>= i (count recs)) (str out "</sObjects>")
+      (let [fs (match (v/unmeta (nth recs i)) (v/VObj xs) xs _ [])
+            o (loop [k 0 o (str out "<sObject>")]
+                (if (>= k (count fs)) (str o "</sObject>")
+                  (let [n (:name (:key (nth fs k))) x (v/unmeta (:value (nth fs k)))]
+                    (recur (+ k 1) (match x (v/VNull) (str o "<" n " xsi:nil=\"true\" xmlns:xsi=\"" sc/XSI "\"/>") _ (str o "<" n ">" (sc/xml-esc (sc/field-text x)) "</" n ">"))))))]
+        (recur (+ i 1) o)))))
+
+(defn- batch-result-val v/Val [n: &xml/XNode]
+  (v/->VMeta (bulk-result-of n false true) [(v/field "class" (v/->VStr "org.mule.runtime.api.bulk.BulkOperationResult"))]))
+
+(defn- run-bulk1 conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config op: &Str xh: &Vec(hm/Header)]
+  (let [xmlct "application/xml; charset=UTF-8"
+        [jid jx] (conn/attr-str c "jobId" "")]
+    (cond
+      (= op "create-job")
+      (let [[rq re] (sc/child-val c "create-job-request")
+            ct (let [t (vget rq "contentType")] (if (= t "") "XML" t))
+            cm (vget rq "concurrencyMode")
+            ext (vget rq "externalIdFieldName")
+            body (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?><jobInfo xmlns=\"" ASYNC-NS "\"><operation>" (sc/xml-esc (lit c "operation" "insert")) "</operation><object>" (sc/xml-esc (lit c "type" ""))
+                      "</object>" (if (= ext "") "" (str "<externalIdFieldName>" (sc/xml-esc ext) "</externalIdFieldName>"))
+                      (if (= cm "") "" (str "<concurrencyMode>" (sc/xml-esc cm) "</concurrencyMode>")) "<contentType>" (sc/xml-esc ct) "</contentType></jobInfo>")
+            [n rb x] (async-call cache cfg "POST" "/job" xmlct body xh)]
+        (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (job-info-val n))))
+      (or (= op "close-job") (= op "abort-job"))
+      (let [body (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?><jobInfo xmlns=\"" ASYNC-NS "\"><state>" (if (= op "close-job") "Closed" "Aborted") "</state></jobInfo>")
+            [n rb x] (async-call cache cfg "POST" (str "/job/" jid) xmlct body xh)]
+        (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (job-info-val n))))
+      (= op "job-info")
+      (let [[n rb x] (async-call cache cfg "GET" (str "/job/" jid) xmlct "" xh)]
+        (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (job-info-val n))))
+      (or (= op "create-batch") (= op "create-batch-for-query") (= op "create-batch-stream"))
+      (let [[job je] (attr-or-child c (cond (= op "create-batch") "jobInfoBatch" (= op "create-batch-for-query") "jobInfoBatchForQuery" :else "jobInfoBatchStream")
+                                    (cond (= op "create-batch") "job-info-batch" (= op "create-batch-for-query") "job-info-batch-for-query" :else "job-info-batch-stream"))
+            jct (let [t (vget job "contentType")] (if (= t "") "XML" t))
+            [body bct be] (cond
+                            (= op "create-batch") (let [[x e] (sc/child-val c "objects") recs (match x (v/VArr xs) xs (v/VNull) [] _ [x])]
+                                                    (values (async-objects recs) xmlct e))
+                            (= op "create-batch-for-query") (let [[x e] (sc/child-val c "batch-query")] (values (text-val x) (if (= jct "CSV") "text/csv; charset=UTF-8" xmlct) e))
+                            :else (let [[t e] (conn/child-tv c "stream")
+                                        tv (if (= (count t) 0) (:payload (:event c)) (nth t 0))
+                                        [b be2] (ev/bytes tv)]
+                                    (values b (if (= jct "CSV") "text/csv; charset=UTF-8" xmlct) e)))]
+        (cond (> (count je) 0) (conn/fail-result (nth je 0))
+              (> (count be) 0) (conn/fail-result (nth be 0))
+              :else (let [[n rb x] (async-call cache cfg "POST" (str "/job/" (vget job "id") "/batch") bct body xh)]
+                      (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (batch-info-val n))))))
+      (= op "batch-info-list")
+      (let [[n rb x] (async-call cache cfg "GET" (str "/job/" jid "/batch") xmlct "" xh)]
+        (if (> (count x) 0) (conn/fail-result (nth x 0))
+          (let [bs (sc/kids n "batchInfo")] (sc/java (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count bs)) acc (recur (+ i 1) (conj acc (batch-info-val (nth bs i)))))))))))
+      :else
+      (let [[b be] (sc/child-val c "batch-to-retrieve")
+            base (str "/job/" (vget b "jobId") "/batch/" (vget b "id"))]
+        (cond
+          (> (count be) 0) (conn/fail-result (nth be 0))
+          (= op "batch-info")
+          (let [[n rb x] (async-call cache cfg "GET" base xmlct "" xh)] (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (batch-info-val n))))
+          (= op "batch-result")
+          (let [[n rb x] (async-call cache cfg "GET" (str base "/result") xmlct "" xh)] (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (batch-result-val n))))
+          (= op "query-result-list")
+          (let [[n rb x] (async-call cache cfg "GET" (str base "/result") xmlct "" xh)] (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (sc/texts n "result"))))
+          :else
+          (let [[rid rx] (sc/child-val c "result-id")
+                path (if (= op "batch-result-stream") (str base "/result") (str base "/result/" (text-val rid)))
+                [n rb x] (async-call cache cfg "GET" path xmlct "" xh)
+                om (if (= op "batch-result-stream") "application/xml; charset=UTF-8" "*/*")]
+            (if (> (count x) 0) (conn/fail-result (nth x 0)) (conn/ok-result (ev/tv-raw rb om) (ev/tv-null)))))))))
+
+(def BULK1-HEADER-OPS ["create-job" "create-batch-stream" "create-batch-for-query" "batch-result-stream" "query-result-list" "query-result-stream-by-id"])
+
+(def BULK2-HEADER-OPS ["create-job-bulk-api-v2" "create-query-job-bulk-api-v2"])
+
+(def HEADER-OPS ["query" "query-all" "create" "update" "upsert" "delete" "retrieve" "search" "query-xml-stream" "merge" "merge-multiple"
+                  "convert-lead" "find-duplicates" "find-duplicates-by-ids" "describe-sobject" "describe-global" "publish-platform-event-message"])
+
+(defn- run conn/OpResult [cache: &Atom c: &conn/OpCall]
+  (let [op (:op c)]
+    (if (= (count (:config c)) 0) (conn/fail-result (err/mk "MULE" "CONFIG" (str "salesforce:" op " needs config-ref")))
+      (let [cfg (nth (:config c) 0)
+            [hdr hx] (if (in? HEADER-OPS op) (sh/soap-headers c) (values "" []))
+            none: Vec(hm/Header) []
+            [xh xx] (cond (in? BULK1-HEADER-OPS op) (sh/http-headers c false)
+                          (in? BULK2-HEADER-OPS op) (sh/http-headers c true)
+                          :else (values none []))
+            mx (if (in? sm/OPS op) (sh/meta-headers c) [])]
+        (cond
+          (> (count hx) 0) (conn/fail-result (nth hx 0))
+          (> (count xx) 0) (conn/fail-result (nth xx 0))
+          (> (count mx) 0) (conn/fail-result (nth mx 0))
+          (= op "query") (run-query cache c cfg false hdr)
+          (= op "query-all") (run-query cache c cfg true hdr)
+          (= op "unauthorize")
+          (let [ks (sc/code-of cfg)
+                owner (lit c "resourceOwnerId" (if (= (count ks) 0) "" (:owner (nth ks 0))))
+                z (sc/code-forget! (:name cfg) owner)]
+            (conn/keep-result c))
+          (or (= op "create") (= op "update") (= op "upsert")) (run-save cache c cfg op hdr)
+          (= op "delete") (run-delete cache c cfg hdr)
+          (= op "retrieve") (run-retrieve cache c cfg hdr)
+          (= op "search") (run-search cache c cfg hdr)
+          (= op "query-xml-stream") (run-xml-stream cache c cfg hdr)
+          (= op "merge") (run-merge cache c cfg hdr)
+          (= op "merge-multiple") (run-merge-multiple cache c cfg hdr)
+          (= op "convert-lead") (run-convert cache c cfg hdr)
+          (= op "find-duplicates") (run-dups cache c cfg false hdr)
+          (= op "find-duplicates-by-ids") (run-dups cache c cfg true hdr)
+          (in? BULK1-OPS op) (run-bulk1 cache c cfg op xh)
+          (in? sm/OPS op) (sm/run cache c cfg)
+          (or (= op "invoke-apex-rest-method") (= op "invoke-apex-soap-method")) (sa/run cache c cfg)
+          (in? ss/STREAM-OPS op) (ss/run cache c cfg hdr)
+          (= op "describe-sobject")
+          (let [[t tx] (conn/attr-str c "type" "")]
+            (run-simple cache cfg (str "<urn:describeSObject><urn:sObjectType>" (sc/xml-esc t) "</urn:sObjectType></urn:describeSObject>") describe-val hdr))
+          (= op "describe-global") (run-simple cache cfg "<urn:describeGlobal/>" global-val hdr)
+          (= op "get-user-info") (run-simple cache cfg "<urn:getUserInfo/>" user-val "")
+          (= op "get-server-timestamp") (run-simple cache cfg "<urn:getServerTimestamp/>" (fn v/Val [r: xml/XNode] (v/->VMeta (sc/ldt-utc (sc/text-of r "timestamp")) [(v/field "class" (v/->VStr "java.time.LocalDateTime"))])) "")
+          (= op "get-updated") (run-changes cache c cfg false)
+          (= op "get-deleted") (run-changes cache c cfg true)
+          (or (str/ends-with? op "bulk-api-v2") (str/ends-with? op "bulk-v2")) (run-bulk cache c cfg op xh)
+          :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation salesforce:" op))))))))
+
+(defn- all-fields Values(Vec(Str) Str) [cache: &Atom cfg: &m/Config ot: &Str]
+  (let [k (str "fields:" (:name cfg) ":" ot)
+        mm: Map (dyn->map (deref cache))]
+    (if (contains? mm k) (values (str/split (dyn->str (get! mm k)) ",") "")
+      (let [[r x] (sc/soap cache cfg (str "<urn:describeSObject><urn:sObjectType>" (sc/xml-esc ot) "</urn:sObjectType></urn:describeSObject>"))]
+        (if (> (count x) 0) (values [] (:description (nth x 0)))
+          (let [res (sc/kid r "result") rr (if (= (count res) 0) r (nth res 0))
+                fs (sc/kids rr "fields")
+                names (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (sc/text-of (nth fs i) "name")))))
+                joined (str/join "," names)
+                z (swap! cache (fn Dyn [old: Dyn] (let [m2: Map (dyn->map old)] (->dyn (assoc m2 k (->dyn joined))))))]
+            (values names "")))))))
+
+(defn- now-utc Str []
+  (let [t (iso/instant-str (zt/now-instant-rec))
+        k (str/index-of t ".")]
+    (if (< k 0) t (str (subs t 0 k) "Z"))))
+
+(defn- poll Values(Int Str) [cache: &Atom s: conn/SrcCall]
+  (if (in? ss/SOURCES (:name s)) (ss/poll cache s)
+  (if (= (count (:config s)) 0) (values 0 "salesforce listener needs config-ref")
+    (let [cfg (nth (:config s) 0)
+          ot (conn/param-lit (:params s) "objectType" "")
+          kind (:name s)
+          st0: Map (dyn->map (deref (:state s)))
+          since0 (conn/param-lit (:params s) "since" "")
+          wm (if (contains? st0 "wm") (dyn->str (get! st0 "wm")) (if (= since0 "") (now-utc) since0))
+          z0 (swap! (:state s) (fn Dyn [old: Dyn] (let [m2: Map (dyn->map old)] (->dyn (assoc m2 "wm" (->dyn wm))))))]
+        (let [[fields fe] (all-fields cache cfg ot)]
+          (if (not= fe "") (values 0 fe)
+            (let [deleted (= kind "deleted-object-listener")
+                  col (if (= kind "new-object-listener") "CreatedDate" "LastModifiedDate")
+                  q (str "SELECT " (str/join ", " fields) " FROM " ot " WHERE " (if deleted "IsDeleted = true AND " "") col " > " wm " ORDER BY " col " ASC")
+                  sop (if deleted "queryAll" "query")
+                  [r x] (sc/soap cache cfg (str "<urn:" sop "><urn:queryString>" (sc/xml-esc q) "</urn:queryString></urn:" sop ">"))]
+              (if (> (count x) 0) (values 0 (:description (nth x 0)))
+                (let [[recs rx] (collect-records cache cfg r [] "")]
+                  (loop [i 0 n 0 w wm]
+                    (if (>= i (count recs))
+                      (let [z (swap! (:state s) (fn Dyn [old: Dyn] (let [m2: Map (dyn->map old)] (->dyn (assoc m2 "wm" (->dyn w))))))]
+                        (values n (if (> (count rx) 0) (:description (nth rx 0)) "")))
+                      (let [rec (nth recs i)
+                            stamp (sc/vfield rec col)
+                            skip (and (= kind "modified-object-listener") (= (sc/vfield rec "CreatedDate") stamp))
+                            [ok desc] (if skip (values true "") ((:dispatch s) (ev/tv-val (cls-of (v/unmeta rec) "java.util.HashMap") ev/JAVA) (ev/tv-null)))]
+                        (recur (+ i 1) (if skip n (+ n 1)) (if (> (count stamp) 0) stamp w))))))))))))))
+
+(defn- init Vec(Str) [cache: &Atom app: &m/App]
+  (let [cs (:configs app)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count cs)) acc
+        (let [c (nth cs i)]
+          (recur (+ i 1) (if (= (:kind c) "salesforce:sfdc-config")
+                           (let [[a e] (sc/auth-of c)
+                                 z (if (= e "") (sc/load-jwt-key cache c (:res app)) 0)
+                                 zw (if (and (= e "") (not= (:kind a) "code"))
+                                      (let [zm (sc/warm-mark! cache (:name c))
+                                            ca cache
+                                            f (future (fn Int [x: m/Config] (sc/warm ca x)) c)]
+                                        (future-detach f))
+                                      0)]
+                             (if (= e "") acc (conj acc e)))
+                           acc)))))))
+
+(defn- oauth-mounts Values(Vec(conn/Mount) Vec(Str)) [app: m/App]
+  (let [cs (:configs app)
+        pkce (= (str/lower-case (str/trim (conn/prop-lit app "mulay.salesforce.pkce" "false"))) "true")]
+    (loop [i 0 acc: Vec(conn/Mount) []]
+      (if (>= i (count cs)) (let [e: Vec(Str) []] (values acc e))
+        (let [c (nth cs i)
+              ks (if (= (:kind c) "salesforce:sfdc-config") (sc/code-of c) [])]
+          (if (= (count ks) 0) (recur (+ i 1) acc)
+            (let [k (nth ks 0)
+                  nm (:name c)
+                  ra (conn/->Mount (:listener k) (:authorize-path k) ["GET"] true false
+                                   (fn hm/Response [hs: conn/Host at: conn/At q: hm/Request] (oauth-authorize nm k pkce q)))
+                  rc (conn/->Mount (:listener k) (:callback-path k) ["GET"] true false
+                                   (fn hm/Response [hs: conn/Host at: conn/At q: hm/Request] (oauth-callback nm k q)))]
+              (recur (+ i 1) (conj (conj acc ra) rc)))))))))
+
+(defn- oauth-authorize hm/Response [nm: &Str k: &sc/Code pkce: Bool req: &hm/Request]
+  (let [owner (hx/qparam (:uri req) "resourceOwnerId")
+        [ch ok] (if pkce (sc/code-pkce-begin nm owner) (values "" true))]
+    (if (not ok) (hx/text-resp 500 "Unable to generate the PKCE code verifier")
+      (hm/response 302 [(hm/->Header "Location" (sc/code-authorize-url k owner ch))] "" false))))
+
+(defn- oauth-callback hm/Response [nm: &Str k: &sc/Code req: &hm/Request]
+  (let [uri (:uri req)
+        [st text] (sc/code-callback nm k (hx/qparam uri "code") (hx/qparam uri "state") (hx/qparam uri "error"))]
+    (hx/text-resp st text)))
+
+(defn connector conn/Connector []
+  (let [z: Map {}
+        cache (atom (->dyn z))]
+    (assoc (conn/connector "salesforce" sc/NS (fn conn/OpResult [c: conn/OpCall] (run cache c)))
+           :sources ["new-object-listener" "modified-object-listener" "deleted-object-listener" "replay-topic-listener" "replay-channel-listener"]
+           :push ["replay-topic-listener" "replay-channel-listener"]
+           :poll (fn Values(Int Str) [s: conn/SrcCall] (poll cache s))
+           :init (fn Vec(Str) [a: m/App] (init cache a))
+           :mounts oauth-mounts)))

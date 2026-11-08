@@ -1,0 +1,30 @@
+(ns a2a-json-test (:require [mulay.conn.a2a_spec :as spec]))
+
+(deftest key-json
+  (is (= (spec/key-json "{\"a\":1,\"b\":{\"c\":[true,null]}}" "b") "{\"c\":[true,null]}"))
+  (is (= (spec/key-json "{\"a\":\"x\\\"y\"}" "a") "\"x\\\"y\""))
+  (is (= (spec/key-json "{\"a\":1}" "z") ""))
+  (is (= (spec/key-json "[1]" "a") ""))
+  (is (= (spec/key-json "{\"a\":1,\"a\":2}" "a") "2")))
+
+(deftest with-key
+  (is (= (spec/with-key "{\"a\":1,\"b\":2,\"c\":3}" "b" "[\"x\"]") "{\"a\":1,\"b\":[\"x\"],\"c\":3}"))
+  (is (= (spec/with-key "{\"a\":1}" "b" "true") "{\"a\":1,\"b\":true}"))
+  (is (= (spec/with-key "{}" "b" "null") "{\"b\":null}")))
+
+(deftest array-items
+  (is (= (spec/array-items "[{\"a\":1},2,\"s\"]") ["{\"a\":1}" "2" "\"s\""]))
+  (is (= (count (spec/array-items "[]")) 0))
+  (is (= (count (spec/array-items "{}")) 0)))
+
+;; 1 行の大きな JSON (A2A の JSON-RPC の本文、認証の前に読む) が線形の時間で読めること。以前は値ごとに列を
+;; 行の始まりから数え直していたので O(n^2) (320KB で 19.5 秒、1MB で数分)。列そのものは a2a_spec_gold_test。
+(defn- wide-json Str [n: Int]
+  (loop [i 0 out "["] (if (>= i n) (str out "0]") (recur (+ i 1) (str out "\"é\",")))))
+
+(defn- wide-ok? Bool []
+  (let [[v e] (spec/parse (wide-json 150000))]
+    (and (= e "") (match v (spec/JArr xs l c el ec) (and (= (count xs) 150001) (= ec 600003)) _ false))))
+
+(deftest wide-line
+  (is (wide-ok?)))

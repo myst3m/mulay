@@ -1,0 +1,61 @@
+(ns res-test (:require [mulay.lib.res :as res] [clay.io :as io] [clay.string :as str]))
+
+;; res-url: ディレクトリの資源で、ファイルが在れば "file:" + 絶対パス (ClassLoader.getResource の文字列)
+
+(deftest res-url-of-dir-resource
+  (let [[cwd ce] (io/cwd)
+        rs (res/res-dir "test/lib-misc")
+        u (res/res-url rs "res_test.clay")
+        u2 (res/res-url rs "classpath:/res_test.clay")]
+    (is (= u (str "file:" cwd "/test/lib-misc/res_test.clay")))
+    (is (= u2 u))
+    (is (= (res/res-url rs "no-such.file") ""))
+    (is (= (res/res-url rs "../lib-misc/res_test.clay") ""))
+    (is (= (res/res-url (res/res-dir (str cwd "/test/lib-misc")) "res_test.clay") u))
+    (is (= (res/res-url (res/res-dir "./test/lib-misc") "res_test.clay") u))
+    (is (= (res/res-url (res/res-mem ["a"] ["x"]) "a") ""))
+    (is (= (res/res-url (res/res-none) "a") ""))))
+
+(deftest res-dirs-searched-first
+  (let [rs (res/with-first (res/res-dir "test/lib-num") ["test/lib-misc"] [""])
+        [t ok] (res/res-read rs "res_test.clay")
+        [t2 ok2] (res/res-read rs "no-such.file")
+        [cwd ce] (io/cwd)]
+    (is ok)
+    (is (str/includes? t "res-dirs-searched-first"))
+    (is (not ok2))
+    (is (= (res/res-url rs "res_test.clay") (str "file:" cwd "/test/lib-misc/res_test.clay")))))
+
+(deftest res-first-dir-at-prefix
+  (let [rs (res/with-first (res/res-none) ["test/lib-misc"] ["pre/fix"])
+        [t ok] (res/res-read rs "pre/fix/res_test.clay")
+        [t2 ok2] (res/res-read rs "res_test.clay")
+        [cwd ce] (io/cwd)]
+    (is ok)
+    (is (not ok2))
+    (is (= (res/res-url rs "classpath://pre/fix/res_test.clay") (str "file:" cwd "/test/lib-misc/res_test.clay")))))
+
+(deftest res-dir-tells-directories
+  (let [rd (res/res-dir "test")
+        rm (res/res-mem ["web/index.html" "web/sub/a.txt" "top.txt"] ["i" "a" "t"])]
+    (is (res/res-dir? rd "lib-misc"))
+    (is (res/res-dir? rd "lib-misc/"))
+    (is (res/res-dir? rd ""))
+    (is (not (res/res-dir? rd "lib-misc/res_test.clay")))
+    (is (not (res/res-dir? rd "no-such")))
+    (is (not (res/res-dir? rd "../test")))
+    (is (res/res-dir? rm "web"))
+    (is (res/res-dir? rm "web/sub"))
+    (is (res/res-dir? rm "/web/sub/"))
+    (is (res/res-dir? rm ""))
+    (is (not (res/res-dir? rm "web/index.html")))
+    (is (not (res/res-dir? rm "we")))
+    (is (not (res/res-dir? rm "top.txt")))
+    (is (not (res/res-dir? (res/res-none) "")))))
+
+(deftest res-home-is-where-the-resources-are
+  (let [rd (res/res-dir "test/lib-misc")
+        rm (res/with-home (res/res-mem ["a"] ["x"]) "/srv/apps/demo")]
+    (is (= (:home rd) "test/lib-misc"))
+    (is (= (:home rm) "/srv/apps/demo"))
+    (is (= (:home (res/res-none)) ""))))

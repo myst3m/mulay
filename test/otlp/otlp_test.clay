@@ -1,0 +1,113 @@
+(ns otlp-test (:require [mulay.lib.otlp :as o]))
+
+(def HEXD "0123456789abcdef")
+(defn- hex Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [b (bit-and (nth s i) 255)]
+        (recur (+ i 1) (str out (subs HEXD (quot b 16) (+ (quot b 16) 1)) (subs HEXD (mod b 16) (+ (mod b 16) 1))))))))
+
+(deftest varint
+  (is (= (hex (o/varint 0)) "00"))
+  (is (= (hex (o/varint 127)) "7f"))
+  (is (= (hex (o/varint 128)) "8001"))
+  (is (= (hex (o/varint 300)) "ac02"))
+  (is (= (hex (o/varint 4294967296)) "8080808010")))
+
+;; 長さが 128 バイト以上の文字列は長さが 2 バイトになる
+(deftest long-string
+  (is (let [k (loop [i 0 s ""] (if (>= i 200) s (recur (+ i 1) (str s "k"))))
+            b (o/key-value (o/attr k "v"))]
+        (and (= (hex (subs b 0 3)) "0ac801") (= (count b) (+ 3 200 5))))))
+
+;; 1 つの resource、1 つの scope、1 つの sum (累積・単調増加)、属性 1 つの点 1 つ。バイト列は opentelemetry-proto の
+;; metrics/v1 の field 番号どおり (tools/otlp/otlp decode で読み返せる)
+(deftest one-point
+  (is (= (hex (o/export-request [(o/->Resource [(o/attr "service.name" "a")]
+                                               [(o/->Scope "s" "" [(o/->Metric "m" "" "" o/MONOTONIC [(o/ipoint [(o/attr "k" "v")] 5)])])])]
+                                1 2))
+         (str "0a50"
+              "0a15" "0a13" "0a0c" "736572766963652e6e616d65" "1203" "0a0161"
+              "1237" "0a03" "0a0173"
+              "1230" "0a016d"
+              "3a2b" "0a25" "110100000000000000" "190200000000000000" "310500000000000000"
+              "3a08" "0a016b" "1203" "0a0176"
+              "1002" "1801"))))
+
+;; 説明と単位は空でなければ書く (field 2 と 3)。点の無い sum も書く
+(deftest desc-unit
+  (is (= (hex (o/metric (o/->Metric "m" "d" "u" o/MONOTONIC []) 1 2)) "0a016d1201641a01753a0410021801")))
+
+;; 真偽値の属性 (AnyValue の bool_value = 2)
+(deftest bool-attr
+  (is (= (hex (o/key-value (o/battr "k" true))) "0a016b12021001"))
+  (is (= (hex (o/key-value (o/battr "k" false))) "0a016b12021000")))
+
+;; 小数の点 (as_double = 4、fixed64 の IEEE 754)
+(deftest double-point
+  (is (= (hex (o/metric (o/->Metric "m" "" "" o/MONOTONIC [(o/dpoint [] 0.5)]) 1 2))
+         "0a016d3a210a1b11010000000000000019020000000000000021000000000000e03f10021801")))
+
+;; 増減する Sum (UpDownCounter): is_monotonic は false なので書かない
+(deftest updown
+  (is (= (hex (o/metric (o/->Metric "m" "" "" o/UPDOWN []) 1 2)) "0a016d3a021002")))
+
+;; Gauge (metric の field 5): data_points だけ (temporality は無い)
+(deftest gauge
+  (is (= (hex (o/metric (o/->Metric "m" "" "" o/GAUGE [(o/ipoint [] 1)]) 1 2))
+         "0a016d2a1d0a1b110100000000000000190200000000000000310100000000000000")))
+
+(deftest status-message
+  (let [[m1 ok1] (o/status-message (str (chr 8) (chr 3) (chr 18) (chr 3) "bad"))
+        [m2 ok2] (o/status-message "")
+        [m3 ok3] (o/status-message (str (chr 8) (chr 5)))
+        [m4 ok4] (o/status-message "bad request body")
+        [m5 ok5] (o/status-message (str (chr 18) (chr 2) (chr 0xC3) (chr 0x28)))
+        [m6 ok6] (o/status-message (str (chr 8) (chr 0x80)))
+        [m7 ok7] (o/status-message (str (chr 14) (chr 0)))
+        [m8 ok8] (o/status-message (str (chr 2) (chr 0)))
+        [m9 ok9] (o/status-message (str (chr 26) (chr 2) "xy" (chr 13) "abcd" (chr 9) "12345678" (chr 18) (chr 2) "ok"))
+        [ma oka] (o/status-message (str (chr 27) (chr 8) (chr 1) (chr 28) (chr 18) (chr 1) "g"))
+        [mb okb] (o/status-message (str (chr 18) (chr 9) "short"))]
+    (is (and ok1 (= m1 "bad")))
+    (is (and ok2 (= m2 "")))
+    (is (and ok3 (= m3 "")))
+    (is (not ok4))
+    (is (not ok5))
+    (is (not ok6))
+    (is (not ok7))
+    (is (not ok8))
+    (is (and ok9 (= m9 "ok")))
+    (is (and oka (= ma "g")))
+    (is (not okb))))
+
+(defn- rep Str [b: Int n: Int] (loop [i 0 s ""] (if (>= i n) s (recur (+ i 1) (str s (chr b))))))
+
+;; スパン (trace/v1 の Span): trace_id 1、span_id 2、name 5、kind 6、start 7、end 8 (fixed64)、status 15 (UNSET でも空で書く)、
+;; flags 16 (fixed32)。trace_state 3 と parent_span_id 4 は空なら書かない
+(deftest span-minimal
+  (is (= (hex (o/span (o/->Span (rep 0x11 16) (rep 0x22 8) "" "" 257 "n" o/INTERNAL 1 2 [] [] o/UNSET "")))
+         (str "0a10" "11111111111111111111111111111111" "1208" "2222222222222222"
+              "2a016e" "3001" "390100000000000000" "410200000000000000" "7a00" "850101010000"))))
+
+;; 親と tracestate、属性、イベント (time 1、name 2、attributes 3)、状態 (message 2、code 3)
+(deftest span-full
+  (is (= (hex (o/span (o/->Span (rep 0x11 16) (rep 0x22 8) (rep 0x33 8) "a=b" 769 "n" o/SERVER 1 2
+                                [(o/attr "k" "v")]
+                                [(o/->SEvent 3 "e" [(o/battr "x" true)])]
+                                o/ERROR "m")))
+         (str "0a10" "11111111111111111111111111111111" "1208" "2222222222222222"
+              "1a03" "613d62" "2208" "3333333333333333"
+              "2a016e" "3002" "390100000000000000" "410200000000000000"
+              "4a08" "0a016b" "1203" "0a0176"
+              "5a15" "090300000000000000" "1201" "65" "1a07" "0a0178" "12021001"
+              "7a05" "12016d" "1802"
+              "850101030000"))))
+
+;; ExportTraceServiceRequest: resource_spans 1 (resource 1、scope_spans 2 (scope 1、spans 2))
+(deftest trace-request
+  (is (= (hex (o/trace-request [(o/attr "s" "a")] "mule" "1.0.0" [(o/->Span (rep 0x11 16) (rep 0x22 8) "" "" 1 "n" o/CLIENT 1 2 [] [] o/UNSET "")]))
+         (str "0a5a" "0a0a" "0a08" "0a0173" "1203" "0a0161"
+              "124c" "0a0d" "0a046d756c65" "1205" "312e302e30"
+              "123b" "0a10" "11111111111111111111111111111111" "1208" "2222222222222222"
+              "2a016e" "3003" "390100000000000000" "410200000000000000" "7a00" "850101000000"))))

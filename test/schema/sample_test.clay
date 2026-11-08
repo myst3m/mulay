@@ -1,0 +1,37 @@
+(ns sample-test (:require [mulay.lib.jsonschema :as js] [mulay.lib.yaml :as y]))
+
+(defn- smp Str [schema: Str]
+  (let [[s e] (y/parse schema)
+        [t ok] (js/sample s s)]
+    (if (not= e "") (str "PARSE " e) (if ok t "NONE"))))
+
+(deftest only-required-properties-with-typed-values
+  (is (= (smp "{type: object, required: [a, b, c, d, e], properties: {a: {type: string}, b: {type: integer}, c: {type: number}, d: {type: boolean}, e: {type: array, items: {type: string}}, f: {type: string}}}")
+         "{\"a\":\"sample\",\"b\":1,\"c\":1,\"d\":true,\"e\":[\"sample\"]}"))
+  (is (= (smp "{type: object, required: [o], properties: {o: {type: object, required: [x], properties: {x: {enum: [B, C]}, y: {type: string}}}}}")
+         "{\"o\":{\"x\":\"B\"}}"))
+  (is (= (smp "{type: object}") "{}")))
+
+(deftest formats-and-string-facets
+  (is (= (smp "{type: object, required: [d, t, m, u, i], properties: {d: {type: string, format: date}, t: {type: string, format: date-time}, m: {type: string, format: email}, u: {type: string, format: uuid}, i: {type: string, format: ipv4}}}")
+         "{\"d\":\"2024-01-01\",\"t\":\"2024-01-01T00:00:00Z\",\"m\":\"user@example.com\",\"u\":\"00000000-0000-4000-8000-000000000000\",\"i\":\"127.0.0.1\"}"))
+  (is (= (smp "{type: string, minLength: 10}") "\"samplexxxx\""))
+  (is (= (smp "{type: string, maxLength: 3}") "\"sam\""))
+  (is (= (smp "{type: string, pattern: \"^[A-Z]{3}-\\\\d{4}$\"}") "\"AAA-1111\""))
+  (is (= (smp "{type: string, pattern: \"^(ORD|INV)-[0-9]+$\"}") "\"ORD-0\""))
+  (is (= (smp "{type: string, pattern: \"^(?=x)y$\"}") "NONE")))
+
+(deftest numbers-respect-the-bounds
+  (is (= (smp "{type: integer, minimum: 5}") "5"))
+  (is (= (smp "{type: integer, maximum: 0}") "0"))
+  (is (= (smp "{type: integer, minimum: 1, exclusiveMinimum: true}") "2"))
+  (is (= (smp "{type: number, minimum: 0.5, maximum: 0.7}") "0.7"))
+  (is (= (smp "{type: integer, multipleOf: 5}") "5")))
+
+(deftest refs-and-combinators
+  (is (= (smp "{type: object, required: [a], properties: {a: {$ref: \"#/defs/A\"}}, defs: {A: {type: object, required: [n], properties: {n: {type: integer}}}}}") "{\"a\":{\"n\":1}}"))
+  (is (= (smp "{allOf: [{type: object, required: [a], properties: {a: {type: string}}}, {required: [b], properties: {b: {type: boolean}}}]}") "{\"a\":\"sample\",\"b\":true}"))
+  (is (= (smp "{oneOf: [{type: integer}, {type: string}]}") "1"))
+  (is (= (smp "{type: [\"null\", string]}") "\"sample\""))
+  (is (= (smp "{type: array, minItems: 2, items: {type: integer}}") "[1,1]"))
+  (is (= (js/required-names (let [[s e] (y/parse "{allOf: [{required: [a]}, {required: [b]}]}")] s) (let [[s e] (y/parse "{}")] s)) ["a" "b"])))

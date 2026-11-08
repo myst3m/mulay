@@ -1,0 +1,644 @@
+;; tools/gen-sqlexec-golden.py で作った (手で直さない)。期待値は sqlite-jdbc 3.50.3.0 (SQLite 3.50.3) で同じ台本を実行した結果
+;; Q:列の名前|..|;行の値 .. / C:changes:last_insert_rowid / E:拡張結果コード:errmsg
+(ns exec-test (:require [mulay.lib.sqlparse :as sp] [mulay.lib.sqlexec :as ex] [mulay.lib.sqlfile :as sf] [mulay.lib.ieee :as ieee]
+                         [mulay.dw.lib.binaries :as bin]))
+
+(defn- hex64 Str [x: Int] (loop [i 0 out ""] (if (>= i 8) out (recur (+ i 1) (str out (chr (bit-and (unsigned-bit-shift-right x (* 8 (- 7 i))) 255)))))))
+(defn- enc Str [v: &sf/Val]
+  (match v
+    (sf/VNull) "N"
+    (sf/VInt n) (str "I:" n)
+    (sf/VReal x) (str "R:" (bin/hex-lower (hex64 (ieee/double->bits x))))
+    (sf/VText s) (str "T:" (bin/hex-lower s))
+    (sf/VBlob s) (str "B:" (bin/hex-lower s))))
+(defn- enc-res Str [r: &ex/Res]
+  (let [head (loop [i 0 out "Q:"] (if (>= i (count (:names r))) out (recur (+ i 1) (str out (nth (:names r) i) "|"))))]
+    (loop [i 0 out head]
+      (if (>= i (count (:rows r))) out
+        (let [row (nth (:rows r) i)]
+          (recur (+ i 1) (loop [k 0 o (str out ";")] (if (>= k (count row)) o (let [e (enc (nth row k))] (recur (+ k 1) (if (= k 0) (str o e) (str o " " e))))))))))))
+(defn- run Vec(Str) [stmts: Vec(Str)]
+  (let [ps: Vec(sf/Val) [] ns: Vec(Str) []]
+    (loop [i 0 db (ex/new-db 4096) cs (ex/new-conn-state) out: Vec(Str) []]
+      (if (>= i (count stmts)) out
+        (let [[st pe] (ex/prepare (nth stmts i))]
+          (if (not= pe "") (recur (+ i 1) db cs (conj out (str "E:1:" pe)))
+            (let [[db2 cs2 res code msg] (ex/exec-stmt db cs st ps ns ps)]
+              (cond (not= code 0) (recur (+ i 1) db2 cs2 (conj out (str "E:" code ":" msg)))
+                    (:query res) (recur (+ i 1) db2 cs2 (conj out (enc-res res)))
+                    :else (recur (+ i 1) db2 cs2 (conj out (str "C:" (:changes cs2) ":" (:last-rowid cs2))))))))))))
+
+(deftest script-0
+  (let [r (run ["CREATE TABLE person (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, age INTEGER, score REAL, active BOOLEAN, born DATE, seen TIMESTAMP, note NUMERIC, big INTEGER, blob BLOB)"
+                 "INSERT INTO person (name, age, score, active, born, seen, note, big, blob) VALUES ('Ann', 30, 12.5, 1, '1996-01-02', '2026-09-30 10:11:12.345', '12.50', 9007199254740993, x'0102ff'), ('Bob', NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL), ('Cid', 41, 100, 1, '1985-12-31', '2026-01-01 00:00:00', 7, -5, x'')"
+                 "SELECT id, name FROM person ORDER BY id"
+                 "SELECT * FROM person ORDER BY id"
+                 "UPDATE person SET age = age WHERE 1 = 0"
+                 "SELECT * FROM person WHERE id = 2"
+                 "UPDATE person SET age = age + 1 WHERE age IS NOT NULL"
+                 "DELETE FROM person WHERE name = 'Bob'"
+                 "INSERT INTO person (name, age) VALUES ('Dan', '52')"
+                 "SELECT count(*) AS n, max(age) AS oldest FROM person"
+                 "SELECT * FROM nothing_here"
+                 "INSERT INTO person (name) VALUES (NULL)"
+                 "SELECT * FROM person ORDER BY id"
+                 "SELECT name FROM person WHERE name LIKE 'a%' ORDER BY name"
+                 "SELECT seq FROM sqlite_sequence"
+                 "SELECT * FROM sqlite_sequence"
+                 "DROP TABLE person"
+                 "SELECT * FROM person"
+                 "DROP TABLE IF EXISTS person"
+                 "DROP TABLE person"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:3:3"))
+    (is (= (str "2 " (nth r 2)) "2 Q:id|name|;I:1 T:416e6e;I:2 T:426f62;I:3 T:436964"))
+    (is (= (str "3 " (nth r 3)) "3 Q:id|name|age|score|active|born|seen|note|big|blob|;I:1 T:416e6e I:30 R:4029000000000000 I:1 T:313939362d30312d3032 T:323032362d30392d33302031303a31313a31322e333435 R:4029000000000000 I:9007199254740993 B:0102ff;I:2 T:426f62 N N I:0 N N N N N;I:3 T:436964 I:41 R:4059000000000000 I:1 T:313938352d31322d3331 T:323032362d30312d30312030303a30303a3030 I:7 I:-5 B:"))
+    (is (= (str "4 " (nth r 4)) "4 C:0:3"))
+    (is (= (str "5 " (nth r 5)) "5 Q:id|name|age|score|active|born|seen|note|big|blob|;I:2 T:426f62 N N I:0 N N N N N"))
+    (is (= (str "6 " (nth r 6)) "6 C:2:3"))
+    (is (= (str "7 " (nth r 7)) "7 C:1:3"))
+    (is (= (str "8 " (nth r 8)) "8 C:1:4"))
+    (is (= (str "9 " (nth r 9)) "9 Q:n|oldest|;I:3 I:52"))
+    (is (= (str "10 " (nth r 10)) "10 E:1:no such table: nothing_here"))
+    (is (= (str "11 " (nth r 11)) "11 E:1299:NOT NULL constraint failed: person.name"))
+    (is (= (str "12 " (nth r 12)) "12 Q:id|name|age|score|active|born|seen|note|big|blob|;I:1 T:416e6e I:31 R:4029000000000000 I:1 T:313939362d30312d3032 T:323032362d30392d33302031303a31313a31322e333435 R:4029000000000000 I:9007199254740993 B:0102ff;I:3 T:436964 I:42 R:4059000000000000 I:1 T:313938352d31322d3331 T:323032362d30312d30312030303a30303a3030 I:7 I:-5 B:;I:4 T:44616e I:52 N N N N N N N"))
+    (is (= (str "13 " (nth r 13)) "13 Q:name|;T:416e6e"))
+    (is (= (str "14 " (nth r 14)) "14 Q:seq|;I:4"))
+    (is (= (str "15 " (nth r 15)) "15 Q:name|seq|;T:706572736f6e I:4"))
+    (is (= (str "16 " (nth r 16)) "16 C:0:4"))
+    (is (= (str "17 " (nth r 17)) "17 E:1:no such table: person"))
+    (is (= (str "18 " (nth r 18)) "18 C:0:4"))
+    (is (= (str "19 " (nth r 19)) "19 E:1:no such table: person"))
+    ))
+(deftest script-1
+  (let [r (run ["CREATE TABLE bulk_t (id INTEGER PRIMARY KEY, name VARCHAR(20) NOT NULL, n INTEGER DEFAULT 0)"
+                 "INSERT INTO bulk_t (id, name) VALUES (30, 'a')"
+                 "INSERT INTO bulk_t (id, name) VALUES (31, 'b')"
+                 "INSERT INTO bulk_t (id, name) VALUES (30, 'c')"
+                 "UPDATE bulk_t SET n = n + 1 WHERE id >= 31"
+                 "SELECT id, name, n FROM bulk_t ORDER BY id"
+                 "DELETE FROM bulk_t WHERE id = 30"
+                 "SELECT COUNT(*) AS c FROM bulk_t WHERE id >= 30"
+                 "INSERT INTO no_such_table (id) VALUES (1)"
+                 "INSERT INTO bulk_t (id, name) VALUES ('x', 'y')"
+                 "INSERT INTO bulk_t (id, name) VALUES ('7', 'y')"
+                 "INSERT INTO bulk_t (id, name) VALUES (7.0, 'y2')"
+                 "INSERT INTO bulk_t VALUES (1)"
+                 "INSERT INTO bulk_t (id, nope) VALUES (1, 2)"
+                 "INSERT INTO bulk_t (name) VALUES ('auto')"
+                 "SELECT rowid, * FROM bulk_t"
+                 "SELECT oid, _rowid_ FROM bulk_t"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:1:30"))
+    (is (= (str "2 " (nth r 2)) "2 C:1:31"))
+    (is (= (str "3 " (nth r 3)) "3 E:1555:UNIQUE constraint failed: bulk_t.id"))
+    (is (= (str "4 " (nth r 4)) "4 C:1:31"))
+    (is (= (str "5 " (nth r 5)) "5 Q:id|name|n|;I:30 T:61 I:0;I:31 T:62 I:1"))
+    (is (= (str "6 " (nth r 6)) "6 C:1:31"))
+    (is (= (str "7 " (nth r 7)) "7 Q:c|;I:1"))
+    (is (= (str "8 " (nth r 8)) "8 E:1:no such table: no_such_table"))
+    (is (= (str "9 " (nth r 9)) "9 E:20:datatype mismatch"))
+    (is (= (str "10 " (nth r 10)) "10 C:1:7"))
+    (is (= (str "11 " (nth r 11)) "11 E:1555:UNIQUE constraint failed: bulk_t.id"))
+    (is (= (str "12 " (nth r 12)) "12 E:1:table bulk_t has 3 columns but 1 values were supplied"))
+    (is (= (str "13 " (nth r 13)) "13 E:1:table bulk_t has no column named nope"))
+    (is (= (str "14 " (nth r 14)) "14 C:1:32"))
+    (is (= (str "15 " (nth r 15)) "15 Q:id|id|name|n|;I:7 I:7 T:79 I:0;I:31 I:31 T:62 I:1;I:32 I:32 T:6175746f I:0"))
+    (is (= (str "16 " (nth r 16)) "16 Q:id|id|;I:7 I:7;I:31 I:31;I:32 I:32"))
+    ))
+(deftest script-2
+  (let [r (run ["SELECT 1 AS a"
+                 "SELECT 2 AS a, 'x' b, 1 + 1, \"a\" || 'b'"
+                 "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 10) SELECT n FROM c"
+                 "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c"
+                 "WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT n % 3 + 1 FROM c) SELECT n FROM c"
+                 "WITH a AS (SELECT 1 AS x UNION ALL SELECT 2), b(y) AS (SELECT x * 10 FROM a) SELECT * FROM a, b ORDER BY x, y"
+                 "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT sum(n), count(*) FROM c"
+                 "VALUES (1, 'a'), (2, 'b')"
+                 "VALUES (1), (2, 3)"
+                 "SELECT * FROM (VALUES (1), (2)) AS v"
+                 "SELECT 1 UNION SELECT 1 UNION ALL SELECT 2"
+                 "SELECT 3 UNION SELECT 1 UNION SELECT 2 ORDER BY 1 DESC"
+                 "SELECT 1 a UNION SELECT 2 ORDER BY a"
+                 "SELECT 1 INTERSECT SELECT 1"
+                 "SELECT 1 EXCEPT SELECT 1"
+                 "SELECT 1, 2 UNION SELECT 3"
+                 "SELECT 1 ORDER BY 2"
+                 "SELECT 1 UNION SELECT 2 ORDER BY 3"
+                 "SELECT nope"
+                 "SELECT max(1, 2), min(3)"
+                 "SELECT count(*)"
+                 "SELECT sum(1)"
+                 "SELECT 1 LIMIT 0"
+                 "SELECT 1 LIMIT 'x'"
+                 "SELECT * "
+                 "SELECT t.*"])]
+    (is (= (str "0 " (nth r 0)) "0 Q:a|;I:1"))
+    (is (= (str "1 " (nth r 1)) "1 Q:a|b|1 + 1|\"a\" || 'b'|;I:2 T:78 I:2 T:6162"))
+    (is (= (str "2 " (nth r 2)) "2 Q:n|;I:1;I:2;I:3;I:4;I:5;I:6;I:7;I:8;I:9;I:10"))
+    (is (= (str "3 " (nth r 3)) "3 Q:n|;I:1;I:2;I:3"))
+    (is (= (str "4 " (nth r 4)) "4 Q:n|;I:1;I:2;I:3"))
+    (is (= (str "5 " (nth r 5)) "5 Q:x|y|;I:1 I:10;I:1 I:20;I:2 I:10;I:2 I:20"))
+    (is (= (str "6 " (nth r 6)) "6 Q:sum(n)|count(*)|;I:15 I:5"))
+    (is (= (str "7 " (nth r 7)) "7 Q:column1|column2|;I:1 T:61;I:2 T:62"))
+    (is (= (str "8 " (nth r 8)) "8 E:1:all VALUES must have the same number of terms"))
+    (is (= (str "9 " (nth r 9)) "9 Q:column1|;I:1;I:2"))
+    (is (= (str "10 " (nth r 10)) "10 Q:1|;I:1;I:2"))
+    (is (= (str "11 " (nth r 11)) "11 Q:3|;I:3;I:2;I:1"))
+    (is (= (str "12 " (nth r 12)) "12 Q:a|;I:1;I:2"))
+    (is (= (str "13 " (nth r 13)) "13 Q:1|;I:1"))
+    (is (= (str "14 " (nth r 14)) "14 Q:1|"))
+    (is (= (str "15 " (nth r 15)) "15 E:1:SELECTs to the left and right of UNION do not have the same number of result columns"))
+    (is (= (str "16 " (nth r 16)) "16 E:1:1st ORDER BY term out of range - should be between 1 and 1"))
+    (is (= (str "17 " (nth r 17)) "17 E:1:1st ORDER BY term out of range - should be between 1 and 1"))
+    (is (= (str "18 " (nth r 18)) "18 E:1:no such column: nope"))
+    (is (= (str "19 " (nth r 19)) "19 Q:max(1, 2)|min(3)|;I:2 I:3"))
+    (is (= (str "20 " (nth r 20)) "20 Q:count(*)|;I:1"))
+    (is (= (str "21 " (nth r 21)) "21 Q:sum(1)|;I:1"))
+    (is (= (str "22 " (nth r 22)) "22 Q:1|"))
+    (is (= (str "23 " (nth r 23)) "23 E:20:datatype mismatch"))
+    (is (= (str "24 " (nth r 24)) "24 E:1:no tables specified"))
+    (is (= (str "25 " (nth r 25)) "25 E:1:no such table: t"))
+    ))
+(deftest script-3
+  (let [r (run ["CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, name TEXT, v REAL)"
+                 "INSERT INTO t (k, name, v) VALUES (3, 'c', 1.5), (1, 'a', 2), (2, 'b', NULL), (1, 'A', 0.5), (NULL, 'z', 7), (2, 'b', 3)"
+                 "SELECT * FROM t"
+                 "SELECT * FROM t ORDER BY k"
+                 "SELECT * FROM t ORDER BY k DESC, name"
+                 "SELECT * FROM t ORDER BY k NULLS LAST, id DESC"
+                 "SELECT name FROM t ORDER BY name COLLATE NOCASE, id"
+                 "SELECT name FROM t ORDER BY name"
+                 "SELECT DISTINCT k FROM t ORDER BY k"
+                 "SELECT k, count(*), sum(v), avg(v), total(v), min(v), max(name), group_concat(name) FROM t GROUP BY k"
+                 "SELECT k, count(*) AS n FROM t GROUP BY k HAVING n > 1 ORDER BY n DESC, k"
+                 "SELECT k, count(*) FROM t GROUP BY 1"
+                 "SELECT k AS kk, count(*) FROM t GROUP BY kk"
+                 "SELECT count(*), count(v), count(k), sum(k) FROM t"
+                 "SELECT count(DISTINCT k), group_concat(DISTINCT k) FROM t"
+                 "SELECT group_concat(name, '-') FROM t"
+                 "SELECT string_agg(name, '') FROM t"
+                 "SELECT sum(v) FROM t WHERE 0"
+                 "SELECT total(v), avg(v), count(*), max(v) FROM t WHERE 0"
+                 "SELECT name FROM t WHERE k IN (1, 3) ORDER BY id"
+                 "SELECT name FROM t WHERE k BETWEEN 2 AND 3 ORDER BY id"
+                 "SELECT name FROM t WHERE v IS NULL"
+                 "SELECT * FROM t LIMIT 2"
+                 "SELECT * FROM t LIMIT 2 OFFSET 3"
+                 "SELECT * FROM t LIMIT 3, 2"
+                 "SELECT * FROM t LIMIT -1 OFFSET 4"
+                 "SELECT * FROM t ORDER BY id LIMIT 1 OFFSET 10"
+                 "SELECT k + 1 AS x FROM t ORDER BY x"
+                 "SELECT id FROM t ORDER BY -id"
+                 "SELECT name, k FROM t ORDER BY 2, 1"
+                 "SELECT nope FROM t"
+                 "SELECT t.nope FROM t"
+                 "SELECT x.id FROM t x WHERE x.k = 2"
+                 "SELECT x.id FROM t AS x WHERE t.k = 2"
+                 "SELECT count(*) FROM t WHERE count(*) > 1"
+                 "SELECT sum(sum(k)) FROM t"
+                 "SELECT k, name FROM t GROUP BY k ORDER BY k"
+                 "SELECT max(v), name FROM t"
+                 "SELECT min(v), name FROM t"
+                 "SELECT name, count(*) FROM t"
+                 "SELECT (SELECT max(k) FROM t), (SELECT name FROM t WHERE k = 99)"
+                 "SELECT name FROM t WHERE k = (SELECT min(k) FROM t) ORDER BY id"
+                 "SELECT name FROM t WHERE k IN (SELECT k FROM t WHERE v > 1) ORDER BY id"
+                 "SELECT name FROM t WHERE k NOT IN (SELECT k FROM t WHERE k > 1)"
+                 "SELECT name FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.k = a.k AND b.id <> a.id) ORDER BY id"
+                 "SELECT name, (SELECT count(*) FROM t b WHERE b.k = a.k) FROM t a ORDER BY id"
+                 "SELECT * FROM (SELECT k, count(*) AS n FROM t GROUP BY k) WHERE n > 1"
+                 "SELECT sub.name FROM (SELECT * FROM t WHERE k = 1) sub ORDER BY sub.id"
+                 "UPDATE t SET v = v * 2 WHERE k = 1"
+                 "SELECT id, v FROM t"
+                 "UPDATE t SET id = id + 100 WHERE id = 1"
+                 "SELECT id, name FROM t ORDER BY id"
+                 "UPDATE t SET id = 2 WHERE id = 3"
+                 "UPDATE t SET k = 'x', v = '1e2' WHERE name = 'z'"
+                 "SELECT k, typeof(k), v, typeof(v) FROM t WHERE name = 'z'"
+                 "UPDATE t SET nope = 1"
+                 "DELETE FROM t WHERE k IS NULL"
+                 "DELETE FROM t WHERE nope = 1"
+                 "SELECT count(*) FROM t"
+                 "DELETE FROM t"
+                 "SELECT * FROM t"
+                 "INSERT INTO t (k) VALUES (1)"
+                 "SELECT id FROM t"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:6:6"))
+    (is (= (str "2 " (nth r 2)) "2 Q:id|k|name|v|;I:1 I:3 T:63 R:3ff8000000000000;I:2 I:1 T:61 R:4000000000000000;I:3 I:2 T:62 N;I:4 I:1 T:41 R:3fe0000000000000;I:5 N T:7a R:401c000000000000;I:6 I:2 T:62 R:4008000000000000"))
+    (is (= (str "3 " (nth r 3)) "3 Q:id|k|name|v|;I:5 N T:7a R:401c000000000000;I:2 I:1 T:61 R:4000000000000000;I:4 I:1 T:41 R:3fe0000000000000;I:3 I:2 T:62 N;I:6 I:2 T:62 R:4008000000000000;I:1 I:3 T:63 R:3ff8000000000000"))
+    (is (= (str "4 " (nth r 4)) "4 Q:id|k|name|v|;I:1 I:3 T:63 R:3ff8000000000000;I:3 I:2 T:62 N;I:6 I:2 T:62 R:4008000000000000;I:4 I:1 T:41 R:3fe0000000000000;I:2 I:1 T:61 R:4000000000000000;I:5 N T:7a R:401c000000000000"))
+    (is (= (str "5 " (nth r 5)) "5 Q:id|k|name|v|;I:4 I:1 T:41 R:3fe0000000000000;I:2 I:1 T:61 R:4000000000000000;I:6 I:2 T:62 R:4008000000000000;I:3 I:2 T:62 N;I:1 I:3 T:63 R:3ff8000000000000;I:5 N T:7a R:401c000000000000"))
+    (is (= (str "6 " (nth r 6)) "6 Q:name|;T:61;T:41;T:62;T:62;T:63;T:7a"))
+    (is (= (str "7 " (nth r 7)) "7 Q:name|;T:41;T:61;T:62;T:62;T:63;T:7a"))
+    (is (= (str "8 " (nth r 8)) "8 Q:k|;N;I:1;I:2;I:3"))
+    (is (= (str "9 " (nth r 9)) "9 Q:k|count(*)|sum(v)|avg(v)|total(v)|min(v)|max(name)|group_concat(name)|;N I:1 R:401c000000000000 R:401c000000000000 R:401c000000000000 R:401c000000000000 T:7a T:7a;I:1 I:2 R:4004000000000000 R:3ff4000000000000 R:4004000000000000 R:3fe0000000000000 T:61 T:612c41;I:2 I:2 R:4008000000000000 R:4008000000000000 R:4008000000000000 R:4008000000000000 T:62 T:622c62;I:3 I:1 R:3ff8000000000000 R:3ff8000000000000 R:3ff8000000000000 R:3ff8000000000000 T:63 T:63"))
+    (is (= (str "10 " (nth r 10)) "10 Q:k|n|;I:1 I:2;I:2 I:2"))
+    (is (= (str "11 " (nth r 11)) "11 Q:k|count(*)|;N I:1;I:1 I:2;I:2 I:2;I:3 I:1"))
+    (is (= (str "12 " (nth r 12)) "12 Q:kk|count(*)|;N I:1;I:1 I:2;I:2 I:2;I:3 I:1"))
+    (is (= (str "13 " (nth r 13)) "13 Q:count(*)|count(v)|count(k)|sum(k)|;I:6 I:5 I:5 I:9"))
+    (is (= (str "14 " (nth r 14)) "14 Q:count(DISTINCT k)|group_concat(DISTINCT k)|;I:3 T:332c312c32"))
+    (is (= (str "15 " (nth r 15)) "15 Q:group_concat(name, '-')|;T:632d612d622d412d7a2d62"))
+    (is (= (str "16 " (nth r 16)) "16 Q:string_agg(name, '')|;T:636162417a62"))
+    (is (= (str "17 " (nth r 17)) "17 Q:sum(v)|;N"))
+    (is (= (str "18 " (nth r 18)) "18 Q:total(v)|avg(v)|count(*)|max(v)|;R:0000000000000000 N I:0 N"))
+    (is (= (str "19 " (nth r 19)) "19 Q:name|;T:63;T:61;T:41"))
+    (is (= (str "20 " (nth r 20)) "20 Q:name|;T:63;T:62;T:62"))
+    (is (= (str "21 " (nth r 21)) "21 Q:name|;T:62"))
+    (is (= (str "22 " (nth r 22)) "22 Q:id|k|name|v|;I:1 I:3 T:63 R:3ff8000000000000;I:2 I:1 T:61 R:4000000000000000"))
+    (is (= (str "23 " (nth r 23)) "23 Q:id|k|name|v|;I:4 I:1 T:41 R:3fe0000000000000;I:5 N T:7a R:401c000000000000"))
+    (is (= (str "24 " (nth r 24)) "24 Q:id|k|name|v|;I:4 I:1 T:41 R:3fe0000000000000;I:5 N T:7a R:401c000000000000"))
+    (is (= (str "25 " (nth r 25)) "25 Q:id|k|name|v|;I:5 N T:7a R:401c000000000000;I:6 I:2 T:62 R:4008000000000000"))
+    (is (= (str "26 " (nth r 26)) "26 Q:id|k|name|v|"))
+    (is (= (str "27 " (nth r 27)) "27 Q:x|;N;I:2;I:2;I:3;I:3;I:4"))
+    (is (= (str "28 " (nth r 28)) "28 Q:id|;I:6;I:5;I:4;I:3;I:2;I:1"))
+    (is (= (str "29 " (nth r 29)) "29 Q:name|k|;T:7a N;T:41 I:1;T:61 I:1;T:62 I:2;T:62 I:2;T:63 I:3"))
+    (is (= (str "30 " (nth r 30)) "30 E:1:no such column: nope"))
+    (is (= (str "31 " (nth r 31)) "31 E:1:no such column: t.nope"))
+    (is (= (str "32 " (nth r 32)) "32 Q:id|;I:3;I:6"))
+    (is (= (str "33 " (nth r 33)) "33 E:1:no such column: t.k"))
+    (is (= (str "34 " (nth r 34)) "34 E:1:misuse of aggregate: count()"))
+    (is (= (str "35 " (nth r 35)) "35 E:1:misuse of aggregate function sum()"))
+    (is (= (str "36 " (nth r 36)) "36 Q:k|name|;N T:7a;I:1 T:61;I:2 T:62;I:3 T:63"))
+    (is (= (str "37 " (nth r 37)) "37 Q:max(v)|name|;R:401c000000000000 T:7a"))
+    (is (= (str "38 " (nth r 38)) "38 Q:min(v)|name|;R:3fe0000000000000 T:41"))
+    (is (= (str "39 " (nth r 39)) "39 Q:name|count(*)|;T:63 I:6"))
+    (is (= (str "40 " (nth r 40)) "40 Q:(SELECT max(k) FROM t)|(SELECT name FROM t WHERE k = 99)|;I:3 N"))
+    (is (= (str "41 " (nth r 41)) "41 Q:name|;T:61;T:41"))
+    (is (= (str "42 " (nth r 42)) "42 Q:name|;T:63;T:61;T:62;T:41;T:62"))
+    (is (= (str "43 " (nth r 43)) "43 Q:name|;T:61;T:41"))
+    (is (= (str "44 " (nth r 44)) "44 Q:name|;T:61;T:62;T:41;T:62"))
+    (is (= (str "45 " (nth r 45)) "45 Q:name|(SELECT count(*) FROM t b WHERE b.k = a.k)|;T:63 I:1;T:61 I:2;T:62 I:2;T:41 I:2;T:7a I:0;T:62 I:2"))
+    (is (= (str "46 " (nth r 46)) "46 Q:k|n|;I:1 I:2;I:2 I:2"))
+    (is (= (str "47 " (nth r 47)) "47 Q:name|;T:61;T:41"))
+    (is (= (str "48 " (nth r 48)) "48 C:2:6"))
+    (is (= (str "49 " (nth r 49)) "49 Q:id|v|;I:1 R:3ff8000000000000;I:2 R:4010000000000000;I:3 N;I:4 R:3ff0000000000000;I:5 R:401c000000000000;I:6 R:4008000000000000"))
+    (is (= (str "50 " (nth r 50)) "50 C:1:6"))
+    (is (= (str "51 " (nth r 51)) "51 Q:id|name|;I:2 T:61;I:3 T:62;I:4 T:41;I:5 T:7a;I:6 T:62;I:101 T:63"))
+    (is (= (str "52 " (nth r 52)) "52 E:1555:UNIQUE constraint failed: t.id"))
+    (is (= (str "53 " (nth r 53)) "53 C:1:6"))
+    (is (= (str "54 " (nth r 54)) "54 Q:k|typeof(k)|v|typeof(v)|;T:78 T:74657874 R:4059000000000000 T:7265616c"))
+    (is (= (str "55 " (nth r 55)) "55 E:1:no such column: nope"))
+    (is (= (str "56 " (nth r 56)) "56 C:0:6"))
+    (is (= (str "57 " (nth r 57)) "57 E:1:no such column: nope"))
+    (is (= (str "58 " (nth r 58)) "58 Q:count(*)|;I:6"))
+    (is (= (str "59 " (nth r 59)) "59 C:6:6"))
+    (is (= (str "60 " (nth r 60)) "60 Q:id|k|name|v|"))
+    (is (= (str "61 " (nth r 61)) "61 C:1:1"))
+    (is (= (str "62 " (nth r 62)) "62 Q:id|;I:1"))
+    ))
+(deftest script-4
+  (let [r (run ["CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, name TEXT, v REAL)"
+                 "INSERT INTO t (k, name, v) VALUES (3, 'c', 1.5), (1, 'a', 2), (2, 'b', NULL), (1, 'A', 0.5), (NULL, 'z', 7), (2, 'b', 3)"
+                 "CREATE TABLE u (k INTEGER, label TEXT)"
+                 "INSERT INTO u VALUES (1, 'one'), (2, 'two'), (2, 'deux'), (4, 'four')"
+                 "SELECT t.name, u.label FROM t JOIN u ON t.k = u.k ORDER BY t.id, u.label"
+                 "SELECT t.name, u.label FROM t LEFT JOIN u ON t.k = u.k ORDER BY t.id, u.label"
+                 "SELECT * FROM t JOIN u USING (k) ORDER BY id, label"
+                 "SELECT * FROM t NATURAL JOIN u ORDER BY id, label"
+                 "SELECT k FROM t JOIN u ON t.k = u.k"
+                 "SELECT count(*) FROM t, u"
+                 "SELECT count(*) FROM t CROSS JOIN u WHERE t.k = u.k"
+                 "SELECT t.k, u.* FROM t LEFT OUTER JOIN u ON u.k = t.k AND u.label <> 'two' ORDER BY t.id, u.label"
+                 "SELECT u.label, count(t.id) FROM u LEFT JOIN t ON t.k = u.k GROUP BY u.label ORDER BY u.label"
+                 "SELECT * FROM t JOIN nope ON 1"
+                 "SELECT a.name, b.name FROM t a JOIN t b ON a.k = b.k AND a.id < b.id ORDER BY a.id, b.id"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:6:6"))
+    (is (= (str "2 " (nth r 2)) "2 C:6:6"))
+    (is (= (str "3 " (nth r 3)) "3 C:4:4"))
+    (is (= (str "4 " (nth r 4)) "4 Q:name|label|;T:61 T:6f6e65;T:62 T:64657578;T:62 T:74776f;T:41 T:6f6e65;T:62 T:64657578;T:62 T:74776f"))
+    (is (= (str "5 " (nth r 5)) "5 Q:name|label|;T:63 N;T:61 T:6f6e65;T:62 T:64657578;T:62 T:74776f;T:41 T:6f6e65;T:7a N;T:62 T:64657578;T:62 T:74776f"))
+    (is (= (str "6 " (nth r 6)) "6 Q:id|k|name|v|label|;I:2 I:1 T:61 R:4000000000000000 T:6f6e65;I:3 I:2 T:62 N T:64657578;I:3 I:2 T:62 N T:74776f;I:4 I:1 T:41 R:3fe0000000000000 T:6f6e65;I:6 I:2 T:62 R:4008000000000000 T:64657578;I:6 I:2 T:62 R:4008000000000000 T:74776f"))
+    (is (= (str "7 " (nth r 7)) "7 Q:id|k|name|v|label|;I:2 I:1 T:61 R:4000000000000000 T:6f6e65;I:3 I:2 T:62 N T:64657578;I:3 I:2 T:62 N T:74776f;I:4 I:1 T:41 R:3fe0000000000000 T:6f6e65;I:6 I:2 T:62 R:4008000000000000 T:64657578;I:6 I:2 T:62 R:4008000000000000 T:74776f"))
+    (is (= (str "8 " (nth r 8)) "8 E:1:ambiguous column name: k"))
+    (is (= (str "9 " (nth r 9)) "9 Q:count(*)|;I:24"))
+    (is (= (str "10 " (nth r 10)) "10 Q:count(*)|;I:6"))
+    (is (= (str "11 " (nth r 11)) "11 Q:k|k|label|;I:3 N N;I:1 I:1 T:6f6e65;I:2 I:2 T:64657578;I:1 I:1 T:6f6e65;N N N;I:2 I:2 T:64657578"))
+    (is (= (str "12 " (nth r 12)) "12 Q:label|count(t.id)|;T:64657578 I:2;T:666f7572 I:0;T:6f6e65 I:2;T:74776f I:2"))
+    (is (= (str "13 " (nth r 13)) "13 E:1:no such table: nope"))
+    (is (= (str "14 " (nth r 14)) "14 Q:name|name|;T:61 T:41;T:62 T:62"))
+    ))
+(deftest script-5
+  (let [r (run ["CREATE TABLE c (a INTEGER PRIMARY KEY, b TEXT UNIQUE, c INTEGER CHECK (c > 0), d TEXT NOT NULL DEFAULT 'dd', e REAL DEFAULT -1, f DEFAULT (1 + 2))"
+                 "INSERT INTO c (a, b, c) VALUES (1, 'x', 5)"
+                 "SELECT * FROM c"
+                 "INSERT INTO c (b, c) VALUES ('x', 1)"
+                 "INSERT INTO c (b, c) VALUES ('y', 0)"
+                 "INSERT INTO c (b, c) VALUES (NULL, NULL)"
+                 "INSERT INTO c (b, c) VALUES (NULL, 3)"
+                 "INSERT INTO c (b, d) VALUES ('z', NULL)"
+                 "INSERT OR IGNORE INTO c (b, c) VALUES ('x', 9)"
+                 "INSERT OR REPLACE INTO c (b, c) VALUES ('x', 9)"
+                 "SELECT * FROM c ORDER BY a"
+                 "REPLACE INTO c (a, b) VALUES (2, 'w')"
+                 "SELECT * FROM c ORDER BY a"
+                 "INSERT INTO c (a) VALUES (2)"
+                 "UPDATE c SET b = 'w' WHERE a = 4"
+                 "UPDATE OR IGNORE c SET b = 'w'"
+                 "SELECT * FROM c ORDER BY a"
+                 "UPDATE c SET c = -1"
+                 "UPDATE c SET d = NULL WHERE a = 2"
+                 "INSERT INTO c DEFAULT VALUES"
+                 "SELECT * FROM c ORDER BY a"
+                 "CREATE TABLE c (z)"
+                 "CREATE TABLE IF NOT EXISTS c (z)"
+                 "CREATE TABLE sqlite_x (a)"
+                 "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name"
+                 "CREATE TABLE p (a, b, PRIMARY KEY (a, b))"
+                 "INSERT INTO p VALUES (1, 2)"
+                 "INSERT INTO p VALUES (1, 2)"
+                 "INSERT INTO p VALUES (1, NULL)"
+                 "INSERT INTO p VALUES (1, NULL)"
+                 "SELECT rowid, * FROM p"
+                 "SELECT name FROM sqlite_master ORDER BY name"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:1:1"))
+    (is (= (str "2 " (nth r 2)) "2 Q:a|b|c|d|e|f|;I:1 T:78 I:5 T:6464 R:bff0000000000000 I:3"))
+    (is (= (str "3 " (nth r 3)) "3 E:2067:UNIQUE constraint failed: c.b"))
+    (is (= (str "4 " (nth r 4)) "4 E:275:CHECK constraint failed: c > 0"))
+    (is (= (str "5 " (nth r 5)) "5 C:1:2"))
+    (is (= (str "6 " (nth r 6)) "6 C:1:3"))
+    (is (= (str "7 " (nth r 7)) "7 E:1299:NOT NULL constraint failed: c.d"))
+    (is (= (str "8 " (nth r 8)) "8 C:0:3"))
+    (is (= (str "9 " (nth r 9)) "9 C:1:4"))
+    (is (= (str "10 " (nth r 10)) "10 Q:a|b|c|d|e|f|;I:2 N N T:6464 R:bff0000000000000 I:3;I:3 N I:3 T:6464 R:bff0000000000000 I:3;I:4 T:78 I:9 T:6464 R:bff0000000000000 I:3"))
+    (is (= (str "11 " (nth r 11)) "11 C:1:2"))
+    (is (= (str "12 " (nth r 12)) "12 Q:a|b|c|d|e|f|;I:2 T:77 N T:6464 R:bff0000000000000 I:3;I:3 N I:3 T:6464 R:bff0000000000000 I:3;I:4 T:78 I:9 T:6464 R:bff0000000000000 I:3"))
+    (is (= (str "13 " (nth r 13)) "13 E:1555:UNIQUE constraint failed: c.a"))
+    (is (= (str "14 " (nth r 14)) "14 E:2067:UNIQUE constraint failed: c.b"))
+    (is (= (str "15 " (nth r 15)) "15 C:1:2"))
+    (is (= (str "16 " (nth r 16)) "16 Q:a|b|c|d|e|f|;I:2 T:77 N T:6464 R:bff0000000000000 I:3;I:3 N I:3 T:6464 R:bff0000000000000 I:3;I:4 T:78 I:9 T:6464 R:bff0000000000000 I:3"))
+    (is (= (str "17 " (nth r 17)) "17 E:275:CHECK constraint failed: c > 0"))
+    (is (= (str "18 " (nth r 18)) "18 E:1299:NOT NULL constraint failed: c.d"))
+    (is (= (str "19 " (nth r 19)) "19 C:1:5"))
+    (is (= (str "20 " (nth r 20)) "20 Q:a|b|c|d|e|f|;I:2 T:77 N T:6464 R:bff0000000000000 I:3;I:3 N I:3 T:6464 R:bff0000000000000 I:3;I:4 T:78 I:9 T:6464 R:bff0000000000000 I:3;I:5 N N T:6464 R:bff0000000000000 I:3"))
+    (is (= (str "21 " (nth r 21)) "21 E:1:table c already exists"))
+    (is (= (str "22 " (nth r 22)) "22 C:1:5"))
+    (is (= (str "23 " (nth r 23)) "23 E:1:object name reserved for internal use: sqlite_x"))
+    (is (= (str "24 " (nth r 24)) "24 Q:type|name|tbl_name|sql|;T:7461626c65 T:63 T:63 T:435245415445205441424c45206320286120494e5445474552205052494d415259204b45592c2062205445585420554e495155452c206320494e544547455220434845434b202863203e2030292c20642054455854204e4f54204e554c4c2044454641554c5420276464272c2065205245414c2044454641554c54202d312c20662044454641554c54202831202b20322929;T:696e646578 T:73716c6974655f6175746f696e6465785f635f31 T:63 N"))
+    (is (= (str "25 " (nth r 25)) "25 C:1:5"))
+    (is (= (str "26 " (nth r 26)) "26 C:1:1"))
+    (is (= (str "27 " (nth r 27)) "27 E:1555:UNIQUE constraint failed: p.a, p.b"))
+    (is (= (str "28 " (nth r 28)) "28 C:1:2"))
+    (is (= (str "29 " (nth r 29)) "29 C:1:3"))
+    (is (= (str "30 " (nth r 30)) "30 Q:rowid|a|b|;I:1 I:1 I:2;I:2 I:1 N;I:3 I:1 N"))
+    (is (= (str "31 " (nth r 31)) "31 Q:name|;T:63;T:70;T:73716c6974655f6175746f696e6465785f635f31;T:73716c6974655f6175746f696e6465785f705f31"))
+    ))
+(deftest script-6
+  (let [r (run ["CREATE TABLE ix (a INTEGER, b TEXT COLLATE NOCASE)"
+                 "CREATE INDEX ix_a ON ix (a)"
+                 "CREATE UNIQUE INDEX ix_b ON ix (b)"
+                 "INSERT INTO ix VALUES (1, 'Hello')"
+                 "INSERT INTO ix VALUES (2, 'HELLO')"
+                 "INSERT INTO ix VALUES (2, 'other')"
+                 "SELECT * FROM ix WHERE a = 2"
+                 "CREATE INDEX ix_a ON ix (b)"
+                 "CREATE INDEX IF NOT EXISTS ix_a ON ix (b)"
+                 "CREATE INDEX ix_c ON ix (nope)"
+                 "CREATE INDEX ix_d ON nope (a)"
+                 "CREATE UNIQUE INDEX ix_u ON ix (a)"
+                 "DROP INDEX ix_a"
+                 "DROP INDEX ix_a"
+                 "DROP INDEX IF EXISTS ix_a"
+                 "SELECT name FROM sqlite_schema ORDER BY name"
+                 "SELECT b FROM ix ORDER BY b"
+                 "SELECT b = 'hello' FROM ix ORDER BY a"
+                 "SELECT DISTINCT b FROM ix"
+                 "CREATE TABLE q (a TEXT UNIQUE)"
+                 "DROP INDEX sqlite_autoindex_q_1"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:0:0"))
+    (is (= (str "2 " (nth r 2)) "2 C:0:0"))
+    (is (= (str "3 " (nth r 3)) "3 C:1:1"))
+    (is (= (str "4 " (nth r 4)) "4 E:2067:UNIQUE constraint failed: ix.b"))
+    (is (= (str "5 " (nth r 5)) "5 C:1:2"))
+    (is (= (str "6 " (nth r 6)) "6 Q:a|b|;I:2 T:6f74686572"))
+    (is (= (str "7 " (nth r 7)) "7 E:1:index ix_a already exists"))
+    (is (= (str "8 " (nth r 8)) "8 C:1:2"))
+    (is (= (str "9 " (nth r 9)) "9 E:1:no such column: nope"))
+    (is (= (str "10 " (nth r 10)) "10 E:1:no such table: main.nope"))
+    (is (= (str "11 " (nth r 11)) "11 C:1:2"))
+    (is (= (str "12 " (nth r 12)) "12 C:1:2"))
+    (is (= (str "13 " (nth r 13)) "13 E:1:no such index: ix_a"))
+    (is (= (str "14 " (nth r 14)) "14 C:1:2"))
+    (is (= (str "15 " (nth r 15)) "15 Q:name|;T:6978;T:69785f62;T:69785f75"))
+    (is (= (str "16 " (nth r 16)) "16 Q:b|;T:48656c6c6f;T:6f74686572"))
+    (is (= (str "17 " (nth r 17)) "17 Q:b = 'hello'|;I:1;I:0"))
+    (is (= (str "18 " (nth r 18)) "18 Q:b|;T:48656c6c6f;T:6f74686572"))
+    (is (= (str "19 " (nth r 19)) "19 C:1:2"))
+    (is (= (str "20 " (nth r 20)) "20 E:1:index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"))
+    ))
+(deftest script-7
+  (let [r (run ["CREATE TABLE lk (id INTEGER PRIMARY KEY, k INTEGER, s TEXT COLLATE NOCASE, r REAL, u)"
+                 "CREATE INDEX lk_k ON lk (k)"
+                 "CREATE INDEX lk_s ON lk (s)"
+                 "CREATE INDEX lk_r ON lk (r)"
+                 "CREATE INDEX lk_u ON lk (u COLLATE NOCASE)"
+                 "INSERT INTO lk (k, s, r, u) VALUES (3, 'Abc', 1.0, 'X'), (1, 'abc', 2.5, 'x'), (3, 'b', 1, 'y'), (NULL, NULL, NULL, NULL), ('3', 'ABC', '1', 'X'), (2, 'c', 3, 'Y')"
+                 "SELECT id FROM lk WHERE k = 3"
+                 "SELECT id FROM lk WHERE k = '3'"
+                 "SELECT id FROM lk WHERE 3 = k"
+                 "SELECT id FROM lk WHERE k = 3.0"
+                 "SELECT id FROM lk WHERE k = NULL"
+                 "SELECT id FROM lk WHERE k = 3 AND s = 'b'"
+                 "SELECT id FROM lk WHERE s = 'abc'"
+                 "SELECT id FROM lk WHERE s = 'ABC' COLLATE BINARY"
+                 "SELECT id FROM lk WHERE r = 1"
+                 "SELECT id FROM lk WHERE r = '1'"
+                 "SELECT id FROM lk WHERE u = 'x'"
+                 "SELECT id FROM lk WHERE u = 'X' AND k = 3"
+                 "SELECT id, k FROM lk WHERE id = 3"
+                 "SELECT id FROM lk WHERE id = '3'"
+                 "SELECT id FROM lk WHERE rowid = 2.0"
+                 "SELECT id FROM lk WHERE id = 'x'"
+                 "SELECT id FROM lk WHERE k = 1 + 2"
+                 "SELECT id FROM lk WHERE k = abs(-3)"
+                 "SELECT id FROM lk WHERE k = 99"
+                 "UPDATE lk SET k = 7 WHERE k = 3"
+                 "SELECT id, k FROM lk WHERE k = 7"
+                 "DELETE FROM lk WHERE k = 7"
+                 "SELECT id FROM lk ORDER BY id"
+                 "SELECT count(*) FROM lk WHERE k = 2 OR k = 1"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:0:0"))
+    (is (= (str "2 " (nth r 2)) "2 C:0:0"))
+    (is (= (str "3 " (nth r 3)) "3 C:0:0"))
+    (is (= (str "4 " (nth r 4)) "4 C:0:0"))
+    (is (= (str "5 " (nth r 5)) "5 C:6:6"))
+    (is (= (str "6 " (nth r 6)) "6 Q:id|;I:1;I:3;I:5"))
+    (is (= (str "7 " (nth r 7)) "7 Q:id|;I:1;I:3;I:5"))
+    (is (= (str "8 " (nth r 8)) "8 Q:id|;I:1;I:3;I:5"))
+    (is (= (str "9 " (nth r 9)) "9 Q:id|;I:1;I:3;I:5"))
+    (is (= (str "10 " (nth r 10)) "10 Q:id|"))
+    (is (= (str "11 " (nth r 11)) "11 Q:id|;I:3"))
+    (is (= (str "12 " (nth r 12)) "12 Q:id|;I:1;I:2;I:5"))
+    (is (= (str "13 " (nth r 13)) "13 Q:id|;I:5"))
+    (is (= (str "14 " (nth r 14)) "14 Q:id|;I:1;I:3;I:5"))
+    (is (= (str "15 " (nth r 15)) "15 Q:id|;I:1;I:3;I:5"))
+    (is (= (str "16 " (nth r 16)) "16 Q:id|;I:2"))
+    (is (= (str "17 " (nth r 17)) "17 Q:id|;I:1;I:5"))
+    (is (= (str "18 " (nth r 18)) "18 Q:id|k|;I:3 I:3"))
+    (is (= (str "19 " (nth r 19)) "19 Q:id|;I:3"))
+    (is (= (str "20 " (nth r 20)) "20 Q:id|;I:2"))
+    (is (= (str "21 " (nth r 21)) "21 Q:id|"))
+    (is (= (str "22 " (nth r 22)) "22 Q:id|;I:1;I:3;I:5"))
+    (is (= (str "23 " (nth r 23)) "23 Q:id|;I:1;I:3;I:5"))
+    (is (= (str "24 " (nth r 24)) "24 Q:id|"))
+    (is (= (str "25 " (nth r 25)) "25 C:3:6"))
+    (is (= (str "26 " (nth r 26)) "26 Q:id|k|;I:1 I:7;I:3 I:7;I:5 I:7"))
+    (is (= (str "27 " (nth r 27)) "27 C:3:6"))
+    (is (= (str "28 " (nth r 28)) "28 Q:id|;I:2;I:4;I:6"))
+    (is (= (str "29 " (nth r 29)) "29 Q:count(*)|;I:2"))
+    ))
+(deftest script-8
+  (let [r (run ["CREATE TABLE tx (a)"
+                 "BEGIN"
+                 "INSERT INTO tx VALUES (1)"
+                 "INSERT INTO tx VALUES (2)"
+                 "SELECT * FROM tx"
+                 "ROLLBACK"
+                 "SELECT * FROM tx"
+                 "BEGIN TRANSACTION"
+                 "INSERT INTO tx VALUES (3)"
+                 "BEGIN"
+                 "COMMIT"
+                 "SELECT * FROM tx"
+                 "COMMIT"
+                 "ROLLBACK"
+                 "END"
+                 "BEGIN"
+                 "CREATE TABLE tx2 (b)"
+                 "ROLLBACK"
+                 "SELECT * FROM tx2"
+                 "INSERT INTO tx SELECT a + 10 FROM tx"
+                 "SELECT * FROM tx"
+                 "INSERT INTO tx (a) SELECT 1, 2"
+                 "SELECT changes(), total_changes(), last_insert_rowid()"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:0:0"))
+    (is (= (str "2 " (nth r 2)) "2 C:1:1"))
+    (is (= (str "3 " (nth r 3)) "3 C:1:2"))
+    (is (= (str "4 " (nth r 4)) "4 Q:a|;I:1;I:2"))
+    (is (= (str "5 " (nth r 5)) "5 C:1:2"))
+    (is (= (str "6 " (nth r 6)) "6 Q:a|"))
+    (is (= (str "7 " (nth r 7)) "7 C:1:2"))
+    (is (= (str "8 " (nth r 8)) "8 C:1:1"))
+    (is (= (str "9 " (nth r 9)) "9 E:1:cannot start a transaction within a transaction"))
+    (is (= (str "10 " (nth r 10)) "10 C:1:1"))
+    (is (= (str "11 " (nth r 11)) "11 Q:a|;I:3"))
+    (is (= (str "12 " (nth r 12)) "12 E:1:cannot commit - no transaction is active"))
+    (is (= (str "13 " (nth r 13)) "13 E:1:cannot rollback - no transaction is active"))
+    (is (= (str "14 " (nth r 14)) "14 E:1:cannot commit - no transaction is active"))
+    (is (= (str "15 " (nth r 15)) "15 C:1:1"))
+    (is (= (str "16 " (nth r 16)) "16 C:1:1"))
+    (is (= (str "17 " (nth r 17)) "17 C:1:1"))
+    (is (= (str "18 " (nth r 18)) "18 E:1:no such table: tx2"))
+    (is (= (str "19 " (nth r 19)) "19 C:1:2"))
+    (is (= (str "20 " (nth r 20)) "20 Q:a|;I:3;I:13"))
+    (is (= (str "21 " (nth r 21)) "21 E:1:2 values for 1 columns"))
+    (is (= (str "22 " (nth r 22)) "22 Q:changes()|total_changes()|last_insert_rowid()|;I:1 I:4 I:2"))
+    ))
+(deftest script-9
+  (let [r (run ["CREATE TABLE s (i INTEGER, r REAL)"
+                 "INSERT INTO s VALUES (9223372036854775807, 0.1), (1, 0.2), (NULL, 0.3)"
+                 "SELECT sum(i) FROM s"
+                 "SELECT total(i), avg(i) FROM s"
+                 "SELECT sum(r), avg(r), total(r) FROM s"
+                 "INSERT INTO s VALUES (-9223372036854775807, 1e308), (-3, 1e308)"
+                 "SELECT sum(i), sum(r) FROM s"
+                 "SELECT sum(i) FROM s WHERE i > 0"
+                 "SELECT sum(i) FROM s WHERE i < 9223372036854775807"
+                 "SELECT sum('3'), sum('x'), sum(x'31') FROM s WHERE i = 1"
+                 "SELECT max(i), min(i), max(r), min(r) FROM s"
+                 "SELECT r FROM s ORDER BY r"
+                 "SELECT i, r FROM s ORDER BY i DESC NULLS FIRST"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:3:3"))
+    (is (= (str "2 " (nth r 2)) "2 E:1:integer overflow"))
+    (is (= (str "3 " (nth r 3)) "3 Q:total(i)|avg(i)|;R:43e0000000000000 R:43d0000000000000"))
+    (is (= (str "4 " (nth r 4)) "4 Q:sum(r)|avg(r)|total(r)|;R:3fe3333333333333 R:3fc9999999999999 R:3fe3333333333333"))
+    (is (= (str "5 " (nth r 5)) "5 C:2:5"))
+    (is (= (str "6 " (nth r 6)) "6 E:1:integer overflow"))
+    (is (= (str "7 " (nth r 7)) "7 E:1:integer overflow"))
+    (is (= (str "8 " (nth r 8)) "8 E:1:integer overflow"))
+    (is (= (str "9 " (nth r 9)) "9 Q:sum('3')|sum('x')|sum(x'31')|;I:3 R:0000000000000000 R:3ff0000000000000"))
+    (is (= (str "10 " (nth r 10)) "10 Q:max(i)|min(i)|max(r)|min(r)|;I:9223372036854775807 I:-9223372036854775807 R:7fe1ccf385ebc8a0 R:3fb999999999999a"))
+    (is (= (str "11 " (nth r 11)) "11 Q:r|;R:3fb999999999999a;R:3fc999999999999a;R:3fd3333333333333;R:7fe1ccf385ebc8a0;R:7fe1ccf385ebc8a0"))
+    (is (= (str "12 " (nth r 12)) "12 Q:i|r|;N R:3fd3333333333333;I:9223372036854775807 R:3fb999999999999a;I:1 R:3fc999999999999a;I:-3 R:7fe1ccf385ebc8a0;I:-9223372036854775807 R:7fe1ccf385ebc8a0"))
+    ))
+(deftest script-10
+  (let [r (run ["CREATE TABLE r (a INTEGER PRIMARY KEY, b TEXT UNIQUE, c INTEGER)"
+                 "CREATE INDEX r_c ON r (c)"
+                 "INSERT INTO r VALUES (1, 'x', 1), (2, 'y', 2), (3, 'z', 3)"
+                 "UPDATE r SET a = a + 10 WHERE a = 1"
+                 "SELECT * FROM r ORDER BY a"
+                 "UPDATE OR IGNORE r SET a = 3 WHERE a = 2"
+                 "SELECT * FROM r ORDER BY a"
+                 "UPDATE OR IGNORE r SET a = 20, b = 'z' WHERE a = 2"
+                 "SELECT * FROM r ORDER BY a"
+                 "UPDATE r SET a = 3 WHERE a = 2"
+                 "UPDATE r SET b = 'z' WHERE a = 2"
+                 "SELECT * FROM r ORDER BY a"
+                 "UPDATE OR REPLACE r SET a = 3, c = 9 WHERE a = 2"
+                 "SELECT * FROM r ORDER BY a"
+                 "UPDATE OR REPLACE r SET b = 'x' WHERE a = 3"
+                 "SELECT * FROM r ORDER BY a"
+                 "INSERT INTO r VALUES (5, 'p', 5), (6, 'q', 6)"
+                 "UPDATE r SET b = b, a = a"
+                 "SELECT * FROM r ORDER BY a"
+                 "UPDATE OR IGNORE r SET a = a + 1"
+                 "SELECT * FROM r ORDER BY a"
+                 "SELECT a FROM r WHERE c = 9"
+                 "SELECT a FROM r WHERE b = 'x'"
+                 "SELECT a FROM r WHERE b = 'y'"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:0:0"))
+    (is (= (str "2 " (nth r 2)) "2 C:3:3"))
+    (is (= (str "3 " (nth r 3)) "3 C:1:3"))
+    (is (= (str "4 " (nth r 4)) "4 Q:a|b|c|;I:2 T:79 I:2;I:3 T:7a I:3;I:11 T:78 I:1"))
+    (is (= (str "5 " (nth r 5)) "5 C:0:3"))
+    (is (= (str "6 " (nth r 6)) "6 Q:a|b|c|;I:2 T:79 I:2;I:3 T:7a I:3;I:11 T:78 I:1"))
+    (is (= (str "7 " (nth r 7)) "7 C:0:3"))
+    (is (= (str "8 " (nth r 8)) "8 Q:a|b|c|;I:2 T:79 I:2;I:3 T:7a I:3;I:11 T:78 I:1"))
+    (is (= (str "9 " (nth r 9)) "9 E:1555:UNIQUE constraint failed: r.a"))
+    (is (= (str "10 " (nth r 10)) "10 E:2067:UNIQUE constraint failed: r.b"))
+    (is (= (str "11 " (nth r 11)) "11 Q:a|b|c|;I:2 T:79 I:2;I:3 T:7a I:3;I:11 T:78 I:1"))
+    (is (= (str "12 " (nth r 12)) "12 C:1:3"))
+    (is (= (str "13 " (nth r 13)) "13 Q:a|b|c|;I:3 T:79 I:9;I:11 T:78 I:1"))
+    (is (= (str "14 " (nth r 14)) "14 C:1:3"))
+    (is (= (str "15 " (nth r 15)) "15 Q:a|b|c|;I:3 T:78 I:9"))
+    (is (= (str "16 " (nth r 16)) "16 C:2:6"))
+    (is (= (str "17 " (nth r 17)) "17 C:3:6"))
+    (is (= (str "18 " (nth r 18)) "18 Q:a|b|c|;I:3 T:78 I:9;I:5 T:70 I:5;I:6 T:71 I:6"))
+    (is (= (str "19 " (nth r 19)) "19 C:2:6"))
+    (is (= (str "20 " (nth r 20)) "20 Q:a|b|c|;I:4 T:78 I:9;I:5 T:70 I:5;I:7 T:71 I:6"))
+    (is (= (str "21 " (nth r 21)) "21 Q:a|;I:4"))
+    (is (= (str "22 " (nth r 22)) "22 Q:a|;I:4"))
+    (is (= (str "23 " (nth r 23)) "23 Q:a|"))
+    ))
+(deftest script-11
+  (let [r (run ["CREATE TABLE z (a INTEGER PRIMARY KEY, b, c)"
+                 "INSERT INTO z VALUES (-1, 'd', 1), (2, 'd', 2), (-2, 'e', 3)"
+                 "CREATE UNIQUE INDEX zb ON z (b)"
+                 "SELECT name FROM sqlite_schema WHERE type = 'index'"
+                 "CREATE UNIQUE INDEX zc ON z (c)"
+                 "INSERT INTO z VALUES (3, 'f', 1)"
+                 "INSERT OR IGNORE INTO z VALUES (4, 'g', 3)"
+                 "UPDATE z SET c = 3 WHERE a = 2"
+                 "UPDATE z SET c = 3 WHERE a = -2"
+                 "UPDATE z SET a = -3 WHERE a = -1"
+                 "SELECT * FROM z ORDER BY a"])]
+    (is (= (str "0 " (nth r 0)) "0 C:0:0"))
+    (is (= (str "1 " (nth r 1)) "1 C:3:-2"))
+    (is (= (str "2 " (nth r 2)) "2 E:2067:UNIQUE constraint failed: z.b"))
+    (is (= (str "3 " (nth r 3)) "3 Q:name|"))
+    (is (= (str "4 " (nth r 4)) "4 C:3:-2"))
+    (is (= (str "5 " (nth r 5)) "5 E:2067:UNIQUE constraint failed: z.c"))
+    (is (= (str "6 " (nth r 6)) "6 C:0:-2"))
+    (is (= (str "7 " (nth r 7)) "7 E:2067:UNIQUE constraint failed: z.c"))
+    (is (= (str "8 " (nth r 8)) "8 C:1:-2"))
+    (is (= (str "9 " (nth r 9)) "9 C:1:-2"))
+    (is (= (str "10 " (nth r 10)) "10 Q:a|b|c|;I:-3 T:64 I:1;I:-2 T:65 I:3;I:2 T:64 I:2"))
+    ))

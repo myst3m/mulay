@@ -1,0 +1,335 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Vectors コネクタ (mule4-vectors-connector 1.0.0)。埋め込みは同じアプリの偽の Ollama (/ollama)、保存先は ephemeral-file (vectors.dir)。 -->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:ms-vectors="http://www.mulesoft.org/schema/mule/ms-vectors"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/ms-vectors http://www.mulesoft.org/schema/mule/ms-vectors/current/mule-ms-vectors.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18460"/>
+    </http:listener-config>
+
+    <ms-vectors:embedding-config name="Emb">
+        <ms-vectors:ollama-connection baseUrl="http://localhost:18460/ollama"/>
+    </ms-vectors:embedding-config>
+    <ms-vectors:embedding-config name="EmbBad">
+        <ms-vectors:ollama-connection baseUrl="http://localhost:18460/bad"/>
+    </ms-vectors:embedding-config>
+    <ms-vectors:embedding-config name="EmbDown">
+        <ms-vectors:ollama-connection baseUrl="http://localhost:18469/none"/>
+    </ms-vectors:embedding-config>
+
+    <ms-vectors:store-config name="Store">
+        <ms-vectors:ephemeral-file-connection workingDir="${vectors.dir}"/>
+    </ms-vectors:store-config>
+
+    <os:object-store name="Seen" persistent="false"/>
+
+    <configuration defaultErrorHandler-ref="eh"/>
+    <error-handler name="eh">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 偽の Ollama -->
+    <flow name="ollama">
+        <http:listener config-ref="L" path="/ollama/*"/>
+        <os:store key="last" objectStore="Seen">
+            <os:value>#[output application/json --- {method: attributes.method, path: attributes.requestPath, contentType: attributes.headers.'content-type' default null, body: payload}]</os:value>
+        </os:store>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload resource="mock/embed.dwl"/>
+            </ee:message>
+        </ee:transform>
+    </flow>
+    <!-- 失敗する埋め込みの口 -->
+    <flow name="bad">
+        <http:listener config-ref="L" path="/bad/*">
+            <http:response statusCode="500"/>
+        </http:listener>
+        <set-payload value="#[output application/json --- {error: 'model not found'}]"/>
+    </flow>
+    <flow name="ollama-last">
+        <http:listener config-ref="L" path="/ollama-last"/>
+        <os:retrieve key="last" objectStore="Seen">
+            <os:default-value>#[null]</os:default-value>
+        </os:retrieve>
+    </flow>
+
+    <!-- 保存先のディレクトリを消す (シナリオの最初と最後) -->
+    <flow name="reset">
+        <http:listener config-ref="L" path="/reset"/>
+        <try>
+            <file:delete path="${vectors.dir}"/>
+            <error-handler><on-error-continue><logger level="DEBUG" message="nothing to delete"/></on-error-continue></error-handler>
+        </try>
+        <file:create-directory directoryPath="${vectors.dir}"/>
+        <set-payload value="ok"/>
+    </flow>
+    <!-- 最後に消すだけ -->
+    <flow name="cleanup">
+        <http:listener config-ref="L" path="/cleanup"/>
+        <try>
+            <file:delete path="${vectors.dir}"/>
+            <error-handler><on-error-continue><logger level="DEBUG" message="nothing to delete"/></on-error-continue></error-handler>
+        </try>
+        <set-payload value="ok"/>
+    </flow>
+    <!-- 保存先のファイルの中身 -->
+    <flow name="store-file">
+        <http:listener config-ref="L" path="/store-file"/>
+        <file:read path="#['${vectors.dir}/' ++ (attributes.queryParams.store default 'docs') ++ '.store']" outputMimeType="text/plain"/>
+    </flow>
+
+    <flow name="embed">
+        <http:listener config-ref="L" path="/embed"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[payload.texts]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, payload: payload, attributes: attributes}]"/>
+    </flow>
+    <flow name="embed-down">
+        <http:listener config-ref="L" path="/embed-down"/>
+        <ms-vectors:embedding-generate-from-text config-ref="EmbDown" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[['x']]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+    </flow>
+
+    <!-- 操作の出力をそのまま返す (JSON の書き方と mime を見る) -->
+    <flow name="embed-raw">
+        <http:listener config-ref="L" path="/embed-raw"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[payload.texts]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+    </flow>
+    <flow name="add-raw">
+        <http:listener config-ref="L" path="/add-raw"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[payload.texts]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:store-add config-ref="Store" storeName="raw">
+            <ms-vectors:text-segments-and-embeddings>#[payload]</ms-vectors:text-segments-and-embeddings>
+        </ms-vectors:store-add>
+    </flow>
+    <flow name="query-raw">
+        <http:listener config-ref="L" path="/query-raw"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[[payload.text]]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:query config-ref="Store" storeName="raw" maxResults="5" minScore="0.5">
+            <ms-vectors:text-segment-and-embedding>#[payload]</ms-vectors:text-segment-and-embedding>
+        </ms-vectors:query>
+    </flow>
+    <flow name="chunk-raw">
+        <http:listener config-ref="L" path="/chunk-raw"/>
+        <ms-vectors:transform-chunk-text maxSegmentSizeInChar="30" maxOverlapSizeInChars="0">
+            <ms-vectors:text>#[output text/plain --- payload.text]</ms-vectors:text>
+        </ms-vectors:transform-chunk-text>
+    </flow>
+    <flow name="remove-raw">
+        <http:listener config-ref="L" path="/remove-raw"/>
+        <ms-vectors:store-remove config-ref="Store" storeName="raw" ids="#[payload.ids]"/>
+    </flow>
+    <!-- text を text/plain で渡す (JSON の引用符が付かない) -->
+    <flow name="chunk-plain">
+        <http:listener config-ref="L" path="/chunk-plain"/>
+        <ms-vectors:transform-chunk-text maxSegmentSizeInChar="#[attributes.queryParams.max]" maxOverlapSizeInChars="#[attributes.queryParams.overlap]">
+            <ms-vectors:text>#[output text/plain --- payload.text]</ms-vectors:text>
+        </ms-vectors:transform-chunk-text>
+    </flow>
+
+    <flow name="embed-bad">
+        <http:listener config-ref="L" path="/embed-bad"/>
+        <ms-vectors:embedding-generate-from-text config-ref="EmbBad" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[['x']]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+    </flow>
+    <!-- メタデータの項目を 2 つ (文字列と式) -->
+    <flow name="add-meta2">
+        <http:listener config-ref="L" path="/add-meta2"/>
+        <set-variable variableName="lang" value="#[payload.lang]"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[payload.texts]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:store-add config-ref="Store" storeName="meta2">
+            <ms-vectors:text-segments-and-embeddings>#[payload]</ms-vectors:text-segments-and-embeddings>
+            <ms-vectors:metadata-entries>
+                <ms-vectors:metadata-entry key="kind" value="manual"/>
+                <ms-vectors:metadata-entry key="lang" value="#[vars.lang]"/>
+            </ms-vectors:metadata-entries>
+        </ms-vectors:store-add>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[['order']]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:query config-ref="Store" storeName="meta2" maxResults="5" minScore="0">
+            <ms-vectors:text-segment-and-embedding>#[payload]</ms-vectors:text-segment-and-embedding>
+        </ms-vectors:query>
+    </flow>
+    <!-- 埋め込みでない JSON を渡す -->
+    <flow name="add-bad">
+        <http:listener config-ref="L" path="/add-bad"/>
+        <ms-vectors:store-add config-ref="Store" storeName="bad">
+            <ms-vectors:text-segments-and-embeddings>#[payload]</ms-vectors:text-segments-and-embeddings>
+        </ms-vectors:store-add>
+    </flow>
+    <flow name="remove-ids">
+        <http:listener config-ref="L" path="/remove-ids"/>
+        <ms-vectors:store-remove config-ref="Store" storeName="docs" ids="#[payload.ids]"/>
+        <set-payload value="#[output application/json --- {payload: payload, attributes: attributes}]"/>
+    </flow>
+
+    <!-- 大きさの属性を書かない / 0 -->
+    <flow name="chunk-noattrs">
+        <http:listener config-ref="L" path="/chunk-noattrs"/>
+        <ms-vectors:transform-chunk-text>
+            <ms-vectors:text>#[output text/plain --- payload.text]</ms-vectors:text>
+        </ms-vectors:transform-chunk-text>
+    </flow>
+    <flow name="chunk-zero">
+        <http:listener config-ref="L" path="/chunk-zero"/>
+        <ms-vectors:transform-chunk-text maxSegmentSizeInChar="0" maxOverlapSizeInChars="0">
+            <ms-vectors:text>#[output text/plain --- payload.text]</ms-vectors:text>
+        </ms-vectors:transform-chunk-text>
+    </flow>
+    <!-- inputs を書かない (payload が既定) -->
+    <flow name="embed-payload">
+        <http:listener config-ref="L" path="/embed-payload"/>
+        <set-payload value="#[payload.texts]"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed"/>
+    </flow>
+    <!-- 独自のメタデータの index は取り込みの項目より強い -->
+    <flow name="add-index">
+        <http:listener config-ref="L" path="/add-index"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[payload.texts]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:store-add config-ref="Store" storeName="idx">
+            <ms-vectors:text-segments-and-embeddings>#[payload]</ms-vectors:text-segments-and-embeddings>
+            <ms-vectors:metadata-entries>
+                <ms-vectors:metadata-entry key="index" value="custom"/>
+            </ms-vectors:metadata-entries>
+        </ms-vectors:store-add>
+        <ms-vectors:store-add config-ref="Store" storeName="idx">
+            <ms-vectors:text-segments-and-embeddings>#[output application/json --- {embeddings: [[1, 0]], dimension: 2}]</ms-vectors:text-segments-and-embeddings>
+        </ms-vectors:store-add>
+    </flow>
+    <flow name="store-file-idx">
+        <http:listener config-ref="L" path="/store-file-idx"/>
+        <file:read path="${vectors.dir}/idx.store" outputMimeType="text/plain"/>
+    </flow>
+    <!-- 検索の入力をそのまま渡す -->
+    <flow name="query-input">
+        <http:listener config-ref="L" path="/query-input"/>
+        <ms-vectors:query config-ref="Store" storeName="docs" maxResults="3" minScore="0">
+            <ms-vectors:text-segment-and-embedding>#[payload]</ms-vectors:text-segment-and-embedding>
+        </ms-vectors:query>
+    </flow>
+    <flow name="remove-none">
+        <http:listener config-ref="L" path="/remove-none"/>
+        <ms-vectors:store-remove config-ref="Store" storeName="#[attributes.queryParams.store]"/>
+    </flow>
+
+    <flow name="chunk">
+        <http:listener config-ref="L" path="/chunk"/>
+        <ms-vectors:transform-chunk-text maxSegmentSizeInChar="#[attributes.queryParams.max]" maxOverlapSizeInChars="#[attributes.queryParams.overlap]">
+            <ms-vectors:text>#[payload.text]</ms-vectors:text>
+        </ms-vectors:transform-chunk-text>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, payload: payload, attributes: attributes}]"/>
+    </flow>
+
+    <flow name="parse">
+        <http:listener config-ref="L" path="/parse"/>
+        <ms-vectors:transform-parse-document>
+            <ms-vectors:document-binary>#[payload]</ms-vectors:document-binary>
+            <ms-vectors:document-parser-parameters>
+                <ms-vectors:text-document-parser-parameters/>
+            </ms-vectors:document-parser-parameters>
+        </ms-vectors:transform-parse-document>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, payload: payload, attributes: attributes}]"/>
+    </flow>
+
+    <!-- 本文 {texts: [..]} を埋め込んで保存する -->
+    <flow name="add">
+        <http:listener config-ref="L" path="/add"/>
+        <set-variable variableName="store" value="#[attributes.queryParams.store default 'docs']"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[payload.texts]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:store-add config-ref="Store" storeName="#[vars.store]">
+            <ms-vectors:text-segments-and-embeddings>#[payload]</ms-vectors:text-segments-and-embeddings>
+        </ms-vectors:store-add>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, payload: payload, attributes: attributes}]"/>
+    </flow>
+    <flow name="add-meta">
+        <http:listener config-ref="L" path="/add-meta"/>
+        <set-variable variableName="source" value="#[payload.source]"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[payload.texts]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:store-add config-ref="Store" storeName="docs">
+            <ms-vectors:text-segments-and-embeddings>#[payload]</ms-vectors:text-segments-and-embeddings>
+            <ms-vectors:metadata-entries>
+                <ms-vectors:metadata-entry key="source" value="#[vars.source]"/>
+            </ms-vectors:metadata-entries>
+        </ms-vectors:store-add>
+        <set-payload value="#[output application/json --- {payload: payload, attributes: attributes}]"/>
+    </flow>
+
+    <!-- 本文 {text} を埋め込んで近いものを探す -->
+    <flow name="query">
+        <http:listener config-ref="L" path="/query"/>
+        <set-variable variableName="store" value="#[attributes.queryParams.store default 'docs']"/>
+        <set-variable variableName="max" value="#[attributes.queryParams.max default 3]"/>
+        <set-variable variableName="min" value="#[attributes.queryParams.min default 0]"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[[payload.text]]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:query config-ref="Store" storeName="#[vars.store]" maxResults="#[vars.max]" minScore="#[vars.min]">
+            <ms-vectors:text-segment-and-embedding>#[payload]</ms-vectors:text-segment-and-embedding>
+        </ms-vectors:query>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, payload: payload, attributes: attributes}]"/>
+    </flow>
+    <flow name="query-cond">
+        <http:listener config-ref="L" path="/query-cond"/>
+        <set-variable variableName="cond" value="#[payload.condition]"/>
+        <ms-vectors:embedding-generate-from-text config-ref="Emb" embeddingModelName="mock-embed">
+            <ms-vectors:inputs>#[[payload.text]]</ms-vectors:inputs>
+        </ms-vectors:embedding-generate-from-text>
+        <ms-vectors:query config-ref="Store" storeName="docs" maxResults="10" minScore="0">
+            <ms-vectors:text-segment-and-embedding>#[payload]</ms-vectors:text-segment-and-embedding>
+            <ms-vectors:condition>#[vars.cond]</ms-vectors:condition>
+        </ms-vectors:query>
+        <set-payload value="#[output application/json --- {payload: payload, attributes: attributes}]"/>
+    </flow>
+
+    <flow name="all">
+        <http:listener config-ref="L" path="/all"/>
+        <ms-vectors:query-all config-ref="Store" storeName="#[attributes.queryParams.store default 'docs']" retrieveEmbeddings="#[attributes.queryParams.emb default false]"/>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, payload: payload, attributes: attributes}]"/>
+    </flow>
+
+    <flow name="remove">
+        <http:listener config-ref="L" path="/remove"/>
+        <ms-vectors:store-remove config-ref="Store" storeName="docs" ids="#[payload.ids]"/>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, payload: payload, attributes: attributes}]"/>
+    </flow>
+    <flow name="remove-cond">
+        <http:listener config-ref="L" path="/remove-cond"/>
+        <ms-vectors:store-remove config-ref="Store" storeName="docs">
+            <ms-vectors:condition>#[payload.condition]</ms-vectors:condition>
+        </ms-vectors:store-remove>
+        <set-payload value="#[output application/json --- {payload: payload, attributes: attributes}]"/>
+    </flow>
+</mule>

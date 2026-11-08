@@ -1,0 +1,171 @@
+(ns mulay.conn.http_req
+  (:require [mulay.lib.numparse :as npz] [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.mule.model :as m]
+            [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.rt.engine :as en]
+            [mulay.lib.xml :as xml] [clay.httpmsg :as hm] [mulay.conn.httpmsg :as hx] [clay.string :as str]))
+
+(defn child-elem Vec(xml/XNode) [nodes: &Vec(xml/XNode) local: &Str]
+  (loop [i 0] (if (>= i (count nodes)) []
+                (let [n (nth nodes i)]
+                  (if (and (xml/elem? n) (= (xml/elem-local n) local)) [n] (recur (+ i 1)))))))
+
+(defn attr-of Str [n: &xml/XNode name: &Str default: Str] (xml/attr n "" name default))
+
+(defn url-encode Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)
+            safe (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 45) (= c 46) (= c 95) (= c 126))]
+        (recur (+ i 1) (if safe (str out (subs s i (+ i 1)))
+                         (str out "%" (subs "0123456789ABCDEF" (quot c 16) (+ (quot c 16) 1)) (subs "0123456789ABCDEF" (mod c 16) (+ (mod c 16) 1)))))))))
+
+(defn hpair hm/Header [n: Str x: Str] (hm/->Header n x))
+
+(defn status-error-id Str [st: Int]
+  (case st
+    300 "MULTIPLE_CHOICES" 301 "MOVED_PERMANENTLY" 302 "MOVED_TEMPORARILY" 303 "SEE_OTHER" 304 "NOT_MODIFIED"
+    400 "BAD_REQUEST" 401 "UNAUTHORIZED" 403 "FORBIDDEN" 404 "NOT_FOUND" 405 "METHOD_NOT_ALLOWED"
+    406 "NOT_ACCEPTABLE" 415 "UNSUPPORTED_MEDIA_TYPE" 429 "TOO_MANY_REQUESTS" 500 "INTERNAL_SERVER_ERROR"
+    502 "BAD_GATEWAY" 503 "SERVICE_UNAVAILABLE" 504 "GATEWAY_TIMEOUT"
+    ""))
+
+(defn reason Str [st: Int]
+  (case st
+    300 "multiple choices" 301 "moved permanently" 302 "moved temporarily" 303 "see other" 304 "not modified"
+    400 "bad request" 401 "unauthorized" 403 "forbidden" 404 "not found" 405 "method not allowed"
+    406 "not acceptable" 415 "unsupported media type" 429 "too many requests" 500 "internal server error"
+    502 "bad gateway" 503 "service unavailable" 504 "gateway timeout" ""))
+
+(defn obj-fields Vec(v/Field) [x: &v/Val] (match (v/unmeta x) (v/VObj fs) fs _ []))
+
+(defn eval-obj Values(Vec(v/Field) Str) [c: &conn/OpCall name: &Str]
+  (let [p (conn/param (:exprs c) name)]
+    (if (= (count p) 0) (values [] "")
+      (let [[x e] ((:eval c) (nth p 0) (:event c))] (values (obj-fields x) e)))))
+
+(defn val-text Str [x: &v/Val] (let [[s e] (drt/to-text x)] s))
+
+(defn status-ok? Bool [spec: &Str st: Int]
+  (if (= (str/trim spec) "") (and (>= st 0) (< st 400))
+    (let [parts: Vec(Str) (str/split spec ",")]
+      (loop [i 0]
+        (if (>= i (count parts)) false
+          (let [p (str/trim (nth parts i))
+                d (str/index-of p "..")]
+            (if (if (< d 0) (= (npz/int-or p 0) st)
+                  (and (>= st (npz/int-or (str/trim (subs p 0 d)) 0)) (<= st (npz/int-or (str/trim (subs p (+ d 2) (count p))) 0))))
+              true (recur (+ i 1)))))))))
+
+(defn validator-spec Str [children: &Vec(xml/XNode)]
+  (let [rv (child-elem children "response-validator")]
+    (if (= (count rv) 0) ""
+      (let [sv (child-elem (xml/elem-children (nth rv 0)) "success-status-code-validator")]
+        (if (= (count sv) 0) "" (attr-of (nth sv 0) "values" ""))))))
+
+(defrecord Target [method: Str url: Str url0: Str host: Str port: Str scheme: Str path-only: Str])
+
+(defn conn-node Vec(xml/XNode) [c: &conn/OpCall]
+  (let [cfg (:config c)] (if (= (count cfg) 0) [] (child-elem (:children (nth cfg 0)) "request-connection"))))
+
+(defn cfg-params Vec(m/Param) [c: &conn/OpCall] (let [cfg (:config c)] (if (= (count cfg) 0) [] (:params (nth cfg 0)))))
+
+(defn target Values(Target Str) [c: &conn/OpCall]
+  (let [ps (:params c)
+        cp (cfg-params c)
+        cn (conn-node c)
+        host (if (= (count cn) 0) "localhost" (attr-of (nth cn 0) "host" "localhost"))
+        proto (if (= (count cn) 0) "HTTP" (attr-of (nth cn 0) "protocol" "HTTP"))
+        port (if (= (count cn) 0) "" (attr-of (nth cn 0) "port" (if (= (str/lower-case proto) "https") "443" "80")))
+        base (conn/param-lit cp "basePath" "")
+        [method0 me] (let [p (conn/param ps "method")]
+                       (if (= (count p) 0) (values "GET" "")
+                         (let [[x e] ((:eval c) (nth p 0) (:event c))] (values (val-text x) e))))
+        method method0
+        [path pe] (let [p (conn/param ps "path")]
+                    (if (= (count p) 0) (values "/" "")
+                      (let [[x e] ((:eval c) (nth p 0) (:event c))] (values (val-text x) e))))
+        [url0 ue] (let [p (conn/param ps "url")]
+                    (if (= (count p) 0) (values "" "")
+                      (let [[x e] ((:eval c) (nth p 0) (:event c))] (values (val-text x) e))))
+        [uparams ue2] (eval-obj c "uri-params")
+        [qparams qe] (eval-obj c "query-params")
+        scheme (if (= (str/lower-case proto) "https") "https" "http")
+        path2 (loop [i 0 p path] (if (>= i (count uparams)) p
+                                   (recur (+ i 1) (str/replace p (str "{" (:name (:key (nth uparams i))) "}") (url-encode (val-text (:value (nth uparams i))))))))
+        qs (loop [i 0 out ""] (if (>= i (count qparams)) out
+                                (recur (+ i 1) (str out (if (= i 0) "?" "&") (url-encode (:name (:key (nth qparams i)))) "=" (url-encode (val-text (:value (nth qparams i))))))))
+        url (if (> (count url0) 0) (str url0 qs) (str scheme "://" host (if (= port "") "" (str ":" port)) (hx/join-path base path2) qs))
+        path-only (let [k (str/index-of url "://") rest (if (< k 0) url (subs url (+ k 3) (count url))) sl (str/index-of rest "/")
+                        p (if (< sl 0) "/" (subs rest sl (count rest))) q (str/index-of p "?")]
+                    (if (< q 0) p (subs p 0 q)))
+        first-err (loop [es: Vec(Str) [me pe ue ue2 qe] i 0] (if (>= i (count es)) "" (if (not= (nth es i) "") (nth es i) (recur es (+ i 1)))))]
+    (values (->Target method url url0 host port scheme path-only) first-err)))
+
+(defrecord Body [tv: ev/TV bytes: Str chunked: Bool ct: Str no-body-method: Bool])
+
+(defn body-of Values(Body Str) [c: &conn/OpCall method: &Str]
+  (let [ps (:params c)
+        cp (cfg-params c)
+        bodyp (conn/param (:exprs c) "body")
+        [btv be] (if (= (count bodyp) 0) (values (:payload (:event c)) "") ((:eval-tv c) (nth bodyp 0) (:event c)))
+        sbm (str/upper-case (str/trim (conn/param-lit ps "sendBodyMode" (conn/param-lit cp "sendBodyMode" "AUTO"))))
+        nbm (let [mu (str/upper-case method)] (or (= mu "GET") (= mu "HEAD") (= mu "OPTIONS")))
+        send-body (cond (= sbm "ALWAYS") true (= sbm "NEVER") false :else (not nbm))
+        [body bye] (if send-body (ev/wire-bytes btv) (values "" ""))
+        rsm (str/upper-case (str/trim (conn/param-lit ps "requestStreamingMode" (conn/param-lit cp "requestStreamingMode" "AUTO"))))
+        body-stream (and (:stream btv) (or (= (count bodyp) 0) (match (nth bodyp 0) (m/PExpr t cmp src) (en/identity-expr? src) _ false)))
+        chunked (and send-body (cond (= rsm "NEVER") false body-stream true (= rsm "ALWAYS") (> (count body) 0) :else false))]
+    (values (->Body btv body chunked (ev/content-type btv) nbm) (if (not= be "") be bye))))
+
+(defrecord UserHeaders [headers: Vec(hm/Header) auth: Bool ct: Bool])
+
+(defn user-headers Values(UserHeaders Str) [c: &conn/OpCall]
+  (let [[hdrs he] (eval-obj c "headers")
+        hs (loop [i 0 acc: Vec(hm/Header) []]
+             (if (>= i (count hdrs)) acc
+               (recur (+ i 1) (conj acc (hpair (:name (:key (nth hdrs i))) (val-text (:value (nth hdrs i))))))))
+        has (fn Bool [n: Str] (loop [i 0] (if (>= i (count hdrs)) false (if (= (str/lower-case (:name (:key (nth hdrs i)))) n) true (recur (+ i 1))))))]
+    (values (->UserHeaders hs (has "authorization") (has "content-type")) he)))
+
+(defn resp-attrs Values(v/Val Str) [st: Int reason-phrase: &Str rl: &Vec(hm/Header)]
+  (let [hattrs (loop [i 0 acc: Vec(v/Field) []]
+                 (if (>= i (count rl)) acc
+                   (let [hd (nth rl i)]
+                     (recur (+ i 1) (conj acc (v/field (str/lower-case (:hd-name hd)) (v/->VStr (str (:hd-value hd)))))))))
+        rct (let [r (v/obj-get hattrs "content-type")] (if (= (count r) 0) "" (match (nth r 0) (v/VStr x) x _ "")))]
+    (values (v/->VMeta (v/->VObj [(v/field "headers" (v/->VObj hattrs)) (v/field "reasonPhrase" (v/->VStr (str reason-phrase))) (v/field "statusCode" (v/int-v st))])
+                       [(v/field "class" (v/->VStr "org.mule.extension.http.api.HttpResponseAttributes"))])
+            rct)))
+
+(defn payload-mime Str [c: &conn/OpCall rct: &Str rbody: &Str]
+  (let [ps (:params c)
+        om (conn/param-lit ps "outputMimeType" "")
+        oe (conn/param-lit ps "outputEncoding" "")]
+    (cond (= om "") (if (= rct "") (if (> (count rbody) 0) "application/octet-stream; charset=UTF-8" ev/ANY) (ev/with-charset rct))
+          (= oe "") (str om)
+          :else (str om "; charset=" oe))))
+
+(defn status-result conn/OpResult [c: &conn/OpCall t: &Target b: &Body st: Int payload: ev/TV attrs: v/Val]
+  (let [what (str "HTTP " (:method t) " on resource '" (:url t) "' failed")]
+    (if (status-ok? (validator-spec (:children c)) st) (conn/ok-result payload (ev/tv-val attrs ev/JAVA))
+      (let [id (status-error-id st)
+            why (if (= st 415) (str "media type " (if (or (= (count (:bytes b)) 0) (= (:ct b) "")) "null" (:ct b)) " not supported") (reason st))
+            desc (if (= id "") (str what " with status code " st ".") (str what ": " why " (" st ")."))
+            [bv tt pe2] (ev/value payload)]
+        (conn/fail-result (err/->MErr (if (= id "") "MULE" "HTTP") (if (= id "") "UNKNOWN" id) desc desc [bv] [attrs] "" [] "" "" "" false [] []))))))
+
+(defn match-path Values(Bool Vec(v/Field)) [pattern: &Str path: &Str]
+  (let [ps: Vec(Str) (segments pattern)
+        xs: Vec(Str) (segments path)]
+    (loop [i 0 acc: Vec(v/Field) []]
+      (if (>= i (count ps)) (values (= i (count xs)) acc)
+        (let [p (nth ps i)]
+          (if (= p "*") (values true acc)
+            (if (>= i (count xs)) (values false acc)
+              (let [x (nth xs i)]
+                (if (and (str/starts-with? p "{") (str/ends-with? p "}"))
+                  (recur (+ i 1) (conj acc (v/field (subs p 1 (- (count p) 1)) (v/->VStr (str x)))))
+                  (if (= p x) (recur (+ i 1) acc) (values false acc)))))))))))
+
+(defn- segments Vec(Str) [p: &Str]
+  (let [parts: Vec(Str) (str/split p "/")]
+    (loop [i 0 acc: Vec(Str) []] (if (>= i (count parts)) acc (recur (+ i 1) (if (= (nth parts i) "") acc (conj acc (nth parts i))))))))

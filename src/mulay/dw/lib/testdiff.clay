@@ -1,0 +1,132 @@
+(ns mulay.dw.lib.testdiff
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.fmt.registry :as reg] [clay.string :as str]))
+
+(def M "dw::test::internal::Native")
+
+(defrecord Dif [kind: Str path: Str ty: Str expected: v/Val actual: v/Val])
+
+(defn- dif Dif [kind: Str path: Str ty: Str e: v/Val a: v/Val] (->Dif kind path ty e a))
+
+(defn readable Str [x: &v/Val]
+  (let [[s e] (reg/write-fmt "application/dw" [(v/field "ignoreSchema" (v/bool-v true))] x)]
+    (if (dwe/ok? e) s
+      (let [[s2 e2] (reg/write-fmt "application/dw" [] x)] (if (dwe/ok? e2) s2 (v/type-name (v/unmeta x)))))))
+
+(defn- key-text Str [k: &v/Key]
+  (if (and (> (count (:ns k)) 0) (not= (:prefix (nth (:ns k) 0)) ""))
+    (str (:prefix (nth (:ns k) 0)) "#" (:name k))
+    (:name k)))
+
+(defn- ns-uri Str [k: &v/Key] (if (= (count (:ns k)) 0) "" (:uri (nth (:ns k) 0))))
+
+(defn- same-key? Bool [a: &v/Key b: &v/Key] (and (= (:name a) (:name b)) (= (ns-uri a) (ns-uri b))))
+
+(defn- attr-fields Vec(v/Field) [k: &v/Key]
+  (loop [i 0 acc: Vec(v/Field) []]
+    (if (>= i (count (:attrs k))) acc
+      (let [a (nth (:attrs k) i)] (recur (+ i 1) (conj acc (v/->Field (v/->Key (:ns a) (:name a) []) (:value a))))))))
+
+(defn- by-name Vec(v/Field) [fs: &Vec(v/Field)]
+  (loop [i 1 acc fs]
+    (if (>= i (count acc)) acc
+      (recur (+ i 1)
+             (loop [j i w acc]
+               (if (and (> j 0) (> (core/str-cmp (:name (:key (nth w (- j 1)))) (:name (:key (nth w j)))) 0))
+                 (let [x (nth w (- j 1)) y (nth w j)] (recur (- j 1) (assoc (assoc w (- j 1) y) j x)))
+                 w))))))
+
+(defn- has-name? Bool [fs: &Vec(v/Field) n: &Str]
+  (loop [i 0] (if (>= i (count fs)) false (if (= (:name (:key (nth fs i))) n) true (recur (+ i 1))))))
+
+(defn- first-named v/Val [fs: &Vec(v/Field) n: &Str]
+  (loop [i 0] (if (>= i (count fs)) (v/null-v) (if (= (:name (:key (nth fs i))) n) (:value (nth fs i)) (recur (+ i 1))))))
+
+(defn- absent-names Vec(Str) [from: &Vec(v/Field) other: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count from)) acc
+      (let [n (:name (:key (nth from i)))]
+        (recur (+ i 1) (if (or (has-name? other n) (loop [k 0] (if (>= k (count acc)) false (if (= (nth acc k) n) true (recur (+ k 1)))))) acc (conj acc n)))))))
+
+(defn- in? Bool [xs: &Vec(Str) n: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) n) true (recur (+ i 1))))))
+
+(defn- prepend Vec(Dif) [front: Vec(Dif) back: &Vec(Dif)]
+  (loop [i 0 acc front] (if (>= i (count back)) acc (recur (+ i 1) (conj acc (nth back i))))))
+
+(defn- as-attr Dif [d: &Dif]
+  (let [p (str/replace (:path d) "@." "@")]
+    (cond (= (:kind d) "KEY_NOT_PRESENT") (dif "ATTRIBUTE_NOT_PRESENT" p (:ty d) (v/null-v) (v/null-v))
+          (= (:kind d) "UNEXPECTED_KEY") (dif "UNEXPECTED_ATTRIBUTE" p (:ty d) (v/null-v) (v/null-v))
+          :else d)))
+
+(defn- diff-objs Vec(Dif) [a0: &Vec(v/Field) e0: &Vec(v/Field) unordered: Bool path: &Str]
+  (let [a (if unordered (by-name a0) a0)
+        e (if unordered (by-name e0) e0)
+        missing (absent-names e a)
+        extra (absent-names a e)
+        base (loop [i 0 acc: Vec(Dif) []]
+               (if (>= i (count missing)) acc
+                 (let [n (nth missing i)] (recur (+ i 1) (conj acc (dif "KEY_NOT_PRESENT" (str path "." n) (v/type-name (v/unmeta (first-named e n))) (v/null-v) (v/null-v)))))))
+        base2 (loop [i 0 acc base]
+                (if (>= i (count extra)) acc
+                  (let [n (nth extra i)] (recur (+ i 1) (conj acc (dif "UNEXPECTED_KEY" (str path "." n) (v/type-name (v/unmeta (first-named a n))) (v/null-v) (v/null-v)))))))
+        n (if (< (count a) (count e)) (count a) (count e))]
+    (loop [i 0 acc base2]
+      (if (>= i n) acc
+        (let [af (nth a i) ef (nth e i) ak (:key af) ek (:key ef) et (key-text ek)
+              ds (cond
+                   (in? extra (:name ak)) []
+                   (in? missing (:name ek)) []
+                   (same-key? ak ek)
+                   (let [at (diff-vals (v/->VObj (attr-fields ak)) (v/->VObj (attr-fields ek)) unordered (str path "." et ".@"))
+                         at2 (loop [k 0 o: Vec(Dif) []] (if (>= k (count at)) o (recur (+ k 1) (conj o (as-attr (nth at k))))))]
+                     (prepend at2 (diff-vals (:value af) (:value ef) unordered (str path "." et))))
+                   :else [(dif "KEY_NOT_PRESENT" (str path "." et) (v/type-name (v/unmeta (:value ef))) (v/null-v) (v/null-v))])]
+          (recur (+ i 1) (prepend ds acc)))))))
+
+(defn- diff-arrs Vec(Dif) [a: &Vec(v/Val) e: &Vec(v/Val) unordered: Bool path: &Str]
+  (if (not= (count a) (count e))
+    [(dif "ARRAY_LENGTH_MISMATCH" path "" (v/int-v (count e)) (v/int-v (count a)))]
+    (loop [i 0 acc: Vec(Dif) []]
+      (if (>= i (count a)) acc
+        (recur (+ i 1) (prepend (diff-vals (nth a i) (nth e i) unordered (str path "[" i "]")) acc))))))
+
+(defn- type-mismatch Vec(Dif) [a: &v/Val e: &v/Val path: &Str]
+  [(dif "TYPE_MISMATCH" path "" (v/->VStr (v/type-name e)) (v/->VStr (v/type-name a)))])
+
+(defn diff-vals Vec(Dif) [actual: &v/Val expected: &v/Val unordered: Bool path: &Str]
+  (let [a (v/unmeta actual) e (v/unmeta expected)]
+    (match e
+      (v/VObj efs) (match a (v/VObj afs) (diff-objs afs efs unordered path) _ (type-mismatch a e path))
+      (v/VArr exs) (match a (v/VArr axs) (diff-arrs axs exs unordered path) _ (type-mismatch a e path))
+      _ (if (v/equal? a e) [] [(dif "VALUE_MISMATCH" path "" expected actual)]))))
+
+(defn reason Str [d: &Dif]
+  (let [k (:kind d) p (:path d)]
+    (cond
+      (= k "ATTRIBUTE_NOT_PRESENT") (str "Expected attribute with type " (:ty d) " at " p " but was not present.")
+      (= k "UNEXPECTED_ATTRIBUTE") (str "Encountered unexpected attribute with type " (:ty d) " at " p ".")
+      (= k "KEY_NOT_PRESENT") (str "Expected key with value type " (:ty d) " at " p " but was not present.")
+      (= k "UNEXPECTED_KEY") (str "Encountered unexpected entry with type " (:ty d) " at " p ".")
+      (= k "TYPE_MISMATCH") (str "Expected value to have type " (core/arg-str [(:expected d)] 0) " but was " (core/arg-str [(:actual d)] 0) " at " p ".")
+      (= k "ARRAY_LENGTH_MISMATCH") (str "Expected size of array to be " (readable (:expected d)) " but was " (readable (:actual d)) " at " p ".")
+      :else (str "Expected value to be " (readable (:expected d)) " but was " (readable (:actual d)) " at " p "."))))
+
+(defn- reasons-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[av ae] (v/whole-deep (nth a 0))
+        [ev ee] (v/whole-deep (nth a 1))
+        unordered (match (v/unmeta (nth a 2)) (v/VBool b) b _ false)]
+    (cond
+      (not (dwe/ok? ae)) (values (v/null-v) ae)
+      (not (dwe/ok? ee)) (values (v/null-v) ee)
+      :else
+      (let [ds (diff-vals av ev unordered "(root)")]
+        (rt/ret (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count ds)) acc (recur (+ i 1) (conj acc (v/->VStr (reason (nth ds i)))))))))))))
+
+(defn- readable-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[x e] (v/whole-deep (nth a 0))]
+    (if (not (dwe/ok? e)) (values (v/null-v) e) (rt/ret (v/->VStr (readable x))))))
+
+(defn builtins Vec(rt/Builtin) []
+  [(rt/builtin "equalityReasons" M [(rt/overload ["Any" "Any" "Boolean"] reasons-fn)])
+   (rt/builtin "readable" M [(rt/b1 "Any" readable-fn)])])

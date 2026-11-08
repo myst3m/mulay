@@ -1,0 +1,27 @@
+(ns jhash-test (:require [mulay.lib.jhash :as jh]))
+
+;; 期待値は実 Mule の出力 (Salesforce コネクタの query の結果、everit の検証順) から
+
+(deftest string-hash
+  (is (= (jh/string-hash "") 0))
+  (is (= (jh/string-hash "a") 97))
+  (is (= (jh/string-hash "Name") 2420395))
+  ;; UTF-16 のサロゲート対で数える
+  (is (= (jh/string-hash "😀") (bit-and (+ (* 55357 31) 56832) 4294967295))))
+
+(deftest hashmap-order
+  (is (= (jh/hashmap-order ["type" "Id" "Name" "Industry" "NumberOfEmployees" "AnnualRevenue" "IsDeleted" "Owner"])
+         ["Industry" "IsDeleted" "Owner" "Id" "NumberOfEmployees" "type" "AnnualRevenue" "Name"]))
+  (is (= (jh/hashmap-order ["d" "dt" "u" "id" "ip" "m" "big" "uniq" "few" "small" "any" "all" "notstr" "color" "n" "maxed" "uni" "nested"])
+         ["small" "all" "big" "d" "color" "ip" "m" "any" "nested" "n" "maxed" "dt" "uni" "u" "uniq" "few" "notstr" "id"]))
+  (is (= (jh/hashmap-order ["a" "a" "b"]) ["a" "b"])))
+
+;; 期待値は JDK 17 (new HashMap<>(n + 3) に後ろから put) と実 DW 2.11 の envVars() (Scala 2.12 の HashMap)
+(deftest hashmap-order-with-capacity
+  (let [ks ["PATH" "HOME" "SHELL" "LANG" "USER" "TERM" "EDITOR" "TZ" "A" "BB" "CCC" "DDDD" "MULE_ENV" "JAVA_HOME"]
+        rev (loop [i 13 acc: Vec(Str) []] (if (< i 0) acc (recur (- i 1) (conj acc (nth ks i)))))]
+    (is (= (jh/hashmap-order-with rev 17)
+           ["BB" "PATH" "A" "CCC" "SHELL" "TZ" "JAVA_HOME" "TERM" "USER" "LANG" "EDITOR" "MULE_ENV" "HOME" "DDDD"]))
+    (is (= (jh/scala-map-order (jh/hashmap-order-with rev 17))
+           ["SHELL" "PATH" "TERM" "JAVA_HOME" "HOME" "A" "BB" "TZ" "EDITOR" "USER" "MULE_ENV" "DDDD" "LANG" "CCC"]))
+    (is (= (jh/scala-map-order ["b" "a" "c"]) ["b" "a" "c"]))))

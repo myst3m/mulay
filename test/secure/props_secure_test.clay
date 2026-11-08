@@ -1,0 +1,53 @@
+(ns props-secure-test (:require [mulay.mule.props :as props] [mulay.mule.model :as m] [mulay.lib.res :as res]))
+
+;; <secure-properties:config> の読み込み (props/load-decls)。暗号文は tools/gen-secure-golden.java が実モジュールで作ったもの。
+;; AES / CBC / useRandomIVs=true / 鍵 0123456789abcdef で "s3cret"。
+(def CT "![LTmHGk3QfRu2aPO9KXHZDgVIREjJFHnYeKk1lP7/00s=]")
+
+(defn- decl Vec(props/PropDecl) [file: Str key: Str]
+  [(props/->PropDecl "secure" file key 3 ["AES" "CBC" "true" "false"])])
+
+(defn- props-with props/Props [file: Str text: Str over: Vec(m/Param)]
+  (props/props-new over false "app" (res/res-mem [file] [text])))
+
+(defn- loaded Values(props/Props Vec(m/Diag)) [file: Str text: Str key: Str over: Vec(m/Param)]
+  (let [ds (decl file key)] (props/load-decls (props-with file text over) ds "app.xml")))
+
+(defn- no-over Vec(m/Param) [] (let [e: Vec(m/Param) []] e))
+
+(defn- value-of Str [p: &props/Props k: &Str] (let [[v ok] (props/lookup p k)] (if ok v "<none>")))
+
+(deftest decrypts-and-prefixes-the-names
+  (let [[p errs] (loaded "s.properties" (str "a=" CT "\nb=plain\n") "0123456789abcdef" (no-over))]
+    (is (= (count errs) 0))
+    (is (= (value-of p "secure::a") "s3cret"))
+    (is (= (value-of p "secure::b") "plain"))
+    (is (= (value-of p "a") "<none>"))))
+
+(deftest key-can-come-from-a-property
+  (let [over [(m/->Param "secure.key" (m/->PLit "0123456789abcdef"))]
+        [p errs] (loaded "s.properties" (str "a=" CT "\n") "${secure.key}" over)]
+    (is (= (count errs) 0))
+    (is (= (value-of p "secure::a") "s3cret"))))
+
+(deftest wrong-key-is-reported-without-the-key
+  (let [[p errs] (loaded "s.properties" (str "a=" CT "\n") "fedcba9876543210" (no-over))]
+    (is (= (count errs) 1))
+    (is (= (m/diag-str (nth errs 0)) "app.xml:3: secure-properties: Could not encrypt or decrypt the data."))))
+
+(deftest bad-key-length
+  (let [[p errs] (loaded "s.properties" (str "a=" CT "\n") "short" (no-over))]
+    (is (= (m/diag-str (nth errs 0)) "app.xml:3: secure-properties: The key is invalid, please make sure it's of a supported size (actual is 5)"))))
+
+(deftest missing-file
+  (let [ds (decl "nope.properties" "0123456789abcdef")
+        [p errs] (props/load-decls (props-with "s.properties" "" (no-over)) ds "app.xml")]
+    (is (= (m/diag-str (nth errs 0)) "app.xml:3: secure-properties: file not found: nope.properties"))))
+
+(deftest file-must-be-yaml-or-properties
+  (let [[p errs] (loaded "s.dat" "x" "0123456789abcdef" (no-over))]
+    (is (= (m/diag-str (nth errs 0)) "app.xml:3: secure-properties: Configuration properties file s.dat must end with yaml or properties extension"))))
+
+(deftest missing-key-attribute
+  (let [[p errs] (loaded "s.properties" "" "" (no-over))]
+    (is (= (m/diag-str (nth errs 0)) "app.xml:3: secure-properties: Required attribute 'key' of 'secure-configuration-properties' not found"))))

@@ -1,0 +1,418 @@
+(ns mulay.dw.rt (:require [clay.utf8 :as u8] [mulay.dw.ast :as ast] [mulay.dw.err :as dwe] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.lib.uni :as uni]
+                          [mulay.dw.stdlib_locs :as sl] [mulay.dw.fmt.dw :as dwfmt]))
+
+(defn strip-parens Values(Int Int) [script: &Str s0: Int e0: Int]
+  (loop [s s0 e e0]
+    (if (and (< (+ s 1) e) (<= e (count script)) (= (nth script s) 40) (= (nth script (- e 1)) 41)
+             (loop [i (+ s 1) d 1]
+               (cond (>= i (- e 1)) (= d 1)
+                     (= (nth script i) 40) (recur (+ i 1) (+ d 1))
+                     (= (nth script i) 41) (if (= d 1) false (recur (+ i 1) (- d 1)))
+                     :else (recur (+ i 1) d))))
+      (let [s2 (loop [i (+ s 1)] (if (and (< i e) (let [c (nth script i)] (or (= c 32) (= c 9) (= c 10) (= c 13)))) (recur (+ i 1)) i))
+            e2 (loop [i (- e 1)] (if (and (> i s2) (let [c (nth script (- i 1))] (or (= c 32) (= c 9) (= c 10) (= c 13)))) (recur (- i 1)) i))]
+        (recur s2 e2))
+      (values s e))))
+
+(defn excerpt Values(Int Int Str) [src: &Str sp: &ast/Span]
+  (let [[start end] (if (< (:start sp) 0) (values -1 -1) (strip-parens src (:start sp) (:end sp)))
+        n (count src)]
+    (if (or (< start 0) (>= start n)) (values 0 0 "Unknown location")
+      (let [ls (loop [j start] (if (and (> j 0) (not= (nth src (- j 1)) 10)) (recur (- j 1)) j))
+            le (loop [j start] (if (and (< j n) (not= (nth src j) 10) (not= (nth src j) 13)) (recur (+ j 1)) j))
+            ln (loop [j 0 k 1] (if (>= j start) k (recur (+ j 1) (if (= (nth src j) 10) (+ k 1) k))))
+            col (+ 1 (u8/codepoint-count (subs src ls start)))
+            ce (if (or (> end le) (<= end start)) le end)
+            ncar (let [x (u8/codepoint-count (subs src start ce))] (if (< x 1) 1 x))
+            lnum (str ln)
+            pad (loop [i 0 out ""] (if (>= i (+ (count lnum) 1 col)) out (recur (+ i 1) (str out " "))))
+            car (loop [i 0 out ""] (if (>= i ncar) out (recur (+ i 1) (str out "^"))))]
+        (values ln col (str "\n" lnum "| " (subs src ls le) "\n" pad car))))))
+
+(defrecord SrcSeg [id: Str base: Int text: Str])
+(defrecord Srcs [main: Str id: Str segs: Vec(SrcSeg)])
+
+(defn no-srcs Srcs [] (->Srcs "" "anonymous" []))
+
+(defn seg-of Values(Str Str Int) [s: &Srcs start: Int]
+  (let [gs (:segs s)]
+    (loop [i 0]
+      (if (>= i (count gs)) (values (:main s) (:id s) 0)
+        (let [g (nth gs i)]
+          (if (and (>= start (:base g)) (<= start (+ (:base g) (count (:text g)))))
+            (values (:text g) (:id g) (:base g))
+            (recur (+ i 1))))))))
+
+(defn excerpt-in Values(Int Int Str Str) [s: &Srcs sp: &ast/Span]
+  (let [[text id base] (seg-of s (:start sp))
+        [ln col x] (excerpt text (if (< (:start sp) 0) sp (ast/->Span (- (:start sp) base) (- (:end sp) base))))]
+    (values ln col x id)))
+
+(defn short-name Str [q: &Str]
+  (let [k (loop [i (- (count q) 2)] (if (< i 0) -1 (if (and (= (nth q i) 58) (= (nth q (+ i 1)) 58)) i (recur (- i 1)))))]
+    (if (< k 0) (str q) (subs q (+ k 2) (count q)))))
+
+
+
+(defn native-frame dwe/DwErr [e: dwe/DwErr b: &Builtin i: Int]
+  (if (or (dwe/ok? e) (not (dwe/unset? (:sp e))) (> (count (:frames e)) 0) (= (:kind e) "InvalidFunctionArgs") (= (:kind e) "InvalidFunctionArgsNull")) e
+    (let [key (str (:module b) " " (:name b))
+          ls: Vec(Vec(Int)) (match (get sl/NATIVE-LOC key) (Some x) x (None) [])
+          k (cond (= (count ls) 0) -1
+                  (= (count ls) (count (:overloads b))) i
+                  (= (count ls) 1) 0
+                  :else -1)]
+      (if (or (< k 0) (= (count (nth ls k)) 0)) e
+        (let [loc (nth ls k)
+              line (match (get sl/NATIVE-TEXT key) (Some ts) (nth ts k) (None) "")
+              ln (nth loc 1) col (nth loc 2)
+              lnum (str ln)
+              pad (loop [j 0 out ""] (if (>= j (+ (count lnum) 1 col)) out (recur (+ j 1) (str out " "))))
+              car (loop [j 0 out ""] (if (>= j (- (nth loc 3) (nth loc 0))) out (recur (+ j 1) (str out "^"))))]
+          (dwe/->DwErr (:kind e) (:msg e) (:sp e)
+                   [(dwe/->StackF (:name b) (dwe/no-span) (str (:module b) ":" ln ":" col))]
+                   (:pend e)
+                   (str "\n" lnum "| " line "\n" pad car)))))))
+
+(defn failure Values(v/Val dwe/DwErr) [kind: Str msg: Str] (values (v/null-v) (dwe/err kind msg)))
+
+(defn arith-kind Str [msg: &Str] (if (= msg "Division by zero") "DivisionByZeroException" "ArithmeticException"))
+(defn ret Values(v/Val dwe/DwErr) [x: v/Val] (values x (dwe/ok)))
+
+(defrecord Hooks [call: Fn(Dyn Int v/FnV Vec(v/Val) Values(v/Val dwe/DwErr)) find: Fn(Dyn Str Str Int)
+                  param-default: Fn(Dyn Int v/FnV Int Values(Vec(v/Val) dwe/DwErr))
+                  srcs: Fn(Dyn Srcs)
+                  run: Fn(Dyn Str v/Val v/Val v/Val Bool Values(v/Val dwe/DwErr))
+                  coerce: Fn(v/Val Str Values(v/Val dwe/DwErr))
+                  pure: Fn(Dyn Int Bool)
+                  prep: Fn(Dyn Int v/FnV Int Fn(Vec(v/Val) Values(v/Val dwe/DwErr)))
+                  prep2: Fn(Dyn Int v/FnV Fn(v/Val v/Val Values(v/Val dwe/DwErr)))
+                  prep-ix: Fn(Dyn Int v/FnV Fn(v/Val Int Values(v/Val dwe/DwErr)))
+                  fn-span: Fn(Dyn v/FnV Vec(Int))])
+
+(defrecord Env [ctx: Dyn depth: Int hooks: Hooks lazy: Bool])
+
+(defn env-call Values(v/Val dwe/DwErr) [env: &Env f: &v/FnV args: Vec(v/Val)]
+  ((:call (:hooks env)) (:ctx env) (:depth env) f args))
+(defn env-pure? Bool [env: &Env f: &v/FnV] (match (:host f) (Some h) false (None) ((:pure (:hooks env)) (:ctx env) (:def f))))
+(defn env-prep Fn(Vec(v/Val) Values(v/Val dwe/DwErr)) [env: &Env f: &v/FnV na: Int] ((:prep (:hooks env)) (:ctx env) (:depth env) f na))
+(defn env-prep2 Fn(v/Val v/Val Values(v/Val dwe/DwErr)) [env: &Env f: &v/FnV] ((:prep2 (:hooks env)) (:ctx env) (:depth env) f))
+(defn env-fn-span Vec(Int) [env: &Env f: &v/FnV] ((:fn-span (:hooks env)) (:ctx env) f))
+(defn env-prep-ix Fn(v/Val Int Values(v/Val dwe/DwErr)) [env: &Env f: &v/FnV] ((:prep-ix (:hooks env)) (:ctx env) (:depth env) f))
+(defn env-find Int [env: &Env module: &Str name: &Str]
+  ((:find (:hooks env)) (:ctx env) module name))
+(defn env-srcs Srcs [env: &Env] ((:srcs (:hooks env)) (:ctx env)))
+
+(defn env-run Values(v/Val dwe/DwErr) [env: &Env file: Str fs: v/Val readers: v/Val values0: v/Val write: Bool]
+  ((:run (:hooks env)) (:ctx env) file fs readers values0 write))
+(defn env-coerce Values(v/Val dwe/DwErr) [env: &Env x: v/Val target: Str] ((:coerce (:hooks env)) x target))
+
+(defn env-param-default Values(Vec(v/Val) dwe/DwErr) [env: &Env f: &v/FnV i: Int]
+  ((:param-default (:hooks env)) (:ctx env) (:depth env) f i))
+
+(defn bind-builtin Values(v/Val dwe/DwErr) [env: &Env module: Str name: Str caps: Vec(v/Val) arity: Int]
+  (let [id (env-find env module name)]
+    (if (< id 0) (values (v/null-v) (dwe/err "InternalError" (str "missing builtin " module "::" name)))
+      (values (v/->VFn (v/->FnV (- -1 id) caps (->None) arity)) (dwe/ok)))))
+
+(def IMPURE [["dw::Core" "uuid"] ["dw::Core" "now"] ["dw::Core" "random"] ["dw::Core" "randomInt"] ["dw::Core" "log"]
+             ["dw::Core" "readUrl"] ["dw::Runtime" "wait"] ["dw::Runtime" "run"] ["dw::Runtime" "eval"] ["dw::Runtime" "runUrl"]
+             ["dw::Runtime" "evalUrl"] ["dw::core::Dates" "today"] ["dw::core::Dates" "yesterday"] ["dw::core::Dates" "tomorrow"]
+             ["dw::Mule" "lookup"]])
+
+(defn impure-builtin? Bool [b: &rt/Builtin]
+  (or (= (:module b) "dw::util::Timer")
+      (loop [i 0] (if (>= i (count IMPURE)) false
+                    (let [p (nth IMPURE i)] (if (and (= (nth p 0) (:module b)) (= (nth p 1) (:name b))) true (recur (+ i 1))))))))
+
+(defrecord Overload [params: Vec(Str) tags: Vec(Int) run: Fn(Env Vec(v/Val) Values(v/Val dwe/DwErr)) seq: Bool])
+
+(defn overload Overload [params: Vec(Str) run: Fn(Env Vec(v/Val) Values(v/Val dwe/DwErr))]
+  (let [ts (loop [i 0 acc: Vec(Int) []] (if (>= i (count params)) acc (recur (+ i 1) (conj acc (type-tag (nth params i))))))]
+    (->Overload params ts run false)))
+
+(defn overload-seq Overload [params: Vec(Str) run: Fn(Env Vec(v/Val) Values(v/Val dwe/DwErr))]
+  (assoc (overload params run) :seq true))
+
+(defn whole-args Values(Vec(v/Val) dwe/DwErr) [args: Vec(v/Val)]
+  (loop [i 0 out args]
+    (if (>= i (count out)) (values out (dwe/ok))
+      (if (not (v/has-seq? (nth out i))) (recur (+ i 1) out)
+        (let [[y e] (v/whole-deep (nth out i))] (if (dwe/ok? e) (recur (+ i 1) (assoc out i y)) (values out e)))))))
+
+(defn- top-obj Values(v/Val dwe/DwErr) [x: &v/Val]
+  (match x
+    (v/VOSeq q) (let [[fs e] (v/fseq-vec q)] (values (v/->VObj fs) e))
+    (v/VMeta y m) (let [[z e] (top-obj y)] (values (v/->VMeta z m) e))
+    _ (values x (dwe/ok))))
+
+(defn top-objs Values(Vec(v/Val) dwe/DwErr) [args: Vec(v/Val)]
+  (loop [i 0 out args]
+    (if (>= i (count out)) (values out (dwe/ok))
+      (let [[y e] (top-obj (nth out i))] (if (dwe/ok? e) (recur (+ i 1) (assoc out i y)) (values out e))))))
+
+(defn- run-overload Values(v/Val dwe/DwErr) [o: &Overload env: &Env args: Vec(v/Val)]
+  (cond (not (:lazy env)) ((:run o) env args)
+        (:seq o) (let [[a2 e] (top-objs args)] (if (dwe/ok? e) ((:run o) env a2) (values (v/null-v) e)))
+        :else (let [[a2 e] (whole-args args)] (if (dwe/ok? e) ((:run o) env a2) (values (v/null-v) e)))))
+(defrecord Builtin [name: Str module: Str overloads: Vec(Overload) cand: Vec(Vec(Int)) pipe: Int fold: Int])
+
+(defn builtin Builtin [name: Str module: Str os: Vec(Overload)]
+  (let [cand (loop [t 0 acc: Vec(Vec(Int)) []]
+               (if (>= t (count TYPE-NAMES)) acc
+                 (recur (+ t 1)
+                        (conj acc (loop [i 0 c: Vec(Int) []]
+                                    (if (>= i (count os)) c
+                                      (let [ts (:tags (nth os i))]
+                                        (recur (+ i 1) (if (or (= (count ts) 0) (tag-coercible? t (nth ts 0))) (conj c i) c)))))))))
+        core (= module "dw::Core")
+        pipe (cond (not core) 0 (= name "map") 1 (= name "filter") 2 :else 0)
+        fold (cond (not core) 0 (= name "sizeOf") 1 (= name "sum") 2 (= name "avg") 3 (= name "max") 4 (= name "min") 5 :else 0)]
+    (->Builtin name module os cand pipe fold)))
+
+(defn exact-index Int [b: &Builtin tags: &Vec(Int)]
+  (let [os (:overloads b)
+        na (count tags)
+        cs (if (= na 0) (all-indexes (count os)) (nth (:cand b) (nth tags 0)))]
+    (loop [k 0] (if (>= k (count cs)) -1 (if (exact-tags? (nth os (nth cs k)) na (if (> na 0) (nth tags 0) 0) (if (> na 1) (nth tags 1) 0) (if (> na 2) (nth tags 2) 0) tags) (nth cs k) (recur (+ k 1)))))))
+
+(defn constant Builtin [name: Str module: Str x: v/Val]
+  (builtin name module [(overload [] (fn Values(v/Val dwe/DwErr) [env: Env a: Vec(v/Val)] (values x (dwe/ok))))]))
+
+(defn constant? Bool [b: &Builtin]
+  (let [os (:overloads b) n (:name b)]
+    (and (= (count os) 1) (= (count (:params (nth os 0))) 0)
+         (> (count n) 0) (>= (nth n 0) 65) (<= (nth n 0) 90))))
+
+(defn b1 Overload [t: Str f: Fn(Env Vec(v/Val) Values(v/Val dwe/DwErr))] (overload [t] f))
+(defn b2 Overload [t: Str u: Str f: Fn(Env Vec(v/Val) Values(v/Val dwe/DwErr))] (overload [t u] f))
+
+(def TYPE-NAMES ["Any" "Null" "Boolean" "Number" "String" "Array" "Object" "Range" "Binary" "Regex" "Function" "Type" "Key"
+                 "Namespace" "Date" "DateTime" "LocalDateTime" "Time" "LocalTime" "TimeZone" "Period"])
+
+(defn type-tag Int [name: &Str]
+  (loop [i 0] (if (>= i (count TYPE-NAMES)) -1 (if (= (nth TYPE-NAMES i) name) i (recur (+ i 1))))))
+
+(defn val-tag Int [x: &v/Val]
+  (match x
+    (v/VNull) 1 (v/VBool b) 2 (v/VInt i) 3 (v/VNum n) 3 (v/VStr s) 4 (v/VArr xs) 5 (v/VSeq q) 5 (v/VObj fs) 6 (v/VOSeq q) 6 (v/VRange a b) 7
+    (v/VBin b) 8 (v/VRegex s f) 9 (v/VFn f) 10 (v/VType t) 11 (v/VKey k) 12 (v/VNsV n) 13 (v/VDate d) 14
+    (v/VDateTime z) 15 (v/VLocalDateTime d) 16 (v/VTime d) 17 (v/VLocalTime d) 18 (v/VTimeZone d) 19 (v/VPeriod d) 20
+    (v/VMeta y m) (val-tag y)))
+
+(defn tag-is? Bool [xt: Int t: Int] (or (= t 0) (= t xt) (and (= t 5) (= xt 7))))
+
+(defn- tag-coercible? Bool [xt: Int t: Int]
+  (or (tag-is? xt t)
+      (and (= t 4) (or (= xt 3) (= xt 2) (= xt 12) (= xt 8) (= xt 9) (= xt 11) (and (>= xt 14) (<= xt 20))))
+      (and (= t 3) (= xt 4))
+      (and (= t 8) (= xt 4))))
+
+(defn tag-fits? Bool [xt: Int t: Int] (or (= xt 0) (tag-coercible? xt t)))
+
+(defn val-is? Bool [x0: &v/Val t: &Str] (tag-is? (val-tag x0) (type-tag t)))
+
+(defn to-text Values(Str dwe/DwErr) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VStr s) (values s (dwe/ok))
+      (v/VNum n) (values (num/to-string n) (dwe/ok))
+      (v/VInt n-i) (let [n (num/from-int n-i)] (values (num/to-string n) (dwe/ok)))
+      (v/VBool b) (values (if b "true" "false") (dwe/ok))
+      (v/VKey k) (values (:name k) (dwe/ok))
+      (v/VRegex s f) (values s (dwe/ok))
+      (v/VType t) (values (v/type-display t) (dwe/ok))
+      (v/VNull) (values "" (dwe/err "CoercionException" "Cannot coerce Null to String"))
+      (v/VDate d) (let [[s ok2] (v/temporal-str x)] (values s (dwe/ok)))
+      (v/VDateTime d) (let [[s ok2] (v/temporal-str x)] (values s (dwe/ok)))
+      (v/VLocalDateTime d) (let [[s ok2] (v/temporal-str x)] (values s (dwe/ok)))
+      (v/VTime d) (let [[s ok2] (v/temporal-str x)] (values s (dwe/ok)))
+      (v/VLocalTime d) (let [[s ok2] (v/temporal-str x)] (values s (dwe/ok)))
+      (v/VTimeZone d) (let [[s ok2] (v/temporal-str x)] (values s (dwe/ok)))
+      (v/VPeriod d) (let [[s ok2] (v/temporal-str x)] (values s (dwe/ok)))
+      _ (values "" (dwe/err "CoercionException" (str "Cannot coerce " (v/type-name x) " to String"))))))
+
+(defn- coerce-to Vec(v/Val) [x: &v/Val xt: Int t: Int]
+  (if (tag-is? xt t) [x]
+    (cond
+      (= t 4) (match (v/unmeta x)
+                (v/VNum n) [(v/->VStr (num/to-string n))]
+                (v/VInt i) [(v/->VStr (str i))]
+                (v/VBool b) [(v/->VStr (if b "true" "false"))]
+                (v/VKey k) [(v/->VStr (:name k))]
+                (v/VBin b) [(v/->VStr (uni/sanitize (str b)))]
+                (v/VRegex s f) [(v/->VStr s)]
+                (v/VType ty) [(v/->VStr (v/type-display ty))]
+                _ (let [[s ok] (v/temporal-str (v/unmeta x))] (if ok [(v/->VStr s)] [])))
+      (= t 3) (match (v/unmeta x)
+                (v/VStr s) (let [[n e] (num/parse-lit s)] (if (= e "") [(v/num-v n)] []))
+                _ [])
+      (= t 8) (match (v/unmeta x) (v/VStr s) [(v/->VBin s)] _ [])
+      :else [])))
+
+(defn- exact-tags? Bool [o: &Overload na: Int t0: Int t1: Int t2: Int tv: &Vec(Int)]
+  (let [ps (:tags o)]
+    (and (= (count ps) na)
+         (if (> na 3)
+           (loop [i 0] (if (>= i na) true (if (tag-is? (nth tv i) (nth ps i)) (recur (+ i 1)) false)))
+           (and (or (< na 1) (tag-is? t0 (nth ps 0)))
+                (or (< na 2) (tag-is? t1 (nth ps 1)))
+                (or (< na 3) (tag-is? t2 (nth ps 2))))))))
+
+(defn- all-indexes Vec(Int) [n: Int] (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc i)))))
+
+(defn- coercible? Bool [o: &Overload ts: &Vec(Int)]
+  (let [ps (:tags o)]
+    (and (= (count ps) (count ts))
+         (loop [i 0] (if (>= i (count ps)) true (if (tag-coercible? (nth ts i) (nth ps i)) (recur (+ i 1)) false))))))
+
+(defn- coerce-args Vec(Vec(v/Val)) [o: &Overload args: &Vec(v/Val) ts: &Vec(Int)]
+  (let [ps (:tags o)]
+    (if (not= (count ps) (count args)) []
+      (loop [i 0 acc: Vec(v/Val) []]
+        (if (>= i (count ps)) [acc]
+          (let [c (coerce-to (nth args i) (nth ts i) (nth ps i))]
+            (if (= (count c) 0) [] (recur (+ i 1) (conj acc (nth c 0))))))))))
+
+(defn- type-weight Int [t: Int]
+  (cond (or (= t 8) (= t 1) (= t 10)) 9990
+        (= t 4) 9980
+        (or (= t 6) (= t 7) (= t 17)) 9960
+        (= t 16) 9950
+        (= t 15) 9940
+        (or (= t 0) (< t 0)) 10000
+        :else 9970))
+
+(defn- utf16-len Int [s: &Str]
+  (loop [i 0 n 0] (if (>= i (count s)) n (recur (uni/next-index s i) (+ n (if (> (uni/cp-at s i) 65535) 2 1))))))
+
+(defn- utf16-prefix Str [s: &Str k: Int]
+  (loop [i 0 n 0]
+    (if (>= i (count s)) s
+      (let [w (if (> (uni/cp-at s i) 65535) 2 1)]
+        (if (> (+ n w) k) (subs s 0 i) (recur (uni/next-index s i) (+ n w)))))))
+
+(defn- abbreviate Str [s: Str max: Int] (if (<= (utf16-len s) max) s (str (utf16-prefix s (- max 3)) "...")))
+
+(def ARG-VALUE-MAX 80)
+
+(defn- arg-value Str [x: &v/Val]
+  (let [nss: Vec(v/Ns) []
+        [o e] (dwfmt/write-into "" x (dwfmt/->Ctx "" false -1) 0 nss)]
+    (if (not= e "") "" (abbreviate o ARG-VALUE-MAX))))
+
+(defn- describe-args Str [args: &Vec(v/Val)]
+  (loop [i 0 out ""]
+    (if (>= i (count args)) out
+      (let [x (nth args i)
+            s (arg-value x)
+            o1 (str out "  " (+ i 1) ": " (v/type-name (v/unmeta x)))
+            o2 (if (= s "") o1 (str o1 " (" s ")"))]
+        (recur (+ i 1) (str o2 "\n"))))))
+
+(defrecord Sig [params: Vec(Str) tags: Vec(Int) weights: Vec(Int) null: Bool])
+
+(defn tag-weight Int [t: Int] (type-weight t))
+
+(defn- overload-sig Sig [o: &Overload]
+  (let [ts (:tags o)
+        ws (loop [i 0 acc: Vec(Int) []] (if (>= i (count ts)) acc (recur (+ i 1) (conj acc (type-weight (nth ts i))))))
+        nl (loop [i 0] (if (>= i (count ts)) false (if (= (nth ts i) 1) true (recur (+ i 1)))))]
+    (->Sig (:params o) ts ws nl)))
+
+(defn- mismatch Values(Int Int) [g: &Sig ts: &Vec(Int)]
+  (let [ps (:tags g) ws (:weights g)]
+    (loop [i 0 w 0 n 0]
+      (if (or (>= i (count ps)) (>= i (count ts))) (values w n)
+        (if (= (nth ps i) (nth ts i)) (recur (+ i 1) w n)
+          (recur (+ i 1) (+ w (nth ws i)) (+ n 1)))))))
+
+(defn- first-param Str [g: &Sig] (let [ps (:params g)] (if (= (count ps) 0) "" (nth ps 0))))
+
+(defn- sort-by-int Vec(Int) [idx: Vec(Int) keys: &Vec(Int)]
+  (loop [i 1 v idx]
+    (if (>= i (count v)) v
+      (let [x (nth v i)
+            j (loop [j i] (if (and (> j 0) (> (nth keys (nth v (- j 1))) (nth keys x))) (recur (- j 1)) j))
+            v2 (loop [k i w v] (if (<= k j) w (let [p (nth w (- k 1))] (recur (- k 1) (assoc w k p)))))]
+        (recur (+ i 1) (assoc v2 j x))))))
+
+(defn- bytes-cmp Int [a: &Str b: &Str]
+  (loop [i 0]
+    (cond (and (>= i (count a)) (>= i (count b))) 0
+          (>= i (count a)) -1
+          (>= i (count b)) 1
+          (not= (nth a i) (nth b i)) (- (nth a i) (nth b i))
+          :else (recur (+ i 1)))))
+
+(defn- sort-by-str Vec(Int) [idx: Vec(Int) keys: &Vec(Str)]
+  (loop [i 1 v idx]
+    (if (>= i (count v)) v
+      (let [x (nth v i)
+            j (loop [j i] (if (and (> j 0) (> (bytes-cmp (nth keys (nth v (- j 1))) (nth keys x)) 0)) (recur (- j 1)) j))
+            v2 (loop [k i w v] (if (<= k j) w (let [p (nth w (- k 1))] (recur (- k 1) (assoc w k p)))))]
+        (recur (+ i 1) (assoc v2 j x))))))
+
+(defn weight-order Vec(Int) [sigs: &Vec(Sig) idx: Vec(Int) ts: &Vec(Int)]
+  (let [[ws ms] (loop [i 0 ws: Vec(Int) [] ms: Vec(Int) []]
+                  (if (>= i (count sigs)) (values ws ms)
+                    (let [[w n] (mismatch (nth sigs i) ts)] (recur (+ i 1) (conj ws w) (conj ms n)))))]
+    (sort-by-int (sort-by-int idx ws) ms)))
+
+(defn- param-list Str [g: &Sig]
+  (let [ps (:params g)]
+    (loop [i 0 out "("] (if (>= i (count ps)) (str out ")") (recur (+ i 1) (str out (if (> i 0) ", " "") (nth ps i)))))))
+
+(defn- describe-expected Str [sigs: &Vec(Sig) ts: &Vec(Int)]
+  (let [idx (loop [i 0 acc: Vec(Int) []] (if (>= i (count sigs)) acc (recur (+ i 1) (if (:null (nth sigs i)) acc (conj acc i)))))
+        fs (loop [i 0 fs: Vec(Str) []] (if (>= i (count sigs)) fs (recur (+ i 1) (conj fs (first-param (nth sigs i))))))]
+    (if (= (count idx) 1)
+      (let [ps (:params (nth sigs (nth idx 0)))]
+        (loop [i 0 out "But it expects arguments of these types:\n"]
+          (if (>= i (count ps)) out (recur (+ i 1) (str out "  " (+ i 1) ": " (nth ps i) "\n")))))
+      (let [sorted (sort-by-str (weight-order sigs idx ts) fs)]
+        (loop [k 0 out "But it expects one of these combinations:\n  "]
+          (if (>= k (count sorted)) out
+            (let [o1 (if (> k 0) (str out "\n  ") out)
+                  pl (param-list (nth sigs (nth sorted k)))]
+              (recur (+ k 1) (str o1 pl)))))))))
+
+(defn val-tags Vec(Int) [args: &Vec(v/Val)]
+  (loop [i 0 acc: Vec(Int) []] (if (>= i (count args)) acc (recur (+ i 1) (conj acc (val-tag (nth args i)))))))
+
+(defn call-types-kind Str [args: &Vec(v/Val)]
+  (if (loop [i 0] (if (>= i (count args)) false (if (v/null? (v/unmeta (nth args i))) true (recur (+ i 1)))))
+    "InvalidFunctionArgsNull" "InvalidFunctionArgs"))
+
+(defn unexpected-types-msg Str [name: &Str args: &Vec(v/Val) sigs: &Vec(Sig)]
+  (let [head (str "You called the function '" name "' with these arguments: \n")
+        as (describe-args args)
+        ts (val-tags args)
+        ex (describe-expected sigs ts)]
+    (str head as "\n" ex)))
+
+(defn- no-overload-msg Str [b: &Builtin args: &Vec(v/Val)]
+  (let [os (:overloads b)
+        sigs (loop [i 0 acc: Vec(Sig) []] (if (>= i (count os)) acc (recur (+ i 1) (conj acc (overload-sig (nth os i))))))]
+    (unexpected-types-msg (:name b) args sigs)))
+
+(defn invoke Values(v/Val dwe/DwErr) [env: &Env b: &Builtin args: Vec(v/Val)]
+  (let [os (:overloads b)
+        na (count args)
+        t0 (if (> na 0) (val-tag (nth args 0)) 0)
+        t1 (if (> na 1) (val-tag (nth args 1)) 0)
+        t2 (if (> na 2) (val-tag (nth args 2)) 0)
+        tv (if (> na 3) (val-tags args) [])
+        cs (if (= na 0) (all-indexes (count os)) (nth (:cand b) t0))
+        exact (loop [k 0] (if (>= k (count cs)) -1 (if (exact-tags? (nth os (nth cs k)) na t0 t1 t2 tv) (nth cs k) (recur (+ k 1)))))]
+    (if (>= exact 0) (let [[y e] (run-overload (nth os exact) env args)] (values y (native-frame e b exact)))
+      (let [ts (if (> na 3) tv (val-tags args))
+            [idx cargs] (loop [k 0]
+                          (if (>= k (count cs)) (values -1 args)
+                            (let [i (nth cs k)]
+                              (if (not (coercible? (nth os i) ts)) (recur (+ k 1))
+                                (let [c (coerce-args (nth os i) args ts)]
+                                  (if (> (count c) 0) (values i (nth c 0)) (recur (+ k 1))))))))]
+        (if (>= idx 0) (let [[y e] (run-overload (nth os idx) env cargs)] (values y (native-frame e b idx)))
+          (let [[shown se] (if (:lazy env) (whole-args args) (values args (dwe/ok)))]
+            (if (dwe/ok? se) (failure (call-types-kind shown) (no-overload-msg b shown)) (values (v/null-v) se))))))))

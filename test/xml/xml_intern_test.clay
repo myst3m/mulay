@@ -1,0 +1,59 @@
+(ns xml-intern-test (:require [mulay.lib.xml :as xml] [clay.string :as str]))
+
+(def SIZES [0 7 4096 1000000])
+
+(defn- doc Str [close: &Str]
+  (let [a (loop [i 0 out "<r>"] (if (>= i 1000) out (recur (+ i 1) (str out "<a" i "/>"))))
+        b (str a "<x><y><x>")
+        c (loop [i 0 out b] (if (>= i 70000) out (recur (+ i 1) (str out "<n" i "/>"))))]
+    (str c close)))
+
+(defn- events Values(Int Str Str) [src: &Str size: Int]
+  (if (= size 0)
+    (let [[r0 e0] (xml/reader src (xml/default-opts))]
+      (loop [r r0 starts 0 last ""]
+        (let [[r2 ev err] (xml/next-event r)]
+          (cond (not (= err "")) (values starts last err)
+                :else (match ev
+                        (xml/XeStart n as ns) (recur r2 (+ starts 1) (str (:local n)))
+                        (xml/XeEndDoc) (values starts last "")
+                        _ (recur r2 starts last))))))
+    (let [[r0 e0] (xml/reader-chunked (xml/default-opts))
+          n (count src)]
+      (loop [r r0 off 0 starts 0 last ""]
+        (let [[r2 ev need err] (xml/next-chunk r)]
+          (cond
+            need (let [end (if (> (+ off size) n) n (+ off size))
+                       [r3 fe] (xml/feed r2 (subs src off end) (>= end n))]
+                   (recur r3 end starts last))
+            (not (= err "")) (values starts last err)
+            :else (match ev
+                    (xml/XeStart q as ns) (recur r2 off (+ starts 1) (str (:local q)))
+                    (xml/XeEndDoc) (values starts last "")
+                    _ (recur r2 off starts last))))))))
+
+(defn- tokens Values(Int Str Str) [src: &Str]
+  (let [[r0 e0] (xml/reader src (xml/default-opts))]
+    (loop [r r0 starts 0 last ""]
+      (let [[r2 k] (xml/next-token r)]
+        (cond (= k xml/T-ERR) (values starts last (xml/token-error r2))
+              (= k xml/T-ENDDOC) (values starts last "")
+              (= k xml/T-START) (let [[u p l] (xml/token-name r2)] (recur r2 (+ starts 1) l))
+              :else (recur r2 starts last))))))
+
+(defn- agree? Bool [src: &Str starts: Int last: &Str err: &Str]
+  (let [[ts tl te] (tokens src)]
+    (and (= ts starts) (= tl last) (= te err)
+         (loop [i 0]
+           (if (>= i (count SIZES)) true
+             (let [[s l e] (events src (nth SIZES i))]
+               (if (and (= s starts) (= l last) (= e err)) (recur (+ i 1))
+                 (do (eprintln (str "size " (nth SIZES i) ": " s " " l " " e)) false))))))))
+
+(deftest open-elements-keep-their-names-when-the-name-table-is-rebuilt
+  (is (agree? (doc "</x></y></x></r>") 71004 "n69999" "")))
+
+(deftest end-tag-mismatch-after-the-rebuild-names-the-open-element
+  (let [d (doc "</x></z></x></r>")
+        col (+ (str/index-of-after d "</z>" 0) 1)]
+    (is (agree? d 71004 "n69999" (str "line 1, column " col ": mismatched end tag: expected </y> but found </z>")))))

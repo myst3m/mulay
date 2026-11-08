@@ -1,0 +1,183 @@
+(ns conn-test
+  (:require [mulay.conn.file :as file] [mulay.conn.apikit :as apikit] [mulay.conn.apispec :as sp] [mulay.conn.sf_core :as sf] [mulay.conn.salesforce :as sfc]
+            [mulay.dw.val :as v] [mulay.rt.error :as err] [mulay.mule.model :as m] [mulay.lib.xml :as xml] [mulay.conn.tls :as tls] [clay.string :as str]))
+
+;; 期待値は実 Mule の記録 (test/fixtures/apps/file-ops、apikit-oas、salesforce-ops) から
+
+(deftest file-mime-of-name
+  (is (= (file/mime-of-name "a.json") "text/json"))
+  (is (= (file/mime-of-name "b.xml") "text/xml"))
+  (is (= (file/mime-of-name "c.csv") "text/csv"))
+  (is (= (file/mime-of-name "d.txt") "text/plain"))
+  (is (= (file/mime-of-name "g.html") "text/html"))
+  (is (= (file/mime-of-name "f.yaml") "application/octet-stream"))
+  (is (= (file/mime-of-name "noext") "application/octet-stream"))
+  ;; 後の行が勝つ (java は text/plain と application/java の両方にある)
+  (is (= (file/mime-of-name "X.java") "application/java"))
+  (is (= (file/mime-of-name "a.zip") "application/zip"))
+  ;; Mule の表に無ければ mimetypes.default (大文字小文字を区別する)
+  (is (= (file/mime-of-name "p.PNG") "image/png"))
+  (is (= (file/mime-of-name "q.TXT") "text/plain"))
+  (is (= (file/mime-of-name "r.JSON") "application/octet-stream")))
+
+(deftest file-resolve-path
+  (is (= (file/resolve-path "/w" "a.txt") "/w/a.txt"))
+  (is (= (file/resolve-path "/w/" "sub//b.txt") "/w/sub/b.txt"))
+  (is (= (file/resolve-path "/w" "/abs/c") "/abs/c"))
+  (is (= (file/resolve-path "/w" ".") "/w/."))
+  (is (= (file/resolve-path "/w" "tree/../d.txt") "/w/tree/../d.txt"))
+  (is (= (file/resolve-path "/w" "dir/") "/w/dir"))
+  (is (= (file/resolve-path "/w" "") "/w")))
+
+(defn- no-res Values(Str Bool) [p: Str] (values "" false))
+
+(deftest apikit-parse-api
+  (let [[a e] (apikit/parse-api "openapi: 3.0.3\npaths:\n  /x:\n    get:\n      responses:\n        '200':\n          description: ok\n" "api.yaml" no-res "")
+        [a2 e2] (apikit/parse-api "openapi: 3.0.3\npaths:\n  /x:\n    get:\n      responses:\n        '200':\n          content:\n            application/json:\n              schema:\n                type: array\n" "bad.yaml" no-res "")
+        [a3 e3] (apikit/parse-api "#%RAML 1.0\ntitle: x\n" "api.raml" no-res "")
+        [a4 e4] (apikit/parse-api "openapi: [" "broken.yaml" no-res "")]
+    (is (= e ""))
+    (is (= (count (:res a)) 1))
+    (is (> (count e2) 0))
+    (is (= e3 ""))
+    (is (> (count e4) 0))))
+
+(defn- xnode xml/XNode [s: &Str] (let [[d e] (xml/parse s)] (xml/doc-root d)))
+(defn- keys-of Vec(Str) [x: &v/Val]
+  (match (v/unmeta x) (v/VObj fs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (:name (:key (nth fs i))))))) _ []))
+
+(deftest salesforce-sobject
+  (let [n (xnode "<records xmlns=\"urn:partner.soap.sforce.com\" xmlns:sf=\"urn:sobject.partner.soap.sforce.com\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"sf:sObject\"><sf:type>Account</sf:type><sf:Id>001A</sf:Id><sf:Id>001A</sf:Id><sf:Name>n</sf:Name><sf:Industry xsi:nil=\"true\"/><sf:NumberOfEmployees>12</sf:NumberOfEmployees><sf:AnnualRevenue xsi:nil=\"true\"/><sf:IsDeleted>false</sf:IsDeleted><sf:Owner xsi:type=\"sf:sObject\"><sf:type>User</sf:type><sf:Id xsi:nil=\"true\"/><sf:Name>o</sf:Name></sf:Owner></records>")
+        x (sf/sobject-val n)
+        fs (match x (v/VObj f) f _ [])]
+    ;; java.util.HashMap の順 (実 Mule の query の結果と同じ)
+    (is (= (keys-of x) ["Industry" "IsDeleted" "Owner" "Id" "NumberOfEmployees" "type" "AnnualRevenue" "Name"]))
+    (is (v/null? (nth (v/obj-get fs "Industry") 0)))
+    (is (match (v/unmeta (nth (v/obj-get fs "NumberOfEmployees") 0)) (v/VStr s) (= s "12") _ false))
+    (is (match (nth (v/obj-get fs "NumberOfEmployees") 0) (v/VMeta y m) (= (count (v/obj-get m "class")) 1) _ false))
+    (is (= (keys-of (nth (v/obj-get fs "Owner") 0)) ["Id" "type" "Name"]))))
+
+(deftest salesforce-auth
+  (let [cc (xnode "<salesforce:oauth-client-credentials-connection xmlns:salesforce=\"http://www.mulesoft.org/schema/mule/salesforce\"><salesforce:oauth-client-credentials clientId=\"id\" clientSecret=\"sec\" tokenUrl=\"https://x/token\"/></salesforce:oauth-client-credentials-connection>")
+        [a e] (sf/auth-of (m/->Config "salesforce:sfdc-config" "SF" [] [cc] [] (m/->Loc "f" 1 "" "" "" [])))
+        jwt (xnode "<salesforce:jwt-connection xmlns:salesforce=\"http://www.mulesoft.org/schema/mule/salesforce\" consumerKey=\"k\"/>")
+        [a2 e2] (sf/auth-of (m/->Config "salesforce:sfdc-config" "SF" [] [jwt] [] (m/->Loc "f" 1 "" "" "" [])))
+        saml (xnode "<salesforce:saml-connection xmlns:salesforce=\"http://www.mulesoft.org/schema/mule/salesforce\"/>")
+        [a3 e3] (sf/auth-of (m/->Config "salesforce:sfdc-config" "SF" [] [saml] [] (m/->Loc "f" 1 "" "" "" [])))]
+    (is (= e ""))
+    (is (= (:kind a) "cc"))
+    (is (= (:client-id a) "id"))
+    (is (= (:url a) "https://x/token"))
+    (is (= (:api a) "65.0"))
+    (is (= e2 ""))
+    (is (= (:kind a2) "jwt"))
+    (is (= (:client-id a2) "k"))
+    (is (> (count e3) 0))))
+
+;; 起動のときの下ごしらえ (warm): 操作のセッションは、下ごしらえが終わるまで待ってから取る (トークンを 2 度取らない)。
+;; 下ごしらえの失敗は覚えない (操作が取り直して、その失敗を返す)。トークンの URL は繋がらない所 (すぐ失敗する)
+(defn- warm-later Int [ca: Atom cfg: m/Config] (let [z (sleep-ms 200)] (sf/warm ca cfg)))
+
+(deftest salesforce-warm
+  (let [cc (xnode "<salesforce:oauth-client-credentials-connection xmlns:salesforce=\"http://www.mulesoft.org/schema/mule/salesforce\"><salesforce:oauth-client-credentials clientId=\"id\" clientSecret=\"sec\" tokenUrl=\"http://127.0.0.1:1/token\"/></salesforce:oauth-client-credentials-connection>")
+        cfg (m/->Config "salesforce:sfdc-config" "SF" [] [cc] [] (m/->Loc "f" 1 "" "" "" []))
+        z: Map {}
+        cache (atom (->dyn z))
+        zm (sf/warm-mark! cache "SF")
+        ca cache
+        f (future (fn Int [x: m/Config] (warm-later ca x)) cfg)
+        t0 (quot (mono-us) 1000)
+        [s e] (sf/session cache cfg false)
+        waited (- (quot (mono-us) 1000) t0)
+        r (deref f)
+        t1 (quot (mono-us) 1000)
+        [s2 e2] (sf/session cache cfg false)
+        again (- (quot (mono-us) 1000) t1)]
+    (is (>= waited 150))
+    (is (> (count e) 0))
+    (is (> (count e2) 0))
+    (is (< again 5000))))
+
+;; query の escapeSpecialCharactersForParametersValue="true": 値を SalesforceUtils.escapeParameterValue (11.3.4 の
+;; バイトコード) と同じに逃がしてから :名前 を置き換える。以前は属性を読まず、値の ' で SOQL の文字列を閉じられた。
+(defn- obj1 v/Val [k: Str s: Str] (v/->VObj [(v/field k (v/->VStr s))]))
+
+(deftest salesforce-escape-param
+  (is (= (sf/escape-param "O'Brien") "O\\'Brien"))
+  (is (= (sf/escape-param "a\\b\"c_d%e") "a\\\\b\\\"c\\_d\\%e"))
+  (is (= (sf/escape-param (str "x" (chr 10) "y" (chr 13) (chr 8) (chr 9) (chr 12))) "x\\ny\\r\\b\\t\\f"))
+  (is (= (sf/escape-param "plain") "plain"))
+  (is (= (sfc/bind-params "SELECT Id FROM Account WHERE Name = ':n'" (obj1 "n" "x' OR Name != '") true)
+         "SELECT Id FROM Account WHERE Name = 'x\\' OR Name != \\''"))
+  ;; 既定 (false) は実 Mule も逃がさない
+  (is (= (sfc/bind-params "SELECT Id FROM Account WHERE Name = ':n'" (obj1 "n" "a_b") false)
+         "SELECT Id FROM Account WHERE Name = 'a_b'")))
+
+;; sObject のフィールド名は XML のタグ名にそのまま書くので、XML の名前でないキー (データから来たレコードの
+;; "Name>x</urn1:Name></urn:sObjects><urn:sObjects>..") は送らずに SALESFORCE:INVALID_INPUT にする
+;; (以前は SOAP の本文に別の型の sObject を差し込めた)。
+(defn- rec-err Str [k: Str] (let [x (sf/records-err [(obj1 k "v")])] (if (= (count x) 0) "" (:description (nth x 0)))))
+
+(deftest salesforce-field-names
+  (is (= (rec-err "Name") ""))
+  (is (= (rec-err "Custom_Field__c") ""))
+  (is (= (rec-err "Name>x</urn1:Name></urn:sObjects><urn:sObjects><urn1:type>User</urn1:type><urn1:LastName") "Invalid field name: 'Name>x</urn1:Name></urn:sObjects><urn:sObjects><urn1:type>User</urn1:type><urn1:LastName'"))
+  (is (= (rec-err "a b") "Invalid field name: 'a b'"))
+  (is (= (rec-err "1abc") "Invalid field name: '1abc'"))
+  (is (= (rec-err "") "Invalid field name: ''")))
+
+;; tls:context の enabledProtocols / enabledCipherSuites → clay.tls の protocols と suites (IANA の名前。clay.tls が持つ 9 つだけ)。
+;; スイートに TLS1.3 のものが無ければ TLSv1.3 を、TLS1.2 のものが無ければ TLSv1.2 を外す (Java の意味)
+(defn- lim Str [ps: Str cs: Str]
+  (let [[protos suites e] (tls/limits ps cs)]
+    (if (not= e "") e (str (str/join "," protos) "|" (str/join ":" suites)))))
+
+(deftest tls-limits
+  (is (= (lim "" "") "|"))
+  (is (= (lim "TLSv1.3" "") "TLSv1.3|"))
+  (is (= (lim "TLSv1.1, TLSv1.2" "") "TLSv1.2|"))
+  (is (= (lim "TLSv1.2" "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256") "TLSv1.2|TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"))
+  (is (= (lim "" "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384") "TLSv1.2|TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"))
+  (is (= (lim "" "TLS_AES_128_GCM_SHA256") "TLSv1.3|TLS_AES_128_GCM_SHA256"))
+  ;; clay.tls に無いスイート (CBC、RSA の鍵交換、SCSV) は捨てる。TLS1.2 のものが残らないので TLSv1.3 だけ
+  (is (= (lim "" "TLS_AES_256_GCM_SHA384, TLS_RSA_WITH_AES_128_CBC_SHA, TLS_EMPTY_RENEGOTIATION_INFO_SCSV")
+         "TLSv1.3|TLS_AES_256_GCM_SHA384"))
+  (is (= (lim "" "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_CHACHA20_POLY1305_SHA256")
+         "TLSv1.2,TLSv1.3|TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_CHACHA20_POLY1305_SHA256"))
+  (is (= (lim "TLSv1.1" "") "tls:context enabledProtocols: none of 'TLSv1.1' is supported (TLSv1.2, TLSv1.3)"))
+  (is (= (lim "" "TLS_FOO") "tls:context enabledCipherSuites: none of 'TLS_FOO' is supported"))
+  (is (= (lim "" "TLS_RSA_WITH_AES_128_CBC_SHA") "tls:context enabledCipherSuites: none of 'TLS_RSA_WITH_AES_128_CBC_SHA' is supported"))
+  (is (= (lim "TLSv1.2" "TLS_AES_128_GCM_SHA256") "tls:context enabledCipherSuites: no suite for the enabled protocols (TLSv1.2)")))
+
+;; OAuth の認可コード (config-with-oauth-connection): 認可の口のリダイレクト先と、トークンの無いときの失敗
+;; (実 Mule: salesforce-oauth)
+(defn- code-cfg m/Config [owner: Str]
+  (let [x (str "<c><config-with-oauth-connection><oauth-authorization-code consumerKey=\"CK.1\" consumerSecret=\"S\" "
+               "authorizationUrl=\"https://ex.my.salesforce.com/services/oauth2/authorize\" accessTokenUrl=\"https://ex.my.salesforce.com/services/oauth2/token\" "
+               "scopes=\"api refresh_token\"" (if (= owner "") "" (str " resourceOwnerId=\"" owner "\"")) "/>"
+               "<oauth-callback-config listenerConfig=\"HTTP\" callbackPath=\"/callback\" authorizePath=\"/authorize\" externalCallbackUrl=\"http://localhost:18172/callback\"/>"
+               "</config-with-oauth-connection></c>")
+        [d e] (xml/parse x)]
+    (m/->Config "salesforce:sfdc-config" "SF" [] (xml/child-elems (xml/doc-root d)) [] (m/->Loc "t.xml" 1 "SF" "" "" []))))
+
+(deftest salesforce-oauth-code
+  (let [c (code-cfg "")
+        k (nth (sf/code-of c) 0)
+        [s e] (sf/session (atom (->dyn (let [m: Map(Str Dyn) {}] m))) c false)
+        z (sf/code-store! "SF" "" ["tok" "https://ex.my.salesforce.com" "ref"])
+        [s2 e2] (sf/session (atom (->dyn (let [m: Map(Str Dyn) {}] m))) c false)
+        z2 (sf/code-forget! "SF" "")
+        [s3 e3] (sf/session (atom (->dyn (let [m: Map(Str Dyn) {}] m))) c false)]
+    (is (= (sf/code-authorize-url k "" "") "https://ex.my.salesforce.com/services/oauth2/authorize?response_type=code&client_id=CK.1&scope=api+refresh_token&redirect_uri=http%3A%2F%2Flocalhost%3A18172%2Fcallback"))
+    (is (= e "OAuth authorization dance not yet performed for resourceOwnerId null"))
+    (is (= e2 ""))
+    (is (= (:token s2) "tok"))
+    (is (= (:instance s2) "https://ex.my.salesforce.com"))
+    (is (= e3 "OAuth authorization dance not yet performed for resourceOwnerId null"))))
+
+;; PKCE (mulay だけの拡張、mulay.salesforce.pkce): code_challenge は code_verifier の SHA-256 の base64url (RFC 7636 の付録 B の例)
+(deftest salesforce-oauth-pkce-challenge
+  (let [k (nth (sf/code-of (code-cfg "")) 0)]
+    (is (= (sf/pkce-challenge "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"))
+    (is (= (sf/code-authorize-url k "" "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
+           "https://ex.my.salesforce.com/services/oauth2/authorize?response_type=code&client_id=CK.1&scope=api+refresh_token&redirect_uri=http%3A%2F%2Flocalhost%3A18172%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"))))

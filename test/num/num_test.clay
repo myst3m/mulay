@@ -1,0 +1,111 @@
+(ns num-test (:require [mulay.lib.numparse :as npz] [mulay.dw.num :as n] [mulay.lib.dec :as d]))
+
+;; 期待値はすべて実 DW 2.11.2 (tools/dw-oracle) の出力。
+
+(defn- lit n/Num [s: Str] (let [[x e] (n/parse-lit s)] x))
+(defn- s Str [x: n/Num] (n/to-string x))
+(defn- dv Str [a: Str b: Str] (let [[q e] (n/div (lit a) (lit b))] (if (= e "") (n/to-string q) (str "ERR:" e))))
+(defn- md Str [a: Str b: Str] (let [[q e] (n/rem-num (lit a) (lit b))] (if (= e "") (n/to-string q) (str "ERR:" e))))
+(defn- addn Str [a: &n/Num b: &n/Num] (let [[x e] (n/add a b)] (if (= e "") (n/to-string x) (str "ERR:" e))))
+(defn- subn Str [a: &n/Num b: &n/Num] (let [[x e] (n/sub a b)] (if (= e "") (n/to-string x) (str "ERR:" e))))
+(defn- muln Str [a: &n/Num b: &n/Num] (let [[x e] (n/mul a b)] (if (= e "") (n/to-string x) (str "ERR:" e))))
+
+(deftest literals
+  (is (= (s (lit "1.0")) "1"))
+  (is (= (s (lit "1.50")) "1.5"))
+  (is (= (s (lit "1e10")) "1E+10"))
+  (is (= (s (lit "1E-3")) "0.001"))
+  (is (= (s (lit "1E+2")) "1E+2"))
+  (is (= (s (lit "100e0")) "100"))
+  (is (= (s (lit "1.0e2")) "1.0E+2"))
+  (is (= (s (lit "12.30e1")) "123"))
+  (is (= (s (lit "0.0000001")) "1E-7"))
+  (is (= (s (lit "0.000001")) "0.000001"))
+  (is (= (s (lit "1000000000000000000000.0")) "1000000000000000000000"))
+  (is (= (s (lit "123456789012345678901234567890")) "123456789012345678901234567890"))
+  (is (= (s (lit "-0.0")) "0")))
+
+(deftest arithmetic
+  (is (= (muln (lit "1.5") (lit "2")) "3"))
+  (is (= (addn (lit "0.1") (lit "0.2")) "0.3"))
+  (is (= (muln (lit "1e10") (lit "1")) "10000000000"))
+  (is (= (addn (lit "1e10") (lit "1")) "10000000001"))
+  (is (= (muln (lit "1e-2") (lit "100")) "1"))
+  (is (= (subn (lit "5.0") (lit "5")) "0"))
+  (is (= (addn (lit "0.50") (lit "0.50")) "1"))
+  (is (= (muln (lit "1.23e-10") (lit "2")) "2.46E-10"))
+  (is (= (addn (lit "9223372036854775807") (lit "1")) "9223372036854775808"))
+  (is (= (muln (lit "9223372036854775807") (lit "10")) "92233720368547758070"))
+  (is (= (subn (lit "-9223372036854775808") (lit "1")) "-9223372036854775809"))
+  (is (= (addn (lit "9999999999999999999999999999999999") (lit "1")) "10000000000000000000000000000000000")))
+
+(deftest division
+  (is (= (dv "10" "2") "5"))
+  (is (= (dv "10" "4") "2.5"))
+  (is (= (dv "2" "3") "0.6666666666666666666666666666666667"))
+  (is (= (dv "-2" "3") "-0.6666666666666666666666666666666667"))
+  (is (= (dv "1" "7") "0.1428571428571428571428571428571429"))
+  (is (= (dv "100000000000000000000" "3") "33333333333333333333.33333333333333"))
+  (is (= (dv "99999999999999999999999999999999999" "1") "99999999999999999999999999999999999"))
+  (is (= (dv "1e2" "1") "100"))
+  (is (= (dv "100" "10.0") "10"))
+  (is (= (dv "1" "0") "ERR:Division by zero")))
+
+(deftest modulo
+  (is (= (md "7" "2") "1"))
+  (is (= (md "-7" "2") "-1"))
+  (is (= (md "7" "-2") "1"))
+  (is (= (md "7.5" "2") "1.5"))
+  (is (= (md "3.0" "2") "1")))
+
+(deftest compare
+  (is (n/eq? (lit "1") (lit "1.0")))
+  (is (n/eq? (lit "1.0") (lit "1.00")))
+  (is (< (n/cmp (lit "1") (lit "2.5")) 0))
+  (is (> (n/cmp (lit "1e10") (lit "9999999999")) 0)))
+
+(deftest floats
+  (is (= (let [[x e] (n/from-float (npz/flt "1.4142135623730951"))] (n/to-string x)) "1.4142135623730951"))
+  (is (= (let [[x e] (n/from-float (npz/flt "2.0"))] (n/to-string x)) "2")))
+
+;; 小さい小数の高速経路 (Int で計算) が Dec での計算と同じ結果になること。
+;; 値は疑似乱数で、Int の上限付近と桁あふれする組も含める。
+(defn- ref-norm n/Num [x: d/Dec]
+  (let [s0 (d/strip-trailing-zeros x)]
+    (if (< (d/scale s0) 0) (let [[r e] (d/set-scale s0 0 d/UNNECESSARY)] (n/mk r)) (n/mk s0))))
+
+(defn- gen-lit Str [r: Int]
+  (let [k (mod r 7)
+        u (cond (= k 0) (mod r 1000) (= k 1) (- 0 (mod r 100000)) (= k 2) 9223372036854775807
+                (= k 3) (mod r 3037000499) (= k 4) (- 0 (mod r 922337203685477580)) :else (mod r 97))
+        sc (mod (quot r 7) 20)]
+    (if (= sc 0) (str u) (str u "e-" sc))))
+
+(deftest small-decimal-fast-path
+  (let [bad (loop [i 0 seed 12345 bad 0]
+              (if (>= i 3000) bad
+                (let [r1 (mod (+ (* seed 6364136223846793005) 1442695040888963407) 9223372036854775807)
+                      r2 (mod (+ (* r1 6364136223846793005) 1442695040888963407) 9223372036854775807)
+                      a (lit (gen-lit (if (< r1 0) (- 0 r1) r1)))
+                      b (lit (gen-lit (if (< r2 0) (- 0 r2) r2)))
+                      ok (and (= (addn a b) (let [[x e] (d/add (n/to-dec a) (n/to-dec b))] (s (ref-norm x))))
+                              (= (subn a b) (let [[x e] (d/sub (n/to-dec a) (n/to-dec b))] (s (ref-norm x))))
+                              (= (muln a b) (s (ref-norm (d/mul (n/to-dec a) (n/to-dec b))))))]
+                  (recur (+ i 1) r2 (if ok bad (+ bad 1))))))]
+    (is (= bad 0))))
+
+;; 桁を展開しすぎる加減算と、Java の int を超える乗算の scale は失敗 (文言は実 DW、bignum_test/expansion-limit)。
+(deftest arith-limits
+  (is (= (addn (lit "1e20000000") (lit "1")) "ERR:BigInteger would overflow supported range"))
+  (is (= (subn (lit "1") (lit "1e20000000")) "ERR:BigInteger would overflow supported range"))
+  (is (= (muln (lit "1e2000000000") (lit "1e2000000000")) "ERR:Overflow"))
+  (is (= (muln (lit "1e-2000000000") (lit "1e-2000000000")) "ERR:Underflow"))
+  (is (= (addn (lit "1e999999999") (lit "1e999999999")) "2E+999999999"))
+  (is (= (n/op-error 1 (lit "1e700000000") (lit "1") "BigInteger would overflow supported range")
+         "Unable to resolve addition operation: `1E+700000000 + 1`. Reason: java.lang.ArithmeticException: BigInteger would overflow supported range"))
+  (is (= (n/op-error 2 (lit "1") (lit "1e700000000") "BigInteger would overflow supported range")
+         "Unable to resolve subtraction operation: `1 - 1E+700000000`. Reason: BigInteger would overflow supported range"))
+  (is (= (n/op-error 3 (lit "1e2000000000") (lit "1e2000000000") "Overflow")
+         "Unable to resolve multiplication operation: `1E+2000000000 * 1E+2000000000`. Reason: Overflow"))
+  (is (= (md "1e20000000" "7") "ERR:Division by zero"))
+  (is (= (dv "1e2000000000" "1e-2000000000") "ERR:Division by zero")))

@@ -1,0 +1,478 @@
+(ns mulay.conn.sf_composite
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as drt] [mulay.mule.model :as m]
+            [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.rt.event :as ev] [mulay.lib.xml :as xml]
+            [mulay.conn.sf_core :as sf] [mulay.conn.sf_cjson :as cj]
+            [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/salesforce-composite")
+(def VER "67.0")
+
+(defn- failure conn/OpResult [id: Str msg: Str] (conn/fail-result (err/mk "SALESFORCE-COMPOSITE" id msg)))
+(defn- errs conn/OpResult [x: Vec(err/MErr)] (conn/->OpResult (ev/tv-null) (ev/tv-null) x []))
+
+(defn- cat Vec(err/MErr) [a: &Vec(err/MErr) b: &Vec(err/MErr)]
+  (loop [i 0 acc (subvec a 0 (count a))] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+(defn- java conn/OpResult [x: v/Val] (conn/ok-result (ev/tv-val x ev/JAVA) (ev/tv-null)))
+
+(defn- cm Vec(v/Field) [cls: &Str] [(v/field "class" (v/->VStr (str cls)))])
+(defn- jstr v/Val [s: &Str] (v/->VMeta (v/->VStr (str s)) cj/CM-STR))
+
+(defn- cce Str [from: &Str to: &Str]
+  (str "class " from " cannot be cast to class " to " (" from " and " to " are in module java.base of loader 'bootstrap')"))
+
+(defn- cls-of Str [x: &v/Val]
+  (match x (v/VMeta a ms) (let [r (v/obj-get ms "class")] (if (= (count r) 0) "" (match (nth r 0) (v/VStr k) (str k) _ ""))) _ ""))
+
+(defn- jin v/Val [x0: &v/Val]
+  (let [[x ms] (match x0 (v/VMeta a b) (values a b) _ (values x0 []))
+        has (> (count (v/obj-get ms "class")) 0)]
+    (match x
+      (v/VObj fs) (v/->VMeta (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (v/->Field (:key (nth fs i)) (jin (:value (nth fs i)))))))))
+                             (if has ms cj/CM-LHM))
+      (v/VArr xs) (v/->VMeta (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (jin (nth xs i))))))) (if has ms cj/CM-AL))
+      (v/VStr s) (if has x0 (v/->VMeta x cj/CM-STR))
+      (v/VBool b) (if has x0 (v/->VMeta x cj/CM-BOOL))
+      (v/VInt i) (if has x0 (v/->VMeta x (if (and (>= i -2147483648) (<= i 2147483647)) cj/CM-INT cj/CM-LONG)))
+      (v/VNum n) (if has x0
+                   (if (num/integer? n)
+                     (let [[k e] (num/to-int n)]
+                       (v/->VMeta x (cond (not= e "") cj/CM-BIGINT (and (>= k -2147483648) (<= k 2147483647)) cj/CM-INT :else cj/CM-LONG)))
+                     (v/->VMeta x cj/CM-DOUBLE)))
+      _ x0)))
+
+(defn- java-class Str [x: &v/Val]
+  (let [c (cls-of x)]
+    (if (not= c "") c
+      (match (v/unmeta x)
+        (v/VObj fs) "java.util.LinkedHashMap" (v/VArr xs) "java.util.ArrayList" (v/VStr s) "java.lang.String"
+        (v/VBool b) "java.lang.Boolean" (v/VInt i) "java.lang.Integer" (v/VNum n) "java.lang.Double" _ "java.lang.Object"))))
+
+(defn- fields-of Vec(v/Field) [x: &v/Val] (match (v/unmeta x) (v/VObj fs) fs _ []))
+
+(defn- get-f Vec(v/Val) [x: &v/Val k: &Str] (v/obj-get (fields-of x) k))
+
+(defn- text-of Str [x: &v/Val] (match (v/unmeta x) (v/VStr s) (str s) (v/VNull) "" _ (let [[t e] (drt/to-text x)] t)))
+
+(defn- blank? Bool [s: &Str] (= (str/trim s) ""))
+
+(defrecord Sess [token: Str instance: Str refresh: Bool])
+
+(defn- conn-elem Vec(xml/XNode) [cfg: &m/Config local: &Str] (conn/child-elem (:children cfg) local))
+
+(defn- conn-local Str [cfg: &m/Config]
+  (let [ch (:children cfg)
+        el (loop [i 0] (if (>= i (count ch)) -1 (if (and (xml/elem? (nth ch i)) (str/ends-with? (xml/elem-local (nth ch i)) "-connection")) i (recur (+ i 1)))))]
+    (if (< el 0) "" (xml/elem-local (nth ch el)))))
+
+(defn- cattr Values(Str Vec(err/MErr)) [c: &conn/OpCall cfg: &m/Config attr: &Str default: Str]
+  (let [ln (conn-local cfg)
+        px (conn/param (:exprs cfg) (str ln "@" attr))]
+    (if (> (count px) 0)
+      (let [[x e] ((:eval c) (nth px 0) (:event c))]
+        (cond (not= e "") (values "" [(err/mk "MULE" "EXPRESSION" e)])
+              (v/null? x) (values default [])
+              :else (values (text-of x) [])))
+      (let [n (conn-elem cfg ln)] (if (= (count n) 0) (values default []) (values (xml/attr (nth n 0) "" attr default) []))))))
+
+(defn- session Values(Sess Vec(err/MErr)) [cache: &Atom c: &conn/OpCall cfg: &m/Config fresh: Bool]
+  (let [tc (conn-elem cfg "token-connection")
+        ce (let [ln (conn-local cfg)] (if (= ln "") [] (conn-elem cfg ln)))
+        [proxy pe] (cattr c cfg "proxyHost" "")
+        tls (and (> (count ce) 0) (> (count (conn/child-elem (xml/elem-children (nth ce 0)) "context")) 0))]
+    (cond
+      (> (count pe) 0) (values (->Sess "" "" false) pe)
+      (or (not= (str/trim proxy) "") tls)
+      (values (->Sess "" "" false) [(err/mk "SALESFORCE-COMPOSITE" "CONNECTIVITY" (str "salesforce-composite:composite-config '" (:name cfg) "': mulay does not support proxyHost and tls:context"))])
+      (> (count tc) 0)
+      (let [[sid se] (cattr c cfg "sessionId" "") [iu ie] (cattr c cfg "instanceUrl" "")]
+        (if (> (count (cat se ie)) 0) (values (->Sess "" "" false) (cat se ie))
+          (values (->Sess sid iu false) [])))
+      (and (= (count (conn-elem cfg "oauth-client-credentials-connection")) 0) (= (count (conn-elem cfg "oauth-user-pass-connection")) 0))
+      (values (->Sess "" "" false) [(err/mk "SALESFORCE-COMPOSITE" "CONNECTIVITY"
+                                            (str "salesforce-composite:composite-config '" (:name cfg) "': mulay supports only token-connection, oauth-client-credentials-connection and oauth-user-pass-connection"))])
+      :else
+      (let [[s e] (sf/session cache cfg fresh)]
+        (if (not= e "") (values (->Sess "" "" false) [(err/mk "SALESFORCE-COMPOSITE" "CONNECTIVITY" e)])
+          (values (->Sess (:token s) (:instance s) true) []))))))
+
+(defn- unit-ms Int [n: Int unit: &Str]
+  (cond (= unit "MILLISECONDS") n (= unit "MICROSECONDS") (quot n 1000) (= unit "NANOSECONDS") (quot n 1000000)
+        (= unit "MINUTES") (* n 60000) (= unit "HOURS") (* n 3600000) (= unit "DAYS") (* n 86400000) :else (* n 1000)))
+
+(defn- timeout-ms Int [c: &conn/OpCall cfg: &m/Config]
+  (let [[t te] (cattr c cfg "responseTimeout" "5")
+        [u ue] (cattr c cfg "responseTimeoutTimeUnit" "SECONDS")
+        [n e] (parse-long (str/trim t))]
+    (unit-ms (if (= e "") n 5) (str/upper-case u))))
+
+(defrecord Resp [status: Int body: Str headers: Vec(hm/Header) err: Str])
+
+(defn- host-port Str [url: &Str]
+  (let [k (str/index-of url "://")
+        rest (if (< k 0) (str url) (subs url (+ k 3) (count url)))
+        e (loop [i 0] (if (>= i (count rest)) i (let [ch (nth rest i)] (if (or (= ch 47) (= ch 63)) i (recur (+ i 1))))))
+        hp (subs rest 0 e)
+        c (str/index-of hp ":")
+        host (if (< c 0) hp (subs hp 0 c))
+        port (if (< c 0) (if (str/starts-with? url "https") "443" "80") (subs hp (+ c 1) (count hp)))]
+    (str (if (= host "localhost") "localhost/127.0.0.1" (str host "/" host)) ":" port)))
+
+(defn- send Resp [method: &Str url: &Str body: &Str has-body: Bool tok: &Str tmo: Int]
+  (let [h0: Vec(hm/Header) [(hm/->Header "User-Agent" "Mule HTTP Client") (hm/->Header "authorization" (str "Bearer " tok))
+                            (hm/->Header "content-type" "application/json")]
+        h1 (if has-body (conj h0 (hm/->Header "Transfer-Encoding" "chunked")) h0)
+        hs (conj (conj h1 (hm/->Header "Accept" "*/*")) (hm/->Header "Connection" "keep-alive"))
+        [r e] (http/request (assoc (assoc (assoc (assoc (assoc (http/request-opts (str url)) :method (str method)) :headers hs) :body (str body))
+                                          :timeout-ms tmo) :max-redirects 10))]
+    (if (not= e "") (->Resp 0 "" [] (str e)) (->Resp (:status r) (:body r) (:headers r) ""))))
+
+(def EXPIRED ["session timed out" "request timed out waiting for connection" "illegal session. session not found, missing session hash"
+              "invalid session id found in sessionheader: illegal session" "session expired or invalid" "invalid session id" "invalid_session_id"])
+
+(defn- expired? Bool [body: &Str]
+  (let [b (str/lower-case body)] (loop [i 0] (if (>= i (count EXPIRED)) false (if (str/includes? b (nth EXPIRED i)) true (recur (+ i 1)))))))
+
+(defn- check Values(v/Val Str Str Bool) [r: &Resp map: Bool slow-type: &Str]
+  (let [st (:status r) body (:body r)]
+    (cond
+      (not= (:err r) "")
+      (let [e (str/lower-case (:err r))]
+        (cond (or (str/includes? e "timed out") (str/includes? e "timeout") (str/includes? e "deadline")) (values (v/null-v) slow-type "Timeout exceeded" false)
+              (str/includes? e "refused") (values (v/null-v) "UNKNOWN" "" false)
+              :else (values (v/null-v) "UNKNOWN" (:err r) false)))
+      (= st 401)
+      (let [[x e] (cj/read-java body false)]
+        (cond
+          (not= e "") (values (v/null-v) "TRANSFORMATION" e false)
+          :else
+          (match (v/unmeta x)
+            (v/VArr xs) (if (and (> (count xs) 0) (= (text-of (let [r0 (get-f (nth xs 0) "errorCode")] (if (= (count r0) 0) (v/null-v) (nth r0 0)))) "INVALID_SESSION_ID"))
+                          (values (v/null-v) "CONNECTIVITY" "Invalid session Id" true)
+                          (values (v/null-v) "UNKNOWN" "Invalid status code: 401, response body: " false))
+            (v/VNull) (values (v/null-v) "UNKNOWN" "Invalid status code: 401, response body: " false)
+            _ (values (v/null-v) "UNKNOWN" (cce (java-class x) "java.util.List") false))))
+      (or (< st 200) (>= st 300))
+      (if (expired? body) (values (v/null-v) "CONNECTIVITY" "Invalid session Id" true)
+        (values (v/null-v) "UNKNOWN" (str "Invalid status code: " st ", response body: " body) false))
+      (= (count body) 0) (values (v/null-v) "UNKNOWN" "Empty stream came as response" false)
+      :else
+      (let [[x e] (cj/read-java body map)]
+        (if (not= e "") (values (v/null-v) "TRANSFORMATION" e false) (values x "" "" false))))))
+
+(defn- headers-val v/Val [hs: &Vec(hm/Header)]
+  (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count hs)) acc (recur (+ i 1) (conj acc (v/field (str/lower-case (:hd-name (nth hs i))) (jstr (:hd-value (nth hs i))))))))))
+
+(defn- http-op conn/OpResult [cache: &Atom c: &conn/OpCall method: &Str path: &Str body: &Str has-body: Bool kind: &Str slow-type: &Str]
+  (let [cfg (nth (:config c) 0)
+        tmo (timeout-ms c cfg)]
+    (loop [attempt 0]
+      (let [[s se] (session cache c cfg (> attempt 0))]
+        (if (> (count se) 0) (errs se)
+          (let [url (str (:instance s) path)
+                r (send method url body has-body (:token s) tmo)
+                [x et msg exp] (check r (= kind "map") slow-type)]
+            (cond
+              (and exp (:refresh s) (< attempt 2)) (recur (+ attempt 1))
+              (= et "")
+              (let [bad (match (v/unmeta x)
+                          (v/VNull) ""
+                          (v/VArr xs) (if (= kind "obj") (cce "java.util.ArrayList" "java.util.Map") "")
+                          (v/VObj fs) (if (= kind "list") (cce "java.util.LinkedHashMap" "java.util.List") "")
+                          _ (if (= kind "map") "" (cce (java-class x) (if (= kind "list") "java.util.List" "java.util.Map"))))]
+                (if (not= bad "") (failure "UNKNOWN" bad)
+                  (conn/ok-result (ev/tv-val x ev/JAVA)
+                                  (ev/tv-val (cj/hash-map [(v/field "status-code" (v/->VMeta (v/int-v (:status r)) cj/CM-INT))
+                                                           (v/field "headers" (headers-val (:headers r)))]) ev/JAVA))))
+              (and (= et "UNKNOWN") (= msg "")) (failure "UNKNOWN" (str "Connection refused: " (host-port url)))
+              :else (failure et msg))))))))
+
+(defn- content Values(v/Val Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [[x src e] (sf/child-val-src c local)] (values x e)))
+
+(defn- text-child Values(Str Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [[ts x] (conn/child-tv c local)]
+    (cond (> (count x) 0) (values "" x)
+          (= (count ts) 0) (values "" [])
+          :else (let [[pv pt pe] (ev/value (nth ts 0))] (values (text-of pv) (if (= pe "") [] [(err/mk "MULE" "EXPRESSION" pe)]))))))
+
+(defn- empty-param conn/OpResult [name: &Str] (failure "VALIDATION" (str "Parameter '" name "' is Empty.")))
+
+(defn- list-strs Vec(Str) [x: &v/Val]
+  (match (v/unmeta x) (v/VArr xs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (text-of (nth xs i)))))) _ []))
+
+(defn- url-enc Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (cond (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (= c 46) (= c 45) (= c 42) (= c 95))
+                     (str out (subs s i (+ i 1)))
+                     (= c 32) (str out "+")
+                     :else (str out "%" (subs "0123456789ABCDEF" (quot c 16) (+ (quot c 16) 1)) (subs "0123456789ABCDEF" (mod c 16) (+ (mod c 16) 1)))))))))
+
+(defn- mformat Str [pat: &Str args: &Vec(Str)]
+  (let [n (count pat)]
+    (loop [i 0 q false out ""]
+      (if (>= i n) out
+        (let [ch (nth pat i)]
+          (cond
+            (and (= ch 39) (< (+ i 1) n) (= (nth pat (+ i 1)) 39)) (recur (+ i 2) q (str out "'"))
+            (= ch 39) (recur (+ i 1) (not q) out)
+            (and (not q) (= ch 123))
+            (let [e (str/index-of-after pat "}" i)
+                  [k ke] (if (< e 0) (values -1 "x") (parse-long (str/trim (subs pat (+ i 1) e))))]
+              (if (or (not= ke "") (< k 0)) (recur (+ i 1) q (str out "{"))
+                (recur (+ e 1) q (str out (if (< k (count args)) (nth args k) (str "{" k "}"))))))
+            :else (recur (+ i 1) q (str out (subs pat i (+ i 1))))))))))
+
+(defn- sub-request v/Val [method: v/Val url: &Str rich: Vec(v/Val)]
+  (cj/hash-map (let [base [(v/field "method" method) (v/field "url" (jstr url))]]
+                 (if (= (count rich) 0) base (conj base (v/field "richInput" (nth rich 0)))))))
+
+(defn- process Values(v/Val Str) [fs0: &Vec(v/Field)]
+  (let [ftn (v/obj-get fs0 "fieldsToNull")
+        keep (loop [i 0 acc: Vec(v/Field) []]
+               (if (>= i (count fs0)) acc
+                 (let [k (:name (:key (nth fs0 i)))]
+                   (recur (+ i 1) (if (or (= k "Id") (= k "fieldsToNull")) acc (conj acc (v/field (str k) (jin (:value (nth fs0 i))))))))))
+        [names bad] (if (or (= (count ftn) 0) (v/null? (nth ftn 0))) (values [] "")
+                      (match (v/unmeta (nth ftn 0))
+                        (v/VArr xs) (values (list-strs (nth ftn 0)) "")
+                        _ (values [] (cce (java-class (nth ftn 0)) "java.util.List"))))]
+    (if (not= bad "") (values (v/null-v) bad)
+      (let [all (loop [i 0 acc keep]
+                  (if (>= i (count names)) acc
+                    (let [k (nth names i)
+                          j (loop [x 0] (if (>= x (count acc)) -1 (if (= (:name (:key (nth acc x))) k) x (recur (+ x 1)))))]
+                      (recur (+ i 1) (if (< j 0) (conj acc (v/field (str k) (v/null-v))) (assoc acc j (v/field (str k) (v/null-v))))))))]
+        (values (cj/hash-copy all (count fs0)) "")))))
+
+(defn- pre-create conn/OpResult [c: &conn/OpCall]
+  (let [[ty te] (conn/attr-str c "type" "")
+        [so se] (content c "s-object")]
+    (if (> (count (cat te se)) 0) (errs (cat te se))
+      (let [[rich bad] (process (fields-of so))]
+        (if (not= bad "") (failure "UNKNOWN" bad)
+          (java (sub-request (jstr "POST") (mformat "v{0}/sobjects/{1}" [VER ty]) [rich])))))))
+
+(defn- pre-update conn/OpResult [c: &conn/OpCall]
+  (let [[ty te] (conn/attr-str c "type" "")
+        [so se] (content c "s-object")
+        fs (fields-of so)
+        id (v/obj-get fs "Id")]
+    (cond
+      (> (count (cat te se)) 0) (errs (cat te se))
+      (or (= (count id) 0) (not (match (v/unmeta (nth id 0)) (v/VStr s) (not= s "") _ false))) (failure "VALIDATION" "Invalid field content.")
+      :else
+      (let [rest (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count fs)) acc (recur (+ i 1) (if (= (:name (:key (nth fs i))) "Id") acc (conj acc (nth fs i))))))
+            [rich bad] (process rest)]
+        (if (not= bad "") (failure "UNKNOWN" bad)
+          (java (sub-request (v/->VMeta (v/->VStr "PATCH") (cm "org.mule.runtime.http.api.HttpConstants$Method"))
+                             (str "v" VER "/sobjects/" ty "/" (text-of (nth id 0))) [rich])))))))
+
+(defn- pre-delete conn/OpResult [c: &conn/OpCall]
+  (let [[ty te] (conn/attr-str c "type" "")
+        [id ie] (conn/attr-str c "id" "")]
+    (cond (> (count (cat te ie)) 0) (errs (cat te ie))
+          (blank? id) (empty-param "id")
+          :else (java (sub-request (jstr "DELETE") (str "v" VER "/sobjects/" ty "/" id) [])))))
+
+(defn- non-empty-str? Bool [r: &Vec(v/Val)] (and (> (count r) 0) (match (v/unmeta (nth r 0)) (v/VStr s) (not= s "") _ false)))
+
+(defn- pre-retrieve conn/OpResult [c: &conn/OpCall]
+  (let [[d de] (content c "retrieve-data")
+        fs (fields-of d)
+        id (v/obj-get fs "Id") ty (v/obj-get fs "Type") fl (v/obj-get fs "Fields")
+        flist (if (= (count fl) 0) [] (match (v/unmeta (nth fl 0)) (v/VArr xs) xs _ []))]
+    (cond
+      (> (count de) 0) (errs de)
+      (not (non-empty-str? id)) (failure "VALIDATION" "Invalid field content.")
+      (or (= (count fl) 0) (not (match (v/unmeta (nth fl 0)) (v/VArr xs) true _ false))) (failure "VALIDATION" "Field value has to be an instance of list.")
+      (= (count flist) 0) (failure "VALIDATION" "Field value can not be an empty list.")
+      (not (non-empty-str? ty)) (failure "VALIDATION" "Invalid field content.")
+      :else
+      (let [fields (loop [i 0 out ""]
+                     (if (>= i (count flist)) out
+                       (let [x (nth flist i)
+                             t (if (v/null? x) "" (str/trim (text-of x)))]
+                         (recur (+ i 1) (if (= t "") out (str out t (if (< (+ i 1) (count flist)) "," "")))))))]
+        (java (sub-request (jstr "GET") (mformat (str "v" VER "/sobjects/" (text-of (nth ty 0)) "/{0}?fields={1}") [(text-of (nth id 0)) (url-enc fields)]) []))))))
+
+(defn- pre-query conn/OpResult [c: &conn/OpCall all: Bool]
+  (let [[q qe] (text-child c "query")
+        [ps pe] (let [p (conn/param (:exprs c) "parameters")]
+                  (if (= (count p) 0) (values (v/->VObj []) [])
+                    (let [[x e] ((:eval c) (nth p 0) (:event c))] (values x (if (= e "") [] [(err/mk "MULE" "EXPRESSION" e)])))))]
+    (cond
+      (> (count (cat qe pe)) 0) (errs (cat qe pe))
+      (blank? q) (empty-param "query")
+      :else
+      (let [fs (fields-of ps)
+            q2 (loop [i 0 s (str q)] (if (>= i (count fs)) s (recur (+ i 1) (str/replace s (str ":" (:name (:key (nth fs i)))) (text-of (:value (nth fs i)))))))]
+        (java (sub-request (jstr "GET") (str "v" VER (if all "/queryAll/?q=" "/query/?q=") (url-enc q2)) []))))))
+
+(defn- pre-search conn/OpResult [c: &conn/OpCall]
+  (let [[s se] (content c "search")]
+    (cond (> (count se) 0) (errs se)
+          (blank? (if (v/null? s) "" (text-of s))) (empty-param "search")
+          :else (java (sub-request (jstr "GET") (str "v" VER "/search/?q=" (url-enc (text-of s))) [])))))
+
+(defn- has-errors? Bool [m0: &v/Val]
+  (let [r (get-f m0 "statusCode")]
+    (if (= (count r) 0) false
+      (match (v/unmeta (nth r 0))
+        (v/VInt i) (>= i 400)
+        (v/VNum n) (let [[k e] (num/to-int n)] (if (= e "") (>= k 400) (>= (num/to-float n) 400.0)))
+        (v/VStr s) (let [d (loop [i (if (and (> (count s) 0) (= (nth s 0) 45)) 1 0) out ""]
+                             (if (>= i (count s)) out
+                               (let [ch (nth s i)]
+                                 (cond (and (>= ch 48) (<= ch 57)) (recur (+ i 1) (str out (subs s i (+ i 1))))
+                                       (and (= ch 44) (> (count out) 0)) (recur (+ i 1) out)
+                                       :else out))))
+                         [k e] (parse-long d)]
+                     (and (not= d "") (= e "") (not (str/starts-with? s "-")) (>= k 400)))
+        _ false))))
+
+(defn- result-of Vec(v/Val) [m0: &v/Val] (get-f m0 "result"))
+
+(defn- errors-of Values(v/Val Str) [m0: &v/Val]
+  (let [r (result-of m0)]
+    (if (or (= (count r) 0) (v/null? (nth r 0))) (values (cj/hash-map [(v/field "errors" (v/null-v))]) "")
+      (match (v/unmeta (nth r 0))
+        (v/VArr xs) (values (cj/hash-map [(v/field "errors" (jin (nth r 0)))]) "")
+        _ (values (v/null-v) (cce (java-class (jin (nth r 0))) "java.util.List"))))))
+
+(defn- as-map Values(v/Val Str) [r: &Vec(v/Val)]
+  (if (or (= (count r) 0) (v/null? (nth r 0))) (values (v/null-v) "")
+    (match (v/unmeta (nth r 0)) (v/VObj fs) (values (jin (nth r 0)) "") _ (values (v/null-v) (cce (java-class (jin (nth r 0))) "java.util.Map")))))
+
+(defn- post conn/OpResult [c: &conn/OpCall local: &Str whole: Bool]
+  (let [[m0 me] (content c local)]
+    (cond
+      (> (count me) 0) (errs me)
+      (has-errors? m0) (let [[x bad] (errors-of m0)] (if (not= bad "") (failure "UNKNOWN" bad) (java x)))
+      whole (java (jin m0))
+      :else (let [[x bad] (as-map (result-of m0))] (if (not= bad "") (failure "UNKNOWN" bad) (java x))))))
+
+(defn- post-search conn/OpResult [c: &conn/OpCall]
+  (let [[m0 me] (content c "search-result")]
+    (cond
+      (> (count me) 0) (errs me)
+      (has-errors? m0) (let [[x bad] (errors-of m0)] (if (not= bad "") (failure "UNKNOWN" bad) (java (v/->VMeta (v/->VArr [x]) cj/CM-AL))))
+      :else
+      (let [[r bad] (as-map (result-of m0))]
+        (cond (not= bad "") (failure "UNKNOWN" bad)
+              (v/null? r) (failure "UNKNOWN" "Cannot invoke \"java.util.Map.get(Object)\" because \"result\" is null")
+              :else (let [sr (get-f r "searchRecords")] (java (if (= (count sr) 0) (v/null-v) (nth sr 0)))))))))
+
+(def CURSOR (cm "org.mule.runtime.core.internal.streaming.object.ManagedCursorIteratorProvider"))
+
+(defn- items-of Vec(v/Val) [x: &v/Val] (match (v/unmeta x) (v/VArr xs) xs _ []))
+
+(defn- post-query conn/OpResult [cache: &Atom c: &conn/OpCall need-query: Bool]
+  (let [[q qe] (if need-query (text-child c "query") (values "x" []))
+        [m0 me] (content c "query-result")]
+    (cond
+      (> (count (cat qe me)) 0) (errs (cat qe me))
+      (blank? q) (empty-param "query")
+      (has-errors? m0) (java (v/->VMeta (v/->VArr []) CURSOR))
+      :else
+      (let [[r bad] (as-map (result-of m0))]
+        (if (not= bad "") (failure "UNKNOWN" bad)
+          (let [recs (items-of (let [x (get-f r "records")] (if (= (count x) 0) (v/null-v) (nth x 0))))
+                nxt (let [x (get-f r "nextRecordsUrl")] (if (or (= (count x) 0) (v/null? (nth x 0))) "" (text-of (nth x 0))))
+                first (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count recs)) acc (recur (+ i 1) (conj acc (jin (nth recs i))))))]
+            (if (= nxt "") (java (v/->VMeta (v/->VArr first) CURSOR))
+              (let [cfg (nth (:config c) 0)
+                    [s se] (session cache c cfg false)]
+                (if (> (count se) 0) (errs se)
+                  (loop [acc first url nxt]
+                    (let [resp (send "GET" (str (:instance s) url) "" false (:token s) (timeout-ms c cfg))
+                          [x et msg exp] (check resp true "UNKNOWN")]
+                      (cond
+                        (and (= et "UNKNOWN") (= msg "")) (failure "UNKNOWN" (str "Connection refused: " (host-port (:instance s))))
+                        (not= et "") (failure et msg)
+                        :else
+                        (let [more (items-of (let [y (get-f x "records")] (if (= (count y) 0) (v/null-v) (nth y 0))))
+                              acc2 (loop [i 0 a acc] (if (>= i (count more)) a (recur (+ i 1) (conj a (nth more i)))))
+                              n2 (let [y (get-f x "nextRecordsUrl")] (if (or (= (count y) 0) (v/null? (nth y 0))) "" (text-of (nth y 0))))
+                              done (let [y (get-f x "done")] (and (> (count y) 0) (match (v/unmeta (nth y 0)) (v/VBool b) b _ false)))]
+                          (if (or done (= n2 "")) (java (v/->VMeta (v/->VArr acc2) CURSOR)) (recur acc2 n2)))))))))))))))
+
+(defn- body-of Values(Str Str) [x: &v/Val] (cj/write-java x))
+
+(defn- wrap v/Val [k: &Str x: &v/Val] (cj/hash-map [(v/field (str k) (jin x))]))
+
+(defn- with-body conn/OpResult [cache: &Atom c: &conn/OpCall method: &Str path: &Str x: &v/Val kind: &Str slow: &Str]
+  (let [[b be] (body-of x)]
+    (if (not= be "") (failure "TRANSFORMATION" be) (http-op cache c method path b true kind slow))))
+
+(defn- base Str [] (str "/services/data/v" VER))
+
+(defn- run-op conn/OpResult [cache: &Atom c: &conn/OpCall]
+  (let [op (:op c)]
+    (cond
+      (= (count (:config c)) 0) (failure "CONNECTIVITY" "No <salesforce-composite:composite-config> for the operation")
+      (= op "pre-create") (pre-create c)
+      (= op "pre-update") (pre-update c)
+      (= op "pre-delete") (pre-delete c)
+      (= op "pre-retrieve") (pre-retrieve c)
+      (= op "pre-get-limits") (java (sub-request (jstr "GET") (str "v" VER "/limits") []))
+      (= op "pre-query") (pre-query c false)
+      (= op "pre-query-all") (pre-query c true)
+      (= op "pre-search") (pre-search c)
+      (= op "post-create") (post c "create-result" false)
+      (= op "post-retrieve") (post c "retrieve-data" false)
+      (= op "post-update") (post c "update-result" true)
+      (= op "post-delete") (post c "delete-result" true)
+      (= op "post-get-limits") (post c "get-limits-result" true)
+      (= op "post-search") (post-search c)
+      (= op "post-query") (post-query cache c true)
+      (= op "post-query-all") (post-query cache c false)
+      (= op "create-sobject-tree")
+      (let [[ty te] (conn/attr-str c "type" "") [x xe] (content c "s-objects")]
+        (if (> (count (cat te xe)) 0) (errs (cat te xe)) (with-body cache c "POST" (str (base) "/composite/tree/" ty) (wrap "records" x) "map" "UNKNOWN")))
+      (= op "execute-composite-batch")
+      (let [[x xe] (content c "sub-requests")]
+        (if (> (count xe) 0) (errs xe) (with-body cache c "POST" (str (base) "/composite/batch/") (wrap "batchRequests" x) "map" "UNKNOWN")))
+      (= op "execute-composite-graph")
+      (let [[x xe] (content c "graphs")]
+        (if (> (count xe) 0) (errs xe) (with-body cache c "POST" (str (base) "/composite/graph/") (wrap "graphs" x) "map" "UNKNOWN")))
+      (= op "execute-composite-request")
+      (let [[x xe] (content c "request-body")]
+        (if (> (count xe) 0) (errs xe) (with-body cache c "POST" (str (base) "/composite") (jin x) "obj" "CONNECTIVITY")))
+      (= op "create-sobject-collections")
+      (let [[x xe] (content c "request-body")]
+        (if (> (count xe) 0) (errs xe) (with-body cache c "POST" (str (base) "/composite/sobjects") (jin x) "list" "CONNECTIVITY")))
+      (= op "update-sobject-collections")
+      (let [[x xe] (content c "request-body")]
+        (if (> (count xe) 0) (errs xe) (with-body cache c "PATCH" (str (base) "/composite/sobjects") (jin x) "list" "CONNECTIVITY")))
+      (= op "upsert-sobject-collections")
+      (let [[ty te] (conn/attr-str c "type" "") [ef fe] (conn/attr-str c "externalFieldName" "") [x xe] (content c "request-body")]
+        (if (> (count (cat (cat te fe) xe)) 0) (errs (cat (cat te fe) xe))
+          (with-body cache c "PATCH" (str (base) "/composite/sobjects/" ty "/" ef) (jin x) "list" "CONNECTIVITY")))
+      (= op "get-sobject-collections")
+      (let [[ty te] (conn/attr-str c "type" "") [ids ie] (conn/attr-val c "ids") [fl fe] (conn/attr-val c "fields")]
+        (if (> (count (cat (cat te ie) fe)) 0) (errs (cat (cat te ie) fe))
+          (with-body cache c "POST" (str (base) "/composite/sobjects/" ty)
+                     (cj/hash-map [(v/field "ids" (if (= (count ids) 0) (v/null-v) (jin (nth ids 0)))) (v/field "fields" (if (= (count fl) 0) (v/null-v) (jin (nth fl 0))))])
+                     "list" "CONNECTIVITY")))
+      (= op "delete-sobject-collections")
+      (let [[ids ie] (conn/attr-val c "ids") [all ae] (conn/attr-bool c "allOrNone" false)]
+        (if (> (count (cat ie ae)) 0) (errs (cat ie ae))
+          (http-op cache c "DELETE" (str (base) "/composite/sobjects?ids=" (str/join "," (if (= (count ids) 0) [] (list-strs (nth ids 0)))) "&allOrNone=" (if all "true" "false"))
+                   "null" true "list" "CONNECTIVITY")))
+      :else (failure "UNKNOWN" (str "mulay does not support salesforce-composite:" op)))))
+
+(def ERROR-PARENTS
+  [
+   "SALESFORCE-COMPOSITE:CONNECTIVITY" "MULE:CONNECTIVITY"
+   "SALESFORCE-COMPOSITE:INVALID_SESSION" "MULE:CONNECTIVITY"
+   "SALESFORCE-COMPOSITE:TRANSFORMATION" "MULE:TRANSFORMATION"
+   "SALESFORCE-COMPOSITE:VALIDATION" "MULE:VALIDATION"
+   "SALESFORCE-COMPOSITE:RETRY_EXHAUSTED" "MULE:RETRY_EXHAUSTED"])
+
+(defn connector conn/Connector []
+  (let [z: Map {}
+        cache (atom (->dyn z))]
+    (assoc (conn/connector "salesforce-composite" NS (fn conn/OpResult [c: conn/OpCall] (run-op cache c))) :error-parents ERROR-PARENTS)))

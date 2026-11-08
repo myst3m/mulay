@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="HTTP_Listener_Config">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <!-- mulay: 実 Mule のスキーマでは outboundHeadersMapName と httpStatusVarName が必須 -->
+    <apikit:config name="products-api-config" api="api/products-api.yaml"
+                   outboundHeadersMapName="outboundHeaders" httpStatusVarName="httpStatus"/>
+
+    <!-- Main flow with APIKit router -->
+    <flow name="products-api-main">
+        <http:listener config-ref="HTTP_Listener_Config" path="/api/*"/>
+        <apikit:router config-ref="products-api-config"/>
+        <error-handler>
+            <on-error-propagate type="APIKIT:BAD_REQUEST">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    error: "Bad Request",
+    message: error.description
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <set-variable variableName="httpStatus" value="400"/>
+            </on-error-propagate>
+            <on-error-propagate type="APIKIT:NOT_FOUND">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    error: "Not Found",
+    message: error.description
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <set-variable variableName="httpStatus" value="404"/>
+            </on-error-propagate>
+            <on-error-propagate type="APIKIT:METHOD_NOT_ALLOWED">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    error: "Method Not Allowed",
+    message: error.description
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <set-variable variableName="httpStatus" value="405"/>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <!-- GET /products -->
+    <flow name="get:\products:products-api-config">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var products = [
+    {id: "P001", name: "Laptop", price: 1200.00, category: "electronics", stock: 50},
+    {id: "P002", name: "T-Shirt", price: 25.00, category: "clothing", stock: 200},
+    {id: "P003", name: "Apple", price: 1.50, category: "food", stock: 500}
+]
+var category = attributes.queryParams.category
+---
+if (category != null)
+    products filter ((item) -> item.category == category)
+else
+    products]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- GET /products/{productId} -->
+    <flow name="get:\products\(productId):products-api-config">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var products = [
+    {id: "P001", name: "Laptop", price: 1200.00, category: "electronics", stock: 50},
+    {id: "P002", name: "T-Shirt", price: 25.00, category: "clothing", stock: 200},
+    {id: "P003", name: "Apple", price: 1.50, category: "food", stock: 500}
+]
+var productId = attributes.uriParams.productId
+var product = products filter ((item) -> item.id == productId)
+---
+if (sizeOf(product) > 0) product[0] else null]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- POST /products -->
+    <flow name="post:\products:products-api-config">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    id: "P" ++ (random() * 1000) as String {format: "000"},
+    name: payload.name,
+    price: payload.price,
+    category: payload.category default "electronics",
+    stock: payload.stock default 0
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="httpStatus" value="201"/>
+    </flow>
+
+</mule>

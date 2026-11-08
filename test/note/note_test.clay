@@ -1,0 +1,450 @@
+(ns note-test (:require [mulay.note.run :as nr] [mulay.lib.host :as host] [mulay.mule.amodel :as am] [mulay.lib.uni :as uni] [clay.string :as str] [clay.json :as json]))
+
+(def DIR "test/fixtures/livenote/orders-api")
+
+(defn- ex Str [id: &Str]
+  (let [[t e] (read-file (str DIR "/livenote/examples.json"))
+        k (str/index-of t (str "\"id\": \"" id "\""))
+        s (loop [i k] (if (= (nth t i) 123) i (recur (- i 1))))
+        e2 (loop [i s d 0] (let [c (nth t i) d2 (cond (= c 123) (+ d 1) (= c 125) (- d 1) :else d)] (if (and (= c 125) (= d2 0)) (+ i 1) (recur (+ i 1) d2))))]
+    (subs t s e2)))
+
+(defn- run nr/NTrace [id: Str] (let [z (nr/load-dir DIR)] (nr/run-example (ex id))))
+
+(defn- line Str [t: &nr/NTrace]
+  (str/join "|" (loop [i 0 acc: Vec(Str) []]
+                  (if (>= i (count (:steps t))) acc
+                    (let [s (nth (:steps t) i)
+                          p (:path s)
+                          short (subs p (count "post-orders/") (count p))]
+                      (recur (+ i 1) (conj acc (str short " " (:status s) (if (>= (:route s) 0) (str " r" (:route s)) "")
+                                                    (if (= (:err-type s) "") "" (str " " (:err-type s)))))))))))
+
+(defn- body-of Str [t: &nr/NTrace] (nr/value-text (:body t)))
+
+(deftest normal
+  (let [t (run "normal")]
+    (is (= (line t) (str "source ok|processors/0 ok|processors/1 replayed|processors/2 ok|processors/3 ok r1|processors/4 replayed|processors/5 ok"
+                         "|processors/3/route/0/processors/0 not-reached|errorHandler/0/processors/0 not-reached|errorHandler/0/processors/1 not-reached"
+                         "|errorHandler/1/processors/0 not-reached|errorHandler/1/processors/1 not-reached")))
+    (is (:has-resp t))
+    (is (= (:status t) 201))
+    (is (= (body-of t) "{\n  \"orderId\": \"a0B5g00000Xq3PAAS\",\n  \"total\": 2400\n}"))
+    (is (= (:handler t) ""))
+    (is (= (:stopped t) ""))
+    (is (= (nr/value-text (:out-payload (nth (:steps t) 3))) "{\n  \"customer\": \"山田工業\",\n  \"tier\": \"standard\",\n  \"total\": 2400\n}"))))
+
+(deftest gold
+  (let [t (run "gold")]
+    (is (str/starts-with? (line t) "source ok|processors/0 ok|processors/1 replayed|processors/2 ok|processors/3 ok r0|processors/3/route/0/processors/0 ok|processors/4 replayed"))
+    (is (= (:status t) 201))
+    (is (= (body-of t) "{\n  \"orderId\": \"a0B5g00000XyZ1AAJ\",\n  \"total\": 2160\n}"))))
+
+(deftest missing
+  (let [t (run "missing")]
+    (is (str/starts-with? (line t) "source ok|processors/0 failed VALIDATION:NULL|errorHandler/0/processors/0 ok|errorHandler/0/processors/1 ok|processors/1 not-reached"))
+    (is (= (:handler t) "post-orders/errorHandler/0"))
+    (is (= (:status t) 400))
+    (is (= (body-of t) "{\n  \"error\": \"customer は必須です\"\n}"))
+    (is (= (:err-desc (nth (:steps t) 1)) "customer は必須です"))))
+
+(deftest dbdown
+  (let [t (run "dbdown")]
+    (is (str/starts-with? (line t) "source ok|processors/0 ok|processors/1 failed DB:CONNECTIVITY|errorHandler/1/processors/0 ok|errorHandler/1/processors/1 ok"))
+    (is (= (:handler t) "post-orders/errorHandler/1"))
+    (is (= (:status t) 503))
+    (is (= (:err-desc (nth (:steps t) 2)) "orders-db に接続できません（記録した応答: 接続を拒否された）"))))
+
+(deftest held-without-recording
+  (let [z (nr/load-dir DIR)
+        t (nr/run-example (str/replace (ex "normal") "\"id\": \"normal\"" "\"id\": \"norec\""))]
+    (is (str/starts-with? (line t) "source ok|processors/0 ok|processors/1 held|processors/2 not-reached"))
+    (is (= (:stopped t) "post-orders/processors/1"))
+    (is (not (:has-resp t)))
+    (is (= (:handler t) ""))))
+
+(deftest trace-json
+  (let [z (nr/load-dir DIR)
+        t (nr/run-example (ex "missing"))
+        j (nr/trace-json t)
+        [d e] (json/parse j)
+        id (nr/first-value-id t)
+        v (nr/get-value id)]
+    (is (= e ""))
+    (is (str/includes? j "\"exampleId\":\"missing\""))
+    (is (str/includes? j "\"handler\":\"post-orders/errorHandler/0\""))
+    (is (str/includes? j "\"error\":{\"type\":\"VALIDATION:NULL\",\"description\":\"customer は必須です\"}"))
+    (is (str/includes? j "\"response\":{\"status\":400,\"body\":{\"id\":\""))
+    (is (str/starts-with? id "missing:"))
+    (is (str/includes? v "\"text\":"))
+    (is (= (nr/get-value "missing:999999") "{\"error\":\"unknown value id missing:999999\"}"))
+    (is (str/includes? j "{\"path\":\"post-orders/source\",\"docId\":\"9ed83c75-731e-47bc-81be-3a913b9629a2\",\"status\":\"ok\""))
+    (is (str/includes? (nr/value-text (:out-attrs (nth (:steps t) 0))) "\"method\": \"POST\""))
+    (is (str/includes? j "\"attributes\":{\"id\":\"missing:"))))
+
+(def MULTI "test/fixtures/livenote/multi-flow")
+
+(defn- run-multi nr/NTrace [id: Str]
+  (let [z (nr/load-dir MULTI)
+        xs (nr/examples MULTI)
+        x (loop [i 0] (if (= (nr/example-id (nth xs i)) id) (nth xs i) (recur (+ i 1))))]
+    (nr/run-example-val x "")))
+
+(defn- steps-line Str [t: &nr/NTrace]
+  (str/join "|" (loop [i 0 acc: Vec(Str) []]
+                  (if (>= i (count (:steps t))) acc
+                    (let [s (nth (:steps t) i)]
+                      (recur (+ i 1) (conj acc (str (:path s) " " (:status s) (if (>= (:iteration s) 0) (str " i" (:iteration s)) "")))))))))
+
+(defn- last-var Str [t: &nr/NTrace name: &Str]
+  (let [ss (:steps t) vs (:out-vars (nth ss (- (count ss) 1)))]
+    (loop [i 0] (if (>= i (count vs)) "" (if (= (nth (nth vs i) 0) name) (nr/value-text (nth (nth vs i) 1)) (recur (+ i 1)))))))
+
+(deftest flow-ref-steps
+  (let [t (run-multi "refs")]
+    (is (= (steps-line t) (str "main/source ok|main/processors/0 ok|sub/processors/0 ok i0|main/processors/1 ok|sub/processors/0 ok i1"
+                               "|main/processors/2 ok|other/processors/0 ok|main/processors/3 ok")))
+    (is (= (last-var t "n") "2"))
+    (is (uni/valid? (nr/trace-json t)))))
+
+(deftest scheduler-example
+  (let [t (run-multi "tick")]
+    (is (= (steps-line t) "sched/source ok|sched/processors/0 ok"))
+    (is (= (nr/value-text (:out-attrs (nth (:steps t) 0))) "null"))
+    (is (not (:has-resp t)))
+    (is (not (str/includes? (nr/trace-json t) "\"response\"")))))
+
+(def PROPS "test/fixtures/livenote/props")
+
+(defn- props-payload Str [ps: Str]
+  (let [[xs e] (nr/props-json ps)
+        z (nr/load-dir-with PROPS xs)
+        t (nr/run-example-val (nth (nr/examples PROPS) 0) "")
+        ss (:steps t)]
+    (nr/value-text (:out-payload (nth ss (- (count ss) 1))))))
+
+(deftest system-properties-win-over-global-and-file
+  (let [a (props-payload "{\"secure::db.password\":\"s3\"}")
+        b (props-payload "{\"env\":\"dev\",\"secure::db.password\":\"s3\"}")
+        c (props-payload "{\"env\":\"dev\",\"db.user\":\"root\",\"greeting\":7,\"secure::db.password\":\"x\"}")]
+    (is (= a "hello local:app:s3"))
+    (is (= b "hello dev:dev-app:s3"))
+    (is (= c "7:root:x"))))
+
+(deftest props-json-errors
+  (let [[a ae] (nr/props-json "[1]")
+        [b be] (nr/props-json "{\"a\":{\"b\":1}}")
+        [c ce] (nr/props-json "{\"a\":true,\"n\":null}")]
+    (is (= ae "@properties must be a JSON object of strings"))
+    (is (= be "@properties: value of 'a' must be a string, number or boolean"))
+    (is (= ce ""))
+    (is (= (count c) 1))
+    (is (= (:name (nth c 0)) "a"))))
+
+(def APIKIT "test/fixtures/livenote/apikit")
+
+(defn- run-api nr/NTrace [id: Str]
+  (let [z (nr/load-dir APIKIT)
+        xs (nr/examples APIKIT)
+        x (loop [i 0] (if (= (nr/example-id (nth xs i)) id) (nth xs i) (recur (+ i 1))))]
+    (nr/run-example-val x "")))
+
+(defn- api-res Str [id: Str] (let [t (run-api id)] (str (:status t) " " (:handler t) " " (body-of t))))
+
+(deftest apikit-router-dispatches-to-impl-flows
+  (let [l (run-api "list")]
+    (is (str/starts-with? (steps-line l) "orders-main/source ok|orders-main/processors/0 ok|get:\\orders:orders-config/processors/0 ok|orders-main/errorHandler/0/processors/0 not-reached"))
+    (is (= (:stopped l) ""))
+    (is (str/includes? (api-res "list") "\"status\": \"open\""))
+    (is (str/starts-with? (api-res "create") "201  "))
+    (is (str/includes? (api-res "create") "\"item\": \"ink\""))
+    (is (= (api-res "one") "200  7"))
+    (is (str/starts-with? (api-res "bad") "400 orders-main/errorHandler/1 "))
+    (is (= (api-res "missing") "404 orders-main/errorHandler/0 not found"))))
+
+(deftest apikit-router-runs-in-the-browser
+  (is (str/includes? (nr/components-json ["apikit:router"]) "\"support\":\"browser\"")))
+
+(deftest apikit-model-has-entries-and-apis
+  (let [j (am/to-json (nr/load-dir APIKIT))]
+    (is (str/includes? j "{\"kind\":\"apikit\",\"flow\":\"get:\\\\orders:orders-config\""))
+    (is (str/includes? j ",\"apis\":[{\"config\":\"orders-config\",\"file\":\"src/main/resources/api/orders.yaml\""))))
+
+(deftest scaffold-from-the-session
+  (let [z (nr/load-dir APIKIT)
+        j (nr/scaffold-json "{\"config\":\"orders-config\"}")
+        e (nr/scaffold-json "{\"config\":\"x\"}")]
+    (is (= j "{\"edits\":[],\"flows\":[],\"error\":null}"))
+    (is (= e "{\"edits\":[],\"flows\":[],\"error\":\"no apikit:config named 'x'\"}"))))
+
+(def APIKIT-BARE "test/fixtures/livenote/apikit-bare")
+
+(deftest apikit-finds-the-api-under-the-api-folder
+  (let [z (nr/load-dir APIKIT-BARE)
+        xs (nr/examples APIKIT-BARE)
+        x (loop [i 0] (if (= (nr/example-id (nth xs i)) "one") (nth xs i) (recur (+ i 1))))
+        t (nr/run-example-val x "")
+        r (str (:status t) " " (body-of t))
+        j (am/to-json (nr/load-dir APIKIT-BARE))
+        s (nr/scaffold-json "{\"config\":\"orders-config\"}")]
+    (is (= r "200 7"))
+    (is (str/includes? j ",\"apis\":[{\"config\":\"orders-config\",\"file\":\"src/main/resources/api/orders.yaml\",\"format\":\"oas3\",\"error\":null"))
+    (is (= s "{\"edits\":[],\"flows\":[],\"error\":null}"))))
+
+(def SOURCES "test/fixtures/livenote/sources")
+
+(defn- src-out Str [id: Str]
+  (let [z (nr/load-dir SOURCES)
+        xs (nr/examples SOURCES)
+        x (loop [i 0] (if (= (nr/example-id (nth xs i)) id) (nth xs i) (recur (+ i 1))))
+        t (nr/run-example-val x "")
+        ss (:steps t)]
+    (str/replace (str/replace (nr/value-text (:out-payload (nth ss (- (count ss) 1)))) "\n" "") "  " "")))
+
+(deftest non-http-attributes
+  (is (= (src-out "vm") "{\"p\": {\"n\": 1},\"a\": {\"queueName\": \"orders\",\"correlationId\": \"c1\",\"timestamp\": \"2026-10-24T01:02:03\"}}"))
+  (is (= (src-out "file") (str "{\"p\": \"a,b\",\"a\": {\"fileName\": \"x.csv\",\"symbolicLink\": false,\"regularFile\": true,\"directory\": false,"
+                               "\"path\": \"/in/x.csv\",\"size\": 3,\"name\": \"x.csv\"},\"t\": \"LocalDateTime\"}")))
+  (is (= (src-out "sftp") (str "{\"fileName\": \"example.txt\",\"symbolicLink\": false,\"regularFile\": true,\"directory\": false,"
+                               "\"path\": \"/up/example.txt\",\"size\": 5,\"permissions\": 420,\"name\": \"example.txt\"}")))
+  (is (= (src-out "mq") "{\"messageId\": \"m1\",\"properties\": {\"k\": \"v\"}}"))
+  (is (= (src-out "mq0") "null")))
+
+(def BATCH "test/fixtures/livenote/batch")
+
+(defn- count-of Str [t: &nr/NTrace path: &Str]
+  (let [ss (:steps t)
+        [ok bad] (loop [i 0 a 0 b 0] (if (>= i (count ss)) (values a b)
+                                       (let [s (nth ss i)] (if (= (:path s) path) (if (= (:status s) "ok") (recur (+ i 1) (+ a 1) b) (recur (+ i 1) a (+ b 1))) (recur (+ i 1) a b)))))]
+    (str ok "/" bad)))
+
+(deftest batch-runs-inside-the-example
+  (let [z (nr/load-dir BATCH)
+        t (nr/run-example-val (nth (nr/examples BATCH) 0) "")
+        j (nr/trace-json t)
+        b "sync/processors/0/"]
+    (is (= (:stopped t) ""))
+    (is (= (count-of t (str b "process-records/0/processors/0")) "2/1"))
+    (is (= (count-of t (str b "process-records/0/processors/1")) "2/0"))
+    (is (= (count-of t (str b "process-records/1/processors/0")) "2/0"))
+    (is (= (count-of t (str b "process-records/1/aggregator/processors/0")) "1/0"))
+    (is (= (count-of t (str b "process-records/2/processors/0")) "1/0"))
+    (is (= (count-of t (str b "on-complete/processors/0")) "1/0"))
+    (is (= (steps-line t) (str "sync/source ok|sync/processors/0 ok|" b "process-records/0/processors/0 ok i0|" b "process-records/0/processors/1 ok i0|"
+                               b "process-records/0/processors/0 failed i1|" b "process-records/1/processors/0 ok i0|" b "process-records/2/processors/0 ok|"
+                               b "process-records/0/processors/0 ok i2|" b "process-records/0/processors/1 ok i1|" b "process-records/1/processors/0 ok i1|"
+                               b "process-records/1/aggregator/processors/0 ok|" b "on-complete/processors/0 ok")))
+    (is (str/includes? j "\"status\":\"failed\",\"ms\":"))))
+
+(deftest batch-model-shows-steps
+  (let [j (am/to-json (nr/load-dir BATCH))]
+    (is (str/includes? j "\"element\":\"batch:job\",\"kind\":\"scope\""))
+    (is (str/includes? j "{\"kind\":\"batch-step\",\"path\":\"sync/processors/0/process-records/0\",\"name\":\"validate\",\"acceptPolicy\":\"NO_FAILURES\",\"spans\":"))
+    (is (str/includes? j "{\"kind\":\"aggregator\",\"path\":\"sync/processors/0/process-records/1/aggregator\",\"size\":2,\"spans\":"))
+    (is (str/includes? j "{\"kind\":\"batch-step\",\"path\":\"sync/processors/0/process-records/2\",\"name\":\"failures\",\"acceptPolicy\":\"ONLY_FAILURES\",\"acceptExpression\":\"#[true]\",\"spans\":"))
+    (is (str/includes? j "{\"kind\":\"on-complete\",\"path\":\"sync/processors/0/on-complete\",\"spans\":"))
+    (is (str/includes? j "{\"path\":\"sync/processors/0/process-records/1/aggregator/processors/0\""))))
+
+(def LINKED "test/fixtures/livenote/linked")
+(def SEEN (atom ""))
+(def REPLY (atom ""))
+
+(defn- linked-run Str []
+  (let [z (nr/load-dir LINKED)
+        t (nr/run-example-val (nth (nr/examples LINKED) 0) "")
+        ss (:steps t)]
+    (str (:status (nth ss 1)) " " (:stopped t) " " (str/replace (str/replace (body-of t) "\n" "") "  " ""))))
+
+(deftest http-request-goes-through-the-host-bridge
+  (let [z0 (host/clear-http-bridge!)
+        held (linked-run)
+        z1 (host/set-http-bridge! (fn Str [req: Str] (let [z (reset! SEEN req)] (deref REPLY))))
+        z2 (reset! REPLY "{\"status\":200,\"headers\":{\"x-from\":\"cust\"},\"body\":\"{\\\"name\\\":\\\"A\\\"}\",\"mediaType\":\"application/json\"}")
+        ok (linked-run)
+        req (deref SEEN)
+        z3 (reset! REPLY "{\"status\":404,\"headers\":{},\"body\":\"\"}")
+        nf (linked-run)
+        z4 (reset! REPLY "")
+        un (linked-run)
+        z5 (reset! REPLY "{\"error\":{\"type\":\"HTTP:CONNECTIVITY\",\"description\":\"down\"}}")
+        er (linked-run)
+        z6 (host/clear-http-bridge!)]
+    (is (str/starts-with? held "held orders/processors/0 "))
+    (is (= ok "ok  {\"got\": {\"name\": \"A\"},\"st\": 200,\"h\": \"cust\"}"))
+    (is (str/includes? req "\"method\":\"POST\",\"url\":\"http://customer-sys:8082/api/customers/42?v=1%202\",\"path\":\"/api/customers/42\""))
+    (is (str/includes? req "\"X-Tenant\":\"acme\""))
+    (is (str/includes? req "\"mediaType\":\"application/json"))
+    (is (str/includes? req "\"from\":{\"flowPath\":\"orders/processors/0\",\"docId\":\"call1\"}"))
+    (is (= nf "failed  HTTP POST on resource 'http://customer-sys:8082/api/customers/42?v=1%202' failed: not found (404)."))
+    (is (str/starts-with? un "held orders/processors/0 "))
+    (is (str/starts-with? er "failed "))))
+
+(deftest call-runs-the-matching-listener
+  (let [z (nr/load-dir APIKIT)
+        j (nr/call-json "{\"method\":\"GET\",\"path\":\"/api/orders/7\",\"headers\":{\"accept\":\"*/*\"}}")
+        p (nr/call-json "{\"method\":\"POST\",\"path\":\"/api/orders\",\"mediaType\":\"application/json\",\"body\":\"{\\\"item\\\":\\\"x\\\"}\"}")
+        n (nr/call-json "{\"method\":\"GET\",\"path\":\"/nothing\"}")]
+    (is (str/starts-with? j "{\"status\":200,\"headers\":{"))
+    (is (str/includes? j ",\"body\":\"7\",\"mediaType\":\"application/java; charset=UTF-8\",\"trace\":{\"exampleId\":\"call\""))
+    (is (str/includes? p "{\"status\":201,"))
+    (is (= n "{\"status\":404,\"headers\":{},\"body\":\"No listener for endpoint: /nothing\",\"mediaType\":\"text/plain\",\"trace\":null}"))))
+
+(deftest call-splits-the-query
+  (let [z (nr/load-dir "test/fixtures/livenote/customer-sys")
+        j (nr/call-json "{\"method\":\"POST\",\"path\":\"/api/customers/42?v=1%202&w=a+b\",\"mediaType\":\"application/json\",\"body\":\"{\\\"order\\\":\\\"7\\\"}\"}")]
+    (is (str/includes? j "\\\"id\\\": \\\"42\\\""))
+    (is (str/includes? j "\\\"v\\\": \\\"1 2\\\""))))
+
+(deftest binary-bodies-cross-the-bridge-as-base64
+  (let [z0 (nr/load-dir LINKED)
+        z1 (host/set-http-bridge! (fn Str [req: Str] (let [z (reset! SEEN req)] "{\"status\":200,\"bodyBase64\":\"AP9D\",\"mediaType\":\"application/octet-stream\"}")))
+        t (nr/run-example-val (nth (nr/examples LINKED) 1) "")
+        req (deref SEEN)
+        z2 (host/clear-http-bridge!)]
+    (is (str/includes? req "\"body\":\"\",\"bodyBase64\":\"/wBB\""))
+    (is (= (body-of t) "AP9D"))))
+
+(def DBAPP "test/fixtures/livenote/dbapp")
+
+(defn- db-run Str [id: Str]
+  (let [z (nr/load-dir DBAPP)
+        xs (nr/examples DBAPP)
+        x (loop [i 0] (if (= (nr/example-id (nth xs i)) id) (nth xs i) (recur (+ i 1))))
+        t (nr/run-example-val x "")
+        st (str/join "," (mapv (fn Str [s: nr/NStep] (:status s)) (:steps t)))]
+    (str st " | " (:stopped t) " | " (str/replace (str/replace (body-of t) "\n" "") "  " ""))))
+
+(deftest db-emulator-runs-when-there-is-no-recording
+  (is (= (db-run "get") "ok,emulated,ok |  | {\"item\": \"pen\",\"id\": 1,\"t\": \"LocalDateTime\"}"))
+  (is (= (db-run "add") "ok,emulated,emulated,ok,not-reached |  | 2"))
+  (is (= (db-run "add") "ok,emulated,emulated,ok,not-reached |  | 2"))
+  (is (str/includes? (db-run "dup") "ORA-00001: unique constraint (SHOP.SYS_C0000001) violated on table SHOP.ORDERS columns (ID)"))
+  (is (str/starts-with? (db-run "proc") "ok,held | proc/processors/0 |"))
+  (is (str/starts-with? (db-run "other") "ok,held | other/processors/0 |"))
+  (is (= (db-run "rec") "ok,replayed,ok |  | {\"item\": \"recorded\",\"id\": 1,\"t\": \"String\"}")))
+
+(deftest recording-and-emulator-shapes-are-compared
+  (let [z (nr/load-dir DBAPP)
+        xs (nr/examples DBAPP)
+        pick (fn nr/NTrace [id: Str] (nr/run-example-val (loop [i 0] (if (= (nr/example-id (nth xs i)) id) (nth xs i) (recur (+ i 1)))) ""))
+        ok (pick "rec")
+        bad (pick "drift")
+        j (nr/trace-json bad)]
+    (is (= (:warn (nth (:steps ok) 1)) ""))
+    (is (= (:warn (nth (:steps bad) 1)) "the emulator's result differs from the recording: columns only in the recording: id, EXTRA; columns only in the emulator: ID"))
+    (is (str/includes? j "\"status\":\"replayed\""))
+    (is (str/includes? j ",\"warnings\":[\"the emulator's result differs from the recording: columns only in the recording: id, EXTRA; columns only in the emulator: ID\"]"))))
+
+(deftest dw-p-reads-the-same-properties
+  (let [[xs e] (nr/props-json "{\"env\":\"dev\",\"db.user\":\"root\"}")
+        z (nr/load-dir-with PROPS xs)
+        t (nr/run-example-val (nth (nr/examples PROPS) 1) "")]
+    (is (= (body-of t) "hello dev:root:none"))))
+
+(def LOGAPP "test/fixtures/livenote/logs")
+
+(deftest logger-output-goes-into-the-trace
+  (let [z (nr/load-dir LOGAPP)
+        t (nr/run-example-val (nth (nr/examples LOGAPP) 0) "")
+        j (nr/trace-json t)
+        lg (fn Str [i: Int] (str/join "|" (mapv (fn Str [x: Vec(Str)] (str/join "," x)) (:logs (nth (:steps t) i)))))]
+    (is (= (lg 1) "INFO,org.mule.runtime.core.internal.processor.LoggerMessageProcessor,\"LOGMARK-C-12\",true"))
+    (is (= (lg 2) "INFO,orders,\"custom C-12\",false"))
+    (is (= (lg 3) "WARN,orders,warned,true"))
+    (is (= (lg 4) "DEBUG,orders,(not evaluated by Mule at this level),false"))
+    (is (str/includes? j "\"logs\":[{\"level\":\"INFO\",\"category\":\"org.mule.runtime.core.internal.processor.LoggerMessageProcessor\",\"message\":\"\\\"LOGMARK-C-12\\\"\",\"shown\":true}]"))
+    (is (= (:status (nth (:steps t) 4)) "ok"))))
+
+(deftest error-handler-steps-see-the-error
+  (let [t (run-api "bad")
+        ss (:steps t)
+        k (loop [i 0] (if (= (:path (nth ss i)) "orders-main/errorHandler/1/processors/0") i (recur (+ i 1))))
+        s (nth ss k)
+        txt (nr/value-text (:in-error s))
+        j (nr/trace-json t)]
+    (is (str/includes? txt "\"identifier\": \"BAD_REQUEST\""))
+    (is (str/includes? txt "\"namespace\": \"APIKIT\""))
+    (is (str/includes? txt "\"description\": \"required key [item] not found\""))
+    (is (= (:in-error (nth ss 1)) ""))
+    (is (str/includes? j "\"path\":\"orders-main/errorHandler/1/processors/0\""))
+    (is (str/includes? j ",\"error\":{\"id\":\"bad:"))))
+
+(deftest replay-compares-what-was-sent
+  (let [z (nr/load-dir DBAPP)
+        xs (nr/examples DBAPP)
+        pick (fn nr/NTrace [id: Str] (nr/run-example-val (loop [i 0] (if (= (nr/example-id (nth xs i)) id) (nth xs i) (recur (+ i 1)))) ""))
+        same (pick "sent-same")
+        diff (pick "sent-diff")
+        j (nr/trace-json diff)]
+    (is (= (:warn (nth (:steps same) 1)) ""))
+    (is (str/includes? (nr/value-text (:request (nth (:steps same) 1))) "\"input-parameters\": {"))
+    (is (= (:warn (nth (:steps diff) 1)) "the request differs from the recording: input-parameters was {\"id\": 1} but now {\"id\": 2}"))
+    (is (str/includes? j ",\"request\":{\"id\":\"sent-diff:"))))
+
+(deftest replay-compares-the-sql-text
+  (let [z (nr/load-dir DBAPP)
+        xs (nr/examples DBAPP)
+        t (nr/run-example-val (loop [i 0] (if (= (nr/example-id (nth xs i)) "sent-sql") (nth xs i) (recur (+ i 1)))) "")
+        st (nth (:steps t) 1)]
+    (is (str/includes? (nr/value-text (:request st)) "\"sql\": \"SELECT id, item, created FROM orders WHERE id = :id\""))
+    (is (= (:warn st) "the request differs from the recording: sql was \"SELECT id, item FROM orders WHERE id = :id\" but now \"SELECT id, item, created FROM orders WHERE id = :id\""))))
+
+(deftest replay-masked-recording-matches-anything
+  (let [z (nr/load-dir DBAPP)
+        xs (nr/examples DBAPP)
+        pick (fn nr/NTrace [id: Str] (nr/run-example-val (loop [i 0] (if (= (nr/example-id (nth xs i)) id) (nth xs i) (recur (+ i 1)))) ""))
+        ok (pick "sent-masked")
+        bad (pick "sent-masked-diff")]
+    (is (= (:warn (nth (:steps ok) 1)) ""))
+    (is (= (:warn (nth (:steps bad) 1)) "the request differs from the recording: sql was \"SELECT ****** FROM orders WHERE id = 2\" but now \"SELECT id, item, created FROM orders WHERE id = :id\""))))
+
+(deftest shown-follows-the-apps-log4j2
+  (let [z (nr/load-dir "test/fixtures/apps/core-log4j2")
+        t (nr/run-example "{\"id\":\"x\",\"flow\":\"levels\",\"request\":{\"method\":\"GET\",\"path\":\"/levels\"}}")
+        all (str/join "|" (loop [i 0 acc: Vec(Str) []]
+                             (if (>= i (count (:steps t))) acc
+                               (recur (+ i 1) (let [ls (:logs (nth (:steps t) i))] (if (= (count ls) 0) acc (conj acc (str (nth (nth ls 0) 1) "=" (nth (nth ls 0) 3)))))))))
+        z2 (nr/load-dir LOGAPP)]
+    (is (str/includes? all "orders=true"))
+    (is (str/includes? all "com.example.child=true"))
+    (is (str/includes? all "com.example.quiet=false"))
+    (is (str/includes? all "com.example.off=false"))))
+
+(deftest flows-without-a-source-run-without-a-response
+  (let [z (nr/load-dir MULTI)
+        t (nr/run-example "{\"id\":\"e2\",\"flow\":\"sub\",\"request\":{\"method\":\"GET\",\"path\":\"/\",\"body\":\"5\",\"mediaType\":\"application/json\"}}")
+        u (nr/run-example "{\"id\":\"e3\",\"flow\":\"other\",\"body\":\"x\"}")]
+    (is (= (:has-resp t) false))
+    (is (= (steps-line t) "sub/processors/0 ok"))
+    (is (= (nr/value-text (:out-payload (nth (:steps t) 0))) "5"))
+    (is (= (steps-line u) "other/processors/0 ok"))
+    (is (uni/valid? (nr/trace-json t)))))
+
+(deftest call-returns-the-response-headers
+  (let [z (nr/load-dir "test/fixtures/livenote/customer-sys")
+        j (nr/call-json "{\"method\":\"POST\",\"path\":\"/api/customers/1\",\"mediaType\":\"application/json\",\"body\":\"{\\\"order\\\":\\\"7\\\"}\"}")]
+    (is (str/includes? j "\"headers\":{\"x-from\":\"customer-sys\""))))
+
+(deftest example-requests-go-through-the-listener
+  (let [z (nr/load-dir DIR)
+        t405 (nr/run-example "{\"id\":\"m\",\"flow\":\"post-orders\",\"request\":{\"method\":\"GET\",\"path\":\"/orders\"}}")
+        t404 (nr/run-example "{\"id\":\"n\",\"flow\":\"post-orders\",\"request\":{\"method\":\"POST\",\"path\":\"/n%6fpe\",\"body\":\"{}\",\"mediaType\":\"application/json\"}}")]
+    (is (:has-resp t405))
+    (is (= (:status t405) 405))
+    (is (= (body-of t405) "Method not allowed for endpoint: /orders"))
+    (is (= (count (filterv (fn Bool [s: nr/NStep] (not= (:status s) "not-reached")) (:steps t405))) 0))
+    (is (> (count (:steps t405)) 0))
+    (is (= (:status t404) 404))
+    (is (= (body-of t404) "No listener for endpoint: /n%6fpe"))
+    (is (str/includes? (nr/trace-json t404) "\"response\":{\"status\":404"))))
+
+(deftest try-steps-name-the-handler-that-ran
+  (let [z (nr/load-dir "test/fixtures/livenote/tryapp")
+        t (nr/run-example "{\"id\":\"t\",\"flow\":\"f\",\"request\":{\"method\":\"GET\",\"path\":\"/t\"}}")
+        pick (fn nr/NStep [p: Str] (let [ss (:steps t)] (loop [i 0] (if (= (:path (nth ss i)) p) (nth ss i) (recur (+ i 1))))))
+        j (nr/trace-json t)]
+    (is (= (:handler (pick "f/processors/0")) "f/processors/0/errorHandler/1"))
+    (is (= (:handler (pick "f/processors/1")) ""))
+    (is (= (:handler t) "f/errorHandler/0"))
+    (is (str/includes? j "{\"path\":\"f/processors/0\""))
+    (is (str/includes? j ",\"handler\":\"f/processors/0/errorHandler/1\""))))

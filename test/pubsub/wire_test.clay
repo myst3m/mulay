@@ -1,0 +1,70 @@
+(ns wire-test (:require [mulay.conn.sf_pubsub_wire :as w] [clay.string :as str]))
+
+(defn- hexval Int [c: Int] (if (<= c 57) (- c 48) (- c 87)))
+
+(defn- unhex Str [h: Str]
+  (loop [i 0 out ""]
+    (if (>= (+ i 1) (count h)) out
+      (recur (+ i 2) (str out (chr (+ (* 16 (hexval (nth h i))) (hexval (nth h (+ i 1))))))))))
+
+(deftest fetch-requests
+  (let [a (w/fetch-request "/event/MulayEvent__e" w/LATEST [] 100)
+        b (w/fetch-request "/event/X__e" w/EARLIEST [] 1)
+        c (w/fetch-request "/data/AccountChangeEvent" w/CUSTOM [2785443] 100)]
+    (is (= a (unhex "0a142f6576656e742f4d756c61794576656e745f5f652064")))
+    (is (= b (unhex "0a0b2f6576656e742f585f5f6510012001")))
+    (is (= c (unhex "0a182f646174612f4163636f756e744368616e67654576656e7410021a0800000000002a80a32064")))))
+
+(deftest small-requests
+  (let [t (w/topic-request "/event/MulayEvent__e")
+        s (w/schema-request "abcDEF123")
+        p (w/publish-request "/event/MulayEvent__e" "sid1" [(str (chr 1) (chr 2) (chr 0) (chr 255)) ""])]
+    (is (= t (unhex "0a142f6576656e742f4d756c61794576656e745f5f65")))
+    (is (= s (unhex "0a09616263444546313233")))
+    (is (= p (unhex "0a142f6576656e742f4d756c61794576656e745f5f65120c1204736964311a04010200ff1206120473696431")))))
+
+(deftest topic-and-schema-info
+  (let [[ti te] (w/topic-info (unhex "0a0b2f6576656e742f545f5f6512053030447878180120012a0253313203722d31"))
+        [si se] (w/schema-info (unhex "0a117b2274797065223a227265636f7264227d120253311a03722d32"))]
+    (is (= te ""))
+    (is (= (:schema-id ti) "S1"))
+    (is (:can-publish ti))
+    (is (:can-subscribe ti))
+    (is (= se ""))
+    (is (= (:json si) "{\"type\":\"record\"}"))
+    (is (= (:id si) "S1"))))
+
+(deftest publish-response
+  (let [[rs e] (w/publish-results (unhex "0a100a0800000000000000631a04636b2d310a10120808011204626f6f6d1a04636b2d32120253311a03722d33"))]
+    (is (= e ""))
+    (is (= (count rs) 2))
+    (is (not (:has-error (nth rs 0))))
+    (is (= (:replay-id (nth rs 0)) [99]))
+    (is (= (:corr (nth rs 0)) "ck-1"))
+    (is (:has-error (nth rs 1)))
+    (is (= (:err-code (nth rs 1)) "PUBLISH"))
+    (is (= (:err-msg (nth rs 1)) "boom"))
+    (is (= (:replay-id (nth rs 1)) []))
+    (is (= (:corr (nth rs 1)) "ck-2"))))
+
+(deftest fetch-responses
+  (let [[r e] (w/fetch-response (unhex "0a1a0a0e0a0465762d31120253311a02090812080000011f71fb04cb12080000011f71fb04cc1a03722d342063"))
+        [k ke] (w/fetch-response (unhex "120800000000000000051a03722d352064"))
+        ev (nth (:events r) 0)]
+    (is (= e ""))
+    (is (= (count (:events r)) 1))
+    (is (= (:id ev) "ev-1"))
+    (is (= (:schema-id ev) "S1"))
+    (is (= (:payload ev) (str (chr 9) (chr 8))))
+    (is (= (:replay-id ev) [1234567890123]))
+    (is (= (:pending r) 99))
+    (is (= ke ""))
+    (is (= (count (:events k)) 0))
+    (is (= (:pending k) 100))))
+
+(deftest replay-id-bytes
+  (let [b (w/replay-bytes -1)]
+    (is (= (count b) 8))
+    (is (= (w/replay-of b) [-1]))
+    (is (= (w/replay-of "") []))
+    (is (= (w/replay-of (str (chr 1) (chr 2))) []))))

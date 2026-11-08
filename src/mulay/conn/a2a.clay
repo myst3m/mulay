@@ -1,0 +1,1165 @@
+(ns mulay.conn.a2a
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.rt.ops :as ops] [mulay.rt.trace :as tr] [mulay.lib.otlp :as o] [mulay.lib.xml :as xml] [mulay.lib.jhash :as jh]
+            [mulay.conn.a2a_spec :as spec] [mulay.conn.http :as h] [mulay.conn.httpmsg :as hx] [mulay.conn.tls :as tls] [mulay.rt.ostore :as ost] [mulay.dw.lib.core_misc :as misc] [mulay.dw.fmt.registry :as reg]
+            [mulay.lib.netaddr :as na] [mulay.rt.log :as log] [clay.http :as http] [clay.httpmsg :as hm] [clay.tls :as ctls] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/a2a")
+
+(defn error-codes Values(Int Int) [t: &Str]
+  (cond (= t "PARSE_ERROR") (values -32700 500) (= t "INVALID_REQUEST") (values -32600 400)
+        (= t "METHOD_NOT_FOUND") (values -32601 404) (= t "INVALID_PARAMS") (values -32602 500)
+        (= t "INTERNAL_ERROR") (values -32603 500) (= t "SERVER_ERROR") (values -32000 500)
+        (= t "TASK_NOT_FOUND") (values -32001 404) (= t "TASK_NOT_CANCELABLE") (values -32002 409)
+        (= t "PUSH_NOTIFICATION_UNSUPPORTED") (values -32003 400) (= t "UNSUPPORTED_OPERATION") (values -32004 400)
+        (= t "UNAUTHORIZED") (values -32005 403)
+        :else (values -32603 500)))
+
+(defn type-of-code Str [code: Int]
+  (cond (= code -32700) "PARSE_ERROR" (= code -32600) "INVALID_REQUEST" (= code -32601) "METHOD_NOT_FOUND"
+        (= code -32602) "INVALID_PARAMS" (= code -32000) "SERVER_ERROR" (= code -32001) "TASK_NOT_FOUND"
+        (= code -32002) "TASK_NOT_CANCELABLE" (= code -32003) "PUSH_NOTIFICATION_UNSUPPORTED"
+        (= code -32004) "UNSUPPORTED_OPERATION" (= code -32005) "UNAUTHORIZED"
+        :else "INTERNAL_ERROR"))
+
+(defn- id-out Str [id: &Str] (if (= id "") "" (str ",\"id\":" id)))
+
+(defn- error-body Str [id: &Str code: Int msg: &Str]
+  (str "{\"jsonrpc\":\"2.0\"" (id-out id) ",\"error\":{\"code\":" code ",\"message\":" (spec/json-str msg) "}}"))
+
+(defrecord Server [name: Str listener: Str path: Str card: Str card-err: Str streaming: Bool push: Bool history: Bool store: Str])
+
+(defrecord Answer [status: Int body: Str headers: Vec(hm/Header)])
+
+(defrecord FlowOut [ok: Bool body: Str headers: Vec(hm/Header) etype: Str emsg: Str])
+
+(defn- elem-child Vec(xml/XNode) [n: &xml/XNode local: &Str]
+  (let [cs (xml/child-elems n)] (loop [i 0] (if (>= i (count cs)) [] (if (= (xml/elem-local (nth cs i)) local) [(nth cs i)] (recur (+ i 1)))))))
+
+(defn- cfg-child Vec(xml/XNode) [c: &m/Config local: &Str] (conn/child-elem (:children c) local))
+
+(defn server-of Server [c: &m/Config res: &Fn(Str Values(Str Bool))]
+  (let [cn (cfg-child c "connection")
+        listener (if (= (count cn) 0) "" (xml/attr (nth cn 0) "" "listenerConfig" ""))
+        path (if (= (count cn) 0) "/" (xml/attr (nth cn 0) "" "agentPath" "/"))
+        ac (cfg-child c "agent-card")
+        js (if (= (count ac) 0) [] (elem-child (nth ac 0) "json"))
+        file (if (= (count ac) 0) "" (xml/attr (nth ac 0) "" "file" ""))
+        [text te] (cond (> (count js) 0) (values (xml/text-content (nth js 0)) "")
+                        (not= file "") (let [[t e] (read-file file)] (if (= e "") (values t "") (values "" (str "Agent card file '" file "' could not be read: " e))))
+                        :else (values "" "Agent card is required"))
+        [card ce] (if (not= te "") (values "" te) (spec/canon "AgentCard" text (now-str)))
+        hist (let [h (cfg-child c "history")] (if (= (count h) 0) true (not= (str/lower-case (xml/attr (nth h 0) "" "taskHistoryEnabled" "true")) "false")))
+        store (let [h (cfg-child c "history")] (if (= (count h) 0) "" (xml/attr (nth h 0) "" "taskRepositoryObjectStore" "")))]
+    (->Server (:name c) listener path card ce (card-flag card "streaming") (card-flag card "pushNotifications") hist store)))
+
+(defn- card-flag Bool [card: &Str k: &Str]
+  (str/includes? card (str "\"" k "\":true")))
+
+(defn servers Vec(Server) [app: &m/App]
+  (let [cs (:configs app) r (:res app)
+        z (reset! APPNAME (str (:name app)))
+        ss (loop [i 0 acc: Vec(Server) []]
+             (if (>= i (count cs)) acc
+               (recur (+ i 1) (if (= (:kind (nth cs i)) "a2a:server-config") (conj acc (server-of (nth cs i) r)) acc))))
+        z2 (reset! STORES (loop [i 0 m: Map(Str Str) {}] (if (>= i (count ss)) m (recur (+ i 1) (assoc m (:name (nth ss i)) (:store (nth ss i)))))))
+        z3 (reset! PUSH-TIMEOUTS (push-timeouts (:flows app)))
+        z4 (reset! PUSH-PRIVATE (= (str/lower-case (str/trim (conn/prop-lit app "mulay.a2a.allowPrivatePushUrls" "false"))) "true"))]
+    ss))
+
+(defn- unit-ms Int [u: &Str]
+  (let [x (str/upper-case (str/trim u))]
+    (cond (= x "MILLISECONDS") 1 (= x "SECONDS") 1000 (= x "MINUTES") 60000 (= x "HOURS") 3600000 (= x "DAYS") 86400000 :else 1000)))
+
+(defn- push-timeouts Map(Str Int) [fs: &Vec(m/Flow)]
+  (loop [i 0 acc: Map(Str Int) {}]
+    (if (>= i (count fs)) acc
+      (let [srcs (:source (nth fs i))]
+        (recur (+ i 1)
+               (if (= (count srcs) 0) acc
+                 (match (nth srcs 0)
+                   (m/SrcConnector cn nm cref ps ch ex sch loc)
+                   (if (and (= cn "a2a") (= nm "push-notification-config-listener"))
+                     (let [oa (conn/child-elem ch "on-config-accepted")
+                           t (if (= (count oa) 0) "60" (xml/attr (nth oa 0) "" "requestTimeout" "60"))
+                           u (if (= (count oa) 0) "SECONDS" (xml/attr (nth oa 0) "" "requestTimeoutUnit" "SECONDS"))
+                           [n e] (parse-long (str/trim t))]
+                       (assoc acc cref (* (if (= e "") n 60) (unit-ms u))))
+                     acc)
+                   _ acc)))))))
+
+(defn now-str Str [] (spec/now-utc))
+
+(defrecord Push [id: Str url: Str token: Str timeout: Int])
+
+(defrecord Item [ctx: Str state: Str task: Str history: Vec(Str) push: Vec(Push) stream: Str])
+
+(defn- no-push Vec(Push) [] (let [z: Vec(Push) []] z))
+(def TASKS: Atom(Map(Str Item)) (atom (let [m: Map(Str Item) {}] m)))
+
+(defn- final-state? Bool [s: &Str] (or (= s "completed") (= s "canceled") (= s "failed") (= s "rejected") (= s "unknown")))
+
+(def TASKS-MAX 10000)
+(def TASK-TTL-MS 86400000)
+(def TASK-AT: Atom(Map(Str Int)) (atom (let [m: Map(Str Int) {}] m)))
+
+(defn- oldest-first Vec(Str) [ks: Vec(Str) at: &Map(Str Int)]
+  (let [m at] (sort-by (fn Int [k: &Str] (get m k 0)) ks)))
+
+(defn evict-keys Vec(Str) [items: &Map(Str Item) at: &Map(Str Int) now: Int ttl: Int cap: Int]
+  (let [ks (oldest-first (keys items) at)
+        old (loop [i 0 acc: Vec(Str) []] (if (>= i (count ks)) acc (recur (+ i 1) (if (< (get at (nth ks i) 0) (- now ttl)) (conj acc (nth ks i)) acc))))
+        over (- (- (count ks) (count old)) cap)]
+    (if (<= over 0) old
+      (let [live (loop [i 0 acc: Vec(Str) []] (if (>= i (count ks)) acc (recur (+ i 1) (if (< (get at (nth ks i) 0) (- now ttl)) acc (conj acc (nth ks i))))))
+            done (loop [i 0 acc: Vec(Str) []] (if (>= i (count live)) acc (recur (+ i 1) (if (final-state? (:state (get! items (nth live i)))) (conj acc (nth live i)) acc))))
+            busy (loop [i 0 acc: Vec(Str) []] (if (>= i (count live)) acc (recur (+ i 1) (if (final-state? (:state (get! items (nth live i)))) acc (conj acc (nth live i))))))]
+        (loop [i 0 acc old]
+          (cond (>= (- (count acc) (count old)) over) acc
+                (< i (count done)) (recur (+ i 1) (conj acc (nth done i)))
+                :else (recur (+ i 1) (conj acc (nth busy (- i (count done)))))))))))
+
+(defn- sweep-tasks Int []
+  (let [full (> (count (deref TASKS)) TASKS-MAX)
+        ks (evict-keys (deref TASKS) (deref TASK-AT) (epoch-ms) TASK-TTL-MS (if full (quot (* TASKS-MAX 9) 10) TASKS-MAX))]
+    (if (= (count ks) 0) 0
+      (let [z1 (swap! TASKS (fn Map(Str Item) [o: Map(Str Item)] (loop [i 0 m o] (if (>= i (count ks)) m (recur (+ i 1) (dissoc m (nth ks i)))))))
+            z2 (swap! TASK-AT (fn Map(Str Int) [o: Map(Str Int)] (loop [i 0 m o] (if (>= i (count ks)) m (recur (+ i 1) (dissoc m (nth ks i)))))))]
+        0))))
+
+(def EVLOG-MAX 1000)
+(def EVLOG: Atom(Map(Str Vec(Str))) (atom (let [m: Map(Str Vec(Str)) {}] m)))
+(def EVIDS: Atom(Map(Str Vec(Str))) (atom (let [m: Map(Str Vec(Str)) {}] m)))
+(def EVORDER: Atom(Vec(Str)) (atom (let [v: Vec(Str) []] v)))
+(def LOCK: Atom(Int) (atom 0))
+(def LOCK-TOKEN: Atom(Int) (atom 0))
+
+(defn- lock! Int []
+  (let [t (swap! LOCK-TOKEN (fn Int [o: Int] (+ o 1)))]
+    (loop []
+      (let [r (swap! LOCK (fn Int [o: Int] (if (= o 0) t o)))]
+        (if (= r t) 0 (let [z (sleep-ms 1)] (recur)))))))
+
+(defn- unlock! Int [] (let [z (reset! LOCK 0)] 0))
+
+(defn- open-log Int [key: &Str]
+  (let [m (deref EVLOG)]
+    (if (contains? m key) 0
+      (let [z1 (swap! EVLOG (fn Map(Str Vec(Str)) [o: Map(Str Vec(Str))] (assoc o key (let [e: Vec(Str) []] e))))
+            ord (swap! EVORDER (fn Vec(Str) [o: Vec(Str)] (conj o (str key))))]
+        (if (<= (count ord) EVLOG-MAX) 0
+          (let [oldest (nth ord 0)
+                z2 (swap! EVLOG (fn Map(Str Vec(Str)) [o: Map(Str Vec(Str))] (dissoc o oldest)))
+                z3 (swap! EVIDS (fn Map(Str Vec(Str)) [o: Map(Str Vec(Str))] (dissoc o oldest)))
+                z4 (swap! EVORDER (fn Vec(Str) [o: Vec(Str)] (loop [i 1 acc: Vec(Str) []] (if (>= i (count o)) acc (recur (+ i 1) (conj acc (nth o i)))))))]
+            0))))))
+
+(defn- log-event Int [key: &Str text: &Str]
+  (let [id (misc/uuid4)
+        z (swap! EVLOG (fn Map(Str Vec(Str)) [o: Map(Str Vec(Str))]
+                         (if (contains? o key) (assoc o key (conj (get! o key) (str text))) o)))
+        z2 (swap! EVIDS (fn Map(Str Vec(Str)) [o: Map(Str Vec(Str))]
+                          (if (contains? o key) (assoc o key (conj (get! o key) (str id))) (assoc o key [(str id)]))))]
+    0))
+
+(def STORES: Atom(Map(Str Str)) (atom (let [m: Map(Str Str) {}] m)))
+(def APPNAME: Atom(Str) (atom ""))
+(def PUSH-TIMEOUTS: Atom(Map(Str Int)) (atom (let [m: Map(Str Int) {}] m)))
+
+(defn- push-timeout Int [srv: &Server] (let [m (deref PUSH-TIMEOUTS)] (if (contains? m (:name srv)) (get! m (:name srv)) 60000)))
+
+(def TASK-CLASS "com.mulesoft.connectors.a2a.internal.server.agent.repository.TaskRepositoryItem")
+(def CONTEXT-CLASS "com.mulesoft.connectors.a2a.internal.server.agent.repository.ContextRepositoryItem")
+
+(defn- split-key Values(Str Str) [key: &Str]
+  (let [i (str/index-of key "/")] (if (< i 0) (values "" (str key)) (values (subs key 0 i) (subs key (+ i 1) (count key))))))
+
+(defn- store-of Str [key: &Str]
+  (let [[srv tid] (split-key key) m (deref STORES)] (if (contains? m srv) (get! m srv) "")))
+
+(defn- hostname Str [] (let [[t e] (read-file "/proc/sys/kernel/hostname")] (if (= e "") (str/trim t) "localhost")))
+
+(defn- java-obj v/Val [cls: &Str fs: Vec(v/Field)] (v/->VMeta (v/->VObj fs) [(v/field "class" (v/->VStr (str cls)))]))
+
+(defn- str-or-nullv v/Val [s: &Str] (if (= s "") (v/null-v) (v/->VStr (str s))))
+
+(defn- event-parts Values(Str Str) [text: &Str]
+  (let [a (str/index-of text "\ndata: ")
+        kind (if (str/starts-with? text "event: ") (subs text 7 (if (< a 0) (count text) a)) "")
+        end (str/index-of text "\n\n")
+        data (if (< a 0) "" (subs text (+ a 7) (if (< end 0) (count text) end)))]
+    (values kind data)))
+
+(defn- buffered-events v/Val [key: &Str]
+  (let [lg (deref EVLOG) ids (deref EVIDS)
+        evs (if (contains? lg key) (get! lg key) (let [e: Vec(Str) []] e))
+        eids (if (contains? ids key) (get! ids key) (let [e: Vec(Str) []] e))]
+    (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                (if (>= i (count evs)) acc
+                  (let [[k d] (event-parts (nth evs i))]
+                    (recur (+ i 1) (conj acc (v/->VObj [(v/field "eventId" (v/->VStr (if (< i (count eids)) (nth eids i) "")))
+                                                         (v/field "eventType" (v/->VStr k)) (v/field "eventData" (v/->VStr d))])))))))))
+
+(defn- push-val v/Val [p: &Push]
+  (v/->VObj [(v/field "proxyConfig" (v/null-v)) (v/field "timeout" (v/->VInt (:timeout p))) (v/field "url" (v/->VStr (str (:url p))))
+             (v/field "token" (str-or-nullv (:token p))) (v/field "additionalHeaders" (v/->VObj []))
+             (v/field "id" (v/->VStr (str (:id p)))) (v/field "authentication" (v/null-v))]))
+
+(defn- item-val v/Val [key: &Str it: &Item]
+  (let [streaming (not= (:stream it) "")
+        sc (if (not streaming) (v/null-v)
+             (v/->VObj [(v/field "bufferedEvents" (buffered-events key))
+                        (v/field "workerInstanceId" (v/->VStr (str (hostname) ".." (deref APPNAME))))
+                        (v/field "requestId" (v/->VStr (unquote (:stream it))))]))
+        hist (str "[" (str/join "," (:history it)) "]")
+        pushes (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count (:push it))) acc (recur (+ i 1) (conj acc (push-val (nth (:push it) i)))))))]
+    (java-obj TASK-CLASS [(v/field "historyLength" (v/->VInt (count (:history it)))) (v/field "streamingContext" sc)
+                          (v/field "contextId" (v/->VStr (str (:ctx it)))) (v/field "history" (v/->VStr hist))
+                          (v/field "taskState" (v/->VStr (str (:state it)))) (v/field "task" (v/->VStr (str (:task it))))
+                          (v/field "pushNotificationConfigs" pushes)])))
+
+(defn- fstr Str [fs: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get fs k)] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) (str s) _ ""))))
+
+(defn- fint Int [fs: &Vec(v/Field) k: &Str default: Int]
+  (let [r (v/obj-get fs k)] (if (= (count r) 0) default (match (v/unmeta (nth r 0)) (v/VInt n) n _ default))))
+
+(defn- fields-of Vec(v/Field) [x: &v/Val] (match (v/unmeta x) (v/VObj fs) fs _ (let [e: Vec(v/Field) []] e)))
+
+(defn- decode-item Item [x: &v/Val]
+  (let [fs (fields-of x)
+        sc (v/obj-get fs "streamingContext")
+        sfs (if (= (count sc) 0) (let [e: Vec(v/Field) []] e) (fields-of (nth sc 0)))
+        rid (fstr sfs "requestId")
+        pr (v/obj-get fs "pushNotificationConfigs")
+        pushes (if (= (count pr) 0) (no-push)
+                 (match (v/unmeta (nth pr 0))
+                   (v/VArr xs) (loop [i 0 acc (no-push)]
+                                 (if (>= i (count xs)) acc
+                                   (let [pf (fields-of (nth xs i))]
+                                     (recur (+ i 1) (conj acc (->Push (fstr pf "id") (fstr pf "url") (fstr pf "token") (fint pf "timeout" 60000)))))))
+                   _ (no-push)))]
+    (->Item (fstr fs "contextId") (fstr fs "taskState") (fstr fs "task") (spec/array-items (fstr fs "history")) pushes
+            (if (= (count sc) 0) "" (if (v/null? (nth sc 0)) "" (spec/json-str rid))))))
+
+(defn- hydrate-log Int [key: &Str x: &v/Val]
+  (let [fs (fields-of x)
+        sc (v/obj-get fs "streamingContext")]
+    (if (or (= (count sc) 0) (contains? (deref EVLOG) key)) 0
+      (let [be (v/obj-get (fields-of (nth sc 0)) "bufferedEvents")]
+        (match (if (= (count be) 0) (v/null-v) (v/unmeta (nth be 0)))
+          (v/VArr xs)
+          (let [texts (loop [i 0 acc: Vec(Str) []]
+                        (if (>= i (count xs)) acc
+                          (let [e (fields-of (nth xs i))]
+                            (recur (+ i 1) (conj acc (str "event: " (fstr e "eventType") "\ndata: " (fstr e "eventData") "\n\n"))))))
+                ids (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (fstr (fields-of (nth xs i)) "eventId")))))
+                z (swap! EVLOG (fn Map(Str Vec(Str)) [o: Map(Str Vec(Str))] (assoc o key texts)))
+                z2 (swap! EVIDS (fn Map(Str Vec(Str)) [o: Map(Str Vec(Str))] (assoc o key ids)))]
+            0)
+          _ 0)))))
+
+(defn- get-item Vec(Item) [key: &Str]
+  (let [store (store-of key)]
+    (if (= store "")
+      (let [m (deref TASKS)] (if (contains? m key) [(get! m key)] []))
+      (let [[srv tid] (split-key key)
+            r (ost/get-val store (str "task-" tid))]
+        (if (= (count r) 0) []
+          (let [z (hydrate-log key (nth r 0))] [(decode-item (nth r 0))]))))))
+
+(defn- put-item Int [key: &Str it: Item]
+  (let [store (store-of key)]
+    (if (= store "")
+      (let [fresh (not (contains? (deref TASKS) key))
+            z (swap! TASKS (fn Map(Str Item) [o: Map(Str Item)] (assoc o key it)))
+            now (epoch-ms)
+            z1 (swap! TASK-AT (fn Map(Str Int) [o: Map(Str Int)] (assoc o key now)))]
+        (if (and fresh (or (> (count (deref TASKS)) TASKS-MAX) (= (mod (count (deref TASKS)) 256) 0))) (sweep-tasks) 0))
+      (let [[srv tid] (split-key key)
+            z (ost/put-val store (str "task-" tid) (item-val key it))
+            ck (str "context-" (:ctx it))]
+        (if (> (count (ost/get-val store ck)) 0) 0
+          (ost/put-val store ck (java-obj CONTEXT-CLASS [(v/field "contextId" (v/->VStr (str (:ctx it))))])))))))
+
+(defn- sync-item Int [key: &Str]
+  (if (= (store-of key) "") 0
+    (let [its (get-item key)] (if (= (count its) 0) 0 (put-item key (nth its 0))))))
+
+(defn request-attributes v/Val [task-id: &Str ctx-id: &Str method: &Str headers: &Vec(hm/Header) query: v/Val scheme: &Str
+                                local: &Str remote: &Str rpc-method: &Str]
+  (let [hv (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                       (if (>= i (count headers)) acc
+                         (let [h (nth headers i)] (recur (+ i 1) (conj acc (v/field (str/lower-case (:hd-name h)) (v/->VStr (str (:hd-value h))))))))))
+        fs [(v/field "headers" hv) (v/field "clientCertificate" (v/null-v)) (v/field "method" (v/->VStr (str method)))
+            (v/field "scheme" (v/->VStr (str scheme))) (v/field "queryParams" query) (v/field "contextId" (str-or-null ctx-id))
+            (v/field "version" (v/->VStr "HTTP/1.1")) (v/field "jsonRpcMethod" (v/->VStr (str rpc-method)))
+            (v/field "localAddress" (v/->VStr (str local))) (v/field "taskId" (str-or-null task-id)) (v/field "remoteAddress" (v/->VStr (str remote)))]]
+    (v/->VMeta (v/->VObj fs)
+               [(v/field "class" (v/->VStr "com.mulesoft.connectors.a2a.api.listener.RequestAttributes"))])))
+
+(defn- str-or-null v/Val [s: &Str] (if (= s "") (v/null-v) (v/->VStr (str s))))
+
+(defn- node-get Vec(spec/JN) [ks: &Vec(Str) vs: &Vec(spec/JN) k: &Str]
+  (loop [i (- (count ks) 1)] (if (< i 0) [] (if (= (nth ks i) k) [(nth vs i)] (recur (- i 1))))))
+
+(defrecord Rpc [id: Str method: Str params: Vec(spec/JN) jsonrpc: Vec(spec/JN) ok: Bool])
+
+(defn- read-rpc Rpc [body: &Str]
+  (let [[n e] (spec/parse body)]
+    (if (not= e "") (->Rpc "" "" [] [] false)
+      (match n
+        (spec/JObj ks vs l c el ec)
+        (let [idn (node-get ks vs "id") mn (node-get ks vs "method")
+              id (if (= (count idn) 0) "" (match (nth idn 0) (spec/JStr s l2 c2) (spec/json-str s) (spec/JNum r l2 c2) (str r) _ ""))
+              meth (if (= (count mn) 0) "" (match (nth mn 0) (spec/JStr s l2 c2) (str s) (spec/JNum r l2 c2) (str r) (spec/JNull l2 c2) "null" _ ""))]
+          (->Rpc id meth (node-get ks vs "params") (node-get ks vs "jsonrpc") (> (count mn) 0)))
+        _ (->Rpc "" "" [] [] false)))))
+
+(def METHODS ["message/send" "message/stream" "tasks/get" "tasks/cancel" "tasks/resubscribe" "tasks/pushNotificationConfig/set"
+              "tasks/pushNotificationConfig/get" "tasks/pushNotificationConfig/list" "tasks/pushNotificationConfig/delete"])
+(def AUTH-METHODS ["tasks/get" "tasks/cancel" "tasks/resubscribe" "tasks/pushNotificationConfig/get"
+                   "tasks/pushNotificationConfig/list" "tasks/pushNotificationConfig/delete"])
+
+(defn- has-str? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn- request-type Str [m: &Str]
+  (cond (= m "message/send") "SendMessageRequest" (= m "message/stream") "SendStreamingMessageRequest"
+        (= m "tasks/get") "GetTaskRequest" (= m "tasks/cancel") "CancelTaskRequest" (= m "tasks/resubscribe") "TaskResubscriptionRequest"
+        (= m "tasks/pushNotificationConfig/set") "SetTaskPushNotificationConfigRequest"
+        (= m "tasks/pushNotificationConfig/get") "GetTaskPushNotificationConfigRequest"
+        (= m "tasks/pushNotificationConfig/list") "ListTaskPushNotificationConfigRequest"
+        :else "DeleteTaskPushNotificationConfigRequest"))
+
+(defn- params-type Str [m: &Str]
+  (cond (or (= m "message/send") (= m "message/stream")) "MessageSendParams" (= m "tasks/get") "TaskQueryParams"
+        (= m "tasks/pushNotificationConfig/set") "TaskPushNotificationConfig"
+        (= m "tasks/pushNotificationConfig/get") "GetTaskPushNotificationConfigParams"
+        (= m "tasks/pushNotificationConfig/list") "ListTaskPushNotificationConfigParams"
+        (= m "tasks/pushNotificationConfig/delete") "DeleteTaskPushNotificationConfigParams"
+        :else "TaskIdParams"))
+
+(defn- fail-answer Answer [status: Int t: &Str msg: &Str id: &Str]
+  (let [[code s] (error-codes t)] (->Answer status (error-body id code msg) [])))
+
+(defn- invalid-request Answer [m: &Str cause: &Str id: &Str]
+  (fail-answer 400 "INVALID_REQUEST" (str "Error unmarshalling string json payload into type io.a2a.spec." (request-type m) ". Cause: " cause) id))
+
+(def UNKNOWN-LOC "\n at [Source: UNKNOWN; byte offset: #UNKNOWN]")
+
+(defrecord Step [kind: Str answer: Answer payload: Str tid: Str cid: Str rpc: Str id: Str key: Str])
+
+(defn- no-headers Vec(hm/Header) [] (let [h: Vec(hm/Header) []] h))
+(defn- done Step [a: Answer] (->Step "done" a "" "" "" "" "" ""))
+
+(defn- task-key Str [srv: &Server tid: &Str] (str (:name srv) "/" tid))
+
+(defn begin-rpc Step [srv: &Server body: &Str has-auth: Bool]
+  (let [r (read-rpc body)
+        id (:id r) meth (:method r)]
+    (cond
+      (not (:ok r)) (done (fail-answer 400 "PARSE_ERROR" "Invalid JSON payload" ""))
+      (not (has-str? METHODS meth)) (done (fail-answer 400 "METHOD_NOT_FOUND" (str "Method not found or unsupported - " meth) id))
+      (or (= (count (:jsonrpc r)) 0) (not (match (nth (:jsonrpc r) 0) (spec/JStr s l c) (= s "2.0") _ false)))
+      (done (invalid-request meth (str "Invalid JSON-RPC protocol version" UNKNOWN-LOC) id))
+      (= (count (:params r)) 0) (done (invalid-request meth (str "Parameter 'params' may not be null" (if (= meth "tasks/resubscribe") "" UNKNOWN-LOC)) id))
+      :else
+      (let [[params pe] (spec/canon-node (params-type meth) (nth (:params r) 0) (now-str))]
+        (cond
+          (not= pe "") (done (invalid-request meth (str "Invalid params" UNKNOWN-LOC) id))
+          (has-str? AUTH-METHODS meth)
+          (cond
+            (not has-auth) (done (fail-answer 403 "UNAUTHORIZED" (str "Authorization listener required for " meth) id))
+            :else
+            (let [tid (unquote (spec/key-json params "id"))]
+              (->Step "auth" (->Answer 0 "" (no-headers)) params tid "" meth id (task-key srv tid))))
+          (= meth "message/send") (begin-send srv params id)
+          (= meth "tasks/pushNotificationConfig/set") (begin-set-push srv params id)
+          (= meth "message/stream") (begin-stream srv params id)
+          :else (done (fail-answer 400 "UNSUPPORTED_OPERATION" (str "Not supported by mulay: " meth) id)))))))
+
+(defn- unquote Str [j: &Str]
+  (let [[n e] (spec/parse j)] (match n (spec/JStr s l c) (str s) _ "")))
+
+(defn- msg-ids Values(Str Str Bool) [params: &Str]
+  (let [m (spec/key-json params "message")
+        cfg (spec/key-json params "configuration")]
+    (values (unquote (spec/key-json m "taskId")) (unquote (spec/key-json m "contextId"))
+            (and (not= cfg "") (not= (spec/key-json cfg "pushNotificationConfig") "")))))
+
+(defn- str-field Str [ks: &Vec(Str) vs: &Vec(spec/JN) k: &Str]
+  (loop [i 0] (if (>= i (count ks)) "" (if (= (nth ks i) k) (match (nth vs i) (spec/JStr s l c) (str s) _ "") (recur (+ i 1))))))
+
+(defn- begin-send Step [srv: &Server params: &Str id: &Str]
+  (let [[tid0 cid0 push] (msg-ids params)
+        tid (if (= tid0 "") (misc/uuid4) tid0)
+        cid (if (= cid0 "") (misc/uuid4) cid0)
+        key (task-key srv tid)
+        hist (:history srv)
+        existing (if (and hist (not= tid0 "")) (get-item key) [])]
+    (cond
+      (and hist (not= tid0 "") (= (count existing) 0)) (done (fail-answer 404 "TASK_NOT_FOUND" "task not found!" id))
+      (and hist (not= tid0 "") (final-state? (:state (nth existing 0)))) (done (fail-answer 400 "UNSUPPORTED_OPERATION" "Task has reached terminal state." id))
+      (and hist (not= tid0 "") (not= cid0 (:ctx (nth existing 0)))) (done (fail-answer 500 "INVALID_PARAMS" "Task belongs to different context!" id))
+      (and push (not (:push srv))) (done (fail-answer 400 "PUSH_NOTIFICATION_UNSUPPORTED" "Push notification not supported for this agent!" id))
+      :else
+      (let [z0 (if hist (let [it (if (> (count existing) 0) (nth existing 0) (->Item cid "submitted" "" [] (no-push) ""))] (put-item key it)) 0)]
+        (if push
+          (->Step "push" (->Answer 0 "" (no-headers)) params tid cid "message/send" id key)
+          (let [z1 (add-request-history srv key params)]
+            (->Step "flow" (->Answer 0 "" (no-headers)) params tid cid "message/send" id key)))))))
+
+(defn- begin-stream Step [srv: &Server params: &Str id: &Str]
+  (let [[tid0 cid0 push] (msg-ids params)
+        tid (if (= tid0 "") (misc/uuid4) tid0)
+        cid (if (= cid0 "") (misc/uuid4) cid0)
+        key (task-key srv tid)
+        hist (:history srv)
+        existing (if (and hist (not= tid0 "")) (get-item key) [])]
+    (cond
+      (and hist (not= tid0 "") (= (count existing) 0)) (done (fail-answer 404 "TASK_NOT_FOUND" "task not found!" id))
+      (and hist (not= tid0 "") (final-state? (:state (nth existing 0)))) (done (fail-answer 400 "UNSUPPORTED_OPERATION" "Task has reached terminal state." id))
+      (and hist (not= tid0 "") (not= cid0 (:ctx (nth existing 0)))) (done (fail-answer 500 "INVALID_PARAMS" "Task belongs to different context!" id))
+      (not (:streaming srv)) (done (fail-answer 400 "UNSUPPORTED_OPERATION" "Streaming not supported for this agent!" id))
+      :else (->Step "stream" (->Answer 0 "" (no-headers)) params tid cid "message/stream" id key))))
+
+(def SINKS: Atom(Map(Str Vec(hm/Sink))) (atom (let [m: Map(Str Vec(hm/Sink)) {}] m)))
+
+(defn- add-sink Int [key: &Str sk: hm/Sink]
+  (let [z (swap! SINKS (fn Map(Str Vec(hm/Sink)) [o: Map(Str Vec(hm/Sink))]
+                          (let [cur (if (contains? o key) (get! o key) (let [e: Vec(hm/Sink) []] e))] (assoc o key (conj cur sk)))))] 0))
+
+(defn- take-sinks Vec(hm/Sink) [key: &Str]
+  (let [m (deref SINKS)] (if (contains? m key) (get! m key) (let [e: Vec(hm/Sink) []] e))))
+
+(defn- drop-sinks Int [key: &Str]
+  (let [z (swap! SINKS (fn Map(Str Vec(hm/Sink)) [o: Map(Str Vec(hm/Sink))] (dissoc o key)))] 0))
+
+(defn- id-string Str [id: &Str] (if (str/starts-with? id "\"") (str id) (spec/json-str id)))
+
+(defn- event-text Str [kind: &Str stream-id: &Str ev: &Str]
+  (str "event: " kind "\ndata: {\"jsonrpc\":\"2.0\",\"id\":" stream-id ",\"result\":" ev "}\n\n"))
+
+(defn- broadcast Int [key: &Str kind: &Str stream-id: &Str ev: &Str final: Bool rec: Bool]
+  (let [text (event-text kind stream-id ev)
+        zl (lock!)
+        zr (if rec (let [z (log-event key text) z2 (sync-item key)] 0) 0)
+        sks (take-sinks key)
+        z (loop [i 0] (if (>= i (count sks)) 0 (let [e (hm/sink-write (nth sks i) text)] (recur (+ i 1)))))
+        zf (if final
+             (let [z2 (loop [i 0] (if (>= i (count sks)) 0 (let [c (hm/sink-close (nth sks i))] (recur (+ i 1)))))] (drop-sinks key))
+             0)
+        zu (unlock!)]
+    0))
+
+(defn start-stream hm/Response [srv: &Server st: &Step]
+  (let [key (:key st)
+        sid (id-string (:id st))
+        its (get-item key)
+        task (str "{\"id\":" (spec/json-str (:tid st)) ",\"contextId\":" (spec/json-str (:cid st))
+                  ",\"status\":{\"state\":\"submitted\",\"timestamp\":" (spec/json-str (now-str)) "},\"artifacts\":[],\"history\":[],\"kind\":\"task\"}")
+        z0 (if (= (count its) 0) (put-item key (->Item (:cid st) "submitted" task [] (no-push) sid))
+             (let [it (nth its 0)] (put-item key (->Item (:ctx it) (:state it) (:task it) (:history it) (:push it) sid))))
+        cur (nth (get-item key) 0)
+        [resp sk] (hm/stream-response 200 [(hm/->Header "Content-Type" "text/event-stream")])
+        zo (open-log key)
+        z1 (add-sink key sk)
+        shown (spec/with-key (:task cur) "history" "[]")
+        z2 (broadcast key "task" sid shown false false)]
+    resp))
+
+(defn resubscribe hm/Response [srv: &Server st: &Step]
+  (let [key (:key st)
+        its (get-item key)
+        it (nth its 0)
+        [resp sk] (hm/stream-response 200 [(hm/->Header "Content-Type" "text/event-stream")])
+        zl (lock!)
+        shown (spec/with-key (:task it) "history" "[]")
+        z0 (hm/sink-write sk (event-text "task" (:stream it) shown))
+        log (let [m (deref EVLOG)] (if (contains? m key) (get! m key) (let [e: Vec(Str) []] e)))
+        z1 (loop [i 0] (if (>= i (count log)) 0 (let [e (hm/sink-write sk (nth log i))] (recur (+ i 1)))))
+        fin (final-state? (:state it))
+        z2 (if fin (hm/sink-close sk) (add-sink key sk))
+        zu (unlock!)]
+    resp))
+
+(defn stream-failed Int [srv: &Server st: &Step]
+  (let [its (get-item (:key st))
+        sid (if (= (count its) 0) (id-string (:id st)) (:stream (nth its 0)))
+        ev (str "{\"taskId\":" (spec/json-str (:tid st)) ",\"status\":{\"state\":\"failed\",\"timestamp\":" (spec/json-str (now-str))
+                "},\"contextId\":" (spec/json-str (:cid st)) ",\"final\":true,\"kind\":\"status-update\"}")]
+    (broadcast (:key st) "status-update" sid ev true false)))
+
+(defn- update-task conn/OpResult [c: &conn/OpCall artifact: Bool]
+  (let [cfgs (:config c)
+        local (if artifact "artifact-content" "status-content")
+        ty (if artifact "TaskArtifactUpdateEvent" "TaskStatusUpdateEvent")]
+    (if (= (count cfgs) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" "a2a: missing config-ref"))
+      (let [srv (server-of (nth cfgs 0) no-res)
+            [ts x] (conn/child-tv c local)
+            [b be] (if (= (count ts) 0) (values "" "") (ev/bytes (nth ts 0)))
+            [evj ee] (spec/canon-stream ty b (now-str))]
+        (cond
+          (> (count x) 0) (conn/fail-result (nth x 0))
+          (or (not= be "") (not= ee "")) (conn/fail-result (a2a-err "INVALID_REQUEST" (str "Failed to parse " ty " content")))
+          :else
+          (let [tid (unquote (spec/key-json evj "taskId"))
+                key (task-key srv tid)
+                its (get-item key)]
+            (if (= (count its) 0) (conn/fail-result (a2a-err "TASK_NOT_FOUND" (str "Task not found: " tid)))
+              (let [it (nth its 0)
+                    meta (spec/key-json evj "metadata")
+                    t0 (if (= (:task it) "") "{}" (:task it))
+                    t1 (if artifact
+                         (let [arts (cat-strs (spec/array-items (spec/key-json t0 "artifacts")) [(spec/key-json evj "artifact")])]
+                           (spec/with-key t0 "artifacts" (str "[" (str/join "," arts) "]")))
+                         (spec/with-key t0 "status" (spec/key-json evj "status")))
+                    t2 (if (= meta "") t1 (spec/with-key t1 "metadata" meta))
+                    status (spec/key-json t2 "status")
+                    msg (spec/key-json status "message")
+                    hist (if artifact (:history it) (conj (:history it) (if (= msg "") "null" msg)))
+                    z (put-item key (->Item (:ctx it) (unquote (spec/key-json status "state")) t2 hist (:push it) (:stream it)))
+                    final (and (not artifact) (= (spec/key-json evj "final") "true"))]
+                (if (= (:stream it) "") (conn/fail-result (a2a-err "INTERNAL_ERROR" (str "No streaming context found for task: " tid)))
+                  (let [z2 (broadcast key (if artifact "artifact-update" "status-update") (:stream it) evj final true)]
+                    (conn/keep-result c)))))))))))
+
+(defn- add-request-history Int [srv: &Server key: &Str params: &Str]
+  (let [its (if (:history srv) (get-item key) [])]
+    (if (= (count its) 0) 0
+      (let [it (nth its 0)]
+        (put-item key (->Item (:ctx it) (:state it) (:task it) (conj (:history it) (spec/key-json params "message")) (:push it) (:stream it)))))))
+
+(defn- begin-set-push Step [srv: &Server params: &Str id: &Str]
+  (let [tid (unquote (spec/key-json params "taskId"))
+        key (task-key srv tid)
+        its (get-item key)]
+    (cond
+      (not (:push srv)) (done (fail-answer 400 "PUSH_NOTIFICATION_UNSUPPORTED" "Push notification not supported for this agent!" id))
+      (and (:history srv) (= (count its) 0)) (done (fail-answer 404 "TASK_NOT_FOUND" "task not found!" id))
+      (and (:history srv) (final-state? (:state (nth its 0)))) (done (fail-answer 400 "UNSUPPORTED_OPERATION" "Task has reached terminal state." id))
+      :else (->Step "push" (->Answer 0 "" (no-headers)) params tid "" "tasks/pushNotificationConfig/set" id key))))
+
+(defn after-push Step [srv: &Server st: &Step ok: Bool msg: &Str]
+  (let [id (:id st)
+        cfg (if (= (:rpc st) "message/send") (spec/key-json (spec/key-json (:payload st) "configuration") "pushNotificationConfig")
+              (spec/key-json (:payload st) "pushNotificationConfig"))
+        url (unquote (spec/key-json cfg "url"))
+        token (unquote (spec/key-json cfg "token"))
+        bad (cond (= (str/trim url) "") "java.lang.IllegalArgumentException: Push notification URL is required but was empty or null"
+                  (not (http-url? url)) (str "java.lang.IllegalArgumentException: Invalid push notification URL: " url ". URL must be a valid HTTP or HTTPS URL.")
+                  :else "")
+        reason (if ok bad (str msg))]
+    (if (not= reason "") (done (fail-answer 500 "INVALID_PARAMS" (str "Push notification config rejected: " reason) id))
+      (let [p (->Push (misc/uuid4) url token (push-timeout srv))
+            z (add-push srv (:key st) p)]
+        (if (= (:rpc st) "message/send")
+          (let [task (str "{\"id\":" (spec/json-str (:tid st)) ",\"contextId\":" (spec/json-str (:cid st))
+                          ",\"status\":{\"state\":\"submitted\",\"timestamp\":" (spec/json-str (now-str)) "},\"artifacts\":[],\"history\":[],\"kind\":\"task\"}")
+                z1 (set-task srv (:key st) task "submitted")
+                z2 (add-request-history srv (:key st) (:payload st))]
+            (->Step "async" (result-answer 202 id task) (:payload st) (:tid st) (:cid st) "message/send" id (:key st)))
+          (done (result-answer 200 id (push-json (:tid st) p))))))))
+
+(defn- http-url? Bool [u: &Str]
+  (let [l (str/lower-case u)] (or (str/starts-with? l "http:") (str/starts-with? l "https:"))))
+
+(defn- push-json Str [tid: &Str p: &Push]
+  (str "{\"taskId\":" (spec/json-str tid) ",\"pushNotificationConfig\":{\"url\":" (spec/json-str (:url p))
+       (if (= (:token p) "") "" (str ",\"token\":" (spec/json-str (:token p)))) ",\"id\":" (spec/json-str (:id p)) "}}"))
+
+(defn- add-push Int [srv: &Server key: &Str p: Push]
+  (let [its (if (:history srv) (get-item key) [])]
+    (if (= (count its) 0) 0
+      (let [it (nth its 0)] (put-item key (->Item (:ctx it) (:state it) (:task it) (:history it) (conj (:push it) p) (:stream it)))))))
+
+(defn- set-pushes Int [srv: &Server key: &Str ps: Vec(Push)]
+  (let [its (if (:history srv) (get-item key) [])]
+    (if (= (count its) 0) 0
+      (let [it (nth its 0)] (put-item key (->Item (:ctx it) (:state it) (:task it) (:history it) ps (:stream it)))))))
+
+(defn- set-task Int [srv: &Server key: &Str task: &Str state: &Str]
+  (let [its (if (:history srv) (get-item key) [])]
+    (if (= (count its) 0) 0
+      (let [it (nth its 0)] (put-item key (->Item (:ctx it) (str state) (str task) (:history it) (:push it) (:stream it)))))))
+
+(def PUSH-PRIVATE: Atom(Bool) (atom false))
+
+(defn- first-v4 Vec(Int) [as: &Vec(Vec(Int))]
+  (loop [i 0] (if (>= i (count as)) (nth as 0) (if (= (count (nth as i)) 4) (nth as i) (recur (+ i 1))))))
+
+(defn- first-internal Vec(Vec(Int)) [as: &Vec(Vec(Int))]
+  (loop [i 0] (if (>= i (count as)) [] (if (na/internal? (nth as i)) [(nth as i)] (recur (+ i 1))))))
+
+(defn- push-target Values(Str Str Str Str) [url: &Str allow: Bool]
+  (let [[u ue] (http/parse-url url)]
+    (if (not= ue "") (values "" "" "" (str "Push notification failed: " ue))
+      (let [[as re] (na/resolve (:host u))
+            bad (if (= re "") (first-internal as) [])
+            def-port (= (:port u) (if (:secure u) 443 80))
+            hhost (if (str/includes? (:host u) ":") (str "[" (:host u) "]") (str (:host u)))
+            authority (if def-port hhost (str hhost ":" (:port u)))]
+        (cond
+          (not= re "") (values "" "" "" (str "Push notification failed: " re))
+          (and (not allow) (> (count bad) 0))
+          (values "" "" "" (str "Push notification refused: '" url "' resolves to the internal address " (na/url-host (nth bad 0))
+                                " (set mulay.a2a.allowPrivatePushUrls=true to allow)"))
+          allow (values (str url) "" "" "")
+          :else (values (str (if (:secure u) "https://" "http://") (na/url-host (first-v4 as)) ":" (:port u) (:path u))
+                        authority (str (:host u)) ""))))))
+
+(defn post-push Str [p: &Push body: &Str allow: Bool]
+  (let [[target authority sni te] (push-target (:url p) allow)]
+    (if (not= te "") (let [z (log/emit log/WARN log/INFO "mulay" "mulay.a2a" te)] te)
+      (let [hs0: Vec(hm/Header) [(hm/->Header "Content-Type" "application/json")]
+            hs1 (if (= (:token p) "") hs0 (conj hs0 (hm/->Header "X-A2A-Notification-Token" (:token p))))
+            hs (if (= authority "") hs1 (conj hs1 (hm/->Header "Host" authority)))
+            o0 (assoc (assoc (assoc (assoc (assoc (http/request-opts target) :method "POST") :headers hs) :body (str body)) :timeout-ms 60000) :max-redirects 0)
+            o (if (= sni "") o0 (assoc o0 :tls (assoc (:tls o0) :sni sni)))
+            [resp e] (http/request o)]
+        e))))
+
+(defn push-answer Int [srv: &Server st: &Step ans: &Answer]
+  (let [its (get-item (:key st))]
+    (if (or (= (count its) 0) (= (count (:push (nth its 0))) 0)) 0
+      (let [ps (:push (nth its 0))
+            e (post-push (nth ps (- (count ps) 1)) (:body ans) (deref PUSH-PRIVATE))]
+        (set-pushes srv (:key st) (no-push))))))
+
+(defn end-rpc Answer [srv: &Server st: &Step out: &FlowOut]
+  (let [id (:id st)]
+    (if (not (:ok out))
+      (let [t (if (= (:etype out) "") "INTERNAL_ERROR" (:etype out))
+            [code status] (error-codes t)]
+        (->Answer status (error-body id code (:emsg out)) (:headers out)))
+      (let [[ek ee] (spec/canon-stream "EventKind" (:body out) (now-str))]
+        (cond
+          (not= ee "")
+          (fail-answer 500 "INTERNAL_ERROR" (str "Error unmarshalling input stream json payload into type io.a2a.spec.EventKind. Cause: " ee) id)
+          (not (ids-match ek (:tid st) (:cid st))) (fail-answer 500 "INTERNAL_ERROR" "Server error occured! Kindly check with the administrator." id)
+          :else
+          (let [z1 (if (:history srv) (record-response srv ek) 0)]
+            (->Answer 200 (str "{\"jsonrpc\":\"2.0\"" (id-out id) ",\"result\":" ek "}") (:headers out))))))))
+
+(defn- ids-match Bool [ek: &Str tid: &Str cid: &Str]
+  (if (= (unquote (spec/key-json ek "kind")) "task")
+    (and (= (unquote (spec/key-json ek "id")) tid) (= (unquote (spec/key-json ek "contextId")) cid))
+    (let [t (unquote (spec/key-json ek "taskId")) x (unquote (spec/key-json ek "contextId"))]
+      (and (or (= t "") (= t tid)) (or (= x "") (= x cid))))))
+
+(defn- record-response Int [srv: &Server ek: &Str]
+  (if (= (unquote (spec/key-json ek "kind")) "task")
+    (let [key (task-key srv (unquote (spec/key-json ek "id")))
+          its (get-item key)]
+      (if (= (count its) 0) 0
+        (let [it (nth its 0)
+              old (if (= (:task it) "") (let [z: Vec(Str) []] z) (spec/array-items (spec/key-json (:task it) "artifacts")))
+              arts (cat-strs old (spec/array-items (spec/key-json ek "artifacts")))
+              task (spec/with-key ek "artifacts" (str "[" (str/join "," arts) "]"))
+              status (spec/key-json ek "status")
+              msg (spec/key-json status "message")]
+          (put-item key (->Item (:ctx it) (unquote (spec/key-json status "state")) task
+                                (conj (:history it) (if (= msg "") "null" msg)) (:push it) (:stream it))))))
+    (let [t (unquote (spec/key-json ek "taskId"))
+          its (if (= t "") [] (get-item (task-key srv t)))]
+      (if (= (count its) 0) 0
+        (let [it (nth its 0)]
+          (put-item (task-key srv t) (->Item (:ctx it) (:state it) (:task it) (conj (:history it) ek) (:push it) (:stream it))))))))
+
+(defn- cat-strs Vec(Str) [a: Vec(Str) b: Vec(Str)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn after-auth Step [srv: &Server st: &Step ok: Bool]
+  (let [id (:id st)]
+    (cond
+      (not ok) (done (fail-answer 403 "UNAUTHORIZED" "Unauthorized" id))
+      (= (:rpc st) "tasks/get") (done (get-task srv st))
+      (= (:rpc st) "tasks/cancel") (done (cancel-task srv st))
+      (= (:rpc st) "tasks/resubscribe")
+      (let [its (if (:history srv) (get-item (:key st)) [])]
+        (cond
+          (not (:streaming srv)) (done (fail-answer 400 "UNSUPPORTED_OPERATION" "Streaming not supported for this agent!" id))
+          (or (= (count its) 0) (= (:stream (nth its 0)) "")) (done (fail-answer 404 "TASK_NOT_FOUND" (str "Task not found: " (:tid st)) id))
+          :else (->Step "resub" (->Answer 0 "" (no-headers)) "" (:tid st) "" "tasks/resubscribe" id (:key st))))
+      :else (done (push-config srv st)))))
+
+(defn- push-config Answer [srv: &Server st: &Step]
+  (let [id (:id st) meth (:rpc st)
+        its (if (:history srv) (get-item (:key st)) [])
+        pid (unquote (spec/key-json (:payload st) "pushNotificationConfigId"))]
+    (cond
+      (not (:push srv)) (fail-answer 400 "PUSH_NOTIFICATION_UNSUPPORTED" "Push notification not supported for this agent!" id)
+      (= meth "tasks/pushNotificationConfig/delete")
+      (cond
+        (= (count its) 0) (fail-answer 404 "TASK_NOT_FOUND" "task not found!" id)
+        (final-state? (:state (nth its 0))) (fail-answer 400 "UNSUPPORTED_OPERATION" "Task has reached terminal state." id)
+        :else (let [ps (:push (nth its 0))
+                    kept (loop [i 0 acc (no-push)] (if (>= i (count ps)) acc (recur (+ i 1) (if (= (:id (nth ps i)) pid) acc (conj acc (nth ps i))))))
+                    z (set-pushes srv (:key st) kept)]
+                (result-answer 200 id "null")))
+      (= (count its) 0) (fail-answer 404 "TASK_NOT_FOUND" "Task not found" id)
+      (= meth "tasks/pushNotificationConfig/list")
+      (let [ps (:push (nth its 0))]
+        (result-answer 200 id (str "[" (str/join "," (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (push-json (:tid st) (nth ps i))))))) "]")))
+      :else
+      (let [ps (:push (nth its 0))
+            k (if (= pid "") (- (count ps) 1) (loop [i 0] (if (>= i (count ps)) -2 (if (= (:id (nth ps i)) pid) i (recur (+ i 1))))))]
+        (cond
+          (= k -2) (fail-answer 500 "INTERNAL_ERROR" "Push notification config not found" id)
+          (< k 0) (fail-answer 500 "INTERNAL_ERROR" (str "Index " k " out of bounds for length " (count ps)) id)
+          :else (result-answer 200 id (push-json (:tid st) (nth ps k))))))))
+
+(defn- result-answer Answer [status: Int id: &Str result: &Str]
+  (->Answer status (str "{\"jsonrpc\":\"2.0\"" (id-out id) ",\"result\":" result "}") (no-headers)))
+
+(defn- get-task Answer [srv: &Server st: &Step]
+  (let [id (:id st)
+        its (if (:history srv) (get-item (:key st)) [])
+        [hl he] (parse-long (spec/key-json (:payload st) "historyLength"))
+        not-found (fail-answer 404 "TASK_NOT_FOUND" "Task not found" id)]
+    (if (or (= (count its) 0) (= (:task (nth its 0)) "")) not-found
+      (let [it (nth its 0)
+            hs (:history it)
+            n (min (if (= he "") hl 0) (count hs))
+            sel (loop [i (- (count hs) n) acc: Vec(Str) []] (if (>= i (count hs)) acc (recur (+ i 1) (conj acc (nth hs i)))))]
+        (if (has-str? sel "null") not-found
+          (result-answer 200 id (spec/with-key (:task it) "history" (str "[" (str/join "," sel) "]"))))))))
+
+(defn- cancel-task Answer [srv: &Server st: &Step]
+  (let [id (:id st)
+        key (:key st)
+        its (if (:history srv) (get-item key) [])]
+    (cond
+      (= (count its) 0) (fail-answer 404 "TASK_NOT_FOUND" "task not found!" id)
+      (final-state? (:state (nth its 0))) (fail-answer 400 "UNSUPPORTED_OPERATION" "Task has reached terminal state." id)
+      (= (:task (nth its 0)) "") (fail-answer 500 "INTERNAL_ERROR" "Task has no state to cancel" id)
+      :else
+      (let [it (nth its 0)
+            task (spec/with-key (:task it) "status" (str "{\"state\":\"canceled\",\"timestamp\":" (spec/json-str (now-str)) "}"))
+            z (put-item key (->Item (:ctx it) "canceled" task (:history it) (:push it) (:stream it)))]
+        (result-answer 202 id task)))))
+
+(defrecord Peer [url: Str card: Str])
+(def PEERS: Atom(Map(Str Peer)) (atom (let [m: Map(Str Peer) {}] m)))
+(def REQ-ID: Atom(Int) (atom 0))
+
+(defn- a2a-err err/MErr [t: Str desc: Str] (err/mk "A2A" t desc))
+
+(defn- server-url Str [cfg: &m/Config]
+  (let [cn (cfg-child cfg "client-connection")] (if (= (count cn) 0) "" (xml/attr (nth cn 0) "" "serverUrl" ""))))
+
+(defn- card-url Str [base: &Str] (if (str/ends-with? base "/") (str base ".well-known/agent-card.json") (str base "/.well-known/agent-card.json")))
+
+(defn- response-attributes v/Val [r: &hm/Resp]
+  (let [hs (:headers r)
+        hv (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                       (if (>= i (count hs)) acc
+                         (let [h (nth hs i)] (recur (+ i 1) (conj acc (v/field (str/lower-case (:hd-name h)) (v/->VStr (str (:hd-value h))))))))))]
+    (v/->VMeta (v/->VObj [(v/field "headers" hv) (v/field "reasonPhrase" (v/->VStr (str (:reason r)))) (v/field "statusCode" (v/int-v (:status r)))])
+               [(v/field "class" (v/->VStr "com.mulesoft.connectors.a2a.api.model.transport.ResponseAttributes"))])))
+
+(defn- fetch-card Values(hm/Resp Str Vec(err/MErr)) [c: &conn/OpCall base: &Str]
+  (let [[resp e] (send c "GET" (card-url base) (no-headers) "")]
+    (if (not= e "") (values resp "" [(a2a-err "CONNECTIVITY" (str "Failed to connect: " e))])
+      (values resp (:body resp) []))))
+
+(defn- client-conn Vec(xml/XNode) [c: &conn/OpCall]
+  (let [cfgs (:config c)] (if (= (count cfgs) 0) [] (cfg-child (nth cfgs 0) "client-connection"))))
+
+(defn- send Values(hm/Resp Str) [c: &conn/OpCall method: &Str url: &Str hs: Vec(hm/Header) body: &Str]
+  (let [[o1 err0 au path] (request-of c method url hs body)
+        [r0 e0] (if (not= err0 "") (values (hm/->Resp 0 (no-headers) "" "" []) err0) (http/request o1))
+        retry (h/challenge-header r0 e0 au method path)]
+    (if (= (count retry) 0) (values r0 e0)
+      (http/request (assoc o1 :headers (h/swap-auth (:headers o1) (nth retry 0)))))))
+
+(defn- client-trace Vec(hm/Header) [c: &conn/OpCall url: &Str hs: Vec(hm/Header)]
+  (let [e (:event c)
+        tp (tr/traceparent e)]
+    (if (= tp "") hs
+      (let [[u ue] (http/parse-url url)
+            z0 (tr/add-attr! e "http.method" "POST")
+            z1 (tr/add-attr! e "span.kind.override" "CLIENT")
+            z2 (tr/add-attr! e "http.flavor" "1.1")
+            z3 (tr/add-attr! e "http.url" url)
+            z4 (if (= ue "") (tr/add-attr! e "net.peer.port" (str (:port u))) 0)
+            z5 (if (= ue "") (tr/add-attr! e "net.peer.name" (:host u)) 0)]
+        (conj (conj hs (hm/->Header "traceparent" tp)) (hm/->Header "tracestate" (tr/tracestate e)))))))
+
+(defn- request-of Values(http/RequestOpts Str h/Auth Str) [c: &conn/OpCall method: &Str url: &Str hs: Vec(hm/Header) body: &Str]
+  (let [cn (client-conn c)
+        h0: Vec(hm/Header) [(hm/->Header "Content-Type" "application/json")]
+        h1 (cat-headers h0 hs)
+        h2 (if (= (count cn) 0) h1 (cat-headers h1 (default-headers (nth cn 0))))
+        [au ae] (if (= (count cn) 0) (values (h/no-auth) "") (h/auth-of c (nth cn 0)))
+        path (url-path url)
+        h3 (h/first-auth-header h2 au path)
+        o (assoc (assoc (assoc (http/request-opts url) :method method) :headers h3) :timeout-ms (if (= (count cn) 0) 30000 (timeout-ms (nth cn 0))))
+        [tl te] (if (or (= (count cn) 0) (not (str/starts-with? (str/lower-case url) "https:"))) (values [] "")
+                  (tls/of-connection (:configs c) (:res c) (nth cn 0)))
+        o0 (if (str/starts-with? (str/lower-case url) "https:")
+             (assoc o :tls (assoc (if (= (count tl) 0) (ctls/default-config) (h/tls-opts (nth tl 0))) :alpn ["http/1.1"]))
+             o)
+        o1 (if (= body "") o0 (assoc o0 :body (str body)))]
+    (values o1 (if (not= ae "") ae te) au path)))
+
+(defn- send-stream Values(hm/Resp Str Vec(Vec(Str))) [c: &conn/OpCall url: &Str hs: Vec(hm/Header) body: &Str]
+  (let [[o1 err0 au path] (request-of c "POST" url (conj hs (hm/->Header "Accept" "text/event-stream")) body)
+        acc: Atom(Vec(Vec(Str))) (atom (let [z: Vec(Vec(Str)) []] z))
+        o2 (assoc o1 :as (http/->EventStream (fn http/Flow [name: Str data: Str] (let [z (swap! acc (fn Vec(Vec(Str)) [o: Vec(Vec(Str))] (conj o [name data])))] (http/->Continue)))))
+        [r e] (if (not= err0 "") (values (hm/->Resp 0 (no-headers) "" "" []) err0) (http/request o2))]
+    (values r e (deref acc))))
+
+(defn- timeout-ms Int [cn: &xml/XNode]
+  (let [[n e] (parse-long (str/trim (xml/attr cn "" "requestTimeout" "30")))
+        u (str/upper-case (str/trim (xml/attr cn "" "requestTimeoutUnit" "SECONDS")))
+        k (cond (= u "MILLISECONDS") 1 (= u "MINUTES") 60000 (= u "HOURS") 3600000 (= u "DAYS") 86400000 :else 1000)]
+    (if (or (not= e "") (<= n 0)) 30000 (* n k))))
+
+(defn- cat-headers Vec(hm/Header) [a: Vec(hm/Header) b: &Vec(hm/Header)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- default-headers Vec(hm/Header) [cn: &xml/XNode]
+  (let [d (elem-child cn "default-headers")]
+    (if (= (count d) 0) (no-headers)
+      (let [ks (xml/child-elems (nth d 0))]
+        (loop [i 0 acc (no-headers)]
+          (if (>= i (count ks)) acc
+            (recur (+ i 1) (conj acc (hm/->Header (xml/attr (nth ks i) "" "key" "") (xml/attr (nth ks i) "" "value" ""))))))))))
+
+(defn- url-path Str [url: &Str]
+  (let [k (str/index-of url "://") rest (if (< k 0) (str url) (subs url (+ k 3) (count url))) sl (str/index-of rest "/")
+        p (if (< sl 0) "/" (subs rest sl (count rest))) q (str/index-of p "?")]
+    (if (< q 0) p (subs p 0 q))))
+
+(defn- peer Values(Peer Vec(err/MErr)) [c: &conn/OpCall cfg: &m/Config]
+  (let [nm (:name cfg) ps (deref PEERS)]
+    (if (contains? ps nm) (values (get! ps nm) [])
+      (let [base (server-url cfg)
+            [resp body x] (fetch-card c base)]
+        (if (> (count x) 0) (values (->Peer base "") x)
+          (let [[card ce] (spec/canon "AgentCard" body (now-str))]
+            (if (not= ce "") (values (->Peer base "") [(a2a-err "INVALID_AGENT_CARD" (str "Failed to discover agent card: " ce))])
+              (let [u (card-field card "url")
+                    p (->Peer (if (= u "") base u) card)
+                    z (swap! PEERS (fn Map(Str Peer) [o: Map(Str Peer)] (assoc o nm p)))]
+                (values p [])))))))))
+
+(defn- card-field Str [card: &Str k: &Str]
+  (let [[n e] (spec/parse card)] (match n (spec/JObj ks vs l c el ec) (str-field ks vs k) _ "")))
+
+(defn- payload-json Values(Str Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [[ts x] (conn/child-tv c local)
+        t (if (> (count ts) 0) (nth ts 0) (:payload (:event c)))]
+    (if (> (count x) 0) (values "" x)
+      (let [[b be] (ev/bytes t)] (if (not= be "") (values "" [(err/mk "MULE" "EXPRESSION" be)]) (values b []))))))
+
+(defn- call conn/OpResult [c: &conn/OpCall meth: &Str ptype: &Str local: &Str]
+  (let [cfgs (:config c)]
+    (if (= (count cfgs) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" "a2a: missing config-ref"))
+      (let [[p px] (peer c (nth cfgs 0))
+            [body bx] (payload-json c local)]
+        (cond
+          (> (count px) 0) (conn/fail-result (nth px 0))
+          (> (count bx) 0) (conn/fail-result (nth bx 0))
+          :else
+          (let [[params pe] (spec/canon ptype body (now-str))]
+            (if (not= pe "") (conn/fail-result (a2a-err "INVALID_REQUEST" (str "Error unmarshalling input stream json payload into type io.a2a.spec." ptype ". Cause: " pe)))
+              (let [n (swap! REQ-ID (fn Int [x: Int] (+ x 1)))
+                    req (str "{\"jsonrpc\":\"2.0\",\"id\":\"" n "\",\"method\":" (spec/json-str meth) ",\"params\":" params "}")
+                    [extra xe] (extra-headers c)
+                    [resp e] (if (not= xe "") (values (hm/->Resp 0 (no-headers) "" "" []) "") (send c "POST" (:url p) (client-trace c (:url p) extra) req))]
+                (cond (not= xe "") (conn/fail-result (err/mk "MULE" "EXPRESSION" xe))
+                      (not= e "") (conn/fail-result (a2a-err "CONNECTIVITY" e))
+                      :else (rpc-result resp))))))))))
+
+(defn- extra-headers Values(Vec(hm/Header) Str) [c: &conn/OpCall]
+  (let [p (conn/param (:exprs c) "additional-properties")
+        none: Vec(hm/Header) []]
+    (if (= (count p) 0) (values none "")
+      (let [[x e] ((:eval c) (nth p 0) (:event c))]
+        (if (not= e "") (values none e)
+          (match (v/unmeta x)
+            (v/VObj fs) (loop [i 0 acc none]
+                          (if (>= i (count fs)) (values acc "")
+                            (let [f (nth fs i) [t te] (drt/to-text (:value f))]
+                              (recur (+ i 1) (conj acc (hm/->Header (:name (:key f)) t))))))
+            _ (values none "")))))))
+
+(defn- rpc-result conn/OpResult [resp: &hm/Resp]
+  (let [st (:status resp)
+        content (:body resp)
+        attrs (ev/tv-val (response-attributes resp) ev/JAVA)]
+    (if (= st 401) (conn/fail-result (a2a-err "UNAUTHORIZED" content))
+      (let [[n e] (spec/parse content)]
+        (if (not= e "") (conn/fail-result (a2a-err "PARSE_ERROR" (str "Failed to parse the server response: " e)))
+          (match n
+            (spec/JObj ks vs l c el ec)
+            (let [er (loop [i 0] (if (>= i (count ks)) -1 (if (= (nth ks i) "error") i (recur (+ i 1)))))
+                  rs (loop [i 0] (if (>= i (count ks)) -1 (if (= (nth ks i) "result") i (recur (+ i 1)))))]
+              (cond
+                (and (>= er 0) (or (>= st 400) (= st 200)))
+                (match (nth vs er)
+                  (spec/JObj k2 v2 l2 c2 e2 f2)
+                  (let [code (let [r (loop [i 0] (if (>= i (count k2)) "" (if (= (nth k2 i) "code") (match (nth v2 i) (spec/JNum x l3 c3) (str x) _ "") (recur (+ i 1)))))]
+                               (let [[x xe] (parse-long r)] (if (= xe "") x -32603)))
+                        msg (str-field k2 v2 "message")]
+                    (conn/fail-result (a2a-err (type-of-code code) (str "Error " code ": " msg))))
+                  _ (conn/fail-result (a2a-err "INTERNAL_ERROR" "Invalid error response")))
+                (and (>= st 200) (< st 300))
+                (let [[out oe] (if (< rs 0) (values "null" "") (spec/canon-node "StreamingEventKind" (nth vs rs) (now-str)))]
+                  (if (not= oe "") (conn/fail-result (a2a-err "PARSE_ERROR" (str "Failed to parse the server response: " oe)))
+                    (conn/ok-result (ev/tv-raw out "application/json") attrs)))
+                :else (conn/fail-result (a2a-err "INTERNAL_ERROR" (str "Invalid response status code: " st)))))
+            _ (conn/fail-result (a2a-err "PARSE_ERROR" "Failed to parse the server response"))))))))
+
+(defn- get-card conn/OpResult [c: &conn/OpCall]
+  (let [cfgs (:config c)]
+    (if (= (count cfgs) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" "a2a: missing config-ref"))
+      (let [[p px] (peer c (nth cfgs 0))]
+        (if (> (count px) 0) (conn/fail-result (nth px 0))
+          (let [[resp body x] (fetch-card c (server-url (nth cfgs 0)))]
+            (if (> (count x) 0) (conn/fail-result (nth x 0))
+              (conn/ok-result (ev/tv-raw body "application/json") (ev/tv-val (response-attributes resp) ev/JAVA)))))))))
+
+(defn- send-push conn/OpResult [c: &conn/OpCall]
+  (let [cfgs (:config c)]
+    (if (= (count cfgs) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" "a2a: missing config-ref"))
+      (let [srv (server-of (nth cfgs 0) no-res)
+            [ts x] (conn/child-tv c "notification-message")]
+        (cond
+          (> (count x) 0) (conn/fail-result (nth x 0))
+          (not (:push srv))
+          (conn/fail-result (a2a-err "PUSH_NOTIFICATION_UNSUPPORTED" "This agent doesn't support push notifications! Enable push notifications in the agent card capabilities."))
+          (= (count ts) 0) (conn/fail-result (a2a-err "INVALID_PARAMS" "Notification message is required but was null"))
+          :else
+          (let [[b be] (ev/bytes (nth ts 0))
+                [ek ee] (spec/canon-stream "EventKind" b (now-str))]
+            (if (not= ee "") (conn/fail-result (a2a-err "PARSE_ERROR" (str "Error unmarshalling input stream json payload into type io.a2a.spec.EventKind. Cause: " ee)))
+              (let [tid (if (= (unquote (spec/key-json ek "kind")) "task") (unquote (spec/key-json ek "id")) (unquote (spec/key-json ek "taskId")))
+                    its (get-item (task-key srv tid))]
+                (cond
+                  (= (str/trim tid) "") (conn/fail-result (a2a-err "INVALID_PARAMS" "TaskId is required but was null or empty in the message payload"))
+                  (or (= (count its) 0) (= (count (:push (nth its 0))) 0))
+                  (conn/fail-result (a2a-err "INVALID_PARAMS" (str "No push notification configuration found for taskId: " tid ". Make sure setPushNotificationConfig has been called for this task before sending notifications.")))
+                  :else
+                  (let [body (str "{\"jsonrpc\":\"2.0\",\"id\":" (spec/json-str (misc/uuid4)) ",\"result\":" ek "}")
+                        ps (:push (nth its 0))
+                        errs (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (let [e (post-push (nth ps i) body (deref PUSH-PRIVATE))] (recur (+ i 1) (if (= e "") acc (conj acc e))))))]
+                    (if (> (count errs) 0) (conn/fail-result (a2a-err "INTERNAL_ERROR" (str "Failed to send push notification for taskId: " tid)))
+                      (conn/keep-result c))))))))))))
+
+(defn- no-res Values(Str Bool) [s: Str] (values "" false))
+
+(defn- stream-op conn/OpResult [c: &conn/OpCall meth: &Str ptype: &Str local: &Str]
+  (let [cfgs (:config c)]
+    (if (= (count cfgs) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" "a2a: missing config-ref"))
+      (let [[p px] (peer c (nth cfgs 0))
+            [body bx] (payload-json c local)]
+        (cond
+          (> (count px) 0) (conn/fail-result (nth px 0))
+          (> (count bx) 0) (conn/fail-result (nth bx 0))
+          :else
+          (let [[params pe] (spec/canon ptype body (now-str))]
+            (if (not= pe "") (conn/fail-result (a2a-err "INVALID_REQUEST" (str "Error unmarshalling input stream json payload into type io.a2a.spec." ptype ". Cause: " pe)))
+              (let [n (swap! REQ-ID (fn Int [x: Int] (+ x 1)))
+                    req (str "{\"jsonrpc\":\"2.0\",\"id\":\"" n "\",\"method\":" (spec/json-str meth) ",\"params\":" params "}")
+                    [extra xe] (extra-headers c)
+                    [resp e evs] (send-stream c (:url p) (client-trace c (:url p) extra) req)
+                    ct: Str (match (hm/header-of (:headers resp) "content-type") (Some x) x (None) "")]
+                (cond
+                  (not= xe "") (conn/fail-result (err/mk "MULE" "EXPRESSION" xe))
+                  (not= e "") (conn/fail-result (a2a-err "CONNECTIVITY" e))
+                  (not (str/includes? (str/lower-case ct) "text/event-stream")) (rpc-result resp)
+                  :else (run-events c resp evs))))))))))
+
+(defn- run-events conn/OpResult [c: &conn/OpCall resp: &hm/Resp evs: &Vec(Vec(Str))]
+  (let [ra (response-attributes resp)
+        route-attrs (v/->VMeta (v/unmeta ra) [(v/field "class" (v/->VStr "java.util.Optional"))])
+        [outs final]
+        (loop [i 0 acc: Vec(Str) [] fin false]
+          (if (or fin (>= i (count evs))) (values acc fin)
+            (let [data (nth (nth evs i) 1)
+                  res (spec/key-json data "result")
+                  [ek ee] (if (= res "") (values "" "x") (spec/canon "StreamingEventKind" res (now-str)))]
+              (if (not= ee "") (recur (+ i 1) acc fin)
+                (let [kind (unquote (spec/key-json ek "kind"))
+                      route (cond (= kind "status-update") "on-task-status-update" (= kind "artifact-update") "on-task-artifact-update" :else "")
+                      z (if (= route "") 0
+                          (let [e0 (ev/with-attributes (ev/with-payload (:event c) (ev/tv-val (v/->VStr (str data)) "*/*")) (ev/tv-val route-attrs ev/JAVA))
+                                [e1 x found] ((:chain c) route e0)]
+                            0))
+                      is-final (and (= kind "status-update") (= (spec/key-json ek "final") "true"))]
+                  (recur (+ i 1) (conj acc ek) is-final))))))
+        hs (match (v/unmeta ra) (v/VObj fs) (let [h (v/obj-get fs "headers")] (if (= (count h) 0) (v/->VObj []) (nth h 0))) _ (v/->VObj []))
+        attrs (v/->VMeta (v/->VObj [(v/field "headers" hs) (v/field "finalEventFound" (v/->VBool final))
+                                    (v/field "reasonPhrase" (v/->VStr (str (:reason resp)))) (v/field "statusCode" (v/int-v (:status resp)))])
+                         [(v/field "class" (v/->VStr "com.mulesoft.connectors.a2a.api.model.transport.StreamingResponseAttributes"))])]
+    (conn/ok-result (ev/tv-raw (str "{\"events\":[" (str/join "," outs) "]}") "application/json") (ev/tv-val attrs ev/JAVA))))
+
+(defn- run-op conn/OpResult [c: conn/OpCall]
+  (let [op (:op c)]
+    (cond
+      (= op "get-card") (get-card c)
+      (= op "send-message") (call c "message/send" "MessageSendParams" "message")
+      (= op "get-task") (call c "tasks/get" "TaskQueryParams" "task-query")
+      (= op "cancel-task") (call c "tasks/cancel" "TaskIdParams" "task-id")
+      (= op "send-push-notification") (send-push c)
+      (= op "send-stream-message") (stream-op c "message/stream" "MessageSendParams" "stream-message")
+      (= op "task-resubscribe") (stream-op c "tasks/resubscribe" "TaskIdParams" "task-id-params")
+      (= op "update-task-status") (update-task c false)
+      (= op "update-task-artifact") (update-task c true)
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation <a2a:" op ">"))))))
+
+(defn connector conn/Connector []
+  (let [ups ["on-task-status-update" "on-task-artifact-update"]]
+    (assoc (conn/connector "a2a" NS (fn conn/OpResult [c: conn/OpCall] (run-op c)))
+           :op-chains [(m/->OpChains "send-stream-message" ups) (m/->OpChains "task-resubscribe" ups)]
+           :mounts server-mounts :routed ROUTED)))
+
+(def ROUTED ["task-listener" "task-stream-listener" "authorization-listener" "push-notification-config-listener"])
+
+(defrecord Served [s: Server kind: Str auth: Vec(Int) push: Vec(Int) stream: Vec(Int) flow: Int flows: Vec(m/Flow) exprs: Vec(m/Param)])
+
+(defn- server-mounts Values(Vec(conn/Mount) Vec(Str)) [app: m/App]
+  (let [fs (:flows app)]
+    (loop [i 0 acc: Vec(conn/Mount) [] errs: Vec(Str) []]
+      (if (>= i (count fs)) (values acc errs)
+        (let [srcs (:source (nth fs i))]
+          (if (= (count srcs) 0) (recur (+ i 1) acc errs)
+            (match (nth srcs 0)
+              (m/SrcConnector cn nm cref ps ch ex sch loc)
+              (if (and (= cn "a2a") (= nm "task-listener"))
+                (let [[ms me] (task-mounts app cref i ex)]
+                  (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count ms)) a (recur (+ k 1) (conj a (nth ms k)))))
+                         (loop [k 0 a errs] (if (>= k (count me)) a (recur (+ k 1) (conj a (nth me k)))))))
+                (recur (+ i 1) acc errs))
+              _ (recur (+ i 1) acc errs))))))))
+
+(defn- task-mounts Values(Vec(conn/Mount) Vec(Str)) [app: &m/App name: &Str fi: Int exs: &Vec(m/Param)]
+  (let [ss (servers app)
+        k (loop [i 0] (if (>= i (count ss)) -1 (if (= (:name (nth ss i)) name) i (recur (+ i 1)))))
+        none: Vec(conn/Mount) []]
+    (if (< k 0) (values none [(str "A2A server config '" name "' not found")])
+      (let [s (nth ss k)
+            auth (srv-source-flow app name "authorization-listener")
+            push (srv-source-flow app name "push-notification-config-listener")
+            stream (srv-source-flow app name "task-stream-listener")]
+        (cond
+          (and (> (count stream) 0) (not (:streaming s)))
+          (values none [(str "A <a2a:task-stream-listener> was defined for config " name ", but its agent card doesn't specify the streaming capability. Please update agent card or remove listener")])
+          (and (= (count stream) 0) (:streaming s))
+          (values none [(str "Agent card for config " name " specifies streaming capability, but no <a2a:task-stream-listener> was found. Please add a <a2a:task-stream-listener> or disable streaming in the agent card")])
+          (and (> (count push) 0) (not (:push s)))
+          (values none [(str "A <a2a:push-notification-config-listener> was defined for config " name ", but its agent card doesn't specify the pushNotifications capability. Please update agent card or remove listener")])
+          (and (= (count push) 0) (:push s))
+          (values none [(str "Agent card for config " name " specifies pushNotifications capability, but no <a2a:push-notification-config-listener> was found. Please add a <a2a:push-notification-config-listener> or disable pushNotifications in the agent card")])
+          (not= (:card-err s) "") (values none [(str "A2A server config '" name "': invalid agent card: " (:card-err s))])
+          :else
+          (let [rpc (->Served s "rpc" auth push stream fi (:flows app) exs)
+                card (->Served s "card" auth push stream fi (:flows app) exs)
+                none-e: Vec(Str) []]
+            (values [(conn/->Mount (:listener s) (:path s) ["POST"] true false
+                                   (fn hm/Response [ho: conn/Host at: conn/At q: hm/Request] (srv-respond ho at rpc q)))
+                     (conn/->Mount (:listener s) (hx/join-path (:path s) "/.well-known/agent-card.json") ["GET"] true false
+                                   (fn hm/Response [ho: conn/Host at: conn/At q: hm/Request] (srv-respond ho at card q)))]
+                    none-e)))))))
+
+(defn- srv-source-flow Vec(Int) [app: &m/App name: &Str source: &Str]
+  (let [fs (:flows app)]
+    (loop [i 0]
+      (if (>= i (count fs)) []
+        (let [srcs (:source (nth fs i))
+              hit (if (= (count srcs) 0) false
+                    (match (nth srcs 0)
+                      (m/SrcConnector cn nm cref ps ch ex sch loc) (and (= cn "a2a") (= nm source) (= cref name))
+                      _ false))]
+          (if hit [i] (recur (+ i 1))))))))
+
+(defn- srv-respond hm/Response [ho: &conn/Host at: &conn/At sv: &Served req: &hm/Request]
+  (let [s (:s sv)]
+    (if (= (:kind sv) "card") (assoc (hm/response 200 [(hm/->Header "Content-Type" "application/json")] (:card s) false) :reason "")
+      (let [st0 (begin-rpc s (:body req) (> (count (:auth sv)) 0))
+            st1 (if (= (:kind st0) "auth") (after-auth s st0 (srv-authorize ho at sv req st0)) st0)
+            st (if (= (:kind st1) "push") (let [[ok msg] (srv-push-config ho at sv req st1)] (after-push s st1 ok msg)) st1)
+            z (if (= (:kind st) "async") (srv-async ho at sv req st) 0)]
+        (if (= (:kind st) "stream") (srv-stream ho at sv req st)
+        (if (= (:kind st) "resub") (resubscribe s st)
+        (let [ans (if (= (:kind st) "flow") (srv-answer ho at sv req st) (:answer st))]
+        (assoc (hm/response (:status ans) (conj (:headers ans) (hm/->Header "Content-Type" "application/json")) (:body ans) false) :reason ""))))))))
+
+(defn- srv-stream hm/Response [ho: &conn/Host at: &conn/At sv: &Served req: &hm/Request st: &Step]
+  (let [s (:s sv)
+        resp (start-stream s st)]
+    (if (= (count (:stream sv)) 0) resp
+      (let [fi (nth (:stream sv) 0)
+            f (nth (:flows sv) fi)
+            e0 (ev/new-event (ev/tv-raw (:payload st) "application/json") (ev/tv-val (srv-attrs at req st) ev/JAVA) (conn/corr-id fi) (:name f))
+            ho1 ho s1 s st1 st
+            z (ops/spawn-bg (fn Int [k: Int]
+                              (let [[e x] ((:run ho1) fi e0)]
+                                (if (> (count x) 0) (stream-failed s1 st1) 0))))]
+        resp))))
+
+(defn- srv-push-config Values(Bool Str) [ho: &conn/Host at: &conn/At sv: &Served req: &hm/Request st: &Step]
+  (if (= (count (:push sv)) 0) (values true "")
+    (let [fi (nth (:push sv) 0)
+          f (nth (:flows sv) fi)
+          e0 (ev/new-event (ev/tv-raw (:payload st) "application/json") (ev/tv-val (srv-attrs at req st) ev/JAVA) (conn/corr-id fi) (:name f))
+          [e x] ((:run ho) fi e0)]
+      (if (= (count x) 0) (values true "") (values false (:description (nth x 0)))))))
+
+(defn- srv-async Int [ho: &conn/Host at: &conn/At sv: &Served req: &hm/Request st: &Step]
+  (let [ho1 ho at1 at sv1 sv q1 req st1 st]
+    (ops/spawn-bg (fn Int [k: Int]
+                    (let [s (:s sv1)
+                          ans (srv-answer ho1 at1 sv1 q1 st1)]
+                      (push-answer s st1 ans))))))
+
+(defn- srv-authorize Bool [ho: &conn/Host at: &conn/At sv: &Served req: &hm/Request st: &Step]
+  (let [fi (nth (:auth sv) 0)
+        f (nth (:flows sv) fi)
+        e0 (ev/new-event (ev/tv-raw (:payload st) "application/json") (ev/tv-val (srv-attrs at req st) ev/JAVA) (conn/corr-id fi) (:name f))
+        [e x] ((:run ho) fi e0)]
+    (= (count x) 0)))
+
+(defn- srv-attrs v/Val [at: &conn/At req: &hm/Request st: &Step]
+  (let [uri (:uri req)
+        q (str/index-of uri "?")
+        remote (let [a (:remote-addr req)] (if (= a "") "127.0.0.1:0" a))]
+    (request-attributes (:tid st) (:cid st) (:method req) (:headers req)
+                            (hx/query-params (if (< q 0) "" (subs uri (+ q 1) (count uri)))) (:scheme at)
+                            (str "/127.0.0.1:" (:port at)) (str "/" remote) (:rpc st))))
+
+(defn- srv-answer Answer [ho: &conn/Host at: &conn/At sv: &Served req: &hm/Request st: &Step]
+  (let [f (nth (:flows sv) (:flow sv))
+        attrs (srv-attrs at req st)
+        e0 (ev/new-event (ev/tv-raw (:payload st) "text/json") (ev/tv-val attrs ev/JAVA) (conn/corr-id (:flow sv)) (:name f))
+        [sp e1] (tr/start-root e0 "mule:flow" o/INTERNAL (:name f) (hm/header req "traceparent" "") (hm/header req "tracestate" "") [])
+        [e x] ((:run ho) (:flow sv) e1)
+        ans (end-rpc (:s sv) st (srv-run ho sv e x))
+        z1 (tr/add-attr! e "http.status_code" (str (:status ans)))
+        z2 (tr/add-attr! e "status.override" (if (= (:status ans) 500) "ERROR" "UNSET"))
+        z3 (tr/finish sp e x)]
+    ans))
+
+(defn- srv-run FlowOut [ho: &conn/Host sv: &Served e: ev/Event x: Vec(err/MErr)]
+  (let [exs (:exprs sv)
+        none: Vec(hm/Header) []]
+    (if (> (count x) 0)
+      (let [me (nth x 0)
+            [hs he] (srv-headers ho exs "error-response/response-headers" (ev/with-error e x))]
+        (->FlowOut false "" hs (if (= (:ns me) "A2A") (:id me) "") (:description me)))
+      (let [bp (conn/param exs "response/response")
+            [bt e2 bx] (if (= (count bp) 0) (values [(:payload e)] e []) (conn/host-eval-tv ho bp e))
+            [hs he] (srv-headers ho exs "response/response-headers" e2)]
+        (cond
+          (> (count bx) 0) (->FlowOut false "" none "" (:description (nth bx 0)))
+          (not= he "") (->FlowOut false "" none "" he)
+          :else (let [[b be] (ev/bytes (nth bt 0))]
+                  (if (not= be "") (->FlowOut false "" none "" be) (->FlowOut true b hs "" ""))))))))
+
+(defn- srv-headers Values(Vec(hm/Header) Str) [ho: &conn/Host exs: &Vec(m/Param) key: &Str e: ev/Event]
+  (let [p (conn/param exs key)]
+    (if (= (count p) 0) (let [z: Vec(hm/Header) []] (values z ""))
+      (let [[v e2 x] (conn/host-eval ho p e)]
+        (if (> (count x) 0) (let [z: Vec(hm/Header) []] (values z (:description (nth x 0))))
+          (let [[hs ct he] (hx/header-list (nth v 0))] (values (if (= ct "") hs (conj hs (hm/->Header "Content-Type" ct))) he)))))))

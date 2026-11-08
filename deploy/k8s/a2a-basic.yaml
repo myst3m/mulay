@@ -1,0 +1,23 @@
+# a2a-basic を 1 Pod で動かす例 (namespace agents-sim)。
+#   kubectl -n agents-sim create configmap a2a-basic-app --from-file=a2a-basic.xml=test/fixtures/apps/a2a-basic/src/main/mule/a2a-basic.xml
+#   kubectl -n agents-sim apply -f deploy/k8s/a2a-basic.yaml
+# アプリの XML は ConfigMap を /app/src/main/mule にマウントして渡す。エージェントごとの差は args の key=value
+# (または env。${name} が環境変数からも読まれる)。resources (config.yaml など) は /app/src/main/resources に別のマウントで。
+apiVersion: v1
+kind: Pod
+metadata: {name: a2a-basic, namespace: agents-sim, labels: {app: a2a-basic}}
+spec:
+  securityContext: {runAsUser: 1000, runAsGroup: 1000, runAsNonRoot: true}
+  containers:
+  - name: mulay
+    image: mulay:dev
+    imagePullPolicy: Never          # kind load docker-image mulay:dev --name <クラスタ名>
+    args: ["run", "/app"]           # 例: ["run", "/app", "agent.name=alice", "agent.peer=http://bob:8081"]
+    ports: [{containerPort: 18162}]
+    securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+    volumeMounts:
+    - {name: app, mountPath: /app/src/main/mule, readOnly: true}
+    - {name: work, mountPath: /work}  # 永続ストア (ObjectStore、VM) の作業ディレクトリ
+  volumes:
+  - {name: app, configMap: {name: a2a-basic-app}}
+  - {name: work, emptyDir: {}}

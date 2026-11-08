@@ -1,0 +1,59 @@
+(ns corrupt-test (:require [mulay.lib.sqlfile :as sf] [mulay.lib.sqlexec :as sx]))
+
+;; 壊れたファイル (1 バイトの書き換え、途中で切れたもの) を読んでも範囲の外を読まない (abort しない)。
+;; 失敗するなら文言は "database disk image is malformed" か、ファイルでないという理由
+
+(defn- flip Str [s: &Str i: Int x: Int] (str (subs s 0 i) (chr (bit-xor (nth s i) x)) (subs s (+ i 1) (count s))))
+
+(defn- fixture Str [name: Str] (let [[d e] (read-file (str "test/sqlfile/fixtures/" name))] d))
+
+;; 全部の表と索引を読む。返すのは失敗の数 (落ちなければよい)
+(defn- read-all Int [data: Str]
+  (let [[db e] (sf/open-bytes data)]
+    (if (not= e "") 1
+      (let [[rows se] (sf/schema db)]
+        (loop [i 0 bad (if (= se "") 0 1)]
+          (if (>= i (count rows)) bad
+            (let [r (nth rows i)
+                  e2 (if (= (:type r) "table")
+                       (let [[x e3] (sf/table-rows db (:root r))] e3)
+                       (let [[x e3] (sf/index-keys db (:root r))] e3))]
+              (recur (+ i 1) (if (= e2 "") bad (+ bad 1))))))))))
+
+(defn- fuzz Int [name: Str step: Int x: Int]
+  (let [d (fixture name)]
+    (loop [i 0 n 0] (if (>= i (count d)) n (recur (+ i step) (+ n (read-all (flip d i x))))))))
+
+(defn- cuts Int [name: Str step: Int]
+  (let [d (fixture name)]
+    (loop [i 0 n 0] (if (>= i (count d)) n (recur (+ i step) (+ n (read-all (subs d 0 i))))))))
+
+(deftest flipped-bytes
+  (is (>= (fuzz "types.db" 7 255) 0))
+  (is (>= (fuzz "worowid.db" 5 128) 0))
+  (is (>= (fuzz "many.db" 997 1) 0))
+  (is (>= (fuzz "big.db" 1009 64) 0)))
+
+(deftest truncated
+  (is (>= (cuts "many.db" 4093) 0))
+  (is (>= (cuts "big.db" 2039) 0))
+  (is (= (read-all "") 1))
+  (is (= (read-all "SQLite format 3") 1)))
+
+;; 書ける方のエンジン (sqlbtree・sqlexec) で開いても abort しない。空きページの表 (ヘッダの 32 バイト目) と
+;; 1 バイトずつの書き換え
+(defn- set-u32 Str [s: &Str at: Int v: Int]
+  (str (subs s 0 at) (chr (bit-and (bit-shift-right v 24) 255)) (chr (bit-and (bit-shift-right v 16) 255))
+       (chr (bit-and (bit-shift-right v 8) 255)) (chr (bit-and v 255)) (subs s (+ at 4) (count s))))
+
+(defn- open-n Int [data: Str] (let [[db e] (sx/open-db data)] (if (= e "") 0 1)))
+
+(deftest engine-opens-corrupt-files
+  (let [d (fixture "worowid.db")
+        a (open-n (set-u32 d 32 1))
+        b (open-n (set-u32 d 32 2))
+        n (loop [i 0 n 0] (if (>= i (count d)) n (recur (+ i 3) (+ n (open-n (flip d i 255))))))
+        m (fixture "many.db")
+        n2 (loop [i 0 n 0] (if (>= i (count m)) n (recur (+ i 997) (+ n (open-n (flip m i 1))))))
+        n3 (loop [i 0 n 0] (if (>= i (count m)) n (recur (+ i 4093) (+ n (open-n (subs m 0 i))))))]
+    (is (>= (+ a b n n2 n3) 0))))

@@ -1,0 +1,816 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18173"/>
+    </http:listener-config>
+
+    <db:config name="Pg">
+        <db:generic-connection url="jdbc:postgresql://localhost:15432/mulay" driverClassName="org.postgresql.Driver" user="mulay" password="mulay"/>
+    </db:config>
+
+    <!-- TLS の指定 (検査用のサーバーは ssl=off)。pgjdbc: sslmode が無ければ ssl=true で verify-full、それ以外は prefer -->
+    <db:config name="PgRequire">
+        <db:generic-connection url="jdbc:postgresql://localhost:15432/mulay?sslmode=require" driverClassName="org.postgresql.Driver" user="mulay" password="mulay"/>
+    </db:config>
+    <db:config name="PgSslTrue">
+        <db:generic-connection url="jdbc:postgresql://localhost:15432/mulay?ssl=true" driverClassName="org.postgresql.Driver" user="mulay" password="mulay"/>
+    </db:config>
+    <db:config name="PgPrefer">
+        <db:generic-connection url="jdbc:postgresql://localhost:15432/mulay?sslmode=prefer" driverClassName="org.postgresql.Driver" user="mulay" password="mulay"/>
+    </db:config>
+    <db:config name="PgBadMode">
+        <db:generic-connection url="jdbc:postgresql://localhost:15432/mulay?sslmode=bogus" driverClassName="org.postgresql.Driver" user="mulay" password="mulay"/>
+    </db:config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="ssl-require">
+        <http:listener config-ref="L" path="/ssl-require"/>
+        <db:select config-ref="PgRequire"><db:sql>SELECT 1 AS one</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="ssl-true">
+        <http:listener config-ref="L" path="/ssl-true"/>
+        <db:select config-ref="PgSslTrue"><db:sql>SELECT 1 AS one</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="ssl-prefer">
+        <http:listener config-ref="L" path="/ssl-prefer"/>
+        <db:select config-ref="PgPrefer"><db:sql>SELECT 1 AS one</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="ssl-bad">
+        <http:listener config-ref="L" path="/ssl-bad"/>
+        <db:select config-ref="PgBadMode"><db:sql>SELECT 1 AS one</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 表を作り直す (シナリオの最初に呼ぶ) -->
+    <flow name="reset">
+        <http:listener config-ref="L" path="/reset"/>
+        <db:execute-script config-ref="Pg">
+            <db:sql><![CDATA[DROP FUNCTION IF EXISTS people();
+DROP TABLE IF EXISTS person;
+CREATE TABLE person (id SERIAL PRIMARY KEY, name TEXT NOT NULL, age INT, score NUMERIC(8,2), active BOOLEAN, born DATE, seen TIMESTAMP, seen_tz TIMESTAMPTZ, big BIGINT, blob BYTEA);
+INSERT INTO person (name, age, score, active, born, seen, seen_tz, big, blob) VALUES
+ ('Ann', 30, 12.50, true, '1996-01-02', '2026-09-30 10:11:12.345', '2026-09-30 10:11:12+09', 9007199254740993, '\x0102ff'),
+ ('Bob', NULL, NULL, false, NULL, NULL, NULL, NULL, NULL),
+ ('Cid', 41, 100, true, '1985-12-31', '2026-01-01 00:00:00', '2026-01-01 00:00:00Z', -5, '')]]></db:sql>
+        </db:execute-script>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <!-- select: 行の値とその型 -->
+    <!-- select の maxRows -->
+    <flow name="select-max">
+        <http:listener config-ref="L" path="/select-max"/>
+        <db:select config-ref="Pg" maxRows="#[attributes.queryParams.n as Number]">
+            <db:sql>SELECT id, name FROM person ORDER BY id</db:sql>
+        </db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="select">
+        <http:listener config-ref="L" path="/select"/>
+        <db:select config-ref="Pg">
+            <db:sql>SELECT * FROM person ORDER BY id</db:sql>
+        </db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="select-types">
+        <http:listener config-ref="L" path="/select-types"/>
+        <db:select config-ref="Pg">
+            <db:sql>SELECT * FROM person ORDER BY id</db:sql>
+        </db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map ((row) -> row mapObject ((v, k) -> {(k): {t: typeOf(v) as String, c: v.^class default null}}))]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="select-param">
+        <http:listener config-ref="L" path="/select-param"/>
+        <db:select config-ref="Pg">
+            <db:sql>SELECT id, name FROM person WHERE age &gt; :min AND name &lt;&gt; :skip ORDER BY id</db:sql>
+            <db:input-parameters><![CDATA[#[{min: attributes.queryParams.min as Number, skip: 'nobody'}]]]></db:input-parameters>
+        </db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="insert">
+        <http:listener config-ref="L" path="/insert"/>
+        <db:insert config-ref="Pg" autoGenerateKeys="true">
+            <db:sql>INSERT INTO person (name, age) VALUES (:name, :age)</db:sql>
+            <db:input-parameters><![CDATA[#[{name: 'Dee', age: 22}]]]></db:input-parameters>
+        </db:insert>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="update">
+        <http:listener config-ref="L" path="/update"/>
+        <db:update config-ref="Pg">
+            <db:sql>UPDATE person SET age = age + 1 WHERE age IS NOT NULL</db:sql>
+        </db:update>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="delete">
+        <http:listener config-ref="L" path="/delete"/>
+        <db:delete config-ref="Pg">
+            <db:sql>DELETE FROM person WHERE name = :n</db:sql>
+            <db:input-parameters><![CDATA[#[{n: 'Dee'}]]]></db:input-parameters>
+        </db:delete>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="bulk-insert">
+        <http:listener config-ref="L" path="/bulk-insert"/>
+        <db:bulk-insert config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[[{name: 'E1', age: 1}, {name: 'E2', age: 2}]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO person (name, age) VALUES (:name, :age)</db:sql>
+        </db:bulk-insert>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="query-single">
+        <http:listener config-ref="L" path="/query-single"/>
+        <db:query-single config-ref="Pg">
+            <db:sql>SELECT count(*) AS n, max(age) AS oldest FROM person</db:sql>
+        </db:query-single>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <!-- 失敗: SQL の誤り、無い表、制約違反 -->
+    <flow name="err-syntax">
+        <http:listener config-ref="L" path="/err-syntax"/>
+        <db:select config-ref="Pg"><db:sql>SELEC 1</db:sql></db:select>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="err-table">
+        <http:listener config-ref="L" path="/err-table"/>
+        <db:select config-ref="Pg"><db:sql>SELECT * FROM nothing_here</db:sql></db:select>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="err-constraint">
+        <http:listener config-ref="L" path="/err-constraint"/>
+        <db:insert config-ref="Pg"><db:sql>INSERT INTO person (name) VALUES (NULL)</db:sql></db:insert>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- ストアドプロシージャ: 作る -->
+    <flow name="sp-setup">
+        <http:listener config-ref="L" path="/sp-setup"/>
+        <db:execute-ddl config-ref="Pg"><db:sql><![CDATA[CREATE OR REPLACE PROCEDURE add_one(a int, INOUT b int DEFAULT NULL) LANGUAGE plpgsql AS $$ BEGIN b := a + 1; END $$]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="Pg"><db:sql><![CDATA[CREATE OR REPLACE PROCEDURE touch_bob() LANGUAGE sql AS $$ UPDATE person SET age = 7 WHERE name = 'Bob' $$]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="Pg"><db:sql><![CDATA[CREATE OR REPLACE FUNCTION info(n text, OUT len int, OUT up text) LANGUAGE sql AS $$ SELECT length(n), upper(n) $$]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="Pg"><db:sql><![CDATA[CREATE OR REPLACE FUNCTION bump(a int, INOUT b int) LANGUAGE sql AS $$ SELECT a + b $$]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="Pg"><db:sql><![CDATA[CREATE OR REPLACE FUNCTION twice(x int) RETURNS int LANGUAGE sql AS $$ SELECT x * 2 $$]]></db:sql></db:execute-ddl>
+        <db:execute-ddl config-ref="Pg"><db:sql><![CDATA[CREATE OR REPLACE FUNCTION people() RETURNS SETOF person LANGUAGE sql AS $$ SELECT * FROM person ORDER BY id $$]]></db:sql></db:execute-ddl>
+        <set-payload value="#['ok']"/>
+    </flow>
+
+    <!-- INOUT (プロシージャ) -->
+    <flow name="sp-out">
+        <http:listener config-ref="L" path="/sp-out"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{call add_one(:a, :b)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{a: 41}]]]></db:input-parameters>
+            <db:output-parameters>
+                <db:output-parameter key="b" type="INTEGER"/>
+            </db:output-parameters>
+        </db:stored-procedure>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload mapObject ((v, k) -> {(k): {v: v, t: typeOf(v) as String, c: v.^class default null}})]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="sp-inout">
+        <http:listener config-ref="L" path="/sp-inout"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{call add_one(:a, :b)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{a: 1}]]]></db:input-parameters>
+            <db:in-out-parameters>
+                <db:in-out-parameter key="b" value="#[5]"/>
+            </db:in-out-parameters>
+        </db:stored-procedure>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload mapObject ((v, k) -> {(k): {v: v, t: typeOf(v) as String, c: v.^class default null}})]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <!-- 実 Mule は解決したテンプレートを db:config ごとに SQL の文面で覚え、引数の種類 (IN / OUT / IN-OUT) は最初の
+         呼び出しのものを使い続ける (DbConnectionProvider の cachedTemplates)。/sp-out の後の /sp-inout は b を OUT として
+         送る。ここでは別の文面 (空白が 2 つ) で、先に IN-OUT、次に OUTPUT で呼ぶ -->
+    <flow name="spc-inout">
+        <http:listener config-ref="L" path="/spc-inout"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{call  add_one(:a, :b)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{a: 1}]]]></db:input-parameters>
+            <db:in-out-parameters>
+                <db:in-out-parameter key="b" value="#[5]"/>
+            </db:in-out-parameters>
+        </db:stored-procedure>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="spc-out">
+        <http:listener config-ref="L" path="/spc-out"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{call  add_one(:a, :b)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{a: 41}]]]></db:input-parameters>
+            <db:output-parameters>
+                <db:output-parameter key="b" type="INTEGER"/>
+            </db:output-parameters>
+        </db:stored-procedure>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="sp-none">
+        <http:listener config-ref="L" path="/sp-none"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{call touch_bob()}]]></db:sql>
+        </db:stored-procedure>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload mapObject ((v, k) -> {(k): {v: v, t: typeOf(v) as String, c: v.^class default null}})]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="sp-multi">
+        <http:listener config-ref="L" path="/sp-multi"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{call info(:n, :len, :up)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{n: 'abc'}]]]></db:input-parameters>
+            <db:output-parameters>
+                <db:output-parameter key="len" type="INTEGER"/>
+                <db:output-parameter key="up" type="VARCHAR"/>
+            </db:output-parameters>
+        </db:stored-procedure>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload mapObject ((v, k) -> {(k): {v: v, t: typeOf(v) as String, c: v.^class default null}})]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="sp-func">
+        <http:listener config-ref="L" path="/sp-func"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{:r = call twice(:x)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{x: 21}]]]></db:input-parameters>
+            <db:output-parameters>
+                <db:output-parameter key="r" type="INTEGER"/>
+            </db:output-parameters>
+        </db:stored-procedure>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload mapObject ((v, k) -> {(k): {v: v, t: typeOf(v) as String, c: v.^class default null}})]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="sp-set">
+        <http:listener config-ref="L" path="/sp-set"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{call people()}]]></db:sql>
+        </db:stored-procedure>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="sp-missing">
+        <http:listener config-ref="L" path="/sp-missing"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{call nothing_here(:a)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{a: 1}]]]></db:input-parameters>
+        </db:stored-procedure>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="sp-inout-func">
+        <http:listener config-ref="L" path="/sp-inout-func"/>
+        <db:stored-procedure config-ref="Pg">
+            <db:sql><![CDATA[{call bump(:a, :b)}]]></db:sql>
+            <db:input-parameters><![CDATA[#[{a: 1}]]]></db:input-parameters>
+            <db:in-out-parameters>
+                <db:in-out-parameter key="b" value="#[5]"/>
+            </db:in-out-parameters>
+        </db:stored-procedure>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload mapObject ((v, k) -> {(k): {v: v, t: typeOf(v) as String, c: v.^class default null}})]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+    <!-- execute-script の途中の文の失敗 -->
+    <flow name="err-script">
+        <http:listener config-ref="L" path="/err-script"/>
+        <db:execute-script config-ref="Pg">
+            <db:sql><![CDATA[UPDATE person SET age = age WHERE 1 = 0;
+SELECT * FROM nothing_here;
+UPDATE person SET age = age WHERE 1 = 0]]></db:sql>
+        </db:execute-script>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="err-script2">
+        <http:listener config-ref="L" path="/err-script2"/>
+        <db:execute-script config-ref="Pg">
+            <db:sql><![CDATA[UPDATE person SET age = age WHERE 1 = 0;
+INSERT INTO person (name) VALUES (NULL);
+UPDATE person SET age = age WHERE 1 = 0]]></db:sql>
+        </db:execute-script>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="err-script-semi">
+        <http:listener config-ref="L" path="/err-script-semi"/>
+        <db:execute-script config-ref="Pg">
+            <db:sql><![CDATA[UPDATE person SET age = age WHERE 1 = 0;
+INSERT INTO nothing_here VALUES (1);]]></db:sql>
+        </db:execute-script>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="err-script-space-semi">
+        <http:listener config-ref="L" path="/err-script-space-semi"/>
+        <db:execute-script config-ref="Pg">
+            <db:sql><![CDATA[UPDATE person SET age = age WHERE 1 = 0;
+INSERT INTO nothing_here VALUES (1) ;  ]]></db:sql>
+        </db:execute-script>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="script-select">
+        <http:listener config-ref="L" path="/script-select"/>
+        <db:execute-script config-ref="Pg">
+            <db:sql><![CDATA[UPDATE person SET age = age WHERE 1 = 0;
+SELECT name FROM person WHERE 1 = 0]]></db:sql>
+        </db:execute-script>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- トランザクション: try の transactionalAction -->
+    <flow name="tx-ok">
+        <http:listener config-ref="L" path="/tx-ok"/>
+        <try transactionalAction="ALWAYS_BEGIN">
+            <db:insert config-ref="Pg"><db:sql>INSERT INTO person (name) VALUES ('T1')</db:sql></db:insert>
+            <db:insert config-ref="Pg"><db:sql>INSERT INTO person (name) VALUES ('T2')</db:sql></db:insert>
+        </try>
+        <db:select config-ref="Pg"><db:sql>SELECT name FROM person WHERE name LIKE 'T%' ORDER BY name</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="tx-rollback">
+        <http:listener config-ref="L" path="/tx-rollback"/>
+        <try>
+            <try transactionalAction="ALWAYS_BEGIN">
+                <db:insert config-ref="Pg"><db:sql>INSERT INTO person (name) VALUES ('R1')</db:sql></db:insert>
+                <raise-error type="APP:FAIL" description="fail in tx"/>
+            </try>
+            <error-handler><on-error-continue><set-payload value="#['caught']"/></on-error-continue></error-handler>
+        </try>
+        <db:select config-ref="Pg"><db:sql>SELECT name FROM person WHERE name LIKE 'R%' ORDER BY name</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="tx-continue">
+        <http:listener config-ref="L" path="/tx-continue"/>
+        <try transactionalAction="ALWAYS_BEGIN">
+            <db:insert config-ref="Pg"><db:sql>INSERT INTO person (name) VALUES ('C1')</db:sql></db:insert>
+            <raise-error type="APP:FAIL" description="fail in tx"/>
+            <error-handler><on-error-continue><set-payload value="#['continued']"/></on-error-continue></error-handler>
+        </try>
+        <db:select config-ref="Pg"><db:sql>SELECT name FROM person WHERE name LIKE 'C%' ORDER BY name</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="tx-notsupported">
+        <http:listener config-ref="L" path="/tx-notsupported"/>
+        <try>
+            <try transactionalAction="ALWAYS_BEGIN">
+                <db:insert config-ref="Pg" transactionalAction="NOT_SUPPORTED"><db:sql>INSERT INTO person (name) VALUES ('N1')</db:sql></db:insert>
+                <db:insert config-ref="Pg"><db:sql>INSERT INTO person (name) VALUES ('N2')</db:sql></db:insert>
+                <raise-error type="APP:FAIL" description="fail in tx"/>
+            </try>
+            <error-handler><on-error-continue><set-payload value="#['caught']"/></on-error-continue></error-handler>
+        </try>
+        <db:select config-ref="Pg"><db:sql>SELECT name FROM person WHERE name LIKE 'N%' ORDER BY name</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="tx-sees-own">
+        <http:listener config-ref="L" path="/tx-sees-own"/>
+        <try transactionalAction="ALWAYS_BEGIN">
+            <db:insert config-ref="Pg"><db:sql>INSERT INTO person (name) VALUES ('S1')</db:sql></db:insert>
+            <db:select config-ref="Pg"><db:sql>SELECT count(*) AS n FROM person WHERE name = 'S1'</db:sql></db:select>
+            <set-variable variableName="inside" value="#[payload[0].n]"/>
+            <raise-error type="APP:FAIL" description="undo"/>
+            <error-handler><on-error-propagate/></error-handler>
+        </try>
+        <error-handler>
+            <on-error-continue>
+                <db:select config-ref="Pg"><db:sql>SELECT count(*) AS n FROM person WHERE name = 'S1'</db:sql></db:select>
+                <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{inside: vars.inside, after: payload[0].n}]]></ee:set-payload></ee:message></ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- bulk 操作: 件数の配列、途中の行の失敗 (それまでの行が残るか)、空の入力、トランザクションの中の失敗 -->
+    <flow name="bulk-setup">
+        <http:listener config-ref="L" path="/bulk-setup"/>
+        <db:execute-script config-ref="Pg">
+            <db:sql><![CDATA[DROP TABLE IF EXISTS bulk_t;
+CREATE TABLE bulk_t (id INTEGER PRIMARY KEY, name VARCHAR(20) NOT NULL, n INTEGER DEFAULT 0)]]></db:sql>
+        </db:execute-script>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="bulk-rows">
+        <http:listener config-ref="L" path="/bulk-rows"/>
+        <db:select config-ref="Pg"><db:sql>SELECT id, name, n FROM bulk_t ORDER BY id</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map {id: $.id default $.ID, name: $.name default $.NAME, n: $.n default $.N}]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+
+    <flow name="bulk-ok">
+        <http:listener config-ref="L" path="/bulk-ok"/>
+        <db:bulk-insert config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 1, name: 'a'}, {id: 2, name: 'b'}, {id: 3, name: 'c'}, {id: 4, name: 'd'}]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO bulk_t (id, name) VALUES (:id, :name)</db:sql>
+        </db:bulk-insert>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="bulk-upd">
+        <http:listener config-ref="L" path="/bulk-upd"/>
+        <db:bulk-update config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[[{min: 1}, {min: 3}, {min: 99}]]]]></db:bulk-input-parameters>
+            <db:sql>UPDATE bulk_t SET n = n + 1 WHERE id &gt;= :min</db:sql>
+        </db:bulk-update>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="bulk-null">
+        <http:listener config-ref="L" path="/bulk-null"/>
+        <db:bulk-insert config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 10, name: 'x'}, {id: 11, name: null}, {id: 12, name: 'z'}]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO bulk_t (id, name) VALUES (:id, :name)</db:sql>
+        </db:bulk-insert>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="bulk-dup">
+        <http:listener config-ref="L" path="/bulk-dup"/>
+        <db:bulk-insert config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 20, name: 'p'}, {id: 1, name: 'dup'}, {id: 21, name: 'q'}]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO bulk_t (id, name) VALUES (:id, :name)</db:sql>
+        </db:bulk-insert>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="bulk-empty">
+        <http:listener config-ref="L" path="/bulk-empty"/>
+        <db:bulk-insert config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[[]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO bulk_t (id, name) VALUES (:id, :name)</db:sql>
+        </db:bulk-insert>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="bulk-del">
+        <http:listener config-ref="L" path="/bulk-del"/>
+        <db:bulk-delete config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 2}, {id: 99}, {id: 3}]]]]></db:bulk-input-parameters>
+            <db:sql>DELETE FROM bulk_t WHERE id = :id</db:sql>
+        </db:bulk-delete>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="bulk-tx">
+        <http:listener config-ref="L" path="/bulk-tx"/>
+        <try>
+            <try transactionalAction="ALWAYS_BEGIN">
+                <db:bulk-insert config-ref="Pg">
+                    <db:bulk-input-parameters><![CDATA[#[[{id: 30, name: 't1'}, {id: 31, name: 't2'}]]]]></db:bulk-input-parameters>
+                    <db:sql>INSERT INTO bulk_t (id, name) VALUES (:id, :name)</db:sql>
+                </db:bulk-insert>
+                <db:bulk-insert config-ref="Pg">
+                    <db:bulk-input-parameters><![CDATA[#[[{id: 32, name: 't3'}, {id: 30, name: 'dup'}]]]]></db:bulk-input-parameters>
+                    <db:sql>INSERT INTO bulk_t (id, name) VALUES (:id, :name)</db:sql>
+                </db:bulk-insert>
+            </try>
+            <error-handler><on-error-continue><set-payload value="#['caught']"/></on-error-continue></error-handler>
+        </try>
+        <db:select config-ref="Pg"><db:sql>SELECT COUNT(*) AS c FROM bulk_t WHERE id &gt;= 30</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload[0].c default payload[0].C]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+    <flow name="bulk-notable">
+        <http:listener config-ref="L" path="/bulk-notable"/>
+        <db:bulk-insert config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 1}, {id: 2}]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO no_such_table (id) VALUES (:id)</db:sql>
+        </db:bulk-insert>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- 失敗した組の値を SQL に埋め込んだ形 (pgjdbc の BatchUpdateException の文言) -->
+    <flow name="bulk-types">
+        <http:listener config-ref="L" path="/bulk-types"/>
+        <db:bulk-insert config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[[{id: 1, s: "it's", f: 1.5, b: true, big: 9007199254740993, dbl: 0.1 as Number, neg: -7, d: |2026-10-03|, dt: |2026-10-03T10:11:12|, n: null}]]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO bulk_t (id, name) VALUES (:id, CAST(:s AS VARCHAR) || CAST(:f AS VARCHAR) || CAST(:b AS VARCHAR) || CAST(:big AS VARCHAR) || CAST(:dbl AS VARCHAR) || CAST(:neg AS VARCHAR) || CAST(:d AS VARCHAR) || CAST(:dt AS VARCHAR) || CAST(:n AS VARCHAR))</db:sql>
+        </db:bulk-insert>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- pgjdbc の executeBatch (bulk-* と execute-script): 文を続けて送り、Sync は先頭の 255 文の後、その後は 256 文ごとと最後
+         (Sync までが 1 つのトランザクション)。失敗すると、その区切りの中の前の文は取り消され、前の区切りまでは残る -->
+    <flow name="script-tx-setup">
+        <http:listener config-ref="L" path="/script-tx-setup"/>
+        <db:execute-script config-ref="Pg">
+            <db:sql><![CDATA[DROP TABLE IF EXISTS script_t;
+CREATE TABLE script_t (id INTEGER PRIMARY KEY)]]></db:sql>
+        </db:execute-script>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+    <!-- n 文の INSERT (id は from から)。dup が 0 でなければ dup 番目 (1 から) の文の id を from にする (重複で失敗) -->
+    <flow name="script-tx">
+        <http:listener config-ref="L" path="/script-tx"/>
+        <db:execute-script config-ref="Pg">
+            <db:sql><![CDATA[#[%dw 2.0
+var q = attributes.queryParams
+var from = q.from as Number
+---
+((1 to (q.n as Number)) map ((i) -> "INSERT INTO script_t VALUES (" ++ ((if (i == (q.dup default "0") as Number) from else from + i - 1) as String) ++ ")")) joinBy ";\n"]]]></db:sql>
+        </db:execute-script>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{n: sizeOf(payload), sum: sum(payload)}]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="script-tx-count">
+        <http:listener config-ref="L" path="/script-tx-count"/>
+        <db:select config-ref="Pg">
+            <db:sql>SELECT count(*) AS c, coalesce(max(id), 0) AS m FROM script_t</db:sql>
+        </db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload[0]]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+    <!-- n 組の INSERT (id は from から)。dup が 0 でなければ dup 番目 (1 から) の組の id を from にする (重複で失敗) -->
+    <flow name="bulk-tx-n">
+        <http:listener config-ref="L" path="/bulk-tx-n"/>
+        <db:bulk-insert config-ref="Pg">
+            <db:bulk-input-parameters><![CDATA[#[%dw 2.0
+var q = attributes.queryParams
+var from = q.from as Number
+---
+(1 to (q.n as Number)) map ((i) -> {id: if (i == (q.dup default "0") as Number) from else from + i - 1})]]]></db:bulk-input-parameters>
+            <db:sql>INSERT INTO script_t VALUES (:id)</db:sql>
+        </db:bulk-insert>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{n: sizeOf(payload), sum: sum(payload)}]]></ee:set-payload></ee:message></ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- queryTimeout / queryTimeoutUnit: かかった時間は 1.5 秒より速いか (fast / slow) だけを返す -->
+    <db:config name="PgOne">
+        <db:generic-connection url="jdbc:postgresql://localhost:15432/mulay" driverClassName="org.postgresql.Driver" user="mulay" password="mulay">
+            <db:pooling-profile maxPoolSize="1"/>
+        </db:generic-connection>
+    </db:config>
+    <error-handler name="qt-report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        </on-error-continue>
+    </error-handler>
+    <flow name="qt-select">
+        <http:listener config-ref="L" path="/qt/select"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="Pg" queryTimeout="1"><db:sql>SELECT 1 AS x FROM pg_sleep(3)</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-select-ok">
+        <http:listener config-ref="L" path="/qt/select-ok"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="Pg" queryTimeout="5"><db:sql>SELECT 1 AS x FROM pg_sleep(0.2)</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-millis">
+        <http:listener config-ref="L" path="/qt/millis"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="Pg" queryTimeout="500" queryTimeoutUnit="MILLISECONDS"><db:sql>SELECT 1 AS x FROM pg_sleep(2)</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-millis-1500">
+        <http:listener config-ref="L" path="/qt/millis-1500"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="Pg" queryTimeout="1500" queryTimeoutUnit="MILLISECONDS"><db:sql>SELECT 1 AS x FROM pg_sleep(3)</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-minutes">
+        <http:listener config-ref="L" path="/qt/minutes"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="Pg" queryTimeout="1" queryTimeoutUnit="MINUTES"><db:sql>SELECT 1 AS x FROM pg_sleep(0.2)</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-expr">
+        <http:listener config-ref="L" path="/qt/expr"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="Pg" queryTimeout="#[1]"><db:sql>SELECT 1 AS x FROM pg_sleep(3)</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-zero">
+        <http:listener config-ref="L" path="/qt/zero"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="Pg" queryTimeout="0"><db:sql>SELECT 1 AS x FROM pg_sleep(0.2)</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-negative">
+        <http:listener config-ref="L" path="/qt/negative"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:select config-ref="Pg" queryTimeout="-1"><db:sql>SELECT 1 AS x FROM pg_sleep(0.2)</db:sql></db:select>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-query-single">
+        <http:listener config-ref="L" path="/qt/query-single"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:query-single config-ref="Pg" queryTimeout="1"><db:sql>SELECT 1 AS x FROM pg_sleep(3)</db:sql></db:query-single>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-reuse">
+        <http:listener config-ref="L" path="/qt/reuse"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <try>
+            <db:select config-ref="PgOne" queryTimeout="1"><db:sql>SELECT 1 AS x FROM pg_sleep(3)</db:sql></db:select>
+            <error-handler><on-error-continue><set-variable variableName="first" value="#[error.description]"/></on-error-continue></error-handler>
+        </try>
+        <db:select config-ref="PgOne"><db:sql>SELECT 2 AS y</db:sql></db:select>
+        <set-payload value="#[output application/java --- {first: vars.first, second: payload}]"/>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-insert">
+        <http:listener config-ref="L" path="/qt/insert"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:execute-ddl config-ref="Pg"><db:sql>CREATE TABLE IF NOT EXISTS qt_t (x int)</db:sql></db:execute-ddl>
+        <db:insert config-ref="Pg" queryTimeout="1"><db:sql>INSERT INTO qt_t SELECT 1 FROM pg_sleep(3)</db:sql></db:insert>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-bulk">
+        <http:listener config-ref="L" path="/qt/bulk"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:execute-ddl config-ref="Pg"><db:sql>CREATE TABLE IF NOT EXISTS qt_t (x int)</db:sql></db:execute-ddl>
+        <db:bulk-insert config-ref="Pg" queryTimeout="1"><db:bulk-input-parameters>#[[{x: 1}, {x: 2}]]</db:bulk-input-parameters><db:sql>INSERT INTO qt_t SELECT :x FROM pg_sleep(0.8)</db:sql></db:bulk-insert>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-script">
+        <http:listener config-ref="L" path="/qt/script"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:execute-script config-ref="Pg" queryTimeout="1"><db:sql>DO $$ BEGIN PERFORM pg_sleep(3); END $$;</db:sql></db:execute-script>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-ddl">
+        <http:listener config-ref="L" path="/qt/ddl"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:execute-ddl config-ref="Pg" queryTimeout="1"><db:sql>DO $$ BEGIN PERFORM pg_sleep(3); END $$</db:sql></db:execute-ddl>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+    <flow name="qt-proc">
+        <http:listener config-ref="L" path="/qt/proc"/>
+        <set-variable variableName="t0" value="#[now()]"/>
+        <db:stored-procedure config-ref="Pg" queryTimeout="1"><db:sql>{call pg_sleep(3)}</db:sql></db:stored-procedure>
+        <set-payload value="#[output application/json --- {result: payload, speed: if (((now() as Number {unit: 'milliseconds'}) - (vars.t0 as Number {unit: 'milliseconds'})) &lt; 1500) 'fast' else 'slow'}]"/>
+        <error-handler ref="qt-report"/>
+    </flow>
+
+</mule>

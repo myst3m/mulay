@@ -1,0 +1,73 @@
+(ns mulay.db.sqltext (:require [mulay.lib.regex :as rx] [clay.string :as str]))
+
+(defrecord Template [sql: Str names: Vec(Str) kind: Str])
+
+(def DETECTORS
+  [["SELECT" "SELECT\\s+.+"]
+   ["INSERT" "INSERT\\s+.+"]
+   ["DELETE" "DELETE\\s+.+"]
+   ["UPDATE" "UPDATE\\s+.+"]
+   ["STORE_PROCEDURE_CALL" "(\\{\\s*)?(:\\S+\\s*=)?\\s*CALL\\s* \\s*.*"]
+   ["TRUNCATE" "TRUNCATE TABLE\\s+.+"]
+   ["MERGE" "MERGE\\s+.+"]
+   ["SELECT" "WITH\\s+.+"]])
+
+(def FLAGS 40)
+
+(defn query-type Str [sql0: &Str]
+  (let [s (str/upper-case (str/trim sql0))]
+    (loop [i 0]
+      (if (>= i (count DETECTORS)) "DDL"
+        (let [d (nth DETECTORS i)
+              [re e] (rx/compile (nth d 1) FLAGS)
+              [ok e2] (if (= e "") (rx/matches? re s) (values false e))]
+          (if ok (nth d 0) (recur (+ i 1))))))))
+
+(def SEPARATORS "\"':&,;()|=+-*%/\\<>^")
+
+(defn- separator? Bool [c: Int]
+  (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 11) (= c 12)
+      (>= (str/index-of SEPARATORS (chr c)) 0)))
+
+(defn- skip-at Int [s: &Str i: Int]
+  (let [n (count s)
+        c (nth s i)
+        [open close] (cond (= c 39) (values "'" "'")
+                           (= c 34) (values "\"" "\"")
+                           (and (= c 45) (< (+ i 1) n) (= (nth s (+ i 1)) 45)) (values "--" "\n")
+                           (and (= c 47) (< (+ i 1) n) (= (nth s (+ i 1)) 42)) (values "/*" "*/")
+                           :else (values "" ""))]
+    (if (= open "") i
+      (let [e (str/index-of-after s close (+ i (count open)))]
+        (if (< e 0) n (+ e (count close)))))))
+
+(def PARSED-MAX 256)
+(def PARSED: Atom(Map(Str Template)) (atom (let [m: Map(Str Template) {}] m)))
+
+(defn- remember Map(Str Template) [m: Map(Str Template) k: Str t: Template]
+  (if (>= (count m) PARSED-MAX) (let [e: Map(Str Template) {}] (assoc e k t)) (assoc m k t)))
+
+(defn parse Template [sql0: &Str]
+  (let [m (deref PARSED)]
+    (if (contains? m sql0) (get! m sql0)
+      (let [t (parse-text sql0) z (swap! PARSED remember (str sql0) (->Template (:sql t) (:names t) (:kind t)))] t))))
+
+(defn- parse-text Template [sql0: &Str]
+  (let [s (str/trim sql0)
+        n (count s)]
+    (loop [i 0 out "" names: Vec(Str) []]
+      (if (>= i n) (->Template out names (query-type s))
+        (let [j (skip-at s i)]
+          (if (> j i) (recur j (str out (subs s i j)) names)
+            (let [c (nth s i)]
+              (cond
+                (and (= c 92) (< (+ i 1) n) (= (nth s (+ i 1)) 58)) (recur (+ i 2) (str out ":") names)
+                (= c 58)
+                (cond
+                  (and (< (+ i 1) n) (= (nth s (+ i 1)) 61)) (recur (+ i 1) (str out ":") names)
+                  (and (< (+ i 1) n) (= (nth s (+ i 1)) 58)) (recur (+ i 2) (str out "::") names)
+                  :else (let [e (loop [k (+ i 1)] (if (and (< k n) (not (separator? (nth s k)))) (recur (+ k 1)) k))]
+                          (if (> (- e i) 1) (recur e (str out "?") (conj names (subs s (+ i 1) e)))
+                            (recur e out names))))
+                (= c 63) (recur (+ i 1) (str out "?") (conj names ""))
+                :else (recur (+ i 1) (str out (subs s i (+ i 1))) names)))))))))

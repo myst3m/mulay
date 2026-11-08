@@ -1,0 +1,500 @@
+(ns mulay.conn.file
+  (:require [mulay.dw.val :as v] [mulay.dw.fmt.registry :as reg] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.stream :as stream] [mulay.rt.bodies :as bodies] [mulay.lib.spool :as spool]
+            [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.lib.xml :as xml] [mulay.lib.fs :as fs]
+            [mulay.lib.glob :as glob] [mulay.lib.regex :as rx] [mulay.lib.numparse :as npz]
+            [mulay.lib.time.tz :as tzr] [mulay.lib.time.zoned :as zt] [mulay.lib.time.types :as tt]
+            [mulay.lib.time.iso :as iso] [mulay.lib.time.local :as tl]
+            [clay.io :as io] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/file")
+
+(def ATTR-CLASS "org.mule.extension.file.api.LocalFileAttributes")
+
+(defn- ferr err/MErr [id: Str desc: Str] (err/mk "FILE" id desc))
+(defn- failure conn/OpResult [x: &Vec(err/MErr)] (conn/fail-result (nth x 0)))
+
+(def MIME-TYPES
+  [["text/plain" "txt" "cgi"] ["text/json" "json"] ["text/xml" "xml"] ["text/html" "htm" "html" "shtml"]
+   ["text/csv" "csv"] ["application/octet-stream" "bin" "class"] ["application/postscript" "ps" "eps" "ai"]
+   ["application/pdf" "pdf"] ["image/x-xbitmap" "xbm"] ["image/x-xpixmap" "xpm"] ["image/x-xwindowdump" "xwd"]
+   ["image/x-cmu-raster" "ras"] ["image/x-portable-anymap" "pnm"] ["image/x-portable-bitmap" "pbm"]
+   ["image/x-portable-graymap" "pgm"] ["image/x-rgb" "rgb"] ["image/gif" "gif"] ["image/jpeg" "jpeg" "jpe" "jpg"]
+   ["image/tiff" "tiff" "tif"] ["audio/basic" "au" "snd"] ["audio/x-wav" "wav"] ["video/mpeg" "mpeg" "mpe" "mpg"]
+   ["video/quicktime" "mov" "qt"] ["video/x-sgi-movie" "movie"] ["application/java" "java"] ["application/x-csh" "csh"]
+   ["application/x-sh" "sh"] ["application/x-tcl" "tcl"] ["application/x-shar" "shar"] ["application/x-tar" "tar"]
+   ["application/x-dvi" "dvi"] ["application/x-hdf" "hdf"] ["application/x-x509-ca-cert" "cer" "cert"]
+   ["multipart/x-zip" "zip"] ["application/zip" "zip"]])
+
+(def MIME-DEFAULT
+  [["text/html" "html" "htm" "HTML" "HTM"] ["text/plain" "txt" "text" "TXT" "TEXT"] ["image/gif" "gif" "GIF"]
+   ["image/ief" "ief"] ["image/jpeg" "jpeg" "jpg" "jpe" "JPG"] ["image/tiff" "tiff" "tif"] ["image/png" "png" "PNG"]
+   ["image/x-xwindowdump" "xwd"] ["application/postscript" "ai" "eps" "ps"] ["application/rtf" "rtf"]
+   ["application/x-tex" "tex"] ["application/x-texinfo" "texinfo" "texi"] ["application/x-troff" "t" "tr" "roff"]
+   ["audio/basic" "au"] ["audio/midi" "midi" "mid"] ["audio/x-aifc" "aifc"] ["audio/x-aiff" "aif" "aiff"]
+   ["audio/x-mpeg" "mpeg" "mpg"] ["audio/x-wav" "wav"] ["video/mpeg" "mpeg" "mpg" "mpe"] ["video/quicktime" "qt" "mov"]
+   ["video/x-msvideo" "avi"]])
+
+(defn- lookup-ext Str [table: &Vec(Vec(Str)) ext: &Str first-wins: Bool]
+  (loop [i 0 found ""]
+    (if (>= i (count table)) found
+      (let [row (nth table i)
+            hit (loop [k 1] (if (>= k (count row)) false (if (= (nth row k) ext) true (recur (+ k 1)))))]
+        (if (and hit first-wins) (nth row 0) (recur (+ i 1) (if hit (nth row 0) found)))))))
+
+(defn mime-of-name Str [name: &Str]
+  (let [k (loop [i (- (count name) 1)] (if (< i 0) -1 (if (= (nth name i) 46) i (recur (- i 1)))))
+        ext (if (< k 0) "" (subs name (+ k 1) (count name)))]
+    (if (= ext "") "application/octet-stream"
+      (let [a (lookup-ext MIME-TYPES ext false)]
+        (if (not= a "") a
+          (let [b (lookup-ext MIME-DEFAULT ext true)] (if (not= b "") b "application/octet-stream")))))))
+
+(defn- data-mime Str [out-mime: &Str out-enc: &Str name: &Str]
+  (let [base (if (= out-mime "") (mime-of-name name) (str out-mime))
+        enc (if (= out-enc "") "UTF-8" (str out-enc))]
+    (if (str/includes? (str/lower-case base) "charset=") base (str base "; charset=" enc))))
+
+(defn- home Str [] (let [h (getenv "HOME" "")] (if (= h "") "/" h)))
+
+(defn- working-dir Str [cfg: &Vec(m/Config)]
+  (if (= (count cfg) 0) (home)
+    (let [cn (conn/child-elem (:children (nth cfg 0)) "connection")
+          wd (if (= (count cn) 0) "" (xml/attr (nth cn 0) "" "workingDir" ""))]
+      (if (= wd "") (home) wd))))
+
+(defn- jpath Str [p: &Str]
+  (let [n (count p)
+        out (loop [i 0 out ""]
+              (if (>= i n) out
+                (let [c (nth p i)]
+                  (if (and (= c 47) (> (count out) 0) (= (nth out (- (count out) 1)) 47)) (recur (+ i 1) out)
+                    (recur (+ i 1) (str out (subs p i (+ i 1))))))))]
+    (if (and (> (count out) 1) (= (nth out (- (count out) 1)) 47)) (subs out 0 (- (count out) 1)) out)))
+
+(defn- path-arg Values(Str Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [[p x] (conn/required-str c name)]
+    (if (and (= (count x) 0) (>= (str/index-of p (chr 0)) 0))
+      (values p [(err/mk "MULE" "UNKNOWN" (str "Nul character not allowed: " p))])
+      (values p x))))
+
+(defn- write-path-arg Values(Str Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [[p x] (conn/required-str c name)]
+    (if (and (= (count x) 0) (>= (str/index-of p (chr 0)) 0))
+      (values p [(ferr "ILLEGAL_PATH" (str p " Invalid path"))])
+      (values p x))))
+
+(defn resolve-path Str [wd: &Str p: &Str]
+  (cond (str/starts-with? p "/") (jpath p)
+        (= p "") (jpath wd)
+        :else (jpath (fs/join wd p))))
+
+(defn- ldt v/Val [secs: Int nanos: Int zone: &tt/TimeZone]
+  (v/->VLocalDateTime (zt/zdt-ldt (zt/zdt-of-instant secs nanos zone))))
+
+(defn attrs-val v/Val [path: &Str st: &fs/Stat zone: &tt/TimeZone]
+  (let [name (fs/base-name path)
+        lm (ldt (:mtime-s st) (:mtime-ns st) zone)
+        la (ldt (:atime-s st) (:atime-ns st) zone)]
+    (v/->VMeta
+      (v/->VObj [(v/field "fileName" (v/->VStr name))
+                 (v/field "lastModifiedTime" lm)
+                 (v/field "lastAccessTime" la)
+                 (v/field "creationTime" lm)
+                 (v/field "symbolicLink" (v/bool-v (:link st)))
+                 (v/field "regularFile" (v/bool-v (= (:kind st) fs/FILE)))
+                 (v/field "directory" (v/bool-v (= (:kind st) fs/DIR)))
+                 (v/field "path" (v/->VStr path))
+                 (v/field "size" (v/int-v (:size st)))
+                 (v/field "name" (v/->VStr name))])
+      [(v/field "class" (v/->VStr ATTR-CLASS))])))
+
+(defn- not-exist err/MErr [p: &Str] (ferr "ILLEGAL_PATH" (str "Path '" p "' doesn't exist")))
+(defn- already-exists err/MErr [p: &Str]
+  (ferr "FILE_ALREADY_EXISTS" (str "'" p "' already exists. Set the 'overwrite' parameter to 'true' to perform the operation anyway")))
+
+(defrecord TimeCond [which: Int since: Bool at: tt/LocalDateTime])
+
+(defrecord Matcher [name-pat: Str path-pat: Str dirs: Str files: Str links: Str min: Int max: Int
+                    updated-in: Int not-updated-in: Int times: Vec(TimeCond)])
+
+(defn no-matcher Matcher [] (let [ts: Vec(TimeCond) []] (->Matcher "" "" "INCLUDE" "INCLUDE" "INCLUDE" -1 -1 -1 -1 ts)))
+
+(def TIME-ATTRS ["createdSince" "createdUntil" "updatedSince" "updatedUntil" "accessedSince" "accessedUntil"])
+(def TIME-WHICH [0 0 1 1 2 2])
+(def TIME-SINCE [true false true false true true])
+
+(defn- time-conds Vec(TimeCond) [get: &Fn(Str Str)]
+  (loop [i 0 acc: Vec(TimeCond) []]
+    (if (>= i (count TIME-ATTRS)) acc
+      (let [s (get (nth TIME-ATTRS i))
+            [x e] (iso/parse-ldt s)]
+        (recur (+ i 1) (if (or (= s "") (not= e "")) acc (conj acc (->TimeCond (nth TIME-WHICH i) (nth TIME-SINCE i) x))))))))
+
+(defn- unit-ms Int [u: &Str]
+  (let [x (str/upper-case u)]
+    (cond (= x "NANOSECONDS") 0 (= x "MICROSECONDS") 0 (= x "SECONDS") 1000 (= x "MINUTES") 60000
+          (= x "HOURS") 3600000 (= x "DAYS") 86400000 :else 1)))
+
+(defn matcher-of Matcher [get: Fn(Str Str)]
+  (let [num (fn Int [k: Str] (let [s (get k)] (if (= s "") -1 (npz/int-or s -1))))
+        um (unit-ms (get "timeUnit"))
+        upd (num "updatedInTheLast")
+        nup (num "notUpdatedInTheLast")
+        pol (fn Str [k: Str] (let [s (str/upper-case (get k))] (if (= s "") "INCLUDE" s)))]
+    (->Matcher (get "filenamePattern") (get "pathPattern") (pol "directories") (pol "regularFiles") (pol "symLinks")
+               (num "minSize") (num "maxSize") (if (< upd 0) -1 (* upd um)) (if (< nup 0) -1 (* nup um)) (time-conds get))))
+
+(defn- pat-match Bool [pat: &Str s: &Str]
+  (cond (= pat "") true
+        (str/starts-with? pat "regex:")
+        (let [[r e] (rx/compile (subs pat 6 (count pat)) 0)]
+          (and (= e "") (let [[ok me] (rx/matches? r s)] (and ok (= me "")))))
+        (str/starts-with? pat "glob:") (glob/glob-match (subs pat 5 (count pat)) s)
+        :else (glob/glob-match pat s)))
+
+(defn- policy-ok Bool [pol: &Str is: Bool]
+  (cond (= pol "REQUIRE") is (= pol "EXCLUDE") (not is) :else true))
+
+(defn matches-facts Bool [mt: &Matcher path: &Str dir: Bool reg: Bool link: Bool size: Int mtime-ms: Int now-ms: Int]
+  (let [age (- now-ms mtime-ms)]
+    (and (pat-match (:name-pat mt) (fs/base-name path))
+         (pat-match (:path-pat mt) path)
+         (policy-ok (:dirs mt) dir)
+         (policy-ok (:files mt) reg)
+         (policy-ok (:links mt) link)
+         (or (< (:min mt) 0) (>= size (:min mt)))
+         (or (< (:max mt) 0) (<= size (:max mt)))
+         (or (< (:updated-in mt) 0) (<= age (:updated-in mt)))
+         (or (< (:not-updated-in mt) 0) (>= age (:not-updated-in mt))))))
+
+(defn- matches Bool [mt: &Matcher path: &Str st: &fs/Stat now-ms: Int]
+  (and (matches-facts mt path (= (:kind st) fs/DIR) (= (:kind st) fs/FILE) (:link st) (:size st)
+                      (+ (* (:mtime-s st) 1000) (/ (:mtime-ns st) 1000000)) now-ms)
+       (times-ok (:times mt) st)))
+
+(defn- times-ok Bool [ts: &Vec(TimeCond) st: &fs/Stat]
+  (if (= (count ts) 0) true
+    (let [zone (tzr/system-zone)
+          lm (zt/zdt-ldt (zt/zdt-of-instant (:mtime-s st) (:mtime-ns st) zone))
+          la (zt/zdt-ldt (zt/zdt-of-instant (:atime-s st) (:atime-ns st) zone))]
+      (loop [i 0]
+        (if (>= i (count ts)) true
+          (let [t (nth ts i)
+                c (tl/ldt-compare (if (= (:which t) 2) la lm) (:at t))]
+            (if (if (:since t) (>= c 0) (<= c 0)) (recur (+ i 1)) false)))))))
+
+(defn- global-matcher Values(Matcher Str) [configs: &Vec(m/Config) name: &Str]
+  (let [cs (conn/find-config configs "file:matcher" name)]
+    (if (= (count cs) 0) (values (no-matcher) (str "No matcher named '" name "' was found"))
+      (let [ps (:params (nth cs 0))]
+        (values (matcher-of (fn Str [k: Str] (conn/param-lit ps k ""))) "")))))
+
+(defn- op-matcher Values(Matcher Vec(err/MErr)) [c: &conn/OpCall]
+  (let [inl (conn/child-elem (:children c) "matcher")]
+    (if (> (count inl) 0)
+      (let [node (nth inl 0)
+            errs (atom (->dyn ""))
+            cc c
+            mt (matcher-of (fn Str [k: Str] (inline-attr cc node k errs)))
+            e: Str (dyn->str (deref errs))]
+        (if (= e "") (values mt []) (values mt [(err/mk "MULE" "EXPRESSION" e)])))
+      (let [[name x] (conn/attr-str c "matcher" "")]
+        (cond (> (count x) 0) (values (no-matcher) x)
+              (= name "") (values (no-matcher) [])
+              :else (let [[mt e] (global-matcher (:configs c) name)]
+                      (if (= e "") (values mt []) (values mt [(err/mk "MULE" "CONFIG" e)]))))))))
+
+(defn- inline-attr Str [c: &conn/OpCall node: &xml/XNode k: Str errs: &Atom]
+  (let [p (conn/param (:exprs c) (str "matcher@" k))]
+    (if (= (count p) 0) (xml/attr node "" k "")
+      (let [[x e] ((:eval c) (nth p 0) (:event c))]
+        (if (not= e "") (let [z (reset! errs (->dyn e))] "")
+          (match (v/unmeta x) (v/VNull) "" (v/VStr s) (str s) (v/VBool b) (if b "true" "false")
+                 (v/VLocalDateTime y) (iso/ldt-str y) (v/VDateTime z) (iso/ldt-str (zt/zdt-ldt z)) _ ""))))))
+
+(defn- content-tv Values(ev/TV Str) [path: &Str mime: &Str owner: &Str]
+  (if (and (not= owner "") (> (:size (fs/stat path)) bodies/IN-MEMORY))
+    (let [[sp e] (spool/of-file path)]
+      (if (not= e "") (values (ev/tv-null) e)
+        (values (ev/->TV (v/null-v) (str mime) [] (bodies/open owner sp) ev/PIPE true) "")))
+    (let [[data e] (read-file path)]
+      (if (not= e "") (values (ev/tv-null) e) (values (ev/as-stream (ev/tv-raw data mime)) "")))))
+
+(defn- size-check-ms Int [own: &Str own-unit: &Str cfg: &Vec(m/Config)]
+  (let [cps (if (= (count cfg) 0) [] (:params (nth cfg 0)))
+        [v u] (if (not= (str/trim own) "") (values (str/trim own) (str own-unit))
+                (values (str/trim (conn/param-lit cps "timeBetweenSizeCheck" "")) (conn/param-lit cps "timeBetweenSizeCheckUnit" "")))
+        n (if (= v "") 0 (npz/int-or v 0))]
+    (if (<= n 0) 0 (* n (unit-ms u)))))
+
+(def BEING-MODIFIED "org.mule.extension.file.common.api.exceptions.FileBeingModifiedException")
+(def DELETED-WHILE-READ "org.mule.extension.file.common.api.exceptions.DeletedFileWhileReadException")
+
+(defn- stream-err ev/TV [cls: &Str msg: &Str mime: &Str]
+  (ev/tv-failed (str cls " - " msg "\n" cls ": " (subs msg 0 (- (count msg) 1))) (str mime)))
+
+(defn- stable-content-tv Values(ev/TV Str) [path: &Str mime: &Str size0: Int ms: Int owner: &Str]
+  (if (<= ms 0) (content-tv path mime owner)
+    (loop [r 0 old size0]
+      (let [z (sleep-ms ms)
+            st (fs/stat path)]
+        (cond
+          (= (:kind st) fs/NONE) (values (stream-err DELETED-WHILE-READ (str "File on path " path " was read but does not exist anymore.") mime) "")
+          (and (= (:size st) old) (< r 3)) (content-tv path mime owner)
+          (>= r 3) (values (stream-err BEING-MODIFIED (str "File on path " path " is still being written.") mime) "")
+          :else (recur (+ r 1) (:size st)))))))
+
+(defn- run-read conn/OpResult [c: &conn/OpCall wd: &Str]
+  (let [[p0 x1] (path-arg c "path")
+        [om x2] (conn/attr-str c "outputMimeType" "")
+        [oe x3] (conn/attr-str c "outputEncoding" "")
+        [sc x4] (conn/attr-str c "timeBetweenSizeCheck" "")
+        [su x5] (conn/attr-str c "timeBetweenSizeCheckUnit" "")]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2) (> (count x3) 0) (failure x3) (> (count x4) 0) (failure x4) (> (count x5) 0) (failure x5)
+      :else
+      (let [p (resolve-path wd p0) st (fs/stat p)]
+        (cond
+          (= (:kind st) fs/NONE) (conn/fail-result (not-exist p))
+          (= (:kind st) fs/DIR) (conn/fail-result (ferr "ILLEGAL_PATH" (str "Cannot read path '" p "' since it's a directory")))
+          (not= (:kind st) fs/FILE) (conn/fail-result (ferr "ACCESS_DENIED" (str "Could not read file '" p "': it is not a regular file")))
+          :else (let [[t e] (stable-content-tv p (data-mime om oe (fs/base-name p)) (:size st) (size-check-ms sc su (:config c)) (:rid (:event c)))]
+                  (if (not= e "") (conn/fail-result (ferr "ACCESS_DENIED" (str "Could not read file '" p "': " e)))
+                    (conn/ok-result t (ev/tv-val (attrs-val p st (tzr/system-zone)) ev/JAVA)))))))))
+
+(defn- list-item v/Val [p: &Str st: &fs/Stat zone: &tt/TimeZone]
+  (let [pv (if (= (:kind st) fs/DIR) (v/->VMeta (v/null-v) [(v/field "mimeType" (v/->VStr "*/*"))])
+             (let [mime (data-mime "" "" (fs/base-name p))
+                   [t e] (if (= (:kind st) fs/FILE) (content-tv p mime "") (values (ev/tv-raw "" mime) ""))
+                   [x t2 pe] (ev/value t)
+                   val (if (or (not= e "") (not= pe "")) (v/->VBin (:raw t)) x)]
+               (v/->VMeta val [(v/field "mimeType" (v/->VStr (reg/norm-mime mime)))])))]
+    (v/->VObj [(v/field "payload" pv) (v/field "attributes" (attrs-val p st zone))])))
+
+(defn- walk Vec(v/Val) [acc: Vec(v/Val) dir: &Str rec: Bool mt: &Matcher now-ms: Int zone: &tt/TimeZone]
+  (let [[names le] (io/list-dir dir)]
+    (loop [i 0 a acc]
+      (if (>= i (count names)) a
+        (let [p (fs/join dir (nth names i))
+              st (fs/stat p)
+              a1 (if (matches mt p st now-ms) (conj a (list-item p st zone)) a)
+              a2 (if (and rec (= (:kind st) fs/DIR) (not (:link st))) (walk a1 p rec mt now-ms zone) a1)]
+          (recur (+ i 1) a2))))))
+
+(defn- run-list conn/OpResult [c: &conn/OpCall wd: &Str]
+  (let [[p0 x1] (path-arg c "directoryPath")
+        [rec x2] (conn/attr-bool c "recursive" false)
+        [mt x3] (op-matcher c)]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2) (> (count x3) 0) (failure x3)
+      :else
+      (let [p (resolve-path wd p0) st (fs/stat p)]
+        (cond
+          (= (:kind st) fs/NONE) (conn/fail-result (not-exist p))
+          (not= (:kind st) fs/DIR)
+          (conn/fail-result (ferr "ILLEGAL_PATH" (str "Cannot list path '" p "' because it's a file. Only directories can be listed")))
+          :else (let [items (walk [] p rec mt (epoch-ms) (tzr/system-zone))]
+                  (conn/ok-result (ev/tv-val (v/->VArr items) ev/JAVA) (ev/tv-null))))))))
+
+(defn- run-write conn/OpResult [c: &conn/OpCall wd: &Str]
+  (let [[p0 x1] (write-path-arg c "path")
+        [mode0 x2] (conn/attr-str c "mode" "OVERWRITE")
+        [cpd x3] (conn/attr-bool c "createParentDirectories" true)
+        [ct x4] (conn/child-tv c "content")]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2) (> (count x3) 0) (failure x3) (> (count x4) 0) (failure x4)
+      :else
+      (let [p (resolve-path wd p0)
+            mode (str/upper-case (str/trim mode0))
+            st (fs/stat p)
+            t (if (= (count ct) 0) (:payload (:event c)) (nth ct 0))
+            par (fs/parent p)]
+        (cond
+          (and (not= mode "OVERWRITE") (not= mode "APPEND") (not= mode "CREATE_NEW"))
+          (conn/fail-result (err/mk "MULE" "EXPRESSION" (str "Invalid write mode '" mode0 "'")))
+          (= (:kind st) fs/DIR)
+          (conn/fail-result (ferr "ILLEGAL_PATH" (str "Cannot write to path '" p "' because it is a Directory.")))
+          (and (= mode "CREATE_NEW") (not= (:kind st) fs/NONE))
+          (conn/fail-result (ferr "FILE_ALREADY_EXISTS" (str "Cannot write to path '" p "' because it already exists and write mode 'CREATE_NEW' was selected. Use a different write mode or point to a path which doesn't exist")))
+          (and (not cpd) (not= par "") (not (fs/dir? par)))
+          (conn/fail-result (ferr "ILLEGAL_PATH" (str "Cannot write to file '" p "' because path to it doesn't exist. Consider setting the 'createParentDirectories' attribute to 'true'")))
+          :else
+          (let [me (if (= par "") "" (fs/mkdirs par))
+                [ex ce] (if (and (= me "") (= mode "CREATE_NEW")) (fs/create-new p) (values false ""))
+                we (cond (not= me "") me
+                         ex "exists"
+                         (not= ce "") ce
+                         (and (= (:state t) ev/DEFER) (ev/defer-open t)) (write-chunks p (= mode "APPEND") t)
+                         (and (= (:state t) ev/PIPE) (stream/repeatable? (:raw t)))
+                         (let [id (stream/fork (:raw t)) r (write-chunks p (= mode "APPEND") (assoc t :raw id)) z (stream/discard id)] r)
+                         :else (let [[data be] (ev/bytes t)]
+                                 (cond (not= be "") be
+                                       (= mode "APPEND") (append-file p data)
+                                       :else (write-file p data))))]
+            (cond
+              ex (conn/fail-result (ferr "FILE_ALREADY_EXISTS" (str "Cannot write to path '" p "' because it already exists and write mode 'CREATE_NEW' was selected. Use a different write mode or point to a path which doesn't exist")))
+              (not= we "") (conn/fail-result (ferr "ACCESS_DENIED" (str "Could not write to file '" p "': " we)))
+              :else (conn/keep-result c))))))))
+
+(defn- write-chunks Str [p: &Str append: Bool t: &ev/TV]
+  (loop [first true]
+    (let [[chunk done e] (ev/defer-next t)
+          we (if (and first (not append)) (write-file p chunk) (if (= (count chunk) 0) "" (append-file p chunk)))]
+      (cond (not= we "") we
+            done ""
+            :else (recur false)))))
+
+(defn- transfer conn/OpResult [c: &conn/OpCall wd: &Str move?: Bool]
+  (let [[s0 x1] (path-arg c "sourcePath")
+        [t0 x2] (path-arg c "targetPath")
+        [ow x3] (conn/attr-bool c "overwrite" false)
+        [cpd x4] (conn/attr-bool c "createParentDirectories" true)
+        [rn x5] (conn/attr-str c "renameTo" "")]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2) (> (count x3) 0) (failure x3) (> (count x4) 0) (failure x4) (> (count x5) 0) (failure x5)
+      :else
+      (let [src (resolve-path wd s0)
+            ss (fs/stat src)
+            tdir (resolve-path wd t0)
+            ts (fs/stat tdir)
+            name (if (= rn "") (fs/base-name src) rn)]
+        (cond
+          (= (:kind ss) fs/NONE) (conn/fail-result (not-exist src))
+          (and (not= (:kind ts) fs/NONE) (not= (:kind ts) fs/DIR) (not ow)) (conn/fail-result (already-exists tdir))
+          (and (= (:kind ts) fs/NONE) (not cpd))
+          (conn/fail-result (ferr "ILLEGAL_PATH" (str "Can't " (if move? "move" "copy") " '" src "' to '" tdir "' because the destination path doesn't exist")))
+          :else
+          (let [me (if (= (:kind ts) fs/NONE) (fs/mkdirs tdir) "")
+                dst (if (= (:kind ts) fs/DIR) (fs/join tdir name) (if (= (:kind ts) fs/NONE) (fs/join tdir name) tdir))
+                exists (fs/exists? dst)]
+            (cond
+              (not= me "") (conn/fail-result (ferr "ACCESS_DENIED" me))
+              (and exists (not ow)) (conn/fail-result (already-exists dst))
+              :else
+              (let [re (if exists (fs/remove-tree dst) "")
+                    e (cond (not= re "") re move? (fs/move src dst) :else (fs/copy-tree src dst))]
+                (if (not= e "") (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Could not " (if move? "move" "copy") " '" src "' to '" dst "': " e)))
+                  (conn/keep-result c))))))))))
+
+(defn- run-rename conn/OpResult [c: &conn/OpCall wd: &Str]
+  (let [[p0 x1] (path-arg c "path")
+        [to x2] (path-arg c "to")
+        [ow x3] (conn/attr-bool c "overwrite" false)]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2) (> (count x3) 0) (failure x3)
+      (str/includes? to "/")
+      (conn/fail-result (ferr "ILLEGAL_PATH" (str "'to' parameter of rename operation should not contain any file separator character but '" to "' was received")))
+      (or (= to ".") (= to "..") (= to ""))
+      (conn/fail-result (ferr "ILLEGAL_PATH" (str "'to' parameter of rename operation should not be '.' or '..' but '" to "' was received")))
+      :else
+      (let [p (resolve-path wd p0)
+            dst (fs/join (fs/parent p) to)]
+        (cond
+          (not (fs/exists? p)) (conn/fail-result (not-exist p))
+          (and (fs/exists? dst) (not ow))
+          (conn/fail-result (ferr "FILE_ALREADY_EXISTS" (str "'" p "' cannot be renamed because '" dst "' already exists")))
+          :else
+          (let [re (if (fs/exists? dst) (fs/remove-tree dst) "")
+                e (if (not= re "") re (fs/move p dst))]
+            (if (not= e "") (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Exception was found renaming '" p "' to '" to "': " e)))
+              (conn/keep-result c))))))))
+
+(defn- run-delete conn/OpResult [c: &conn/OpCall wd: &Str]
+  (let [[p0 x1] (path-arg c "path")]
+    (if (> (count x1) 0) (failure x1)
+      (let [p (resolve-path wd p0)]
+        (cond
+          (not (fs/exists? p)) (conn/fail-result (not-exist p))
+          (not= (fs/remove-tree p) "") (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Could not delete '" p "'")))
+          :else (conn/keep-result c))))))
+
+(defn- run-mkdir conn/OpResult [c: &conn/OpCall wd: &Str]
+  (let [[p0 x1] (path-arg c "directoryPath")]
+    (if (> (count x1) 0) (failure x1)
+      (let [p (resolve-path wd p0)]
+        (cond
+          (fs/exists? p) (conn/fail-result (ferr "FILE_ALREADY_EXISTS" (str "Directory '" p "' already exists")))
+          :else (let [e (fs/mkdirs p)]
+                  (if (not= e "") (conn/fail-result (ferr "ACCESS_DENIED" (str "Could not create directory '" p "': " e)))
+                    (conn/keep-result c))))))))
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (let [op (:op c)
+        wd (working-dir (:config c))]
+    (cond
+      (= op "read") (run-read c wd)
+      (= op "write") (run-write c wd)
+      (= op "list") (run-list c wd)
+      (= op "copy") (transfer c wd false)
+      (= op "move") (transfer c wd true)
+      (= op "rename") (run-rename c wd)
+      (= op "delete") (run-delete c wd)
+      (= op "create-directory") (run-mkdir c wd)
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation file:" op))))))
+
+(defn- poll-files Vec(Str) [acc: Vec(Str) dir: &Str rec: Bool mt: &Matcher now-ms: Int]
+  (let [[names le] (io/list-dir dir)]
+    (loop [i 0 a acc]
+      (if (>= i (count names)) a
+        (let [p (fs/join dir (nth names i))
+              st (fs/stat p)
+              a1 (if (and (= (:kind st) fs/FILE) (matches mt p st now-ms)) (conj a p) a)
+              a2 (if (and rec (= (:kind st) fs/DIR) (not (:link st))) (poll-files a1 p rec mt now-ms) a1)]
+          (recur (+ i 1) a2))))))
+
+(defn- lit Str [s: &conn/SrcCall k: &Str] (conn/param-lit (:params s) k ""))
+
+(defn- lit-bool Bool [s: &conn/SrcCall k: &Str default: Bool]
+  (let [x (str/lower-case (str/trim (lit s k)))] (if (= x "") default (= x "true"))))
+
+(defn- stamp Int [st: &fs/Stat] (+ (* (:mtime-s st) 1000000000) (:mtime-ns st)))
+
+(defn- poll Values(Int Str) [s: conn/SrcCall]
+  (let [wd (working-dir (:config s))
+        dir (resolve-path wd (lit s "directory"))
+        rec (lit-bool s "recursive" true)
+        auto-del (lit-bool s "autoDelete" false)
+        move-to (lit s "moveToDirectory")
+        rename-to (lit s "renameTo")
+        on-fail (lit-bool s "applyPostActionWhenFailed" true)
+        wm? (lit-bool s "watermarkEnabled" false)
+        mname (lit s "matcher")
+        inl (conn/child-elem (:children s) "matcher")
+        [mt me] (cond (> (count inl) 0) (let [n (nth inl 0)] (values (matcher-of (fn Str [k: Str] (xml/attr n "" k ""))) ""))
+                      (= mname "") (values (no-matcher) "")
+                      :else (global-matcher (:configs s) mname))
+        ds (fs/stat dir)]
+    (cond
+      (not= me "") (values 0 me)
+      (= (:kind ds) fs/NONE) (values 0 (str "Path '" dir "' doesn't exist"))
+      (not= (:kind ds) fs/DIR) (values 0 (str "Path '" dir "' is not a directory"))
+      :else
+      (let [files (poll-files [] dir rec mt (epoch-ms))
+            st0: Map (dyn->map (deref (:state s)))
+            wm0 (if (contains? st0 "wm") (dyn->int (get! st0 "wm")) -1)
+            zone (tzr/system-zone)
+            om (lit s "outputMimeType")
+            oe (lit s "outputEncoding")
+            scms (size-check-ms (lit s "timeBetweenSizeCheck") (lit s "timeBetweenSizeCheckUnit") (:config s))]
+        (loop [i 0 n 0 wm wm0]
+          (if (>= i (count files))
+            (let [z (swap! (:state s) (fn Dyn [old: Dyn] (let [mm: Map (dyn->map old)] (->dyn (assoc mm "wm" (->dyn wm))))))]
+              (values n ""))
+            (let [p (nth files i)
+                  st (fs/stat p)
+                  sp (stamp st)]
+              (if (or (not= (:kind st) fs/FILE) (and wm? (<= sp wm0))) (recur (+ i 1) n wm)
+                (let [[t e] (stable-content-tv p (data-mime om oe (fs/base-name p)) (:size st) scms "")]
+                  (if (not= e "") (recur (+ i 1) n wm)
+                    (let [[ok desc] ((:dispatch s) t (ev/tv-val (attrs-val p st zone) ev/JAVA))
+                          z (cond (not (or ok on-fail)) ""
+                                  auto-del (fs/remove-tree p)
+                                  (not= move-to "")
+                                  (let [td (resolve-path wd move-to) me2 (fs/mkdirs td)]
+                                    (if (not= me2 "") me2 (fs/move p (fs/join td (if (= rename-to "") (fs/base-name p) rename-to)))))
+                                  :else "")]
+                      (recur (+ i 1) (+ n 1) (if (> sp wm) sp wm)))))))))))))
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "file" NS (fn conn/OpResult [c: conn/OpCall] (run-op c)))
+         :sources ["listener"] :poll (fn Values(Int Str) [s: conn/SrcCall] (poll s))))

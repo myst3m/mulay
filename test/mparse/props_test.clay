@@ -1,0 +1,75 @@
+(ns props-test (:require [mulay.mule.props :as pr] [mulay.lib.res :as res] [mulay.mule.model :as m]))
+
+(defn- env Str [k: Str] (getenv k ""))
+(defn- pv Str [ps: &Vec(m/Param) k: &Str]
+  (loop [i 0] (if (>= i (count ps)) "<none>" (if (= (:name (nth ps i)) k) (match (:v (nth ps i)) (m/PLit s) s _ "<expr>") (recur (+ i 1))))))
+(deftest properties-format
+  (let [ps (pr/parse-properties "# c\n! c2\na=1\nb : two words  \n  c\\\n   d = x\\ty\nkey\\ with\\=eq=v\\u00e9\nempty\n\nlast=z")]
+    (is (= (count ps) 6))
+    (is (= (pv ps "a") "1"))
+    (is (= (pv ps "b") "two words  "))
+    (is (= (pv ps "cd") "x\ty"))
+    (is (= (pv ps "key with=eq") "vé"))
+    (is (= (pv ps "empty") ""))
+    (is (= (pv ps "last") "z"))))
+(deftest yaml-flatten
+  (let [[ps err] (pr/flatten-yaml "http:\n  port: 8081\n  host: \"0.0.0.0\"\ndb:\n  url: jdbc\n  nulls:\nlist:\n  - a\n  - b\nobjs:\n  - x: 1\n")]
+    (is (= err ""))
+    (is (= (pv ps "http.port") "8081"))
+    (is (= (pv ps "http.host") "0.0.0.0"))
+    (is (= (pv ps "db.url") "jdbc"))
+    (is (= (pv ps "db.nulls") ""))
+    (is (= (pv ps "list") "a,b"))
+    (is (= (pv ps "objs.0.x") "1"))))
+(deftest resolve
+  (let [p0 (pr/props-new [(m/->Param "env" (m/->PLit "dev"))] false "app1" (res/res-mem ["cert.pem"] ["PEM"]))
+        p1 (pr/add-file p0 [(m/->Param "dev.port" (m/->PLit "9000")) (m/->Param "url" (m/->PLit "http://h:${dev.port}/x")) (m/->Param "env" (m/->PLit "prod"))
+                            (m/->Param "loop" (m/->PLit "${loop}"))])
+        p (pr/add-global p1 "g" "global")
+        [a ea] (pr/resolve-str p "port=${${env}.port}")
+        [b eb] (pr/resolve-str p "${url} ${g} ${app.name}")
+        [c ec] (pr/resolve-str p "x${missing}y")
+        [d ed] (pr/resolve-str p "${loop}")
+        [e ee] (pr/resolve-str p "${secure::pw}")
+        [f ef] (pr/resolve-str p "${file::cert.pem}|${unclosed")]
+    (is (= a "port=9000")) (is (= (count ea) 0))
+    (is (= b "http://h:9000/x global app1")) (is (= (count eb) 0))
+    (is (= c "x${missing}y")) (is (= (count ec) 1))
+    (is (= (count ed) 1)) (is (= d "${loop}"))
+    (is (= (count ee) 1))
+    (is (= f "PEM|${unclosed")) (is (= (count ef) 0))))
+(deftest res-paths
+  (is (= (res/norm-res-path "classpath:/a/b.dwl") "a/b.dwl"))
+  (is (= (res/norm-res-path "./x") "x"))
+  (is (= (res/norm-res-path "../etc/passwd") ""))
+  (is (= (res/norm-res-path "a/../../b") "")))
+(deftest env-and-precedence
+  (let [p0 (pr/props-new [(m/->Param "a" (m/->PLit "over"))] true "x" (res/res-none))
+        p1 (pr/add-file p0 [(m/->Param "a" (m/->PLit "file")) (m/->Param "HOME" (m/->PLit "file-home")) (m/->Param "b" (m/->PLit "file-b"))])
+        p (pr/add-global p1 "b" "global-b")
+        [x ex] (pr/resolve-str p "${a}|${b}")
+        [h eh] (pr/resolve-str p "${HOME}")
+        pn (pr/add-file (pr/props-new [] false "x" (res/res-none)) [(m/->Param "HOME" (m/->PLit "file-home"))])
+        [h2 eh2] (pr/resolve-str pn "${HOME}")]
+    (is (= x "over|file-b"))
+    (is (= h (env "HOME")))
+    (is (= h2 "file-home"))))
+;; 値の出どころ (mulay inspect が表示する)。lookup と同じ優先順位で、勝った層のものを返す
+(deftest origins
+  (let [p0 (pr/props-new [(m/->Param "a" (m/->PLit "over"))] true "x" (res/res-none))
+        p1 (pr/add-file-from p0 [(m/->Param "a" (m/->PLit "f")) (m/->Param "b" (m/->PLit "f")) (m/->Param "HOME" (m/->PLit "f"))] "config.yaml")
+        p2 (pr/add-file-from p1 [(m/->Param "b" (m/->PLit "f2")) (m/->Param "c" (m/->PLit "f2"))] "other.yaml")
+        p (pr/add-global p2 "g" "gv")
+        pa (pr/props-new [(m/->Param "app.name" (m/->PLit "mine"))] false "x" (res/res-none))
+        ps (pr/resolved-params p)
+        os (pr/resolved-origins p)]
+    (is (= (pr/origin p "a") "command line"))
+    (is (= (pr/origin p "app.name") "built-in"))
+    (is (= (pr/origin pa "app.name") "command line"))
+    (is (= (pr/origin p "b") "config.yaml"))
+    (is (= (pr/origin p "c") "other.yaml"))
+    (is (= (pr/origin p "HOME") "environment"))
+    (is (= (pr/origin p "g") "global-property"))
+    (is (= (pr/origin p "nope") ""))
+    (is (= (count os) (count ps)))
+    (is (= (nth os 0) "command line"))))

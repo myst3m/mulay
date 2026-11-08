@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:vm="http://www.mulesoft.org/schema/mule/vm"
+      xmlns:batch="http://www.mulesoft.org/schema/mule/batch"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+        http://www.mulesoft.org/schema/mule/batch http://www.mulesoft.org/schema/mule/batch/current/mule-batch.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18161"/>
+    </http:listener-config>
+
+    <vm:config name="V">
+        <vm:queues>
+            <vm:queue queueName="recQ"/>
+            <vm:queue queueName="aggQ"/>
+            <vm:queue queueName="doneQ"/>
+        </vm:queues>
+    </vm:config>
+
+    <!-- q のキューを空になるまで読む (vars.items に積む) -->
+    <sub-flow name="drain">
+        <set-variable variableName="items" value="#[[]]"/>
+        <try>
+            <foreach collection="#[1 to 50]">
+                <vm:consume config-ref="V" queueName="#[vars.q]" timeout="300" timeoutUnit="MILLISECONDS"/>
+                <set-variable variableName="items" value="#[vars.items + payload]"/>
+            </foreach>
+            <error-handler><on-error-continue><logger level="DEBUG"/></on-error-continue></error-handler>
+        </try>
+    </sub-flow>
+
+    <!-- on-complete の結果を待ち、記録と集約を集める -->
+    <sub-flow name="collect">
+        <vm:consume config-ref="V" queueName="doneQ" timeout="30" timeoutUnit="SECONDS"/>
+        <set-variable variableName="done" value="#[payload]"/>
+        <set-variable variableName="q" value="recQ"/>
+        <flow-ref name="drain"/>
+        <set-variable variableName="recs" value="#[vars.items]"/>
+        <set-variable variableName="q" value="aggQ"/>
+        <flow-ref name="drain"/>
+        <set-payload value="#[output application/json --- {instance: vars.instance, done: vars.done, records: vars.recs orderBy ($.p as String), aggregates: vars.items}]"/>
+    </sub-flow>
+
+    <sub-flow name="summary">
+        <set-payload value="#[output application/java --- {class: payload.^class, keys: keysOf(payload) map ($ as String) orderBy $, total: payload.totalRecords, successful: payload.successfulRecords, failed: payload.failedRecords, loaded: payload.loadedRecords, processed: payload.processedRecords, failedOnInputPhase: payload.failedOnInputPhase, failedOnLoadingPhase: payload.failedOnLoadingPhase, failedOnCompletePhase: payload.failedOnCompletePhase}]"/>
+    </sub-flow>
+
+    <sub-flow name="instance">
+        <set-variable variableName="instance" value="#[output application/java --- {class: payload.^class, keys: keysOf(payload) map ($ as String) orderBy $, ownerJobName: payload.ownerJobName, recordCount: payload.recordCount, status: payload.status as String}]"/>
+    </sub-flow>
+
+    <!-- 基本: 2 つのステップ。記録の変数はステップをまたぐ。集約は 2 件ずつ -->
+    <flow name="basic">
+        <http:listener config-ref="L" path="/basic"/>
+        <set-payload value="#[[1, 2, 3, 4, 5]]"/>
+        <batch:job jobName="basicJob" blockSize="2" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="double">
+                    <set-variable variableName="orig" value="#[payload]"/>
+                    <set-payload value="#[payload * 2]"/>
+                </batch:step>
+                <batch:step name="publish">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload, orig: vars.orig}]</vm:content></vm:publish>
+                    <batch:aggregator size="2">
+                        <vm:publish config-ref="V" queueName="aggQ"><vm:content>#[output application/java --- {n: sizeOf(payload), items: payload map (x) -> x}]</vm:content></vm:publish>
+                    </batch:aggregator>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+
+    <!-- 失敗: 3 で失敗する。ONLY_FAILURES のステップは失敗した記録だけ、ALL はすべて -->
+    <flow name="failures">
+        <http:listener config-ref="L" path="/failures"/>
+        <set-payload value="#[[1, 2, 3, 4, 5]]"/>
+        <batch:job jobName="failJob" maxFailedRecords="-1" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="maybeFail">
+                    <choice>
+                        <when expression="#[payload == 3]"><raise-error type="APP:BAD" description="three"/></when>
+                    </choice>
+                    <set-payload value="#[payload * 10]"/>
+                </batch:step>
+                <batch:step name="onlyFailures" acceptPolicy="ONLY_FAILURES">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload, step: "onlyFailures"}]</vm:content></vm:publish>
+                </batch:step>
+                <batch:step name="noFailures">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload, step: "noFailures"}]</vm:content></vm:publish>
+                </batch:step>
+                <batch:step name="all" acceptPolicy="ALL">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload, step: "all"}]</vm:content></vm:publish>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+
+    <!-- maxFailedRecords の既定 (0): 最初の失敗でジョブが止まる。止まった後の次のブロックが流れるかは実 Mule では競争なので、その記録 (p3) は比べない -->
+    <flow name="stop">
+        <http:listener config-ref="L" path="/stop"/>
+        <set-payload value="#[[1, 2, 3, 4, 5]]"/>
+        <batch:job jobName="stopJob" blockSize="1" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="maybeFail">
+                    <choice>
+                        <when expression="#[payload == 2]"><raise-error type="APP:BAD" description="two"/></when>
+                    </choice>
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload}]</vm:content></vm:publish>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+        <set-payload value="#[output application/json --- payload update { case r at .records -> r filter ($.p &lt; 3) }]"/>
+    </flow>
+
+    <!-- 同じく、blockSize の既定 (100): 1 つのブロックの中で失敗する -->
+    <flow name="stop-block">
+        <http:listener config-ref="L" path="/stop-block"/>
+        <set-payload value="#[[1, 2, 3, 4, 5]]"/>
+        <batch:job jobName="stopBlockJob" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="maybeFail">
+                    <choice>
+                        <when expression="#[payload == 2]"><raise-error type="APP:BAD" description="two"/></when>
+                    </choice>
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload}]</vm:content></vm:publish>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+
+    <!-- maxFailedRecords="1": 2 つ目の失敗で止まる (2 と 4 で失敗)。止まった後のブロックの記録 (p5) は /stop と同じく比べない -->
+    <flow name="stop-two">
+        <http:listener config-ref="L" path="/stop-two"/>
+        <set-payload value="#[[1, 2, 3, 4, 5, 6, 7]]"/>
+        <batch:job jobName="stopTwoJob" blockSize="1" maxFailedRecords="1" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="maybeFail">
+                    <choice>
+                        <when expression="#[payload == 2 or payload == 4]"><raise-error type="APP:BAD" description="two"/></when>
+                    </choice>
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload}]</vm:content></vm:publish>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+        <set-payload value="#[output application/json --- payload update { case r at .records -> r filter ($.p &lt; 5) }]"/>
+    </flow>
+
+    <!-- BatchJobResult の batchStepResults (ステップごとの BatchStepResult) -->
+    <flow name="step-results">
+        <http:listener config-ref="L" path="/step-results"/>
+        <set-payload value="#[[1, 2, 3, 4]]"/>
+        <batch:job jobName="stepResultsJob" maxFailedRecords="-1" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="first">
+                    <choice>
+                        <when expression="#[payload == 2]"><raise-error type="APP:BAD" description="two"/></when>
+                    </choice>
+                </batch:step>
+                <batch:step name="second" acceptExpression="#[payload != 4]">
+                    <logger level="DEBUG"/>
+                </batch:step>
+                <batch:step name="third" acceptPolicy="ONLY_FAILURES">
+                    <logger level="DEBUG"/>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <set-payload value="#[output application/java --- {steps: payload.batchStepResults pluck ((v, k) -> {key: k as String, class: v.^class, keys: keysOf(v) map ($ as String) orderBy $, v: v orderBy $$})}]"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+
+    <!-- acceptExpression -->
+    <flow name="accept">
+        <http:listener config-ref="L" path="/accept"/>
+        <set-payload value="#[[1, 2, 3, 4, 5, 6]]"/>
+        <batch:job jobName="acceptJob" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="evens" acceptExpression="#[(payload mod 2) == 0]">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload}]</vm:content></vm:publish>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+
+    <!-- acceptExpression が失敗する (mod は == より弱いので payload mod (2 == 0)): 記録は失敗になる -->
+    <flow name="accept-bad">
+        <http:listener config-ref="L" path="/accept-bad"/>
+        <set-payload value="#[[1, 2, 3, 4, 5, 6]]"/>
+        <batch:job jobName="acceptBadJob" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="evens" acceptExpression="#[payload mod 2 == 0]">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload}]</vm:content></vm:publish>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+    <!-- 並行: maxConcurrency 4 でブロック (3 件) を同時に流す。順は決まらないので、記録と集約は並べ替えて見る -->
+    <flow name="parallel">
+        <http:listener config-ref="L" path="/parallel"/>
+        <set-payload value="#[1 to 20]"/>
+        <batch:job jobName="parJob" blockSize="3" maxConcurrency="4">
+            <batch:process-records>
+                <batch:step name="double">
+                    <set-payload value="#[payload * 2]"/>
+                </batch:step>
+                <batch:step name="publish">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: payload}]</vm:content></vm:publish>
+                    <batch:aggregator size="5">
+                        <vm:publish config-ref="V" queueName="aggQ"><vm:content>#[output application/java --- {n: sizeOf(payload), sum: sum(payload)}]</vm:content></vm:publish>
+                    </batch:aggregator>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+        <set-payload value="#[output application/json --- payload update { case a at .aggregates -> {count: sizeOf(a), sizes: (a map $.n) orderBy $, total: sum(a map $.sum)} }]"/>
+    </flow>
+    <flow name="mimeJson">
+        <http:listener config-ref="L" path="/mimeJson"/>
+        <set-payload value='[{"a": 1, "b": [true]}, {"a": 2}, {"a": 3}, {"a": 4}]' mimeType="application/json"/>
+        <batch:job jobName="mimeJsonJob" blockSize="2" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="peek">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: write(payload, "application/json", {indent: false}), mime: payload.^mimeType default "none", "type": typeOf(payload) as String}]</vm:content></vm:publish>
+                    <batch:aggregator size="3">
+                        <vm:publish config-ref="V" queueName="aggQ"><vm:content>#[output application/java --- {n: sizeOf(payload), types: payload map (typeOf($) as String), mimes: payload map ($.^mimeType default "none"), first: if (payload[0] is Binary) (payload[0] as String) else write(payload[0], "application/json", {indent: false})}]</vm:content></vm:publish>
+                    </batch:aggregator>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+    <flow name="mimeJsonKeep">
+        <http:listener config-ref="L" path="/mimeJsonKeep"/>
+        <set-payload value='[{"a": 1, "b": [true]}, {"a": 2}, {"a": 3}, {"a": 4}]' mimeType="application/json"/>
+        <batch:job jobName="mimeJsonKeepJob" blockSize="2" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="peek">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: write(payload, "application/json", {indent: false}), mime: payload.^mimeType default "none", "type": typeOf(payload) as String}]</vm:content></vm:publish>
+                    <batch:aggregator size="3" preserveMimeTypes="true">
+                        <vm:publish config-ref="V" queueName="aggQ"><vm:content>#[output application/java --- {n: sizeOf(payload), types: payload map (typeOf($) as String), mimes: payload map ($.^mimeType default "none"), first: if (payload[0] is Binary) (payload[0] as String) else write(payload[0], "application/json", {indent: false})}]</vm:content></vm:publish>
+                    </batch:aggregator>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+    <flow name="mimeJava">
+        <http:listener config-ref="L" path="/mimeJava"/>
+        <set-payload value='#[[{a: 1, b: [true]}, {a: 2}, {a: 3}, {a: 4}]]'/>
+        <batch:job jobName="mimeJavaJob" blockSize="2" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="peek">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: write(payload, "application/json", {indent: false}), mime: payload.^mimeType default "none", "type": typeOf(payload) as String}]</vm:content></vm:publish>
+                    <batch:aggregator size="3">
+                        <vm:publish config-ref="V" queueName="aggQ"><vm:content>#[output application/java --- {n: sizeOf(payload), types: payload map (typeOf($) as String), mimes: payload map ($.^mimeType default "none"), first: if (payload[0] is Binary) (payload[0] as String) else write(payload[0], "application/json", {indent: false})}]</vm:content></vm:publish>
+                    </batch:aggregator>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+    <flow name="mimeCsv">
+        <http:listener config-ref="L" path="/mimeCsv"/>
+        <set-payload value="#[output application/csv --- [{a: 1, b: 'x'}, {a: 2, b: 'y'}, {a: 3, b: 'z'}, {a: 4, b: 'w'}]]"/>
+        <batch:job jobName="mimeCsvJob" blockSize="2" maxConcurrency="1">
+            <batch:process-records>
+                <batch:step name="peek">
+                    <vm:publish config-ref="V" queueName="recQ"><vm:content>#[output application/java --- {p: write(payload, "application/json", {indent: false}), mime: payload.^mimeType default "none", "type": typeOf(payload) as String}]</vm:content></vm:publish>
+                    <batch:aggregator size="3">
+                        <vm:publish config-ref="V" queueName="aggQ"><vm:content>#[output application/java --- {n: sizeOf(payload), types: payload map (typeOf($) as String), mimes: payload map ($.^mimeType default "none"), first: if (payload[0] is Binary) (payload[0] as String) else write(payload[0], "application/json", {indent: false})}]</vm:content></vm:publish>
+                    </batch:aggregator>
+                </batch:step>
+            </batch:process-records>
+            <batch:on-complete>
+                <flow-ref name="summary"/>
+                <vm:publish config-ref="V" queueName="doneQ"/>
+            </batch:on-complete>
+        </batch:job>
+        <flow-ref name="instance"/>
+        <flow-ref name="collect"/>
+    </flow>
+</mule>

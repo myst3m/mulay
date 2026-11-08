@@ -1,0 +1,108 @@
+(ns amq-gold-test (:require [mulay.conn.amq_wire :as w] [mulay.dw.val :as v] [clay.string :as str]))
+
+;; 生成物: tools/gen-amq-golden.java (手で編集しない)。期待値は anypoint-mq-connector 4.0.23、
+;; anypoint-mq-rest-client 5.1.500、Gson 2.12.0 を Java 17 で直接呼んで得たもの。
+
+(defn- tok-str Str [t: Str] (let [[x e] (w/ack-token-decode t)] (if (not= e "") (str "ERR " e) (w/token-str x))))
+(defn- recv-str Str [j: Str] (let [[ms e] (w/parse-receive j)] (if (not= e "") (str "ERR " e) (w/msgs-str ms))))
+
+(deftest ack-token-encode
+  (is (= (w/ack-token "mulay-test-q" "m1" "2_AQEBuE5y+/x9Ab==")
+         "eyJkZXN0aW5hdGlvbiI6Im11bGF5LXRlc3QtcSIsIm1lc3NhZ2VJZCI6Im0xIiwibG9ja0lkIjoiMl9BUUVCdUU1eSsveDlBYlx1MDAzZFx1MDAzZCJ9"))
+  (is (= (w/ack-token "q" "<a&b>'\"\\" (str "l" (chr 1) " é"))
+         "eyJkZXN0aW5hdGlvbiI6InEiLCJtZXNzYWdlSWQiOiJcdTAwM2NhXHUwMDI2Ylx1MDAzZVx1MDAyN1wiXFwiLCJsb2NrSWQiOiJsXHUwMDAxXHUyMDI4w6kifQ=="))
+  (is (= (w/ack-token "キュー" "日本語" "x\ty\n")
+         "eyJkZXN0aW5hdGlvbiI6IuOCreODpeODvCIsIm1lc3NhZ2VJZCI6IuaXpeacrOiqniIsImxvY2tJZCI6InhcdHlcbiJ9"))
+  (is (= (w/ack-token "q" "id-1" "AQEB/abc+def=")
+         "eyJkZXN0aW5hdGlvbiI6InEiLCJtZXNzYWdlSWQiOiJpZC0xIiwibG9ja0lkIjoiQVFFQi9hYmMrZGVmXHUwMDNkIn0="))
+)
+
+(deftest ack-token-decode
+  (is (= (tok-str "eyJkZXN0aW5hdGlvbiI6Im11bGF5LXRlc3QtcSIsIm1lc3NhZ2VJZCI6Im0xIiwibG9ja0lkIjoiMl9BUUVCdUU1eSsveDlBYlx1MDAzZFx1MDAzZCJ9") "mulay-test-q|m1|2_AQEBuE5y+/x9Ab=="))
+  (is (= (tok-str "eyJkZXN0aW5hdGlvbiI6InEiLCJtZXNzYWdlSWQiOiJcdTAwM2NhXHUwMDI2Ylx1MDAzZVx1MDAyN1wiXFwiLCJsb2NrSWQiOiJsXHUwMDAxXHUyMDI4w6kifQ==") (str "q|<a&b>'\"\\|l" (chr 1) " é")))
+  (is (= (tok-str "not-a-token") "ERR Illegal base64 character 2d"))
+  (is (= (tok-str "aGVsbG8=") "ERR java.lang.IllegalStateException: Expected BEGIN_OBJECT but was STRING at line 1 column 1 path $\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"))
+  (is (= (tok-str "e30=") "null|null|null"))
+  (is (= (tok-str "W10=") "ERR java.lang.IllegalStateException: Expected BEGIN_OBJECT but was BEGIN_ARRAY at line 1 column 2 path $\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"))
+  (is (= (tok-str "MTIz") "ERR java.lang.IllegalStateException: Expected BEGIN_OBJECT but was NUMBER at line 1 column 4 path $\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"))
+  (is (= (tok-str "dHJ1ZQ==") "ERR java.lang.IllegalStateException: Expected BEGIN_OBJECT but was BOOLEAN at line 1 column 5 path $\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"))
+  (is (= (tok-str "a") "ERR Input byte[] should at least have 2 bytes for base64 bytes"))
+  (is (= (tok-str "ab") "ERR java.lang.IllegalStateException: Expected BEGIN_OBJECT but was STRING at line 1 column 1 path $\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"))
+  (is (= (tok-str "abc") "ERR java.lang.IllegalStateException: Expected BEGIN_OBJECT but was STRING at line 1 column 1 path $\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"))
+  (is (= (tok-str "abcde") "ERR Last unit does not have enough valid bits"))
+  (is (= (tok-str "ab=c") "ERR Input byte array has wrong 4-byte ending unit"))
+  (is (= (tok-str "ab==c") "ERR Input byte array has incorrect ending byte at 4"))
+  (is (= (tok-str " e30=") "ERR Illegal base64 character 20"))
+  (is (= (tok-str "e30") "null|null|null"))
+  (is (= (tok-str "e3=0") "ERR Input byte array has wrong 4-byte ending unit"))
+  (is (= (tok-str "é") "ERR Illegal base64 character -3d"))
+  (is (= (tok-str "YWJj\n") "ERR Illegal base64 character a"))
+  (is (= (tok-str "@@@@") "ERR Illegal base64 character 40"))
+  (is (= (tok-str "eyJkZXN0aW5hdGlvbiI6ImQiLCJtZXNzYWdlSWQiOjUsImxvY2tJZCI6ImwifQ==") "d|5|l"))
+  (is (= (tok-str "eyJ4IjoxLCJtZXNzYWdlSWQiOiJtIn0=") "null|m|null"))
+  (is (= (tok-str "eydkZXN0aW5hdGlvbic6J2QnLCdsb2NrSWQnOidsJ30=") "d|null|l"))
+  (is (= (tok-str "e2Rlc3RpbmF0aW9uOmQsbG9ja0lkOmx9") "d|null|l"))
+  (is (= (tok-str "eyJkZXN0aW5hdGlvbiI6ImQi") "ERR java.io.EOFException: End of input at line 1 column 19 path $.destination"))
+  (is (= (tok-str "eyJkZXN0aW5hdGlvbiI6ImQiLH0=") "ERR com.google.gson.stream.MalformedJsonException: Expected name at line 1 column 21 path $.destination\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json"))
+  (is (= (tok-str "eyJkZXN0aW5hdGlvbiI6ImQiICJsb2NrSWQiOiJsIn0=") "ERR com.google.gson.stream.MalformedJsonException: Unterminated object at line 1 column 21 path $.destination\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json"))
+  (is (= (tok-str "eyJkZXN0aW5hdGlvbiI6ImRcdTAwNDFcbiJ9") "dA\n|null|null"))
+  (is (= (tok-str "bnVsbA==") "NULL"))
+  (is (= (tok-str "") "NULL"))
+  (is (= (tok-str "ICAg") "NULL"))
+  (is (= (tok-str "eyJkZXN0aW5hdGlvbiI6bnVsbCwibWVzc2FnZUlkIjoibSJ9") "null|m|null"))
+  (is (= (tok-str "eyJkZXN0aW5hdGlvbiI6ImQiLCJkZXN0aW5hdGlvbiI6ImUifQ==") "e|null|null"))
+  (is (= (tok-str "eyJsb2NrSWQiOnRydWV9") "null|null|true"))
+  (is (= (tok-str "eyJsb2NrSWQiOnt9fQ==") "ERR java.lang.IllegalStateException: Expected a string but was BEGIN_OBJECT at line 1 column 12 path $.lockId\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"))
+  (is (= (tok-str "eyJsb2NrSWQiOltdfQ==") "ERR java.lang.IllegalStateException: Expected a string but was BEGIN_ARRAY at line 1 column 12 path $.lockId\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"))
+  (is (= (tok-str "e30gdHJhaWxpbmc=") "ERR com.google.gson.stream.MalformedJsonException: Use JsonReader.setStrictness(Strictness.LENIENT) to accept malformed JSON at line 1 column 5 path $\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json"))
+  (is (= (tok-str "WzFd") "ERR java.lang.IllegalStateException: Expected BEGIN_OBJECT but was BEGIN_ARRAY at line 1 column 2 path $\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure"))
+)
+
+(deftest url-encode
+  (is (= (w/url-encode "m1") "m1"))
+  (is (= (w/url-encode "a b+c/d=e&f?g#h") "a+b%2Bc%2Fd%3De%26f%3Fg%23h"))
+  (is (= (w/url-encode "日本") "%E6%97%A5%E6%9C%AC"))
+  (is (= (w/url-encode "~*._-") "%7E*._-"))
+  (is (= (w/url-encode "%41") "%2541"))
+  (is (= (w/url-encode "2_AQEBuE5y+/x9Ab==") "2_AQEBuE5y%2B%2Fx9Ab%3D%3D"))
+  (is (= (w/url-encode (str "é" (chr 1) "")) "%C3%A9%01"))
+)
+
+(deftest publish-json
+  (is (= (w/publish-json "hello"
+                         [(w/->Kv "messageId" (w/->JStr "m1"))]
+                         [(w/->Kv "contentType" (w/->JStr "text/plain; charset=UTF-8")) (w/->Kv "MULE_ENCODING" (w/->JStr "UTF-8"))])
+         "{\"body\":\"hello\",\"headers\":{\"messageId\":\"m1\"},\"properties\":{\"contentType\":\"text/plain; charset\\u003dUTF-8\",\"MULE_ENCODING\":\"UTF-8\"}}"))
+  (is (= (w/publish-json "{\"a\": 1}\n"
+                         [(w/->Kv "messageId" (w/->JStr "id-2")) (w/->Kv "deliveryDelay" (w/->JStr "2000")) (w/->Kv "messageGroupId" (w/->JStr "g1"))]
+                         [(w/->Kv "contentType" (w/->JStr "application/json; charset=UTF-8")) (w/->Kv "MULE_ENCODING" (w/->JStr "UTF-8")) (w/->Kv "s" (w/->JStr "x")) (w/->Kv "n" (w/->JNum "1")) (w/->Kv "big" (w/->JNum "12345678901234")) (w/->Kv "d" (w/->JNum "1.5")) (w/->Kv "b" (w/->JStr "true"))])
+         "{\"body\":\"{\\\"a\\\": 1}\\n\",\"headers\":{\"messageGroupId\":\"g1\",\"messageId\":\"id-2\",\"deliveryDelay\":\"2000\"},\"properties\":{\"big\":12345678901234,\"b\":\"true\",\"s\":\"x\",\"d\":1.5,\"contentType\":\"application/json; charset\\u003dUTF-8\",\"MULE_ENCODING\":\"UTF-8\",\"n\":1}}"))
+  (is (= (w/publish-json "<x>&'=</x>"
+                         [(w/->Kv "messageId" (w/->JStr "m3"))]
+                         [ (w/->Kv "contentType" (w/->JStr "app/override")) (w/->Kv "k=v" (w/->JStr "<&>"))])
+         "{\"body\":\"\\u003cx\\u003e\\u0026\\u0027\\u003d\\u003c/x\\u003e\",\"headers\":{\"messageId\":\"m3\"},\"properties\":{\"k\\u003dv\":\"\\u003c\\u0026\\u003e\",\"contentType\":\"app/override\"}}"))
+  (is (= (w/publish-json (str "é" (chr 1) " ")
+                         [(w/->Kv "messageId" (w/->JStr "m4")) (w/->Kv "deliveryDelay" (w/->JStr "0"))]
+                         [(w/->Kv "contentType" (w/->JStr "*/*")) (w/->Kv "zz" (w/->JStr "1")) (w/->Kv "aa" (w/->JStr "2")) (w/->Kv "MULE_ENCODING" (w/->JStr "x"))])
+         "{\"body\":\"é\\u0001\\u2028\",\"headers\":{\"messageId\":\"m4\",\"deliveryDelay\":\"0\"},\"properties\":{\"zz\":\"1\",\"aa\":\"2\",\"contentType\":\"*/*\",\"MULE_ENCODING\":\"x\"}}"))
+)
+
+(deftest parse-receive
+  (is (= (recv-str "[ {\n  \"properties\" : {\n    \"b\" : \"true\",\n    \"contentType\" : \"text/plain; charset=UTF-8\",\n    \"MULE_ENCODING\" : \"UTF-8\",\n    \"n\" : 5\n  },\n  \"headers\" : {\n    \"messageId\" : \"test-1\",\n    \"lockId\" : \"2_AQEB+/x=\",\n    \"ttl\" : \"10000\",\n    \"created\" : \"Mon, 12 Oct 2026 03:45:16 GMT\",\n    \"deliveryCount\" : \"1\"\n  },\n  \"body\" : \"hello\"\n} ]")
+         "H lockId=2_AQEB+/x= created=Mon, 12 Oct 2026 03:45:16 GMT messageId=test-1 ttl=10000 deliveryCount=1 P b=String:true contentType=String:text/plain; charset=UTF-8 MULE_ENCODING=String:UTF-8 n=Long:5 B hello;"))
+  (is (= (recv-str "[{\"properties\":{\"big\":12345678901234,\"d\":1.5,\"e\":1.0,\"f\":1e3,\"s\":\"x\",\"t\":true,\"neg\":-7,\"huge\":99999999999999999999},\"headers\":{\"messageId\":\"m\",\"lockId\":\"l\",\"ttl\":\"120000\",\"messageGroupId\":\"g\",\"created\":\"c\",\"deliveryCount\":\"2\",\"deliveryDelay\":\"2000\"},\"body\":\"line1\\nline2 \\u00e9 \\\"q\\\"\"},{\"properties\":{},\"headers\":{\"messageId\":\"m2\",\"lockId\":\"l2\"},\"body\":\"\"}]")
+         "H lockId=l messageGroupId=g created=c messageId=m ttl=120000 deliveryCount=2 deliveryDelay=2000 P big=Long:12345678901234 neg=Long:-7 s=String:x d=Double:1.5 t=String:true e=Double:1.0 f=Double:1000.0 huge=Double:1.0E20 B line1\nline2 é \"q\";H lockId=l2 messageId=m2 P B ;"))
+  (is (= (recv-str "[]")
+         ""))
+)
+
+(deftest group-id
+  (is (= (w/group-id-ok? "g1") true))
+  (is (= (w/group-id-ok? "has space") false))
+  (is (= (w/group-id-ok? "") false))
+  (is (= (w/group-id-ok? "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~") true))
+  (is (= (w/group-id-ok? "日本") false))
+  (is (= (w/group-id-ok? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") true))
+  (is (= (w/group-id-ok? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") false))
+  (is (= (w/group-id-ok? "tab\t") false))
+)

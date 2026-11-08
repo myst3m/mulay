@@ -1,0 +1,38 @@
+(ns zip-fuzz-test (:require [mulay.lib.zip :as zip] [mulay.lib.inflate :as z]))
+(defn- lcg Int [x: Int] (bit-and (+ (* x 1103515245) 12345) 2147483647))
+(defn- corpus Str [] (loop [i 0 s ""] (if (>= i 300) s (recur (+ i 1) (str s "entry " (mod (* i 31) 17) " payload text; ")))))
+;; corrupted compressed streams and archives give errors, never aborts
+(deftest inflate-corrupt
+  (is (let [c (z/deflate (corpus))]
+        (loop [k 0 seed 5 errs 0]
+          (if (>= k 2000) (> errs 0)
+            (let [s1 (lcg seed) s2 (lcg s1)
+                  pos (mod s1 (count c))
+                  bad (str (subs c 0 pos) (chr (mod s2 256)) (subs c (+ pos 1) (count c)))
+                  [o e err] (z/inflate-limit bad 0 1000000)]
+              (recur (+ k 1) s2 (if (= err "") errs (+ errs 1)))))))))
+(deftest inflate-truncated
+  (is (let [c (z/deflate (corpus))]
+        (loop [i 0 errs 0] (if (>= i (count c)) (= errs (count c))
+                             (let [[o e err] (z/inflate (subs c 0 i) 0)] (recur (+ i 1) (if (= err "") errs (+ errs 1)))))))))
+(deftest zip-corrupt
+  (is (let [[a werr] (zip/write [(zip/zip-in "a.txt" (corpus)) (zip/zip-in "b/c.txt" "small")])]
+        (loop [k 0 seed 9 fails 0]
+          (if (>= k 2000) true
+            (let [s1 (lcg seed) s2 (lcg s1)
+                  pos (mod s1 (count a))
+                  bad (str (subs a 0 pos) (chr (mod s2 256)) (subs a (+ pos 1) (count a)))
+                  [es err] (zip/entries bad)
+                  n (loop [i 0 n 0] (if (>= i (count es)) n (let [[o e2] (zip/read-entry-limit bad (nth es i) 1000000)] (recur (+ i 1) (if (= e2 "") n (+ n 1))))))]
+              (recur (+ k 1) s2 (+ fails n))))))))
+;; ZIP64 の 64 ビットの位置や大きさが INT64_MAX 近くでも、位置に足して溢れず、誤りとして返す
+(deftest huge-zip64-values
+  (let [[a werr] (zip/write [(zip/zip-in "a.txt" "hello")])
+        [es err] (zip/entries a)
+        e (nth es 0)
+        far (zip/->ZipEntry "a.txt" 0 0 (:crc e) 5 5 9223372036854775806 false)
+        big (zip/->ZipEntry "a.txt" 0 0 (:crc e) 9223372036854775806 5 (:offset e) false)
+        [o1 e1] (zip/read-entry-limit a far 1000000)
+        [o2 e2] (zip/read-entry-limit a big 1000000)]
+    (is (= e1 "bad local header for a.txt"))
+    (is (= e2 "a.txt: entry data runs past the end of the archive"))))

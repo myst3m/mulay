@@ -1,0 +1,122 @@
+(ns pg-test (:require [mulay.db.pg :as p] [mulay.db.sql :as sql] [clay.postgres :as pg] [clay.tls :as tls] [clay.string :as str]))
+
+;; DB に繋がずに確かめられる部分 (URL、? の番号付け、失敗の文言、値の文字の形)。
+;; 失敗の文言の期待値は pgjdbc 42.7 の ServerErrorMessage#toString (実 Mule の db-pg の記録と同じ形)
+
+(defn- url Str [u: Str] (let [[h port db kvs e] (p/parse-url u)] (if (= e "") (str h "|" port "|" db "|" (count kvs)) (str "ERR " e))))
+
+(defn- perr pg/PgError [msg: Str detail: Str position: Str]
+  (pg/->PgError "ERROR" "ERROR" "42P01" msg detail "" position "" "" "" "" "" "" "" "" "" "" "" false))
+
+(deftest urls
+  (is (= (url "//localhost:15432/mulay") "localhost|15432|mulay|0"))
+  (is (= (url "//db.example/app?sslmode=disable&user=u") "db.example|5432|app|2"))
+  (is (= (url "//h") "h|5432||0"))
+  (is (= (url "//:6000/x") "localhost|6000|x|0"))
+  (is (= (url "//h:99999/x") "ERR Invalid port number: 99999"))
+  (is (= (url "//h:1a/x") "ERR Invalid port number: 1a"))
+  (is (= (url "localhost/x") "ERR Invalid PostgreSQL URL: jdbc:postgresql:localhost/x")))
+
+(deftest params
+  (is (= (p/number-params "SELECT * FROM t WHERE a > ? AND b <> ?") "SELECT * FROM t WHERE a > $1 AND b <> $2"))
+  (is (= (p/number-params "SELECT '?', \"x?\", ? -- ?\n, ? /* ? */") "SELECT '?', \"x?\", $1 -- ?\n, $2 /* ? */"))
+  (is (= (p/number-params "SELECT 1") "SELECT 1")))
+
+(deftest errors
+  (is (= (p/error-text (perr "relation \"nothing_here\" does not exist" "" "15"))
+         "ERROR: relation \"nothing_here\" does not exist\n  Position: 15"))
+  (is (= (p/error-text (perr "null value in column \"name\"" "Failing row contains (7, null)." ""))
+         "ERROR: null value in column \"name\"\n  Detail: Failing row contains (7, null).")))
+
+(deftest values
+  (is (= (p/timestamp "2026-09-30 10:11:12.345" false) "2026-09-30T10:11:12.345"))
+  (is (= (p/timestamp "2026-09-30 10:11:12+09" true) "2026-09-30T10:11:12"))
+  (is (= (p/timestamp "2026-01-01 09:00:00.5-03:30" true) "2026-01-01T09:00:00.5"))
+  (is (= (p/bytea "\\x0102ff") (str (chr 1) (chr 2) (chr 255))))
+  (is (= (p/bytea "\\x") "")))
+
+(defn- cs Str [s: Str dirs: Vec(Int)] (let [[q sent] (p/call-sql s dirs)] (str q " " (count sent))))
+
+;; pgjdbc の escapeSyntaxCallMode=select の書き換え (Parser.modifyJdbcCall の出力と同じ。call の後ろの文面は空白も
+;; そのまま、戻り値の ? は引数の先頭、OUT の ? も残す)。dirs は IN 0、OUT 1、INOUT 2
+(deftest call-sql
+  (is (= (cs "{call add_one(?, ?)}" [0 1]) "select * from add_one($1, $2) as result 2"))
+  (is (= (cs "{call  add_one(?, ?)}" [0 2]) "select * from  add_one($1, $2) as result 2"))
+  (is (= (cs "{ call add_one(?,?) }" [0 2]) "select * from add_one($1,$2)  as result 2"))
+  (is (= (cs "{call bump(?, ?)}" [0 2]) "select * from bump($1, $2) as result 2"))
+  (is (= (cs "{? = call twice(?)}" [1 0]) "select * from twice($1,$2) as result 2"))
+  (is (= (cs "{? = call f(1, ?)}" [1 0]) "select * from f($1,1, $2) as result 2"))
+  (is (= (cs "{? = call f()}" [1]) "select * from f($1) as result 1"))
+  (is (= (cs "{?=call f}" [1]) "select * from f($1) as result 1"))
+  (is (= (cs "{call touch_bob()}" []) "select * from touch_bob() as result 0"))
+  (is (= (cs "{call touch_bob}" []) "select * from touch_bob() as result 0"))
+  (is (= (cs "  {call f(?)}" [0]) "select * from f($1) as result 1"))
+  (is (= (cs "{call f(?, 'a,b', ?)}" [0 0]) "select * from f($1, 'a,b', $2) as result 2")))
+
+;; bulk の失敗の文言に入る SQL (pgjdbc の toString): 数の型には後置、文字列の型には付けない、' は重ねる、NULL はそのまま
+(deftest render-sql
+  (let [q "INSERT INTO t (id, name, d) VALUES ($1, $2, $3) -- $9"
+        row [(sql/->CInt 11) (sql/->CStr "it's") (sql/->CNull)]]
+    (is (= (p/render-sql q row [23 1043 1043]) "INSERT INTO t (id, name, d) VALUES (('11'::int4), ('it''s'), (NULL)) -- $9"))
+    (is (= (p/render-sql "SELECT $1, $2" [(sql/->CDecimal "1.5") (sql/->CBool true)] [1700 25]) "SELECT ('1.5'::numeric), ('true')"))
+    (is (= (p/render-sql "SELECT $1" [(sql/->CLong 9007199254740993)] []) "SELECT ('9007199254740993')"))))
+
+;; URL の ssl / sslmode (pgjdbc 42.7 の SslMode.of): sslmode が無ければ ssl=true か ssl= で verify-full、それ以外は
+;; prefer。prefer / require は証明書を確かめない (pgjdbc の NonValidatingTM)。verify-ca は鎖だけ、verify-full は名前も確かめる。
+(defn- mode-name Str [m: &pg/SslMode] (match m (pg/SslDisable) "disable" (pg/SslPrefer) "prefer" (pg/SslRequire) "require"))
+
+(defn- ssl Str [q: Str]
+  (let [[m c e] (p/ssl-of (if (= q "") [] (str/split q "&")))]
+    (if (= e "") (str (mode-name m) "|" (match (:verify c) (tls/VerifyNone) "insecure" (tls/VerifyCa) "ca" (tls/VerifyFull) "verify")) (str "ERR " e))))
+
+(deftest ssl-modes
+  (is (= (ssl "") "prefer|insecure"))
+  (is (= (ssl "user=u") "prefer|insecure"))
+  (is (= (ssl "ssl=true") "require|verify"))
+  (is (= (ssl "ssl=TRUE") "require|verify"))
+  (is (= (ssl "ssl=") "require|verify"))
+  (is (= (ssl "ssl=false") "prefer|insecure"))
+  (is (= (ssl "sslmode=disable") "disable|insecure"))
+  (is (= (ssl "sslmode=allow") "prefer|insecure"))
+  (is (= (ssl "sslmode=prefer&ssl=true") "prefer|insecure"))
+  (is (= (ssl "sslmode=require") "require|insecure"))
+  (is (= (ssl "sslmode=verify-ca") "require|ca"))
+  (is (= (ssl "ssl=false&sslmode=verify-full") "require|verify"))
+  (is (= (ssl "sslmode=bogus") "ERR Invalid sslmode value: bogus"))
+  (is (= (ssl "ssl=true&sslfactory=org.postgresql.ssl.NonValidatingFactory") "require|insecure"))
+  (is (= (ssl "ssl=true&sslfactory=com.example.Factory") "ERR sslfactory com.example.Factory is not supported by mulay (only org.postgresql.ssl.NonValidatingFactory)"))
+  (is (= (ssl "sslmode=require&sslcert=/c.pem") "ERR sslcert / sslkey (client certificates) are not supported by mulay"))
+  (is (= (ssl "sslmode=verify-full&sslrootcert=/no/such.crt") "ERR Could not open SSL root certificate file /no/such.crt."))
+  ;; 確かめないモードでは sslrootcert を読まない (pgjdbc も)
+  (is (= (ssl "sslmode=require&sslrootcert=/no/such.crt") "require|insecure")))
+
+;; executeBatch の Sync の位置 (pgjdbc 42.7 の QueryExecutorImpl#flushIfDeadlockRisk): 文ごとに 250 を足し、64000 に
+;; 届いたら次の文を送る前に Sync。区切りの終わり (含まない) の位置を返す。実 Mule の記録 (db-pg の /bulk-tx-n) では
+;; 先頭の 255 文、その後は 256 文ずつがそれぞれ 1 つのトランザクション
+(deftest batch-segments
+  (is (= (p/batch-segments 0) []))
+  (is (= (p/batch-segments 1) [1]))
+  (is (= (p/batch-segments 255) [255]))
+  (is (= (p/batch-segments 256) [255 256]))
+  (is (= (p/batch-segments 511) [255 511]))
+  (is (= (p/batch-segments 600) [255 511 600])))
+
+(deftest native-stmts-like-pgjdbc
+  (let [one (p/native-stmts "INSERT INTO t VALUES (1);")
+        sp (p/native-stmts "INSERT INTO t VALUES (1) ;")
+        two (p/native-stmts "UPDATE a SET x = 1; INSERT INTO t VALUES (1)")
+        dollar (p/native-stmts "DO $$ BEGIN PERFORM pg_sleep(3); END $$;")
+        tagged (p/native-stmts "DO $fn$ BEGIN x; END $fn$; SELECT 2")
+        quoted (p/native-stmts "SELECT 'a;b', \"c;d\", E'x\\';y' FROM t; SELECT 1")
+        comments (p/native-stmts "SELECT 1 -- a;b\n; /* c; /* d; */ e; */ SELECT 2")
+        ident (p/native-stmts "SELECT a$b; SELECT 3")
+        blank (p/native-stmts " ; ;SELECT 4;  ")]
+    (is (= one ["INSERT INTO t VALUES (1)"]))
+    (is (= sp ["INSERT INTO t VALUES (1) "]))
+    (is (= two ["UPDATE a SET x = 1" " INSERT INTO t VALUES (1)"]))
+    (is (= dollar ["DO $$ BEGIN PERFORM pg_sleep(3); END $$"]))
+    (is (= tagged ["DO $fn$ BEGIN x; END $fn$" " SELECT 2"]))
+    (is (= quoted ["SELECT 'a;b', \"c;d\", E'x\\';y' FROM t" " SELECT 1"]))
+    (is (= comments ["SELECT 1 -- a;b\n" " /* c; /* d; */ e; */ SELECT 2"]))
+    (is (= ident ["SELECT a$b" " SELECT 3"]))
+    (is (= blank ["SELECT 4"]))))

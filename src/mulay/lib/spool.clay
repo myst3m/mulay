@@ -1,0 +1,57 @@
+(ns mulay.lib.spool (:require [clay.io :as io] [mulay.lib.host :as host] [mulay.lib.fs :as fs]))
+
+(defrecord Spool [path: Str limit: Int mem: Str size: Int file: Vec(io/File) own: Bool])
+
+(defn new Spool [path: &Str limit: Int] (let [none: Vec(io/File) []] (->Spool (str path) limit "" 0 none true)))
+
+(defn size Int [s: &Spool] (:size s))
+
+(defn in-memory? Bool [s: &Spool] (= (count (:file s)) 0))
+
+(target-when "wasm"
+(do
+(defn of-file Values(Spool Str) [path: &Str]
+  (let [[t e] (host/file-read path)]
+    (if (not= e "") (values (new path 0) (str "spool: " path ": " e))
+      (values (->Spool (str path) 0 t (count t) (let [none: Vec(io/File) []] none) false) ""))))
+(defn add Values(Spool Str) [s: Spool piece: &Str]
+  (let [m (:mem s)] (values (assoc s :mem (str m piece) :size (+ (:size s) (count piece))) "")))
+(defn read-at Values(Str Str) [s: &Spool off: Int n: Int]
+  (if (or (< off 0) (<= n 0) (>= off (:size s))) (values "" "")
+    (let [m (:mem s) end (if (> n (- (count m) off)) (count m) (+ off n))] (values (subs m off end) ""))))
+(defn delete Str [s: &Spool] "")
+)
+(do
+(defn of-file Values(Spool Str) [path: &Str]
+  (let [[f oe] (io/open path "r")]
+    (if (not= oe "") (values (new path 0) (str "spool: " path ": " oe))
+      (let [[n se] (io/file-size f)]
+        (if (not= se "") (values (new path 0) (str "spool: " path ": " se))
+          (values (->Spool (str path) 0 "" n [f] false) ""))))))
+
+(defn add Values(Spool Str) [s: Spool piece: &Str]
+  (cond
+    (= (count piece) 0) (values s "")
+    (and (in-memory? s) (<= (count piece) (- (:limit s) (:size s))))
+    (let [m (:mem s)] (values (assoc s :mem (str m piece) :size (+ (:size s) (count piece))) ""))
+    (in-memory? s)
+    (let [[ex ce] (fs/create-new-private (:path s))]
+      (if (not= ce "") (values s (str "spool: " ce))
+        (let [[f oe] (io/open (:path s) "rw")]
+          (if (not= oe "") (values s (str "spool: " (:path s) ": " oe))
+            (let [e1 (io/pwrite f 0 (:mem s))
+                  e2 (if (= e1 "") (io/pwrite f (:size s) piece) e1)]
+              (if (not= e2 "") (values s (str "spool: " (:path s) ": " e2))
+                (values (assoc s :mem "" :size (+ (:size s) (count piece)) :file [f]) "")))))))
+    :else
+    (let [e (io/pwrite (nth (:file s) 0) (:size s) piece)]
+      (if (not= e "") (values s (str "spool: " (:path s) ": " e))
+        (values (assoc s :size (+ (:size s) (count piece))) "")))))
+
+(defn read-at Values(Str Str) [s: &Spool off: Int n: Int]
+  (cond (or (< off 0) (<= n 0) (>= off (:size s))) (values "" "")
+        (in-memory? s) (let [m (:mem s) end (if (> n (- (count m) off)) (count m) (+ off n))] (values (subs m off end) ""))
+        :else (let [[p e] (io/pread (nth (:file s) 0) off n)] (if (= e "") (values p "") (values "" (str "spool: " (:path s) ": " e))))))
+
+(defn delete Str [s: &Spool]
+  (if (in-memory? s) "" (let [c (io/close (nth (:file s) 0))] (if (:own s) (io/remove (str (:path s))) ""))))))

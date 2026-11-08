@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18145"/>
+    </http:listener-config>
+    <http:request-config name="Self">
+        <http:request-connection host="localhost" port="18145"/>
+    </http:request-config>
+
+    <!-- 出力の encoding がそのまま応答のバイト列と Content-Type になる -->
+    <flow name="sjis-json">
+        <http:listener config-ref="L" path="/sjis-json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json encoding="Shift_JIS"
+---
+{k: "あ～①", e: "é"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Shift_JIS で書いた JSON を読み直す (DataType の charset で読む) -->
+    <flow name="roundtrip-json">
+        <http:listener config-ref="L" path="/roundtrip-json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json encoding="Shift_JIS"
+---
+{k: "あい"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import toHex from dw::core::Binaries
+output application/json
+---
+{k: payload.k, mime: payload.^mimeType, enc: payload.^encoding, hex: toHex(payload.^raw)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- EUC-JP の XML: 宣言に encoding が入り、読み直せる -->
+    <flow name="roundtrip-xml">
+        <http:listener config-ref="L" path="/roundtrip-xml"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/xml encoding="EUC-JP"
+---
+{a: "日本語"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import toHex from dw::core::Binaries
+output application/json
+---
+{a: payload.a, mime: payload.^mimeType, hex: toHex(payload.^raw)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- http:request で windows-1252 のテキストを送り、listener が charset で読む -->
+    <flow name="send">
+        <http:listener config-ref="L" path="/send"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output text/plain encoding="windows-1252"
+---
+"café €"]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <http:request config-ref="Self" method="POST" path="/recv"/>
+    </flow>
+    <flow name="recv">
+        <http:listener config-ref="L" path="/recv"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import toHex from dw::core::Binaries
+output application/json
+---
+{got: payload as String, ct: attributes.headers."content-type", hex: toHex(payload.^raw)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 受け取った Shift_JIS の JSON を charset で読む -->
+    <flow name="read-sjis">
+        <http:listener config-ref="L" path="/read-sjis"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{k: payload.k}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+    <flow name="send-sjis-json">
+        <http:listener config-ref="L" path="/send-sjis-json"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json encoding="Shift_JIS"
+---
+{k: "漢字"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <http:request config-ref="Self" method="POST" path="/read-sjis"/>
+    </flow>
+</mule>

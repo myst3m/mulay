@@ -1,0 +1,28 @@
+(ns dberr-test (:require [mulay.conn.db :as db] [mulay.db.sql :as sql]))
+
+;; 期待値は mule-db-client 1.7 の DbExceptionHandler の規則と、実 Mule の db-oracle / db-pg の記録
+
+(defn- m Str [msg: Str state: Str exc: Str] (let [[id d] (db/db-error (sql/->DbErr msg state 0 exc))] (str id "|" d)))
+
+(deftest mapping
+  (is (= (m "ORA-00942: x" "42000" "java.sql.SQLSyntaxErrorException") "BAD_SQL_SYNTAX|java.sql.SQLSyntaxErrorException: ORA-00942: x"))
+  (is (= (m "ORA-01400: y" "23000" "java.sql.SQLIntegrityConstraintViolationException") "QUERY_EXECUTION|ORA-01400: y"))
+  (is (= (m "ERROR: relation" "42P01" "org.postgresql.util.PSQLException") "QUERY_EXECUTION|ERROR: relation"))
+  (is (= (m "gone" "08006" "org.postgresql.util.PSQLException") "CONNECTIVITY|gone"))
+  (is (= (m "The connection is closed: x" "" "java.sql.SQLException") "CONNECTIVITY|The connection is closed: x"))
+  (is (= (m "s" "S0001" "java.sql.SQLException") "BAD_SQL_SYNTAX|s"))
+  (is (= (m "t" "08P01" "java.sql.SQLException") "QUERY_EXECUTION|t")))
+
+(defn- co Str [c: sql/Cell t: Str]
+  (match (db/coerce-out c t)
+    (sql/CInt i) (str "Int " i) (sql/CLong i) (str "Long " i) (sql/CDecimal s) (str "Dec " s) (sql/CStr s) (str "Str " s)
+    (sql/CDate s) (str "Date " s) (sql/CBool b) (str "Bool " b) (sql/CNull) "Null" _ "other"))
+
+;; OUT の値の型 (CallableStatement#getObject と同じ。実 Mule の db-oracle の sp-multi)
+(deftest coerce
+  (is (= (co (sql/->CDecimal "3") "INTEGER") "Int 3"))
+  (is (= (co (sql/->CDecimal "42") "NUMERIC") "Dec 42"))
+  (is (= (co (sql/->CTimestamp "2026-01-02T00:00:00") "DATE") "Date 2026-01-02"))
+  (is (= (co (sql/->CBool true) "BOOLEAN") "Bool true"))
+  (is (= (co (sql/->CNull) "INTEGER") "Null"))
+  (is (= (co (sql/->CStr "x") "OTHER") "Str x")))

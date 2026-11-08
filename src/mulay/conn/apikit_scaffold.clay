@@ -1,0 +1,227 @@
+(ns mulay.conn.apikit_scaffold
+  (:require [mulay.mule.model :as m] [mulay.mule.amodel :as am] [mulay.mule.parse :as ps] [mulay.lib.xml :as xml]
+            [mulay.conn.apikit :as apikit] [mulay.conn.apispec :as sp] [mulay.rt.conn :as conn] [mulay.dw.lib.core_misc :as cm]
+            [clay.json :as json] [clay.string :as str]))
+
+(defrecord Req [config: Str file: Str listener-config: Str path: Str])
+(defrecord Edit [file: Str start: Int end: Int text: Str])
+(defrecord Result [edits: Vec(Edit) flows: Vec(Str) error: Str])
+
+(def NS-HTTP "http://www.mulesoft.org/schema/mule/http")
+(def NS-APIKIT "http://www.mulesoft.org/schema/mule/mule-apikit")
+(def NS-XSI "http://www.w3.org/2001/XMLSchema-instance")
+
+(def XSD [["http://www.mulesoft.org/schema/mule/ee/core" "http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd"]
+          ["http://www.mulesoft.org/schema/mule/http" "http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd"]
+          ["http://www.mulesoft.org/schema/mule/mule-apikit" "http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd"]])
+
+(def ERRORS [["BAD_REQUEST" "400" "Bad request"] ["NOT_FOUND" "404" "Resource not found"] ["METHOD_NOT_ALLOWED" "405" "Method not allowed"]
+             ["NOT_ACCEPTABLE" "406" "Not acceptable"] ["UNSUPPORTED_MEDIA_TYPE" "415" "Unsupported media type"] ["NOT_IMPLEMENTED" "501" "Not Implemented"]])
+
+(defn- failure Result [msg: Str] (let [e: Vec(Edit) [] f: Vec(Str) []] (->Result e f msg)))
+
+(defrecord- Ns [uri: Str prefix: Str])
+
+(defn- declared Vec(Ns) [sp: &xml/XSpan]
+  (loop [i 0 acc: Vec(Ns) []]
+    (if (>= i (count (:attrs sp))) acc
+      (let [a (nth (:attrs sp) i) n (:name a)]
+        (recur (+ i 1) (if (str/starts-with? n "xmlns:") (conj acc (->Ns (str (:raw a)) (subs n 6 (count n)))) acc))))))
+
+(defn- prefix-of Vec(Str) [ds: &Vec(Ns) uri: &Str]
+  (loop [i 0] (if (>= i (count ds)) [] (if (= (:uri (nth ds i)) uri) [(str (:prefix (nth ds i)))] (recur (+ i 1))))))
+
+(defn- taken? Bool [ds: &Vec(Ns) p: &Str] (loop [i 0] (if (>= i (count ds)) false (if (= (:prefix (nth ds i)) p) true (recur (+ i 1))))))
+
+(defn- pick Values(Vec(Ns) Str Bool) [ds: Vec(Ns) uri: &Str want: &Str]
+  (let [have (prefix-of ds uri)]
+    (if (> (count have) 0) (values ds (nth have 0) false)
+      (let [p (loop [k 1 c (str want)] (if (taken? ds c) (recur (+ k 1) (str want k)) c))]
+        (values (conj ds (->Ns (str uri) p)) p true)))))
+
+(defn- xsd-of Str [uri: &Str] (loop [i 0] (if (>= i (count XSD)) "" (if (= (nth (nth XSD i) 0) uri) (str (nth (nth XSD i) 1)) (recur (+ i 1))))))
+
+(defn- cdata Str [s: &Str] (str "<![CDATA[" (str/replace s "]]>" "]]]]><![CDATA[>") "]]>"))
+
+(defn- json-mime? Bool [m: &Str] (or (= m "application/json") (str/ends-with? m "+json")))
+
+(defn- example-of Vec(sp/Example) [o: &sp/Op]
+  (let [xs (:examples o)
+        ok (fn Bool [x: sp/Example] (json-mime? (:mime x)))
+        two (loop [i 0] (if (>= i (count xs)) -1 (if (and (str/starts-with? (:code (nth xs i)) "2") (ok (nth xs i))) i (recur (+ i 1)))))]
+    (if (>= two 0) [(nth xs two)] [])))
+
+(defrecord- P [doc: Str ee: Str http: Str apikit: Str])
+
+(defn- transform Str [u: &Str ind: &Str p: &P mime: &Str body: &Str vars: &Vec(Vec(Str))]
+  (let [ee (:ee p)
+        o1 (str ind "<" ee ":transform " (:doc p) ":id=\"" (cm/uuid4) "\">\n"
+                ind u "<" ee ":message>\n"
+                ind u u "<" ee ":set-payload>" (cdata (str "%dw 2.0\noutput " mime "\n---\n" body)) "</" ee ":set-payload>\n"
+                ind u "</" ee ":message>\n")
+        o2 (if (= (count vars) 0) o1
+             (loop [i 0 o (str o1 ind u "<" ee ":variables>\n")]
+               (if (>= i (count vars)) (str o ind u "</" ee ":variables>\n")
+                 (recur (+ i 1) (str o ind u u "<" ee ":set-variable variableName=\"" (xml/escape-attr (nth (nth vars i) 0)) "\">" (nth (nth vars i) 1) "</" ee ":set-variable>\n")))))]
+    (str o2 ind "</" ee ":transform>\n")))
+
+(defn- impl-flow Str [u: &Str name: &Str o: &sp/Op p: &P]
+  (let [ex (example-of o)
+        n (xml/escape-attr name)
+        body (if (= (count ex) 0)
+               (str u u "<logger level=\"INFO\" " (:doc p) ":id=\"" (cm/uuid4) "\" message=\"" n "\"/>\n")
+               (let [z: Vec(Vec(Str)) []] (transform u (str u u) p (:mime (nth ex 0)) (:json (nth ex 0)) z)))]
+    (str "\n" u "<flow name=\"" n "\">\n" body u "</flow>\n")))
+
+(defn- listener-flow Str [u: &Str name: &Str lcfg: &Str path: &Str cfg: &m/Config p: &P op: &Str errors: &Vec(Vec(Str))]
+  (let [hv (conn/param-lit (:params cfg) "outboundHeadersMapName" "outboundHeaders")
+        sv (conn/param-lit (:params cfg) "httpStatusVarName" "httpStatus")
+        h (:http p) i2 (str u u) i3 (str u u u) i4 (str u u u u)
+        o1 (str "\n" u "<flow name=\"" (xml/escape-attr name) "\">\n"
+                i2 "<" h ":listener config-ref=\"" (xml/escape-attr lcfg) "\" path=\"" (xml/escape-attr path) "\">\n"
+                i3 "<" h ":response statusCode=\"#[vars." sv " default 200]\">\n"
+                i4 "<" h ":headers>#[vars." hv " default {}]</" h ":headers>\n"
+                i3 "</" h ":response>\n"
+                i3 "<" h ":error-response statusCode=\"#[vars." sv " default 500]\">\n"
+                i4 "<" h ":body>#[payload]</" h ":body>\n"
+                i4 "<" h ":headers>#[vars." hv " default {}]</" h ":headers>\n"
+                i3 "</" h ":error-response>\n"
+                i2 "</" h ":listener>\n"
+                i2 "<" (:apikit p) ":" op " config-ref=\"" (xml/escape-attr (:name cfg)) "\"/>\n"
+                i2 "<error-handler>\n")
+        o2 (loop [i 0 o o1]
+             (if (>= i (count errors)) o
+               (let [e (nth errors i)]
+                 (recur (+ i 1) (str o i3 "<on-error-propagate type=\"APIKIT:" (nth e 0) "\">\n"
+                                     (transform u i4 p "application/json" (str "{message: \"" (nth e 2) "\"}") [[sv (nth e 1)]])
+                                     i3 "</on-error-propagate>\n")))))]
+    (str o2 i2 "</error-handler>\n" u "</flow>\n")))
+
+(defn- main-flow Str [u: &Str name: &Str lcfg: &Str path: &Str cfg: &m/Config p: &P] (listener-flow u name lcfg path cfg p "router" ERRORS))
+
+(defn- console-flow Str [u: &Str name: &Str lcfg: &Str cfg: &m/Config p: &P] (listener-flow u name lcfg "/console/*" cfg p "console" [(nth ERRORS 1)]))
+
+(defn- indent-unit Str [t: &Str from: Int]
+  (let [nl (str/index-of-after t "\n" from)]
+    (if (< nl 0) "    "
+      (let [e (loop [j (+ nl 1)] (if (and (< j (count t)) (or (= (nth t j) 32) (= (nth t j) 9))) (recur (+ j 1)) j))]
+        (if (= e (+ nl 1)) "    " (subs t (+ nl 1) e))))))
+
+(defn- has-flow? Bool [app: &m/App n: &Str] (loop [i 0] (if (>= i (count (:flows app))) false (if (= (:name (nth (:flows app) i)) n) true (recur (+ i 1))))))
+
+(defn- unique-name Str [app: &m/App base: &Str] (loop [k 1 c (str base)] (if (has-flow? app c) (recur (+ k 1) (str base "-" k)) c)))
+
+(defn- base-name Str [api: &Str]
+  (let [s (let [k (str/last-index-of api "/")] (if (< k 0) (str api) (subs api (+ k 1) (count api))))
+        d (str/last-index-of s ".")]
+    (if (> d 0) (subs s 0 d) s)))
+
+(defn- find-config Vec(m/Config) [app: &m/App kind: &Str name: &Str]
+  (loop [i 0] (if (>= i (count (:configs app))) []
+                (let [c (nth (:configs app) i)] (if (and (= (:kind c) kind) (= (:name c) name)) [c] (recur (+ i 1)))))))
+
+(defn- configs-of Vec(Str) [app: &m/App kind: &Str]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i (count (:configs app))) acc (recur (+ i 1) (let [c (nth (:configs app) i)] (if (= (:kind c) kind) (conj acc (str (:name c))) acc))))))
+
+(defn- main-file Str [app: &m/App md: &am/AModel cfg: &Str]
+  (let [fl (:flows app)
+        mn (loop [i 0] (if (>= i (count fl)) "" (if (> (count (am/router-of (nth fl i) cfg)) 0) (str (:name (nth fl i))) (recur (+ i 1)))))
+        af (:flows md)
+        f1 (if (= mn "") "" (loop [i 0] (if (>= i (count af)) "" (if (= (:name (nth af i)) mn) (str (:file (nth af i))) (recur (+ i 1))))))
+        gs (:globals md)
+        f2 (loop [i 0] (if (>= i (count gs)) "" (let [g (nth gs i)] (if (and (> (count (:name g)) 0) (= (nth (:name g) 0) cfg) (str/ends-with? (:element g) ":config")) (str (:file g)) (recur (+ i 1))))))
+        fs (:files md)
+        f3 (loop [i 0] (if (>= i (count fs)) "" (if (> (count (:root (nth fs i))) 0) (str (:path (nth fs i))) (recur (+ i 1)))))]
+    (cond (not= f1 "") f1 (not= f2 "") f2 :else f3)))
+
+(defn- root-of Vec(xml/XSpan) [md: &am/AModel file: &Str]
+  (let [fs (:files md)] (loop [i 0] (if (>= i (count fs)) [] (if (= (:path (nth fs i)) file) (:root (nth fs i)) (recur (+ i 1)))))))
+
+(defn- ops-of Vec(Vec(Int)) [a: &sp/Api]
+  (loop [i 0 acc: Vec(Vec(Int)) []]
+    (if (>= i (count (:res a))) acc
+      (recur (+ i 1) (loop [k 0 x acc] (if (>= k (count (:ops (nth (:res a) i)))) x (recur (+ k 1) (conj x [i k]))))))))
+
+(defn scaffold Result [app: &m/App md: &am/AModel pre: &Str req: &Req]
+  (let [apis (:apis md)
+        ai (loop [i 0] (if (>= i (count apis)) -1 (if (= (:config (nth apis i)) (:config req)) i (recur (+ i 1)))))
+        cfgs (find-config app "mule-apikit:config" (:config req))]
+    (cond
+      (or (< ai 0) (= (count cfgs) 0)) (failure (str "no apikit:config named '" (:config req) "'"))
+      (not= (:error (nth apis ai)) "") (failure (str (:error (nth apis ai))))
+      :else
+      (let [mdl (nth apis ai)
+            cfg (nth cfgs 0)
+            fl (:flows app)
+            has-main (loop [i 0] (if (>= i (count fl)) false (if (> (count (am/router-of (nth fl i) (:config req))) 0) true (recur (+ i 1)))))
+            lcs (configs-of app "http:listener-config")
+            lcfg (cond has-main ""
+                       (not= (:listener-config req) "") (if (> (count (find-config app "http:listener-config" (:listener-config req))) 0) (str (:listener-config req)) "?")
+                       (= (count lcs) 1) (nth lcs 0)
+                       :else "")
+            file (if (not= (:file req) "") (str (:file req)) (main-file app md (:config req)))
+            roots (root-of md file)
+            text (get (:texts app) (if (str/starts-with? file pre) (subs file (count pre) (count file)) (str file)) "")]
+        (cond
+          (= lcfg "?") (failure (str "no http:listener-config named '" (:listener-config req) "'"))
+          (and (not has-main) (= lcfg "")) (failure "no http:listener-config to put the main flow on; pass listenerConfig")
+          (or (= (count roots) 0) (= text "")) (failure (str "no Mule configuration file '" file "' to add the flows to"))
+          (< (:close (nth roots 0)) 0) (failure (str "the root element of '" file "' is self-closing; open it before adding flows"))
+          :else
+          (let [rs (nth roots 0)
+                api-txt (apikit/api-path (conn/param-lit (:params cfg) "api" "") (:res app))
+                [a ae] (let [[src found] ((:res app) api-txt)] (apikit/parse-api src api-txt (:res app) (apikit/apikit-version app)))
+                pairs (ops-of a)
+                aops (:ops mdl)
+                missing (loop [i 0 acc: Vec(Int) [] seen: Vec(Str) []]
+                          (if (>= i (count aops)) acc
+                            (let [o (nth aops i)]
+                              (if (or (:implemented o) (> (count (filterv (fn Bool [s: Str] (= s (:flow o))) seen)) 0)) (recur (+ i 1) acc seen)
+                                (recur (+ i 1) (conj acc i) (conj seen (str (:flow o))))))))
+                need-ee (or (not has-main) (loop [i 0] (if (>= i (count missing)) false (let [pr (nth pairs (nth missing i))] (if (> (count (example-of (nth (:ops (nth (:res a) (nth pr 0))) (nth pr 1)))) 0) true (recur (+ i 1)))))))
+                ds0 (declared rs)
+                [ds1 pdoc ndoc] (pick ds0 ps/NS-DOC "doc")
+                [ds2 pee nee] (if need-ee (pick ds1 ps/NS-EE "ee") (values ds1 "ee" false))
+                [ds3 phttp nhttp] (if has-main (values ds2 "http" false) (pick ds2 NS-HTTP "http"))
+                [ds4 papi napi] (if has-main (values ds3 "apikit" false) (pick ds3 NS-APIKIT "apikit"))
+                p (->P pdoc pee phttp papi)
+                added (loop [i (count ds0) acc: Vec(Ns) []] (if (>= i (count ds4)) acc (recur (+ i 1) (conj acc (nth ds4 i)))))
+                u (indent-unit text (:open-end rs))
+                mname (if has-main "" (unique-name app (str (base-name api-txt) "-main")))
+                cname (if has-main "" (unique-name app (str (base-name api-txt) "-console")))
+                mtext (if has-main "" (str (main-flow u mname lcfg (if (= (:path req) "") "/api/*" (:path req)) cfg p) (console-flow u cname lcfg cfg p)))
+                ftext (loop [i 0 o mtext]
+                        (if (>= i (count missing)) o
+                          (let [pr (nth pairs (nth missing i))]
+                            (recur (+ i 1) (str o (impl-flow u (:flow (nth aops (nth missing i))) (nth (:ops (nth (:res a) (nth pr 0))) (nth pr 1)) p))))))
+                names (loop [i 0 acc: Vec(Str) (if has-main [] [mname cname])] (if (>= i (count missing)) acc (recur (+ i 1) (conj acc (str (:flow (nth aops (nth missing i))))))))
+                attrs (:attrs rs)
+                last-ns (loop [i 0 at -1] (if (>= i (count attrs)) at (recur (+ i 1) (if (str/starts-with? (:name (nth attrs i)) "xmlns") (:end (nth attrs i)) at))))
+                ns-at (if (>= last-ns 0) last-ns (- (:open-end rs) 1))
+                ns-text (loop [i 0 o ""] (if (>= i (count added)) o (recur (+ i 1) (str o " xmlns:" (:prefix (nth added i)) "=\"" (:uri (nth added i)) "\""))))
+                sl (loop [i 0] (if (>= i (count attrs)) -1 (let [x (nth attrs i)] (if (and (str/ends-with? (:name x) ":schemaLocation") (> (count (prefix-of ds0 NS-XSI)) 0) (= (:name x) (str (nth (prefix-of ds0 NS-XSI) 0) ":schemaLocation"))) (:vend x) (recur (+ i 1))))))
+                sl-text (loop [i 0 o ""] (if (>= i (count added)) o (let [x (xsd-of (:uri (nth added i)))] (recur (+ i 1) (if (= x "") o (str o " " (:uri (nth added i)) " " x))))))
+                e1: Vec(Edit) (if (= ns-text "") [] [(->Edit (str file) ns-at ns-at ns-text)])
+                e2 (if (or (< sl 0) (= sl-text "")) e1 (conj e1 (->Edit (str file) sl sl sl-text)))
+                e3 (if (= ftext "") e2 (conj e2 (->Edit (str file) (:close rs) (:close rs) ftext)))
+                sorted (sort-edits e3)]
+            (if (= (count names) 0) (let [z: Vec(Edit) []] (->Result z names ""))
+              (->Result sorted names ""))))))))
+
+(defn- sort-edits Vec(Edit) [es: Vec(Edit)]
+  (loop [i 1 v es]
+    (if (>= i (count v)) v
+      (recur (+ i 1) (loop [j i w v] (if (and (> j 0) (> (:start (nth w (- j 1))) (:start (nth w j))))
+                                       (let [a (nth w (- j 1)) b (nth w j)] (recur (- j 1) (assoc (assoc w (- j 1) b) j a)))
+                                       w))))))
+
+(defn to-json Str [r: &Result]
+  (let [es (:edits r)
+        o1 (loop [i 0 o "{\"edits\":["]
+             (if (>= i (count es)) (str o "]")
+               (let [e (nth es i)]
+                 (recur (+ i 1) (str (if (> i 0) (str o ",") o) "{\"file\":\"" (json/escape (:file e)) "\",\"start\":" (:start e) ",\"end\":" (:end e)
+                                     ",\"text\":\"" (json/escape (:text e)) "\"}")))))
+        fs (:flows r)
+        o2 (loop [i 0 o (str o1 ",\"flows\":[")] (if (>= i (count fs)) (str o "]") (recur (+ i 1) (str (if (> i 0) (str o ",") o) "\"" (json/escape (nth fs i)) "\""))))]
+    (str o2 ",\"error\":" (if (= (:error r) "") "null" (str "\"" (json/escape (:error r)) "\"")) "}")))

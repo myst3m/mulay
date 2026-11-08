@@ -1,0 +1,72 @@
+(ns mulay.dw.coerce_num
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.numfmt :as nf]
+            [mulay.lib.dec :as d]))
+
+(defn- render Str [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VNull) "null"
+      (v/VBool b) (if b "true" "false")
+      (v/VNum n) (num/to-string n)
+      (v/VInt n-i) (let [n (num/from-int n-i)] (num/to-string n))
+      (v/VStr s) (str "\"" s "\"")
+      (v/VKey k) (str "\"" (:name k) "\"")
+      (v/VArr xs) (loop [i 0 out "["] (if (>= i (count xs)) (str out "]") (recur (+ i 1) (str out (if (> i 0) ", " "") (render (nth xs i))))))
+      (v/VObj fs) (loop [i 0 out "{"]
+                    (if (>= i (count fs)) (str out "}")
+                      (let [f (nth fs i)]
+                        (recur (+ i 1) (str out (if (> i 0) ", " "") (:name (:key f)) ": " (render (:value f)))))))
+      _ (v/type-name x))))
+
+(defn- schema-err dwe/DwErr [opt: &Str x: &v/Val]
+  (dwe/err "CoercionException"
+          (str "Schema option `" opt "` expects type `String` but got `" (v/type-name (v/unmeta x)) "(" (render x) ")`.")))
+
+(defn- opt-str Values(Str Bool dwe/DwErr) [meta: &Vec(v/Field) opt: Str]
+  (let [xs (v/obj-get meta opt)]
+    (if (= (count xs) 0) (values "" false (dwe/ok))
+      (let [[s e] (rt/to-text (nth xs 0))]
+        (if (dwe/ok? e) (values s true (dwe/ok)) (values "" true (schema-err opt (nth xs 0))))))))
+
+(defn- mode-of Int [s: &Str]
+  (let [[m e] (d/mode-of-str s)] (if (= e "") m d/HALF-UP)))
+
+(defn num-to-str Values(v/Val dwe/DwErr) [n: &num/Num meta: &Vec(v/Field)]
+  (let [[f has-f fe] (opt-str meta "format")]
+    (if (not (dwe/ok? fe)) (values (v/null-v) fe)
+      (let [[l has-l le] (opt-str meta "locale")]
+        (if (not (dwe/ok? le)) (values (v/null-v) le)
+          (let [[r has-r re] (opt-str meta "roundMode")]
+            (if (not (dwe/ok? re)) (values (v/null-v) re)
+              (if (not has-f) (rt/ret (v/->VStr (num/to-string n)))
+                (let [[s pe ae] (nf/format-dec (num/to-dec n) f (if has-l (if (= l "") "und" l) "") (if has-r (mode-of r) d/HALF-UP))]
+                  (cond
+                    (not= pe "") (rt/failure "CoercionException" (str "Cannot coerce Number (" (num/to-string n) ") to String, caused by: " pe))
+                    (not= ae "") (rt/failure "ArithmeticException" ae)
+                    :else (rt/ret (v/->VStr s))))))))))))
+
+(defn str-to-num Values(v/Val dwe/DwErr Bool) [s: &Str meta: &Vec(v/Field)]
+  (let [[f has-f fe] (opt-str meta "format")]
+    (if (not (dwe/ok? fe)) (values (v/null-v) fe true)
+      (if (not has-f) (values (v/null-v) (dwe/ok) false)
+        (let [[l has-l le] (opt-str meta "locale")
+              fail-msg (str "Unable to coerce `" s "` as Number using `" f "` as format.")]
+          (if (not (dwe/ok? le)) (values (v/null-v) (dwe/err "InvalidNumberFormat" fail-msg) true)
+            (let [[x pe ok] (nf/parse-dec s f (if has-l (if (= l "") "und" l) ""))]
+              (if (or (not= pe "") (not ok)) (values (v/null-v) (dwe/err "InvalidNumberFormat" fail-msg) true)
+                (values (v/num-v (num/mk (nf/normalize x))) (dwe/ok) true)))))))))
+
+(defn coerce-number Values(v/Val dwe/DwErr Bool) [x0: &v/Val t: &v/TypeV]
+  (let [meta (:meta t)]
+    (if (or (not= (:kind t) "name") (= (count meta) 0)) (values (v/null-v) (dwe/ok) false)
+      (let [x (v/unmeta x0) n (:name t)]
+        (if (= n "String")
+          (match x
+            (v/VNum m) (let [[y e] (num-to-str m meta)] (values y e true))
+            (v/VInt m-i) (let [m (num/from-int m-i)] (let [[y e] (num-to-str m meta)] (values y e true)))
+            _ (values (v/null-v) (dwe/ok) false))
+          (if (= n "Number")
+            (match x
+              (v/VStr s) (str-to-num s meta)
+              _ (values (v/null-v) (dwe/ok) false))
+            (values (v/null-v) (dwe/ok) false)))))))

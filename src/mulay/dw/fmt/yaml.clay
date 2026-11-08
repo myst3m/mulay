@@ -1,0 +1,144 @@
+(ns mulay.dw.fmt.yaml
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.fmt.props :as p] [mulay.lib.yaml :as y]
+            [mulay.dw.fmt.scalar :as sc]
+            [clay.string :as str]))
+
+(defn- num-of v/Val [t: &Str]
+  (let [[n e] (num/parse-lit t)] (if (= e "") (v/num-v n) (v/->VStr (str t)))))
+
+(defn- to-val v/Val [x: &y/YVal]
+  (match x
+    (y/YNull) (v/null-v)
+    (y/YBool b) (v/bool-v b)
+    (y/YInt t) (let [neg (str/starts-with? t "-")
+                     body (if (or neg (str/starts-with? t "+")) (subs t 1 (count t)) (str t))]
+                 (if (or (str/starts-with? body "0x") (str/starts-with? body "0o"))
+                   (let [[i ok] (y/int-value x)] (if ok (v/int-v i) (v/->VStr (str t))))
+                   (num-of (str (if neg "-" "") (strip-zeros body)))))
+    (y/YFloat t) (let [r (str/lower-case (str t))]
+                   (if (or (= r ".inf") (= r "+.inf")) (v/->VMeta (v/null-v) [(v/field "inf" (v/->VStr "positive"))])
+                     (if (= r "-.inf") (v/->VMeta (v/null-v) [(v/field "inf" (v/->VStr "negative"))])
+                       (if (= r ".nan") (v/->VMeta (v/null-v) [(v/field "nan" (v/bool-v true))])
+                         (num-of (if (str/starts-with? t "+") (subs t 1 (count t)) (str t)))))))
+    (y/YStr s) (v/->VStr (str s))
+    (y/YTagged t y) (to-val y)
+    (y/YSeq xs) (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (to-val (nth xs i)))))))
+    (y/YMap ks vs) (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                               (if (>= i (count ks)) acc
+                                 (recur (+ i 1) (conj acc (v/field (y/scalar-text (nth ks i)) (to-val (nth vs i))))))))))
+
+(defn- strip-zeros Str [s: &Str]
+  (let [k (loop [i 0] (if (and (< i (- (count s) 1)) (= (nth s i) 48)) (recur (+ i 1)) i))] (subs s k (count s))))
+
+(defn read Values(v/Val Str) [text: &Str mime: &Str] (read-named text [] mime "payload"))
+
+(defn read-named Values(v/Val Str) [text: &Str props: &Vec(v/Field) mime: &Str name: &Str]
+  (let [[mx me] (p/pint props "maxEntityCount" 1)]
+    (if (not= me "") (values (v/null-v) me)
+      (let [[docs e] (y/parse-all-with text (assoc (y/default-opts) :max-aliases mx))]
+        (cond
+          (not= e "") (values (v/null-v) (str e ", while reading `" name "` as Yaml."))
+          (<= (count docs) 1) (values (v/->VMeta (if (= (count docs) 0) (v/null-v) (to-val (nth docs 0))) (p/reader-meta mime)) "")
+          :else (values (v/->VMeta (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count docs)) acc (recur (+ i 1) (conj acc (to-val (nth docs i)))))))
+                                   (conj (p/reader-meta mime) (v/field "documents" (v/bool-v true))))
+                        ""))))))
+
+(defrecord YOpts [skip-arrays: Bool skip-objects: Bool])
+
+(defn- pad Str [out: Str n: Int] (loop [acc out i 0] (if (>= i n) acc (recur (str acc "  ") (+ i 1)))))
+
+(defn- hex4 Str [c: Int]
+  (let [d "0123456789abcdef"]
+    (str (subs d (quot c 4096) (+ (quot c 4096) 1)) (subs d (mod (quot c 256) 16) (+ (mod (quot c 256) 16) 1))
+         (subs d (mod (quot c 16) 16) (+ (mod (quot c 16) 16) 1)) (subs d (mod c 16) (+ (mod c 16) 1)))))
+
+(defn- quote-str Str [out: Str s: &Str]
+  (loop [i 0 acc (str out "\"")]
+    (if (>= i (count s)) (str acc "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (case c
+                 34 (str acc "\\\"")
+                 92 (str acc "\\\\")
+                 10 (str acc "\\n")
+                 9 (str acc "\\t")
+                 13 (str acc "\\r")
+                 (if (or (< c 32) (= c 127)) (str acc "\\u" (hex4 c)) (str acc (subs s i (+ i 1))))))))))
+
+(defn- str-into Str [out: Str s: &Str depth: Int]
+  (let [nl (str/index-of s "\n")]
+    (if (and (>= nl 0) (> (count s) 0) (not= (nth s 0) 32)
+             (not (str/ends-with? s "\n\n")) (not (has-ctl? s)))
+      (let [keep (str/ends-with? s "\n")
+            body (if keep (subs s 0 (- (count s) 1)) (str s))
+            lines: Vec(Str) (str/split body "\n")]
+        (loop [i 0 acc (str out (if keep "|" "|-"))]
+          (if (>= i (count lines)) (if keep (str acc "\n") acc)
+            (recur (+ i 1) (str (pad (str acc "\n") depth) (nth lines i))))))
+      (if (y/quote-needed? s) (quote-str out s) (str out s)))))
+
+(defn- has-ctl? Bool [s: &Str]
+  (loop [i 0] (if (>= i (count s)) false (let [c (nth s i)] (if (and (< c 32) (not= c 10)) true (recur (+ i 1)))))))
+
+(defn- scalar-into Values(Str Str) [out: Str x: &v/Val depth: Int]
+  (match x
+    (v/VNull) (values (str out "null") "")
+    (v/VBool b) (values (str out (if b "true" "false")) "")
+    (v/VNum n) (let [t (num/to-string n)] (values (str out t) ""))
+    (v/VInt n-i) (let [n (num/from-int n-i)] (let [t (num/to-string n)] (values (str out t) "")))
+    (v/VStr s) (values (str-into out s depth) "")
+    (v/VKey k) (values (str-into out (:name k) depth) "")
+    _ (values out (str "Cannot write " (v/type-name x) " as application/yaml"))))
+
+(defn- ycoll? Bool [x: &v/Val] (match x (v/VArr xs) true (v/VObj fs) true (v/VRange a b) true _ false))
+
+(defn- other? Bool [x: &v/Val]
+  (match x (v/VBin b) true (v/VRegex s f) true (v/VNsV n) true _ (let [[s ok] (v/temporal-str x)] ok)))
+
+(defn- other-text Values(Str Str) [x0: &v/Val]
+  (match (v/unmeta x0)
+    (v/VBin b) (values (str b) "")
+    (v/VRegex s f) (values (str s) "")
+    (v/VNsV n) (values (:uri n) "")
+    _ (let [[ts tt te] (sc/temporal-text x0 true)] (values ts te))))
+
+(defn- write-block Values(Str Str) [out: Str x0: &v/Val o: &YOpts depth: Int]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VObj fs)
+      (if (= (count fs) 0) (values (str out "{}") "")
+        (loop [i 0 acc out first true]
+          (if (>= i (count fs)) (values acc "")
+            (let [f (nth fs i) e (:value f)]
+              (if (and (:skip-objects o) (v/null? e)) (recur (+ i 1) acc first)
+                (let [a1 (if first acc (pad (str acc "\n") depth))
+                      a2 (str (str-into a1 (:name (:key f)) depth) ":")
+                      [a3 er] (write-child a2 e o depth)]
+                  (if (not= er "") (values a3 er) (recur (+ i 1) a3 false))))))))
+      (v/VArr xs) (write-seq out xs o depth)
+      (v/VRange a b) (write-seq out (v/items x) o depth)
+      _ (if (other? x) (let [[t e] (other-text x0)] (values (str out t) e)) (scalar-into out x depth)))))
+
+(defn- write-seq Values(Str Str) [out: Str xs: &Vec(v/Val) o: &YOpts depth: Int]
+  (if (= (count xs) 0) (values (str out "[]") "")
+    (loop [i 0 acc out first true]
+      (if (>= i (count xs)) (values acc "")
+        (let [e (nth xs i)]
+          (if (and (:skip-arrays o) (v/null? e)) (recur (+ i 1) acc first)
+            (let [a1 (if first acc (pad (str acc "\n") depth))
+                  a2 (str a1 "-")
+                  [a3 er] (write-child a2 e o depth)]
+              (if (not= er "") (values a3 er) (recur (+ i 1) a3 false)))))))))
+
+(defn- write-child Values(Str Str) [out: Str e: &v/Val o: &YOpts depth: Int]
+  (let [x (v/unmeta e)]
+    (if (or (ycoll? x) (other? x))
+      (write-block (pad (str out "\n") (+ depth 1)) e o (+ depth 1))
+      (scalar-into (str out " ") x (+ depth 1)))))
+
+(defn write Values(Str Str) [x: &v/Val props: &Vec(v/Field)]
+  (let [[decl e1] (p/pbool props "writeDeclaration" true)
+        [sk e2] (p/pstr props "skipNullOn" "")
+        o (->YOpts (or (= sk "arrays") (= sk "everywhere")) (or (= sk "objects") (= sk "everywhere")))]
+    (if (not= (p/either-err e1 e2) "") (values "" (p/either-err e1 e2))
+      (write-block (if decl "%YAML 1.2\n---\n" "") x o 0))))

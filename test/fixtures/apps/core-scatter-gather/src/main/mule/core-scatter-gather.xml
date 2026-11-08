@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18113"/>
+    </http:listener-config>
+
+    <!-- 結果は {"0": Message, "1": Message, ...}。各ルートは同じ入力 event を受け取る -->
+    <flow name="sg-basic">
+        <http:listener config-ref="L" path="/basic"/>
+        <set-variable variableName="before" value="set-before"/>
+        <scatter-gather>
+            <route>
+                <set-payload value="#[output application/json --- {route: 0, in: payload}]"/>
+            </route>
+            <route>
+                <set-payload value="route-one" mimeType="text/plain"/>
+                <set-variable variableName="fromRoute1" value="r1"/>
+            </route>
+            <route>
+                <set-variable variableName="before" value="changed-in-route2"/>
+                <set-variable variableName="fromRoute2" value="#[[1, 2]]"/>
+            </route>
+        </scatter-gather>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  keys: keysOf(payload),
+  payloads: payload pluck ((v, k) -> v.payload),
+  vars: vars - "outboundHeaders"
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- 1 ルートでも失敗すると MULE:COMPOSITE_ROUTING。error.errorMessage.payload に成功と失敗の内訳 -->
+    <flow name="sg-fail">
+        <http:listener config-ref="L" path="/fail"/>
+        <scatter-gather>
+            <route>
+                <set-payload value="ok-0"/>
+            </route>
+            <route>
+                <raise-error type="APP:ROUTE_FAILED" description="route 1 failed on purpose"/>
+            </route>
+            <route>
+                <set-payload value="#[1 / 0]"/>
+            </route>
+        </scatter-gather>
+        <error-handler>
+            <on-error-continue type="MULE:COMPOSITE_ROUTING">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  errorType: error.errorType.namespace ++ ":" ++ error.errorType.identifier,
+  description: error.description,
+  successKeys: keysOf(error.errorMessage.payload.results default {}),
+  failureKeys: keysOf(error.errorMessage.payload.failures default {}),
+  results: (error.errorMessage.payload.results default {}) mapObject ((v, k) -> {(k): v.payload}),
+  failures: (error.errorMessage.payload.failures default {}) mapObject ((v, k) -> {(k): {
+      errorType: v.errorType.namespace ++ ":" ++ v.errorType.identifier,
+      description: v.description
+  }})
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- 失敗をハンドラで拾わないとき (既定のエラー応答) -->
+    <flow name="sg-fail-unhandled">
+        <http:listener config-ref="L" path="/fail-unhandled"/>
+        <scatter-gather>
+            <route>
+                <set-payload value="ok"/>
+            </route>
+            <route>
+                <raise-error type="APP:BOOM" description="boom"/>
+            </route>
+        </scatter-gather>
+    </flow>
+
+    <!-- ルートの中で try して失敗を吸収すれば全体は成功 -->
+    <flow name="sg-route-try">
+        <http:listener config-ref="L" path="/route-try"/>
+        <scatter-gather>
+            <route>
+                <try>
+                    <raise-error type="APP:SOFT" description="soft failure"/>
+                    <error-handler>
+                        <on-error-continue>
+                            <set-payload value="#['recovered: ' ++ error.description]"/>
+                        </on-error-continue>
+                    </error-handler>
+                </try>
+            </route>
+            <route>
+                <set-payload value="fine"/>
+            </route>
+        </scatter-gather>
+        <set-payload value="#[output application/json --- payload pluck $.payload]"/>
+    </flow>
+
+</mule>

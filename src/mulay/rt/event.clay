@@ -1,0 +1,341 @@
+(ns mulay.rt.event
+  (:require [mulay.dw.err :as dwe] [mulay.dw.val :as v] [mulay.dw.fmt.registry :as reg] [mulay.rt.error :as err] [mulay.rt.javaser :as js] [mulay.lib.host :as host] [mulay.lib.otlp :as o]
+            [mulay.dw.lib.binaries :as bin] [mulay.rt.stream :as stream] [mulay.dw.fmt.json :as json] [mulay.dw.fmt.csv :as csvf] [mulay.dw.fmt.props :as fp] [mulay.dw.fmt.xml :as xmlf] [clay.string :as str]))
+
+(def VAL 0)
+(def RAW 1)
+(def BOTH 2)
+(def FAILED 3)
+(def CURSOR 4)
+(def DEFER 5)
+(def PIPE 6)
+(def TYPED 7)
+
+(defrecord TV [val: v/Val mime: Str props: Vec(v/Field) raw: Str state: Int stream: Bool])
+
+(defn as-stream TV [t: &TV] (->TV (:val t) (:mime t) (:props t) (:raw t) (:state t) true))
+
+(defn tv-val TV [x: v/Val mime: Str] (->TV x mime [] "" VAL false))
+(defn tv-raw TV [raw: Str mime: Str] (->TV (v/null-v) mime [] raw RAW false))
+(defn tv-null TV [] (->TV (v/null-v) "application/java" [] "" VAL false))
+(defn tv-failed TV [msg: Str mime: Str] (->TV (v/null-v) mime [] msg FAILED false))
+(defn tv-cursor TV [id: Str] (->TV (v/null-v) "application/java; charset=UTF-8" [] id CURSOR false))
+
+(defn tv-cursor-of TV [id: Str mime: Str cls: Str ens: Str eid: Str]
+  (->TV (v/null-v) mime [(v/field "class" (v/->VStr cls)) (v/field "errorNamespace" (v/->VStr ens)) (v/field "errorIdentifier" (v/->VStr eid))] id CURSOR false))
+
+(defn tv-cursor-typed TV [id: Str ens: Str eid: Str]
+  (->TV (v/null-v) "application/java; charset=UTF-8" [(v/field "errorNamespace" (v/->VStr ens)) (v/field "errorIdentifier" (v/->VStr eid))] id CURSOR false))
+
+(defn cursor-error-type Values(Str Str) [t: &TV]
+  (let [ns (v/obj-get (:props t) "errorNamespace") id (v/obj-get (:props t) "errorIdentifier")]
+    (if (or (= (count ns) 0) (= (count id) 0)) (values "MULE" "UNKNOWN")
+      (values (match (nth ns 0) (v/VStr x) (str x) _ "MULE") (match (nth id 0) (v/VStr x) (str x) _ "UNKNOWN")))))
+
+(defn typed-error Values(Str Str Str) [ns: &Str id: &Str msg: &Str]
+  (if (not= id "*") (values (str ns) (str id) (str msg))
+    (let [k (str/index-of msg "\n")
+          head (if (< k 0) "" (subs msg 0 k))
+          c (str/index-of head ":")]
+      (if (or (< k 0) (< c 0)) (values (str ns) "UNKNOWN" (str msg))
+        (values (subs head 0 c) (subs head (+ c 1) (count head)) (subs msg (+ k 1) (count msg)))))))
+
+(defn cursor-error Values(Str Str Str) [t: &TV msg: &Str]
+  (let [[ns id] (cursor-error-type t)] (typed-error ns id msg)))
+(defn tv-defer TV [id: Str mime: Str] (->TV (v/null-v) mime [] id DEFER true))
+
+(defn tv-pipe TV [id: Str mime: Str] (->TV (v/null-v) mime [] id PIPE true))
+
+(def TYPED-MIME "*/*; charset=UTF-8")
+(def NOT-SERIALIZABLE "Could not serialize object")
+
+(defn tv-typed TV [raw: Str inner: Str] (->TV (v/null-v) TYPED-MIME [(v/field "mediaType" (v/->VStr inner))] raw TYPED false))
+
+(defn typed-inner Str [t: &TV]
+  (let [r (v/obj-get (:props t) "mediaType")] (if (= (count r) 0) "" (match (nth r 0) (v/VStr s) (str s) _ ""))))
+
+(defn typed-read Values(v/Val Str) [t: &TV raw: &Str name: &Str]
+  (let [m (typed-inner t)] (reg/read-named m [] (decode-text raw m) name)))
+
+(defn pipe-raw Values(TV Str) [t: &TV]
+  (let [id (stream/fork (:raw t))
+        [rows e] (stream/all id)
+        z (if (= id (:raw t)) 0 (stream/discard id))
+        text (loop [i 0 o ""] (if (>= i (count rows)) o (recur (+ i 1) (match (nth rows i) (v/VStr x) (str o x) _ o))))]
+    (values (->TV (v/null-v) (:mime t) (:props t) text RAW true) e)))
+
+(defn- pipe-fetch Fn(Int Values(Str Bool Str)) [id: Str]
+  (let [k id]
+    (fn Values(Str Bool Str) [n: Int]
+      (let [[rows done e] (stream/take-vals k 16)
+            text (loop [i 0 o ""] (if (>= i (count rows)) o (recur (+ i 1) (match (nth rows i) (v/VStr x) (str o x) _ o))))]
+        (values text done e)))))
+
+(defn- json-lazy? Bool [t: &TV]
+  (and (= (:state t) PIPE) (stream/repeatable? (:raw t)) (= (reg/format-id (:mime t)) "json") (= (count (:props t)) 0)
+       (let [cs (bin/charset-id (charset-of (:mime t)))] (or (= cs "") (= cs "UTF-8")))))
+
+(defn- json-iter Fn(Int Values(v/Val Bool dwe/DwErr)) [raw: Str name: Str]
+  (let [pid (stream/fork raw)
+        f (pipe-fetch pid)
+        [rd0 arr e0] (json/arr-open f)
+        rd (atom rd0) buf: Atom(Vec(v/Val)) (atom []) bi (atom 0)
+        st (atom (if (not= e0 "") 2 (if arr 0 1)))
+        why (atom e0)
+        nm name]
+    (fn Values(v/Val Bool dwe/DwErr) [k: Int]
+      (loop []
+        (let [i (deref bi) b (deref buf)]
+          (cond
+            (< i (count b)) (let [z (reset! bi (+ i 1))] (values (nth b i) false (dwe/ok)))
+            (= (deref st) 1) (let [z (stream/discard pid)] (values (v/null-v) true (dwe/ok)))
+            (= (deref st) 2) (let [z (stream/discard pid)] (values (v/null-v) true (dwe/input-err (deref why))))
+            :else (let [[xs r2 done e] (json/arr-next (deref rd) f nm)
+                        z1 (reset! rd r2) z2 (reset! buf xs) z3 (reset! bi 0)
+                        z4 (cond (not= e "") (let [w (reset! why e)] (reset! st 2)) done (reset! st 1) :else 0)]
+                    (recur))))))))
+
+(defn- csv-lazy? Bool [t: &TV]
+  (and (= (:state t) PIPE) (stream/repeatable? (:raw t)) (= (reg/format-id (:mime t)) "csv")
+       (let [cs (bin/charset-id (charset-of (:mime t)))] (or (= cs "") (= cs "UTF-8")))))
+
+(defn- csv-iter Fn(Int Values(v/Val Bool dwe/DwErr)) [raw: Str props: Vec(v/Field)]
+  (let [pid (stream/fork raw)
+        f (pipe-fetch pid)
+        [rd0 oe] (csvf/stream-open props)
+        rd (atom rd0) buf: Atom(Vec(v/Val)) (atom []) bi (atom 0)
+        st (atom 0)
+        why (atom "")]
+    (fn Values(v/Val Bool dwe/DwErr) [k: Int]
+      (loop []
+        (let [i (deref bi) b (deref buf)]
+          (cond
+            (< i (count b)) (let [z (reset! bi (+ i 1))] (values (nth b i) false (dwe/ok)))
+            (= (deref st) 1) (let [z (stream/discard pid)] (values (v/null-v) true (dwe/ok)))
+            (= (deref st) 2) (let [z (stream/discard pid)] (values (v/null-v) true (dwe/input-err (deref why))))
+            :else (let [[xs r2 done e] (csvf/stream-next (deref rd) f)
+                        z1 (reset! rd r2) z2 (reset! buf xs) z3 (reset! bi 0)
+                        z4 (cond (not= e "") (let [w (reset! why e)] (reset! st 2)) done (reset! st 1) :else 0)]
+                    (recur))))))))
+
+(defn- csv-seq Values(v/Val Bool) [t: &TV]
+  (let [[props pe] (reg/reader-props (:mime t) (:props t))
+        [rd oe] (csvf/stream-open props)]
+    (if (or (not= pe "") (not= oe "")) (values (v/null-v) false)
+      (let [m (reg/norm-mime (:mime t))
+            raw (str (:raw t))
+            ps props
+            x (v/->VMeta (v/->VSeq (v/->Seq (fn Fn(Int Values(v/Val Bool dwe/DwErr)) [k: Int] (csv-iter raw ps)))) (fp/reader-meta m))]
+        (values (if (str/includes? (str/lower-case (:mime t)) "charset=") (with-encoding x (charset-of (:mime t))) x) true)))))
+
+(defn- xml-lazy? Bool [t: &TV]
+  (and (= (:state t) PIPE) (stream/repeatable? (:raw t)) (= (reg/format-id (:mime t)) "xml")
+       (let [cs (bin/charset-id (charset-of (:mime t)))] (or (= cs "") (= cs "UTF-8")))))
+
+(defn- xml-src xmlf/XSrc [raw: Str]
+  (let [pid (stream/fork raw)]
+    (xmlf/->XSrc (pipe-fetch pid) (fn Int [k: Int] (stream/discard pid)))))
+
+(defn- xml-seq Values(v/Val Bool) [t: &TV name: &Str]
+  (let [[props pe] (reg/reader-props (:mime t) (:props t))]
+    (if (not= pe "") (values (v/null-v) false)
+      (let [raw (str (:raw t))]
+        (xmlf/lazy-read (fn xmlf/XSrc [k: Int] (xml-src raw)) props (reg/norm-mime (:mime t)) name)))))
+
+(defn pipe-seq Values(v/Val Bool) [t: &TV name: &Str]
+  (if (not (json-lazy? t)) (cond (csv-lazy? t) (csv-seq t) (xml-lazy? t) (xml-seq t name) :else (values (v/null-v) false))
+    (let [pid (stream/fork (:raw t))
+          [rd arr e] (json/arr-open (pipe-fetch pid))
+          z (stream/discard pid)
+          raw (str (:raw t)) nm (str name)]
+      (if (or (not arr) (not= e "")) (values (v/null-v) false)
+        (values (v/->VSeq (v/->Seq (fn Fn(Int Values(v/Val Bool dwe/DwErr)) [k: Int] (json-iter raw nm)))) true)))))
+
+(def PIPE-CLOSED "java.io.IOException - Pipe closed\njava.io.IOException: Pipe closed")
+
+(defn drain Values(Str Str Bool) [t: &TV]
+  (let [id (:raw t)]
+    (if (not (stream/fresh? id)) (values "" "" false)
+      (loop [out ""]
+        (let [[rows done e] (stream/take-vals id 64)
+              out2 (loop [i 0 o out] (if (>= i (count rows)) o (recur (+ i 1) (match (nth rows i) (v/VStr x) (str o x) _ o))))]
+          (if done (values out2 e true) (recur out2)))))))
+
+(defn defer-open Bool [t: &TV] (stream/fresh? (:raw t)))
+
+(defn defer-next Values(Str Bool Str) [t: &TV]
+  (let [[rows done e] (stream/take-vals (:raw t) 4096)]
+    (loop [i 0 o ""] (if (>= i (count rows)) (values o done e) (recur (+ i 1) (match (nth rows i) (v/VStr x) (str o x) _ o))))))
+
+(defn- drain-tv TV [t: &TV]
+  (let [[text e ok] (drain t)] (if ok (tv-raw text (:mime t)) (tv-failed PIPE-CLOSED (:mime t)))))
+
+(defn realize Values(TV Str) [t: &TV]
+  (if (not= (:state t) CURSOR) (values t "")
+    (let [[rows e] (stream/all (:raw t))
+          cls (v/obj-get (:props t) "class")
+          arr (if (= (count cls) 0) (v/->VArr rows) (v/->VMeta (v/->VArr rows) [(v/field "class" (nth cls 0))]))]
+      (values (->TV arr (:mime t) [] "" VAL false) e))))
+
+(defn settle TV [t: &TV]
+  (cond
+    (= (:state t) DEFER) (drain-tv t)
+    (= (:state t) PIPE) (let [[t2 e] (pipe-raw t)] (if (= e "") t2 (tv-failed e (:mime t))))
+    :else (let [[t2 e] (realize t)] (if (= e "") t2 (tv-failed e (:mime t))))))
+
+(def JAVA "application/java; charset=UTF-8")
+(def ANY "*/*")
+
+(defn with-charset Str [m: &Str]
+  (if (or (str/includes? (str/lower-case m) "charset=") (= (reg/norm-mime m) "*/*") (= m "")) (str m) (str m "; charset=UTF-8")))
+
+(defn java-mime? Bool [m: &Str]
+  (let [n (reg/norm-mime m)] (or (= n "application/java") (= n "") (= n "*/*"))))
+
+(defn content-type Str [t: &TV]
+  (let [m (reg/norm-mime (:mime t))]
+    (cond (or (= m "") (= m "*/*")) ""
+          (= m "application/java") JAVA
+          :else (str (:mime t)))))
+
+(defn encode Str [s: &Str enc: &Str]
+  (let [cs (bin/charset-id enc)]
+    (if (or (= cs "") (= cs "UTF-8")) (str s) (bin/cs-encode s cs))))
+
+(defn decode-text Str [raw: &Str mime: &Str]
+  (let [cs (bin/charset-id (charset-of mime))]
+    (if (or (= cs "") (= cs "UTF-8")) (str raw)
+      (let [[t k n] (bin/cs-decode raw cs false)] t))))
+
+(defn charset-of Str [m: &Str]
+  (let [lm (str/lower-case m) k (str/index-of lm "charset=")]
+    (if (< k 0) "UTF-8"
+      (let [rest (subs m (+ k 8) (count m))
+            e (str/index-of rest ";")
+            v (str/trim (if (< e 0) rest (subs rest 0 e)))]
+        (if (and (>= (count v) 2) (= (nth v 0) 34)) (subs v 1 (- (count v) 1)) v)))))
+
+(defn value Values(v/Val TV Str) [t: &TV] (value-named t "payload"))
+
+(defn value-named Values(v/Val TV Str) [t: &TV name: &Str]
+  (cond
+    (= (:state t) FAILED) (values (v/null-v) t (str (:raw t) ", while reading `" name "` as " (reader-name (:mime t)) ".\nTrace:\n  at main (Unknown)"))
+    (= (:state t) CURSOR) (let [[t2 e] (realize t)] (if (not= e "") (values (v/null-v) t e) (value-read t2 name)))
+    (= (:state t) PIPE) (let [[t2 e] (pipe-raw t)] (if (not= e "") (values (v/null-v) t e) (let [[x t3 e3] (value-read t2 name)] (values x t e3))))
+    (= (:state t) DEFER) (let [[x t2 e] (value-named (drain-tv t) name)] (values x t e))
+    (= (:state t) TYPED) (if (not (v/null? (:val t))) (values (:val t) t "")
+                           (let [[x e] (typed-read t (:raw t) name)]
+                             (if (not= e "") (values (v/null-v) t e) (values x (->TV x (:mime t) (:props t) (:raw t) TYPED false) ""))))
+    :else (value-read t name)))
+
+(defn reader-name Str [m: &Str]
+  (let [id (reg/format-id m)]
+    (cond (= id "json") "Json" (= id "xml") "Xml" (= id "csv") "Csv" (= id "text") "TextPlain" (= id "yaml") "Yaml"
+          (= id "urlencoded") "UrlEncoded" (= id "multipart") "Multipart" (= id "properties") "Properties"
+          (= id "ndjson") "Ndjson" (= id "dw") "DataWeave" (= id "protobuf") "ProtoBuf" :else "Binary")))
+
+(defn- value-read Values(v/Val TV Str) [t: &TV name: &Str]
+  (if (not= (:state t) RAW) (if (= (:state t) VAL) (string-value t name) (values (:val t) t ""))
+    (let [m (reg/norm-mime (:mime t))]
+      (if (or (= m "") (= m "*/*") (= m "application/octet-stream") (= (reg/format-id m) ""))
+        (values (v/->VMeta (v/->VBin (:raw t)) [(v/field "encoding" (v/->VStr (charset-of (:mime t))))]) t "")
+        (let [fid (reg/format-id m)
+              text (if (or (= fid "xml") (= fid "multipart")) (str (:raw t)) (decode-text (:raw t) (:mime t)))
+              [x0 e] (reg/read-named m (:props t) text name)
+              x (if (or (= fid "xml") (= fid "multipart") (not (str/includes? (str/lower-case (:mime t)) "charset="))) x0
+                  (with-encoding x0 (charset-of (:mime t))))]
+          (if (not= e "") (values (v/null-v) t e)
+            (values x (->TV x (:mime t) (:props t) (:raw t) BOTH (:stream t)) "")))))))
+
+(defn- with-encoding v/Val [x: v/Val cs: &Str]
+  (match x
+    (v/VMeta y ms) (v/->VMeta y (loop [i 0 acc: Vec(v/Field) []]
+                                  (if (>= i (count ms)) acc
+                                    (recur (+ i 1) (conj acc (if (= (:name (:key (nth ms i))) "encoding") (v/field "encoding" (v/->VStr (str cs))) (nth ms i)))))))
+    _ x))
+
+(defn- string-value Values(v/Val TV Str) [t: &TV name: &Str]
+  (let [m (reg/norm-mime (:mime t))]
+    (if (or (= m "") (= m "*/*") (= m "application/java") (= m "text/plain")) (values (:val t) t "")
+      (match (v/unmeta (:val t))
+        (v/VStr s) (if (= m "application/octet-stream") (values (v/->VBin s) t "")
+                     (let [[x e] (reg/read-named m (:props t) s name)] (if (not= e "") (values (v/null-v) t e) (values x t ""))))
+        _ (values (:val t) t "")))))
+
+(defn bytes Values(Str Str) [t: &TV]
+  (cond
+    (= (:state t) FAILED) (values "" (str (:raw t)))
+    (= (:state t) CURSOR) (let [[t2 e] (realize t)] (if (not= e "") (values "" e) (bytes t2)))
+    (= (:state t) DEFER) (bytes (drain-tv t))
+    (= (:state t) PIPE) (let [[t2 e] (pipe-raw t)] (if (not= e "") (values "" e) (bytes t2)))
+    (= (:state t) TYPED) (values "" NOT-SERIALIZABLE)
+    (not= (:state t) VAL) (values (:raw t) "")
+    :else
+    (let [x (v/unmeta (:val t))]
+      (match x
+        (v/VNull) (values "" "")
+        (v/VStr s) (values (str s) "")
+        (v/VBin b) (values (str b) "")
+        (v/VFn f) (if (java-mime? (:mime t)) (values (fn-object-text) "") (values "" NOT-SERIALIZABLE))
+        _ (if (java-mime? (:mime t)) (values (js/serialize (:val t)) "")
+            (let [[s e] (reg/write-fmt (:mime t) (:props t) (:val t))] (values s (if (dwe/ok? e) "" (:msg e)))))))))
+
+(defn- fn-object-text Str []
+  (let [h (host/rand-below 2147483647)
+        hx (loop [n h out ""] (if (= n 0) (if (= out "") "0" out) (recur (quot n 16) (str (subs "0123456789abcdef" (rem n 16) (+ (rem n 16) 1)) out))))]
+    (str "org.mule.weave.v2.module.pojo.function.WeaveFunctionWrapper@" hx)))
+
+(defn wire-bytes Values(Str Str) [t: &TV]
+  (if (not= (:state t) VAL) (bytes t)
+    (match (v/unmeta (:val t))
+      (v/VStr s) (let [cs (charset-of (:mime t))] (values (encode s cs) ""))
+      _ (bytes t))))
+
+(defrecord Var [name: Str tv: TV])
+
+(defrecord SpanMod [name: Str attrs: Vec(o/Attr)])
+
+(defrecord SpanCtx [trace: Str span: Str flags: Int state: Str sampled: Bool mod: Atom(SpanMod) up: Str])
+
+(def NO-SPAN (->SpanCtx "" "" 0 "" false (atom (->SpanMod "" [])) ""))
+
+(defn traced? Bool [s: &SpanCtx] (not= (:trace s) ""))
+
+(defrecord Event
+  [payload: TV
+   attributes: TV
+   vars: Vec(Var)
+   error: Vec(err/MErr)
+   corr: Str
+   flow: Str
+   tx: Str
+   frame: Str
+   callers: Vec(Str)
+   rid: Str
+   span: SpanCtx])
+
+(defn new-event Event [payload: TV attributes: TV corr: Str flow: Str]
+  (->Event payload attributes [] [] corr flow "" flow [] (str corr) NO-SPAN))
+
+(defn with-payload Event [e: Event p: TV] (->Event p (:attributes e) (:vars e) (:error e) (:corr e) (:flow e) (:tx e) (:frame e) (:callers e) (:rid e) (:span e)))
+(defn with-attributes Event [e: Event a: TV] (->Event (:payload e) a (:vars e) (:error e) (:corr e) (:flow e) (:tx e) (:frame e) (:callers e) (:rid e) (:span e)))
+(defn with-error Event [e: Event x: Vec(err/MErr)] (->Event (:payload e) (:attributes e) (:vars e) x (:corr e) (:flow e) (:tx e) (:frame e) (:callers e) (:rid e) (:span e)))
+(defn with-flow Event [e: Event f: Str] (->Event (:payload e) (:attributes e) (:vars e) (:error e) (:corr e) f (:tx e) (:frame e) (:callers e) (:rid e) (:span e)))
+(defn with-tx Event [e: Event tx: Str] (->Event (:payload e) (:attributes e) (:vars e) (:error e) (:corr e) (:flow e) tx (:frame e) (:callers e) (:rid e) (:span e)))
+(defn with-frame Event [e: Event frame: Str callers: Vec(Str)] (->Event (:payload e) (:attributes e) (:vars e) (:error e) (:corr e) (:flow e) (:tx e) frame callers (:rid e) (:span e)))
+(defn with-rid Event [e: Event rid: Str] (->Event (:payload e) (:attributes e) (:vars e) (:error e) (:corr e) (:flow e) (:tx e) (:frame e) (:callers e) rid (:span e)))
+(defn with-span Event [e: Event sc: SpanCtx] (->Event (:payload e) (:attributes e) (:vars e) (:error e) (:corr e) (:flow e) (:tx e) (:frame e) (:callers e) (:rid e) sc))
+(defn with-vars Event [e: Event vs: Vec(Var)] (->Event (:payload e) (:attributes e) vs (:error e) (:corr e) (:flow e) (:tx e) (:frame e) (:callers e) (:rid e) (:span e)))
+
+(defn set-var Event [e: Event name: Str t: TV]
+  (let [vs (:vars e)
+        i (loop [k 0] (if (>= k (count vs)) -1 (if (= (:name (nth vs k)) name) k (recur (+ k 1)))))]
+    (with-vars e (if (>= i 0) (assoc vs i (->Var name t)) (conj vs (->Var name t))))))
+
+(defn remove-var Event [e: Event name: &Str]
+  (let [vs (:vars e)]
+    (with-vars e (loop [k 0 acc: Vec(Var) []] (if (>= k (count vs)) acc (recur (+ k 1) (if (= (:name (nth vs k)) name) acc (conj acc (nth vs k)))))))))
+
+(defn get-var Vec(TV) [e: &Event name: &Str]
+  (let [vs (:vars e)]
+    (loop [k 0] (if (>= k (count vs)) [] (if (= (:name (nth vs k)) name) [(:tv (nth vs k))] (recur (+ k 1)))))))

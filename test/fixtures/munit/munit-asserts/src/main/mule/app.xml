@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <global-property name="http.port" value="18601"/>
+    <http:listener-config name="HTTP"><http:listener-connection host="0.0.0.0" port="${http.port}"/></http:listener-config>
+    <http:request-config name="Self"><http:request-connection host="localhost" port="${http.port}"/></http:request-config>
+    <http:request-config name="Remote"><http:request-connection host="localhost" port="18699"/></http:request-config>
+
+    <os:object-store name="St" persistent="false"/>
+
+    <flow name="greet">
+        <http:listener config-ref="HTTP" path="/greet"/>
+        <set-payload value="#['hello ' ++ (attributes.queryParams.name default 'x')]"/>
+    </flow>
+
+    <flow name="double">
+        <set-payload value="#[payload * 2]" doc:name="Double it"/>
+    </flow>
+
+    <flow name="boom">
+        <raise-error type="APP:BOOM" description="it went boom"/>
+    </flow>
+
+    <flow name="tick">
+        <scheduler>
+            <scheduling-strategy><fixed-frequency frequency="100"/></scheduling-strategy>
+        </scheduler>
+        <os:store key="ticked" objectStore="St"><os:value>#[true]</os:value></os:store>
+    </flow>
+
+    <flow name="counter">
+        <os:retrieve key="n" objectStore="St"><os:default-value>#[0]</os:default-value></os:retrieve>
+        <os:store key="n" objectStore="St"><os:value>#[payload + 1]</os:value></os:store>
+        <os:retrieve key="n" objectStore="St"/>
+    </flow>
+
+    <flow name="ticked">
+        <os:contains key="ticked" objectStore="St"/>
+    </flow>
+
+    <flow name="remote">
+        <http:request config-ref="Remote" method="GET" path="/data" doc:name="Get data"/>
+        <set-payload value="#[output application/json --- {got: payload, status: attributes.statusCode}]"/>
+    </flow>
+
+    <flow name="remote-twice">
+        <http:request config-ref="Remote" method="GET" path="/a" doc:name="Get data"/>
+        <http:request config-ref="Remote" method="GET" path="/b" doc:name="Get other"/>
+        <set-payload value="#[payload]"/>
+    </flow>
+
+    <flow name="echo-vars">
+        <set-payload value="#[output application/json --- {p: payload, a: attributes.x, v: vars.k}]"/>
+    </flow>
+</mule>

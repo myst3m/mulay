@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <!-- 認証情報はリポジトリに入れない (scenario.scn の requires) -->
+    <configuration-properties file="sf-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <salesforce:sfdc-config name="SF">
+        <salesforce:oauth-client-credentials-connection>
+            <salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}"/>
+        </salesforce:oauth-client-credentials-connection>
+    </salesforce:sfdc-config>
+
+    <!-- ジョブの ID を要求をまたいで引き継ぐ -->
+    <os:object-store name="Jobs" persistent="false"/>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 値の形 (Java のクラス、MIME、DW の型) と値そのもの -->
+    <sub-flow name="describe">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  class: payload.^class,
+  mime: payload.^mimeType,
+  "type": typeOf(payload) as String,
+  itemClass: if (payload is Array and sizeOf(payload) > 0) payload[0].^class else null,
+  // ジョブの値は HashMap で、同じ桶の中の並びは実 Mule でも実行ごとに変わるので、キーの順に並べて比べる
+  keys: if (payload is Object) sizeOf(keysOf(payload)) else null,
+  value: if (payload is Object) (payload orderBy $$) else payload
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- 前の実行の残り (Account と ingest のジョブ) を消す -->
+    <flow name="setup">
+        <http:listener config-ref="HTTP" path="/setup" allowedMethods="POST"/>
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>SELECT Id FROM Account WHERE Name LIKE 'mulay bulk2%'</salesforce:salesforce-query>
+        </salesforce:query>
+        <choice>
+            <when expression="#[sizeOf(vars.found) > 0]">
+                <salesforce:delete config-ref="SF">
+                    <salesforce:ids>#[vars.found map $.Id]</salesforce:ids>
+                </salesforce:delete>
+            </when>
+        </choice>
+        <set-payload value="clean"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- ingest: CSV (payload) で Account を入れる -->
+    <flow name="ingest">
+        <http:listener config-ref="HTTP" path="/ingest" allowedMethods="POST"/>
+        <salesforce:create-job-bulk-api-v2 config-ref="SF" objectType="Account" operation="insert"/>
+        <os:store key="ingest" objectStore="Jobs">
+            <os:value>#[payload.id]</os:value>
+        </os:store>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- ingest のジョブが終わるまで待つ (get-job-state) -->
+    <flow name="ingest-wait">
+        <http:listener config-ref="HTTP" path="/ingest/wait" allowedMethods="GET"/>
+        <os:retrieve key="ingest" objectStore="Jobs" target="id"/>
+        <until-successful maxRetries="110" millisBetweenRetries="1000">
+            <salesforce:get-job-state-bulk-api-v2 config-ref="SF" id="#[vars.id]"/>
+            <choice>
+                <when expression="#[not (['JobComplete', 'Failed', 'Aborted'] contains payload.state)]">
+                    <raise-error type="APP:PENDING" description="#[payload.state]"/>
+                </when>
+            </choice>
+        </until-successful>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="ingest-successful">
+        <http:listener config-ref="HTTP" path="/ingest/successful" allowedMethods="GET"/>
+        <os:retrieve key="ingest" objectStore="Jobs" target="id"/>
+        <salesforce:retrieve-job-successful-results-bulk-v2 config-ref="SF" id="#[vars.id]"/>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="ingest-failed">
+        <http:listener config-ref="HTTP" path="/ingest/failed" allowedMethods="GET"/>
+        <os:retrieve key="ingest" objectStore="Jobs" target="id"/>
+        <salesforce:retrieve-job-failed-results-bulk-v2 config-ref="SF" id="#[vars.id]"/>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="ingest-unprocessed">
+        <http:listener config-ref="HTTP" path="/ingest/unprocessed" allowedMethods="GET"/>
+        <os:retrieve key="ingest" objectStore="Jobs" target="id"/>
+        <salesforce:retrieve-job-unprocessed-results-bulk-v2 config-ref="SF" id="#[vars.id]"/>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- ジョブの一覧は org の中身で変わるので、形だけ -->
+    <flow name="all-jobs">
+        <http:listener config-ref="HTTP" path="/all-jobs" allowedMethods="GET"/>
+        <os:retrieve key="ingest" objectStore="Jobs" target="id"/>
+        <salesforce:get-all-jobs-bulk-api-v2 config-ref="SF"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var p = payload
+var recs = if (p is Object) (p.records default []) else if (p is Array) p else []
+var mine = recs filter ((r) -> r.id == vars.id)
+---
+{
+  class: p.^class,
+  "type": typeOf(p) as String,
+  recordClass: if (sizeOf(recs) > 0) recs[0].^class else null,
+  found: sizeOf(mine),
+  mine: if (sizeOf(mine) > 0) (mine[0] orderBy $$) else null
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- query のジョブ -->
+    <flow name="query">
+        <http:listener config-ref="HTTP" path="/query" allowedMethods="POST"/>
+        <salesforce:create-query-job-bulk-api-v2 config-ref="SF" query="SELECT Name, NumberOfEmployees FROM Account WHERE Name LIKE 'mulay bulk2%' ORDER BY Name"/>
+        <os:store key="query" objectStore="Jobs">
+            <os:value>#[payload.id]</os:value>
+        </os:store>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="query-wait">
+        <http:listener config-ref="HTTP" path="/query/wait" allowedMethods="GET"/>
+        <os:retrieve key="query" objectStore="Jobs" target="id"/>
+        <until-successful maxRetries="110" millisBetweenRetries="1000">
+            <salesforce:get-query-job-info-bulk-api-v2 config-ref="SF" id="#[vars.id]"/>
+            <choice>
+                <when expression="#[not (['JobComplete', 'Failed', 'Aborted'] contains payload.state)]">
+                    <raise-error type="APP:PENDING" description="#[payload.state]"/>
+                </when>
+            </choice>
+        </until-successful>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 結果。max を付ければ maxRecordsPerPage (ページをまたいで全部返すか) -->
+    <flow name="query-results">
+        <http:listener config-ref="HTTP" path="/query/results" allowedMethods="GET"/>
+        <os:retrieve key="query" objectStore="Jobs" target="id"/>
+        <choice>
+            <when expression="#[attributes.queryParams.max != null]">
+                <salesforce:get-query-job-results-bulk-api-v2 config-ref="SF" id="#[vars.id]" maxRecordsPerPage="#[attributes.queryParams.max as Number]"/>
+            </when>
+            <otherwise>
+                <salesforce:get-query-job-results-bulk-api-v2 config-ref="SF" id="#[vars.id]"/>
+            </otherwise>
+        </choice>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 終わったジョブの abort (失敗の形) と delete -->
+    <flow name="query-abort">
+        <http:listener config-ref="HTTP" path="/query/abort" allowedMethods="POST"/>
+        <os:retrieve key="query" objectStore="Jobs" target="id"/>
+        <salesforce:abort-query-job-bulk-api-v2 config-ref="SF" id="#[vars.id]"/>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="query-delete">
+        <http:listener config-ref="HTTP" path="/query/delete" allowedMethods="POST"/>
+        <os:retrieve key="query" objectStore="Jobs" target="id"/>
+        <salesforce:delete-query-job-bulk-api-v2 config-ref="SF" id="#[vars.id]"/>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="all-query-jobs">
+        <http:listener config-ref="HTTP" path="/all-query-jobs" allowedMethods="GET"/>
+        <os:retrieve key="query" objectStore="Jobs" target="id"/>
+        <salesforce:get-all-query-jobs-bulk-api-v2 config-ref="SF"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var p = payload
+var recs = if (p is Object) (p.records default []) else if (p is Array) p else []
+var mine = recs filter ((r) -> r.id == vars.id)
+---
+{
+  class: p.^class,
+  "type": typeOf(p) as String,
+  recordClass: if (sizeOf(recs) > 0) recs[0].^class else null,
+  found: sizeOf(mine),
+  mine: if (sizeOf(mine) > 0) (mine[0] orderBy $$) else null
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 手で叩く確かめ用 (シナリオには入れない): 存在しない ID 1 万件の delete のジョブを作ってすぐ abort し、未処理の
+         結果を見る。abort の直後の結果の読み取りに Salesforce が 500 を返し続けることがあり、結果が安定しない
+         (2026-10-04 に 2 回成功: 1 万件とも JobUnprocessedRecordResult {originalFields}、abort は BulkJobState) -->
+    <flow name="unprocessed">
+        <http:listener config-ref="HTTP" path="/probe/unprocessed" allowedMethods="POST"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/csv
+---
+(0 to 9999) map {Id: "001" ++ ($ as String {format: "000000000000"})}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <salesforce:create-job-bulk-api-v2 config-ref="SF" objectType="Account" operation="delete"/>
+        <set-variable variableName="id" value="#[payload.id]"/>
+        <salesforce:abort-job-bulk-api-v2 config-ref="SF" id="#[vars.id]" target="aborted"/>
+        <!-- abort の直後は Salesforce が 500 を返すことがある (どちらの実行系でも) -->
+        <until-successful maxRetries="5" millisBetweenRetries="2000">
+            <salesforce:retrieve-job-unprocessed-results-bulk-v2 config-ref="SF" id="#[vars.id]"/>
+        </until-successful>
+        <set-variable variableName="unprocessed" value="#[payload]"/>
+        <until-successful maxRetries="5" millisBetweenRetries="2000">
+            <salesforce:delete-job-bulk-api-v2 config-ref="SF" id="#[vars.id]" target="deleted"/>
+        </until-successful>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var u = vars.unprocessed
+---
+{abortedClass: vars.aborted.^class, aborted: vars.aborted orderBy $$, count: sizeOf(u), itemClass: if (sizeOf(u) > 0) u[0].^class else null, first: if (sizeOf(u) > 0) u[0] else null,
+ firstTypes: if (sizeOf(u) > 0) (u[0] mapObject ((v, k) -> {(k): typeOf(v) as String})) else null}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 存在しないジョブ (失敗の型と文言) -->
+    <flow name="bogus-state">
+        <http:listener config-ref="HTTP" path="/bogus/state" allowedMethods="GET"/>
+        <salesforce:get-job-state-bulk-api-v2 config-ref="SF" id="750000000000000AAA"/>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="bogus-query-info">
+        <http:listener config-ref="HTTP" path="/bogus/query-info" allowedMethods="GET"/>
+        <salesforce:get-query-job-info-bulk-api-v2 config-ref="SF" id="750000000000000AAA"/>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 手で叩く確かめ用 (シナリオには入れない。処理の速さで結果が変わる): query のジョブを作ってすぐ abort する -->
+    <flow name="probe-query-abort">
+        <http:listener config-ref="HTTP" path="/probe/query-abort" allowedMethods="POST"/>
+        <salesforce:create-query-job-bulk-api-v2 config-ref="SF" query="SELECT Id, Name, Description FROM Account"/>
+        <salesforce:abort-query-job-bulk-api-v2 config-ref="SF" id="#[payload.id]"/>
+        <set-variable variableName="aborted" value="#[payload]"/>
+        <salesforce:delete-query-job-bulk-api-v2 config-ref="SF" id="#[vars.aborted.id]"/>
+        <set-payload value="#[vars.aborted]"/>
+        <flow-ref name="describe"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 片づけ: ingest のジョブと Account を消す -->
+    <flow name="cleanup">
+        <http:listener config-ref="HTTP" path="/cleanup" allowedMethods="POST"/>
+        <os:retrieve key="ingest" objectStore="Jobs" target="id"/>
+        <salesforce:delete-job-bulk-api-v2 config-ref="SF" id="#[vars.id]" target="deleted"/>
+        <flow-ref name="setup-body"/>
+        <set-payload value="#[vars.deleted]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <sub-flow name="setup-body">
+        <salesforce:query config-ref="SF" target="found">
+            <salesforce:salesforce-query>SELECT Id FROM Account WHERE Name LIKE 'mulay bulk2%'</salesforce:salesforce-query>
+        </salesforce:query>
+        <choice>
+            <when expression="#[sizeOf(vars.found) > 0]">
+                <salesforce:delete config-ref="SF" target="ignored">
+                    <salesforce:ids>#[vars.found map $.Id]</salesforce:ids>
+                </salesforce:delete>
+            </when>
+        </choice>
+    </sub-flow>
+</mule>

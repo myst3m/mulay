@@ -1,0 +1,20 @@
+%dw 2.0
+import * from dw::core::Arrays
+output application/json
+---
+{ "results" : [
+    "ok" : [
+      [1,2,3] some (($ mod 2) == 0),
+      [1,2,3] some ((nextNum) -> (nextNum mod 2) == 0),
+      [1,2,3] some (($ mod 2) == 1),
+      [1,2,3,4,5,6,7,8] some (log('should stop at 2 ==', $) == 2),
+      [1,2,3] some ($ == 1),
+      [1,1,1] some ($ == 1),
+      [1] some ($ == 1)
+    ],
+    "err" : [
+      [1,2,3] some ($ == 100),
+      [1] some ($ == 2)
+    ]
+  ]
+}

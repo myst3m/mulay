@@ -1,0 +1,50 @@
+(ns mulay.wasm.main (:require [mulay.lib.host :as host] [mulay.note.run :as note] [mulay.mule.amodel :as am] [mulay.mule.model :as m] [clay.json :as json] [clay.string :as str]))
+
+(defn unpack Values(Vec(Str) Vec(Str) Str) [s: &Str]
+  (loop [i 0 ps: Vec(Str) [] bs: Vec(Str) []]
+    (if (>= i (count s)) (values ps bs "")
+      (let [a (str/index-of-after s "\n" i)
+            b (if (< a 0) -1 (str/index-of-after s "\n" (+ a 1)))]
+        (if (< b 0) (values ps bs (str "bad file list at byte " i))
+          (let [[n ne] (parse-long (subs s (+ a 1) b))
+                e (+ b 1 n)]
+            (if (or (not= ne "") (< n 0) (> e (count s))) (values ps bs (str "bad length at byte " (+ a 1)))
+              (recur e (conj ps (str "/app/" (subs s i a))) (conj bs (subs s (+ b 1) e))))))))))
+
+(def PROPS-PATH "/app/@properties")
+
+(def LINKS-PATH "/app/@links")
+
+(defn split-props Values(Vec(Str) Vec(Str) Str Str) [ps: &Vec(Str) bs: &Vec(Str)]
+  (loop [i 0 fs: Vec(Str) [] ts: Vec(Str) [] pj "" lj ""]
+    (if (>= i (count ps)) (values fs ts pj lj)
+      (cond (= (nth ps i) PROPS-PATH) (recur (+ i 1) fs ts (str (nth bs i)) lj)
+            (= (nth ps i) LINKS-PATH) (recur (+ i 1) fs ts pj (str (nth bs i)))
+            :else (recur (+ i 1) (conj fs (str (nth ps i))) (conj ts (str (nth bs i))) pj lj)))))
+
+(defn- jerr Str [msg: &Str] (str "{\"error\":\"" (json/escape (str msg)) "\"}"))
+
+(defn ^:export load Str [files: Str]
+  (let [[ps0 bs0 err] (unpack files)
+        [ps bs pj lj] (split-props ps0 bs0)
+        [props perr] (if (= pj "") (let [z: Vec(m/Param) []] (values z "")) (note/props-json pj))]
+    (cond (not= err "") (jerr err)
+          (not= perr "") (jerr perr)
+          :else (let [z (host/mount! ps bs)
+                      md (note/load-dir-full "/app" props lj)]
+                  (am/to-json md)))))
+
+(defn ^:export run Str [example: Str] (note/trace-json (note/run-example example)))
+
+(defn ^:export call Str [req: Str] (note/call-json req))
+
+(defn ^:export scaffold Str [req: Str] (note/scaffold-json req))
+
+(defn ^:export get-value Str [id: Str] (note/get-value id))
+
+(defn ^:export components Str [names: Str]
+  (let [xs: Vec(Str) (str/split names "\n")
+        ys (loop [i 0 a: Vec(Str) []] (if (>= i (count xs)) a (recur (+ i 1) (if (= (nth xs i) "") a (conj a (nth xs i))))))]
+    (note/components-json ys)))
+
+(defn main Int [] 0)

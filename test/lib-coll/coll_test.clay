@@ -1,0 +1,137 @@
+(ns coll-test (:require [mulay.dw.engine :as eng]))
+
+;; dw::Core の配列・オブジェクト系、dw::core::Arrays、dw::core::Objects の組み込み関数。
+;; 期待値は実 DW 2.11.2 (tools/dw-oracle) の結果を compact な JSON で書いたもの。
+;; 失敗の文言のうち、ラムダが定数を返すものは実 DW では静的な型検査で先に落ちるので、
+;; 同じ値を payload から渡したときの実行時の文言 (オラクルで確認) を期待値にしている。
+;; (map / filter / mapObject / pluck は core.clay の同名の実装が先に登録されている間は
+;;  core_coll の実装が使われないので、ここでは扱わない。golden で確かめる。)
+
+(defn- run Str [header: Str expr: Str]
+  (let [ins: Vec(eng/Input) []
+        [mime out err] (eng/run-text (str "%dw 2.0\n" header "output application/json indent=false\n---\n" expr) ins)]
+    (if (= err "") out (str "ERR:" err))))
+
+(defn- dw Str [expr: Str] (run "" expr))
+(defn- dwa Str [expr: Str] (run "import * from dw::core::Arrays\n" expr))
+(defn- dwo Str [expr: Str] (run "import * from dw::core::Objects\n" expr))
+
+(deftest reduce-acc
+  (is (= (dw "[1,2,3] reduce ($$ ++ \",\" ++ $)") "\"1,2,3\""))
+  (is (= (dw "[\"a\",\"b\",\"c\"] reduce (x, y) -> x ++ y") "\"cba\""))
+  (is (= (dw "[1,2,3] reduce ((item, acc = 10) -> acc + item)") "16"))
+  (is (= (dw "[1] reduce ((item, acc = 5) -> acc + item)") "6"))
+  (is (= (dw "[] reduce ($ + $$)") "null"))
+  (is (= (dw "[true, false, true] reduce $$") "true"))
+  (is (= (dw "\"abc\" reduce ((c, acc = []) -> acc + c)") "[\"a\",\"b\",\"c\"]"))
+  (is (= (dw "\"abc\" reduce ($$ ++ $)") "\"abc\""))
+  (is (= (dw "\"\" reduce ($$ ++ $)") "\"\""))
+  (is (= (dw "null reduce ($$ ++ $)") "null")))
+
+(deftest order-by
+  (is (= (dw "[3,1,2,1] orderBy $") "[1,1,2,3]"))
+  (is (= (dw "[{a:2,i:0},{a:1,i:1},{a:2,i:2},{a:1,i:3}] orderBy $.a map $.i") "[1,3,0,2]"))
+  (is (= (dw "[\"b\",\"a\",\"B\"] orderBy $") "[\"B\",\"a\",\"b\"]"))
+  (is (= (dw "[true,false,true] orderBy $") "[false,true,true]"))
+  (is (= (dw "[1,2,3] orderBy (x, i) -> -i") "[3,2,1]"))
+  (is (= (dw "{b:2,a:1,c:0} orderBy $") "{\"c\": 0,\"a\": 1,\"b\": 2}"))
+  (is (= (dw "{b:2,a:1,c:0} orderBy $$") "{\"a\": 1,\"b\": 2,\"c\": 0}"))
+  (is (= (dw "null orderBy $") "null"))
+  ;; 32 要素以上 (マージの経路) も安定
+  (is (= (dw "((1 to 40) orderBy ($ mod 2))[0 to 3]") "[2,4,6,8]")))
+
+(deftest order-by-errors
+  (is (= (dw "[1, \"a\"] orderBy $") "ERR:Types `String` and `Number` can not be compared."))
+  (is (= (dw "[\"a\", 1] orderBy $") "ERR:Types `Number` and `String` can not be compared."))
+  (is (= (dw "[1, null, 0] orderBy $") "ERR:Types `Null` and `Number` can not be compared."))
+  (is (= (dw "[null, null] orderBy $") "ERR:You cannot compare a value of type :Null"))
+  (is (= (dw "[{a:1},{a:0}] orderBy $") "ERR:You cannot compare a value of type :Object")))
+
+(deftest group-by
+  (is (= (dw "[1,2,3] groupBy ($ mod 2)") "{\"1\": [1,3],\"0\": [2]}"))
+  (is (= (dw "[1,2,3] groupBy ($ > 1)") "{\"false\": [1],\"true\": [2,3]}"))
+  (is (= (dw "\"hello\" groupBy $") "{\"h\": \"h\",\"e\": \"e\",\"l\": \"ll\",\"o\": \"o\"}"))
+  (is (= (dw "{a:1,b:2,c:1} groupBy $") "{\"1\": {\"a\": 1,\"c\": 1},\"2\": {\"b\": 2}}"))
+  (is (= (dw "{a:1,b:2} groupBy $$") "{\"a\": {\"a\": 1},\"b\": {\"b\": 2}}"))
+  (is (= (dw "[1,2] groupBy [$]") "ERR:Cannot coerce Array to String"))
+  (is (= (dw "null groupBy $") "null")))
+
+(deftest distinct-by
+  (is (= (dw "[1,2,1,1.0,\"1\"] distinctBy $") "[1,2,\"1\"]"))
+  (is (= (dw "[{a:1},{a:1.0},{a:2}] distinctBy $") "[{\"a\": 1},{\"a\": 2}]"))
+  (is (= (dw "{a:1,b:2,c:1} distinctBy $") "{\"a\": 1,\"b\": 2}"))
+  (is (= (dw "null distinctBy $") "null")))
+
+(deftest flat
+  (is (= (dw "flatten([[1,2],3,null,[[4]]])") "[1,2,3,null,[4]]"))
+  (is (= (dw "flatten(null)") "null"))
+  (is (= (dw "[1,2] flatMap [$,$$]") "[1,0,2,1]"))
+  (is (= (dw "null flatMap [$]") "null")))
+
+(deftest zips
+  (is (= (dw "zip([1,2,3],[\"a\",\"b\"])") "[[1,\"a\"],[2,\"b\"]]"))
+  (is (= (dw "unzip([[1,\"a\"],[2,\"b\",3]])") "[[1,2],[\"a\",\"b\"]]"))
+  (is (= (dw "unzip([])") "[[],[]]")))
+
+(deftest search
+  (is (= (dw "[1,2,1] find 1") "[0,2]"))
+  (is (= (dw "find(null, 1)") "[]"))
+  (is (= (dw "[1,2,1] indexOf 1") "0"))
+  (is (= (dw "[1,2,1] lastIndexOf 1") "2"))
+  (is (= (dw "[1,2,1] indexOf 5") "-1"))
+  (is (= (dw "indexOf(null, 1)") "-1"))
+  (is (= (dw "[1,2] contains 2.0") "true"))
+  (is (= (dw "null contains 1") "false"))
+  (is (= (dw "[isEmpty([]), isEmpty([1]), isEmpty({}), isEmpty({a:1}), isEmpty(null)]") "[true,false,true,false,true]")))
+
+(deftest join-by
+  (is (= (dw "[1,true,\"a\",2.50] joinBy \"-\"") "\"1-true-a-2.5\""))
+  (is (= (dw "[] joinBy \"-\"") "\"\""))
+  (is (= (dw "null joinBy \"-\"") "null"))
+  (is (= (dw "[1,[2]] joinBy \"-\"") "ERR:Cannot coerce Array to String")))
+
+(deftest aggregates
+  (is (= (dw "[max([]), max([1,5,3]), min([\"b\",\"a\"]), max([true,false])]") "[null,5,\"a\",true]"))
+  (is (= (dw "[sum([]), sum([1.5, 2.5]), avg([1,2]), avg([1,2,4])]") "[0,4,1.5,2.333333333333333333333333333333333]"))
+  (is (= (dw "avg([])") "ERR:Division by zero"))
+  (is (= (dw "[{a:1},{a:3},{a:2}] maxBy $.a") "{\"a\": 3}"))
+  (is (= (dw "[{a:1},{a:3},{a:0}] minBy $.a") "{\"a\": 0}"))
+  (is (= (dw "[] maxBy $") "null")))
+
+(deftest object-views
+  (is (= (dw "entriesOf({a @(x: 1): 1, b: 2})")
+         "[{\"key\": \"a\",\"value\": 1,\"attributes\": {\"x\": 1}},{\"key\": \"b\",\"value\": 2,\"attributes\": {}}]"))
+  (is (= (dw "[namesOf({a:1, a:2}), keysOf({a:1}), valuesOf({a:1})]") "[[\"a\",\"a\"],[\"a\"],[1]]"))
+  (is (= (dw "[entriesOf(null), namesOf(null), keysOf(null), valuesOf(null)]") "[null,null,null,null]"))
+  (is (= (dw "{a:1,b:2} filterObject ($ > 1)") "{\"b\": 2}"))
+  (is (= (dw "{a:1,b:2} filterObject ((v,k,i) -> i == 0)") "{\"a\": 1}"))
+  (is (= (dw "{a:1} filterObject ((v) -> \"x\")") "ERR:Cannot coerce String (x) to Boolean")))
+
+(deftest arrays-module
+  (is (= (dwa "[some([1,2], (x) -> x > 1), every([1,2], (x) -> x > 1), some(null, (x) -> x), every(null, (x) -> x)]") "[true,false,false,true]"))
+  (is (= (dwa "[countBy([1,2,3], (x) -> x > 1), sumBy([1,2,3], (x) -> x * 2), sumBy([], (x) -> x)]") "[2,12,0]"))
+  (is (= (dwa "[divideBy([1,2,3,4,5], 2), divideBy([1,2,3,4,5], 2.5)]") "[[[1,2],[3,4],[5]],[[1,2,3],[4,5]]]"))
+  (is (= (dwa "[take([1,2,3], 1.5), take([1,2,3], 0), drop([1,2,3], 1.5), drop([1,2,3], 5), drop([1,2,3], -1)]") "[[1,2],[],[2,3],[],[1,2,3]]"))
+  (is (= (dwa "[slice([1,2,3,4], 1.5, 3), slice([1,2,3,4], -2, 2), slice([1,2,3,4], 2, 10), slice([1,2,3,4], 5, 10), slice([1,2,3,4], 3, 1)]") "[[2,3],[1,2],[3,4],[],[]]"))
+  (is (= (dwa "[indexOf([1,2,3], 2), indexWhere([1,2,3], (x) -> x > 1), indexWhere([1,2,3], (x) -> x > 5)]") "[1,1,-1]"))
+  (is (= (dwa "[splitAt([1,2,3], 1), splitWhere([1,2,3], (x) -> x > 5)]") "[{\"l\": [1],\"r\": [2,3]},{\"l\": [],\"r\": [1,2,3]}]"))
+  (is (= (dwa "[takeWhile([1,2,3,1], (x) -> x < 3), dropWhile([1,2,3,1], (x) -> x < 3), dropWhile([1,2], (x) -> x < 3)]") "[[1,2],[3,1],[]]"))
+  (is (= (dwa "partition([1,2,3], (x) -> x > 1)") "{\"success\": [2,3],\"failure\": [1]}"))
+  (is (= (dwa "firstWith([1,2,3], (x, i) -> i == 1)") "2"))
+  (is (= (dwa "some([1], (x) -> \"x\")") "ERR:Invalid if condition type. Expecting type `Boolean` but got `String(\"x\")`")))
+
+(deftest joins
+  (is (= (dwa "join([{id:1},{id:2}], [{id:1,b:1},{id:1,b:2},{id:3,b:3}], (l) -> l.id, (r) -> r.id) map $.r.b") "[1,2]"))
+  (is (= (dwa "leftJoin([{id:1},{id:2}], [{id:1,b:1},{id:3,b:3}], (l) -> l.id, (r) -> r.id)")
+         "[{\"l\": {\"id\": 1},\"r\": {\"id\": 1,\"b\": 1}},{\"l\": {\"id\": 2}}]"))
+  (is (= (dwa "outerJoin([{id:1},{id:2}], [{id:1,b:1},{id:3,b:3}], (l) -> l.id, (r) -> r.id)")
+         "[{\"l\": {\"id\": 1},\"r\": {\"id\": 1,\"b\": 1}},{\"l\": {\"id\": 2}},{\"r\": {\"id\": 3,\"b\": 3}}]")))
+
+(deftest objects-module
+  (is (= (dwo "mergeWith({a:1,b:2},{b:3,c:4})") "{\"a\": 1,\"b\": 3,\"c\": 4}"))
+  (is (= (dwo "[mergeWith(null,{b:3}), mergeWith({b:3}, null)]") "[{\"b\": 3},{\"b\": 3}]"))
+  (is (= (dwo "[divideBy({a:1,b:2,c:3}, 2), divideBy({a:1,b:2,c:3}, 0)]") "[[{\"a\": 1,\"b\": 2},{\"c\": 3}],[{\"a\": 1,\"b\": 2,\"c\": 3}]]"))
+  (is (= (dwo "takeWhile({a:1,b:2,c:1}, (v,k) -> v < 2)") "{\"a\": 1}"))
+  (is (= (dwo "[everyEntry({a:1,b:2}, (v,k) -> v > 0), everyEntry(null, (v,k) -> v > 0), someEntry({a:1,b:2}, (v,k) -> v > 1), someEntry(null, (v,k) -> v)]") "[true,true,true,false]"))
+  (is (= (dwo "[nameSet({a:1}), keySet({a:1}), valueSet({a:1})]") "[[\"a\"],[\"a\"],[1]]"))
+  (is (= (dwo "entrySet({a:1})") "[{\"key\": \"a\",\"value\": 1,\"attributes\": {}}]")))

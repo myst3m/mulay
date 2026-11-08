@@ -1,0 +1,545 @@
+(ns mulay.lib.sqlbtree (:require [mulay.lib.sqlfile :as sf] [clay.bytes :as bytes]))
+
+(def LEAF-TABLE 13)
+(def INNER-TABLE 5)
+(def LEAF-INDEX 10)
+(def INNER-INDEX 2)
+
+(defrecord Pager [pages: Vec(Vec(Str)) pgs: Vec(Vec(Pg)) npages: Int page-size: Int usable: Int free: Vec(Int) cookie: Int])
+
+(def CH 64)
+
+(defn- raw-at Str [p: &Pager n: Int] (nth (nth (:pages p) (quot (- n 1) CH)) (mod (- n 1) CH)))
+(defn- pg-at Pg [p: &Pager n: Int] (nth (nth (:pgs p) (quot (- n 1) CH)) (mod (- n 1) CH)))
+
+(defn- chunk-set-str Vec(Vec(Str)) [outer: Vec(Vec(Str)) i: Int x: Str]
+  (let [ci (quot i CH) ch (nth outer ci) o2 (assoc outer ci [])] (assoc o2 ci (assoc ch (mod i CH) x))))
+(defn- chunk-set-pg Vec(Vec(Pg)) [outer: Vec(Vec(Pg)) i: Int x: Pg]
+  (let [ci (quot i CH) ch (nth outer ci) o2 (assoc outer ci [])] (assoc o2 ci (assoc ch (mod i CH) x))))
+(defn- chunk-add-str Vec(Vec(Str)) [outer: Vec(Vec(Str)) n: Int x: Str]
+  (if (= (mod n CH) 0) (conj outer [x])
+    (let [ci (quot n CH) ch (nth outer ci) o2 (assoc outer ci [])] (assoc o2 ci (conj ch x)))))
+(defn- chunk-add-pg Vec(Vec(Pg)) [outer: Vec(Vec(Pg)) n: Int x: Pg]
+  (if (= (mod n CH) 0) (conj outer [x])
+    (let [ci (quot n CH) ch (nth outer ci) o2 (assoc outer ci [])] (assoc o2 ci (conj ch x)))))
+
+(defn page-count Int [p: &Pager] (:npages p))
+
+(defrecord Pg [kind: Int cells: Vec(Str) right: Int bytes: Int])
+
+(defn- cells-bytes Int [cs: &Vec(Str)] (loop [i 0 s 0] (if (>= i (count cs)) s (recur (+ i 1) (+ s (+ 2 (count (nth cs i))))))))
+(defn- mk-pg Pg [kind: Int cells: Vec(Str) right: Int] (let [b (cells-bytes cells)] (->Pg kind cells right b)))
+
+(defn- zeros Str [n: Int] (loop [out (chr 0)] (if (>= (count out) n) (subs out 0 n) (recur (str out out)))))
+
+(defn- hdr-off Int [n: Int] (if (= n 1) 100 0))
+
+(defn page-of Str [p: &Pager n: Int] (let [d (raw-at p n)] (if (= (count d) 0) (zeros (:page-size p)) d)))
+
+(defn- set-page Pager [p: Pager n: Int data: Str]
+  (let [ps (:pages p) gs (:pgs p) p2 (assoc p :pages [] :pgs [])]
+    (assoc p2 :pages (chunk-set-str ps (- n 1) data) :pgs (chunk-set-pg gs (- n 1) (mk-pg 0 [] 0)))))
+
+(defn- u16 Int [s: &Str i: Int] (bytes/unpack s i 2 true))
+(defn- u32 Int [s: &Str i: Int] (bytes/unpack s i 4 true))
+(defn- p32 Str [n: Int] (bytes/pack n 4 true))
+(defn- p16 Str [n: Int] (bytes/pack n 2 true))
+
+(defn- leaf? Bool [kind: Int] (or (= kind LEAF-TABLE) (= kind LEAF-INDEX)))
+(defn- table? Bool [kind: Int] (or (= kind LEAF-TABLE) (= kind INNER-TABLE)))
+
+(defn local-size Int [u: Int n: Int table-leaf: Bool]
+  (let [x (if table-leaf (- u 35) (- (quot (* (- u 12) 64) 255) 23))
+        m (- (quot (* (- u 12) 32) 255) 23)
+        k (+ m (mod (- n m) (- u 4)))]
+    (cond (<= n x) n (<= k x) k :else m)))
+
+(defn- cell-len Int [u: Int kind: Int pg: &Str c: Int]
+  (if (= kind INNER-TABLE)
+    (let [[r p ok] (sf/get-varint pg (+ c 4))] (- p c))
+    (let [start (if (= kind INNER-INDEX) (+ c 4) c)
+          [n p1 ok] (sf/get-varint pg start)
+          p2 (if (= kind LEAF-TABLE) (let [[r p ok2] (sf/get-varint pg p1)] p) p1)
+          local (local-size u n (= kind LEAF-TABLE))]
+      (+ (- p2 c) (+ local (if (< local n) 4 0))))))
+
+(defn- take-pg Values(Pager Pg) [p: Pager n: Int]
+  (let [g0 (pg-at p n)]
+    (if (= (:kind g0) 0) (values p (decode-pg p n))
+      (let [i (- n 1) ci (quot i CH) k (mod i CH)
+            gs (:pgs p) p2 (assoc p :pgs [])
+            ch (nth gs ci) o2 (assoc gs ci [])
+            g (nth ch k) ch2 (assoc ch k (mk-pg 0 [] 0))]
+        (values (assoc p2 :pgs (assoc o2 ci ch2)) g)))))
+
+(defn read-pg Pg [p: &Pager n: Int]
+  (let [g (pg-at p n)] (if (not= (:kind g) 0) g (decode-pg p n))))
+
+(defn- decode-pg Pg [p: &Pager n: Int]
+  (let [pg (page-of p n) h (hdr-off n)
+        kind (nth pg h)
+        ncell (u16 pg (+ h 3))
+        ptrs (+ h (if (leaf? kind) 8 12))
+        right (if (leaf? kind) 0 (u32 pg (+ h 8)))
+        cells (loop [i 0 acc: Vec(Str) []]
+                (if (>= i ncell) acc
+                  (let [c (u16 pg (+ ptrs (* 2 i)))] (recur (+ i 1) (conj acc (subs pg c (+ c (cell-len (:usable p) kind pg c))))))))]
+    (mk-pg kind cells right)))
+
+(defn- pg-size Int [n: Int g: &Pg] (+ (+ (hdr-off n) (if (leaf? (:kind g)) 8 12)) (:bytes g)))
+
+(defn- fits? Bool [p: &Pager n: Int g: &Pg] (<= (pg-size n g) (:usable p)))
+
+(defn- write-pg Pager [p: Pager n: Int g: &Pg]
+  (let [gs (:pgs p) p2 (assoc p :pgs [])] (assoc p2 :pgs (chunk-set-pg gs (- n 1) (->Pg (:kind g) (:cells g) (:right g) (:bytes g))))))
+
+(defn- encode-pg Str [p: &Pager n: Int g: &Pg]
+  (let [u (:usable p) ps (:page-size p) h (hdr-off n)
+        cells (:cells g) nc (count cells)
+        hsz (if (leaf? (:kind g)) 8 12)
+        [offs top] (loop [i 0 top u acc: Vec(Int) []]
+                      (if (>= i nc) (values acc top) (let [t (- top (count (nth cells i)))] (recur (+ i 1) t (conj acc t)))))
+        head (str (chr (:kind g)) (p16 0) (p16 nc) (p16 (if (= top 65536) 0 top)) (chr 0) (if (leaf? (:kind g)) "" (p32 (:right g))))
+        ptrs (loop [i 0 out ""] (if (>= i nc) out (recur (+ i 1) (str out (p16 (nth offs i))))))
+        prefix (if (= n 1) (zeros 100) "")
+        gap (zeros (- top (+ (+ h hsz) (* 2 nc))))
+        body (loop [i (- nc 1) out ""] (if (< i 0) out (recur (- i 1) (str out (nth cells i)))))
+        tail (zeros (- ps u))]
+    (str prefix head ptrs gap body tail)))
+
+(defn- alloc Values(Pager Int) [p: Pager]
+  (if (> (count (:free p)) 0)
+    (let [fr (:free p) n (nth fr (- (count fr) 1))
+          rest (loop [i 0 acc: Vec(Int) []] (if (>= i (- (count fr) 1)) acc (recur (+ i 1) (conj acc (nth fr i)))))]
+      (values (set-page (assoc p :free rest) n "") n))
+    (let [ps (:pages p) gs (:pgs p) n0 (:npages p) p2 (assoc p :pages [] :pgs [])]
+      (values (assoc p2 :pages (chunk-add-str ps n0 "") :pgs (chunk-add-pg gs n0 (mk-pg 0 [] 0)) :npages (+ n0 1)) (+ n0 1)))))
+
+(defn- release Pager [p: Pager n: Int] (let [fr (:free p) p2 (assoc p :free [])] (assoc p2 :free (conj fr n))))
+
+(defn new-pager Pager [page-size: Int reserved: Int]
+  (let [p (->Pager [[""]] [[(mk-pg 0 [] 0)]] 1 page-size (- page-size reserved) [] 1)]
+    (write-pg p 1 (mk-pg LEAF-TABLE [] 0))))
+
+(defn schema-cookie Int [p: &Pager] (:cookie p))
+(defn bump-schema Pager [p: Pager] (assoc p :cookie (+ (:cookie p) 1)))
+
+(defn- place-payload Values(Pager Str) [p0: Pager payload: &Str table-leaf: Bool]
+  (let [u (:usable p0) n (count payload) local (local-size u n table-leaf)]
+    (if (= local n) (values p0 (str payload))
+      (let [chunk (- u 4)
+            parts (loop [off local acc: Vec(Str) []] (if (>= off n) acc (recur (+ off chunk) (conj acc (subs payload off (min n (+ off chunk)))))))
+            [p1 first] (loop [i (- (count parts) 1) p p0 next 0]
+                         (if (< i 0) (values p next)
+                           (let [[p2 pg] (alloc p)
+                                 data (str (p32 next) (nth parts i))
+                                 full (str data (zeros (- (:page-size p2) (count data))))]
+                             (recur (- i 1) (set-page p2 pg full) pg))))]
+        (values p1 (str (subs payload 0 local) (p32 first)))))))
+
+(defn- cell-payload Str [p: &Pager cell: &Str start: Int table-leaf: Bool]
+  (let [[n p1 ok] (sf/get-varint cell start)
+        p2 (if table-leaf (let [[r q ok2] (sf/get-varint cell p1)] q) p1)
+        local (local-size (:usable p) n table-leaf)]
+    (if (= local n) (subs cell p2 (+ p2 n))
+      (loop [out (subs cell p2 (+ p2 local)) next (u32 cell (+ p2 local))]
+        (if (or (>= (count out) n) (= next 0)) out
+          (let [pg (page-of p next) k (min (- n (count out)) (- (:usable p) 4)) part (subs pg 4 (+ 4 k))]
+            (recur (str out part) (u32 pg 0))))))))
+
+(defn- free-overflow Pager [p0: Pager cell: &Str start: Int table-leaf: Bool]
+  (let [[n p1 ok] (sf/get-varint cell start)
+        p2 (if table-leaf (let [[r q ok2] (sf/get-varint cell p1)] q) p1)
+        local (local-size (:usable p0) n table-leaf)]
+    (if (= local n) p0
+      (loop [p p0 next (u32 cell (+ p2 local))]
+        (if (= next 0) p (let [nx (u32 (page-of p next) 0)] (recur (release p next) nx)))))))
+
+(defn- leaf-cell-rowid Int [cell: &Str] (let [[n p ok] (sf/get-varint cell 0) [r q ok2] (sf/get-varint cell p)] r))
+(defn- inner-cell-rowid Int [cell: &Str] (let [[r q ok] (sf/get-varint cell 4)] r))
+(defn- child-of Int [cell: &Str] (u32 cell 0))
+(defn- with-child Str [cell: &Str child: Int] (str (p32 child) (subs cell 4 (count cell))))
+
+(defn- ins-at Vec(Str) [cs0: Vec(Str) i: Int x: &Str]
+  (let [n (count cs0)]
+    (if (>= i n) (conj cs0 (str x))
+      (let [last (nth cs0 (- n 1))]
+        (loop [k (- n 1) cs (conj cs0 last)]
+          (if (<= k i) (assoc cs i (str x))
+            (let [prev (nth cs (- k 1))] (recur (- k 1) (assoc cs k prev)))))))))
+(defn- del-at Vec(Str) [cs: &Vec(Str) i: Int]
+  (loop [k 0 acc: Vec(Str) []] (cond (>= k (count cs)) acc (= k i) (recur (+ k 1) acc) :else (recur (+ k 1) (conj acc (nth cs k))))))
+(defn- set-at Vec(Str) [cs: &Vec(Str) i: Int x: &Str]
+  (loop [k 0 acc: Vec(Str) []] (cond (>= k (count cs)) acc (= k i) (recur (+ k 1) (conj acc (str x))) :else (recur (+ k 1) (conj acc (nth cs k))))))
+
+(defn create-tree Values(Pager Int) [p0: Pager table: Bool]
+  (let [[p n] (alloc p0)] (values (write-pg p n (mk-pg (if table LEAF-TABLE LEAF-INDEX) [] 0)) n)))
+
+(defn- free-tree Pager [p0: Pager root: Int keep-root: Bool]
+  (let [kind0 (:kind (read-pg p0 root))]
+    (loop [p p0 stack [root]]
+      (if (= (count stack) 0)
+        (if keep-root (write-pg p root (mk-pg (if (table? kind0) LEAF-TABLE LEAF-INDEX) [] 0)) p)
+        (let [n (nth stack (- (count stack) 1))
+              rest (loop [i 0 acc: Vec(Int) []] (if (>= i (- (count stack) 1)) acc (recur (+ i 1) (conj acc (nth stack i)))))
+              g (read-pg p n)
+              kids (if (leaf? (:kind g)) rest
+                     (loop [i 0 acc (conj rest (:right g))] (if (>= i (count (:cells g))) acc (recur (+ i 1) (conj acc (child-of (nth (:cells g) i)))))))
+              p2 (loop [i 0 q p] (if (>= i (count (:cells g))) q
+                                   (let [c (nth (:cells g) i)]
+                                     (recur (+ i 1) (cond (= (:kind g) LEAF-TABLE) (free-overflow q c 0 true)
+                                                          (= (:kind g) LEAF-INDEX) (free-overflow q c 0 false)
+                                                          (= (:kind g) INNER-INDEX) (free-overflow q c 4 false)
+                                                          :else q)))))
+              p3 (if (and keep-root (= n root)) p2 (release p2 n))]
+          (recur p3 kids))))))
+
+(defn drop-tree Pager [p: Pager root: Int] (free-tree p root false))
+(defn clear-tree Pager [p: Pager root: Int] (free-tree p root true))
+
+(defrecord Step [pg: Int idx: Int])
+
+(defn- split Pager [p0: Pager path: &Vec(Step) n: Int g: &Pg]
+  (let [u (:usable p0) kind (:kind g) cells (:cells g)
+        cap (quot (- u (if (leaf? kind) 8 12)) 2)
+        lift (not= kind LEAF-TABLE)
+        groups0 (loop [i 0 cur: Vec(Str) [] size 0 groups: Vec(Vec(Str)) []]
+                  (if (>= i (count cells)) (conj groups cur)
+                    (let [c (nth cells i) sz (+ 2 (count c))]
+                      (if (and (> (count cur) (if lift 1 0)) (> (+ size sz) cap))
+                        (recur (+ i 1) [c] sz (conj groups cur))
+                        (recur (+ i 1) (conj cur c) (+ size sz) groups)))))
+        [groups seps] (if (not lift) (values groups0 [])
+                        (loop [i 0 gs: Vec(Vec(Str)) [] ss: Vec(Str) []]
+                          (if (>= i (count groups0)) (values gs ss)
+                            (let [gr (nth groups0 i)]
+                              (if (= i (- (count groups0) 1)) (recur (+ i 1) (conj gs gr) ss)
+                                (recur (+ i 1) (conj gs (but-last gr)) (conj ss (last-cell gr))))))))
+        is-root (= (count path) 0)]
+    (split-place p0 path n g groups seps is-root)))
+
+(defn- split-place Pager [p0: Pager path: &Vec(Step) n: Int g: &Pg groups: &Vec(Vec(Str)) seps: &Vec(Str) is-root: Bool]
+  (let [kind (:kind g)
+        ng (count groups)
+        [p1 pgnos] (loop [i 0 p p0 acc: Vec(Int) []]
+                     (if (>= i ng) (values p acc)
+                       (if (and (not is-root) (= i (- ng 1))) (recur (+ i 1) p (conj acc n))
+                         (let [[p2 k] (alloc p)] (recur (+ i 1) p2 (conj acc k))))))
+        p2 (loop [i 0 p p1]
+             (if (>= i ng) p
+               (let [right (if (leaf? kind) 0 (if (< i (- ng 1)) (child-of (nth seps i)) (:right g)))
+                     gcells (nth groups i)]
+                 (recur (+ i 1) (write-pg p (nth pgnos i) (mk-pg kind gcells right))))))
+        divs (loop [i 0 acc: Vec(Str) []]
+               (if (>= i (- ng 1)) acc
+                 (let [d (cond (= kind LEAF-TABLE) (str (p32 (nth pgnos i)) (sf/put-varint (leaf-cell-rowid (last-cell (nth groups i)))))
+                               (= kind LEAF-INDEX) (str (p32 (nth pgnos i)) (nth seps i))
+                               :else (with-child (nth seps i) (nth pgnos i)))]
+                   (recur (+ i 1) (conj acc d)))))
+        pkind (if (table? kind) INNER-TABLE INNER-INDEX)]
+    (if is-root
+      (let [g2 (mk-pg pkind divs (nth pgnos (- ng 1)))] (write-pg p2 n g2))
+      (let [st (nth path (- (count path) 1))
+            ppath (loop [i 0 acc: Vec(Step) []] (if (>= i (- (count path) 1)) acc (recur (+ i 1) (conj acc (nth path i)))))
+            parent (read-pg p2 (:pg st))
+            pc (:cells parent)
+            at (:idx st)
+            newcells (loop [k 0 cs pc] (if (>= k (count divs)) cs (recur (+ k 1) (ins-at cs (+ at k) (nth divs k)))))
+            g2 (mk-pg (:kind parent) newcells (:right parent))]
+        (if (fits? p2 (:pg st) g2) (write-pg p2 (:pg st) g2) (split p2 ppath (:pg st) g2))))))
+
+(defn- last-cell Str [cs: &Vec(Str)] (nth cs (- (count cs) 1)))
+(defn- but-last Vec(Str) [cs: &Vec(Str)] (loop [k 0 acc: Vec(Str) []] (if (>= k (- (count cs) 1)) acc (recur (+ k 1) (conj acc (nth cs k))))))
+
+(defn- put-pg Pager [p: Pager path: &Vec(Step) n: Int g: &Pg]
+  (if (fits? p n g) (write-pg p n g) (split p path n g)))
+
+(defn- descend-rowid Values(Vec(Step) Int Int Bool) [p: &Pager root: Int rowid: Int]
+  (loop [n root path: Vec(Step) []]
+    (let [g (read-pg p n) cs (:cells g)]
+      (if (= (:kind g) LEAF-TABLE)
+        (let [i (loop [lo 0 hi (count cs)] (if (>= lo hi) lo (let [m (quot (+ lo hi) 2)] (if (< (leaf-cell-rowid (nth cs m)) rowid) (recur (+ m 1) hi) (recur lo m)))))]
+          (values path n i (and (< i (count cs)) (= (leaf-cell-rowid (nth cs i)) rowid))))
+        (let [i (loop [lo 0 hi (count cs)] (if (>= lo hi) lo (let [m (quot (+ lo hi) 2)] (if (< (inner-cell-rowid (nth cs m)) rowid) (recur (+ m 1) hi) (recur lo m)))))
+              child (if (< i (count cs)) (child-of (nth cs i)) (:right g))]
+          (recur child (conj path (->Step n i))))))))
+
+(defn table-insert Pager [p0: Pager root: Int rowid: Int payload: &Str]
+  (let [[path leaf i found] (descend-rowid p0 root rowid)
+        [p1 body] (place-payload p0 payload true)
+        cell (str (sf/put-varint (count payload)) (sf/put-varint rowid) body)
+        [p1b g] (take-pg p1 leaf)
+        bytes0 (:bytes g)
+        cs (:cells g)
+        g-empty (assoc g :cells [])
+        p2 (if found (free-overflow p1b (nth cs i) 0 true) p1b)
+        bytes (if found (+ (- bytes0 (count (nth cs i))) (count cell)) (+ bytes0 (+ 2 (count cell))))
+        cs2 (if found (set-at cs i cell) (ins-at cs i cell))]
+    (put-pg p2 path leaf (->Pg LEAF-TABLE cs2 0 bytes))))
+
+(defn table-find Values(Str Bool) [p: &Pager root: Int rowid: Int]
+  (let [[path leaf i found] (descend-rowid p root rowid)]
+    (if found (values (cell-payload p (nth (:cells (read-pg p leaf)) i) 0 true) true) (values "" false))))
+
+(defn table-max Values(Int Bool) [p: &Pager root: Int]
+  (loop [n root]
+    (let [g (read-pg p n)]
+      (cond (not (leaf? (:kind g))) (recur (:right g))
+            (= (count (:cells g)) 0) (values 0 false)
+            :else (values (leaf-cell-rowid (last-cell (:cells g))) true)))))
+
+(defn- fix-empty Pager [p0: Pager path: &Vec(Step) n: Int]
+  (if (= (count path) 0)
+    (let [g (read-pg p0 n)]
+      (if (or (leaf? (:kind g)) (> (count (:cells g)) 0)) p0
+        (let [only (read-pg p0 (:right g))]
+          (if (fits? p0 n only) (write-pg (release p0 (:right g)) n only) p0))))
+    (let [st (nth path (- (count path) 1))
+          gp (:pg st)
+          up-path (up path)
+          parent (read-pg p0 gp)
+          pc (:cells parent)
+          at (:idx st)
+          g (read-pg p0 n)
+          p1 (release p0 n)]
+      (if (= (:kind g) LEAF-TABLE)
+        (let [gone (if (= at (count pc)) (- (count pc) 1) at)
+              right (if (= at (count pc)) (child-of (nth pc gone)) (:right parent))
+              cells (del-at pc gone)
+              p2 (write-pg p1 gp (mk-pg (:kind parent) cells right))]
+          (if (= (count cells) 0) (fix-empty p2 up-path gp) p2))
+        (if (> at 0)
+          (let [d (nth pc (- at 1))
+                l (child-of d)
+                lg (read-pg p1 l)
+                merged (if (leaf? (:kind g))
+                         (mk-pg (:kind lg) (conj (:cells lg) (subs d 4 (count d))) 0)
+                         (mk-pg (:kind lg) (conj (:cells lg) (with-child d (:right lg))) (:right g)))
+                cells1 (del-at pc (- at 1))
+                [cells right] (if (< at (count pc)) (values (set-at cells1 (- at 1) (with-child (nth cells1 (- at 1)) l)) (:right parent))
+                                (values cells1 l))
+                p2 (write-pg p1 gp (mk-pg (:kind parent) cells right))
+                p3 (put-pg p2 (conj up-path (->Step gp (- at 1))) l merged)]
+            (refix p3 up-path gp))
+          (let [d (nth pc 0)
+                r (if (> (count pc) 1) (child-of (nth pc 1)) (:right parent))
+                rg (read-pg p1 r)
+                merged (if (leaf? (:kind g))
+                         (mk-pg (:kind rg) (ins-at (:cells rg) 0 (subs d 4 (count d))) 0)
+                         (mk-pg (:kind rg) (ins-at (:cells rg) 0 (with-child d (:right g))) (:right rg)))
+                cells (del-at pc 0)
+                p2 (write-pg p1 gp (mk-pg (:kind parent) cells (:right parent)))
+                p3 (put-pg p2 (conj up-path (->Step gp 0)) r merged)]
+            (refix p3 up-path gp)))))))
+
+(defn- refix Pager [p: Pager path: &Vec(Step) gp: Int]
+  (let [g (read-pg p gp)] (if (and (not (leaf? (:kind g))) (= (count (:cells g)) 0)) (fix-empty p path gp) p)))
+
+(defn table-delete Values(Pager Bool) [p0: Pager root: Int rowid: Int]
+  (let [[path leaf i found] (descend-rowid p0 root rowid)]
+    (if (not found) (values p0 false)
+      (let [g (read-pg p0 leaf) cs (:cells g)
+            p1 (free-overflow p0 (nth cs i) 0 true)
+            cs2 (loop [k 0 acc: Vec(Str) []] (cond (>= k (count cs)) acc (= k i) (recur (+ k 1) acc) :else (recur (+ k 1) (conj acc (nth cs k)))))]
+        (if (and (= (count cs2) 0) (> (count path) 0))
+          (values (fix-empty (write-pg p1 leaf (mk-pg LEAF-TABLE cs2 0)) path leaf) true)
+          (values (write-pg p1 leaf (mk-pg LEAF-TABLE cs2 0)) true))))))
+
+(defrecord KeyCmp [f: Fn(Str Int Str Int)])
+
+(defn- index-key Str [p: &Pager cell: &Str inner: Bool] (cell-payload p cell (if inner 4 0) false))
+
+(defn- lower-bound Int [p: &Pager cs: &Vec(Str) inner: Bool key: &Str cmp: &KeyCmp]
+  (loop [lo 0 hi (count cs)]
+    (if (>= lo hi) lo
+      (let [mid (quot (+ lo hi) 2)]
+        (if (< (cmp-cell p (nth cs mid) inner key cmp) 0) (recur (+ mid 1) hi) (recur lo mid))))))
+
+(defn- cmp-cell Int [p: &Pager cell: &Str inner: Bool key: &Str cmp: &KeyCmp]
+  (let [start (if inner 4 0)
+        [n p1 ok] (sf/get-varint cell start)]
+    (if (= (local-size (:usable p) n false) n) ((:f cmp) cell p1 key)
+      (let [k (index-key p cell inner)] ((:f cmp) k 0 key)))))
+
+(defn- descend-key Values(Vec(Step) Int Int) [p: &Pager root: Int key: &Str cmp: &KeyCmp]
+  (loop [n root path: Vec(Step) []]
+    (let [g (read-pg p n) cs (:cells g) inner (= (:kind g) INNER-INDEX)
+          i (lower-bound p cs inner key cmp)]
+      (if (not inner) (values path n i)
+        (recur (if (< i (count cs)) (child-of (nth cs i)) (:right g)) (conj path (->Step n i)))))))
+
+(defn index-insert Pager [p0: Pager root: Int key: &Str cmp: &KeyCmp]
+  (let [[path leaf i] (descend-key p0 root key cmp)
+        [p1 body] (place-payload p0 key false)
+        cell (str (sf/put-varint (count key)) body)
+        [p1b g] (take-pg p1 leaf)
+        bytes0 (:bytes g)
+        cs (:cells g)
+        g-empty (assoc g :cells [])
+        bytes (+ bytes0 (+ 2 (count cell)))
+        cs2 (ins-at cs i cell)]
+    (put-pg p1b path leaf (->Pg LEAF-INDEX cs2 0 bytes))))
+
+(defn- rebuild-without Pager [p0: Pager root: Int key: &Str cmp: &KeyCmp]
+  (let [ks (loop [c (cur-first p0 root) acc: Vec(Str) []]
+             (if (not (valid? c)) acc
+               (let [k (cur-payload p0 c)] (recur (cur-next p0 c) (if (= ((:f cmp) k 0 key) 0) acc (conj acc k))))))
+        p1 (clear-tree p0 root)]
+    (loop [i 0 p p1] (if (>= i (count ks)) p (recur (+ i 1) (index-insert p root (nth ks i) cmp))))))
+
+(defn index-delete Values(Pager Bool) [p0: Pager root: Int key: &Str cmp: &KeyCmp]
+  (loop [n root path: Vec(Step) []]
+    (let [g (read-pg p0 n) cs (:cells g) inner (= (:kind g) INNER-INDEX)
+          i (lower-bound p0 cs inner key cmp)
+          hit (and (< i (count cs)) (= (cmp-cell p0 (nth cs i) inner key cmp) 0))]
+      (cond
+        (and hit (not inner))
+        (let [p1 (free-overflow p0 (nth cs i) 0 false)
+              cs2 (loop [k 0 acc: Vec(Str) []] (cond (>= k (count cs)) acc (= k i) (recur (+ k 1) acc) :else (recur (+ k 1) (conj acc (nth cs k)))))]
+          (if (and (= (count cs2) 0) (> (count path) 0))
+            (values (fix-empty (write-pg p1 n (mk-pg LEAF-INDEX cs2 0)) path n) true)
+            (values (write-pg p1 n (mk-pg LEAF-INDEX cs2 0)) true)))
+        hit
+        (let [[lpath lleaf] (loop [m (child-of (nth cs i)) lp (conj (copy path) (->Step n i))]
+                              (let [h (read-pg p0 m)]
+                                (if (leaf? (:kind h)) (values lp m) (recur (:right h) (conj lp (->Step m (count (:cells h))))))))
+              lc (:cells (read-pg p0 lleaf))
+              pred (last-cell lc)
+              p1 (free-overflow p0 (nth cs i) 4 false)
+              g2 (mk-pg INNER-INDEX (set-at cs i (str (p32 (child-of (nth cs i))) pred)) (:right g))
+              lc2 (loop [k 0 acc: Vec(Str) []] (if (>= k (- (count lc) 1)) acc (recur (+ k 1) (conj acc (nth lc k)))))]
+          (cond
+            (> (count lc2) 0)
+            (values (put-pg (write-pg p1 lleaf (mk-pg LEAF-INDEX lc2 0)) path n g2) true)
+            (fits? p1 n g2)
+            (values (fix-empty (write-pg (write-pg p1 n g2) lleaf (mk-pg LEAF-INDEX [] 0)) lpath lleaf) true)
+            :else (values (rebuild-without p0 root key cmp) true)))
+        inner (recur (if (< i (count cs)) (child-of (nth cs i)) (:right g)) (conj path (->Step n i)))
+        :else (values p0 false)))))
+
+(defrecord Cur [path: Vec(Step) ok: Bool])
+
+(defn valid? Bool [c: &Cur] (:ok c))
+
+(defn- leftmost Vec(Step) [p: &Pager n0: Int path0: Vec(Step)]
+  (loop [n n0 path path0]
+    (let [g (read-pg p n)]
+      (if (leaf? (:kind g)) (conj path (->Step n 0))
+        (recur (if (> (count (:cells g)) 0) (child-of (nth (:cells g) 0)) (:right g)) (conj path (->Step n 0)))))))
+
+(defn- settle Cur [p: &Pager path0: Vec(Step)]
+  (loop [path path0]
+    (if (= (count path) 0) (->Cur path false)
+      (let [st (nth path (- (count path) 1)) g (read-pg p (:pg st)) nc (count (:cells g))]
+        (cond
+          (and (leaf? (:kind g)) (< (:idx st) nc)) (->Cur path true)
+          (leaf? (:kind g)) (recur (up path))
+          (and (= (:kind g) INNER-INDEX) (< (:idx st) nc)) (->Cur path true)
+          (< (:idx st) nc)
+          (let [nxt (+ (:idx st) 1)
+                child (if (< nxt nc) (child-of (nth (:cells g) nxt)) (:right g))]
+            (recur (leftmost p child (set-last path (->Step (:pg st) nxt)))))
+          :else (recur (up path)))))))
+
+(defn- up Vec(Step) [path: &Vec(Step)]
+  (loop [i 0 acc: Vec(Step) []] (if (>= i (- (count path) 1)) acc (recur (+ i 1) (conj acc (nth path i))))))
+
+(defn- set-last Vec(Step) [path: &Vec(Step) s: Step]
+  (let [base (up path)] (conj base s)))
+
+(defn cur-first Cur [p: &Pager root: Int] (settle p (leftmost p root [])))
+
+(defn cur-next Cur [p: &Pager c: &Cur]
+  (let [path (:path c) st (nth path (- (count path) 1)) g (read-pg p (:pg st))]
+    (if (leaf? (:kind g))
+      (settle p (set-last path (->Step (:pg st) (+ (:idx st) 1))))
+      (let [nxt (+ (:idx st) 1)
+            child (if (< nxt (count (:cells g))) (child-of (nth (:cells g) nxt)) (:right g))]
+        (settle p (leftmost p child (set-last path (->Step (:pg st) nxt))))))))
+
+(defn seek-rowid Cur [p: &Pager root: Int rowid: Int]
+  (let [[path leaf i found] (descend-rowid p root rowid)]
+    (settle p (conj path (->Step leaf i)))))
+
+(defn seek-ge Cur [p: &Pager root: Int key: &Str cmp: &KeyCmp]
+  (let [[path leaf i] (descend-key p root key cmp)]
+    (settle p (conj path (->Step leaf i)))))
+
+(defn- cur-cell Values(Str Int) [p: &Pager c: &Cur]
+  (let [st (nth (:path c) (- (count (:path c)) 1)) g (read-pg p (:pg st))]
+    (values (nth (:cells g) (:idx st)) (:kind g))))
+
+(defn cur-rowid Int [p: &Pager c: &Cur] (let [[cell kind] (cur-cell p c)] (leaf-cell-rowid cell)))
+
+(defn cur-payload Str [p: &Pager c: &Cur]
+  (let [[cell kind] (cur-cell p c)]
+    (cond (= kind LEAF-TABLE) (cell-payload p cell 0 true)
+          (= kind INNER-INDEX) (cell-payload p cell 4 false)
+          :else (cell-payload p cell 0 false))))
+
+(defn to-bytes Str [p0: &Pager change: Int]
+  (let [ps (:page-size p0) u (:usable p0)
+        fr (:free p0)
+        per (- (quot u 4) 2)
+        [p1 first-trunk] (loop [i 0 p p0 prev-first 0 trunks: Vec(Int) []]
+                           (if (>= i (count fr)) (values p prev-first)
+                             (let [t (nth fr i)
+                                   leaves (loop [k (+ i 1) acc: Vec(Int) []] (if (or (>= k (count fr)) (>= (count acc) per)) acc (recur (+ k 1) (conj acc (nth fr k)))))
+                                   data (str (p32 prev-first) (p32 (count leaves)) (loop [k 0 out ""] (if (>= k (count leaves)) out (recur (+ k 1) (str out (p32 (nth leaves k)))))))
+                                   full (str data (zeros (- ps (count data))))]
+                               (recur (+ (+ i 1) (count leaves)) (set-page p t full) t (conj trunks t)))))
+        npages (:npages p1)
+        p1b (loop [i 0 p p1] (if (>= i npages) p
+                               (let [g (pg-at p (+ i 1))] (recur (+ i 1) (if (= (:kind g) 0) p (set-page p (+ i 1) (encode-pg p (+ i 1) g)))))))
+        hdr (str "SQLite format 3" (chr 0) (p16 (if (= ps 65536) 1 ps)) (chr 1) (chr 1) (chr (- ps u)) (chr 64) (chr 32) (chr 32)
+                 (p32 change) (p32 npages) (p32 first-trunk) (p32 (count fr)) (p32 (:cookie p1b)) (p32 4)
+                 (p32 0) (p32 0) (p32 1) (p32 0) (p32 0) (p32 0) (zeros 20) (p32 change) (p32 3050003))
+        page1 (page-of p1b 1)
+        p2 (set-page p1b 1 (str hdr (subs page1 100 ps)))]
+    (loop [i 0 out ""] (if (>= i npages) out (recur (+ i 1) (let [pg (page-of p2 (+ i 1))] (str out pg)))))))
+
+(defn- readable? Bool [db: &sf/Db]
+  (let [[rows se] (sf/schema db)]
+    (and (= se "")
+         (loop [i 0]
+           (if (>= i (count rows)) true
+             (let [r (nth rows i)
+                   e2 (cond (<= (:root r) 0) ""
+                            (= (:type r) "table") (let [[x e3] (sf/table-rows db (:root r))] e3)
+                            :else (let [[x e3] (sf/index-keys db (:root r))] e3))]
+               (if (= e2 "") (recur (+ i 1)) false)))))))
+
+(defn from-bytes Values(Pager Str) [data: Str]
+  (let [[db e0] (sf/open-bytes data)
+        e (if (and (= e0 "") (not (readable? db))) sf/MALFORMED e0)]
+    (if (not= e "") (values (new-pager 4096 0) e)
+      (let [ps (:page-size db) n (:pages db)
+            pages (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (recur (+ i 1) (conj acc (subs data (* i ps) (* (+ i 1) ps))))))
+            free (loop [t (u32 data 32) acc: Vec(Int) [] hops 0]
+                   (if (or (= t 0) (> t n) (> hops n)) acc
+                     (let [pg (nth pages (- t 1)) k0 (u32 pg 4) kmax (quot (- ps 8) 4) k (if (or (< k0 0) (> k0 kmax)) kmax k0)
+                           acc2 (loop [j 0 a (conj acc t)] (if (>= j k) a (recur (+ j 1) (conj a (u32 pg (+ 8 (* 4 j)))))))]
+                       (recur (u32 pg 0) acc2 (+ hops 1)))))]
+        (values (decode-trees (->Pager (loop [i 0 acc: Vec(Vec(Str)) []] (if (>= i n) acc (recur (+ i 1) (chunk-add-str acc i (nth pages i)))))
+                                       (loop [i 0 acc: Vec(Vec(Pg)) []] (if (>= i n) acc (recur (+ i 1) (chunk-add-pg acc i (mk-pg 0 [] 0)))))
+                                       n ps (:usable db) free (u32 data 40))) "")))))
+
+(defn- decode-trees Pager [p0: Pager]
+  (let [roots (loop [c (cur-first p0 1) acc: Vec(Int) [1]]
+                (if (not (valid? c)) acc
+                  (let [[vs ok] (sf/decode-record (cur-payload p0 c))
+                        r (if (and ok (> (count vs) 3)) (match (nth vs 3) (sf/VInt x) x _ 0) 0)]
+                    (recur (cur-next p0 c) (if (and (> r 1) (<= r (:npages p0))) (conj acc r) acc)))))]
+    (loop [i 0 p p0]
+      (if (>= i (count roots)) p
+        (recur (+ i 1) (decode-tree p (nth roots i)))))))
+
+(defn- decode-tree Pager [p0: Pager root: Int]
+  (loop [p p0 stack [root] guard 0]
+    (if (or (= (count stack) 0) (> guard (:npages p0))) p
+      (let [n (nth stack (- (count stack) 1))
+            rest (loop [i 0 acc: Vec(Int) []] (if (>= i (- (count stack) 1)) acc (recur (+ i 1) (conj acc (nth stack i)))))
+            g (read-pg p n)
+            kids (if (leaf? (:kind g)) rest
+                   (loop [i 0 acc (conj rest (:right g))] (if (>= i (count (:cells g))) acc (recur (+ i 1) (conj acc (child-of (nth (:cells g) i)))))))]
+        (recur (write-pg p n g) kids (+ guard 1))))))

@@ -1,0 +1,106 @@
+(ns xml-token-test (:require [mulay.lib.xml :as xml] [mulay.lib.host :as host] [clay.string :as str]))
+
+(def SIZES [1 2 3 7 64 1000000])
+
+
+(defn- read-lp Vec(Str) [data: &Str]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count data)) acc
+      (let [nl (str/index-of-byte data i 10)
+            [n e] (parse-long (subs data i nl))
+            a (+ nl 1)]
+        (recur (+ a n 1) (conj acc (subs data a (+ a n))))))))
+
+(defn- qn Str [uri: &Str pre: &Str loc: &Str] (str "{" uri "}" (if (= pre "") "" (str pre ":")) loc))
+
+(defn- show-ev Str [out: Str ev: &xml/XEvent]
+  (match ev
+    (xml/XeStartDoc v e s) (str out "SD")
+    (xml/XeDoctype n p s) (str out "DT(" n "," p "," s ")")
+    (xml/XeStart n as ns) (str out "S(" (qn (:uri n) (:prefix n) (:local n))
+                               (loop [i 0 o ""] (if (>= i (count as)) o
+                                                  (let [q (:name (nth as i))] (recur (+ i 1) (str o " " (qn (:uri q) (:prefix q) (:local q)) "=" (:value (nth as i)))))))
+                               ")")
+    (xml/XeEnd n) (str out "E")
+    (xml/XeText t) (str out "T(" t ")")
+    (xml/XeCData t) (str out "C(" t ")")
+    (xml/XeComment t) (str out "!(" t ")")
+    (xml/XePI t d) (str out "?")
+    (xml/XeEndDoc) (str out "ED")))
+
+(defn- events Str [src: &Str size: Int]
+  (if (= size 0)
+    (let [[r0 e0] (xml/reader src (xml/default-opts))]
+      (if (not (= e0 "")) (str "ERR " e0)
+        (loop [r r0 out ""]
+          (let [[r2 ev err] (xml/next-event r)]
+            (cond (not (= err "")) (str out "ERR " err)
+                  (match ev (xml/XeEndDoc) true _ false) (show-ev out ev)
+                  :else (recur r2 (show-ev out ev)))))))
+    (let [[r0 e0] (xml/reader-chunked (xml/default-opts))
+          n (count src)]
+      (loop [r r0 off 0 out ""]
+        (let [[r2 ev need err] (xml/next-chunk r)]
+          (cond
+            need (let [end (if (> (+ off size) n) n (+ off size))
+                       [r3 fe] (xml/feed r2 (subs src off end) (>= end n))]
+                   (if (not (= fe "")) (str out "ERR " fe) (recur r3 end out)))
+            (not (= err "")) (str out "ERR " err)
+            (match ev (xml/XeEndDoc) true _ false) (show-ev out ev)
+            :else (recur r2 off (show-ev out ev))))))))
+
+(defn- ws-str? Bool [s: &Str] (loop [i 0] (if (>= i (count s)) true (let [c (nth s i)] (if (or (= c 32) (= c 9) (= c 10) (= c 13)) (recur (+ i 1)) false)))))
+
+(defn- show-tok Str [out: Str r: &xml/XmlReader k: Int]
+  (cond
+    (= k xml/T-STARTDOC) (str out "SD")
+    (= k xml/T-DOCTYPE) (let [[n p s] (xml/token-doctype r)] (str out "DT(" n "," p "," s ")"))
+    (= k xml/T-START)
+    (let [[u p l] (xml/token-name r)
+          as (loop [i 0 o ""]
+               (if (>= i (xml/token-attr-count r)) o
+                 (let [[plain au ap al av] (xml/token-attr r i)]
+                   (recur (+ i 1) (if plain (str o " " (qn au ap al) "=" av) o)))))]
+      (str out "S(" (qn u p l) as ")"))
+    (= k xml/T-END) (str out "E")
+    (= k xml/T-TEXT) (let [t (xml/token-text r)] (str out "T(" t ")" (if (= (xml/token-ws? r) (ws-str? t)) "" "WS!")))
+    (= k xml/T-CDATA) (str out "C(" (xml/token-span r) ")")
+    (= k xml/T-COMMENT) (str out "!(" (xml/token-span r) ")")
+    (= k xml/T-PI) (str out "?")
+    (= k xml/T-ENDDOC) (str out "ED")
+    :else (str out "ERR " (xml/token-error r))))
+
+(defn- markup-ok? Bool [m: Int k: Int]
+  (cond (= m 1) (or (= k xml/T-START) (= k xml/T-ERR))
+        (= m 2) (or (= k xml/T-END) (= k xml/T-ERR))
+        :else true))
+
+(defn- tokens Str [src: &Str size: Int]
+  (let [[r0 e0] (if (= size 0) (xml/reader src (xml/default-opts)) (xml/reader-chunked (xml/default-opts)))
+        n (count src)]
+    (if (and (= size 0) (not (= e0 ""))) (str "ERR " e0)
+    (loop [r r0 off 0 out "" m 0]
+      (let [[r2 k] (xml/next-token r)]
+        (cond
+          (= k xml/T-NEED)
+          (let [end (if (> (+ off size) n) n (+ off size))
+                [r3 fe] (xml/feed r2 (subs src off end) (>= end n))]
+            (if (not (= fe "")) (str out "ERR " fe) (recur r3 end out m)))
+          (or (= k xml/T-ERR) (= k xml/T-ENDDOC)) (str (show-tok out r2 k) (if (markup-ok? m k) "" "MK!"))
+          :else (recur r2 off (str (show-tok out r2 k) (if (markup-ok? m k) "" "MK!")) (if (= k xml/T-TEXT) (xml/next-markup r2) 0))))))))
+
+(defn- merge-text Str [s: &Str] (str/replace s ")T(" ""))
+
+(defn- same Bool [src: &Str]
+  (loop [i 0]
+    (if (> i (count SIZES)) true
+      (let [size (if (= i 0) 0 (nth SIZES (- i 1)))
+            w (merge-text (events src size))
+            t (merge-text (tokens src size))]
+        (if (= t w) (recur (+ i 1)) (do (eprintln (str "DIFF size " size "\n  events: " w "\n  tokens: " t)) false))))))
+
+(deftest token-accessors-agree-with-events-at-every-chunk-size
+  (let [[data e] (host/file-read "test/fixtures/xml-read/docs.lp")
+        docs (read-lp data)
+        bad (loop [i 0 bad 0] (if (>= i (count docs)) bad (recur (+ i 1) (if (same (nth docs i)) bad (+ bad 1)))))]
+    (is (and (= e "") (> (count docs) 400) (= bad 0)))))

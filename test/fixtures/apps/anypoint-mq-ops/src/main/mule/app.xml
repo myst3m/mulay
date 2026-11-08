@@ -1,0 +1,419 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:anypoint-mq="http://www.mulesoft.org/schema/mule/anypoint-mq"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/anypoint-mq http://www.mulesoft.org/schema/mule/anypoint-mq/current/mule-anypoint-mq.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+    <!-- 認証情報はリポジトリに入れない (scenario.scn の requires と note) -->
+    <configuration-properties file="mq-secret.yaml"/>
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <anypoint-mq:config name="MQ">
+        <anypoint-mq:connection url="${mq.url}" clientId="${mq.clientId}" clientSecret="${mq.clientSecret}"/>
+    </anypoint-mq:config>
+
+    <!-- 存在しない client app (実在の ID を記録に残さないよう、偽の ID) -->
+    <anypoint-mq:config name="BAD">
+        <anypoint-mq:connection url="${mq.url}" clientId="0123456789abcdef0123456789abcdef" clientSecret="nope"/>
+    </anypoint-mq:config>
+
+    <!-- 組織と環境の無い URL -->
+    <anypoint-mq:config name="NOORG">
+        <anypoint-mq:connection url="https://mq-ap-northeast-1.anypoint.mulesoft.com/api/v1" clientId="${mq.clientId}" clientSecret="${mq.clientSecret}"/>
+    </anypoint-mq:config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier,
+ parent: (error.errorType.parentErrorType.namespace default "") ++ ":" ++ (error.errorType.parentErrorType.identifier default ""),
+ description: error.description}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 使うキューを空にする (前の実行の残り)。ロック中のものは見えない -->
+    <flow name="drain">
+        <http:listener config-ref="HTTP" path="/drain"/>
+        <foreach collection="#[['mulay-test-q', 'mulay-test-fifo']]">
+            <set-variable variableName="q" value="#[payload]"/>
+            <set-variable variableName="done" value="#[false]"/>
+            <foreach collection="#[1 to 30]">
+                <choice>
+                    <when expression="#[not vars.done]">
+                        <try>
+                            <anypoint-mq:consume config-ref="MQ" destination="#[vars.q]" pollingTime="1"/>
+                            <error-handler>
+                                <on-error-continue>
+                                    <set-variable variableName="done" value="#[true]"/>
+                                </on-error-continue>
+                            </error-handler>
+                        </try>
+                    </when>
+                </choice>
+            </foreach>
+        </foreach>
+        <set-payload value="drained"/>
+    </flow>
+
+    <!-- publish: 要求の本文を q に。結果の payload と attributes -->
+    <flow name="pub">
+        <http:listener config-ref="HTTP" path="/pub"/>
+        <anypoint-mq:publish config-ref="MQ" destination="#[attributes.queryParams.q default 'mulay-test-q']" messageId="#[attributes.queryParams.id]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{mime: payload.^mimeType, encoding: payload.^encoding, class: attributes.^class, attrs: attributes, body: payload as String}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- publish の本文の種類: json (DW の出力)、text (set-payload の mimeType)、none (mimeType の無い set-payload)、noct (sendContentType=false) -->
+    <flow name="pubkind">
+        <http:listener config-ref="HTTP" path="/pubkind"/>
+        <set-variable variableName="kind" value="#[attributes.queryParams.kind]"/>
+        <set-variable variableName="id" value="#[attributes.queryParams.id]"/>
+        <choice>
+            <when expression="#[vars.kind == 'json']">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{a: 1, b: "two", c: [true, null]}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]"/>
+            </when>
+            <when expression="#[vars.kind == 'text']">
+                <set-payload value="héllo text" mimeType="text/plain"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]"/>
+            </when>
+            <when expression="#[vars.kind == 'none']">
+                <set-payload value="plain value"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]"/>
+            </when>
+            <when expression="#[vars.kind == 'noct']">
+                <set-payload value='{"x": 1}' mimeType="application/json"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]" sendContentType="false"/>
+            </when>
+            <when expression="#[vars.kind == 'latin1']">
+                <set-payload value="caf&#233;" mimeType="text/plain; charset=ISO-8859-1"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]"/>
+            </when>
+            <when expression="#[vars.kind == 'xml']">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/xml
+---
+{root: {a: "1"}}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]"/>
+            </when>
+            <when expression="#[vars.kind == 'body']">
+                <set-payload value="ignored"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]">
+                    <anypoint-mq:body><![CDATA[#[output application/json --- {fromBody: true}]]]></anypoint-mq:body>
+                </anypoint-mq:publish>
+            </when>
+            <when expression="#[vars.kind == 'props']">
+                <set-payload value="with props" mimeType="text/plain"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]">
+                    <anypoint-mq:properties><![CDATA[#[{s: "x", n: 1, big: 12345678901234, d: 1.5, b: true, contentType: "app/override"}]]]></anypoint-mq:properties>
+                </anypoint-mq:publish>
+            </when>
+            <when expression="#[vars.kind == 'delay']">
+                <set-payload value="delayed" mimeType="text/plain"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]" deliveryDelay="2" deliveryDelayUnit="SECONDS"/>
+            </when>
+            <when expression="#[vars.kind == 'expr']">
+                <!-- DW の式の値に mimeType を付けたもの -->
+                <set-payload value="#['expr ' ++ vars.id]" mimeType="text/plain"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#[vars.id]"/>
+            </when>
+            <when expression="#[vars.kind == 'noid']">
+                <set-payload value="no id" mimeType="text/plain"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q"/>
+            </when>
+        </choice>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{mime: payload.^mimeType, class: attributes.^class, attrs: attributes}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- consume: 取れたものの payload と attributes -->
+    <flow name="con">
+        <http:listener config-ref="HTTP" path="/con"/>
+        <anypoint-mq:consume config-ref="MQ" destination="#[attributes.queryParams.q default 'mulay-test-q']"
+                             acknowledgementMode="#[attributes.queryParams.mode default 'IMMEDIATE']"
+                             pollingTime="#[attributes.queryParams.poll default '5000']"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{mime: payload.^mimeType, encoding: payload.^encoding, "type": typeOf(payload), class: attributes.^class, isNull: payload == null, attrs: attributes,
+ body: if (payload == null) null else (payload.^raw as String default null)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- consume して payload をそのまま返す (応答の Content-Type に mime が出る) -->
+    <flow name="conraw">
+        <http:listener config-ref="HTTP" path="/conraw"/>
+        <anypoint-mq:consume config-ref="MQ" destination="#[attributes.queryParams.q default 'mulay-test-q']" pollingTime="5000"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- ack / nack: 本文の ackToken で。結果の payload (void か) -->
+    <flow name="ack">
+        <http:listener config-ref="HTTP" path="/ack"/>
+        <set-variable variableName="token" value="#[payload as String]"/>
+        <set-payload value="before" mimeType="text/plain"/>
+        <anypoint-mq:ack config-ref="MQ" ackToken="#[vars.token]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payload: payload, mime: payload.^mimeType, attrs: attributes.^class}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="nack">
+        <http:listener config-ref="HTTP" path="/nack"/>
+        <set-variable variableName="token" value="#[payload as String]"/>
+        <set-payload value="before" mimeType="text/plain"/>
+        <anypoint-mq:nack config-ref="MQ" ackToken="#[vars.token]"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payload: payload, mime: payload.^mimeType, attrs: attributes.^class}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 失敗 -->
+    <flow name="err">
+        <http:listener config-ref="HTTP" path="/err"/>
+        <set-variable variableName="k" value="#[attributes.queryParams.k]"/>
+        <choice>
+            <when expression="#[vars.k == 'pub-notfound']">
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-no-such-queue" messageId="e1"/>
+            </when>
+            <when expression="#[vars.k == 'con-notfound']">
+                <anypoint-mq:consume config-ref="MQ" destination="mulay-no-such-queue" pollingTime="1"/>
+            </when>
+            <when expression="#[vars.k == 'con-exchange']">
+                <anypoint-mq:consume config-ref="MQ" destination="mulay-test-x" pollingTime="1"/>
+            </when>
+            <when expression="#[vars.k == 'con-range']">
+                <anypoint-mq:consume config-ref="MQ" destination="mulay-test-q" pollingTime="30" pollingTimeUnit="SECONDS"/>
+            </when>
+            <when expression="#[vars.k == 'con-negack']">
+                <anypoint-mq:consume config-ref="MQ" destination="mulay-test-q" acknowledgementTimeout="-1"/>
+            </when>
+            <when expression="#[vars.k == 'con-timeout']">
+                <anypoint-mq:consume config-ref="MQ" destination="mulay-test-q" pollingTime="1000"/>
+            </when>
+            <when expression="#[vars.k == 'ack-empty']">
+                <anypoint-mq:ack config-ref="MQ" ackToken="#['']"/>
+            </when>
+            <when expression="#[vars.k == 'ack-blank']">
+                <anypoint-mq:ack config-ref="MQ" ackToken="#['  ']"/>
+            </when>
+            <when expression="#[vars.k == 'ack-null']">
+                <anypoint-mq:ack config-ref="MQ" ackToken="#[null]"/>
+            </when>
+            <when expression="#[vars.k == 'ack-garbage']">
+                <anypoint-mq:ack config-ref="MQ" ackToken="not-a-token"/>
+            </when>
+            <when expression="#[vars.k == 'ack-notjson']">
+                <anypoint-mq:ack config-ref="MQ" ackToken="aGVsbG8="/>
+            </when>
+            <when expression="#[vars.k == 'nack-garbage']">
+                <anypoint-mq:nack config-ref="MQ" ackToken="not-a-token"/>
+            </when>
+            <when expression="#[vars.k == 'nack-empty']">
+                <anypoint-mq:nack config-ref="MQ" ackToken="#['']"/>
+            </when>
+            <when expression="#[vars.k == 'group-bad']">
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-fifo" messageId="e2" messageGroupId="has space"/>
+            </when>
+            <when expression="#[vars.k == 'delay-bad']">
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="e3" deliveryDelay="16" deliveryDelayUnit="MINUTES"/>
+            </when>
+            <when expression="#[vars.k == 'body-null']">
+                <set-payload value="#[null]"/>
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="e4"/>
+            </when>
+            <when expression="#[vars.k == 'prop-null']">
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="e5">
+                    <anypoint-mq:properties><![CDATA[#[{a: null}]]]></anypoint-mq:properties>
+                </anypoint-mq:publish>
+            </when>
+            <when expression="#[vars.k == 'ack-nulltoken']">
+                <anypoint-mq:ack config-ref="MQ" ackToken="bnVsbA=="/>
+            </when>
+            <when expression="#[vars.k == 'ack-emptyobj']">
+                <anypoint-mq:ack config-ref="MQ" ackToken="e30="/>
+            </when>
+            <when expression="#[vars.k == 'ack-nolock']">
+                <!-- {"destination":"mulay-test-q","messageId":"m"} -->
+                <anypoint-mq:ack config-ref="MQ" ackToken="eyJkZXN0aW5hdGlvbiI6Im11bGF5LXRlc3QtcSIsIm1lc3NhZ2VJZCI6Im0ifQ=="/>
+            </when>
+            <when expression="#[vars.k == 'ack-noid']">
+                <!-- {"destination":"mulay-test-q","lockId":"l"} -->
+                <anypoint-mq:ack config-ref="MQ" ackToken="eyJkZXN0aW5hdGlvbiI6Im11bGF5LXRlc3QtcSIsImxvY2tJZCI6ImwifQ=="/>
+            </when>
+            <when expression="#[vars.k == 'ack-nomsg']">
+                <!-- {"destination":"mulay-test-q","messageId":"nosuch","lockId":"bogus"}: ブローカーは 500 -->
+                <anypoint-mq:ack config-ref="MQ" ackToken="eyJkZXN0aW5hdGlvbiI6Im11bGF5LXRlc3QtcSIsIm1lc3NhZ2VJZCI6Im5vc3VjaCIsImxvY2tJZCI6ImJvZ3VzIn0="/>
+            </when>
+            <when expression="#[vars.k == 'nack-nomsg']">
+                <anypoint-mq:nack config-ref="MQ" ackToken="eyJkZXN0aW5hdGlvbiI6Im11bGF5LXRlc3QtcSIsIm1lc3NhZ2VJZCI6Im5vc3VjaCIsImxvY2tJZCI6ImJvZ3VzIn0="/>
+            </when>
+            <when expression="#[vars.k == 'ack-noqueue']">
+                <!-- {"destination":"mulay-no-such-queue","messageId":"m","lockId":"l"} -->
+                <anypoint-mq:ack config-ref="MQ" ackToken="eyJkZXN0aW5hdGlvbiI6Im11bGF5LW5vLXN1Y2gtcXVldWUiLCJtZXNzYWdlSWQiOiJtIiwibG9ja0lkIjoibCJ9"/>
+            </when>
+            <when expression="#[vars.k == 'group-long']">
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-fifo" messageId="e8" messageGroupId="#[((1 to 129) map 'a') joinBy '']"/>
+            </when>
+            <when expression="#[vars.k == 'group-empty']">
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-fifo" messageId="e9" messageGroupId="#['']"/>
+            </when>
+            <when expression="#[vars.k == 'delay-neg']">
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="e10" deliveryDelay="-1"/>
+            </when>
+            <when expression="#[vars.k == 'prop-obj']">
+                <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="e11">
+                    <anypoint-mq:properties><![CDATA[#[{a: {b: 1}}]]]></anypoint-mq:properties>
+                </anypoint-mq:publish>
+            </when>
+            <when expression="#[vars.k == 'bad-creds']">
+                <anypoint-mq:publish config-ref="BAD" destination="mulay-test-q" messageId="e6"/>
+            </when>
+            <when expression="#[vars.k == 'bad-url']">
+                <anypoint-mq:publish config-ref="NOORG" destination="mulay-test-q" messageId="e7"/>
+            </when>
+        </choice>
+        <set-payload value="no error"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- FIFO: 同じグループの 3 件を送り、送った順に受ける。FIFO のキューは 5 分の間は同じ messageId を重複として捨てるので、
+         messageId には実行ごとの印 (vars.run) を付け、結果からは外す -->
+    <flow name="fifo">
+        <http:listener config-ref="HTTP" path="/fifo"/>
+        <set-variable variableName="run" value="#[uuid()]"/>
+        <foreach collection="#[['f1', 'f2', 'f3']]">
+            <anypoint-mq:publish config-ref="MQ" destination="mulay-test-fifo" messageId="#[payload ++ '-' ++ vars.run]" messageGroupId="grp-a">
+                <anypoint-mq:body><![CDATA[#[output text/plain --- 'body of ' ++ (payload splitBy '-')[0]]]]></anypoint-mq:body>
+            </anypoint-mq:publish>
+        </foreach>
+        <set-variable variableName="got" value="#[[]]"/>
+        <foreach collection="#[1 to 3]">
+            <anypoint-mq:consume config-ref="MQ" destination="mulay-test-fifo" pollingTime="5000"/>
+            <set-variable variableName="got" value="#[output application/java --- vars.got ++ [{id: attributes.messageId replace ('-' ++ vars.run) with '', group: attributes.headers.messageGroupId, body: payload, n: attributes.deliveryCount, keys: keysOf(attributes.headers)}]]"/>
+        </foreach>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+vars.got]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 時間を測る: n 件を送る / n 件を受ける (IMMEDIATE) -->
+    <flow name="perfpub">
+        <http:listener config-ref="HTTP" path="/perfpub"/>
+        <foreach collection="#[1 to (attributes.queryParams.n default '50') as Number]">
+            <anypoint-mq:publish config-ref="MQ" destination="mulay-test-q" messageId="#['perf-' ++ payload]">
+                <anypoint-mq:body><![CDATA[#[output application/json --- {i: payload}]]]></anypoint-mq:body>
+            </anypoint-mq:publish>
+        </foreach>
+        <set-payload value="published"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="perfcon">
+        <http:listener config-ref="HTTP" path="/perfcon"/>
+        <set-variable variableName="ids" value="#[[]]"/>
+        <foreach collection="#[1 to (attributes.queryParams.n default '50') as Number]">
+            <anypoint-mq:consume config-ref="MQ" destination="mulay-test-q" pollingTime="5000"/>
+            <set-variable variableName="ids" value="#[vars.ids ++ [attributes.messageId]]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- {count: sizeOf(vars.ids), distinct: sizeOf(vars.ids distinctBy $)}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 知らない mime の入力を DW がどう読むか (consume の contentType が app/override のときと同じ) -->
+    <flow name="typeof">
+        <http:listener config-ref="HTTP" path="/typeof"/>
+        <set-payload value="#[output application/json --- {mime: payload.^mimeType, &quot;type&quot;: typeOf(payload), text: payload.^raw as String}]"/>
+    </flow>
+
+    <!-- 同じ set-payload を HTTP の応答にしたときの Content-Type -->
+    <flow name="ctecho">
+        <http:listener config-ref="HTTP" path="/ctecho"/>
+        <set-payload value="#['expr ' ++ 'x']" mimeType="text/plain"/>
+    </flow>
+
+    <!-- consume の outputMimeType / outputEncoding -->
+    <flow name="conout">
+        <http:listener config-ref="HTTP" path="/conout"/>
+        <choice>
+            <when expression="#[attributes.queryParams.enc == null]">
+                <anypoint-mq:consume config-ref="MQ" destination="mulay-test-q" pollingTime="5000" outputMimeType="application/json"/>
+            </when>
+            <otherwise>
+                <anypoint-mq:consume config-ref="MQ" destination="mulay-test-q" pollingTime="5000" outputMimeType="application/json" outputEncoding="ISO-8859-1"/>
+            </otherwise>
+        </choice>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{mime: payload.^mimeType, encoding: payload.^encoding, "type": typeOf(payload), body: payload, ct: attributes.contentType}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

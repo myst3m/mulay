@@ -1,0 +1,199 @@
+(ns uni-test (:require [mulay.lib.uni :as u] [clay.utf8 :as u8]))
+
+;; Hand-written boundary tests. The bulk comparison against java.lang.Character
+;; and String is golden_test.clay (tools/gen-uni-golden.java).
+
+(defn- bytes Str [v: Vec(Int)] (loop [i 0 out ""] (if (>= i (count v)) out (recur (+ i 1) (str out (chr (nth v i)))))))
+
+(defn- dec-all Str [s: &Str]
+  "code points and step lengths: \"cp/len cp/len ...\""
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [[c j] (u/decode-at s i)] (recur j (str out (if (> i 0) " " "") c "/" (- j i)))))))
+
+(deftest decode-well-formed
+  (let [[a i1] (u/decode-at "A" 0)
+        [b i2] (u/decode-at "é" 0)
+        [c i3] (u/decode-at "日" 0)
+        [d i4] (u/decode-at "😀" 0)]
+    (is (= a 65)) (is (= i1 1))
+    (is (= b 0xE9)) (is (= i2 2))
+    (is (= c 0x65E5)) (is (= i3 3))
+    (is (= d 0x1F600)) (is (= i4 4))))
+
+(deftest decode-malformed
+  ;; maximal subpart: one U+FFFD per maximal ill-formed prefix
+  (is (= (dec-all (bytes [0xE2 0x82])) "65533/2"))
+  (is (= (dec-all (bytes [0xE2 0x82 0x41])) "65533/2 65/1"))
+  (is (= (dec-all (bytes [0xFF 0xFE])) "65533/1 65533/1"))
+  (is (= (dec-all (bytes [0xC0 0xAF])) "65533/1 65533/1"))          ; overlong
+  (is (= (dec-all (bytes [0xED 0xA0 0x80])) "65533/3")) ; surrogate: JDK reads ED + continuation bytes as one
+  (is (= (dec-all (bytes [0xED 0xA0])) "65533/2"))
+  (is (= (dec-all (bytes [0xED 0xAC 0x41])) "65533/2 65/1"))
+  (is (= (dec-all (bytes [0x61 0xED 0xBF 0xBF 0xED 0xA0 0x72])) "97/1 65533/3 65533/2 114/1"))
+  (is (= (dec-all (bytes [0xF4 0x90 0x80 0x80])) "65533/1 65533/1 65533/1 65533/1")) ; > U+10FFFF
+  (is (= (dec-all (bytes [0xF0 0x9F 0x98])) "65533/3"))
+  (is (= (dec-all (bytes [0x80 0x41])) "65533/1 65/1"))
+  (is (= (dec-all (bytes [0xE0 0xA0 0x80])) "2048/3")))
+
+(deftest valid-and-sanitize
+  (is (u/valid? "héllo 日本 😀"))
+  (is (u/valid? ""))
+  (is-refuted (u/valid? (bytes [0x61 0xFF])))
+  (is (u/valid? (u/encode 0xFFFD)))
+  (is (= (u/sanitize (bytes [0x61 0xFF 0x62])) (str "a" (u/encode 0xFFFD) "b")))
+  (is (= (u/sanitize "ok") "ok"))
+  (is (= (u/valid-prefix (bytes [0x49 0xED 0xAC])) "I"))
+  (is (= (u/valid-prefix (bytes [0xE6 0x97 0xA5 0xE6 0x9C])) "日"))
+  (is (= (u/valid-prefix (bytes [0x80 0xBF 0x6F])) ""))
+  (is (= (u/valid-prefix "ok 日本") "ok 日本")))
+
+(deftest encode-round-trip
+  (is (= (u/encode 65) "A"))
+  (is (= (u/encode 0xE9) "é"))
+  (is (= (u/encode 0x65E5) "日"))
+  (is (= (u/encode 0x1F600) "😀"))
+  (is (= (u/encode 0xD800) (u/encode 0xFFFD)))
+  (is (= (u/encode -1) (u/encode 0xFFFD)))
+  (is (= (u/encode 0x110000) (u/encode 0xFFFD)))
+  (is (= (u/from-cps (u/cps "aé日😀")) "aé日😀"))
+  (is (= (count (u/cps "aé日😀")) 4)))
+
+(deftest indices
+  (let [s "aé日😀b"]
+    (is (= (u8/codepoint-count s) 5))
+    (is (= (u/byte-index-of-cp-index s 0) 0))
+    (is (= (u/byte-index-of-cp-index s 2) 3))
+    (is (= (u/byte-index-of-cp-index s 4) 10))
+    (is (= (u/byte-index-of-cp-index s 5) 11))
+    (is (= (u/byte-index-of-cp-index s 6) -1))
+    (is (= (u/byte-index-of-cp-index s -1) -1))
+    (is (= (u/cp-index-of-byte-index s 3) 2))
+    (is (= (u/cp-index-of-byte-index s 4) 2))
+    (is (= (u/cp-index-of-byte-index s 11) 5))
+    (is (= (u/next-index s 1) 3))
+    (is (= (u/prev-index s 10) 6))
+    (is (= (u/prev-index s 3) 1))
+    (is (= (u/prev-index s 1) 0))
+    (is (= (u/cp-at s 6) 0x1F600))))
+
+(deftest sub-cp
+  (let [s "aé日😀b"]
+    (is (= (u/sub-cp s 1 3) "é日"))
+    (is (= (u/sub-cp s 0 5) s))
+    (is (= (u/sub-cp s 3 99) "😀b"))
+    (is (= (u/sub-cp s -5 1) "a"))
+    (is (= (u/sub-cp s 3 3) ""))
+    (is (= (u/sub-cp s 4 2) ""))
+    (is (= (u/sub-cp "" 0 1) ""))))
+
+(deftest categories
+  (is (= (u/gc 65) "Lu"))
+  (is (= (u/gc 0x3042) "Lo"))
+  (is (= (u/gc 0x0301) "Mn"))
+  (is (= (u/gc 0x20AC) "Sc"))
+  (is (= (u/gc 0x10FFFF) "Cn"))
+  (is (= (u/gc -1) "Cn"))
+  (is (= (u/gc 0x110000) "Cn"))
+  (is (= (u/gc 0xD800) "Cs"))
+  (is (= (u/gc 0xE000) "Co"))
+  (is (= (u/gc-id-of-name "Nd") u/GC-ND))
+  (is (= (u/gc-id-of-name "Xx") -1)))
+
+(deftest classification
+  (is (u/java-whitespace? 0x1F))
+  (is (u/java-whitespace? 0x2028))
+  (is-refuted (u/java-whitespace? 0xA0))
+  (is-refuted (u/java-whitespace? 0x202F))
+  (is (u/white-space-prop? 0xA0))
+  (is (u/white-space-prop? 0x85))
+  (is (u/java-digit? 0x0663))
+  (is-refuted (u/java-digit? 0x00BD))
+  (is (u/letter? 0x65E5))
+  (is (u/alphabetic? 0x2160))
+  (is-refuted (u/letter? 0x2160))
+  (is (u/upper-case? 0x2160))
+  (is (u/lower-case? 0xAA))
+  (is (u/title-case? 0x1C5))
+  (is (u/ideographic? 0x3007)))
+
+(deftest case-mapping
+  (is (= (u/upper-cp 0xDF) 0xDF))
+  (is (= (u/upper-full 0xDF) "SS"))
+  (is (= (u/upper "straße") "STRASSE"))
+  (is (= (u/upper "ﬁ") "FI"))
+  (is (= (u/lower "İ") "i̇"))
+  (is (= (u/lower "ΟΔΟΣ") "οδος"))
+  (is (= (u/lower "Σ") "σ"))
+  (is (= (u/lower "ΑΣ ΒΣ.") "ας βς."))
+  (is (= (u/title-cp 0x1C6) 0x1C5))
+  (is (= (u/upper-cp 0x1C6) 0x1C4))
+  (is (= (u/title-cp 0x61) 0x41))
+  (is (= (u/fold-cp 0x212A) 0x6B))
+  (is (= (u/fold-cp 0x17F) 0x73))
+  (is (= (u/upper "abc") "ABC"))
+  (is (= (u/lower "ABC") "abc"))
+  (is (= (u/upper "") ""))
+  ;; malformed input maps to U+FFFD
+  (is (= (u/lower (bytes [0x41 0xFF])) (str "a" (u/encode 0xFFFD))))
+  (is (= (u/upper (bytes [0x61 0xFF 0xC3])) (str "A" (u/encode 0xFFFD) (u/encode 0xFFFD)))))
+
+(deftest trim-strip
+  (is (= (u/java-trim " \t a b \n") "a b"))
+  (is (= (u/java-trim (str (bytes [1 2]) "x" (bytes [31]))) "x"))
+  (is (= (u/java-trim "　x　") "　x　"))
+  (is (= (u/strip "　 x  ") "x"))
+  (is (= (u/strip " x ") " x "))
+  (is (= (u/strip-leading "  x  ") "x  "))
+  (is (= (u/strip-trailing "  x  ") "  x"))
+  (is (= (u/strip "   ") ""))
+  (is (u/blank? " \t "))
+  (is-refuted (u/blank? " x ")))
+
+(deftest scripts-blocks
+  (is (= (u/script-id 0x41) (u/script-of-name "Latin")))
+  (is (= (u/script-of-name "latn") (u/script-of-name "LATIN")))
+  (is (= (u/script-id 0x3042) (u/script-of-name "Hiragana")))
+  (is (= (u/script-id 0x65E5) (u/script-of-name "Han")))
+  (is (= (u/script-id 0x30) (u/script-of-name "Common")))
+  (is (= (u/script-of-name "Klingon") -1)))
+
+(deftest blocks
+  (let [[lo hi] (u/block-of-name "Basic Latin")
+        [a b] (u/block-of-name "GREEK")
+        [x y] (u/block-of-name "nope")]
+    (is (= lo 0)) (is (= hi 0x7F))
+    (is (= a 0x370)) (is (= b 0x3FF))
+    (is (= x -1))))
+
+(deftest char-digit-like-java
+  ;; Character.digit の値 (JDK 17 で確かめたもの)
+  (is (= (u/char-digit 55 10) 7))
+  (is (= (u/char-digit 102 16) 15))
+  (is (= (u/char-digit 70 16) 15))
+  (is (= (u/char-digit 103 16) -1))
+  (is (= (u/char-digit 122 36) 35))
+  (is (= (u/char-digit 0xFF13 10) 3))
+  (is (= (u/char-digit 0xFF26 16) 15))
+  (is (= (u/char-digit 0xFF46 16) 15))
+  (is (= (u/char-digit 0x0663 10) 3))
+  (is (= (u/char-digit 0x0969 10) 3))
+  (is (= (u/char-digit 0x1D7D9 10) 1))
+  (is (= (u/char-digit 56 8) -1))
+  (is (= (u/char-digit 48 1) -1))
+  (is (= (u/char-digit 0x00B2 10) -1)))
+
+(deftest display-width
+  (is (= (u/cp-width 65) 1))
+  (is (= (u/cp-width 0x3042) 2))
+  (is (= (u/cp-width 0x6F22) 2))
+  (is (= (u/cp-width 0xFF21) 2))
+  (is (= (u/cp-width 0xFF71) 1))
+  (is (= (u/cp-width 0xAC00) 2))
+  (is (= (u/cp-width 0x1F600) 2))
+  (is (= (u/cp-width 0x0301) 0))
+  (is (= (u/cp-width 0x200B) 0))
+  (is (= (u/width "abc") 3))
+  (is (= (u/width "山田工業") 8))
+  (is (= (u/width "é") 1))
+  (is (= (u/width "") 0)))

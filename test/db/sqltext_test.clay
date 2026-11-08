@@ -1,0 +1,40 @@
+(ns sqltext-test (:require [mulay.db.sqltext :as q]))
+
+;; 期待値は mule-db-client の SimpleQueryTemplateParser / StatementTypeDetector と同じ規則
+(deftest query-type
+  (is (= (q/query-type "SELECT * FROM t") "SELECT"))
+  (is (= (q/query-type "  select\n* from t") "SELECT"))
+  (is (= (q/query-type "WITH a AS (SELECT 1) SELECT * FROM a") "SELECT"))
+  (is (= (q/query-type "INSERT INTO t VALUES (1)") "INSERT"))
+  (is (= (q/query-type "update t set a = 1") "UPDATE"))
+  (is (= (q/query-type "DELETE FROM t") "DELETE"))
+  (is (= (q/query-type "{ call p(?) }") "STORE_PROCEDURE_CALL"))
+  (is (= (q/query-type "CALL p()") "STORE_PROCEDURE_CALL"))
+  (is (= (q/query-type ":out = call f()") "STORE_PROCEDURE_CALL"))
+  (is (= (q/query-type "TRUNCATE TABLE t") "TRUNCATE"))
+  (is (= (q/query-type "MERGE INTO t USING s ON (1=1)") "MERGE"))
+  (is (= (q/query-type "SELEC 1") "DDL"))
+  (is (= (q/query-type "SELECT") "DDL"))
+  (is (= (q/query-type "CREATE TABLE t (a int)") "DDL")))
+
+(deftest parse-named
+  (let [t (q/parse "SELECT id FROM p WHERE age > :min AND name <> :skip")]
+    (is (= (:sql t) "SELECT id FROM p WHERE age > ? AND name <> ?"))
+    (is (= (:names t) ["min" "skip"]))
+    (is (= (:kind t) "SELECT"))))
+
+(deftest parse-skips
+  (let [t (q/parse "select ':no' , \"x:y\" -- :c\n, a::int, b := 1, c \\:d, e = :e")]
+    (is (= (:sql t) "select ':no' , \"x:y\" -- :c\n, a::int, b := 1, c :d, e = ?"))
+    (is (= (:names t) ["e"]))))
+
+(deftest parse-positional
+  (let [t (q/parse "insert into t values (?, ?)")]
+    (is (= (:sql t) "insert into t values (?, ?)"))
+    (is (= (:names t) ["" ""]))))
+
+(deftest parse-comment
+  (let [t (q/parse "select /* :x */ 1, :y)")]
+    (is (= (:sql t) "select /* :x */ 1, ?)"))
+    (is (= (:names t) ["y"]))
+    (is (= (:sql (q/parse "  select 1  ")) "select 1"))))

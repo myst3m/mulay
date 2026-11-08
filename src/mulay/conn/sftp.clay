@@ -1,0 +1,454 @@
+(ns mulay.conn.sftp
+  (:require [mulay.dw.val :as v] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.conn :as conn]
+            [mulay.conn.file :as file] [mulay.conn.sftp_mimes :as sm] [mulay.lib.sftp :as sf] [mulay.lib.xml :as xml] [mulay.lib.numparse :as npz]
+            [mulay.lib.time.tz :as tzr] [mulay.lib.time.zoned :as zt] [mulay.lib.time.types :as tt]
+            [mulay.lib.time.iso :as iso] [mulay.lib.time.local :as tl] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/sftp")
+(def ATTR-CLASS "org.mule.extension.sftp.api.SftpFileAttributes")
+
+(defn- serr err/MErr [id: Str desc: Str] (err/mk "SFTP" id desc))
+(defn- failure conn/OpResult [x: &Vec(err/MErr)] (conn/fail-result (nth x 0)))
+
+(defn- table-map Map(Str Str) [rows: &Vec(Vec(Str))]
+  (loop [i 0 m: Map(Str Str) {}] (if (>= i (count rows)) m (recur (+ i 1) (assoc m (nth (nth rows i) 0) (nth (nth rows i) 1))))))
+
+(def EXT-MAP (table-map sm/EXTS))
+(def NAME-MAP (table-map sm/NAMES))
+
+(defn mime-of-name Str [path: &Str]
+  (let [i (str/last-index-of path "/")
+        name (str/lower-case (if (< i 0) (str path) (subs path (+ i 1) (count path))))
+        d (str/last-index-of name ".")
+        ext (cond (str/ends-with? name ".tar.gz") "tar.gz" (str/ends-with? name ".tar.bz2") "tar.bz2"
+                  (str/ends-with? name ".tar.xz") "tar.xz" (str/ends-with? name ".tar.z") "tar.z"
+                  (< d 0) "" :else (subs name (+ d 1) (count name)))]
+    (cond
+      (contains? NAME-MAP name) (get! NAME-MAP name)
+      (= ext "") "application/octet-stream"
+      (contains? EXT-MAP ext) (get! EXT-MAP ext)
+      :else "application/octet-stream")))
+
+(defn- data-mime Str [out-mime: &Str out-enc: &Str path: &Str]
+  (let [base (if (= out-mime "") (mime-of-name path) (str out-mime))
+        enc (if (= out-enc "") "UTF-8" (str out-enc))]
+    (if (str/includes? (str/lower-case base) "charset=") base (str base "; charset=" enc))))
+
+(defrecord Spec [name: Str host: Str port: Int user: Str password: Str wd: Str timeout-ms: Int known-hosts: Str])
+
+(defn- spec-of Spec [cfg: &Vec(m/Config)]
+  (if (= (count cfg) 0) (->Spec "" "" 22 "" "" "/" 10000 "")
+    (let [cn (conn/child-elem (:children (nth cfg 0)) "connection")
+          a (fn Str [k: Str d: Str] (if (= (count cn) 0) d (xml/attr (nth cn 0) "" k d)))
+          t (npz/int-or (a "connectionTimeout" "10") 10)
+          unit (str/upper-case (a "connectionTimeoutUnit" "SECONDS"))
+          ms (cond (= unit "MILLISECONDS") t (= unit "MINUTES") (* t 60000) :else (* t 1000))
+          wd (a "workingDir" "")]
+      (->Spec (:name (nth cfg 0)) (a "host" "") (npz/int-or (a "port" "22") 22) (a "username" "") (a "password" "")
+              (if (= wd "") "/" wd) ms (a "knownHostsFile" "")))))
+
+(defn- known-hosts Vec(Str) [sp: &Spec res: &Fn(Str Values(Str Bool))]
+  (let [path (:known-hosts sp)]
+    (if (= path "") []
+      (let [[r ok] (res path)]
+        (if ok [r]
+          (let [[f e] (read-file path)] [(if (= e "") f "")]))))))
+
+(defn- empty-pool Map(Str Vec(sf/Sess)) [] (let [m: Map(Str Vec(sf/Sess)) {}] m))
+(def POOL (atom (empty-pool)))
+
+(defn- acquire Values(sf/Sess Vec(err/MErr)) [sp: &Spec res: &Fn(Str Values(Str Bool))]
+  (let [name (:name sp)
+        got (atom (let [z: Vec(sf/Sess) []] z))
+        z (swap! POOL (fn Map(Str Vec(sf/Sess)) [m: Map(Str Vec(sf/Sess))]
+                        (if (and (contains? m name) (> (count (get! m name)) 0))
+                          (let [xs (get! m name)
+                                last (nth xs (- (count xs) 1))
+                                z1 (reset! got [last])]
+                            (assoc m (str name) (loop [i 0 acc: Vec(sf/Sess) []] (if (>= i (- (count xs) 1)) acc (recur (+ i 1) (conj acc (nth xs i)))))))
+                          (let [z2 (reset! got (let [e: Vec(sf/Sess) []] e))] m))))
+        g (deref got)]
+    (if (> (count g) 0) (values (nth g 0) [])
+      (let [[s kind msg] (sf/connect (:host sp) (:port sp) (:user sp) (:password sp) (:timeout-ms sp) (known-hosts sp res))
+            head (str "Could not establish SFTP connection with host: '" (:host sp) "' at port: '" (:port sp) "' - ")]
+        (cond
+          (= kind 0) (values s [])
+          (= kind sf/AUTH) (values s [(serr "INVALID_CREDENTIALS" (str head "No more authentication methods available"))])
+          (= kind sf/HOSTKEY) (values s [(serr "CANNOT_REACH" (str head msg))])
+          (= kind sf/CANNOT-REACH)
+          (values s [(serr "CANNOT_REACH" (str head "DefaultConnectFuture[" (:user sp) "@" (:host sp) "/" (ip-of (:host sp)) ":" (:port sp)
+                                              "]: Failed (ConnectException) to execute: Connection refused"))])
+          :else (values s [(serr "CONNECTIVITY" (str head msg))]))))))
+
+(defn- ip-of Str [host: &Str] (if (= host "localhost") "127.0.0.1" (str host)))
+
+(defn- release Int [sp: &Spec s: sf/Sess]
+  (let [name (:name sp)
+        z (swap! POOL (fn Map(Str Vec(sf/Sess)) [m: Map(Str Vec(sf/Sess))]
+                        (assoc m (str name) (conj (if (contains? m name) (get! m name) (let [e: Vec(sf/Sess) []] e)) s))))]
+    0))
+
+(defn- base-name Str [p: &Str]
+  (let [i (str/last-index-of p "/")] (if (< i 0) (str p) (subs p (+ i 1) (count p)))))
+
+(defn- parent-of Str [p: &Str]
+  (let [i (str/last-index-of p "/")] (cond (< i 0) "" (= i 0) "/" :else (subs p 0 i))))
+
+(defn- join Str [d: &Str n: &Str] (if (str/ends-with? d "/") (str d n) (str d "/" n)))
+
+(defn- attrs-val v/Val [path: &Str a: &sf/Attrs]
+  (let [name (base-name path)]
+    (v/->VMeta
+      (v/->VObj [(v/field "fileName" (v/->VStr name))
+                 (v/field "symbolicLink" (v/bool-v (:link a)))
+                 (v/field "regularFile" (v/bool-v (:reg a)))
+                 (v/field "directory" (v/bool-v (:dir a)))
+                 (v/field "path" (v/->VStr (str path)))
+                 (v/field "size" (v/int-v (:size a)))
+                 (v/field "permissions" (v/int-v (:perms a)))
+                 (v/field "name" (v/->VStr name))
+                 (v/field "timestamp" (v/->VDateTime (zt/zdt-of-instant (:mtime a) 0 (tzr/system-zone))))])
+      [(v/field "class" (v/->VStr ATTR-CLASS))])))
+
+(defn- not-exist err/MErr [p: &Str] (serr "ILLEGAL_PATH" (str "Path '" p "' doesn't exist")))
+(defn- already-exists err/MErr [p: &Str]
+  (serr "FILE_ALREADY_EXISTS" (str "'" p "' already exists. Set the 'overwrite' parameter to 'true' to perform the operation anyway")))
+
+(defn- kind-of Int [s: &sf/Sess p: &Str]
+  (let [[a code] (sf/stat s p true)]
+    (cond (not= code 0) 0 (:dir a) 2 :else 1)))
+
+(defn- mkdirs Int [s: &sf/Sess p: &Str]
+  (if (or (= p "") (= p "/") (not= (kind-of s p) 0)) 0
+    (let [z (mkdirs s (parent-of p))] (sf/mkdir s p))))
+
+(defn- remove-tree Int [s: &sf/Sess p: &Str]
+  (let [[a code] (sf/stat s p false)]
+    (cond
+      (not= code 0) code
+      (:dir a)
+      (let [[es le] (sf/list-dir s p)
+            z (loop [i 0] (if (>= i (count es)) 0 (let [z1 (remove-tree s (join p (:name (nth es i))))] (recur (+ i 1)))))]
+        (sf/rmdir s p))
+      :else (sf/unlink s p))))
+
+(defn- copy-tree Int [s: &sf/Sess src: &Str dst: &Str]
+  (let [[a code] (sf/stat s src true)]
+    (cond
+      (not= code 0) code
+      (:dir a)
+      (let [m (sf/mkdir s dst)
+            [es le] (sf/list-dir s src)]
+        (loop [i 0] (if (>= i (count es)) 0
+                      (let [n (:name (nth es i)) r (copy-tree s (join src n) (join dst n))]
+                        (if (not= r 0) r (recur (+ i 1)))))))
+      :else (let [[d de] (sf/get-file s src)] (if (not= de 0) de (sf/put-file s dst d "OVERWRITE"))))))
+
+(defn- run-read conn/OpResult [c: &conn/OpCall s: &sf/Sess wd: &Str]
+  (let [[p0 x1] (conn/required-str c "path")
+        [om x2] (conn/attr-str c "outputMimeType" "")
+        [oe x3] (conn/attr-str c "outputEncoding" "")]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2) (> (count x3) 0) (failure x3)
+      :else
+      (let [p (file/resolve-path wd p0)
+            [a code] (sf/stat s p true)]
+        (cond
+          (not= code 0) (conn/fail-result (not-exist p))
+          (:dir a) (conn/fail-result (serr "ILLEGAL_PATH" (str "Cannot read path '" p "' since it's a directory")))
+          :else (let [[data de] (sf/get-file s p)]
+                  (if (not= de 0) (conn/fail-result (serr "ACCESS_DENIED" (str "Could not read file '" p "'")))
+                    (conn/ok-result (ev/tv-raw data (data-mime om oe p)) (ev/tv-val (attrs-val p a) ev/JAVA)))))))))
+
+(defn- walk Vec(v/Val) [acc: Vec(v/Val) s: &sf/Sess dir: &Str rec: Bool]
+  (let [[es le] (sf/list-dir s dir)]
+    (loop [i 0 out acc]
+      (if (>= i (count es)) out
+        (let [e (nth es i)
+              p (join dir (:name e))
+              a (:attrs e)
+              item (v/->VObj [(v/field "payload" (v/->VStr p)) (v/field "attributes" (attrs-val p a))])
+              o1 (conj out item)
+              o2 (if (and rec (:dir a)) (walk o1 s p rec) o1)]
+          (recur (+ i 1) o2))))))
+
+(defn- run-list conn/OpResult [c: &conn/OpCall s: &sf/Sess wd: &Str]
+  (let [[p0 x1] (conn/required-str c "directoryPath")
+        [rec x2] (conn/attr-bool c "recursive" false)]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2)
+      :else
+      (let [p (file/resolve-path wd p0) k (kind-of s p)]
+        (cond
+          (= k 0) (conn/fail-result (not-exist p))
+          (= k 1) (conn/fail-result (serr "ILLEGAL_PATH" (str "Cannot list path '" p "' because it's a file. Only directories can be listed")))
+          :else (conn/ok-result (ev/tv-val (v/->VArr (walk [] s p rec)) ev/JAVA) (ev/tv-null)))))))
+
+(defn- run-write conn/OpResult [c: &conn/OpCall s: &sf/Sess wd: &Str]
+  (let [[p0 x1] (conn/required-str c "path")
+        [mode0 x2] (conn/attr-str c "mode" "OVERWRITE")
+        [cpd x3] (conn/attr-bool c "createParentDirectories" true)
+        [ct x4] (conn/child-tv c "content")]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2) (> (count x3) 0) (failure x3) (> (count x4) 0) (failure x4)
+      :else
+      (let [p (file/resolve-path wd p0)
+            mode (str/upper-case (str/trim mode0))
+            k (kind-of s p)
+            t (if (= (count ct) 0) (:payload (:event c)) (nth ct 0))
+            par (parent-of p)]
+        (cond
+          (and (not= mode "OVERWRITE") (not= mode "APPEND") (not= mode "CREATE_NEW"))
+          (conn/fail-result (err/mk "MULE" "EXPRESSION" (str "Invalid write mode '" mode0 "'")))
+          (= k 2) (conn/fail-result (serr "ILLEGAL_PATH" (str "Cannot write to path '" p "' because it is a Directory.")))
+          (and (= mode "CREATE_NEW") (not= k 0))
+          (conn/fail-result (serr "FILE_ALREADY_EXISTS" (str "Cannot write to path '" p "' because it already exists and write mode 'CREATE_NEW' was selected. Use a different write mode or point to a path which doesn't exist")))
+          (and (not cpd) (not= par "") (not= (kind-of s par) 2))
+          (conn/fail-result (serr "ILLEGAL_PATH" (str "Cannot write to file '" p "' because path to it doesn't exist. Consider setting the 'createParentDirectories' attribute to 'true'")))
+          :else
+          (let [z (if (= par "") 0 (mkdirs s par))
+                we (if (and (= (:state t) ev/DEFER) (ev/defer-open t)) (write-chunks s p mode t)
+                     (let [[data be] (ev/bytes t)] (if (not= be "") -1 (sf/put-file s p data mode))))]
+            (if (not= we 0) (conn/fail-result (serr "ACCESS_DENIED" (str "Could not write to file '" p "'")))
+              (conn/keep-result c))))))))
+
+(defn- write-chunks Int [s: &sf/Sess p: &Str mode: &Str t: &ev/TV]
+  (let [[h oe] (sf/open-write s p mode)]
+    (if (not= oe 0) oe
+      (let [code (loop []
+                   (let [[chunk done e] (ev/defer-next t)
+                         we (sf/write-part s h chunk)]
+                     (cond (not= we 0) we done 0 :else (recur))))
+            z (sf/close-handle s h)]
+        code))))
+
+(defn- transfer conn/OpResult [c: &conn/OpCall s: &sf/Sess wd: &Str move?: Bool]
+  (let [[s0 x1] (conn/required-str c "sourcePath")
+        [t0 x2] (conn/required-str c "targetPath")
+        [ow x3] (conn/attr-bool c "overwrite" false)
+        [cpd x4] (conn/attr-bool c "createParentDirectories" true)
+        [rn x5] (conn/attr-str c "renameTo" "")]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2) (> (count x3) 0) (failure x3) (> (count x4) 0) (failure x4) (> (count x5) 0) (failure x5)
+      :else
+      (let [src (file/resolve-path wd s0)
+            sk (kind-of s src)
+            tdir (file/resolve-path wd t0)
+            tk (kind-of s tdir)
+            name (if (= rn "") (base-name src) rn)]
+        (cond
+          (= sk 0) (conn/fail-result (not-exist src))
+          (and (= tk 1) (not ow)) (conn/fail-result (already-exists tdir))
+          (and (= tk 0) (not cpd))
+          (conn/fail-result (serr "ILLEGAL_PATH" (str "Can't " (if move? "move" "copy") " '" src "' to '" tdir "' because the destination path doesn't exist")))
+          :else
+          (let [z (if (= tk 0) (mkdirs s tdir) 0)
+                dst (if (= tk 1) tdir (join tdir name))
+                exists (not= (kind-of s dst) 0)]
+            (if (and exists (not ow)) (conn/fail-result (already-exists dst))
+              (let [z2 (if exists (remove-tree s dst) 0)
+                    r (if move? (sf/rename s src dst true) (copy-tree s src dst))]
+                (if (not= r 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Could not " (if move? "move" "copy") " '" src "' to '" dst "'")))
+                  (conn/keep-result c))))))))))
+
+(defn- run-rename conn/OpResult [c: &conn/OpCall s: &sf/Sess wd: &Str]
+  (let [[p0 x1] (conn/required-str c "path")
+        [to x2] (conn/required-str c "to")
+        [ow x3] (conn/attr-bool c "overwrite" false)]
+    (cond
+      (> (count x1) 0) (failure x1) (> (count x2) 0) (failure x2) (> (count x3) 0) (failure x3)
+      (str/includes? to "/")
+      (conn/fail-result (serr "ILLEGAL_PATH" (str "'to' parameter of rename operation should not contain any file separator character but '" to "' was received")))
+      (or (= to ".") (= to "..") (= to ""))
+      (conn/fail-result (serr "ILLEGAL_PATH" (str "'to' parameter of rename operation should not be '.' or '..' but '" to "' was received")))
+      :else
+      (let [p (file/resolve-path wd p0)
+            dst (join (parent-of p) to)
+            de (not= (kind-of s dst) 0)]
+        (cond
+          (= (kind-of s p) 0) (conn/fail-result (not-exist p))
+          (and de (not ow)) (conn/fail-result (serr "FILE_ALREADY_EXISTS" (str "'" p "' cannot be renamed because '" dst "' already exists")))
+          :else
+          (let [z (if de (remove-tree s dst) 0)
+                r (sf/rename s p dst true)]
+            (if (not= r 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Exception was found renaming '" p "' to '" to "'")))
+              (conn/keep-result c))))))))
+
+(defn- run-delete conn/OpResult [c: &conn/OpCall s: &sf/Sess wd: &Str]
+  (let [[p0 x1] (conn/required-str c "path")]
+    (if (> (count x1) 0) (failure x1)
+      (let [p (file/resolve-path wd p0)]
+        (cond
+          (= (kind-of s p) 0) (conn/fail-result (not-exist p))
+          (not= (remove-tree s p) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Could not delete '" p "'")))
+          :else (conn/keep-result c))))))
+
+(defn- run-mkdir conn/OpResult [c: &conn/OpCall s: &sf/Sess wd: &Str]
+  (let [[p0 x1] (conn/required-str c "directoryPath")]
+    (if (> (count x1) 0) (failure x1)
+      (let [p (file/resolve-path wd p0)]
+        (if (not= (kind-of s p) 0) (conn/fail-result (serr "FILE_ALREADY_EXISTS" (str "Directory '" p "' already exists")))
+          (if (not= (mkdirs s p) 0) (conn/fail-result (serr "ACCESS_DENIED" (str "Could not create directory '" p "'")))
+            (conn/keep-result c)))))))
+
+(defn- run-with conn/OpResult [c: &conn/OpCall s: &sf/Sess wd: &Str]
+  (let [op (:op c)]
+    (cond
+      (= op "read") (run-read c s wd)
+      (= op "write") (run-write c s wd)
+      (= op "list") (run-list c s wd)
+      (= op "copy") (transfer c s wd false)
+      (= op "move") (transfer c s wd true)
+      (= op "rename") (run-rename c s wd)
+      (= op "delete") (run-delete c s wd)
+      (= op "create-directory") (run-mkdir c s wd)
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation sftp:" op))))))
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (let [sp (spec-of (:config c))
+        [s x] (acquire sp (:res c))]
+    (if (> (count x) 0) (failure x)
+      (let [r (run-with c s (:wd sp))
+            z (release sp s)]
+        r))))
+
+(defrecord SMatch [base: file/Matcher since: Vec(tt/LocalDateTime) until: Vec(tt/LocalDateTime)])
+
+(defn- ldt-param Vec(tt/LocalDateTime) [get: &Fn(Str Str) k: Str]
+  (let [s (get k)
+        [x e] (iso/parse-ldt s)]
+    (if (or (= s "") (not= e "")) [] [x])))
+
+(defn- smatch-of SMatch [get: Fn(Str Str)]
+  (->SMatch (file/matcher-of get) (ldt-param get "timestampSince") (ldt-param get "timestampUntil")))
+
+(defn- no-smatch SMatch [] (let [z: Vec(tt/LocalDateTime) []] (->SMatch (file/no-matcher) z z)))
+
+(defn- mtime-ldt tt/LocalDateTime [a: &sf/Attrs zone: &tt/TimeZone] (zt/zdt-ldt (zt/zdt-of-instant (:mtime a) 0 zone)))
+
+(defn- smatches Bool [mt: &SMatch path: &Str a: &sf/Attrs now-ms: Int zone: &tt/TimeZone]
+  (and (file/matches-facts (:base mt) path (:dir a) (:reg a) (:link a) (:size a) (* (:mtime a) 1000) now-ms)
+       (or (= (count (:since mt)) 0) (>= (tl/ldt-compare (mtime-ldt a zone) (nth (:since mt) 0)) 0))
+       (or (= (count (:until mt)) 0) (<= (tl/ldt-compare (mtime-ldt a zone) (nth (:until mt) 0)) 0))))
+
+(defn- src-matcher Values(SMatch Str) [s: &conn/SrcCall]
+  (let [inl (conn/child-elem (:children s) "matcher")
+        name (conn/param-lit (:params s) "matcher" "")]
+    (cond
+      (> (count inl) 0) (let [n (nth inl 0)] (values (smatch-of (fn Str [k: Str] (xml/attr n "" k ""))) ""))
+      (= name "") (values (no-smatch) "")
+      :else (let [cs (conn/find-config (:configs s) "sftp:matcher" name)]
+              (if (= (count cs) 0) (values (no-smatch) (str "No matcher named '" name "' was found"))
+                (let [ps (:params (nth cs 0))] (values (smatch-of (fn Str [k: Str] (conn/param-lit ps k ""))) "")))))))
+
+(defrecord Found [path: Str attrs: sf/Attrs])
+
+(defn- poll-walk Vec(Found) [acc: Vec(Found) s: &sf/Sess dir: &Str rec: Bool mt: &SMatch now-ms: Int zone: &tt/TimeZone]
+  (let [[es le] (sf/list-dir s dir)]
+    (loop [i 0 out acc]
+      (if (>= i (count es)) out
+        (let [e (nth es i)
+              n (:name e)
+              p (join dir n)
+              a (:attrs e)]
+          (cond
+            (or (= n ".") (= n "..")) (recur (+ i 1) out)
+            (:dir a) (recur (+ i 1) (if rec (poll-walk out s p rec mt now-ms zone) out))
+            (smatches mt p a now-ms zone) (recur (+ i 1) (conj out (->Found p a)))
+            :else (recur (+ i 1) out)))))))
+
+(defn- lit Str [s: &conn/SrcCall k: &Str] (conn/param-lit (:params s) k ""))
+
+(defn- lit-bool Bool [s: &conn/SrcCall k: &Str default: Bool]
+  (let [x (str/lower-case (str/trim (lit s k)))] (if (= x "") default (= x "true"))))
+
+(defn- size-check-ms Int [s: &conn/SrcCall]
+  (let [n (npz/int-or (str/trim (lit s "timeBetweenSizeCheck")) 0)
+        u (str/upper-case (lit s "timeBetweenSizeCheckUnit"))]
+    (cond (<= n 0) 0 (= u "SECONDS") (* n 1000) (= u "MINUTES") (* n 60000) (= u "HOURS") (* n 3600000) :else n)))
+
+(defn- stable? Bool [sess: &sf/Sess p: &Str size0: Int ms: Int]
+  (if (<= ms 0) true
+    (let [z (sleep-ms ms)
+          [a code] (sf/stat sess p true)]
+      (and (= code 0) (= (:size a) size0)))))
+
+(defn- state-map Map [s: &conn/SrcCall] (dyn->map (deref (:state s))))
+
+(defn- set-state Int [s: &conn/SrcCall k: Str x: Dyn]
+  (let [z (swap! (:state s) (fn Dyn [old: Dyn] (let [mm: Map (dyn->map old)] (->dyn (assoc mm k x)))))] 0))
+
+(defn- st-str Str [m: &Map k: &Str] (if (contains? m k) (dyn->str (get! m k)) ""))
+
+(defn- post-action Int [sess: &sf/Sess wd: &Str p: &Str auto-del: Bool move-to: &Str rename-to: &Str]
+  (cond
+    auto-del (sf/unlink sess p)
+    (not= move-to "")
+    (let [td (file/resolve-path wd move-to)
+          z (mkdirs sess td)]
+      (sf/rename sess p (join td (if (= rename-to "") (base-name p) rename-to)) false))
+    (not= rename-to "") (sf/rename sess p (join (parent-of p) rename-to) false)
+    :else 0))
+
+(defn- seen-at-wm? Bool [ids: &Str p: &Str] (str/includes? (str "\n" ids "\n") (str "\n" p "\n")))
+
+(defn- poll-with Values(Int Str) [s: &conn/SrcCall sess: &sf/Sess sp: &Spec]
+  (let [wd (:wd sp)
+        dir0 (lit s "directory")
+        dir (file/resolve-path wd dir0)
+        [da dcode] (sf/stat sess dir true)
+        st0 (state-map s)
+        started (= (st-str st0 "started") "1")
+        z0 (set-state s "started" (->dyn "1"))]
+    (cond
+      (= (st-str st0 "dead") "1") (values 0 "")
+      (and (not started) (or (not= dcode 0) (not (:dir da))))
+      (let [z (set-state s "dead" (->dyn "1"))]
+        (values 0 (str "Message source 'listener' on flow '" (:flow s) "' could not be reconnected. Will be shutdown. Could not resolve path to directory '"
+                       dir0 "'. Path '" dir "' doesn't exist")))
+      (not= dcode 0) (values 0 (str "Path '" dir "' doesn't exist"))
+      :else
+      (let [[mt me] (src-matcher s)]
+        (if (not= me "") (values 0 me)
+          (let [zone (tzr/system-zone)
+                found (poll-walk [] sess dir (lit-bool s "recursive" true) mt (epoch-ms) zone)
+                wm? (lit-bool s "watermarkEnabled" false)
+                wm0 (npz/int-or (st-str st0 "wm") -1)
+                ids0 (st-str st0 "ids")
+                auto-del (lit-bool s "autoDelete" false)
+                move-to (lit s "moveToDirectory")
+                rename-to (lit s "renameTo")
+                on-fail (lit-bool s "applyPostActionWhenFailed" true)
+                om (lit s "outputMimeType")
+                oe (lit s "outputEncoding")
+                scms (size-check-ms s)]
+            (loop [i 0 n 0 wm wm0 ids ids0]
+              (if (>= i (count found))
+                (let [z1 (set-state s "wm" (->dyn (str wm)))
+                      z2 (set-state s "ids" (->dyn ids))]
+                  (values n ""))
+                (let [f (nth found i)
+                      p (:path f)
+                      a (:attrs f)
+                      t (:mtime a)]
+                  (if (and wm? (or (< t wm0) (and (= t wm0) (seen-at-wm? ids0 p)))) (recur (+ i 1) n wm ids)
+                    (if (not (stable? sess p (:size a) scms)) (recur (+ i 1) n wm ids)
+                      (let [[data de] (sf/get-file sess p)]
+                        (if (not= de 0) (recur (+ i 1) n wm ids)
+                          (let [[ok desc] ((:dispatch s) (ev/tv-raw data (data-mime om oe p)) (ev/tv-val (attrs-val p a) ev/JAVA))
+                                z (if (or ok on-fail) (post-action sess wd p auto-del move-to rename-to) 0)
+                                wm2 (if (> t wm) t wm)
+                                ids2 (cond (> t wm) (str p) (= t wm) (str ids "\n" p) :else (str ids))]
+                            (recur (+ i 1) (+ n 1) wm2 ids2)))))))))))))))
+
+(defn- poll Values(Int Str) [s: conn/SrcCall]
+  (let [sp (spec-of (:config s))
+        [sess x] (acquire sp (:res s))]
+    (if (> (count x) 0) (values 0 (:description (nth x 0)))
+      (let [[n e] (poll-with s sess sp)
+            z (release sp sess)]
+        (values n e)))))
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "sftp" NS (fn conn/OpResult [c: conn/OpCall] (run-op c)))
+         :sources ["listener"] :poll (fn Values(Int Str) [s: conn/SrcCall] (poll s))))

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18404"/></http:listener-config>
+    <http:request-config name="R"><http:request-connection host="localhost" port="18404"/></http:request-config>
+
+    <!-- 受け取った multipart の各部分を JSON にして返す -->
+    <flow name="recv">
+        <http:listener config-ref="L" path="/recv"/>
+        <set-payload value="#[output application/json --- {
+            contentType: (attributes.headers.'content-type' splitBy ';')[0],
+            parts: payload.parts pluck ((p, name) -> {
+                name: name,
+                filename: p.headers.'Content-Disposition' default null,
+                contentType: p.headers.'Content-Type' default null,
+                content: p.content
+            })}]"/>
+    </flow>
+
+    <!-- DW で組み立てた multipart/form-data を送る -->
+    <flow name="send-form">
+        <http:listener config-ref="L" path="/send-form"/>
+        <http:request config-ref="R" method="POST" path="/recv">
+            <http:body><![CDATA[#[output multipart/form-data ---
+                {parts: {
+                    field1: {headers: {"Content-Type": "text/plain"}, content: "hello"},
+                    file1: {headers: {"Content-Type": "application/json", "Content-Disposition": {"name": "file1", "filename": "a.json"}}, content: {a: 1}}
+                }}]]]></http:body>
+        </http:request>
+    </flow>
+
+    <!-- multipart/mixed -->
+    <flow name="send-mixed">
+        <http:listener config-ref="L" path="/send-mixed"/>
+        <http:request config-ref="R" method="POST" path="/recv">
+            <http:body><![CDATA[#[output multipart/mixed ---
+                {parts: {
+                    one: {headers: {"Content-Type": "text/plain"}, content: "x"},
+                    two: {headers: {"Content-Type": "text/plain"}, content: "y"}
+                }}]]]></http:body>
+        </http:request>
+    </flow>
+
+    <!-- 送ったボディの生の形 (境界は mask) -->
+    <flow name="raw">
+        <http:listener config-ref="L" path="/raw"/>
+        <set-payload value="#[write(payload, 'multipart/form-data') as String]" />
+    </flow>
+    <flow name="send-raw">
+        <http:listener config-ref="L" path="/send-raw"/>
+        <http:request config-ref="R" method="POST" path="/raw">
+            <http:body><![CDATA[#[output multipart/form-data ---
+                {parts: {a: {headers: {"Content-Type": "text/plain"}, content: "one"}, b: {content: "two"}}}]]]></http:body>
+        </http:request>
+    </flow>
+    <!-- パートの Content-Type の追加指定 (;) が、パートを読む設定になるか -->
+    <flow name="parse-part">
+        <http:listener config-ref="L" path="/parse-part"/>
+        <set-payload value="#[output application/json --- payload.parts.x.content]"/>
+    </flow>
+</mule>

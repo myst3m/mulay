@@ -1,0 +1,306 @@
+(ns mulay.dw.xsdtype (:require [mulay.lib.xml :as xml] [clay.string :as str]))
+
+(def XS "http://www.w3.org/2001/XMLSchema")
+
+(def KEYWORDS ["if" "else" "unless" "default" "do" "fun" "var" "type" "ns" "import" "input" "output" "case" "true" "false" "null"
+               "not" "and" "or" "is" "as" "from" "using" "update" "throw" "dw" "annotation"])
+
+(defrecord SDoc [root: xml/XNode tns: Str module: Str alias: Str qual-el: Bool qual-at: Bool])
+
+(defrecord Ctx [docs: Vec(SDoc) nss: Vec(Str) cur: Int])
+
+(defrecord Hit [doc: Int node: xml/XNode])
+
+(defn- cur-doc SDoc [c: &Ctx] (nth (:docs c) (:cur c)))
+
+(defn- at-doc Ctx [c: &Ctx i: Int] (assoc c :cur i))
+
+(defn- xs-kids Vec(xml/XNode) [n: &xml/XNode local: &Str]
+  (let [ks (xml/child-elems n)]
+    (loop [i 0 acc: Vec(xml/XNode) []]
+      (if (>= i (count ks)) acc
+        (recur (+ i 1) (if (and (= (xml/elem-uri (nth ks i)) XS) (= (xml/elem-local (nth ks i)) local)) (conj acc (nth ks i)) acc))))))
+
+(defn- first-kid Vec(xml/XNode) [n: &xml/XNode locals: &Vec(Str)]
+  (let [ks (xml/child-elems n)]
+    (loop [i 0]
+      (if (>= i (count ks)) []
+        (let [k (nth ks i)]
+          (if (and (= (xml/elem-uri k) XS) (loop [j 0] (if (>= j (count locals)) false (if (= (nth locals j) (xml/elem-local k)) true (recur (+ j 1))))))
+            [k] (recur (+ i 1))))))))
+
+(defn- at Str [n: &xml/XNode name: &Str] (xml/attr n "" name ""))
+
+(defn- local-of Str [q: &Str] (let [i (str/index-of q ":")] (if (< i 0) (str q) (subs q (+ i 1) (count q)))))
+
+(defn- prefix-of Str [q: &Str] (let [i (str/index-of q ":")] (if (< i 0) "" (subs q 0 i))))
+
+(defn- ident? Bool [k: &Str]
+  (and (> (count k) 0)
+       (let [c (nth k 0)] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+       (loop [i 1] (if (>= i (count k)) true
+                     (let [c (nth k i)] (if (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57))) (recur (+ i 1)) false))))
+       (not (loop [i 0] (if (>= i (count KEYWORDS)) false (if (= (nth KEYWORDS i) k) true (recur (+ i 1))))))))
+
+(defn- dw-str Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1) (cond (= c 34) (str out "\\\"") (= c 92) (str out "\\\\") (= c 36) (str out "\\$") (= c 10) (str out "\\n") :else (str out (chr c))))))))
+
+(defn- key-text Str [k: &Str] (if (ident? k) (str k) (dw-str k)))
+
+(defn- ns-pfx Str [c: &Ctx uri: &Str]
+  (if (= uri "") ""
+    (let [k (loop [i 0] (if (>= i (count (:nss c))) -1 (if (= (nth (:nss c) i) uri) i (recur (+ i 1)))))]
+      (if (< k 0) "" (str "ns" k "#")))))
+
+(defn- qkey Str [c: &Ctx name: &Str qualified: Bool]
+  (str (if qualified (ns-pfx c (:tns (cur-doc c))) "") (key-text name)))
+
+(defn- prefix-uri Str [root: &xml/XNode p: &Str]
+  (let [ds (xml/elem-ns root)]
+    (loop [i 0] (if (>= i (count ds)) (if (or (= p "xs") (= p "xsd")) XS "") (if (= (:prefix (nth ds i)) p) (str (:uri (nth ds i))) (recur (+ i 1)))))))
+
+(defn- q-uri Str [c: &Ctx q: &Str] (prefix-uri (:root (cur-doc c)) (prefix-of q)))
+
+(defn- find-comp Vec(Hit) [c: &Ctx kind: &Str q: &Str]
+  (let [uri (q-uri c q) l (local-of q) ds (:docs c)]
+    (loop [i 0]
+      (if (>= i (count ds)) []
+        (let [d (nth ds i)]
+          (if (not= (:tns d) uri) (recur (+ i 1))
+            (let [ns (xs-kids (:root d) kind)
+                  hit (loop [k 0] (if (>= k (count ns)) -1 (if (= (at (nth ns k) "name") l) k (recur (+ k 1)))))]
+              (if (>= hit 0) [(->Hit i (nth ns hit))] (recur (+ i 1))))))))))
+
+(defn- def-ref Str [c: &Ctx h: &Hit name: &Str]
+  (let [d (nth (:docs c) (:doc h))]
+    (str (if (= (:doc h) 0) "" (str (:alias d) "::")) (cap name) "Definition." (ns-pfx c (:tns d)) (key-text name))))
+
+(defn- cap Str [s: &Str]
+  (if (= (count s) 0) "" (let [f (nth s 0)] (str (if (and (>= f 97) (<= f 122)) (chr (- f 32)) (chr f)) (subs s 1 (count s))))))
+
+(def NUMS ["int" "integer" "long" "short" "byte" "double" "decimal" "float" "unsignedLong" "unsignedInt" "unsignedShort" "unsignedByte"
+           "positiveInteger" "negativeInteger" "nonNegativeInteger" "nonPositiveInteger" "number"])
+
+(defn- builtin Str [l: &Str]
+  (cond
+    (loop [i 0] (if (>= i (count NUMS)) false (if (= (nth NUMS i) l) true (recur (+ i 1))))) "Number"
+    (or (= l "hexBinary") (= l "base64Binary")) "Binary"
+    (= l "boolean") "Boolean"
+    (= l "dateTime") "DateTime"
+    (= l "time") "Time"
+    (= l "date") "LocalDateTime"
+    :else "String"))
+
+(defn- xs-type? Bool [c: &Ctx q: &Str] (and (not= (local-of q) "") (= (q-uri c q) XS)))
+
+(defn simple-text Str [c: &Ctx s: &xml/XNode depth: Int]
+  (if (> depth 32) "String"
+    (let [r (first-kid s ["restriction" "list" "union"])]
+      (if (or (= (count r) 0) (not= (xml/elem-local (nth r 0)) "restriction")) "String"
+        (let [rn (nth r 0)
+              base (at rn "base")
+              es (xs-kids rn "enumeration")
+              inline (first-kid rn ["simpleType"])
+              bt (cond
+                   (> (count inline) 0) (simple-text c (nth inline 0) (+ depth 1))
+                   (xs-type? c base) (builtin (local-of base))
+                   :else (let [st (find-comp c "simpleType" base)] (if (= (count st) 0) "String" (simple-text (at-doc c (:doc (nth st 0))) (:node (nth st 0)) (+ depth 1)))))]
+          (if (and (> (count es) 0) (= bt "String"))
+            (str/join " | " (loop [i 0 acc: Vec(Str) []] (if (>= i (count es)) acc (recur (+ i 1) (conj acc (dw-str (at (nth es i) "value")))))))
+            bt))))))
+
+(defn- attr-type Str [c: &Ctx a: &xml/XNode]
+  (let [t (at a "type") inline (first-kid a ["simpleType"])]
+    (cond
+      (> (count inline) 0) (simple-text c (nth inline 0) 0)
+      (= t "") "String"
+      (xs-type? c t) (builtin (local-of t))
+      :else (let [st (find-comp c "simpleType" t)] (if (= (count st) 0) "String" (simple-text (at-doc c (:doc (nth st 0))) (:node (nth st 0)) 0))))))
+
+(defn- attr-fields Vec(Str) [c: &Ctx ct: &xml/XNode]
+  (let [as (xs-kids ct "attribute")]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count as)) acc
+        (let [a (nth as i) nm (at a "name")]
+          (recur (+ i 1) (if (= nm "") acc (conj acc (str (qkey c nm (:qual-at (cur-doc c))) (if (= (at a "use") "required") "" "?") ": " (attr-type c a))))))))))
+
+(defn- ext-of Vec(xml/XNode) [ct: &xml/XNode which: &Str]
+  (let [cc (first-kid ct [which])]
+    (if (= (count cc) 0) [] (first-kid (nth cc 0) ["extension" "restriction"]))))
+
+(defn- all-attrs Vec(Str) [c: &Ctx ct: &xml/XNode depth: Int]
+  (let [cx (ext-of ct "complexContent") sx (ext-of ct "simpleContent")]
+    (cond
+      (> (count cx) 0)
+      (let [e (nth cx 0) bs (find-comp c "complexType" (at e "base"))
+            base (if (or (= (count bs) 0) (> depth 16)) [] (all-attrs (at-doc c (:doc (nth bs 0))) (:node (nth bs 0)) (+ depth 1)))]
+        (loop [i 0 acc base] (let [own (attr-fields c e)] (if (>= i (count own)) acc (recur (+ i 1) (conj acc (nth own i)))))))
+      (> (count sx) 0) (attr-fields c (nth sx 0))
+      :else (attr-fields c ct))))
+
+(defn- attrs-text Str [as: &Vec(Str)] (if (= (count as) 0) "" (str " @(" (str/join ", " as) ")")))
+
+(defn- occurs Str [el: &xml/XNode]
+  (let [mn (at el "minOccurs") mx (at el "maxOccurs")
+        many (and (not= mx "") (not= mx "0") (not= mx "1"))]
+    (str (if many "*" "") (if (= mn "0") "?" ""))))
+
+(defn- group-fields Vec(Str) [c: &Ctx g: &xml/XNode depth: Int]
+  (let [ks (xml/child-elems g)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count ks)) acc
+        (let [k (nth ks i) l (xml/elem-local k)]
+          (cond
+            (not= (xml/elem-uri k) XS) (recur (+ i 1) acc)
+            (= l "element") (recur (+ i 1) (conj acc (element-field c k false depth)))
+            (or (= l "sequence") (= l "all")) (recur (+ i 1) (let [sub (group-fields c k (+ depth 1))] (loop [j 0 a acc] (if (>= j (count sub)) a (recur (+ j 1) (conj a (nth sub j)))))))
+            :else (recur (+ i 1) acc)))))))
+
+(defn- particle-text Str [c: &Ctx ct: &xml/XNode mixed: Bool depth: Int]
+  (let [p (first-kid ct ["sequence" "all" "choice" "group"])
+        txt (if mixed ["\"__text\"*?: String"] [])]
+    (if (= (count p) 0) (if mixed (str "{- " (nth txt 0) " -}") "Object")
+      (let [g (nth p 0) l (xml/elem-local g)]
+        (cond
+          (= l "choice")
+          (let [es (xs-kids g "element")]
+            (if (= (count es) 0) "Object"
+              (str/join " | " (loop [i 0 acc: Vec(Str) []] (if (>= i (count es)) acc (recur (+ i 1) (conj acc (str "{| " (element-field c (nth es i) false depth) " |}"))))))))
+          (= l "all") (str "{ " (str/join ", " (concat-strs txt (group-fields c g depth))) " }")
+          :else (str "{- " (str/join ", " (concat-strs txt (group-fields c g depth))) " -}"))))))
+
+(defn- concat-strs Vec(Str) [a: &Vec(Str) b: Vec(Str)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (< i (count a)) (recur (+ i 1) (conj acc (nth a i)))
+      (loop [k 0 out acc] (if (>= k (count b)) out (recur (+ k 1) (conj out (nth b k))))))))
+
+(defn- optional-all Vec(Str) [fs: &Vec(Str)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count fs)) acc
+      (let [f (nth fs i) k (str/index-of f ":") a (str/index-of f " @(")
+            cut (if (and (>= a 0) (< a k)) a k)
+            head (subs f 0 cut)]
+        (recur (+ i 1) (conj acc (if (str/ends-with? head "?") (str f) (str head "?" (subs f cut (count f))))))))))
+
+(defn complex-body Str [c: &Ctx ct: &xml/XNode depth: Int]
+  (if (> depth 16) "Object"
+    (let [cx (ext-of ct "complexContent") sx (ext-of ct "simpleContent") mixed (= (at ct "mixed") "true")]
+      (cond
+        (> (count sx) 0) "String"
+        (> (count cx) 0)
+        (let [e (nth cx 0) bs (find-comp c "complexType" (at e "base"))
+              base (if (= (count bs) 0) [] (let [bp (first-kid (:node (nth bs 0)) ["sequence" "all"])] (if (= (count bp) 0) [] (group-fields (at-doc c (:doc (nth bs 0))) (nth bp 0) depth))))
+              own (let [op (first-kid e ["sequence" "all"])] (if (= (count op) 0) [] (group-fields c (nth op 0) depth)))
+              fs (optional-all (loop [i 0 acc base] (if (>= i (count own)) acc (recur (+ i 1) (conj acc (nth own i))))))]
+          (str "{- " (str/join ", " fs) " -}"))
+        :else (particle-text c ct mixed depth)))))
+
+(defn- type-ref Values(Str Str) [c: &Ctx owner: &xml/XNode t: &Str depth: Int]
+  (if (xs-type? c t)
+    (if (= (local-of t) "anyType") (values "" "{- \"__text\"*?: String -}") (values "" (builtin (local-of t))))
+    (let [l (local-of t) cts (find-comp c "complexType" t)]
+      (if (> (count cts) 0)
+        (values (attrs-text (all-attrs (at-doc c (:doc (nth cts 0))) (:node (nth cts 0)) 0)) (def-ref c (nth cts 0) l))
+        (let [sts (find-comp c "simpleType" t)] (if (> (count sts) 0) (values "" (def-ref c (nth sts 0) l)) (values "" "String")))))))
+
+(defn- element-type Values(Str Str) [c: &Ctx el: &xml/XNode depth: Int]
+  (let [t (at el "type") ict (first-kid el ["complexType"]) ist (first-kid el ["simpleType"])]
+    (cond
+      (> (count ict) 0) (values (attrs-text (all-attrs c (nth ict 0) 0)) (complex-body c (nth ict 0) (+ depth 1)))
+      (> (count ist) 0) (values "" (simple-text c (nth ist 0) 0))
+      (= t "") (values "" "{- \"__text\"*?: String -}")
+      :else (type-ref c el t depth))))
+
+(defn- element-field Str [c: &Ctx el: &xml/XNode global: Bool depth: Int]
+  (let [ref (at el "ref")]
+    (if (not= ref "")
+      (let [g (find-comp c "element" ref)]
+        (if (= (count g) 0) (str (ns-pfx c (q-uri c ref)) (key-text (local-of ref)) (occurs el) ": Any")
+          (let [c2 (at-doc c (:doc (nth g 0)))
+                [as ty] (element-type c2 (:node (nth g 0)) (+ depth 1))]
+            (str (qkey c2 (local-of ref) true) (occurs el) as ": " ty))))
+      (let [[as ty] (element-type c el (+ depth 1))]
+        (str (qkey c (at el "name") (or global (:qual-el (cur-doc c)))) (if global "" (occurs el)) as ": " ty)))))
+
+(defn- dir-of Str [m: &Str] (let [k (str/last-index-of m "::")] (if (< k 0) "" (subs m 0 k))))
+
+(defn- loc-module Str [base: &Str loc: &Str]
+  (let [segs: Vec(Str) (str/split (str (if (= base "") "" (str (str/replace base "::" "/") "/")) loc) "/")
+        out (loop [i 0 acc: Vec(Str) []]
+              (if (>= i (count segs)) acc
+                (let [x (nth segs i)]
+                  (cond (or (= x "") (= x ".")) (recur (+ i 1) acc)
+                        (= x "..") (recur (+ i 1) (if (= (count acc) 0) acc (pop acc)))
+                        :else (recur (+ i 1) (conj acc x))))))
+        j (str/join "::" out)]
+    (if (str/ends-with? j ".xsd") (subs j 0 (- (count j) 4)) j)))
+
+(defn- alias-of Str [m: &Str] (let [k (str/last-index-of m "::")] (if (< k 0) (str m) (subs m (+ k 2) (count m)))))
+
+(defn- sdoc Values(SDoc Str) [text: &Str m: &Str]
+  (let [[d e] (xml/parse text)]
+    (if (not= e "") (values (->SDoc (xml/doc-root d) "" "" "" false false) e)
+      (let [root (xml/doc-root d)]
+        (if (or (not= (xml/elem-uri root) XS) (not= (xml/elem-local root) "schema"))
+          (values (->SDoc root "" "" "" false false) "not an XML Schema (the root is not xs:schema)")
+          (values (->SDoc root (at root "targetNamespace") (str m) (alias-of m) (= (at root "elementFormDefault") "qualified") (= (at root "attributeFormDefault") "qualified")) ""))))))
+
+(defn- refs-of Vec(Str) [d: &SDoc]
+  (let [ks (xml/child-elems (:root d))]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count ks)) acc
+        (let [k (nth ks i) l (xml/elem-local k) loc (at k "schemaLocation")]
+          (recur (+ i 1) (if (and (= (xml/elem-uri k) XS) (or (= l "import") (= l "include")) (not= loc "")) (conj acc (loc-module (dir-of (:module d)) loc)) acc)))))))
+
+(defn- load-docs Values(Vec(SDoc) Str) [main: SDoc loader: &Fn(Str Values(Str Bool))]
+  (loop [i 0 ds: Vec(SDoc) [main]]
+    (if (>= i (count ds)) (values ds "")
+      (let [rs (refs-of (nth ds i))
+            [ds2 err] (loop [k 0 acc ds]
+                        (if (>= k (count rs)) (values acc "")
+                          (let [m (nth rs k)]
+                            (if (loop [j 0] (if (>= j (count acc)) false (if (= (:module (nth acc j)) m) true (recur (+ j 1))))) (recur (+ k 1) acc)
+                              (let [[t found] (loader (str "xmlschema!" m))]
+                                (if (not found) (values acc (str "cannot read the schema " m ".xsd"))
+                                  (let [[d e] (sdoc t m)] (if (not= e "") (values acc (str m ": " e)) (recur (+ k 1) (conj acc d))))))))))]
+        (if (not= err "") (values ds2 err) (recur (+ i 1) ds2))))))
+
+(defn- ns-list Vec(Str) [ds: &Vec(SDoc)]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count ds)) acc
+      (let [u (:tns (nth ds i))] (recur (+ i 1) (if (or (= u "") (loop [k 0] (if (>= k (count acc)) false (if (= (nth acc k) u) true (recur (+ k 1)))))) acc (conj acc u)))))))
+
+(defn xml-schema-module Values(Str Str) [text: &Str m: &Str loader: &Fn(Str Values(Str Bool))]
+  (let [mod (if (str/starts-with? m "xmlschema!") (subs m 10 (count m)) (str m))
+        [main me] (sdoc text mod)]
+    (if (not= me "") (values "" me)
+      (let [[ds le] (load-docs main loader)]
+        (if (not= le "") (values "" le)
+          (let [nss (ns-list ds)
+                c (->Ctx ds nss 0)
+                o0 (loop [i 0 o "%dw 2.0\n\n"] (if (>= i (count nss)) o (recur (+ i 1) (str o "ns ns" i " " (nth nss i) "\n\n"))))
+                direct (refs-of main)
+                o1 (loop [i 0 o o0] (if (>= i (count direct)) o (recur (+ i 1) (str o "import xmlschema!" (nth direct i) "\n\n"))))
+                same (loop [i 0 acc: Vec(Int) []] (if (>= i (count ds)) acc (recur (+ i 1) (if (= (:tns (nth ds i)) (:tns main)) (conj acc i) acc))))
+                o2 (loop [k 0 o o1]
+                     (if (>= k (count same)) o
+                       (let [di (nth same k) cd (at-doc c di) root (:root (nth ds di))
+                             cts (xs-kids root "complexType") sts (xs-kids root "simpleType")
+                             oa (loop [i 0 o2 o] (if (>= i (count cts)) o2
+                                                   (let [ct (nth cts i) nm (at ct "name")]
+                                                     (recur (+ i 1) (str o2 "type " (cap nm) "Definition = { " (qkey cd nm true) (attrs-text (all-attrs cd ct 0)) ": " (complex-body cd ct 0) " }\n\n")))))]
+                         (recur (+ k 1) (loop [i 0 o3 oa] (if (>= i (count sts)) o3
+                                                            (let [st (nth sts i) nm (at st "name")]
+                                                              (recur (+ i 1) (str o3 "type " (cap nm) "Definition = { " (qkey cd nm true) ": " (simple-text cd st 0) " }\n\n")))))))))
+                [o3 roots] (loop [di 0 o o2 rs: Vec(Str) []]
+                             (if (>= di (count ds)) (values o rs)
+                               (let [cd (at-doc c di) els (xs-kids (:root (nth ds di)) "element")
+                                     [o4 r4] (loop [i 0 o4 o r4 rs]
+                                               (if (>= i (count els)) (values o4 r4)
+                                                 (let [el (nth els i) nm (str (at el "name") "ElementDefinition")]
+                                                   (recur (+ i 1) (str o4 "type " nm " = {| " (element-field cd el true 0) " |}\n\n") (conj r4 nm)))))]
+                                 (recur (+ di 1) o4 r4))))]
+            (values (if (= (count roots) 0) o3 (str o3 "type Root = " (str/join " | " roots) "\n")) "")))))))

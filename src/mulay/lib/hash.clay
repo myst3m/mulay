@@ -1,0 +1,158 @@
+(ns mulay.lib.hash (:require [clay.crypto :as cc] [clay.bytes :as bytes]))
+
+(defn- fill Str [b: Int] (loop [i 0 out ""] (if (>= i 144) out (recur (+ i 1) (str out (chr b))))))
+(def ZEROS: Str (fill 0))
+(def IPAD: Str (fill 0x36))
+(def OPAD: Str (fill 0x5c))
+
+(defn md5 Str [data: &Str] (cc/md5 data))
+(defn sha1 Str [data: &Str] (cc/sha1 data))
+(defn sha224 Str [data: &Str] (cc/sha224 data))
+(defn sha256 Str [data: &Str] (cc/sha256 data))
+(defn sha384 Str [data: &Str] (cc/sha384 data))
+(defn sha512 Str [data: &Str] (cc/sha512 data))
+(defn sha512-224 Str [data: &Str] (cc/sha512-224 data))
+(defn sha512-256 Str [data: &Str] (cc/sha512-256 data))
+
+(def K-MD5 0)
+(def K-SHA1 1)
+(def K-SHA256 2)
+(def K-SHA512 3)
+(def K-SHA3 4)
+
+(defn- md-finish Vec(Int) [kind: Int st: &Vec(Int) data: &Str before: Int]
+  (cond (= kind K-MD5) (cc/md5-finish st data before)
+        (= kind K-SHA1) (cc/sha1-finish st data before)
+        (= kind K-SHA256) (cc/sha256-finish st data before)
+        :else (cc/sha512-finish st data before)))
+
+(defn- md-out Str [kind: Int st: &Vec(Int) nb: Int]
+  (bytes/pack-words st (if (= kind K-SHA512) 8 4) (not= kind K-MD5) nb))
+
+(defn sha3 Str [bits: Int data: &Str] (cc/keccak-finish (cc/keccak-iv) data (- 200 (quot bits 4)) 6 (quot bits 8)))
+
+(defn digest Values(Str Bool) [name: &Str data: &Str]
+  (cond
+    (= name "MD5") (values (md5 data) true)
+    (= name "SHA1") (values (sha1 data) true)
+    (= name "SHA224") (values (sha224 data) true)
+    (= name "SHA256") (values (sha256 data) true)
+    (= name "SHA384") (values (sha384 data) true)
+    (= name "SHA512") (values (sha512 data) true)
+    (= name "SHA512-224") (values (sha512-224 data) true)
+    (= name "SHA512-256") (values (sha512-256 data) true)
+    (= name "SHA3-224") (values (sha3 224 data) true)
+    (= name "SHA3-256") (values (sha3 256 data) true)
+    (= name "SHA3-384") (values (sha3 384 data) true)
+    (= name "SHA3-512") (values (sha3 512 data) true)
+    :else (values "" false)))
+
+(defn block-size Int [name: &Str]
+  (cond
+    (or (= name "MD5") (= name "SHA1") (= name "SHA224") (= name "SHA256")) 64
+    (or (= name "SHA384") (= name "SHA512") (= name "SHA512-224") (= name "SHA512-256")) 128
+    (= name "SHA3-224") 144
+    (= name "SHA3-256") 136
+    (= name "SHA3-384") 104
+    (= name "SHA3-512") 72
+    :else 0))
+
+(defrecord State [kind: Int st: Vec(Int) buf: Str total: Int out: Int])
+
+(defn- bsize Int [kind: Int out: Int] (cond (= kind K-SHA512) 128 (= kind K-SHA3) (- 200 (* 2 out)) :else 64))
+
+(defn- blocks Vec(Int) [kind: Int st: Vec(Int) p: &Str off: Int n: Int bs: Int]
+  (cond (= n 0) st
+        (= kind K-MD5) (cc/md5-blocks st p off n)
+        (= kind K-SHA1) (cc/sha1-blocks st p off n)
+        (= kind K-SHA256) (cc/sha256-blocks st p off n)
+        (= kind K-SHA512) (cc/sha512-blocks st p off n)
+        :else (cc/keccak-blocks st p off n bs)))
+
+(defn start Values(State Bool) [name: &Str]
+  (cond
+    (= name "MD5") (values (->State K-MD5 (cc/md5-iv) "" 0 16) true)
+    (= name "SHA1") (values (->State K-SHA1 (cc/sha1-iv) "" 0 20) true)
+    (= name "SHA224") (values (->State K-SHA256 (cc/sha224-iv) "" 0 28) true)
+    (= name "SHA256") (values (->State K-SHA256 (cc/sha256-iv) "" 0 32) true)
+    (= name "SHA384") (values (->State K-SHA512 (cc/sha384-iv) "" 0 48) true)
+    (= name "SHA512") (values (->State K-SHA512 (cc/sha512-iv) "" 0 64) true)
+    (= name "SHA512-224") (values (->State K-SHA512 (cc/sha512-224-iv) "" 0 28) true)
+    (= name "SHA512-256") (values (->State K-SHA512 (cc/sha512-256-iv) "" 0 32) true)
+    (= name "SHA3-224") (values (->State K-SHA3 (cc/keccak-iv) "" 0 28) true)
+    (= name "SHA3-256") (values (->State K-SHA3 (cc/keccak-iv) "" 0 32) true)
+    (= name "SHA3-384") (values (->State K-SHA3 (cc/keccak-iv) "" 0 48) true)
+    (= name "SHA3-512") (values (->State K-SHA3 (cc/keccak-iv) "" 0 64) true)
+    :else (values (->State K-MD5 (cc/md5-iv) "" 0 16) false)))
+
+(defn feed State [s: State data: &Str]
+  (let [kind (:kind s) out (:out s) bs (bsize kind out)
+        buf (:buf s)
+        n (count data)
+        need (if (= (count buf) 0) 0 (- bs (count buf)))
+        total (+ (:total s) n)]
+    (if (< n need) (->State kind (:st s) (str buf data) total out)
+      (let [st1 (if (= need 0) (:st s) (let [blk (str buf (subs data 0 need))] (blocks kind (:st s) blk 0 1 bs)))
+            nf (quot (- n need) bs)
+            st2 (blocks kind st1 data need nf bs)]
+        (->State kind st2 (subs data (+ need (* nf bs)) n) total out)))))
+
+(defn finish Str [s: State]
+  (let [kind (:kind s) out (:out s) buf (:buf s)]
+    (if (= kind K-SHA3) (cc/keccak-finish (:st s) buf (bsize kind out) 6 out)
+      (md-out kind (md-finish kind (:st s) buf (- (:total s) (count buf))) out))))
+
+(defn- block-key Str [name: &Str key: &Str bs: Int]
+  (let [k (if (> (count key) bs) (let [[x ok] (digest name key)] x) (str key))]
+    (str k (subs ZEROS 0 (- bs (count k))))))
+
+(defn- hmac-states Values(State State Bool) [name: &Str key: &Str]
+  (let [[s0 ok] (start name)
+        [s1 ok1] (start name)]
+    (if (not ok) (values s0 s1 false)
+      (let [bs (block-size name)
+            k (block-key name key bs)]
+        (values (feed s0 (bytes/xor k IPAD)) (feed s1 (bytes/xor k OPAD)) true)))))
+
+(defn- hmac-words Vec(Int) [is: &State os: &State data: &Str]
+  (let [kind (:kind is)
+        inner (md-out kind (md-finish kind (:st is) data (:total is)) (:out is))]
+    (md-finish kind (:st os) inner (:total os))))
+
+(defn- finish-on Str [s: &State data: &Str]
+  (let [kind (:kind s) out (:out s)]
+    (if (= kind K-SHA3) (cc/keccak-finish (:st s) data (bsize kind out) 6 out)
+      (md-out kind (md-finish kind (:st s) data (:total s)) out))))
+
+(defn- hmac-with Str [is: &State os: &State data: &Str]
+  (let [inner (finish-on is data)] (finish-on os inner)))
+
+(defn hmac Values(Str Bool) [name: &Str key: &Str data: &Str]
+  (let [[is os ok] (hmac-states name key)]
+    (if ok (values (hmac-with is os data) true) (values "" false))))
+
+(defn- xor-words Vec(Int) [a: Vec(Int) b: &Vec(Int)]
+  (loop [i 0 v a] (if (>= i (count b)) v (let [x (bit-xor (nth v i) (nth b i))] (recur (+ i 1) (assoc v i x))))))
+
+(defn- pbkdf2-block Str [is: &State os: &State msg: &Str iters: Int]
+  (if (= (:kind is) K-SHA3)
+    (let [u1 (hmac-with is os msg)]
+      (loop [j 1 u u1 acc u1]
+        (if (>= j iters) acc
+          (let [u2 (hmac-with is os u)] (recur (+ j 1) u2 (bytes/xor acc u2))))))
+    (let [kind (:kind os) out (:out os)
+          w1 (hmac-words is os msg)]
+      (loop [j 1 w w1 acc w1]
+        (if (>= j iters) (md-out kind acc out)
+          (let [u (md-out kind w out)
+                w2 (hmac-words is os u)]
+            (recur (+ j 1) w2 (xor-words acc w2))))))))
+
+(defn pbkdf2 Values(Str Bool) [name: &Str pwd: &Str salt: &Str iters: Int n: Int]
+  (let [[is os ok] (hmac-states name pwd)]
+    (if (or (not ok) (<= iters 0) (<= n 0)) (values "" false)
+      (loop [i 1 out ""]
+        (if (>= (count out) n) (values (subs out 0 n) true)
+          (let [msg (str salt (bytes/pack i 4 true))
+                t (pbkdf2-block is os msg iters)]
+            (recur (+ i 1) (str out t))))))))

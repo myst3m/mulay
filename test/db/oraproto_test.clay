@@ -1,0 +1,43 @@
+(ns oraproto-test (:require [mulay.db.oraproto :as op] [mulay.db.orawire :as w]))
+
+;; 期待値は python-oracledb 26 (thin) と Oracle 23.26 のパケットの記録
+
+(defn- bytes Str [xs: Vec(Int)] (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (str out (chr (nth xs i)))))))
+(defn- rep Str [c: Str n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out c)))))
+
+(deftest connect
+  ;; 記録との違いは OOB を申し出ない (service options 0x0001、connect flags 2 = 0) ことだけ
+  (let [pk (op/connect-packets (rep "d" 296))]
+    (is (= (subs pk 0 74)
+           (bytes [0 74 0 0 1 0 0 0 1 63 1 44 12 1 32 0 32 0 79 152 0 0 0 1 1 40 0 74 0 0 0 0 132 132 0 0 0 0 0 0 0 0
+                   0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 32 0 0 0 32 0 0 0 0 0 0 0 0 1])))
+    (is (= (count pk) (+ 74 10 296)))))
+
+(deftest connect-short
+  (let [pk (op/connect-packets "(DESCRIPTION=x)")]
+    (is (= (count pk) (+ 74 15)))
+    (is (= (w/packet-len pk false) (+ 74 15)))))
+
+(deftest execute-select
+  (let [ex (op/->Exec 32865 0 "SELECT * FROM nothing_here" true 2 [] [] [] 0)]
+    (is (= (op/execute 7 24 ex)
+           (bytes [3 94 7 0 2 128 97 0 1 1 26 1 1 13 0 0 0 1 2 4 127 255 255 255 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0
+                   0 0 0 0 0 0 0 26 83 69 76 69 67 84 32 42 32 70 82 79 77 32 110 111 116 104 105 110 103 95 104 101 114
+                   101 1 1 0 0 0 0 0 0 1 1 0 2 128 0 0 0 0])))))
+
+(deftest simple-calls
+  (is (= (op/fetch 6 24 1 100) (bytes [3 5 6 0 1 1 1 100])))
+  (is (= (op/simple 11 24 op/FN-LOGOFF) (bytes [3 9 11 0])))
+  (is (= (op/simple 11 13 op/FN-LOGOFF) (bytes [3 9 11]))))
+
+(deftest values
+  (is (= (op/date-str (bytes [120 126 9 30 11 12 13 20 144 72 64])) "2026-09-30T10:11:12.345"))
+  (is (= (op/date-str (bytes [120 126 1 1 1 1 1])) "2026-01-01T00:00:00"))
+  (is (= (op/date-str (bytes [119 196 1 2 1 1 1])) "1996-01-02T00:00:00"))
+  (is (= (op/date-bytes "2026-09-30T01:02:03" true) (bytes [120 126 9 30 2 3 4])))
+  (is (= (op/date-bytes "2026-09-30T10:11:12.345" true) (bytes [120 126 9 30 11 12 13 20 144 72 64])))
+  (is (= (op/tz-name (bytes [120 126 9 30 2 12 13 0 0 0 0 29 60])) "GMT+09:00"))
+  (is (= (op/tz-name (bytes [120 126 1 1 1 1 1 0 0 0 0 20 60])) "GMT"))
+  (is (= (op/tz-name (bytes [120 126 1 1 1 1 1 0 0 0 0 17 30])) "GMT-03:30"))
+  (is (= (op/rowid-str 72111 0 3 0) "AAARmvAAAAAAAADAAA"))
+  (is (= (op/rowid-str 0 0 0 0) "")))

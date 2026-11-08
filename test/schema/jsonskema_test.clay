@@ -1,0 +1,36 @@
+(ns jsonskema-test (:require [mulay.lib.jsonskema :as jsk] [mulay.lib.yaml :as y] [clay.string :as str]))
+
+(defn- run Str [schema: Str inst: Str]
+  (let [[s se] (y/parse schema) [x xe] (y/parse inst)] (str/join "|" (jsk/validate s s x))))
+
+(deftest keyword-order-and-messages
+  (let [sc "{\"type\": \"object\", \"additionalProperties\": false, \"required\": [\"a\", \"b\"], \"properties\": {\"a\": {\"type\": \"integer\", \"maximum\": 3}, \"c\": {\"enum\": [1]}}}"]
+    (is (= (run sc "{\"a\": 1, \"b\": 2}") "/b false schema always fails"))
+    (is (= (run sc "{\"a\": 4, \"z\": 1}") "/z false schema always fails|required properties are missing: b|/a 4 is greater than maximum 3"))
+    (is (= (run sc "[1]") "expected type: object, actual: array"))
+    (is (= (run "{\"properties\": {\"c\": {\"enum\": [1]}}}" "{\"c\": 2}") "/c the instance is not equal to any enum values"))))
+
+(deftest strings-arrays-and-combinators
+  (is (= (run "{\"type\": \"string\", \"minLength\": 2, \"pattern\": \"^[a-z]+$\"}" "\"A\"") "actual string length 1 is lower than minLength 2|instance value did not match pattern ^[a-z]+$"))
+  (is (= (run "{\"type\": \"string\", \"maxLength\": 1, \"format\": \"date\"}" "\"2020-13-01\"") "actual string length 10 exceeds maxLength 1|instance does not match format 'date'"))
+  (is (= (run "{\"items\": {\"type\": \"string\"}, \"minItems\": 3, \"uniqueItems\": true}" "[\"x\", \"x\"]") "expected minimum items: 3, found only 2|the same array element occurs at positions 0, 1"))
+  (is (= (run "{\"anyOf\": [{\"type\": \"string\"}, {\"type\": \"integer\", \"minimum\": 3}]}" "2") "expected type: string, actual: integer|2 is lower than minimum 3"))
+  (is (= (run "{\"anyOf\": [{\"type\": \"string\"}, {\"type\": \"integer\"}]}" "2") ""))
+  (is (= (run "{\"not\": {\"type\": \"string\"}}" "\"s\"") "negated subschema did not fail"))
+  (is (= (run "{\"type\": \"number\", \"exclusiveMinimum\": 0.0, \"multipleOf\": 0.5}" "0") "0 is lower than or equal to minimum 0.0"))
+  (is (= (run "{\"type\": \"number\", \"multipleOf\": 0.5}" "0.7") "0.7 is not a multiple of 0.5"))
+  (is (= (run "{\"type\": \"integer\"}" "1.5") "expected type: integer, actual: number")))
+
+(deftest pattern-step-budget-is-shared-and-exhaustion-fails
+  (let [bad "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\""
+        items (loop [i 0 out "["] (if (>= i 40) (str out "]") (recur (+ i 1) (str out (if (= i 0) "" ",") bad))))
+        r1 (run "{\"items\": {\"pattern\": \"^(a+)+$\"}}" items)
+        r2 (run "{\"not\": {\"pattern\": \"^(a+)+$\"}}" bad)
+        r3 (run "{\"patternProperties\": {\"^(a+)+$\": false}}" (str "{" bad ": 1}"))]
+    (is (>= (str/index-of r1 "regex step limit exceeded") 0))
+    (is (>= (str/index-of r2 "regex step limit exceeded") 0))
+    (is (>= (str/index-of r3 "regex step limit exceeded") 0))))
+
+(deftest unique-items-reports-the-first-repeat
+  (is (= (run "{\"uniqueItems\": true}" "[1, 2, 3, 2, 1]") "the same array element occurs at positions 1, 3"))
+  (is (= (run "{\"uniqueItems\": true}" (str "[" (loop [i 0 o ""] (if (>= i 40000) o (recur (+ i 1) (str o (if (= i 0) "" ",") i)))) "]")) "")))

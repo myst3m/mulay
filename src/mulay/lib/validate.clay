@@ -1,0 +1,400 @@
+(ns mulay.lib.validate
+  (:require [mulay.lib.regex :as re] [mulay.lib.uni :as u] [mulay.lib.tlds :as tl] [clay.string :as str]))
+
+(defn- pat re/Pattern [s: &Str] (let [[p e] (re/compile s 0)] p))
+
+(def EMAIL-RE (pat "^(.+)@(\\S+)$"))
+(def IP-DOMAIN-RE (pat "^\\[(.*)\\]$"))
+(def USER-RE (pat "^(((\\\\.)|[^\\s\\p{Cntrl}\\(\\)<>@,;:'\\\\\\\"\\.\\[\\]]|')+|(\"(\\\\\"|[^\"])*\"))(\\.(((\\\\.)|[^\\s\\p{Cntrl}\\(\\)<>@,;:'\\\\\\\"\\.\\[\\]]|')+|(\"(\\\\\"|[^\"])*\")))*$"))
+(def DOMAIN-RE (pat "^(?:\\p{Alnum}(?>[\\p{Alnum}-]{0,61}\\p{Alnum})?\\.)+(\\p{Alpha}(?>[\\p{Alnum}-]{0,61}\\p{Alnum})?)\\.?$"))
+(def IPV4-RE (pat "^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$"))
+(def DIGITS-RE (pat "\\d{1,3}"))
+(def ID-CHECK-RE (pat "[^\\s/%]+"))
+
+(defn- full Vec(re/Match) [p: &re/Pattern s: &Str] (let [[ms e] (re/match-full p s)] (if (not= e "") [] ms)))
+
+(defn- matches? Bool [p: &re/Pattern s: &Str] (> (count (full p s)) 0))
+
+(defn utf16-len Int [s: &Str]
+  (loop [i 0 n 0]
+    (if (>= i (count s)) n
+      (let [[cp nxt] (u/decode-at s i)] (recur nxt (+ n (if (> cp 0xFFFF) 2 1)))))))
+
+(defn- ascii? Bool [s: &Str] (loop [i 0] (if (>= i (count s)) true (if (> (nth s i) 127) false (recur (+ i 1))))))
+
+(defn- index-from Int [s: &Str c: Int from: Int]
+  (loop [i from] (if (>= i (count s)) -1 (if (= (nth s i) c) i (recur (+ i 1))))))
+
+(defn- last-index Int [s: &Str c: Int]
+  (loop [i (- (count s) 1)] (if (< i 0) -1 (if (= (nth s i) c) i (recur (- i 1))))))
+
+(defn- count-byte Int [s: &Str c: Int]
+  (loop [i 0 n 0] (if (>= i (count s)) n (recur (+ i 1) (if (= (nth s i) c) (+ n 1) n)))))
+
+(defn- cmp Int [a: &Str b: &Str]
+  (let [n (if (< (count a) (count b)) (count a) (count b))]
+    (loop [i 0]
+      (if (>= i n) (- (count a) (count b))
+        (let [x (nth a i) y (nth b i)] (if (not= x y) (- x y) (recur (+ i 1))))))))
+
+(defn- lower-ascii Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)] (recur (+ i 1) (str out (chr (if (and (>= c 65) (<= c 90)) (+ c 32) c))))))))
+
+(defn- dot-cp? Bool [cp: Int] (or (= cp 46) (= cp 0x3002) (= cp 0xFF0E) (= cp 0xFF61)))
+
+(defn- mapped-to-nothing? Bool [cp: Int]
+  (or (= cp 0xAD) (= cp 0x34F) (= cp 0x1806) (and (>= cp 0x180B) (<= cp 0x180D)) (and (>= cp 0x200B) (<= cp 0x200D))
+      (= cp 0x2060) (and (>= cp 0xFE00) (<= cp 0xFE0F)) (= cp 0xFEFF)))
+
+(defn- prohibited? Bool [cp: Int]
+  (or (and (> cp 127) (or (u/space-char? cp) (u/java-whitespace? cp)))
+      (and (>= cp 0x80) (<= cp 0x9F)) (= cp 0x6DD) (= cp 0x70F) (= cp 0x180E) (and (>= cp 0x200C) (<= cp 0x200D))
+      (= cp 0x2028) (= cp 0x2029) (and (>= cp 0x2060) (<= cp 0x2063)) (and (>= cp 0x206A) (<= cp 0x206F)) (= cp 0xFEFF)
+      (and (>= cp 0xFFF9) (<= cp 0xFFFC)) (and (>= cp 0xE000) (<= cp 0xF8FF)) (and (>= cp 0xF0000) (<= cp 0x10FFFF))
+      (and (>= cp 0xD800) (<= cp 0xDFFF)) (and (>= cp 0xFDD0) (<= cp 0xFDEF)) (= (bit-and cp 0xFFFE) 0xFFFE)))
+
+(defn- pdigit Str [d: Int] (chr (if (< d 26) (+ d 97) (+ d 22))))
+
+(defn- adapt Int [delta0: Int npoints: Int first: Bool]
+  (let [d1 (if first (quot delta0 700) (quot delta0 2))
+        d2 (+ d1 (quot d1 npoints))
+        [d3 k] (loop [d d2 k 0] (if (> d 455) (recur (quot d 35) (+ k 36)) (values d k)))]
+    (+ k (quot (* 36 d3) (+ d3 38)))))
+
+(defn- put-delta Str [out0: Str q0: Int bias: Int]
+  (loop [k 36 q q0 out out0]
+    (let [t (cond (<= k bias) 1 (>= k (+ bias 26)) 26 :else (- k bias))]
+      (if (< q t) (str out (pdigit q))
+        (recur (+ k 36) (quot (- q t) (- 36 t)) (str out (pdigit (+ t (mod (- q t) (- 36 t))))))))))
+
+(defn- punycode Str [cps: &Vec(Int)]
+  (let [basic (loop [i 0 out ""] (if (>= i (count cps)) out (recur (+ i 1) (if (< (nth cps i) 128) (str out (chr (nth cps i))) out))))
+        b (count basic)
+        out0 (if (> b 0) (str basic "-") basic)]
+    (loop [n 128 delta 0 bias 72 h b out out0]
+      (if (>= h (count cps)) out
+        (let [m (loop [i 0 m 0x7FFFFFFF] (if (>= i (count cps)) m (let [c (nth cps i)] (recur (+ i 1) (if (and (>= c n) (< c m)) c m)))))
+              d0 (+ delta (* (- m n) (+ h 1)))
+              [d1 b1 h1 o1]
+              (loop [i 0 d d0 bi bias hh h o out]
+                (if (>= i (count cps)) (values d bi hh o)
+                  (let [c (nth cps i)]
+                    (cond (< c m) (recur (+ i 1) (+ d 1) bi hh o)
+                          (= c m) (let [o2 (put-delta o d bi)]
+                                    (recur (+ i 1) 0 (adapt d (+ hh 1) (= hh b)) (+ hh 1) o2))
+                          :else (recur (+ i 1) d bi hh o)))))]
+          (recur (+ m 1) (+ d1 1) b1 h1 o1))))))
+
+(defn- idn-label Values(Str Bool) [label: &Str]
+  (let [[dest ok]
+        (if (ascii? label) (values (str label) true)
+          (let [cps (u/cps label)
+                [mapped bad] (loop [i 0 acc: Vec(Int) [] bad false]
+                               (if (>= i (count cps)) (values acc bad)
+                                 (let [c (nth cps i)]
+                                   (cond (mapped-to-nothing? c) (recur (+ i 1) acc bad)
+                                         (prohibited? c) (values acc true)
+                                         :else (recur (+ i 1) (conj acc (u/lower-cp c)) bad)))))]
+            (if bad (values "" false) (values (u/from-cps mapped) true))))]
+    (cond (not ok) (values "" false)
+          (= (count dest) 0) (values "" false)
+          (ascii? dest) (values dest (<= (count dest) 63))
+          (str/starts-with? (lower-ascii (if (>= (count dest) 4) (subs dest 0 4) dest)) "xn--") (values "" false)
+          :else (let [a (str "xn--" (punycode (u/cps dest)))] (values a (<= (count a) 63))))))
+
+(defn idn-ascii Values(Str Bool) [s: &Str]
+  (let [cps (u/cps s)]
+    (if (and (= (count cps) 1) (dot-cp? (nth cps 0))) (values "." true)
+      (loop [i 0 start 0 out ""]
+        (if (> i (count cps)) (values out true)
+          (if (or (= i (count cps)) (dot-cp? (nth cps i)))
+            (if (and (= i (count cps)) (= start i) (> i 0)) (values out true)
+              (let [lab (u/from-cps (subvec cps start i))
+                    [a ok] (idn-label lab)]
+                (if (not ok) (values "" false)
+                  (recur (+ i 1) (+ i 1) (str out a (if (< i (count cps)) "." ""))))))
+            (recur (+ i 1) start out)))))))
+
+(defn- to-ascii Str [s: &Str]
+  (if (ascii? s) (str s) (let [[a ok] (idn-ascii s)] (if ok a (str s)))))
+
+(defn tld? Bool [t0: &Str]
+  (let [t1 (lower-ascii (to-ascii t0))
+        t (if (str/starts-with? t1 ".") (subs t1 1 (count t1)) t1)
+        tab tl/TLDS]
+    (loop [lo 0 hi (- (count tab) 1)]
+      (if (> lo hi) false
+        (let [mid (quot (+ lo hi) 2) c (cmp (nth tab mid) t)]
+          (cond (= c 0) true (< c 0) (recur (+ mid 1) hi) :else (recur lo (- mid 1))))))))
+
+(defn domain? Bool [d0: &Str]
+  (let [d (to-ascii d0)]
+    (if (> (utf16-len d) 253) false
+      (let [ms (full DOMAIN-RE d)]
+        (and (> (count ms) 0) (tld? (re/group (nth ms 0) d 1)))))))
+
+(defn email? Bool [s: &Str]
+  (if (str/ends-with? s ".") false
+    (let [ms (full EMAIL-RE s)]
+      (if (= (count ms) 0) false
+        (let [user (re/group (nth ms 0) s 1)
+              dom (re/group (nth ms 0) s 2)]
+          (and (<= (utf16-len user) 64) (matches? USER-RE user)
+               (let [ip (full IP-DOMAIN-RE dom)]
+                 (if (> (count ip) 0) (inet? (re/group (nth ip 0) dom 1)) (domain? dom)))))))))
+
+(defn- parse-dec Int [s: &Str]
+  (let [[n e] (parse-long (str s))] (if (= e "") n -1)))
+
+(defn inet4? Bool [s: &Str]
+  (let [ms (full IPV4-RE s)]
+    (and (> (count ms) 0)
+         (loop [g 1]
+           (if (> g 4) true
+             (let [o (re/group (nth ms 0) s g) n (parse-dec o)]
+               (if (or (= (count o) 0) (> n 255) (and (> (count o) 1) (= (nth o 0) 48))) false (recur (+ g 1)))))))))
+
+(defn- split-all Vec(Str) [s: &Str c: Int]
+  (loop [i 0 start 0 acc: Vec(Str) []]
+    (if (>= i (count s)) (conj acc (subs s start (count s)))
+      (if (= (nth s i) c) (recur (+ i 1) (+ i 1) (conj acc (subs s start i))) (recur (+ i 1) start acc)))))
+
+(defn- split-trim Vec(Str) [s: &Str c: Int]
+  (let [xs (split-all s c)]
+    (loop [n (count xs)] (if (and (> n 0) (= (count (nth xs (- n 1))) 0)) (recur (- n 1)) (subvec xs 0 n)))))
+
+(defn- parse-hex Int [s: &Str]
+  (let [cps (u/cps s)
+        neg (and (> (count cps) 0) (= (nth cps 0) 45))
+        st (if (and (> (count cps) 0) (or (= (nth cps 0) 45) (= (nth cps 0) 43))) 1 0)]
+    (if (>= st (count cps)) -1
+      (let [v (loop [i st v 0] (if (>= i (count cps)) v (let [d (u/char-digit (nth cps i) 16)] (if (< d 0) -1 (if (> v 0xFFFFFFF) -1 (recur (+ i 1) (+ (* v 16) d)))))))]
+        (if (< v 0) -1 (if neg (- 0 v) v))))))
+
+(defn- blank-or-null? Bool [s: &Str] (= (count (u/java-trim s)) 0))
+
+(defn inet6? Bool [s0: &Str]
+  (let [p1 (split-all s0 47)]
+    (cond
+      (> (count p1) 2) false
+      (and (= (count p1) 2) (or (not (matches? DIGITS-RE (nth p1 1))) (> (parse-dec (nth p1 1)) 128))) false
+      :else
+      (let [p2 (split-all (nth p1 0) 37)]
+        (cond
+          (> (count p2) 2) false
+          (and (= (count p2) 2) (not (matches? ID-CHECK-RE (nth p2 1)))) false
+          :else
+          (let [a (nth p2 0)
+                cz (str/includes? a "::")
+                fst (str/index-of a "::")
+                lst (str/last-index-of a "::")
+                sw (str/starts-with? a "::")
+                ew (str/ends-with? a "::")
+                es (str/ends-with? a ":")]
+            (cond
+              (and cz (not= fst lst)) false
+              (or (and (str/starts-with? a ":") (not sw)) (and es (not ew))) false
+              :else
+              (let [o0 (split-trim a 58)
+                    os (cond (not cz) o0 ew (conj o0 "") (and sw (> (count o0) 0)) (subvec o0 1 (count o0)) :else o0)]
+                (if (> (count os) 8) false
+                  (let [[ok valid]
+                        (loop [i 0 valid 0 empty 0]
+                          (if (>= i (count os)) (values true valid)
+                            (let [o (nth os i)]
+                              (if (blank-or-null? o)
+                                (if (> (+ empty 1) 1) (values false 0) (recur (+ i 1) (+ valid 1) (+ empty 1)))
+                                (if (and (= i (- (count os) 1)) (str/includes? o "."))
+                                  (if (inet4? o) (recur (+ i 1) (+ valid 2) 0) (values false 0))
+                                  (let [v (parse-hex o)]
+                                    (if (or (> (utf16-len o) 4) (< v 0) (> v 65535)) (values false 0) (recur (+ i 1) (+ valid 1) 0))))))))]
+                    (and ok (<= valid 8) (or (= valid 8) cz))))))))))))
+
+(defn inet? Bool [s: &Str]
+  (or (inet4? s) (inet6? s)))
+
+(defn- vcat Vec(Int) [a: Vec(Int) b: &Vec(Int)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- guava-v4 Values(Vec(Int) Bool) [cps: &Vec(Int)]
+  (if (not= (+ (loop [i 0 n 0] (if (>= i (count cps)) n (recur (+ i 1) (if (= (nth cps i) 46) (+ n 1) n)))) 1) 4) (values [] false)
+    (loop [k 0 start 0 acc: Vec(Int) []]
+      (if (>= k 4) (values acc true)
+        (let [end (loop [j start] (if (or (>= j (count cps)) (= (nth cps j) 46)) j (recur (+ j 1))))
+              len (- end start)]
+          (if (or (<= len 0) (> len 3) (and (> len 1) (= (nth cps start) 48))) (values [] false)
+            (let [v (loop [j start v 0] (if (>= j end) v (let [d (u/char-digit (nth cps j) 10)] (if (< d 0) -1 (recur (+ j 1) (+ (* v 10) d))))))]
+              (if (or (< v 0) (> v 255)) (values [] false) (recur (+ k 1) (+ end 1) (conj acc v))))))))))
+
+(defn- hex4 Str [v: Int]
+  (let [d "0123456789abcdef"]
+    (if (= v 0) "0"
+      (loop [x v out ""] (if (= x 0) out (recur (quot x 16) (str (subs d (mod x 16) (+ (mod x 16) 1)) out)))))))
+
+(defn- guava-v6? Bool [cps: &Vec(Int)]
+  (let [n (count cps)
+        colons (loop [i 0 c 0] (if (>= i n) c (recur (+ i 1) (if (= (nth cps i) 58) (+ c 1) c))))]
+    (if (or (< colons 2) (> colons 8)) false
+      (let [[skip dup] (loop [i 0 skip (- 8 (+ colons 1)) has false]
+                         (if (>= i (- n 1)) (values (if has skip -100) false)
+                           (if (and (= (nth cps i) 58) (= (nth cps (+ i 1)) 58))
+                             (if has (values 0 true)
+                               (recur (+ i 1) (+ skip 1 (if (= i 0) 1 0) (if (= i (- n 2)) 1 0)) true))
+                             (recur (+ i 1) skip has))))
+            has-skip (not= skip -100)]
+        (cond
+          dup false
+          (and (= (nth cps 0) 58) (not= (nth cps 1) 58)) false
+          (and (= (nth cps (- n 1)) 58) (not= (nth cps (- n 2)) 58)) false
+          (and has-skip (<= skip 0)) false
+          (and (not has-skip) (not= (+ colons 1) 8)) false
+          :else
+          (loop [start (if (= (nth cps 0) 58) 1 0)]
+            (if (>= start n) true
+              (let [end (loop [j start] (if (or (>= j n) (= (nth cps j) 58)) j (recur (+ j 1))))]
+                (if (= (nth cps start) 58) (recur (+ end 1))
+                  (let [len (- end start)]
+                    (if (or (<= len 0) (> len 4)) false (recur (+ end 1)))))))))))))
+
+(defn inet-address? Bool [s: &Str]
+  (let [cps (u/cps s)
+        n (count cps)
+        [has-colon has-dot pct bad]
+        (loop [i 0 hc false hd false]
+          (if (>= i n) (values hc hd -1 false)
+            (let [c (nth cps i)]
+              (cond (= c 46) (recur (+ i 1) hc true)
+                    (= c 58) (if hd (values hc hd -1 true) (recur (+ i 1) true hd))
+                    (= c 37) (values hc hd i false)
+                    (< (u/char-digit c 16) 0) (values hc hd -1 true)
+                    :else (recur (+ i 1) hc hd)))))]
+    (cond
+      bad false
+      has-colon
+      (let [[v6 ok]
+            (if has-dot
+              (let [lc (loop [i (- n 1)] (if (< i 0) -1 (if (= (nth cps i) 58) i (recur (- i 1)))))
+                    [q qok] (guava-v4 (subvec cps (+ lc 1) n))]
+                (if (not qok) (values [] false)
+                  (values (vcat (subvec cps 0 (+ lc 1))
+                                (u/cps (str (hex4 (+ (* (nth q 0) 256) (nth q 1))) ":" (hex4 (+ (* (nth q 2) 256) (nth q 3))))))
+                          true)))
+              (values cps true))
+            p2 (if has-dot -1 pct)]
+        (and ok (guava-v6? (if (>= p2 0) (subvec v6 0 p2) v6))))
+      has-dot (if (>= pct 0) false (let [[q ok] (guava-v4 cps)] ok))
+      :else false)))
+
+(def PROTOCOLS ["file" "ftp" "http" "https" "jar" "jmod" "jrt" "mailto"])
+
+(defn- known-protocol? Bool [p: &Str] (loop [i 0] (if (>= i (count PROTOCOLS)) false (if (= (nth PROTOCOLS i) p) true (recur (+ i 1))))))
+
+(defn- valid-protocol? Bool [cps: &Vec(Int)]
+  (and (> (count cps) 0) (u/letter? (nth cps 0))
+       (loop [i 1] (if (>= i (count cps)) true
+                     (let [c (nth cps i)] (if (or (u/letter-or-digit? c) (= c 46) (= c 43) (= c 45)) (recur (+ i 1)) false))))))
+
+(defn- java-parse-int Values(Int Bool) [cps: &Vec(Int)]
+  (let [n (count cps)
+        neg (and (> n 0) (= (nth cps 0) 45))
+        st (if (and (> n 0) (or (= (nth cps 0) 45) (= (nth cps 0) 43))) 1 0)]
+    (if (>= st n) (values 0 false)
+      (let [v (loop [i st v 0] (if (>= i n) v (let [d (u/char-digit (nth cps i) 10)] (if (< d 0) -1 (if (> v 214748364) -2 (recur (+ i 1) (+ (* v 10) d)))))))]
+        (cond (< v 0) (values 0 false)
+              (and (not neg) (> v 2147483647)) (values 0 false)
+              (and neg (> v 2147483648)) (values 0 false)
+              :else (values (if neg (- 0 v) v) true))))))
+
+(defn- jdk-v4? Bool [cps: &Vec(Int)]
+  (let [n (count cps)]
+    (if (or (= n 0) (> n 15)) false
+      (let [[ok cur v newo] (loop [i 0 cur 0 v 0 newo true]
+                              (if (>= i n) (values true cur v newo)
+                                (let [c (nth cps i)]
+                                  (if (= c 46)
+                                    (if (or newo (> v 255) (= cur 3)) (values false 0 0 true) (recur (+ i 1) (+ cur 1) 0 true))
+                                    (if (or (< c 48) (> c 57)) (values false 0 0 true)
+                                      (let [v2 (+ (* v 10) (- c 48))] (if (> v2 0xFFFFFFFFFF) (values false 0 0 true) (recur (+ i 1) cur v2 false))))))))]
+        (and ok (not newo) (< v (bit-shift-left 1 (* (- 4 cur) 8))))))))
+
+(defn- jdk-v6? Bool [cps0: &Vec(Int)]
+  (let [n0 (count cps0)
+        pc (loop [i 0] (if (>= i n0) -1 (if (= (nth cps0 i) 37) i (recur (+ i 1)))))]
+    (if (or (< n0 2) (= pc (- n0 1))) false
+      (let [n (if (>= pc 0) pc n0)
+            cps cps0
+            [i0 bad0] (if (= (nth cps 0) 58) (if (not= (nth cps 1) 58) (values 0 true) (values 1 false)) (values 0 false))]
+        (if bad0 false
+          (let [[ok j colonp saw]
+                (loop [i i0 curtok i0 j 0 colonp -1 saw false v 0]
+                  (if (>= i n) (if saw (if (> (+ j 2) 16) (values false j colonp saw) (values true (+ j 2) colonp false)) (values true j colonp saw))
+                    (let [c (nth cps i) d (u/char-digit c 16)]
+                      (cond
+                        (>= d 0) (let [v2 (+ (* v 16) d)] (if (> v2 0xFFFF) (values false j colonp saw) (recur (+ i 1) curtok j colonp true v2)))
+                        (= c 58) (cond (not saw) (if (not= colonp -1) (values false j colonp saw) (recur (+ i 1) (+ i 1) j j false 0))
+                                       (= (+ i 1) n) (values false j colonp saw)
+                                       (> (+ j 2) 16) (values false j colonp saw)
+                                       :else (recur (+ i 1) (+ i 1) (+ j 2) colonp false 0))
+                        (and (= c 46) (<= (+ j 4) 16))
+                        (let [ia4 (subvec cps curtok n)
+                              dots (loop [k 0 m 0] (if (>= k (count ia4)) m (recur (+ k 1) (if (= (nth ia4 k) 46) (+ m 1) m))))]
+                          (if (or (not= dots 3) (not (jdk-v4? ia4))) (values false j colonp saw) (values true (+ j 4) colonp false)))
+                        :else (values false j colonp saw)))))]
+            (and ok (if (not= colonp -1) (not= j 16) (= j 16)))))))))
+
+(defn- generic-parse-ok? Bool [spec0: &Str start0: Int limit0: Int]
+  (let [q (index-from spec0 63 0)
+        [spec limit] (if (and (>= start0 0) (< start0 limit0) (>= q 0) (< q limit0)) (values (subs spec0 0 q) q) (values (str spec0) limit0))
+        start start0
+        unc (and (<= start (- limit 4)) (= (nth spec start) 47) (= (nth spec (+ start 1)) 47) (= (nth spec (+ start 2)) 47) (= (nth spec (+ start 3)) 47))]
+    (if (or unc (not (and (<= start (- limit 2)) (= (nth spec start) 47) (= (nth spec (+ start 1)) 47)))) true
+      (let [s2 (+ start 2)
+            i1 (index-from spec 47 s2)
+            i (if (or (< i1 0) (> i1 limit)) (let [i2 (index-from spec 63 s2)] (if (or (< i2 0) (> i2 limit)) limit i2)) i1)
+            auth (subs spec s2 i)
+            at (index-from auth 64 0)
+            host (if (< at 0) auth (if (not= at (last-index auth 64)) "" (subs auth (+ at 1) (count auth))))]
+        (if (and (> (count host) 0) (= (nth host 0) 91))
+          (let [rb (index-from host 93 0)]
+            (if (<= rb 2) false
+              (and (jdk-v6? (u/cps (subs host 1 rb)))
+                   (or (= (count host) (+ rb 1))
+                       (and (= (nth host (+ rb 1)) 58)
+                            (or (= (count host) (+ rb 2))
+                                (let [[p ok] (java-parse-int (u/cps (subs host (+ rb 2) (count host))))] (and ok (>= p -1)))))))))
+          (let [c (index-from host 58 0)]
+            (if (or (< c 0) (= (count host) (+ c 1))) true
+              (let [[p ok] (java-parse-int (u/cps (subs host (+ c 1) (count host))))] (and ok (>= p -1))))))))))
+
+(defn- bang-slash Int [s: &Str]
+  (loop [i (- (count s) 1)]
+    (if (< i 0) -1
+      (if (and (= (nth s i) 33) (< i (- (count s) 1)) (= (nth s (+ i 1)) 47)) (+ i 1) (recur (- i 1))))))
+
+(defn url? Bool [spec: &Str]
+  (let [n (count spec)
+        limit (loop [l n] (if (and (> l 0) (<= (nth spec (- l 1)) 32)) (recur (- l 1)) l))
+        s0 (loop [s 0] (if (and (< s limit) (<= (nth spec s) 32)) (recur (+ s 1)) s))
+        s1 (if (and (<= (+ s0 4) n) (= (lower-ascii (subs spec s0 (+ s0 4))) "url:")) (+ s0 4) s0)
+        aref (and (< s1 n) (= (nth spec s1) 35))
+        [proto start] (if aref (values "" s1)
+                        (loop [i s1]
+                          (if (or (>= i limit) (= (nth spec i) 47)) (values "" s1)
+                            (if (= (nth spec i) 58)
+                              (let [cand (subs spec s1 i)]
+                                (if (valid-protocol? (u/cps cand)) (values (u/lower cand) (+ i 1)) (values "" s1)))
+                              (recur (+ i 1))))))]
+    (if (or (= proto "") (not (known-protocol? proto))) false
+      (let [h (index-from spec 35 start)
+            lim (if (>= h 0) h limit)]
+        (cond
+          (= proto "mailto")
+          (let [file (if (< start lim) (subs spec start lim) "")]
+            (and (> (count file) 0) (> (loop [i 0 k 0] (if (>= i (count file)) k (recur (+ i 1) (if (not= (nth file i) 32) (+ k 1) k)))) 0)))
+          (= proto "jar")
+          (let [absolute (and (>= n 4) (= (lower-ascii (subs spec 0 4)) "jar:"))
+                part (subs spec start lim)]
+            (and absolute
+                 (let [b (bang-slash part)] (and (>= b 0) (url? (subs part 0 (- b 1)))))))
+          :else (generic-parse-ok? spec start lim))))))

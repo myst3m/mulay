@@ -1,0 +1,339 @@
+(ns mulay.conn.sf_meta
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.mule.model :as m] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.rt.event :as ev] [mulay.lib.xml :as xml] [mulay.lib.numparse :as npz]
+            [mulay.conn.sf_core :as sc] [mulay.conn.sf_metatypes :as mt] [clay.base64 :as b64] [clay.string :as str]))
+
+(def MNS "http://soap.sforce.com/2006/04/metadata")
+(def OPS ["describe-metadata" "list-metadata" "read-metadata" "create-metadata" "update-metadata" "upsert-metadata"
+          "rename-metadata" "delete-metadata" "retrieve-metadata" "deploy-metadata"])
+(def BAD-FIELDS "Given fields contain at least one invalid/missing field.")
+(def API-CLASS "org.mule.extension.salesforce.api.metadata.")
+
+(defn- cls-meta v/Val [x: v/Val c: &Str] (v/->VMeta x [(v/field "class" (v/->VStr (str c)))]))
+(defn- alist v/Val [xs: Vec(v/Val)] (cls-meta (v/->VArr xs) "java.util.ArrayList"))
+
+(defn- envelope Str [token: &Str body: &Str]
+  (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?><soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns=\"" MNS "\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+       "<soapenv:Header><SessionHeader><sessionId>" (sc/xml-esc token) "</sessionId></SessionHeader></soapenv:Header><soapenv:Body>" body "</soapenv:Body></soapenv:Envelope>"))
+
+(defn- call-once Values(Vec(xml/XNode) Str Str) [s: &sc/Session api: &Str body: &Str]
+  (let [[st rb e] (sc/send "POST" (str (:instance s) "/services/Soap/m/" api) [(sc/hpair "Content-Type" "text/xml; charset=UTF-8") (sc/hpair "SOAPAction" "\"\"")] (envelope (:token s) body))]
+    (if (not= e "") (values [] "CONNECTIVITY" e)
+      (let [[doc pe] (xml/parse rb)]
+        (if (not= pe "") (values [] "CONNECTIVITY" (str "HTTP " st ": " pe))
+          (let [root (xml/doc-root doc)
+                f (sc/find-desc root "Fault")]
+            (if (> (count f) 0)
+              (values [] (sc/fault-type (sc/text-of (nth f 0) "faultcode")) (sc/text-of (nth f 0) "faultstring"))
+              (let [b (sc/find-desc root "Body")
+                    cs (if (= (count b) 0) [] (xml/child-elems (nth b 0)))]
+                (if (= (count cs) 0) (values [] "CONNECTIVITY" "empty SOAP body") (values [(nth cs 0)] "" ""))))))))))
+
+(defn- call Values(xml/XNode Vec(err/MErr)) [cache: &Atom cfg: &m/Config body: &Str]
+  (let [[s se] (sc/session cache cfg false)]
+    (if (not= se "") (values (xml/->XnText "") [(sc/session-err se)])
+      (let [api (sc/api-of cfg)
+            [r t e] (call-once s api body)]
+        (cond
+          (= t "") (values (nth r 0) [])
+          (= t "INVALID_SESSION")
+          (let [[s2 se2] (sc/session cache cfg true)]
+            (if (not= se2 "") (values (xml/->XnText "") [(sc/session-err se2)])
+              (let [[r2 t2 e2] (call-once s2 api body)]
+                (if (= t2 "") (values (nth r2 0) []) (values (xml/->XnText "") [(sc/sferr t2 e2)])))))
+          :else (values (xml/->XnText "") [(sc/sferr t e)]))))))
+
+(defn- class-of Str [type: &Str] (if (contains? mt/TYPES type) (get! mt/TYPES type) ""))
+
+(defn- spec Values(Str Vec(Str)) [cls: &Str]
+  (if (not (contains? mt/CLASSES cls)) (values "" [])
+    (let [s (get! mt/CLASSES cls)
+          k (str/index-of s "|")
+          fs (subs s (+ k 1) (count s))]
+      (values (subs s 0 k) (if (= fs "") [] (str/split fs ","))))))
+
+(defn- chain Vec(Str) [cls: &Str]
+  (loop [c (str cls) acc: Vec(Vec(Str)) []]
+    (if (or (= c "") (= c "E")) (loop [i (- (count acc) 1) out: Vec(Str) []] (if (< i 0) out (recur (- i 1) (cat-strs out (nth acc i)))))
+      (let [[sup fs] (spec c)] (recur sup (conj acc fs))))))
+
+(defn- chain-leaf-first Vec(Str) [cls: &Str]
+  (loop [c (str cls) out: Vec(Str) []]
+    (if (or (= c "") (= c "E")) out
+      (let [[sup fs] (spec c)] (recur sup (cat-strs out fs))))))
+
+(defn- cat-strs Vec(Str) [a: Vec(Str) b: &Vec(Str)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- fname Str [f: &Str] (subs f 0 (str/index-of f ":")))
+(defn- fkind Str [f: &Str] (subs f (+ (str/index-of f ":") 1) (count f)))
+(defn- xname Str [n: &Str] (if (str/starts-with? n "_") (subs n 1 (count n)) (str n)))
+
+(defn- enum-pairs Vec(Str) [cls: &Str]
+  (if (not (contains? mt/CLASSES cls)) []
+    (let [s (get! mt/CLASSES cls) body (subs s 2 (count s))] (if (= body "") [] (str/split body ",")))))
+
+(defn- enum-name Str [cls: &Str x: &Str]
+  (let [ps (enum-pairs cls)]
+    (loop [i 0] (if (>= i (count ps)) (str x)
+                  (let [p (nth ps i) k (str/index-of p "=")]
+                    (if (= (subs p 0 k) x) (subs p (+ k 1) (count p)) (recur (+ i 1))))))))
+
+(defn- enum-xml Str [cls: &Str x: &Str]
+  (let [ps (enum-pairs cls)]
+    (loop [i 0] (if (>= i (count ps)) (str x)
+                  (let [p (nth ps i) k (str/index-of p "=")]
+                    (if (= (subs p (+ k 1) (count p)) x) (subs p 0 k) (recur (+ i 1))))))))
+
+(defn- xsi-type Str [n: &xml/XNode]
+  (let [t (xml/attr n "http://www.w3.org/2001/XMLSchema-instance" "type" "")
+        k (str/index-of t ":")]
+    (if (< k 0) t (subs t (+ k 1) (count t)))))
+
+(defn- num-val v/Val [s: &Str]
+  (let [[n e] (num/parse-lit (str/trim s))] (if (= e "") (v/num-v n) (v/null-v))))
+
+(defn- one-val v/Val [n: &xml/XNode k: &Str]
+  (let [t (xml/text-content n)]
+    (cond
+      (or (= k "b") (= k "B")) (v/bool-v (= t "true"))
+      (or (= k "i") (= k "l") (= k "d") (= k "I") (= k "L") (= k "D")) (num-val t)
+      (str/starts-with? k "e:") (v/->VStr (enum-name (subs k 2 (count k)) t))
+      (str/starts-with? k "o:") (let [xt (xsi-type n)] (obj-val n (if (and (not= xt "") (contains? mt/CLASSES xt)) xt (subs k 2 (count k)))))
+      :else (if (= (xml/attr n "http://www.w3.org/2001/XMLSchema-instance" "nil" "") "true") (v/null-v) (v/->VStr t)))))
+
+(defn- default-val v/Val [k: &Str]
+  (cond (str/starts-with? k "a") (v/->VArr [])
+        (= k "b") (v/bool-v false)
+        (or (= k "i") (= k "l") (= k "d")) (v/int-v 0)
+        :else (v/null-v)))
+
+(defn obj-val v/Val [n: &xml/XNode cls: &Str]
+  (let [fs (chain-leaf-first cls)
+        kids (xml/child-elems n)
+        pairs (loop [i 0 acc: Vec(v/Field) []]
+                (if (>= i (count fs)) acc
+                  (let [f (nth fs i) nm (fname f) k (fkind f) xn (xname nm)
+                        els (loop [j 0 a: Vec(xml/XNode) []] (if (>= j (count kids)) a (recur (+ j 1) (if (= (xml/elem-local (nth kids j)) xn) (conj a (nth kids j)) a))))
+                        x (cond (= (count els) 0) (default-val k)
+                                (str/starts-with? k "a") (v/->VArr (loop [j 0 a: Vec(v/Val) []] (if (>= j (count els)) a (recur (+ j 1) (conj a (one-val (nth els j) (subs k 1 (count k))))))))
+                                :else (one-val (nth els 0) k))]
+                    (recur (+ i 1) (conj (conj acc (v/field (str nm "__is_set") (v/bool-v (> (count els) 0)))) (v/field nm x))))))]
+    (cls-meta (sc/hashmap-obj pairs) "java.util.HashMap")))
+
+(defn- put-val Values(Str Str) [out: Str tag: &Str k: &Str x: &v/Val]
+  (match (v/unmeta x)
+    (v/VNull) (values out "")
+    (v/VArr xs) (if (str/starts-with? k "a")
+                  (loop [i 0 o out] (if (>= i (count xs)) (values o "")
+                                      (let [[o2 e] (put-val o tag (subs k 1 (count k)) (nth xs i))] (if (not= e "") (values o2 e) (recur (+ i 1) o2)))))
+                  (values out "Invalid request data"))
+    (v/VObj fs) (let [c (cond (str/starts-with? k "ao:") (subs k 3 (count k)) (str/starts-with? k "o:") (subs k 2 (count k)) :else "")]
+                  (if (= c "") (values out "Invalid request data")
+                    (let [[body e] (fields-xml c fs)] (values (str out "<" tag ">" body "</" tag ">") e))))
+    _ (let [k1 (if (str/starts-with? k "a") (subs k 1 (count k)) (str k))
+            t (if (str/starts-with? k1 "e:") (enum-xml (subs k1 2 (count k1)) (sc/field-text x)) (sc/field-text x))]
+        (values (str out "<" tag ">" (sc/xml-esc t) "</" tag ">") ""))))
+
+(defn- fields-xml Values(Str Str) [cls: &Str fs: &Vec(v/Field)]
+  (let [ch (chain cls)
+        unknown (loop [i 0] (if (>= i (count fs)) ""
+                              (let [key (:name (:key (nth fs i)))]
+                                (if (loop [j 0] (if (>= j (count ch)) false (if (= (xname (fname (nth ch j))) key) true (recur (+ j 1))))) (recur (+ i 1)) key))))]
+    (if (not= unknown "") (values "" "Invalid request data")
+      (loop [j 0 out ""]
+        (if (>= j (count ch)) (values out "")
+          (let [f (nth ch j) xn (xname (fname f))
+                got (v/obj-get fs xn)]
+            (if (= (count got) 0) (recur (+ j 1) out)
+              (let [[o e] (put-val out xn (fkind f) (nth got 0))] (if (not= e "") (values o e) (recur (+ j 1) o))))))))))
+
+(defn- objects-xml Values(Str Vec(err/MErr)) [cls: &Str objs: &v/Val]
+  (let [xs (match (v/unmeta objs) (v/VArr a) a (v/VNull) [] _ [objs])]
+    (loop [i 0 out ""]
+      (if (>= i (count xs)) (values out [])
+        (match (v/unmeta (nth xs i))
+          (v/VObj fs) (let [[body e] (fields-xml cls fs)]
+                        (if (not= e "") (values "" [(sc/sferr "INVALID_INPUT" e)])
+                          (recur (+ i 1) (str out "<metadata xsi:type=\"" cls "\">" body "</metadata>"))))
+          _ (values "" [(sc/sferr "INVALID_INPUT" "Invalid request data")]))))))
+
+(defn- save-result v/Val [r: &xml/XNode full: Bool]
+  (cls-meta (sc/obj-in ["fullName" "success" "id" "errors"]
+                       [(if full (sc/sval r "fullName") (v/null-v)) (sc/bval r "success") (v/null-v) (sc/errors-val r)])
+            (str API-CLASS "MetadataResult")))
+
+(defn- upsert-result v/Val [r: &xml/XNode]
+  (cls-meta (sc/obj-in ["created" "fullName" "success" "id" "errors"]
+                       [(v/bool-v false) (sc/sval r "fullName") (sc/bval r "success") (v/null-v) (sc/errors-val r)])
+            (str API-CLASS "UpsertMetadataResult")))
+
+(defn- results v/Val [resp: &xml/XNode kind: Int]
+  (let [rs (sc/kids resp "result")]
+    (alist (loop [i 0 acc: Vec(v/Val) []]
+             (if (>= i (count rs)) acc
+               (let [r (nth rs i)
+                     x (cond (= kind 0) (save-result r true) (= kind 1) (save-result r false) (= kind 2) (upsert-result r) :else (file-props r))]
+                 (recur (+ i 1) (conj acc x))))))))
+
+(defn- read-val v/Val [resp: &xml/XNode cls: &Str]
+  (let [res (sc/kid resp "result") rr (if (= (count res) 0) resp (nth res 0))
+        recs (sc/kids rr "records")]
+    (alist (loop [i 0 acc: Vec(v/Val) []]
+             (if (>= i (count recs)) acc
+               (let [n (nth recs i)
+                     xt (xsi-type n)]
+                 (recur (+ i 1) (if (sc/xnil? n) acc (conj acc (obj-val n (if (contains? mt/CLASSES xt) xt cls)))))))))))
+
+(defn- rename-val v/Val [resp: &xml/XNode]
+  (let [res (sc/kid resp "result")] (if (= (count res) 0) (v/null-v) (save-result (nth res 0) true))))
+
+(defn- describe-val v/Val [resp: &xml/XNode]
+  (let [rr (let [r (sc/kid resp "result")] (if (= (count r) 0) resp (nth r 0)))
+        os (sc/kids rr "metadataObjects")
+        objs (loop [i 0 acc: Vec(v/Val) []]
+               (if (>= i (count os)) acc
+                 (let [o (nth os i)]
+                   (recur (+ i 1) (conj acc (cls-meta (sc/obj-in ["xmlName" "childXmlNames" "suffix" "inFolder" "directoryName" "metaFile"]
+                                                                 [(sc/sval o "xmlName") (sc/texts o "childXmlNames") (sc/sval o "suffix") (sc/bval o "inFolder")
+                                                                  (sc/sval o "directoryName") (sc/bval o "metaFile")])
+                                                      (str API-CLASS "DescribeMetadataResult$DescribeMetadataObject")))))))]
+    (cls-meta (sc/obj-in ["metadataObjects" "organizationNamespace" "partialSaveAllowed" "testRequired"]
+                         [(alist objs) (v/->VStr (sc/text-of rr "organizationNamespace")) (sc/bval rr "partialSaveAllowed") (sc/bval rr "testRequired")])
+              (str API-CLASS "DescribeMetadataResult"))))
+
+(defn- file-props v/Val [r: &xml/XNode]
+  (let [lm (sc/ldt-utc (sc/text-of r "lastModifiedDate"))
+        lms (match lm (v/VNull) (v/null-v) _ (let [[s ok] (v/temporal-str lm)] (v/->VStr s)))]
+    (cls-meta (sc/obj-in ["createdByName" "manageableState" "fileName" "lastModifiedDate" "fullName" "type" "namespacePrefix"
+                          "createdDate" "createdBy" "lastModifiedById" "lastModifiedByName" "id"]
+                         [(sc/sval r "createdByName") (sc/sval r "manageableState") (sc/sval r "fileName") lms (sc/sval r "fullName")
+                          (sc/sval r "type") (sc/sval r "namespacePrefix") (sc/ldt-utc (sc/text-of r "createdDate")) (sc/sval r "createdById")
+                          (sc/sval r "lastModifiedById") (sc/sval r "createdByName") (sc/sval r "id")])
+              (str API-CLASS "FileProperties"))))
+
+(defn- names-xml Str [names: &v/Val tag: &Str]
+  (let [xs (match (v/unmeta names) (v/VArr a) a (v/VNull) [] _ [names])]
+    (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (str out "<" tag ">" (sc/xml-esc (sc/field-text (nth xs i))) "</" tag ">"))))))
+
+(defn- await-done Values(xml/XNode Vec(err/MErr)) [cache: &Atom cfg: &m/Config check: &Str]
+  (loop [n 0 wait 1000]
+    (if (> n 50) (values (xml/->XnText "") [(err/mk "MULE" "RETRY_EXHAUSTED" "Request has been sent to Salesforce but it did not finish in allowed time. You can manually check for changes.")])
+      (let [z (sleep-ms (if (> wait 16000) 16000 wait))
+            [r x] (call cache cfg check)]
+        (if (> (count x) 0) (values r x)
+          (let [res (sc/kid r "result") rr (if (= (count res) 0) r (nth res 0))]
+            (if (= (sc/text-of rr "done") "true") (values rr []) (recur (+ n 1) (* wait 2)))))))))
+
+(defn- package-xml Str [pkg: &Str api: &Str]
+  (let [[doc e] (xml/parse pkg)]
+    (if (not= e "") ""
+      (let [ts (sc/find-desc (xml/doc-root doc) "types")]
+        (loop [i 0 out "<unpackaged>"]
+          (if (>= i (count ts)) (str out "<version>" api "</version></unpackaged>")
+            (let [t (nth ts i)
+                  ms (sc/kids t "members")
+                  mx (loop [j 0 o ""] (if (>= j (count ms)) o (recur (+ j 1) (str o "<types-member>" (sc/xml-esc (xml/text-content (nth ms j))) "</types-member>"))))]
+              (recur (+ i 1) (str out "<types>" (str/replace mx "types-member" "members") "<name>" (sc/xml-esc (sc/text-of t "name")) "</name></types>")))))))))
+
+(defn- list-strs Vec(Str) [x: &v/Val] (match (v/unmeta x) (v/VArr xs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (sc/field-text (nth xs i)))))) (v/VNull) [] _ [(sc/field-text x)]))
+
+(defn- unpackaged-bytes Values(Str Str) [c: &conn/OpCall]
+  (let [p (conn/param (:params c) "unpackaged")]
+    (if (= (count p) 0) (values "" "")
+      (match (nth p 0)
+        (m/PLit s) (values (str s) "")
+        _ (let [[t e] ((:eval-tv c) (nth p 0) (:event c))] (if (not= e "") (values "" e) (ev/bytes t)))))))
+
+(defn- run-retrieve conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config api: &Str]
+  (let [[pkv pe] (sc/child-val c "package-names")
+        [sfv se] (sc/child-val c "specific-files")
+        [up ue] (unpackaged-bytes c)
+        pk (if (> (count pe) 0) [] (if (= (count (conn/param (:exprs c) "package-names")) 0) [] (list-strs pkv)))
+        sf (if (> (count se) 0) [] (if (= (count (conn/param (:exprs c) "specific-files")) 0) [] (list-strs sfv)))]
+    (cond
+      (not= ue "") (conn/fail-result (err/mk "MULE" "EXPRESSION" ue))
+      (and (> (count sf) 0) (> (count pk) 0)) (conn/fail-result (err/mk "MULE" "UNKNOWN" "If a value is specified for specific files, packageNames must be set to null"))
+      :else
+      (let [req (str "<retrieve><retrieveRequest><apiVersion>" api "</apiVersion>"
+                     (loop [i 0 o ""] (if (>= i (count pk)) o (recur (+ i 1) (str o "<packageNames>" (sc/xml-esc (nth pk i)) "</packageNames>"))))
+                     (if (> (count sf) 0) "<singlePackage>true</singlePackage>" "")
+                     (loop [i 0 o ""] (if (>= i (count sf)) o (recur (+ i 1) (str o "<specificFiles>" (sc/xml-esc (nth sf i)) "</specificFiles>"))))
+                     (if (= up "") "" (package-xml up api))
+                     "</retrieveRequest></retrieve>")
+            [r x] (call cache cfg req)]
+        (if (> (count x) 0) (conn/fail-result (nth x 0))
+          (let [id (let [res (sc/kid r "result")] (if (= (count res) 0) "" (sc/text-of (nth res 0) "id")))
+                [rr rx] (await-done cache cfg (str "<checkRetrieveStatus><asyncProcessId>" (sc/xml-esc id) "</asyncProcessId><includeZip>true</includeZip></checkRetrieveStatus>"))]
+            (cond
+              (> (count rx) 0) (conn/fail-result (nth rx 0))
+              (= (sc/text-of rr "status") "Failed") (conn/fail-result (err/mk "MULE" "UNKNOWN" (str (sc/text-of rr "errorStatusCode") " msg: " (sc/text-of rr "errorMessage"))))
+              :else (let [[zip ze] (b64/decode (sc/text-of rr "zipFile"))]
+                      (if (not= ze "") (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "retrieve: bad zipFile: " ze)))
+                        (conn/ok-result (ev/tv-raw zip "application/xml") (ev/tv-null)))))))))))
+
+(defn- deploy-flag Str [n: &xml/XNode k: &Str d: &Str]
+  (let [x (xml/attr n "" k d)] (if (or (= x "true") (= x "false")) x (str d))))
+
+(defn- run-deploy conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config]
+  (let [el (conn/child-elem (:children c) "deploy-metadata-request")]
+    (if (= (count el) 0) (conn/fail-result (sc/sferr "INVALID_INPUT" "Deploy Metadata request should not be null"))
+      (let [n (nth el 0)
+            [zt zx] (conn/child-tv c "deploy-metadata-request@stream")
+            [zip ze] (if (= (count zt) 0) (values "" "") (ev/bytes (nth zt 0)))]
+        (cond
+          (> (count zx) 0) (conn/fail-result (nth zx 0))
+          (not= ze "") (conn/fail-result (err/mk "MULE" "EXPRESSION" ze))
+          (= zip "") (conn/fail-result (sc/sferr "INVALID_INPUT" "Input Stream cannot be null"))
+          :else
+          (let [req (str "<deploy><ZipFile>" (b64/encode zip) "</ZipFile><DeployOptions><ignoreWarnings>" (deploy-flag n "ignoreWarnings" "false")
+                         "</ignoreWarnings><performRetrieve>false</performRetrieve><purgeOnDelete>" (deploy-flag n "purgeOnDelete" "false")
+                         "</purgeOnDelete><rollbackOnError>" (deploy-flag n "rollbackOnError" "true") "</rollbackOnError></DeployOptions></deploy>")
+                [r x] (call cache cfg req)]
+            (if (> (count x) 0) (conn/fail-result (nth x 0))
+              (let [id (let [res (sc/kid r "result")] (if (= (count res) 0) "" (sc/text-of (nth res 0) "id")))
+                    [rr rx] (await-done cache cfg (str "<checkDeployStatus><asyncProcessId>" (sc/xml-esc id) "</asyncProcessId><includeDetails>false</includeDetails></checkDeployStatus>"))]
+                (cond
+                  (> (count rx) 0) (conn/fail-result (nth rx 0))
+                  (and (not= (sc/text-of rr "success") "true") (not= (sc/text-of rr "errorStatusCode") ""))
+                  (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Request has been finished with errors. ErrorCode: " (sc/text-of rr "errorStatusCode") " msg: " (sc/text-of rr "errorMessage"))))
+                  (not= (sc/text-of rr "success") "true") (conn/fail-result (err/mk "MULE" "UNKNOWN" "The files were not successfully deployed"))
+                  :else (conn/keep-result c))))))))))
+
+(defn run conn/OpResult [cache: &Atom c: &conn/OpCall cfg: &m/Config]
+  (let [op (:op c)
+        [type tx] (conn/attr-str c "type" "")
+        cls (class-of type)
+        api (sc/api-of cfg)]
+    (cond
+      (= op "retrieve-metadata") (run-retrieve cache c cfg (sc/api-of cfg))
+      (= op "deploy-metadata") (run-deploy cache c cfg)
+      (= op "describe-metadata")
+      (let [[r x] (call cache cfg (str "<describeMetadata><asOfVersion>" api "</asOfVersion></describeMetadata>"))]
+        (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (describe-val r))))
+      (= cls "") (conn/fail-result (sc/sferr "INVALID_INPUT" BAD-FIELDS))
+      (= op "list-metadata")
+      (let [[r x] (call cache cfg (str "<listMetadata><queries><type>" cls "</type></queries><asOfVersion>" api "</asOfVersion></listMetadata>"))]
+        (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (results r 3))))
+      (= op "read-metadata")
+      (let [[names ne] (sc/child-val c "full-names")]
+        (if (> (count ne) 0) (conn/fail-result (nth ne 0))
+          (let [[r x] (call cache cfg (str "<readMetadata><type>" cls "</type>" (names-xml names "fullNames") "</readMetadata>"))]
+            (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (read-val r cls))))))
+      (or (= op "create-metadata") (= op "update-metadata") (= op "upsert-metadata"))
+      (let [[objs oe] (sc/child-val c "objects")
+            [body be] (if (> (count oe) 0) (values "" oe) (objects-xml cls objs))
+            call-name (cond (= op "create-metadata") "createMetadata" (= op "update-metadata") "updateMetadata" :else "upsertMetadata")]
+        (if (> (count be) 0) (conn/fail-result (nth be 0))
+          (let [[r x] (call cache cfg (str "<" call-name ">" body "</" call-name ">"))]
+            (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (results r (if (= op "upsert-metadata") 2 0)))))))
+      (= op "rename-metadata")
+      (let [[old oe] (conn/attr-str c "oldFullName" "")
+            [new ne] (conn/attr-str c "newFullName" "")
+            [r x] (call cache cfg (str "<renameMetadata><type>" cls "</type><oldFullName>" (sc/xml-esc old) "</oldFullName><newFullName>" (sc/xml-esc new) "</newFullName></renameMetadata>"))]
+        (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (rename-val r))))
+      (= op "delete-metadata")
+      (let [[names ne] (sc/child-val c "full-names")]
+        (if (> (count ne) 0) (conn/fail-result (nth ne 0))
+          (let [[r x] (call cache cfg (str "<deleteMetadata><type>" cls "</type>" (names-xml names "fullNames") "</deleteMetadata>"))]
+            (if (> (count x) 0) (conn/fail-result (nth x 0)) (sc/java (results r 1))))))
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation salesforce:" op))))))

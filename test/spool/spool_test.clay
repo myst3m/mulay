@@ -1,0 +1,94 @@
+(ns spool-test (:require [mulay.lib.spool :as sp] [mulay.lib.fs :as fs] [clay.string :as str]))
+
+(defn- path-of Str [dir: &Str name: Str] (let [z (fs/mkdirs dir)] (fs/join dir name)))
+
+(defn- feed sp/Spool [s0: sp/Spool parts: Vec(Str)]
+  (loop [i 0 s s0] (if (>= i (count parts)) s (let [[s2 e] (sp/add s (nth parts i))] (recur (+ i 1) s2)))))
+
+(defn- read-all Str [s: &sp/Spool step: Int]
+  (loop [off 0 out ""]
+    (let [[piece e] (sp/read-at s off step)]
+      (if (or (not= e "") (= (count piece) 0)) out (recur (+ off (count piece)) (str out piece))))))
+
+(deftest small-bodies-stay-in-memory
+  (let [dir "target/spool-test-1"
+        p (path-of dir "a")
+        s (feed (sp/new p 8) ["abc" "defgh"])
+        made (fs/exists? p)
+        z (fs/remove-tree dir)]
+    (is (= (sp/size s) 8))
+    (is (sp/in-memory? s))
+    (is (not made))
+    (is (= (read-all s 3) "abcdefgh"))
+    (is (= (read-all s 100) "abcdefgh"))))
+
+(deftest past-the-limit-goes-to-the-file
+  (let [dir "target/spool-test-2"
+        p (path-of dir "b")
+        s (feed (sp/new p 8) ["abc" "defgh" "i" "jklmnopqrstuvwxyz"])
+        d (sp/delete s)
+        left (fs/exists? p)
+        z (fs/remove-tree dir)]
+    (is (= (sp/size s) 26))
+    (is (not (sp/in-memory? s)))
+    (is (not left))))
+
+(deftest a-spool-reads-again-from-any-offset
+  (let [dir "target/spool-test-3"
+        p (path-of dir "c")
+        s (feed (sp/new p 4) ["0123456789" "abcdef"])
+        a (read-all s 5)
+        b (read-all s 7)
+        [mid e] (sp/read-at s 8 4)
+        [past e2] (sp/read-at s 16 4)
+        d (sp/delete s)
+        z (fs/remove-tree dir)]
+    (is (= a "0123456789abcdef"))
+    (is (= b a))
+    (is (= mid "89ab"))
+    (is (= past ""))))
+
+(deftest one-piece-crossing-the-limit-and-empty-pieces
+  (let [dir "target/spool-test-4"
+        p (path-of dir "d")
+        s (feed (sp/new p 4) ["" "0123456789" ""])
+        a (read-all s 3)
+        e (feed (sp/new (path-of dir "e") 4) [])
+        d (sp/delete s)
+        z (fs/remove-tree dir)]
+    (is (= a "0123456789"))
+    (is (= (sp/size e) 0))
+    (is (sp/in-memory? e))
+    (is (= (read-all e 3) ""))))
+
+(deftest an-unwritable-place-is-an-error
+  (let [[s e] (sp/add (sp/new "/nonexistent-dir/x" 2) "abcdef")]
+    (is (not= e ""))))
+
+(deftest an-existing-file-is-read-in-place-and-kept
+  (let [dir "target/spool-test-5"
+        p (path-of dir "f")
+        w (write-file p "hello, file")
+        [s e] (sp/of-file p)
+        a (read-all s 4)
+        b (read-all s 100)
+        d (sp/delete s)
+        [s2 e2] (sp/of-file (path-of dir "missing"))
+        kept (fs/exists? p)
+        z (fs/remove-tree dir)]
+    (is (= e ""))
+    (is (= (sp/size s) 11))
+    (is (not (sp/in-memory? s)))
+    (is (= a "hello, file"))
+    (is (= b a))
+    (is kept)
+    (is (not= e2 ""))))
+
+(deftest the-spool-file-is-private
+  (let [dir "target/spool-test-private"
+        p (path-of dir "p")
+        s (feed (sp/new p 4) ["abcdefgh"])
+        m (fs/perm p)
+        d (sp/delete s)
+        z (fs/remove-tree dir)]
+    (is (= m 384))))

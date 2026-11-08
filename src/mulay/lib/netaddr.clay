@@ -1,0 +1,59 @@
+(ns mulay.lib.netaddr (:require [clay.string :as str] [clay.net :as net]))
+
+(defn- in4? Bool [b: &Vec(Int) a0: Int a1: Int bits: Int]
+  (let [x (+ (* (nth b 0) 256) (nth b 1))
+        y (+ (* a0 256) a1)
+        shift (- 16 bits)]
+    (= (bit-shift-right x shift) (bit-shift-right y shift))))
+
+(defn- internal4? Bool [b: &Vec(Int)]
+  (or (= (nth b 0) 0) (= (nth b 0) 10) (= (nth b 0) 127) (>= (nth b 0) 224)
+      (in4? b 100 64 10) (in4? b 169 254 16) (in4? b 172 16 12) (in4? b 192 168 16) (in4? b 198 18 15)
+      (and (= (nth b 0) 192) (= (nth b 1) 0) (= (nth b 2) 0))))
+
+(defn- zeros? Bool [b: &Vec(Int) from: Int to: Int]
+  (loop [i from] (if (>= i to) true (if (= (nth b i) 0) (recur (+ i 1)) false))))
+
+(defn- tail4 Vec(Int) [b: &Vec(Int) at: Int] [(nth b at) (nth b (+ at 1)) (nth b (+ at 2)) (nth b (+ at 3))])
+
+(defn- internal6? Bool [b: &Vec(Int)]
+  (cond
+    (zeros? b 0 12) (or (zeros? b 12 16) (internal4? (tail4 b 12)))
+    (and (zeros? b 0 10) (= (nth b 10) 255) (= (nth b 11) 255)) (internal4? (tail4 b 12))
+    (and (= (nth b 0) 0) (= (nth b 1) 100) (= (nth b 2) 255) (= (nth b 3) 155) (zeros? b 4 12)) (internal4? (tail4 b 12))
+    (and (= (nth b 0) 32) (= (nth b 1) 2)) (internal4? (tail4 b 2))
+    (= (bit-and (nth b 0) 254) 252) true
+    (and (= (nth b 0) 254) (= (bit-and (nth b 1) 192) 128)) true
+    (= (nth b 0) 255) true
+    :else false))
+
+(defn internal? Bool [b: &Vec(Int)]
+  (cond (= (count b) 4) (internal4? b)
+        (= (count b) 16) (internal6? b)
+        :else true))
+
+(defn- hex Str [n: Int]
+  (let [d "0123456789abcdef"]
+    (loop [x n out ""]
+      (let [o (str (subs d (bit-and x 15) (+ (bit-and x 15) 1)) out)]
+        (if (< x 16) o (recur (bit-shift-right x 4) o))))))
+
+(defn url-host Str [b: &Vec(Int)]
+  (if (= (count b) 4) (str (nth b 0) "." (nth b 1) "." (nth b 2) "." (nth b 3))
+    (loop [i 0 out "["]
+      (if (>= i 16) (str out "]")
+        (recur (+ i 2) (str out (if (= i 0) "" ":") (hex (+ (* (nth b i) 256) (nth b (+ i 1))))))))))
+
+(defn- bare Str [host: &Str]
+  (if (and (str/starts-with? host "[") (str/ends-with? host "]")) (subs host 1 (- (count host) 1)) (str host)))
+
+(target-when "wasm"
+(do
+(defn resolve Values(Vec(Vec(Int)) Str) [host: &Str] (values [] (str host ": no name resolution on wasm"))))
+(do
+(defn resolve Values(Vec(Vec(Int)) Str) [host: &Str]
+  (let [h (bare host)
+        [as e] (net/resolve h)]
+    (cond (not= e "") (values [] e)
+          (= (count as) 0) (values [] (str h ": no address"))
+          :else (values (mapv (fn Vec(Int) [a: net/IpAddr] (:ip a)) as) ""))))))

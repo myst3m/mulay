@@ -1,0 +1,51 @@
+(ns props-file-test (:require [clay.io :as io] [mulay.mule.props :as props] [mulay.mule.model :as m] [mulay.lib.res :as res]))
+
+;; <configuration-properties file> (props/load-decls)。実 Mule 4.11.3 は、資源に無い絶対パスのファイルも読む
+;; (k8s の Secret をファイルで付けて、file="${keys.file}" で読む使い方。2026-10-12 に実 Mule で確かめた)。
+
+(defn- decl Vec(props/PropDecl) [file: Str]
+  [(props/->PropDecl "file" file "" 3 [])])
+
+(defn- no-over Vec(m/Param) [] (let [e: Vec(m/Param) []] e))
+
+(defn- loaded Values(props/Props Vec(m/Diag)) [res-name: Str res-text: Str file: Str]
+  (props/load-decls (props/props-new (no-over) false "app" (res/res-mem [res-name] [res-text])) (decl file) "app.xml"))
+
+(defn- value-of Str [p: &props/Props k: &Str] (let [[v ok] (props/lookup p k)] (if ok v "<none>")))
+
+(defn- tmp-file Str [name: Str text: Str]
+  (let [path (str "/tmp/mulay-props-file-test-" name)
+        e (write-file path text)]
+    path))
+
+(deftest absolute-path-outside-the-resources-is-read
+  (let [path (tmp-file "abs.properties" "api.key=s3cret\nother=x\n")
+        [p errs] (loaded "config.yaml" "a: 1\n" path)
+        z (io/remove path)]
+    (is (= (count errs) 0))
+    (is (= (value-of p "api.key") "s3cret"))
+    (is (= (value-of p "other") "x"))))
+
+(deftest relative-name-is-still-a-resource
+  (let [[p errs] (loaded "keys.properties" "api.key=from-res\n" "keys.properties")]
+    (is (= (count errs) 0))
+    (is (= (value-of p "api.key") "from-res"))))
+
+(deftest missing-absolute-file-is-reported
+  (let [[p errs] (loaded "config.yaml" "a: 1\n" "/tmp/mulay-props-file-test-none.properties")]
+    (is (= (count errs) 1))
+    (is (= (m/diag-str (nth errs 0)) "app.xml:3: configuration-properties: file not found: /tmp/mulay-props-file-test-none.properties"))))
+
+(deftest app-home-is-the-resources-home
+  (let [[cwd ce] (io/cwd)
+        pd (props/props-new (no-over) false "app" (res/res-dir "test/fixtures"))
+        pa (props/props-new (no-over) false "app" (res/res-dir (str cwd "/test")))
+        pj (props/props-new (no-over) false "app" (res/with-home (res/res-mem ["a"] ["x"]) "/srv/apps/demo"))
+        pn (props/props-new (no-over) false "app" (res/res-mem ["a"] ["x"]))
+        po (props/props-new [(m/->Param "app.home" (m/->PLit "/mine"))] false "app" (res/res-dir "test"))]
+    (is (= (value-of pd "app.home") (str cwd "/test/fixtures")))
+    (is (= (value-of pa "app.home") (str cwd "/test")))
+    (is (= (value-of pj "app.home") "/srv/apps/demo"))
+    (is (= (value-of pn "app.home") "<none>"))
+    (is (= (value-of po "app.home") "/mine"))
+    (is (= (props/origin pd "app.home") "built-in"))))

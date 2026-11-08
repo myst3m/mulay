@@ -1,0 +1,115 @@
+(ns mulay.dw.lib.diff
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.fmt.registry :as reg]))
+
+(def M "dw::util::Diff")
+
+(defrecord D [matches: Bool diffs: Vec(v/Val)])
+
+(defn- match-d D [] (->D true []))
+(defn- diff-d D [expected: Str actual: Str path: Str]
+  (->D false [(v/->VObj [(v/field "expected" (v/->VStr expected)) (v/field "actual" (v/->VStr actual)) (v/field "path" (v/->VStr path))])]))
+(defn- merge-d D [l: &D r: &D]
+  (->D (and (:matches l) (:matches r))
+       (loop [i 0 acc (:diffs l)] (if (>= i (count (:diffs r))) acc (recur (+ i 1) (conj acc (nth (:diffs r) i)))))))
+
+(defn- write-dw Str [x: &v/Val]
+  (let [[s e] (reg/write-fmt "application/dw" [] x)]
+    (if (dwe/ok? e) s (simple x))))
+
+(defn- simple Str [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VNull) "null"
+      (v/VBool b) (if b "true" "false")
+      (v/VNum n) (num/to-string n)
+      (v/VInt n-i) (let [n (num/from-int n-i)] (num/to-string n))
+      (v/VStr s) (str "\"" s "\"")
+      (v/VKey k) (str "\"" (:name k) "\"")
+      (v/VArr xs) (loop [i 0 out "["] (if (>= i (count xs)) (str out "]") (recur (+ i 1) (str out (if (> i 0) ", " "") (simple (nth xs i))))))
+      (v/VObj fs) (loop [i 0 out "{"]
+                    (if (>= i (count fs)) (str out "}")
+                      (let [f (nth fs i)] (recur (+ i 1) (str out (if (> i 0) ", " "") (:name (:key f)) ": " (simple (:value f)))))))
+      _ (v/type-name x))))
+
+(defn- key-str Str [k: &v/Key]
+  (if (and (> (count (:ns k)) 0) (not= (:prefix (nth (:ns k) 0)) ""))
+    (str (:prefix (nth (:ns k) 0)) "#" (:name k))
+    (:name k)))
+
+(defn- ns-uri Str [k: &v/Key] (if (= (count (:ns k)) 0) "" (:uri (nth (:ns k) 0))))
+
+(defn- names-eq? Bool [a: &v/Key b: &v/Key] (and (= (:name a) (:name b)) (= (ns-uri a) (ns-uri b))))
+
+(defn- attrs-obj Vec(v/Field) [k: &v/Key]
+  (loop [i 0 acc: Vec(v/Field) []]
+    (if (>= i (count (:attrs k))) acc
+      (let [a (nth (:attrs k) i)] (recur (+ i 1) (conj acc (v/->Field (v/->Key (:ns a) (:name a) []) (:value a))))))))
+
+(defn- diff-attrs D [a: &v/Key e: &v/Key unordered: Bool path: Str]
+  (let [aa (attrs-obj a) ea (attrs-obj e)]
+    (cond
+      (and (= (count aa) 0) (> (count ea) 0)) (diff-d (str "Attributes " (write-dw (v/->VObj ea))) "Empty attributes." path)
+      (and (> (count aa) 0) (= (count ea) 0)) (diff-d "Empty attributes" (str "Attributes " (write-dw (v/null-v))) path)
+      (and (= (count aa) 0) (= (count ea) 0)) (match-d)
+      :else (diff-vals (v/->VObj aa) (v/->VObj ea) unordered path))))
+
+(defn- sort-fields Vec(v/Field) [fs: &Vec(v/Field)]
+  (loop [i 1 acc fs]
+    (if (>= i (count acc)) acc
+      (recur (+ i 1)
+             (loop [j i v acc]
+               (if (and (> j 0) (> (core/str-cmp (:name (:key (nth v (- j 1)))) (:name (:key (nth v j)))) 0))
+                 (let [x (nth v (- j 1)) y (nth v j)] (recur (- j 1) (assoc (assoc v (- j 1) y) j x)))
+                 v))))))
+
+(defn- diff-objs D [afs0: &Vec(v/Field) efs0: &Vec(v/Field) unordered: Bool path: Str]
+  (let [afs (if unordered (sort-fields afs0) afs0)
+        efs (if unordered (sort-fields efs0) efs0)]
+    (if (not= (count afs) (count efs)) (diff-d (str "Object size is " (count efs)) (str (count afs)) path)
+      (loop [i 0 acc (match-d)]
+        (if (>= i (count afs)) acc
+          (let [af (nth afs i) ef (nth efs i)
+                ek (:key ef) eks (key-str ek)
+                d (if (names-eq? (:key af) ek)
+                    (merge-d (diff-attrs (:key af) ek unordered (str path "." eks ".@"))
+                             (diff-vals (:value af) (:value ef) unordered (str path "." eks)))
+                    (diff-d (str "Entry " path "." eks " with type " (v/type-name (v/unmeta (:value ef))))
+                            "was not present in object." (str path "." eks)))]
+            (recur (+ i 1) (merge-d d acc))))))))
+
+(defn diff-vals D [actual: &v/Val expected: &v/Val unordered: Bool path: Str]
+  (let [a (v/unmeta actual) e (v/unmeta expected)]
+    (match e
+      (v/VObj efs) (match a
+                     (v/VObj afs) (diff-objs afs efs unordered path)
+                     _ (diff-d "Object type" (str (v/type-name a) " type") path))
+      (v/VArr exs) (diff-arrs a exs unordered path)
+      (v/VRange r1 r2) (diff-arrs a (v/items e) unordered path)
+      _ (if (v/equal? a e) (match-d) (diff-d (write-dw expected) (write-dw actual) path)))))
+
+(defn- diff-arrs D [a: &v/Val exs: &Vec(v/Val) unordered: Bool path: Str]
+  (match a
+    (v/VArr axs) (diff-items axs exs unordered path)
+    (v/VRange r1 r2) (diff-items (v/items a) exs unordered path)
+    _ (diff-d "Array type" (str (v/type-name a) " type") path)))
+
+(defn- diff-items D [axs: &Vec(v/Val) exs: &Vec(v/Val) unordered: Bool path: Str]
+  (if (not= (count axs) (count exs)) (diff-d (str "Array size is " (count exs)) (str "was " (count axs)) path)
+    (loop [i 0 acc (match-d)]
+      (if (>= i (count axs)) acc
+        (recur (+ i 1) (merge-d (diff-vals (nth axs i) (nth exs i) unordered (str path "[" i "]")) acc))))))
+
+(defn- diff-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [cfg (if (> (count a) 2) (core/arg-fields a 2) [])
+        u (v/obj-get cfg "unordered")
+        unordered (and (> (count u) 0) (match (v/unmeta (nth u 0)) (v/VBool b) b _ false))
+        [path pe] (if (> (count a) 3) (rt/to-text (nth a 3)) (values "(root)" (dwe/ok)))]
+    (if (not (dwe/ok? pe)) (values (v/null-v) pe)
+      (let [d (diff-vals (nth a 0) (nth a 1) unordered path)]
+        (rt/ret (v/->VObj [(v/field "matches" (v/bool-v (:matches d))) (v/field "diffs" (v/->VArr (:diffs d)))]))))))
+
+(defn builtins Vec(rt/Builtin) []
+  [(rt/builtin "diff" M [(rt/b2 "Any" "Any" diff-fn)
+                           (rt/overload ["Any" "Any" "Object"] diff-fn)
+                           (rt/overload ["Any" "Any" "Object" "String"] diff-fn)])])

@@ -1,0 +1,1488 @@
+(ns mulay.dw.numfmt
+  (:require [mulay.lib.numparse :as npz] [mulay.lib.dec :as d] [mulay.lib.bigint :as bi] [mulay.lib.uni :as uni] [clay.string :as str]))
+
+(defrecord Syms [zero: Int group: Int dec: Int minus: Str pct: Str permill: Str exp: Str
+                 mdec: Int mgroup: Int inf: Str nan: Str cur: Str intl: Str])
+
+(defrecord Aff [kind: Int text: Str])
+
+(defrecord Pat
+  [pos-pre: Vec(Aff) pos-suf: Vec(Aff) neg-pre: Vec(Aff) neg-suf: Vec(Aff)
+   min-int: Int max-int: Int min-frac: Int max-frac: Int
+   grouping: Bool group-size: Int multiplier: Int dec-always: Bool
+   use-exp: Bool min-exp: Int currency: Bool])
+
+(def INT-MAX32 2147483647)
+
+(def SYMS [
+  "und|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "af|0| |,|-|%|‰|E|,| |∞|NaN"
+  "agq|0| |,|-|%|‰|E|,| |∞|NaN"
+  "ar|٠|٬|٫|؜-|٪؜|؉|اس|٫|٬|∞|ليس رقم"
+  "ar-dz|0|.|,|‎-|‎%‎|‰|E|,|.|∞|ليس رقمًا"
+  "ar-eh|0|,|.|‎-|‎%‎|‰|E|.|,|∞|ليس رقمًا"
+  "ar-ly|0|.|,|‎-|‎%‎|‰|E|,|.|∞|ليس رقمًا"
+  "ar-ma|0|.|,|‎-|‎%‎|‰|E|,|.|∞|ليس رقمًا"
+  "ar-tn|0|.|,|‎-|‎%‎|‰|E|,|.|∞|ليس رقمًا"
+  "as|০|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ast|0|.|,|-|%|‰|E|,|.|∞|ND"
+  "az|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "bas|0| |,|-|%|‰|E|,| |∞|NaN"
+  "be|0| |,|-|%|‰|E|,| |∞|NaN"
+  "bg|0| |,|-|%|‰|E|,| |∞|NaN"
+  "bn|০|,|.|-|%|‰|E|.|,|∞|NaN"
+  "br|0| |,|-|%|‰|E|,| |∞|NaN"
+  "bs|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ca|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ce|0|,|.|-|%|‰|E|.|,|∞|Терхьаш дац"
+  "ckb|٠|٬|٫|‏-|٪|؉|اس|٫|٬|∞|NaN"
+  "cs|0| |,|-|%|‰|E|,| |∞|NaN"
+  "da|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "de|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "de-at|0| |,|-|%|‰|E|,|.|∞|NaN"
+  "de-ch|0|’|.|-|%|‰|E|.|’|∞|NaN"
+  "de-li|0|’|.|-|%|‰|E|.|’|∞|NaN"
+  "dje|0| |.|-|%|‰|E|.| |∞|NaN"
+  "dsb|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "dua|0| |,|-|%|‰|E|,| |∞|NaN"
+  "dyo|0| |,|-|%|‰|E|,| |∞|NaN"
+  "dz|༠|,|.|-|%|‰|E|.|,|གྲངས་མེད|ཨང་མད"
+  "ee|0|,|.|-|%|‰|E|.|,|∞|mnn"
+  "el|0|.|,|-|%|‰|e|,|.|∞|NaN"
+  "en-at|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "en-au|0|,|.|-|%|‰|e|.|,|∞|NaN"
+  "en-be|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "en-ca|0|,|.|-|%|‰|e|.|,|∞|NaN"
+  "en-ch|0|’|.|-|%|‰|E|.|’|∞|NaN"
+  "en-de|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "en-dk|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "en-fi|0| |,|-|%|‰|E|,| |∞|NaN"
+  "en-nl|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "en-se|0| |,|-|%|‰|×10^|,| |∞|NaN"
+  "en-si|0|.|,|-|%|‰|e|,|.|∞|NaN"
+  "en-us-posix|0|,|.|-|%|0/00|E|.|,|INF|NaN"
+  "en-za|0| |,|-|%|‰|E|,| |∞|NaN"
+  "eo|0| |,|-|%|‰|E|,| |∞|NaN"
+  "es|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "es-419|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-br|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-bz|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-cr|0| |,|-|%|‰|E|,| |∞|NaN"
+  "es-cu|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-do|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-gt|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-hn|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-mx|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-ni|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-pa|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-pe|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-pr|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-sv|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "es-us|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "et|0| |,|−|%|‰|×10^|,| |∞|NaN"
+  "eu|0|.|,|−|%|‰|E|,|.|∞|NaN"
+  "ewo|0| |,|-|%|‰|E|,| |∞|NaN"
+  "fa|۰|٬|٫|‎−|٪|؉|×۱۰^|٫|٬|∞|ناعدد"
+  "ff|0| |,|-|%|‰|E|,| |∞|NaN"
+  "ff-adlm|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-bf|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-cm|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-gh|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-gm|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-gn|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-gw|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-lr|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-mr|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-ne|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-ng|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-sl|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ff-adlm-sn|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "fi|0| |,|−|%|‰|E|,| |∞|epäluku"
+  "fo|0|.|,|−|%|‰|E|,|.|∞|NaN"
+  "fr|0| |,|-|%|‰|E|,| |∞|NaN"
+  "fr-ca|0| |,|-|%|‰|E|,| |∞|NaN"
+  "fr-ch|0| |,|-|%|‰|E|.| |∞|NaN"
+  "fr-lu|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "fr-ma|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "fur|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "fy|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ga|0|,|.|-|%|‰|E|.|,|∞|Nuimh"
+  "gl|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "gsw|0|’|.|−|%|‰|E|.|’|∞|NaN"
+  "he|0|,|.|‎-|%|‰|E|.|,|∞|NaN"
+  "hr|0|.|,|−|%|‰|E|,|.|∞|NaN"
+  "hsb|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "hu|0| |,|-|%|‰|E|,| |∞|NaN"
+  "hy|0| |,|-|%|‰|E|,| |∞|ՈչԹ"
+  "ia|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "id|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "is|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "it|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "it-ch|0|’|.|-|%|‰|E|.|’|∞|NaN"
+  "ja-jp-u-ca-japanese-x-lvariant-jp|0|,|.|-|%|‰|E|.|,|∞|�"
+  "jgo|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "jv|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ka|0| |,|-|%|‰|E|,| |∞|არ არის რიცხვი"
+  "kab|0| |,|-|%|‰|E|,| |∞|NaN"
+  "kea|0| |,|-|%|‰|E|,| |∞|NaN"
+  "khq|0| |.|-|%|‰|E|.| |∞|NaN"
+  "kk|0| |,|-|%|‰|E|,| |∞|сан емес"
+  "kkj|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "kl|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "km|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ks|۰|٬|٫|‎-‎|٪|؉|×۱۰^|٫|٬|∞|NaN"
+  "ksf|0| |,|-|%|‰|E|,| |∞|NaN"
+  "ksh|0| |,|−|%|‰|×10^|,| |∞|NaN"
+  "ku|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ky|0| |,|-|%|‰|E|,| |∞|сан эмес"
+  "lb|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ln|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "lo|0|.|,|-|%|‰|E|,|.|∞|ບໍ່​ແມ່ນ​ໂຕ​ເລກ"
+  "lrc|۰|٬|٫|‎-‎|٪|؉|×۱۰^|٫|٬|∞|NaN"
+  "lt|0| |,|−|%|‰|×10^|,| |∞|NaN"
+  "lu|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "lv|0| |,|-|%|‰|E|,| |∞|NS"
+  "mfe|0| |.|-|%|‰|E|.| |∞|NaN"
+  "mgh|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "mk|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "mni|০|,|.|-|%|‰|E|.|,|∞|NaN"
+  "mr|०|,|.|-|%|‰|E|.|,|∞|NaN"
+  "ms-bn|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ms-id|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "mua|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "my|၀|,|.|-|%|‰|E|.|,|∞|ဂဏန်းမဟုတ်သော"
+  "mzn|۰|٬|٫|‎-‎|٪|؉|×۱۰^|٫|٬|∞|NaN"
+  "nb|0| |,|−|%|‰|E|,| |∞|NaN"
+  "ne|०|,|.|-|%|‰|E|.|,|∞|NaN"
+  "nl|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "nmg|0| |,|-|%|‰|E|,| |∞|NaN"
+  "nn|0| |,|−|%|‰|E|,| |∞|NaN"
+  "nnh|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "no|0| |,|−|%|‰|E|,| |∞|NaN"
+  "os|0| |,|-|%|‰|E|,| |∞|НН"
+  "pa-arab|۰|٬|٫|‎-‎|٪|؉|×۱۰^|٫|٬|∞|NaN"
+  "pa-arab-pk|۰|٬|٫|‎-‎|٪|؉|×۱۰^|٫|٬|∞|NaN"
+  "pl|0| |,|-|%|‰|E|,| |∞|NaN"
+  "ps|۰|٬|٫|‎-‎|٪|؉|×۱۰^|٫|٬|∞|NaN"
+  "pt|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "pt-ao|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-ch|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-cv|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-gq|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-gw|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-lu|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-mo|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-mz|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-pt|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-st|0| |,|-|%|‰|E|,| |∞|NaN"
+  "pt-tl|0| |,|-|%|‰|E|,| |∞|NaN"
+  "qu-bo|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "rm|0|’|.|−|%|‰|E|.|’|∞|NaN"
+  "rn|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ro|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ru|0| |,|-|%|‰|E|,| |∞|не число"
+  "rw|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "sa|०|,|.|-|%|‰|E|.|,|∞|NaN"
+  "sah|0| |,|-|%|‰|E|,| |∞|чыыһыла буотах"
+  "sat|᱐|,|.|-|%|‰|E|.|,|∞|NaN"
+  "sd|٠|٬|٫|؜-|٪؜|؉|اس|٫|٬|∞|NaN"
+  "sd-deva|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "sd-deva-in|0|,|.|-|%|‰|E|.|,|∞|NaN"
+  "se|0| |,|−|%|‰|·10^|,| |∞|NaN"
+  "seh|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "ses|0| |.|-|%|‰|E|.| |∞|NaN"
+  "sg|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "shi|0| |,|-|%|‰|E|,| |∞|NaN"
+  "sk|0| |,|-|%|‰|e|,| |∞|NaN"
+  "sl|0|.|,|−|%|‰|e|,|.|∞|NaN"
+  "smn|0| |,|-|%|‰|E|,| |∞|epiloho"
+  "so|0|,|.|-|%|‰|E|.|,|∞|MaL"
+  "sq|0| |,|-|%|‰|E|,| |∞|NaN"
+  "sr|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "su|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "sv|0| |,|−|%|‰|×10^|,| |∞|NaN"
+  "sw-cd|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "tg|0| |,|-|%|‰|E|,| |∞|NaN"
+  "th-th-u-nu-thai-x-lvariant-th|๐|,|.|-|%|‰|E|.|,|∞|�"
+  "tk|0| |,|-|%|‰|E|,| |∞|san däl"
+  "to|0|,|.|-|%|‰|E|.|,|∞|TF"
+  "tr|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "tt|0| |,|-|%|‰|E|,| |∞|NaN"
+  "twq|0| |.|-|%|‰|E|.| |∞|NaN"
+  "tzm|0| |,|-|%|‰|E|,| |∞|NaN"
+  "uk|0| |,|-|%|‰|Е|,| |∞|NaN"
+  "ur|0|,|.|‎-|%|‰|E|.|,|∞|NaN"
+  "ur-in|۰|٬|٫|‎-‎|%|‰|×۱۰^|٫|٬|∞|NaN"
+  "uz|0| |,|-|%|‰|E|,| |∞|son emas"
+  "uz-arab|۰|٬|٫|‎-‎|٪|؉|×۱۰^|٫|٬|∞|NaN"
+  "uz-arab-af|۰|٬|٫|‎-‎|٪|؉|×۱۰^|٫|٬|∞|NaN"
+  "uz-cyrl|0| |,|-|%|‰|E|,| |∞|ҳақиқий сон эмас"
+  "uz-cyrl-uz|0| |,|-|%|‰|E|,| |∞|ҳақиқий сон эмас"
+  "vi|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "wae|0|’|,|-|%|‰|E|,|’|∞|NaN"
+  "wo|0|.|,|-|%|‰|E|,|.|∞|NaN"
+  "xh|0| |.|-|%|‰|E|.| |∞|NaN"
+  "yav|0| |,|-|%|‰|E|,| |∞|NaN"
+  "yue|0|,|.|-|%|‰|E|.|,|∞|非數值"
+  "yue-hans|0|,|.|-|%|‰|E|.|,|∞|非数值"
+  "yue-hans-cn|0|,|.|-|%|‰|E|.|,|∞|非数值"
+  "zgh|0| |,|-|%|‰|E|,| |∞|NaN"
+  "zh-hk|0|,|.|-|%|‰|E|.|,|∞|非數值"
+  "zh-hant|0|,|.|-|%|‰|E|.|,|∞|非數值"
+  "zh-hant-hk|0|,|.|-|%|‰|E|.|,|∞|非數值"
+  "zh-hant-mo|0|,|.|-|%|‰|E|.|,|∞|非數值"
+  "zh-hant-tw|0|,|.|-|%|‰|E|.|,|∞|非數值"
+  "zh-mo|0|,|.|-|%|‰|E|.|,|∞|非數值"
+  "zh-tw|0|,|.|-|%|‰|E|.|,|∞|非數值"
+])
+
+(def CURS [
+  "und|¤|XXX"
+  "af-latn-za|R|ZAR"
+  "af-na|$|NAD"
+  "af-za|R|ZAR"
+  "agq-cm|FCFA|XAF"
+  "agq-latn-cm|FCFA|XAF"
+  "ak-gh|GH₵|GHS"
+  "ak-latn-gh|GH₵|GHS"
+  "am-et|ብር|ETB"
+  "am-ethi-et|ብር|ETB"
+  "ar-ae|د.إ.‏|AED"
+  "ar-arab-eg|ج.م.‏|EGP"
+  "ar-bh|د.ب.‏|BHD"
+  "ar-dj|Fdj|DJF"
+  "ar-dz|د.ج.‏|DZD"
+  "ar-eg|ج.م.‏|EGP"
+  "ar-eh|د.م.‏|MAD"
+  "ar-er|Nfk|ERN"
+  "ar-il|₪|ILS"
+  "ar-iq|د.ع.‏|IQD"
+  "ar-jo|د.أ.‏|JOD"
+  "ar-km|CF|KMF"
+  "ar-kw|د.ك.‏|KWD"
+  "ar-lb|ل.ل.‏|LBP"
+  "ar-ly|د.ل.‏|LYD"
+  "ar-ma|د.م.‏|MAD"
+  "ar-mr|أ.م.|MRU"
+  "ar-om|ر.ع.‏|OMR"
+  "ar-ps|₪|ILS"
+  "ar-qa|ر.ق.‏|QAR"
+  "ar-sa|ر.س.‏|SAR"
+  "ar-sd|ج.س.|SDG"
+  "ar-so|S|SOS"
+  "ar-ss|£|SSP"
+  "ar-sy|ل.س.‏|SYP"
+  "ar-td|FCFA|XAF"
+  "ar-tn|د.ت.‏|TND"
+  "ar-ye|ر.ي.‏|YER"
+  "as-beng-in|₹|INR"
+  "as-in|₹|INR"
+  "asa-latn-tz|TSh|TZS"
+  "asa-tz|TSh|TZS"
+  "ast-es|€|EUR"
+  "ast-latn-es|€|EUR"
+  "az-az|₼|AZN"
+  "az-cyrl-az|₼|AZN"
+  "az-latn-az|₼|AZN"
+  "bas-cm|FCFA|XAF"
+  "bas-latn-cm|FCFA|XAF"
+  "be-by|Br|BYN"
+  "be-cyrl-by|Br|BYN"
+  "bem-latn-zm|K|ZMW"
+  "bem-zm|K|ZMW"
+  "bez-latn-tz|TSh|TZS"
+  "bez-tz|TSh|TZS"
+  "bg-bg|€|EUR"
+  "bg-cyrl-bg|€|EUR"
+  "bm-latn-ml|F CFA|XOF"
+  "bm-ml|F CFA|XOF"
+  "bn-bd|৳|BDT"
+  "bn-beng-bd|৳|BDT"
+  "bn-in|₹|INR"
+  "bo-cn|¥|CNY"
+  "bo-in|₹|INR"
+  "bo-tibt-cn|¥|CNY"
+  "br-fr|€|EUR"
+  "br-latn-fr|€|EUR"
+  "brx-deva-in|₹|INR"
+  "brx-in|₹|INR"
+  "bs-ba|KM|BAM"
+  "bs-cyrl-ba|КМ|BAM"
+  "bs-latn-ba|KM|BAM"
+  "ca-ad|€|EUR"
+  "ca-es|€|EUR"
+  "ca-es-valencia|€|EUR"
+  "ca-fr|€|EUR"
+  "ca-it|€|EUR"
+  "ca-latn-es|€|EUR"
+  "ccp-bd|৳|BDT"
+  "ccp-cakm-bd|৳|BDT"
+  "ccp-in|₹|INR"
+  "ce-cyrl-ru|₽|RUB"
+  "ce-ru|₽|RUB"
+  "ceb-latn-ph|₱|PHP"
+  "ceb-ph|₱|PHP"
+  "cgg-latn-ug|USh|UGX"
+  "cgg-ug|USh|UGX"
+  "chr-cher-us|$|USD"
+  "chr-us|$|USD"
+  "ckb-arab-iq|د.ع.‏|IQD"
+  "ckb-iq|د.ع.‏|IQD"
+  "ckb-ir|IRR|IRR"
+  "cs-cz|Kč|CZK"
+  "cs-latn-cz|Kč|CZK"
+  "cy-gb|£|GBP"
+  "cy-latn-gb|£|GBP"
+  "da-dk|kr.|DKK"
+  "da-gl|kr.|DKK"
+  "da-latn-dk|kr.|DKK"
+  "dav-ke|Ksh|KES"
+  "dav-latn-ke|Ksh|KES"
+  "de-at|€|EUR"
+  "de-be|€|EUR"
+  "de-ch|CHF|CHF"
+  "de-de|€|EUR"
+  "de-it|€|EUR"
+  "de-li|CHF|CHF"
+  "de-lu|€|EUR"
+  "de-latn-de|€|EUR"
+  "dje-latn-ne|F CFA|XOF"
+  "dje-ne|F CFA|XOF"
+  "doi-deva-in|₹|INR"
+  "doi-in|₹|INR"
+  "dsb-de|€|EUR"
+  "dsb-latn-de|€|EUR"
+  "dua-cm|FCFA|XAF"
+  "dua-latn-cm|FCFA|XAF"
+  "dyo-latn-sn|F CFA|XOF"
+  "dyo-sn|F CFA|XOF"
+  "dz-bt|Nu.|BTN"
+  "dz-tibt-bt|Nu.|BTN"
+  "ebu-ke|Ksh|KES"
+  "ebu-latn-ke|Ksh|KES"
+  "ee-gh|GH₵|GHS"
+  "ee-latn-gh|GH₵|GHS"
+  "ee-tg|F CFA|XOF"
+  "el-cy|€|EUR"
+  "el-gr|€|EUR"
+  "el-grek-gr|€|EUR"
+  "en-ae|AED|AED"
+  "en-ag|$|XCD"
+  "en-ai|$|XCD"
+  "en-as|$|USD"
+  "en-at|€|EUR"
+  "en-au|$|AUD"
+  "en-bb|$|BBD"
+  "en-be|€|EUR"
+  "en-bi|FBu|BIF"
+  "en-bm|$|BMD"
+  "en-bs|$|BSD"
+  "en-bw|P|BWP"
+  "en-bz|$|BZD"
+  "en-ca|$|CAD"
+  "en-cc|$|AUD"
+  "en-ch|CHF|CHF"
+  "en-ck|$|NZD"
+  "en-cm|FCFA|XAF"
+  "en-cx|$|AUD"
+  "en-cy|€|EUR"
+  "en-de|€|EUR"
+  "en-dk|kr.|DKK"
+  "en-dm|$|XCD"
+  "en-er|Nfk|ERN"
+  "en-fi|€|EUR"
+  "en-fj|$|FJD"
+  "en-fk|£|FKP"
+  "en-fm|US$|USD"
+  "en-gb|£|GBP"
+  "en-gd|$|XCD"
+  "en-gg|£|GBP"
+  "en-gh|GH₵|GHS"
+  "en-gi|£|GIP"
+  "en-gm|D|GMD"
+  "en-gu|$|USD"
+  "en-gy|$|GYD"
+  "en-hk|HK$|HKD"
+  "en-ie|€|EUR"
+  "en-il|₪|ILS"
+  "en-im|£|GBP"
+  "en-in|₹|INR"
+  "en-io|US$|USD"
+  "en-je|£|GBP"
+  "en-jm|$|JMD"
+  "en-ke|Ksh|KES"
+  "en-ki|$|AUD"
+  "en-kn|$|XCD"
+  "en-ky|$|KYD"
+  "en-lc|$|XCD"
+  "en-lr|$|LRD"
+  "en-ls|LSL|LSL"
+  "en-latn-us|$|USD"
+  "en-mg|Ar|MGA"
+  "en-mh|$|USD"
+  "en-mo|MOP$|MOP"
+  "en-mp|$|USD"
+  "en-ms|$|XCD"
+  "en-mt|€|EUR"
+  "en-mu|Rs|MUR"
+  "en-mw|MK|MWK"
+  "en-my|RM|MYR"
+  "en-na|$|NAD"
+  "en-nf|$|AUD"
+  "en-ng|₦|NGN"
+  "en-nl|€|EUR"
+  "en-nr|$|AUD"
+  "en-nu|$|NZD"
+  "en-nz|$|NZD"
+  "en-pg|K|PGK"
+  "en-ph|₱|PHP"
+  "en-pk|Rs|PKR"
+  "en-pn|$|NZD"
+  "en-pr|$|USD"
+  "en-pw|US$|USD"
+  "en-rw|RF|RWF"
+  "en-sb|$|SBD"
+  "en-sc|SR|SCR"
+  "en-sd|SDG|SDG"
+  "en-se|kr|SEK"
+  "en-sg|$|SGD"
+  "en-sh|£|SHP"
+  "en-si|€|EUR"
+  "en-sl|SLE|SLE"
+  "en-ss|£|SSP"
+  "en-sx|XCG|XCG"
+  "en-sz|E|SZL"
+  "en-tc|US$|USD"
+  "en-tk|$|NZD"
+  "en-to|T$|TOP"
+  "en-tt|$|TTD"
+  "en-tv|$|AUD"
+  "en-tz|TSh|TZS"
+  "en-ug|USh|UGX"
+  "en-um|$|USD"
+  "en-us|$|USD"
+  "en-us-posix|$|USD"
+  "en-vc|$|XCD"
+  "en-vg|US$|USD"
+  "en-vi|$|USD"
+  "en-vu|VT|VUV"
+  "en-ws|WS$|WST"
+  "en-za|R|ZAR"
+  "en-zm|K|ZMW"
+  "en-zw|ZWG|ZWG"
+  "es-ar|$|ARS"
+  "es-bo|Bs|BOB"
+  "es-br|R$|BRL"
+  "es-bz|$|BZD"
+  "es-cl|$|CLP"
+  "es-co|$|COP"
+  "es-cr|₡|CRC"
+  "es-cu|$|CUP"
+  "es-do|RD$|DOP"
+  "es-ec|$|USD"
+  "es-es|€|EUR"
+  "es-gq|FCFA|XAF"
+  "es-gt|Q|GTQ"
+  "es-hn|L|HNL"
+  "es-latn-es|€|EUR"
+  "es-mx|$|MXN"
+  "es-ni|C$|NIO"
+  "es-pa|B/.|PAB"
+  "es-pe|S/|PEN"
+  "es-ph|₱|PHP"
+  "es-pr|$|USD"
+  "es-py|Gs.|PYG"
+  "es-sv|C|SVC"
+  "es-us|$|USD"
+  "es-uy|$|UYU"
+  "es-ve|Bs.S|VES"
+  "et-ee|€|EUR"
+  "et-latn-ee|€|EUR"
+  "eu-es|€|EUR"
+  "eu-latn-es|€|EUR"
+  "ewo-cm|FCFA|XAF"
+  "ewo-latn-cm|FCFA|XAF"
+  "fa-af|؋|AFN"
+  "fa-arab-ir|ریال|IRR"
+  "fa-ir|ریال|IRR"
+  "ff-adlm-bf|𞤅𞤊𞤀|XOF"
+  "ff-adlm-cm|𞤊𞤅𞤊𞤀|XAF"
+  "ff-adlm-gh|GH₵|GHS"
+  "ff-adlm-gm|D|GMD"
+  "ff-adlm-gn|FG|GNF"
+  "ff-adlm-gw|𞤅𞤊𞤀|XOF"
+  "ff-adlm-lr|$|LRD"
+  "ff-adlm-mr|UM|MRU"
+  "ff-adlm-ne|𞤅𞤊𞤀|XOF"
+  "ff-adlm-ng|₦|NGN"
+  "ff-adlm-sl|SLE|SLE"
+  "ff-adlm-sn|𞤅𞤊𞤀|XOF"
+  "ff-gn|GNF|GNF"
+  "ff-latn-bf|F CFA|XOF"
+  "ff-latn-cm|FCFA|XAF"
+  "ff-latn-gh|GH₵|GHS"
+  "ff-latn-gm|D|GMD"
+  "ff-latn-gn|FG|GNF"
+  "ff-latn-gw|F CFA|XOF"
+  "ff-latn-lr|$|LRD"
+  "ff-latn-mr|UM|MRU"
+  "ff-latn-ne|F CFA|XOF"
+  "ff-latn-ng|₦|NGN"
+  "ff-latn-sl|SLE|SLE"
+  "ff-latn-sn|F CFA|XOF"
+  "ff-sn|F CFA|XOF"
+  "fi-fi|€|EUR"
+  "fi-latn-fi|€|EUR"
+  "fil-latn-ph|₱|PHP"
+  "fil-ph|₱|PHP"
+  "fo-dk|kr.|DKK"
+  "fo-fo|kr|DKK"
+  "fo-latn-fo|kr|DKK"
+  "fr-be|€|EUR"
+  "fr-bf|F CFA|XOF"
+  "fr-bi|FBu|BIF"
+  "fr-bj|F CFA|XOF"
+  "fr-bl|€|EUR"
+  "fr-ca|$ CA|CAD"
+  "fr-cd|FC|CDF"
+  "fr-cf|FCFA|XAF"
+  "fr-cg|FCFA|XAF"
+  "fr-ch|CHF|CHF"
+  "fr-ci|F CFA|XOF"
+  "fr-cm|FCFA|XAF"
+  "fr-dj|Fdj|DJF"
+  "fr-dz|DA|DZD"
+  "fr-fr|€|EUR"
+  "fr-ga|FCFA|XAF"
+  "fr-gf|€|EUR"
+  "fr-gn|FG|GNF"
+  "fr-gp|€|EUR"
+  "fr-gq|FCFA|XAF"
+  "fr-ht|G|HTG"
+  "fr-km|CF|KMF"
+  "fr-lu|€|EUR"
+  "fr-latn-fr|€|EUR"
+  "fr-ma|MAD|MAD"
+  "fr-mc|€|EUR"
+  "fr-mf|€|EUR"
+  "fr-mg|Ar|MGA"
+  "fr-ml|F CFA|XOF"
+  "fr-mq|€|EUR"
+  "fr-mr|UM|MRU"
+  "fr-mu|Rs|MUR"
+  "fr-nc|FCFP|XPF"
+  "fr-ne|F CFA|XOF"
+  "fr-pf|FCFP|XPF"
+  "fr-pm|€|EUR"
+  "fr-re|€|EUR"
+  "fr-rw|RF|RWF"
+  "fr-sc|SR|SCR"
+  "fr-sn|F CFA|XOF"
+  "fr-sy|LS|SYP"
+  "fr-td|FCFA|XAF"
+  "fr-tg|F CFA|XOF"
+  "fr-tn|DT|TND"
+  "fr-vu|VT|VUV"
+  "fr-wf|FCFP|XPF"
+  "fr-yt|€|EUR"
+  "fur-it|€|EUR"
+  "fur-latn-it|€|EUR"
+  "fy-latn-nl|€|EUR"
+  "fy-nl|€|EUR"
+  "ga-gb|£|GBP"
+  "ga-ie|€|EUR"
+  "ga-latn-ie|€|EUR"
+  "gd-gb|£|GBP"
+  "gd-latn-gb|£|GBP"
+  "gl-es|€|EUR"
+  "gl-latn-es|€|EUR"
+  "gsw-ch|CHF|CHF"
+  "gsw-fr|€|EUR"
+  "gsw-li|CHF|CHF"
+  "gsw-latn-ch|CHF|CHF"
+  "gu-gujr-in|₹|INR"
+  "gu-in|₹|INR"
+  "guz-ke|Ksh|KES"
+  "guz-latn-ke|Ksh|KES"
+  "gv-im|£|GBP"
+  "gv-latn-im|£|GBP"
+  "ha-gh|GH₵|GHS"
+  "ha-latn-ng|₦|NGN"
+  "ha-ne|F CFA|XOF"
+  "ha-ng|₦|NGN"
+  "haw-latn-us|$|USD"
+  "haw-us|$|USD"
+  "he-hebr-il|₪|ILS"
+  "he-il|₪|ILS"
+  "hi-deva-in|₹|INR"
+  "hi-in|₹|INR"
+  "hr-ba|KM|BAM"
+  "hr-hr|EUR|EUR"
+  "hr-latn-hr|EUR|EUR"
+  "hsb-de|€|EUR"
+  "hsb-latn-de|€|EUR"
+  "hu-hu|Ft|HUF"
+  "hu-latn-hu|Ft|HUF"
+  "hy-am|֏|AMD"
+  "hy-armn-am|֏|AMD"
+  "id-id|Rp|IDR"
+  "id-latn-id|Rp|IDR"
+  "ig-latn-ng|₦|NGN"
+  "ig-ng|₦|NGN"
+  "ii-cn|¥|CNY"
+  "ii-yiii-cn|¥|CNY"
+  "is-is|ISK|ISK"
+  "is-latn-is|ISK|ISK"
+  "it-ch|SFr.|CHF"
+  "it-it|€|EUR"
+  "it-latn-it|€|EUR"
+  "it-sm|€|EUR"
+  "it-va|€|EUR"
+  "ja-jp|￥|JPY"
+  "ja-jp-u-ca-japanese-x-lvariant-jp|￥|JPY"
+  "ja-jpan-jp|￥|JPY"
+  "jgo-cm|FCFA|XAF"
+  "jgo-latn-cm|FCFA|XAF"
+  "jmc-latn-tz|TSh|TZS"
+  "jmc-tz|TSh|TZS"
+  "jv-id|Rp|IDR"
+  "jv-latn-id|Rp|IDR"
+  "ka-ge|₾|GEL"
+  "ka-geor-ge|₾|GEL"
+  "kab-dz|DA|DZD"
+  "kab-latn-dz|DA|DZD"
+  "kam-ke|Ksh|KES"
+  "kam-latn-ke|Ksh|KES"
+  "kde-latn-tz|TSh|TZS"
+  "kde-tz|TSh|TZS"
+  "kea-cv|​|CVE"
+  "kea-latn-cv|​|CVE"
+  "khq-latn-ml|F CFA|XOF"
+  "khq-ml|F CFA|XOF"
+  "ki-ke|Ksh|KES"
+  "ki-latn-ke|Ksh|KES"
+  "kk-cyrl-kz|₸|KZT"
+  "kk-kz|₸|KZT"
+  "kkj-cm|FCFA|XAF"
+  "kkj-latn-cm|FCFA|XAF"
+  "kl-gl|kr.|DKK"
+  "kl-latn-gl|kr.|DKK"
+  "kln-ke|Ksh|KES"
+  "kln-latn-ke|Ksh|KES"
+  "km-kh|៛|KHR"
+  "km-khmr-kh|៛|KHR"
+  "kn-in|₹|INR"
+  "kn-knda-in|₹|INR"
+  "ko-kp|KPW|KPW"
+  "ko-kr|₩|KRW"
+  "ko-kore-kr|₩|KRW"
+  "kok-deva-in|₹|INR"
+  "kok-in|₹|INR"
+  "ks-arab-in|₹|INR"
+  "ks-in|₹|INR"
+  "ksb-latn-tz|TSh|TZS"
+  "ksb-tz|TSh|TZS"
+  "ksf-cm|FCFA|XAF"
+  "ksf-latn-cm|FCFA|XAF"
+  "ksh-de|€|EUR"
+  "ksh-latn-de|€|EUR"
+  "ku-latn-tr|₺|TRY"
+  "ku-tr|₺|TRY"
+  "kw-gb|£|GBP"
+  "kw-latn-gb|£|GBP"
+  "ky-cyrl-kg|сом|KGS"
+  "ky-kg|сом|KGS"
+  "lag-latn-tz|TSh|TZS"
+  "lag-tz|TSh|TZS"
+  "lb-lu|€|EUR"
+  "lb-latn-lu|€|EUR"
+  "lg-latn-ug|USh|UGX"
+  "lg-ug|USh|UGX"
+  "lkt-latn-us|$|USD"
+  "lkt-us|$|USD"
+  "ln-ao|Kz|AOA"
+  "ln-cd|FC|CDF"
+  "ln-cf|FCFA|XAF"
+  "ln-cg|FCFA|XAF"
+  "ln-latn-cd|FC|CDF"
+  "lo-la|₭|LAK"
+  "lo-laoo-la|₭|LAK"
+  "lrc-arab-ir|IRR|IRR"
+  "lrc-iq|د.ع.‏|IQD"
+  "lrc-ir|IRR|IRR"
+  "lt-lt|€|EUR"
+  "lt-latn-lt|€|EUR"
+  "lu-cd|FC|CDF"
+  "lu-latn-cd|FC|CDF"
+  "luo-ke|Ksh|KES"
+  "luo-latn-ke|Ksh|KES"
+  "luy-ke|Ksh|KES"
+  "luy-latn-ke|Ksh|KES"
+  "lv-lv|€|EUR"
+  "lv-latn-lv|€|EUR"
+  "mai-deva-in|₹|INR"
+  "mai-in|₹|INR"
+  "mas-ke|Ksh|KES"
+  "mas-latn-ke|Ksh|KES"
+  "mas-tz|TSh|TZS"
+  "mer-ke|Ksh|KES"
+  "mer-latn-ke|Ksh|KES"
+  "mfe-latn-mu|Rs|MUR"
+  "mfe-mu|Rs|MUR"
+  "mg-latn-mg|Ar|MGA"
+  "mg-mg|Ar|MGA"
+  "mgh-latn-mz|MTn|MZN"
+  "mgh-mz|MTn|MZN"
+  "mgo-cm|FCFA|XAF"
+  "mgo-latn-cm|FCFA|XAF"
+  "mi-latn-nz|$|NZD"
+  "mi-nz|$|NZD"
+  "mk-cyrl-mk|ден.|MKD"
+  "mk-mk|ден.|MKD"
+  "ml-in|₹|INR"
+  "ml-mlym-in|₹|INR"
+  "mn-cyrl-mn|₮|MNT"
+  "mn-mn|₮|MNT"
+  "mni-beng-in|₹|INR"
+  "mni-in|₹|INR"
+  "mr-deva-in|₹|INR"
+  "mr-in|₹|INR"
+  "ms-bn|$|BND"
+  "ms-id|Rp|IDR"
+  "ms-latn-my|RM|MYR"
+  "ms-my|RM|MYR"
+  "ms-sg|$|SGD"
+  "mt-latn-mt|€|EUR"
+  "mt-mt|€|EUR"
+  "mua-cm|FCFA|XAF"
+  "mua-latn-cm|FCFA|XAF"
+  "my-mm|K|MMK"
+  "my-mymr-mm|K|MMK"
+  "mzn-arab-ir|IRR|IRR"
+  "mzn-ir|IRR|IRR"
+  "naq-latn-na|$|NAD"
+  "naq-na|$|NAD"
+  "nb-latn-no|kr|NOK"
+  "nb-no|kr|NOK"
+  "nb-sj|kr|NOK"
+  "nd-latn-zw|ZWG|ZWG"
+  "nd-zw|ZWG|ZWG"
+  "nds-de|€|EUR"
+  "nds-latn-de|€|EUR"
+  "nds-nl|€|EUR"
+  "ne-deva-np|नेरू|NPR"
+  "ne-in|₹|INR"
+  "ne-np|नेरू|NPR"
+  "nl-aw|Afl.|AWG"
+  "nl-be|€|EUR"
+  "nl-bq|$|USD"
+  "nl-cw|XCG|XCG"
+  "nl-latn-nl|€|EUR"
+  "nl-nl|€|EUR"
+  "nl-sr|$|SRD"
+  "nl-sx|XCG|XCG"
+  "nmg-cm|FCFA|XAF"
+  "nmg-latn-cm|FCFA|XAF"
+  "nn-latn-no|kr|NOK"
+  "nn-no|kr|NOK"
+  "nnh-cm|FCFA|XAF"
+  "nnh-latn-cm|FCFA|XAF"
+  "no-latn-no|kr|NOK"
+  "no-no|kr|NOK"
+  "nus-latn-ss|£|SSP"
+  "nus-ss|£|SSP"
+  "nyn-latn-ug|USh|UGX"
+  "nyn-ug|USh|UGX"
+  "om-et|Br|ETB"
+  "om-ke|Ksh|KES"
+  "om-latn-et|Br|ETB"
+  "or-in|₹|INR"
+  "or-orya-in|₹|INR"
+  "os-cyrl-ge|₾|GEL"
+  "os-ge|₾|GEL"
+  "os-ru|₽|RUB"
+  "pa-arab-pk|ر|PKR"
+  "pa-guru-in|₹|INR"
+  "pa-in|₹|INR"
+  "pa-pk|PKR|PKR"
+  "pcm-latn-ng|₦|NGN"
+  "pcm-ng|₦|NGN"
+  "pl-latn-pl|zł|PLN"
+  "pl-pl|zł|PLN"
+  "ps-af|؋|AFN"
+  "ps-arab-af|؋|AFN"
+  "ps-pk|Rs|PKR"
+  "pt-ao|Kz|AOA"
+  "pt-br|R$|BRL"
+  "pt-ch|CHF|CHF"
+  "pt-cv|​|CVE"
+  "pt-gq|FCFA|XAF"
+  "pt-gw|F CFA|XOF"
+  "pt-lu|€|EUR"
+  "pt-latn-br|R$|BRL"
+  "pt-mo|MOP$|MOP"
+  "pt-mz|MTn|MZN"
+  "pt-pt|€|EUR"
+  "pt-st|Db|STN"
+  "pt-tl|US$|USD"
+  "qu-bo|Bs|BOB"
+  "qu-ec|$|USD"
+  "qu-latn-pe|S/|PEN"
+  "qu-pe|S/|PEN"
+  "rm-ch|CHF|CHF"
+  "rm-latn-ch|CHF|CHF"
+  "rn-bi|FBu|BIF"
+  "rn-latn-bi|FBu|BIF"
+  "ro-latn-ro|RON|RON"
+  "ro-md|L|MDL"
+  "ro-ro|RON|RON"
+  "rof-latn-tz|TSh|TZS"
+  "rof-tz|TSh|TZS"
+  "ru-by|Br|BYN"
+  "ru-cyrl-ru|₽|RUB"
+  "ru-kg|сом|KGS"
+  "ru-kz|₸|KZT"
+  "ru-md|L|MDL"
+  "ru-ru|₽|RUB"
+  "ru-ua|₴|UAH"
+  "rw-latn-rw|RF|RWF"
+  "rw-rw|RF|RWF"
+  "rwk-latn-tz|TSh|TZS"
+  "rwk-tz|TSh|TZS"
+  "sa-deva-in|₹|INR"
+  "sa-in|₹|INR"
+  "sah-cyrl-ru|₽|RUB"
+  "sah-ru|₽|RUB"
+  "saq-ke|Ksh|KES"
+  "saq-latn-ke|Ksh|KES"
+  "sat-in|₹|INR"
+  "sat-olck-in|₹|INR"
+  "sbp-latn-tz|TSh|TZS"
+  "sbp-tz|TSh|TZS"
+  "sd-arab-pk|Rs|PKR"
+  "sd-deva-in|₹|INR"
+  "sd-in|₹|INR"
+  "sd-pk|Rs|PKR"
+  "se-fi|€|EUR"
+  "se-latn-no|kr|NOK"
+  "se-no|kr|NOK"
+  "se-se|kr|SEK"
+  "seh-latn-mz|MTn|MZN"
+  "seh-mz|MTn|MZN"
+  "ses-latn-ml|F CFA|XOF"
+  "ses-ml|F CFA|XOF"
+  "sg-cf|FCFA|XAF"
+  "sg-latn-cf|FCFA|XAF"
+  "shi-latn-ma|MAD|MAD"
+  "shi-ma|MAD|MAD"
+  "shi-tfng-ma|MAD|MAD"
+  "si-lk|රු.|LKR"
+  "si-sinh-lk|රු.|LKR"
+  "sk-latn-sk|€|EUR"
+  "sk-sk|€|EUR"
+  "sl-latn-si|€|EUR"
+  "sl-si|€|EUR"
+  "smn-fi|€|EUR"
+  "smn-latn-fi|€|EUR"
+  "sn-latn-zw|ZWG|ZWG"
+  "sn-zw|ZWG|ZWG"
+  "so-dj|Fdj|DJF"
+  "so-et|Br|ETB"
+  "so-ke|Ksh|KES"
+  "so-latn-so|S|SOS"
+  "so-so|S|SOS"
+  "sq-al|Lekë|ALL"
+  "sq-latn-al|Lekë|ALL"
+  "sq-mk|den|MKD"
+  "sq-xk|€|EUR"
+  "sr-ba|КМ.|BAM"
+  "sr-cs|CSD|CSD"
+  "sr-cyrl-ba|КМ|BAM"
+  "sr-cyrl-me|€|EUR"
+  "sr-cyrl-rs|RSD|RSD"
+  "sr-cyrl-xk|€|EUR"
+  "sr-latn-ba|KM|BAM"
+  "sr-latn-me|€|EUR"
+  "sr-latn-rs|RSD|RSD"
+  "sr-latn-xk|€|EUR"
+  "sr-me|€|EUR"
+  "sr-rs|RSD|RSD"
+  "su-id|Rp|IDR"
+  "su-latn-id|Rp|IDR"
+  "sv-ax|€|EUR"
+  "sv-fi|€|EUR"
+  "sv-latn-se|kr|SEK"
+  "sv-se|kr|SEK"
+  "sw-cd|FC|CDF"
+  "sw-ke|Ksh|KES"
+  "sw-latn-tz|TSh|TZS"
+  "sw-tz|TSh|TZS"
+  "sw-ug|USh|UGX"
+  "ta-in|₹|INR"
+  "ta-lk|Rs.|LKR"
+  "ta-my|RM|MYR"
+  "ta-sg|$|SGD"
+  "ta-taml-in|₹|INR"
+  "te-in|₹|INR"
+  "te-telu-in|₹|INR"
+  "teo-ke|Ksh|KES"
+  "teo-latn-ug|USh|UGX"
+  "teo-ug|USh|UGX"
+  "tg-cyrl-tj|сом.|TJS"
+  "tg-tj|сом.|TJS"
+  "th-th|฿|THB"
+  "th-th-u-nu-thai-x-lvariant-th|฿|THB"
+  "th-thai-th|฿|THB"
+  "ti-er|Nfk|ERN"
+  "ti-et|Br|ETB"
+  "ti-ethi-et|Br|ETB"
+  "tk-latn-tm|TMT|TMT"
+  "tk-tm|TMT|TMT"
+  "to-latn-to|T$|TOP"
+  "to-to|T$|TOP"
+  "tr-cy|€|EUR"
+  "tr-latn-tr|₺|TRY"
+  "tr-tr|₺|TRY"
+  "tt-cyrl-ru|₽|RUB"
+  "tt-ru|₽|RUB"
+  "twq-latn-ne|F CFA|XOF"
+  "twq-ne|F CFA|XOF"
+  "tzm-latn-ma|MAD|MAD"
+  "tzm-ma|MAD|MAD"
+  "ug-arab-cn|￥|CNY"
+  "ug-cn|￥|CNY"
+  "uk-cyrl-ua|₴|UAH"
+  "uk-ua|₴|UAH"
+  "ur-arab-pk|Rs|PKR"
+  "ur-in|₹|INR"
+  "ur-pk|Rs|PKR"
+  "uz-af|AFN|AFN"
+  "uz-arab-af|؋|AFN"
+  "uz-cyrl-uz|сўм|UZS"
+  "uz-latn-uz|soʻm|UZS"
+  "uz-uz|soʻm|UZS"
+  "vai-lr|$|LRD"
+  "vai-latn-lr|$|LRD"
+  "vai-vaii-lr|$|LRD"
+  "vi-latn-vn|₫|VND"
+  "vi-vn|₫|VND"
+  "vun-latn-tz|TSh|TZS"
+  "vun-tz|TSh|TZS"
+  "wae-ch|CHF|CHF"
+  "wae-latn-ch|CHF|CHF"
+  "wo-latn-sn|F CFA|XOF"
+  "wo-sn|F CFA|XOF"
+  "xh-latn-za|R|ZAR"
+  "xh-za|R|ZAR"
+  "xog-latn-ug|USh|UGX"
+  "xog-ug|USh|UGX"
+  "yav-cm|FCFA|XAF"
+  "yav-latn-cm|FCFA|XAF"
+  "yo-bj|F CFA|XOF"
+  "yo-latn-ng|₦|NGN"
+  "yo-ng|₦|NGN"
+  "yue-cn|CN¥|CNY"
+  "yue-hk|HK$|HKD"
+  "yue-hans-cn|￥|CNY"
+  "yue-hant-hk|HK$|HKD"
+  "zgh-ma|MAD|MAD"
+  "zgh-tfng-ma|MAD|MAD"
+  "zh-cn|¥|CNY"
+  "zh-hk|HK$|HKD"
+  "zh-hans-cn|¥|CNY"
+  "zh-hans-hk|HK$|HKD"
+  "zh-hans-mo|MOP$|MOP"
+  "zh-hans-sg|$|SGD"
+  "zh-hant-hk|HK$|HKD"
+  "zh-hant-mo|MOP$|MOP"
+  "zh-hant-tw|$|TWD"
+  "zh-mo|MOP$|MOP"
+  "zh-sg|$|SGD"
+  "zh-tw|$|TWD"
+  "zu-latn-za|R|ZAR"
+  "zu-za|R|ZAR"
+])
+
+(defn- ascii-lower Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)] (recur (+ i 1) (str out (chr (if (and (>= c 65) (<= c 90)) (+ c 32) c))))))))
+
+(defn- alpha? Bool [s: &Str]
+  (loop [i 0] (if (>= i (count s)) true
+                (let [c (nth s i)] (if (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))) (recur (+ i 1)) false)))))
+
+(defn- norm-tag Str [locale: &Str]
+  (let [t (ascii-lower locale)
+        parts: Vec(Str) (str/split t "-")
+        l (nth parts 0)]
+    (if (and (>= (count l) 2) (<= (count l) 8) (alpha? l)) t "und")))
+
+(defn- table-find Str [tab: &Vec(Str) tag: &Str]
+  (let [key (str tag "|")]
+    (loop [i 0]
+      (if (>= i (count tab)) ""
+        (let [e (nth tab i)] (if (str/starts-with? e key) (subs e (count key) (count e)) (recur (+ i 1))))))))
+
+(defn- lookup Vec(Str) [tab: &Vec(Str) tag: &Str]
+  (loop [t (str tag)]
+    (let [hit (table-find tab t)]
+      (if (not= hit "") (str/split hit "|")
+        (let [k (str/last-index-of t "-")]
+          (if (> k 0) (recur (subs t 0 k))
+            (str/split (table-find tab "und") "|")))))))
+
+(defn- cp0 Int [s: &Str] (if (= (count s) 0) 0 (uni/cp-at s 0)))
+
+(def NU-ZEROS ["latn|48" "arab|1632" "arabext|1776" "deva|2406" "beng|2534" "guru|2662" "gujr|2790" "orya|2918"
+               "tamldec|3046" "telu|3174" "knda|3302" "mlym|3430" "thai|3664" "laoo|3792" "tibt|3872" "mymr|4160"
+               "khmr|6112" "mong|6160" "fullwide|65296"])
+
+(defn- nu-zero Int [tag: &Str]
+  (let [u (str/index-of tag "-u-")]
+    (if (< u 0) -1
+      (let [ext (subs tag u (count tag)) k (str/index-of ext "-nu-")]
+        (if (< k 0) -1
+          (let [rest (subs ext (+ k 4) (count ext))
+                e (str/index-of rest "-")
+                name (if (< e 0) rest (subs rest 0 e))
+                hit (table-find NU-ZEROS name)]
+            (if (= hit "") -1 (npz/int-or hit 0))))))))
+
+(defn- base-tag Str [tag: &Str]
+  (let [u (str/index-of tag "-u-")] (if (< u 0) (str tag) (subs tag 0 u))))
+
+(defn symbols Syms [locale: &Str]
+  (let [tag0 (if (= locale "") "en-us" (norm-tag locale))
+        tag (if (not= (table-find SYMS tag0) "") tag0 (base-tag tag0))
+        nz (nu-zero tag0)
+        s (lookup SYMS tag)
+        c (lookup CURS tag)]
+    (->Syms (if (>= nz 0) nz (cp0 (nth s 0))) (cp0 (nth s 1)) (cp0 (nth s 2)) (nth s 3) (nth s 4) (nth s 5) (nth s 6)
+            (cp0 (nth s 7)) (cp0 (nth s 8)) (nth s 9) (nth s 10) (nth c 0) (nth c 1))))
+
+(def CH-QUOTE 39)
+(def CH-CURRENCY 164)
+(def CH-DIGIT 35)
+(def CH-ZERO 48)
+(def CH-GROUP 44)
+(def CH-DEC 46)
+(def CH-PERCENT 37)
+(def CH-PERMILL 8240)
+(def CH-SEP 59)
+(def CH-MINUS 45)
+(def CH-EXP 69)
+
+(defn- aff+ Vec(Aff) [v: Vec(Aff) kind: Int text: Str]
+  (let [n (count v)]
+    (if (and (= kind 0) (> n 0) (= (:kind (nth v (- n 1))) 0))
+      (let [last (nth v (- n 1)) t (:text last)]
+        (assoc v (- n 1) (->Aff 0 (str t text))))
+      (conj v (->Aff kind text)))))
+
+(defn- aff-eq? Bool [a: &Vec(Aff) b: &Vec(Aff)]
+  (and (= (count a) (count b))
+       (loop [i 0] (if (>= i (count a)) true
+                     (let [x (nth a i) y (nth b i)]
+                       (if (and (= (:kind x) (:kind y)) (= (:text x) (:text y))) (recur (+ i 1)) false))))))
+
+(defrecord PS [phase: Int quote: Bool pre: Vec(Aff) suf: Vec(Aff) dpos: Int mult: Int
+               dl: Int zc: Int dr: Int gc: Int use-exp: Bool min-exp: Int currency: Bool next: Int err: Str])
+
+(defn- ps-aff PS [s: PS kind: Int text: Str]
+  (if (= (:phase s) 0) (assoc s :pre (aff+ (:pre s) kind text)) (assoc s :suf (aff+ (:suf s) kind text))))
+
+(defn- qpat Str [pattern: &Str] (str "\"" pattern "\""))
+
+(defn- parse-sub PS [cs: &Vec(Int) pattern: &Str start: Int j: Int use-exp0: Bool currency0: Bool]
+  (let [n (count cs)]
+    (loop [pos start
+           s (->PS 0 false [] [] -1 1 0 0 0 -1 use-exp0 0 currency0 start "")]
+      (if (or (>= pos n) (not= (:err s) "")) s
+        (let [ch (nth cs pos) ph (:phase s)]
+          (if (or (= ph 0) (= ph 2))
+            (if (:quote s)
+              (if (= ch CH-QUOTE)
+                (if (and (< (+ pos 1) n) (= (nth cs (+ pos 1)) CH-QUOTE))
+                  (recur (+ pos 2) (ps-aff s 0 "'"))
+                  (recur (+ pos 1) (assoc s :quote false)))
+                (recur (+ pos 1) (ps-aff s 0 (uni/encode ch))))
+              (cond
+                (or (= ch CH-DIGIT) (= ch CH-ZERO) (= ch CH-GROUP) (= ch CH-DEC))
+                (recur pos (assoc s :phase 1))
+                (= ch CH-CURRENCY)
+                (let [doubled (and (< (+ pos 1) n) (= (nth cs (+ pos 1)) CH-CURRENCY))]
+                  (recur (+ pos (if doubled 2 1)) (assoc (ps-aff s (if doubled 5 4) "") :currency true)))
+                (= ch CH-QUOTE)
+                (if (and (< (+ pos 1) n) (= (nth cs (+ pos 1)) CH-QUOTE))
+                  (recur (+ pos 2) (ps-aff s 0 "'"))
+                  (recur (+ pos 1) (assoc s :quote true)))
+                (= ch CH-SEP)
+                (if (or (= ph 0) (= j 0))
+                  (assoc s :err (str "Unquoted special character ';' in pattern " (qpat pattern)))
+                  (assoc s :next (+ pos 1)))
+                (= ch CH-PERCENT)
+                (if (not= (:mult s) 1)
+                  (assoc s :err (str "Too many percent/per mille characters in pattern " (qpat pattern)))
+                  (recur (+ pos 1) (assoc (ps-aff s 1 "") :mult 100)))
+                (= ch CH-PERMILL)
+                (if (not= (:mult s) 1)
+                  (assoc s :err (str "Too many percent/per mille characters in pattern " (qpat pattern)))
+                  (recur (+ pos 1) (assoc (ps-aff s 2 "") :mult 1000)))
+                (= ch CH-MINUS) (recur (+ pos 1) (ps-aff s 3 ""))
+                :else (recur (+ pos 1) (ps-aff s 0 (uni/encode ch)))))
+            (if (= j 0)
+              (let [p2 (loop [p pos]
+                         (if (>= p n) p
+                           (let [c (nth cs p)]
+                             (if (or (= c CH-DIGIT) (= c CH-ZERO) (= c CH-GROUP) (= c CH-DEC) (= c CH-EXP)) (recur (+ p 1)) p))))]
+                (recur p2 (assoc s :phase 2)))
+              (cond
+                (= ch CH-DIGIT)
+                (let [gc (:gc s)
+                      grp (and (>= gc 0) (< (:dpos s) 0))
+                      s2 (if (> (:zc s) 0) (assoc s :dr (+ (:dr s) 1)) (assoc s :dl (+ (:dl s) 1)))]
+                  (recur (+ pos 1) (if grp (assoc s2 :gc (byte-inc gc)) s2)))
+                (= ch CH-ZERO)
+                (if (> (:dr s) 0) (assoc s :err (str "Unexpected '0' in pattern " (qpat pattern)))
+                  (let [gc (:gc s)
+                        grp (and (>= gc 0) (< (:dpos s) 0))
+                        s2 (assoc s :zc (+ (:zc s) 1))]
+                    (recur (+ pos 1) (if grp (assoc s2 :gc (byte-inc gc)) s2))))
+                (= ch CH-GROUP) (recur (+ pos 1) (assoc s :gc 0))
+                (= ch CH-DEC)
+                (if (>= (:dpos s) 0) (assoc s :err (str "Multiple decimal separators in pattern " (qpat pattern)))
+                  (recur (+ pos 1) (assoc s :dpos (+ (+ (:dl s) (:zc s)) (:dr s)))))
+                (= ch CH-EXP)
+                (if (:use-exp s) (assoc s :err (str "Multiple exponential symbols in pattern " (qpat pattern)))
+                  (let [p2 (loop [p (+ pos 1)] (if (and (< p n) (= (nth cs p) CH-ZERO)) (recur (+ p 1)) p))
+                        me (- p2 (+ pos 1))]
+                    (if (or (< (+ (:dl s) (:zc s)) 1) (< me 1))
+                      (assoc s :err (str "Malformed exponential pattern " (qpat pattern)))
+                      (recur p2 (assoc (assoc (assoc s :use-exp true) :min-exp me) :phase 2)))))
+                :else (recur pos (assoc s :phase 2))))))))))
+
+(defn- byte-inc Int [x: Int] (if (= x 127) -128 (+ x 1)))
+
+(defn compile-pattern Values(Pat Str) [pattern: &Str]
+  (let [cs (uni/cps pattern)
+        n (count cs)
+        empty-pat (->Pat [] [] [(->Aff 3 "")] [] 1 INT-MAX32 0 3 true 3 1 false false 0 false)]
+    (if (= n 0)
+      (values (->Pat [] [] [(->Aff 3 "")] [] 0 INT-MAX32 0 INT-MAX32 true 3 1 false false 0 false) "")
+      (loop [j 1 start 0 pat empty-pat got-neg false use-exp false currency false]
+        (if (or (< j 0) (>= start n))
+          (let [p2 (if (or (not got-neg) (and (aff-eq? (:neg-pre pat) (:pos-pre pat)) (aff-eq? (:neg-suf pat) (:pos-suf pat))))
+                     (assoc (assoc pat :neg-suf (:pos-suf pat)) :neg-pre (aff-prepend-minus (:pos-pre pat)))
+                     pat)]
+            (values (assoc (assoc p2 :use-exp use-exp) :currency currency) ""))
+          (let [s0 (parse-sub cs pattern start j use-exp currency)]
+            (if (not= (:err s0) "") (values pat (:err s0))
+              (let [
+                    fix (and (= (:zc s0) 0) (> (:dl s0) 0) (>= (:dpos s0) 0))
+                    nn (if (= (:dpos s0) 0) 1 (:dpos s0))
+                    dr (if fix (- (:dl s0) nn) (:dr s0))
+                    dl (if fix (- nn 1) (:dl s0))
+                    zc (if fix 1 (:zc s0))
+                    dpos (:dpos s0)]
+                (if (or (and (< dpos 0) (> dr 0))
+                        (and (>= dpos 0) (or (< dpos dl) (> dpos (+ dl zc))))
+                        (= (:gc s0) 0) (:quote s0))
+                  (values pat (str "Malformed pattern " (qpat pattern)))
+                  (if (= j 1)
+                    (let [total (+ (+ dl zc) dr)
+                          eff (if (>= dpos 0) dpos total)
+                          min-int (- eff dl)
+                          max-int (if (:use-exp s0) (+ dl min-int) INT-MAX32)
+                          max-frac (if (>= dpos 0) (- total dpos) 0)
+                          min-frac (if (>= dpos 0) (- (+ dl zc) dpos) 0)
+                          gc (:gc s0)]
+                      (recur 0 (:next s0)
+                             (->Pat (:pre s0) (:suf s0) (:pre s0) (:suf s0)
+                                    min-int max-int min-frac max-frac (> gc 0) (if (> gc 0) gc 0) (:mult s0)
+                                    (or (= dpos 0) (= dpos total)) (:use-exp s0) (:min-exp s0) false)
+                             false (:use-exp s0) (:currency s0)))
+                    (recur -1 (:next s0) (assoc (assoc pat :neg-pre (:pre s0)) :neg-suf (:suf s0))
+                           true use-exp (:currency s0))))))))))))
+
+(defn- aff-prepend-minus Vec(Aff) [v: &Vec(Aff)]
+  (loop [i 0 acc: Vec(Aff) [(->Aff 3 "")]]
+    (if (>= i (count v)) acc (recur (+ i 1) (conj acc (nth v i))))))
+
+(defn- expand Str [v: &Vec(Aff) sy: &Syms]
+  (loop [i 0 out ""]
+    (if (>= i (count v)) out
+      (let [a (nth v i) k (:kind a)]
+        (recur (+ i 1)
+               (str out (cond
+                          (= k 0) (:text a)
+                          (= k 1) (:pct sy)
+                          (= k 2) (:permill sy)
+                          (= k 3) (:minus sy)
+                          (= k 4) (:cur sy)
+                          :else (:intl sy))))))))
+
+(defrecord DL [digits: Vec(Int) decimal-at: Int])
+
+(defn- digits-of DL [x: &d/Dec]
+  (if (d/is-zero? x) (->DL [] 0)
+    (let [s (bi/to-string (bi/abs-big (d/unscaled x)))
+          n (count s)
+          nz (loop [k n] (if (and (> k 1) (= (nth s (- k 1)) 48)) (recur (- k 1)) k))
+          ds (loop [i 0 acc: Vec(Int) []] (if (>= i nz) acc (recur (+ i 1) (conj acc (- (nth s i) 48)))))]
+      (->DL ds (- n (d/scale x))))))
+
+(defn- nonzero-after? Bool [ds: &Vec(Int) i: Int]
+  (loop [k i] (if (>= k (count ds)) false (if (not= (nth ds k) 0) true (recur (+ k 1))))))
+
+(defn- round-up? Values(Bool Str) [ds: &Vec(Int) m: Int mode: Int neg: Bool]
+  (if (>= m (count ds)) (values false "")
+    (cond
+      (= mode d/UP) (values (nonzero-after? ds m) "")
+      (= mode d/DOWN) (values false "")
+      (= mode d/CEILING) (values (and (nonzero-after? ds m) (not neg)) "")
+      (= mode d/FLOOR) (values (and (nonzero-after? ds m) neg) "")
+      (= mode d/UNNECESSARY) (if (nonzero-after? ds m) (values false "Rounding needed with the rounding mode being set to RoundingMode.UNNECESSARY") (values false ""))
+      :else
+      (let [dg (nth ds m)]
+        (cond
+          (> dg 5) (values true "")
+          (= dg 5) (if (= m (- (count ds) 1))
+                     (values (or (= mode d/HALF-UP) (and (= mode d/HALF-EVEN) (> m 0) (not= (mod (nth ds (- m 1)) 2) 0))) "")
+                     (values (nonzero-after? ds (+ m 1)) ""))
+          :else (values false ""))))))
+
+(defn- trim-zeros Vec(Int) [ds: Vec(Int)]
+  (loop [v ds] (if (and (> (count v) 1) (= (nth v (- (count v) 1)) 0)) (recur (pop v)) v)))
+
+(defn- take-n Vec(Int) [ds: &Vec(Int) n: Int]
+  (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc (nth ds i))))))
+
+(defn- round-dl Values(DL Str) [dl: DL m: Int mode: Int neg: Bool]
+  (let [ds (:digits dl)]
+    (if (or (< m 0) (>= m (count ds))) (values dl "")
+      (let [[up e] (round-up? ds m mode neg)]
+        (if (not= e "") (values dl e)
+          (if (not up) (values (->DL (trim-zeros (take-n ds m)) (:decimal-at dl)) "")
+            (let [[v2 at2] (loop [k (- m 1) v (take-n ds m)]
+                             (if (< k 0) (values [1] (+ (:decimal-at dl) 1))
+                               (let [x (+ (nth v k) 1)]
+                                 (if (<= x 9) (values (take-n (assoc v k x) (+ k 1)) (:decimal-at dl))
+                                   (recur (- k 1) v)))))]
+              (values (->DL (trim-zeros v2) at2) ""))))))))
+
+(defn- set-dl Values(DL Str) [x: &d/Dec m: Int fixed: Bool mode: Int neg: Bool]
+  (let [dl (digits-of x) at (:decimal-at dl) ds (:digits dl)]
+    (if (and fixed (> (count ds) 0) (> (- 0 at) m)) (values (->DL [] 0) "")
+      (if (and fixed (> (count ds) 0) (= (- 0 at) m))
+        (let [[up e] (round-up? ds 0 mode neg)]
+          (if (not= e "") (values dl e)
+            (if up (values (->DL [1] (+ at 1)) "") (values (->DL [] at) ""))))
+        (round-dl dl (if fixed (+ m at) m) mode neg)))))
+
+(defn- digit-str Str [sy: &Syms k: Int] (uni/encode (+ (:zero sy) k)))
+
+(defn- subformat Str [dl0: &DL p: &Pat sy: &Syms]
+  (let [dl (if (= (count (:digits dl0)) 0) (->DL [] 0) (->DL (:digits dl0) (:decimal-at dl0)))
+        ds (:digits dl) cnt (count ds) at (:decimal-at dl)
+        zero (digit-str sy 0)
+        grp (uni/encode (if (:currency p) (:mgroup sy) (:group sy)))
+        decs (uni/encode (if (:currency p) (:mdec sy) (:dec sy)))
+        min-int (:min-int p) max-int (:max-int p) min-frac (:min-frac p) max-frac (:max-frac p)]
+    (if (:use-exp p)
+      (let [repeat max-int
+            [expo mid] (if (and (> repeat 1) (> repeat min-int))
+                         (values (if (>= at 1) (* (quot (- at 1) repeat) repeat) (* (quot (- at repeat) repeat) repeat)) 1)
+                         (values (- at min-int) min-int))
+            md0 (+ min-int min-frac)
+            md1 (if (< md0 0) INT-MAX32 md0)
+            int-digits (if (= cnt 0) mid (- at expo))
+            md (if (< md1 int-digits) int-digits md1)
+            total (if (> md cnt) md cnt)
+            body (loop [i 0 out ""]
+                   (if (>= i total) out
+                     (let [o2 (if (= i int-digits) (str out decs) out)]
+                       (recur (+ i 1) (str o2 (if (< i cnt) (digit-str sy (nth ds i)) zero))))))
+            body2 (if (and (:dec-always p) (= total int-digits)) (str body decs) body)
+            e (if (= cnt 0) 0 expo)
+            eneg (< e 0)
+            ea (if eneg (- 0 e) e)
+            es (if (= ea 0) "" (str ea))
+            epad (loop [i (count es) out ""] (if (>= i (:min-exp p)) out (recur (+ i 1) (str out zero))))
+            edig (loop [i 0 out ""] (if (>= i (count es)) out (recur (+ i 1) (str out (digit-str sy (- (nth es i) 48))))))]
+        (str body2 (:exp sy) (if eneg (:minus sy) "") epad edig))
+      (let [c0 (if (and (> at 0) (< min-int at)) at min-int)
+            [icount di0] (if (> c0 max-int) (values max-int (- at max-int)) (values c0 0))
+            [ipart di] (loop [i (- icount 1) out "" di di0]
+                         (if (< i 0) (values out di)
+                           (let [[o2 d2] (if (and (< i at) (< di cnt)) (values (str out (digit-str sy (nth ds di))) (+ di 1)) (values (str out zero) di))
+                                 o3 (if (and (:grouping p) (> i 0) (not= (:group-size p) 0) (= (mod i (:group-size p)) 0)) (str o2 grp) o2)]
+                             (recur (- i 1) o3 d2))))
+            frac-present (or (> min-frac 0) (< di cnt))
+            ipart2 (if (and (not frac-present) (= (count ipart) 0)) zero ipart)
+            withdec (if (or (:dec-always p) frac-present) (str ipart2 decs) ipart2)]
+        (loop [i 0 out withdec di di]
+          (if (or (>= i max-frac) (and (>= i min-frac) (>= di cnt))) out
+            (if (> (- -1 i) (- at 1)) (recur (+ i 1) (str out zero) di)
+              (if (< di cnt) (recur (+ i 1) (str out (digit-str sy (nth ds di))) (+ di 1))
+                (recur (+ i 1) (str out zero) di)))))))))
+
+(defn format-with Values(Str Str Str) [x: &d/Dec p: &Pat sy: &Syms mode: Int]
+  (let [xm (if (= (:multiplier p) 1) x (d/mul x (d/from-int (:multiplier p))))
+        neg (< (d/signum xm) 0)
+        ax (d/abs-dec xm)
+        maxd0 (+ (:max-int p) (:max-frac p))
+        maxd (if (or (< maxd0 0) (> maxd0 INT-MAX32)) INT-MAX32 maxd0)
+        [dl e] (set-dl ax (if (:use-exp p) maxd (:max-frac p)) (not (:use-exp p)) mode neg)]
+    (cond
+      (not= e "") (values "" "" e)
+      (and (not (:use-exp p)) (> (:decimal-at dl) d/MAX-DIGITS)) (values "" "" d/TOO-BIG)
+      :else
+      (let [body (subformat dl p sy)]
+        (if neg
+          (values (str (expand (:neg-pre p) sy) body (expand (:neg-suf p) sy)) "" "")
+          (values (str (expand (:pos-pre p) sy) body (expand (:pos-suf p) sy)) "" ""))))))
+
+(defn format-dec Values(Str Str Str) [x: &d/Dec pattern: &Str locale: &Str mode: Int]
+  (let [[p pe] (compile-pattern pattern)]
+    (if (not= pe "") (values "" pe "")
+      (format-with x p (symbols locale) mode))))
+
+(defn- region? Bool [text: &Str pos: Int s: &Str]
+  (and (<= (+ pos (count s)) (count text))
+       (loop [i 0] (if (>= i (count s)) true (if (= (nth text (+ pos i)) (nth s i)) (recur (+ i 1)) false)))))
+
+(defn- unicode-digit Int [cp: Int]
+  (if (and (>= cp 48) (<= cp 57)) (- cp 48)
+    (if (not (uni/java-digit? cp)) -1
+      (let [start (loop [z cp] (if (uni/java-digit? (- z 1)) (recur (- z 1)) z))]
+        (mod (- cp start) 10)))))
+
+(defrecord NumRes [pos: Int digits: Vec(Int) decimal-at: Int infinite: Bool])
+
+(defn- subparse-number NumRes [text: &Str pos0: Int p: &Pat sy: &Syms is-exp: Bool int-only: Bool]
+  (if (and (not is-exp) (region? text pos0 (:inf sy)))
+    (->NumRes (+ pos0 (count (:inf sy))) [] 0 true)
+    (let [n (count text)
+          zero (:zero sy)
+          decc (if (:currency p) (:mdec sy) (:dec sy))
+          grpc (if (:currency p) (:mgroup sy) (:group sy))
+          [pos ds at saw-dec saw-digit dcount backup expo]
+          (loop [pos pos0 ds: Vec(Int) [] at 0 saw-dec false saw-digit false dcount 0 backup -1]
+            (if (>= pos n) (values pos ds at saw-dec saw-digit dcount backup 0)
+              (let [[ch nxt] (uni/decode-at text pos)
+                    dg0 (- ch zero)
+                    dg (if (or (< dg0 0) (> dg0 9)) (unicode-digit ch) dg0)]
+                (cond
+                  (= dg 0)
+                  (if (= (count ds) 0)
+                    (if (not saw-dec) (recur nxt ds at saw-dec true dcount -1)
+                      (recur nxt ds (- at 1) saw-dec true dcount -1))
+                    (recur nxt (conj ds 0) at saw-dec true (+ dcount 1) -1))
+                  (and (> dg 0) (<= dg 9)) (recur nxt (conj ds dg) at saw-dec true (+ dcount 1) -1)
+                  (and (not is-exp) (= ch decc))
+                  (if (or saw-dec int-only) (values pos ds at saw-dec saw-digit dcount backup 0)
+                    (recur nxt ds dcount true saw-digit dcount backup))
+                  (and (not is-exp) (= ch grpc) (:grouping p))
+                  (if saw-dec (values pos ds at saw-dec saw-digit dcount backup 0)
+                    (recur nxt ds at saw-dec saw-digit dcount pos))
+                  (and (not is-exp) (region? text pos (:exp sy)))
+                  (let [ep (+ pos (count (:exp sy)))
+                        eneg (region? text ep (:minus sy))
+                        ep2 (if eneg (+ ep (count (:minus sy))) ep)
+                        r (subparse-number text ep2 p sy true false)]
+                    (if (or (< (:pos r) 0) (not (fits-long? (:digits r) (:decimal-at r) eneg)))
+                      (values pos ds at saw-dec saw-digit dcount backup 0)
+                      (let [ev (loop [i 0 acc 0] (if (>= i (count (:digits r))) acc (recur (+ i 1) (+ (* acc 10) (nth (:digits r) i)))))
+                            ev2 (loop [k (count (:digits r)) acc ev] (if (>= k (:decimal-at r)) acc (recur (+ k 1) (* acc 10))))
+                            ev3 (int32 (if eneg (- 0 ev2) ev2))]
+                        (values (:pos r) ds at saw-dec saw-digit dcount backup ev3))))
+                  :else (values pos ds at saw-dec saw-digit dcount backup 0)))))
+          pos2 (if (not= backup -1) backup pos)
+          at2 (if saw-dec at dcount)]
+      (if (and (not saw-digit) (= dcount 0)) (->NumRes -1 [] 0 false)
+        (->NumRes pos2 ds (+ at2 expo) false)))))
+
+(defn- fits-long? Bool [ds: &Vec(Int) at: Int neg: Bool]
+  (if (or (= (count ds) 0) (<= at 0)) true
+    (if (< at 19) true
+      (if (> at 19) false
+        (let [lim (if neg "9223372036854775808" "9223372036854775807")
+              v (loop [i 0 out ""] (if (>= i 19) out (recur (+ i 1) (str out (if (< i (count ds)) (nth ds i) 0)))))]
+          (<= (str-cmp v lim) 0))))))
+
+(defn- str-cmp Int [a: &Str b: &Str]
+  (loop [i 0] (if (>= i (count a)) 0
+                (let [x (nth a i) y (nth b i)] (if (< x y) -1 (if (> x y) 1 (recur (+ i 1))))))))
+
+(defn- int32 Int [x: Int]
+  (let [u (bit-and x 4294967295)] (if (>= u 2147483648) (- u 4294967296) u)))
+
+(defn- dl-dec d/Dec [ds: &Vec(Int) at: Int]
+  (if (= (count ds) 0)
+    (d/of (bi/zero) (- 0 at))
+    (let [u (loop [i 0 acc (bi/zero)] (if (>= i (count ds)) acc (recur (+ i 1) (bi/add-int (bi/mul-int acc 10) (nth ds i)))))]
+      (d/of u (- (count ds) at)))))
+
+(defn parse-with Values(d/Dec Bool) [text: &Str p: &Pat sy: &Syms]
+  (if (region? text 0 (:nan sy)) (values (d/zero) false)
+    (let [pp (expand (:pos-pre p) sy) np (expand (:neg-pre p) sy)
+          ps (expand (:pos-suf p) sy) ns (expand (:neg-suf p) sy)
+          gp0 (region? text 0 pp) gn0 (region? text 0 np)
+          gp1 (if (and gp0 gn0 (< (count pp) (count np))) false gp0)
+          gn1 (if (and gp0 gn0 (> (count pp) (count np))) false gn0)]
+      (if (and (not gp1) (not gn1)) (values (d/zero) false)
+        (let [start (if gp1 (count pp) (count np))
+              r (subparse-number text start p sy false false)
+              pos (:pos r)]
+          (if (or (< pos 0) (:infinite r)) (values (d/zero) false)
+            (let [gp2 (and gp1 (region? text pos ps))
+                  gn2 (and gn1 (region? text pos ns))
+                  gp3 (if (and gp2 gn2 (< (count ps) (count ns))) false gp2)
+                  gn3 (if (and gp2 gn2 (> (count ps) (count ns))) false gn2)]
+              (if (= gp3 gn3) (values (d/zero) false)
+                (let [x0 (dl-dec (:digits r) (:decimal-at r))
+                      m (:multiplier p)
+                      x1 (if (= m 1) x0
+                           (let [[q e] (d/div-exact x0 (d/from-int m))]
+                             (if (= e "") q (let [[q2 e2] (d/div-scale x0 (d/from-int m) (d/scale x0) d/HALF-EVEN)] q2))))]
+                  (values (if gp3 x1 (d/neg x1)) true))))))))))
+
+(defrecord PRes [kind: Int value: d/Dec positive: Bool end: Int])
+
+(defn parse-at PRes [text: &Str p: &Pat sy: &Syms int-only: Bool]
+  (let [fail (->PRes 0 (d/zero) true -1)]
+    (if (and (> (count (:nan sy)) 0) (region? text 0 (:nan sy))) (->PRes 2 (d/zero) true (count (:nan sy)))
+      (let [pp (expand (:pos-pre p) sy) np (expand (:neg-pre p) sy)
+            ps (expand (:pos-suf p) sy) ns (expand (:neg-suf p) sy)
+            gp0 (region? text 0 pp) gn0 (region? text 0 np)
+            gp1 (if (and gp0 gn0 (< (count pp) (count np))) false gp0)
+            gn1 (if (and gp0 gn0 (> (count pp) (count np))) false gn0)]
+        (if (and (not gp1) (not gn1)) fail
+          (let [start (if gp1 (count pp) (count np))
+                r (subparse-number text start p sy false int-only)
+                pos (:pos r)]
+            (if (< pos 0) fail
+              (let [gp2 (and gp1 (region? text pos ps))
+                    gn2 (and gn1 (region? text pos ns))
+                    gp3 (if (and gp2 gn2 (< (count ps) (count ns))) false gp2)
+                    gn3 (if (and gp2 gn2 (> (count ps) (count ns))) false gn2)]
+                (if (= gp3 gn3) fail
+                  (let [end (+ pos (count (if gp3 ps ns)))]
+                    (if (:infinite r) (->PRes 3 (d/zero) gp3 end)
+                      (let [x0 (dl-dec (:digits r) (:decimal-at r))
+                            m (:multiplier p)
+                            x1 (if (= m 1) x0
+                                 (let [[q e] (d/div-exact x0 (d/from-int m))]
+                                   (if (= e "") q (let [[q2 e2] (d/div-scale x0 (d/from-int m) (d/scale x0) d/HALF-EVEN)] q2))))]
+                        (->PRes 1 x1 gp3 end)))))))))))))
+
+(defn parse-dec Values(d/Dec Str Bool) [text: &Str pattern: &Str locale: &Str]
+  (let [[p pe] (compile-pattern pattern)]
+    (if (not= pe "") (values (d/zero) pe false)
+      (let [[x ok] (parse-with text p (symbols locale))] (values x "" ok)))))
+
+(defn normalize d/Dec [x: &d/Dec]
+  (if (<= (d/scale x) 0) (d/of (d/unscaled x) (d/scale x))
+    (let [s (d/strip-trailing-zeros x)]
+      (if (< (d/scale s) 0) (let [[r e] (d/set-scale s 0 d/UNNECESSARY)] r) s))))

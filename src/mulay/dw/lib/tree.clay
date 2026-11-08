@@ -1,0 +1,199 @@
+(ns mulay.dw.lib.tree
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]))
+
+(def M "dw::util::Tree")
+
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+
+(defn ns-val v/Val [ns: &Vec(v/Ns)]
+  (if (= (count ns) 0) (v/null-v) (v/->VNsV (nth ns 0))))
+
+(defn path-elem v/Val [kind: Str selector: v/Val ns: v/Val]
+  (v/->VObj [(v/field "kind" (v/->VStr kind)) (v/field "selector" selector) (v/field "namespace" ns)]))
+
+(defn key-elem v/Val [kind: Str k: &v/Key] (path-elem kind (v/->VStr (:name k)) (ns-val (:ns k))))
+(defn attr-elem v/Val [a: &v/Attr] (path-elem "Attribute" (v/->VStr (:name a)) (ns-val (:ns a))))
+(defn index-elem v/Val [i: Int] (path-elem "Array" (v/int-v i) (v/null-v)))
+
+(defn- get1 v/Val [x: &v/Val name: Str]
+  (match (v/unmeta x)
+    (v/VObj fs) (let [r (v/obj-get fs name)] (if (= (count r) 0) (v/null-v) (nth r 0)))
+    _ (v/null-v)))
+
+(defn elem-kind Str [e: &v/Val] (match (v/unmeta (get1 e "kind")) (v/VStr s) s _ ""))
+
+(defn last-kind Str [path: &Vec(v/Val)]
+  (if (= (count path) 0) "" (elem-kind (nth path (- (count path) 1)))))
+
+(defn- truthy? Bool [x: &v/Val] (match (v/unmeta x) (v/VBool b) b _ false))
+
+(defn- call2 Values(v/Val dwe/DwErr) [env: &rt/Env f: &v/FnV a: v/Val b: v/Val] (rt/env-call env f [a b]))
+
+(defn- simple? Bool [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VObj fs) false (v/VArr xs) false (v/VRange a b) false (v/VFn f) false (v/VBin b) false _ true))
+
+(defn- as-expression-string Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [ps (core/arg-items a 0)]
+    (loop [i 0 out ""]
+      (if (>= i (count ps)) (ok (v/->VStr out))
+        (let [e (nth ps i) k (elem-kind e) [s se] (rt/to-text (get1 e "selector"))]
+          (if (not (dwe/ok? se)) (values (v/null-v) se)
+            (recur (+ i 1) (str out (cond (= k "Attribute") (str ".@" s) (= k "Array") (str "[" s "]") :else (str "." s))))))))))
+
+(defn- path-err Vec(dwe/DwErr) [xs: &Vec(v/Val)]
+  (loop [i 0]
+    (if (>= i (count xs)) []
+      (match (v/unmeta (nth xs i))
+        (v/VObj fs) (recur (+ i 1))
+        _ (let [y (v/unmeta (nth xs i))
+                shown (match y (v/VStr t) (str "\"" t "\"") _ (let [[t e] (rt/to-text y)] (if (dwe/ok? e) t (v/type-name y))))]
+            [(dwe/err "InvalidArgs" (str "- Expecting Type: `PathElement`, but got: `" shown "`."))])))))
+
+(defn- last-is Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [kind: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (let [xs (core/arg-items a 0) pe (path-err xs)]
+      (if (> (count pe) 0) (values (v/null-v) (nth pe 0))
+        (ok (v/bool-v (= (last-kind xs) kind)))))))
+
+(defn map-leaves Values(v/Val dwe/DwErr) [env: &rt/Env x0: &v/Val path: Vec(v/Val) f: &v/FnV]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VObj fs)
+      (loop [i 0 acc: Vec(v/Field) []]
+        (if (>= i (count fs)) (ok (v/->VObj acc))
+          (let [fl (nth fs i) k (:key fl)
+                [attrs ae] (map-attrs env k path f)]
+            (if (not (dwe/ok? ae)) (values (v/null-v) ae)
+              (let [[y e] (map-leaves env (:value fl) (conj path (key-elem "Object" k)) f)]
+                (if (not (dwe/ok? e)) (values y e)
+                  (recur (+ i 1) (conj acc (v/->Field (v/->Key (:ns k) (:name k) attrs) y)))))))))
+      (v/VArr xs) (map-items env xs path f)
+      (v/VRange a b) (map-items env (v/items x) path f)
+      _ (call2 env f x0 (v/->VArr path)))))
+
+(defn- map-items Values(v/Val dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val) path: Vec(v/Val) f: &v/FnV]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count xs)) (ok (v/->VArr acc))
+      (let [[y e] (map-leaves env (nth xs i) (conj path (index-elem i)) f)]
+        (if (dwe/ok? e) (recur (+ i 1) (conj acc y)) (values y e))))))
+
+(defn- map-attrs Values(Vec(v/Attr) dwe/DwErr) [env: &rt/Env k: &v/Key path: Vec(v/Val) f: &v/FnV]
+  (let [as (:attrs k)]
+    (loop [i 0 acc: Vec(v/Attr) []]
+      (if (>= i (count as)) (values acc (dwe/ok))
+        (let [at (nth as i)
+              [y e] (map-leaves env (:value at) (conj path (attr-elem at)) f)]
+          (if (not (dwe/ok? e)) (values acc e)
+            (recur (+ i 1) (conj acc (v/->Attr (:ns at) (:name at) y)))))))))
+
+(defn- map-leaf-values Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (map-leaves env (nth a 0) [] (core/arg-fn a 1)))
+
+(defn- keep? Values(Bool dwe/DwErr) [env: &rt/Env f: &v/FnV x: &v/Val path: &Vec(v/Val) mode: Int]
+  (let [k (last-kind path)
+        applies (cond
+                  (= mode 0) true
+                  (= mode 1) (and (or (= k "Object") (= k "Attribute")) (simple? x))
+                  :else (and (= k "Array") (simple? x)))]
+    (if (not applies) (values true (dwe/ok))
+      (let [[r e] (call2 env f x (v/->VArr path))] (values (truthy? r) e)))))
+
+(defn filter-tree Values(v/Val dwe/DwErr) [env: &rt/Env x0: &v/Val path: Vec(v/Val) f: &v/FnV mode: Int]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VObj fs)
+      (loop [i 0 acc: Vec(v/Field) []]
+        (if (>= i (count fs)) (ok (v/->VObj acc))
+          (let [fl (nth fs i) k (:key fl) p2 (conj path (key-elem "Object" k))
+                [kp ke] (keep? env f (:value fl) p2 mode)]
+            (if (not (dwe/ok? ke)) (values (v/null-v) ke)
+              (if (not kp) (recur (+ i 1) acc)
+                (let [[attrs ae] (filter-attrs env k p2 f mode)]
+                  (if (not (dwe/ok? ae)) (values (v/null-v) ae)
+                    (let [[y e] (filter-tree env (:value fl) p2 f mode)]
+                      (if (not (dwe/ok? e)) (values y e)
+                        (recur (+ i 1) (conj acc (v/->Field (v/->Key (:ns k) (:name k) attrs) y))))))))))))
+      (v/VArr xs) (filter-items env xs path f mode)
+      (v/VRange a b) (filter-items env (v/items x) path f mode)
+      _ (ok x0))))
+
+(defn- filter-items Values(v/Val dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val) path: Vec(v/Val) f: &v/FnV mode: Int]
+  (let [[kept ke] (loop [i 0 acc: Vec(v/Val) []]
+                    (if (>= i (count xs)) (values acc (dwe/ok))
+                      (let [[kp e] (keep? env f (nth xs i) (conj path (index-elem i)) mode)]
+                        (if (not (dwe/ok? e)) (values acc e) (recur (+ i 1) (if kp (conj acc (nth xs i)) acc))))))]
+    (if (not (dwe/ok? ke)) (values (v/null-v) ke)
+      (loop [i 0 acc: Vec(v/Val) []]
+        (if (>= i (count kept)) (ok (v/->VArr acc))
+          (let [[y e] (filter-tree env (nth kept i) (conj path (index-elem i)) f mode)]
+            (if (dwe/ok? e) (recur (+ i 1) (conj acc y)) (values y e))))))))
+
+(defn- filter-attrs Values(Vec(v/Attr) dwe/DwErr) [env: &rt/Env k: &v/Key path: Vec(v/Val) f: &v/FnV mode: Int]
+  (let [as (:attrs k)]
+    (loop [i 0 acc: Vec(v/Attr) []]
+      (if (>= i (count as)) (values acc (dwe/ok))
+        (let [at (nth as i) [kp e] (keep? env f (:value at) (conj path (attr-elem at)) mode)]
+          (if (not (dwe/ok? e)) (values acc e) (recur (+ i 1) (if kp (conj acc at) acc))))))))
+
+(defn- filter-fn Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [mode: Int]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (filter-tree env (nth a 0) [] (core/arg-fn a 1) mode)))
+
+(defn- exists? Values(Bool dwe/DwErr) [env: &rt/Env x0: &v/Val path: Vec(v/Val) f: &v/FnV]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VObj fs)
+      (loop [i 0]
+        (if (>= i (count fs)) (values false (dwe/ok))
+          (let [fl (nth fs i) k (:key fl) p2 (conj path (key-elem "Object" k))
+                [r e] (call2 env f (:value fl) (v/->VArr p2))]
+            (if (not (dwe/ok? e)) (values false e)
+              (if (truthy? r) (values true (dwe/ok))
+                (let [[r2 e2] (exists? env (:value fl) p2 f)]
+                  (if (not (dwe/ok? e2)) (values false e2)
+                    (if r2 (values true (dwe/ok))
+                      (let [[r3 e3] (attr-exists? env k p2 f)]
+                        (if (not (dwe/ok? e3)) (values false e3)
+                          (if r3 (values true (dwe/ok)) (recur (+ i 1)))))))))))))
+      (v/VArr xs) (items-exist? env xs path f)
+      (v/VRange a b) (items-exist? env (v/items x) path f)
+      _ (let [[r e] (call2 env f x0 (v/->VArr path))] (values (truthy? r) e)))))
+
+(defn- items-exist? Values(Bool dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val) path: Vec(v/Val) f: &v/FnV]
+  (loop [i 0]
+    (if (>= i (count xs)) (values false (dwe/ok))
+      (let [p2 (conj path (index-elem i))
+            [r e] (call2 env f (nth xs i) (v/->VArr p2))]
+        (if (not (dwe/ok? e)) (values false e)
+          (if (truthy? r) (values true (dwe/ok))
+            (let [[r2 e2] (exists? env (nth xs i) p2 f)]
+              (if (not (dwe/ok? e2)) (values false e2)
+                (if r2 (values true (dwe/ok)) (recur (+ i 1)))))))))))
+
+(defn- attr-exists? Values(Bool dwe/DwErr) [env: &rt/Env k: &v/Key path: Vec(v/Val) f: &v/FnV]
+  (let [as (:attrs k)]
+    (loop [i 0]
+      (if (>= i (count as)) (values false (dwe/ok))
+        (let [at (nth as i) [r e] (call2 env f (:value at) (v/->VArr (conj path (attr-elem at))))]
+          (if (not (dwe/ok? e)) (values false e)
+            (if (truthy? r) (values true (dwe/ok)) (recur (+ i 1)))))))))
+
+(defn- node-exists Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[r e] (exists? env (nth a 0) [] (core/arg-fn a 1))]
+    (if (dwe/ok? e) (ok (v/bool-v r)) (values (v/null-v) e))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(rt/constant "OBJECT_TYPE" M (v/->VStr "Object"))
+   (rt/constant "ATTRIBUTE_TYPE" M (v/->VStr "Attribute"))
+   (rt/constant "ARRAY_TYPE" M (v/->VStr "Array"))
+   (B "asExpressionString" [(rt/b1 "Array" as-expression-string)])
+   (B "isAttributeType" [(rt/b1 "Array" (last-is "Attribute"))])
+   (B "isObjectType" [(rt/b1 "Array" (last-is "Object"))])
+   (B "isArrayType" [(rt/b1 "Array" (last-is "Array"))])
+   (B "mapLeafValues" [(rt/b2 "Any" "Function" map-leaf-values)])
+   (B "filterTree" [(rt/b2 "Any" "Function" (filter-fn 0))])
+   (B "filterObjectLeafs" [(rt/b2 "Any" "Function" (filter-fn 1))])
+   (B "filterArrayLeafs" [(rt/b2 "Any" "Function" (filter-fn 2))])
+   (B "nodeExists" [(rt/b2 "Any" "Function" node-exists)])])

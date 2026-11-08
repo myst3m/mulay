@@ -1,0 +1,267 @@
+(ns mulay.conn.vm
+  (:require [mulay.dw.val :as v] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.rt.persist :as ps] [mulay.lib.xml :as xml] [mulay.lib.fs :as fs]
+            [mulay.lib.time.zoned :as zt] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/vm")
+
+(def ATTR-CLASS "org.mule.extensions.vm.api.VMMessageAttributes")
+
+(defrecord Msg [payload: ev/TV attrs: ev/TV reply: Str])
+(defrecord Reply [ok: Bool payload: ev/TV attrs: ev/TV etype: Str desc: Str])
+
+(defrecord Q [queues: Map(Str Vec(Msg)) takes: Map(Str Msg)])
+
+(defrecord Pend [queue: Str msg: Msg consumed: Bool])
+
+(defrecord St [q: Atom(Q) replies: Atom(Map(Str Reply)) seq: Atom(Int)
+               persistent: Atom(Vec(Str)) dir: Atom(Str) ticket: Atom(Int) serving: Atom(Int)
+               txs: Atom(Map(Str Vec(Pend)))])
+
+(defn- persistent? Bool [st: &St queue: &Str]
+  (let [ps (deref (:persistent st))] (loop [i 0] (if (>= i (count ps)) false (if (= (nth ps i) queue) true (recur (+ i 1)))))))
+
+(defn- save Int [st: &St queue: &Str]
+  (if (not (persistent? st queue)) 0
+    (let [t (swap! (:ticket st) (fn Int [n: Int] (+ n 1)))
+          z0 (loop [] (if (= (+ (deref (:serving st)) 1) t) 0 (let [z (sleep-ms 1)] (recur))))
+          qs (:queues (deref (:q st)))
+          msgs: Vec(Msg) (if (contains? qs queue) (get! qs queue) [])
+          lines (loop [i 0 acc: Vec(Str) []]
+                  (if (>= i (count msgs)) acc
+                    (let [m (nth msgs i)] (recur (+ i 1) (conj acc (str (ps/tv-fields (:payload m)) " " (ps/tv-fields (:attrs m))))))))
+          we (ps/save (fs/join (deref (:dir st)) (ps/safe-name queue)) lines)
+          z1 (swap! (:serving st) (fn Int [n: Int] (+ n 1)))]
+      (if (= we "") 0 (let [z (eprintln (str "mulay: VM queue '" queue "': " we))] 1)))))
+
+(defn- next-id Str [st: &St] (str (swap! (:seq st) (fn Int [n: Int] (+ n 1)))))
+
+(defn- push-msg Int [st: &St queue: &Str msg: Msg]
+  (let [z (swap! (:q st) (fn Q [o: Q]
+                             (let [qs (:queues o)
+                                   q: Vec(Msg) (if (contains? qs queue) (get! qs queue) [])]
+                               (->Q (assoc qs queue (conj q msg)) (:takes o)))))]
+    (save st queue)))
+
+(defn- unshift-msg Int [st: &St queue: &Str msg: Msg]
+  (let [z (swap! (:q st) (fn Q [o: Q]
+                             (let [qs (:queues o)
+                                   q: Vec(Msg) (if (contains? qs queue) (get! qs queue) [])
+                                   q2 (loop [i 0 acc: Vec(Msg) [msg]] (if (>= i (count q)) acc (recur (+ i 1) (conj acc (nth q i)))))]
+                               (->Q (assoc qs queue q2) (:takes o)))))]
+    (save st queue)))
+
+(defn- tx-add Int [st: &St tx: &Str p: Pend]
+  (let [z (swap! (:txs st) (fn Map(Str Vec(Pend)) [o: Map(Str Vec(Pend))]
+                               (let [ps: Vec(Pend) (if (contains? o tx) (get! o tx) [])] (assoc o tx (conj ps p)))))]
+    0))
+
+(defn- tx-end Str [st: &St tx: &Str commit: Bool]
+  (let [m (deref (:txs st))]
+    (if (not (contains? m tx)) ""
+      (let [ps (get! m tx)
+            z (swap! (:txs st) (fn Map(Str Vec(Pend)) [o: Map(Str Vec(Pend))] (dissoc o tx)))
+            z2 (if commit
+                 (loop [i 0] (if (>= i (count ps)) 0 (let [p (nth ps i) y (if (:consumed p) 0 (push-msg st (:queue p) (:msg p)))] (recur (+ i 1)))))
+                 (loop [i (- (count ps) 1)] (if (< i 0) 0 (let [p (nth ps i) y (if (:consumed p) (unshift-msg st (:queue p) (:msg p)) 0)] (recur (- i 1))))))]
+        ""))))
+
+(defn- take-msg Values(Msg Bool) [st: &St queue: &Str]
+  (let [tk (next-id st)
+        m (swap! (:q st) (fn Q [o: Q]
+                             (let [qs (:queues o)
+                                   q: Vec(Msg) (if (contains? qs queue) (get! qs queue) [])]
+                               (if (= (count q) 0) o
+                                 (->Q (assoc qs queue (subvec q 1 (count q))) (assoc (:takes o) tk (nth q 0)))))))
+        takes (:takes m)]
+    (if (not (contains? takes tk)) (values (->Msg (ev/tv-null) (ev/tv-null) "") false)
+      (let [msg (get! takes tk)
+            z (swap! (:q st) (fn Q [o: Q] (->Q (:queues o) (dissoc (:takes o) tk))))
+            z2 (save st queue)]
+        (values msg true)))))
+
+(defn- take-reply Values(Reply Bool) [st: &St id: &Str]
+  (let [m (deref (:replies st))]
+    (if (not (contains? m id)) (values (->Reply false (ev/tv-null) (ev/tv-null) "" "") false)
+      (let [r (get! m id)
+            z (swap! (:replies st) (fn Map(Str Reply) [o: Map(Str Reply)] (dissoc o id)))]
+        (values r true)))))
+
+(defn- put-reply Int [st: &St id: &Str r: Reply]
+  (let [z (swap! (:replies st) (fn Map(Str Reply) [o: Map(Str Reply)] (assoc o id r)))] 0))
+
+(defn- wait-msg Values(Msg Bool) [st: &St queue: &Str ms: Int]
+  (let [deadline (+ (quot (mono-us) 1000) ms)]
+    (loop [pause 1]
+      (let [[msg ok] (take-msg st queue)]
+        (cond ok (values msg true)
+              (>= (quot (mono-us) 1000) deadline) (values msg false)
+              :else (let [z (sleep-ms pause)] (recur (if (< pause 8) (* pause 2) 8))))))))
+
+(defn- wait-reply Values(Reply Bool) [st: &St id: &Str ms: Int]
+  (let [deadline (+ (quot (mono-us) 1000) ms)]
+    (loop [pause 1]
+      (let [[r ok] (take-reply st id)]
+        (cond ok (values r true)
+              (>= (quot (mono-us) 1000) deadline) (values r false)
+              :else (let [z (sleep-ms pause)] (recur (if (< pause 8) (* pause 2) 8))))))))
+
+(defn- declared? Bool [cfg: &Vec(m/Config) queue: &Str]
+  (if (= (count cfg) 0) false
+    (let [qs (conn/child-elem (:children (nth cfg 0)) "queues")]
+      (if (= (count qs) 0) false
+        (let [kids (xml/elem-children (nth qs 0))]
+          (loop [i 0]
+            (if (>= i (count kids)) false
+              (let [k (nth kids i)]
+                (if (and (xml/elem? k) (= (xml/elem-local k) "queue") (= (xml/attr k "" "queueName" "") queue)) true (recur (+ i 1)))))))))))
+
+(defn- unit-ms Int [unit: &Str]
+  (cond (= unit "MILLISECONDS") 1 (= unit "SECONDS") 1000 (= unit "MINUTES") 60000
+        (= unit "HOURS") 3600000 (= unit "DAYS") 86400000 :else 0))
+
+(defn- timeout-of Values(Int Str Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[t x1] (conn/attr-str c "timeout" "5")
+        [u x2] (conn/attr-str c "timeoutUnit" "SECONDS")
+        [n ne] (parse-long (str/trim t))
+        unit (str/upper-case (str/trim u))
+        um (unit-ms unit)
+        ms (cond (> um 0) (* n um) (= unit "MICROSECONDS") (/ n 1000) :else (/ n 1000000))]
+    (cond (> (count x1) 0) (values 0 "" x1)
+          (> (count x2) 0) (values 0 "" x2)
+          (not= ne "") (values 0 "" [(err/mk "MULE" "EXPRESSION" (str "Invalid timeout '" t "'"))])
+          :else (values ms (str n " " unit) []))))
+
+(defn- attrs-tv ev/TV [queue: &Str corr: &Str]
+  (let [now (zt/zdt-ldt (zt/now-zdt))]
+    (ev/tv-val (v/->VMeta (v/->VObj [(v/field "queueName" (v/->VStr (str queue)))
+                                     (v/field "correlationId" (if (= corr "") (v/null-v) (v/->VStr (str corr))))
+                                     (v/field "timestamp" (v/->VLocalDateTime now))])
+                          [(v/field "class" (v/->VStr ATTR-CLASS))])
+               ev/JAVA)))
+
+(defn- vm-err err/MErr [id: Str desc: Str] (err/mk "VM" id desc))
+
+(defn- content Values(ev/TV Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[ct x] (conn/child-tv c "content")]
+    (cond (> (count x) 0) (values (ev/tv-null) x)
+          (= (count ct) 0) (values (ev/settle (:payload (:event c))) [])
+          :else (values (ev/settle (nth ct 0)) []))))
+
+(defn- run-op conn/OpResult [st: &St c: &conn/OpCall]
+  (let [op (:op c)
+        [queue qx] (conn/required-str c "queueName")
+        cfg (:config c)
+        [cids cidx] (conn/outbound-corr c (if (= (count cfg) 0) [] (:params (nth cfg 0))))
+        corr (if (= (count cids) 0) "" (nth cids 0))
+        tx0 (:tx (:event c))
+        action (conn/param-lit (:params c) "transactionalAction" "JOIN_IF_POSSIBLE")
+        jtx (if (= action "NOT_SUPPORTED") "" tx0)]
+    (cond
+      (> (count qx) 0) (conn/fail-result (nth qx 0))
+      (and (not= op "consume") (> (count cidx) 0)) (conn/fail-result (nth cidx 0))
+      (not (declared? cfg queue)) (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "queue '" queue "' is not defined")))
+      (and (= tx0 "") (= action "ALWAYS_JOIN") (not= op "publish-consume"))
+      (conn/fail-result (err/mk "MULE" "TRANSACTION" "A transaction is not available for this session, but transaction action is \"Always Join\""))
+      (= op "publish")
+      (let [[p px] (content c)]
+        (if (> (count px) 0) (conn/fail-result (nth px 0))
+          (let [msg (->Msg p (attrs-tv queue corr) "")
+                z (if (= jtx "") (push-msg st queue msg) (tx-add st jtx (->Pend queue msg false)))]
+            (conn/keep-result c))))
+      (= op "consume")
+      (let [[ms label tx] (timeout-of c)]
+        (if (> (count tx) 0) (conn/fail-result (nth tx 0))
+          (let [[msg ok] (wait-msg st queue ms)]
+            (if (not ok)
+              (conn/fail-result (vm-err "EMPTY_QUEUE" (str "Tried to consume messages from VM queue '" queue "' but it was empty after timeout of " label)))
+              (let [z (if (= jtx "") 0 (tx-add st jtx (->Pend queue msg true)))]
+                (conn/ok-result (:payload msg) (:attrs msg)))))))
+      (= op "publish-consume")
+      (let [[ms label tx] (timeout-of c)
+            [p px] (content c)]
+        (cond
+          (> (count tx) 0) (conn/fail-result (nth tx 0))
+          (> (count px) 0) (conn/fail-result (nth px 0))
+          :else
+          (let [id (next-id st)
+                z (push-msg st queue (->Msg p (attrs-tv queue corr) id))
+                [r ok] (wait-reply st id ms)]
+            (if (not ok)
+              (let [z2 (drop-waiting st queue id)]
+                (conn/fail-result (vm-err "QUEUE_TIMEOUT" (str "Published messages to queue '" queue "' but got no response after timeout of " label))))
+              (if (:ok r) (conn/ok-result (:payload r) (:attrs r))
+                (conn/fail-result (vm-err "PUBLISH_CONSUMER_FLOW_ERROR" (str (:etype r) ": " (:desc r)))))))))
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation vm:" op))))))
+
+(defn- drop-waiting Int [st: &St queue: &Str id: &Str]
+  (let [z (swap! (:q st) (fn Q [o: Q]
+                             (let [qs (:queues o)
+                                   q: Vec(Msg) (if (contains? qs queue) (get! qs queue) [])
+                                   kept (loop [i 0 acc: Vec(Msg) []]
+                                          (if (>= i (count q)) acc
+                                            (recur (+ i 1) (if (= (:reply (nth q i)) id) acc (conj acc (nth q i))))))]
+                               (->Q (assoc qs queue kept) (:takes o)))))]
+    (save st queue)))
+
+(defn- poll Values(Int Str) [st: &St s: conn/SrcCall]
+  (let [queue (conn/param-lit (:params s) "queueName" "")]
+    (if (not (declared? (:config s) queue)) (let [z (sleep-ms 1000)] (values 0 (str "queue '" queue "' is not defined")))
+      (let [[msg ok] (wait-msg st queue 200)]
+        (if (not ok) (values 0 "")
+          (let [p (:payload msg) a (:attrs msg) reply (:reply msg)
+                corr (let [f (match (v/unmeta (:val a)) (v/VObj fs) (v/obj-get fs "correlationId") _ [])]
+                       (if (= (count f) 0) "" (match (nth f 0) (v/VStr x) (str x) _ "")))
+                tx (if (= (str/upper-case (conn/param-lit (:params s) "transactionalAction" "NONE")) "ALWAYS_BEGIN")
+                     (str "vm-listener-" (next-id st)) "")
+                z0 (if (= tx "") 0 (tx-add st tx (->Pend queue msg true)))
+                [e x] ((:run s) p a corr tx)
+                z (if (= reply "") 0
+                    (put-reply st reply
+                               (if (= (count x) 0)
+                                 (->Reply true (ev/settle (:payload e)) (:attributes e) "" "")
+                                 (let [me (nth x 0)]
+                                   (->Reply false (ev/tv-null) (ev/tv-null) (str (:ns me) ":" (:id me)) (:description me))))))]
+            (values 1 (if (= (count x) 0) "" (:description (nth x 0))))))))))
+
+(defn- init Vec(Str) [st: &St app: &m/App]
+  (let [z0 (reset! (:dir st) (ps/dir app "vm"))
+        cs (:configs app)
+        names (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count cs)) acc
+                  (let [c (nth cs i)
+                        qs (if (= (:kind c) "vm:config") (conn/child-elem (:children c) "queues") [])
+                        kids (if (= (count qs) 0) [] (xml/elem-children (nth qs 0)))]
+                    (recur (+ i 1) (loop [j 0 a acc]
+                                     (if (>= j (count kids)) a
+                                       (let [k (nth kids j)]
+                                         (recur (+ j 1) (if (and (xml/elem? k) (= (xml/elem-local k) "queue")
+                                                                 (= (str/upper-case (xml/attr k "" "queueType" "TRANSIENT")) "PERSISTENT"))
+                                                          (conj a (xml/attr k "" "queueName" "")) a)))))))))
+        z1 (reset! (:persistent st) names)
+        loaded (loop [i 0 acc: Map(Str Vec(Msg)) {}]
+                 (if (>= i (count names)) acc
+                   (let [n (nth names i)
+                         lines (ps/load (fs/join (deref (:dir st)) (ps/safe-name n)))
+                         msgs (loop [j 0 ms: Vec(Msg) []]
+                                (if (>= j (count lines)) ms
+                                  (let [f (str/split (nth lines j) " ")]
+                                    (recur (+ j 1) (if (< (count f) 6) ms
+                                                     (conj ms (->Msg (ps/tv-of (nth f 0) (nth f 1) (nth f 2)) (ps/tv-of (nth f 3) (nth f 4) (nth f 5)) "")))))))]
+                     (recur (+ i 1) (if (= (count msgs) 0) acc (assoc acc n msgs))))))
+        z2 (swap! (:q st) (fn Q [o: Q] (->Q loaded (:takes o))))]
+    []))
+
+(defn connector conn/Connector []
+  (let [qs: Map(Str Vec(Msg)) {}
+        ts: Map(Str Msg) {}
+        rs: Map(Str Reply) {}
+        pq: Vec(Str) []
+        tm: Map(Str Vec(Pend)) {}
+        st (->St (atom (->Q qs ts)) (atom rs) (atom 0) (atom pq) (atom ".mulay/app/vm") (atom 0) (atom 0) (atom tm))]
+    (assoc (conn/connector "vm" NS (fn conn/OpResult [c: conn/OpCall] (run-op st c)))
+           :sources ["listener"] :push ["listener"]
+           :poll (fn Values(Int Str) [s: conn/SrcCall] (poll st s))
+           :tx-end (fn Str [id: Str commit: Bool] (tx-end st id commit))
+           :init (fn Vec(Str) [a: m/App] (init st a))
+           :consumers 4)))

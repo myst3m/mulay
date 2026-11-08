@@ -1,0 +1,117 @@
+(ns mulay.lib.jhash
+  (:require [clay.core] [clay.string :as str] [mulay.lib.uni :as uni]))
+
+(defn string-hash Int [s: &Str]
+  (loop [i 0 h 0]
+    (if (>= i (count s)) h
+      (let [cp (uni/cp-at s i)
+            n (uni/next-index s i)
+            h2 (if (< cp 65536) (bit-and (+ (* h 31) cp) 4294967295)
+                 (let [c (- cp 65536)
+                       hi (+ 55296 (bit-shift-right c 10))
+                       lo (+ 56320 (bit-and c 1023))
+                       h1 (bit-and (+ (* h 31) hi) 4294967295)]
+                   (bit-and (+ (* h1 31) lo) 4294967295)))]
+        (recur n h2)))))
+
+(defn- bucket Int [s: &Str cap: Int]
+  (let [h (string-hash s)] (bit-and (bit-xor h (bit-shift-right h 16)) (- cap 1))))
+
+(defn- dedup Vec(Str) [names: &Vec(Str)]
+  (let [z: Map(Str Int) {}]
+    (loop [i 0 seen z acc: Vec(Str) []]
+      (if (>= i (count names)) acc
+        (let [k (nth names i)]
+          (if (contains? seen k) (recur (+ i 1) seen acc) (recur (+ i 1) (assoc seen k 1) (conj acc k))))))))
+
+(defn hashmap-order Vec(Str) [names0: &Vec(Str)] (hashmap-order-with names0 16))
+
+(defn hashmap-order-with Vec(Str) [names0: &Vec(Str) initial: Int]
+  (let [names (dedup names0)
+        n (count names)
+        c0 (loop [c 1] (if (< c initial) (recur (* c 2)) c))
+        cap (loop [c c0] (if (> n (quot (* c 3) 4)) (recur (* c 2)) c))
+        bs (loop [i 0 acc: Vec(Int) []] (if (>= i n) acc (recur (+ i 1) (conj acc (bucket (nth names i) cap)))))
+        order (loop [i 0 acc: Vec(Int) []]
+                (if (>= i n) acc
+                  (let [b (nth bs i)
+                        k (loop [j (count acc)] (if (and (> j 0) (> (nth bs (nth acc (- j 1))) b)) (recur (- j 1)) j))]
+                    (recur (+ i 1) (insert-at acc k i)))))]
+    (loop [i 0 out: Vec(Str) []] (if (>= i n) out (recur (+ i 1) (conj out (nth names (nth order i))))))))
+
+(defn- insert-at Vec(Int) [v: Vec(Int) k: Int x: Int]
+  (loop [i 0 out: Vec(Int) []]
+    (cond (> i (count v)) out
+          (= i k) (recur (+ i 1) (if (< i (count v)) (conj (conj out x) (nth v i)) (conj out x)))
+          :else (recur (+ i 1) (if (< i (count v)) (conj out (nth v i)) out)))))
+
+(defn- s32 Int [x: Int]
+  (let [y (bit-and x 4294967295)] (if (>= y 2147483648) (- y 4294967296) y)))
+
+(defn- improve Int [h0: Int]
+  (let [h1 (s32 h0)
+        h2 (s32 (+ h1 (bit-not (s32 (bit-shift-left h1 9)))))
+        h3 (s32 (bit-xor h2 (bit-shift-right (bit-and h2 4294967295) 14)))
+        h4 (s32 (+ h3 (s32 (bit-shift-left h3 4))))
+        h5 (s32 (bit-xor h4 (bit-shift-right (bit-and h4 4294967295) 10)))]
+    (bit-and h5 4294967295)))
+
+(defn- trie-order Vec(Int) [idx: &Vec(Int) hs: &Vec(Int) level: Int]
+  (if (or (<= (count idx) 1) (>= level 35)) (str-copy-ints idx)
+    (loop [b 0 out: Vec(Int) []]
+      (if (>= b 32) out
+        (let [g (loop [i 0 acc: Vec(Int) []]
+                  (if (>= i (count idx)) acc
+                    (recur (+ i 1) (if (= (bit-and (bit-shift-right (nth hs (nth idx i)) level) 31) b) (conj acc (nth idx i)) acc))))
+              sub (if (> (count g) 1) (trie-order g hs (+ level 5)) g)]
+          (recur (+ b 1) (loop [k 0 acc out] (if (>= k (count sub)) acc (recur (+ k 1) (conj acc (nth sub k)))))))))))
+
+(defn- str-copy-ints Vec(Int) [v: &Vec(Int)] (loop [i 0 acc: Vec(Int) []] (if (>= i (count v)) acc (recur (+ i 1) (conj acc (nth v i))))))
+
+(defn scala-map-order Vec(Str) [names0: &Vec(Str)]
+  (let [names (dedup names0)]
+    (if (<= (count names) 4) names
+      (let [hs (loop [i 0 acc: Vec(Int) []] (if (>= i (count names)) acc (recur (+ i 1) (conj acc (improve (string-hash (nth names i)))))))
+            idx (loop [i 0 acc: Vec(Int) []] (if (>= i (count names)) acc (recur (+ i 1) (conj acc i))))
+            order (trie-order idx hs 0)]
+        (loop [i 0 out: Vec(Str) []] (if (>= i (count order)) out (recur (+ i 1) (conj out (nth names (nth order i))))))))))
+
+(defn- commons-hash Int [s: &Str]
+  (let [h0 (s32 (string-hash s))
+        h1 (s32 (+ h0 (s32 (bit-not (s32 (bit-shift-left h0 9))))))
+        h2 (s32 (bit-xor h1 (bit-shift-right (bit-and h1 4294967295) 14)))
+        h3 (s32 (+ h2 (s32 (bit-shift-left h2 4))))]
+    (s32 (bit-xor h3 (bit-shift-right (bit-and h3 4294967295) 10)))))
+
+(defn- ci-key Str [s: &Str] (str/lower-case s))
+
+(defn commons-order Vec(Str) [names: &Vec(Str)]
+  (let [ks (loop [i 0 acc: Vec(Str) []]
+             (if (>= i (count names)) acc
+               (let [k (ci-key (nth names i))]
+                 (recur (+ i 1) (if (loop [j 0] (if (>= j (count acc)) false (if (= (nth acc j) k) true (recur (+ j 1))))) acc (conj acc k))))))
+        [cap buckets] (loop [i 0 cap 16 bs: Vec(Vec(Int)) (empty-buckets 16)]
+                        (if (>= i (count ks)) (values cap bs)
+                          (let [b (bit-and (commons-hash (nth ks i)) (- cap 1))
+                                bs2 (assoc bs b (cons-int i (nth bs b)))
+                                n (+ i 1)]
+                            (if (> n (quot (* cap 3) 4))
+                              (let [nc (* cap 2)]
+                                (recur n nc (rehash bs2 ks nc)))
+                              (recur n cap bs2)))))]
+    (loop [b (- cap 1) acc: Vec(Str) []]
+      (if (< b 0) acc
+        (let [xs (nth buckets b)] (recur (- b 1) (loop [k 0 a acc] (if (>= k (count xs)) a (recur (+ k 1) (conj a (nth ks (nth xs k))))))))))))
+
+(defn- empty-buckets Vec(Vec(Int)) [n: Int] (loop [i 0 acc: Vec(Vec(Int)) []] (if (>= i n) acc (recur (+ i 1) (conj acc [])))))
+
+(defn- cons-int Vec(Int) [x: Int xs: &Vec(Int)] (loop [i 0 acc: Vec(Int) [x]] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (nth xs i))))))
+
+(defn- rehash Vec(Vec(Int)) [old: &Vec(Vec(Int)) ks: &Vec(Str) nc: Int]
+  (loop [b (- (count old) 1) nb (empty-buckets nc)]
+    (if (< b 0) nb
+      (let [xs (nth old b)
+            nb2 (loop [k 0 a nb] (if (>= k (count xs)) a
+                                   (let [x (nth xs k) t (bit-and (commons-hash (nth ks x)) (- nc 1))]
+                                     (recur (+ k 1) (assoc a t (cons-int x (nth a t)))))))]
+        (recur (- b 1) nb2)))))

@@ -1,0 +1,72 @@
+(ns dwgolden-test
+  (:require [clay.core] [clay.string :as str] [clay.io :as io]
+            [mulay.dw.parse :as p] [mulay.dw.astdump :as d] [mulay.dw.ast :as a]))
+
+;; golden: test/fixtures/dwparse/*.golden (tools/dwparse/compare.py --golden が実 DW 2.11.2 の
+;; パーサの結果から作る)。形式:
+;;   @@@@ ok [m]     <src>   @@@@ =   <期待するダンプ>
+;;   @@@@ err [m]    <src>                (実 DW が拒否する: mulay も診断を 1 つ以上出す)
+;; m はモジュール。食い違った例を最大 10 件まで返す (空文字列なら全部一致)。
+
+(defn- starts? Bool [s: &Str p: &Str] (str/starts-with? s p))
+
+(defn- check1 Str [kind: &Str src: &Str expect: &Str]
+  (let [m (str/ends-with? kind " m")
+        [sc ds] (if m (p/parse-module src) (p/parse src))]
+    (if (starts? kind "ok")
+      (if (> (count ds) 0)
+        (str "--- " src "\n  expected: " expect "\n  got diag: " (:msg (nth ds 0)) " @" (:start (:sp (nth ds 0))) "\n")
+        (let [got (d/dump-script sc)]
+          (if (= got expect) "" (str "--- " src "\n  expected: " expect "\n  got:      " got "\n"))))
+      (if (> (count ds) 0) "" (str "--- " src "\n  expected a diagnostic, got: " (d/dump-script sc) "\n")))))
+
+(defn- rtrim-nl Str [x: &Str]
+  (loop [e (count x)] (if (and (> e 0) (= (nth x (- e 1)) 10)) (recur (- e 1)) (subs x 0 e))))
+
+;; 戻り値: [失敗の報告 件数]
+(defn run-golden Values(Str Int Int) [path: Str]
+  (let [[txt err] (read-file path)
+        lines: Vec(Str) (str/split txt "\n")
+        n (count lines)]
+    (loop [i 0 kind "" src "" exp "" in-exp false has false out "" nbad 0 ncases 0]
+      (let [line: Str (if (< i n) (nth lines i) "@@@@ end")
+            marker (starts? line "@@@@ ")]
+        (if (and marker (or (starts? line "@@@@ ok") (starts? line "@@@@ err") (starts? line "@@@@ end")))
+          ;; 前のケースを確かめる
+          (let [r (if has (check1 kind (rtrim-nl src) (rtrim-nl exp)) "")
+                bad (> (count r) 0)
+                out2 (if (and bad (< nbad 10)) (str out r) out)
+                nbad2 (if bad (+ nbad 1) nbad)
+                nc2 (if has (+ ncases 1) ncases)]
+            (if (>= i n) (values out2 nbad2 nc2)
+              (recur (+ i 1) (subs line 5 (count line)) "" "" false true out2 nbad2 nc2)))
+          (if (= line "@@@@ =") (recur (+ i 1) kind src exp true has out nbad ncases)
+            (if (and (not has) (not marker)) (recur (+ i 1) kind src exp in-exp has out nbad ncases)
+              (if in-exp
+                (recur (+ i 1) kind src (if (= (count exp) 0) line (str exp "\n" line)) true has out nbad ncases)
+                (recur (+ i 1) kind (if (= (count src) 0) (if (= line "") "" line) (str src "\n" line)) exp false has out nbad ncases)))))))))
+
+(deftest golden-precedence
+  (let [[out nbad nc] (run-golden "test/fixtures/dwparse/precedence.golden")]
+    (is (> nc 600))
+    (is (= out ""))))
+
+(deftest golden-probes
+  (let [[out nbad nc] (run-golden "test/fixtures/dwparse/probes.golden")]
+    (is (> nc 300))
+    (is (= out ""))))
+
+(deftest golden-corpus
+  (let [[out nbad nc] (run-golden "test/fixtures/dwparse/corpus.golden")]
+    (is (> nc 500))
+    (is (= out ""))))
+
+(deftest golden-docs
+  (let [[out nbad nc] (run-golden "test/fixtures/dwparse/docs.golden")]
+    (is (> nc 600))
+    (is (= out ""))))
+
+(deftest golden-syntax
+  (let [[out nbad nc] (run-golden "test/fixtures/dwparse/syntax.golden")]
+    (is (> nc 160))
+    (is (= out ""))))

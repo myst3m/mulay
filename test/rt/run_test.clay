@@ -1,0 +1,276 @@
+(ns run-test (:require [mulay.app.run :as run] [mulay.rt.engine :as en] [mulay.mule.load :as ld] [mulay.mule.props :as pr] [mulay.lib.res :as res]
+                       [mulay.mule.model :as m] [mulay.rt.ops :as ops] [mulay.conn.registry :as creg] [mulay.rt.conn :as conn] [mulay.rt.event :as ev] [mulay.rt.persist :as ps] [mulay.lib.fs :as fs] [mulay.lib.host :as host] [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]))
+(defextern getpid getpid)
+
+(c-include "<unistd.h>")
+
+;; app/run の要求 1 件の処理 (経路、応答の Content-Type と状態コード) を、要求を直接渡して確かめる。
+
+(def HEAD "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\">\n<http:listener-config name=\"A\"><http:listener-connection host=\"0.0.0.0\" port=\"9001\"/></http:listener-config>\n<http:listener-config name=\"B\"><http:listener-connection host=\"0.0.0.0\" port=\"9002\"/></http:listener-config>\n")
+
+(def BODY (str "<flow name=\"lit\"><http:listener config-ref=\"A\" path=\"/lit\" allowedMethods=\"GET\"/><set-payload value=\"hi\"/></flow>\n"
+               "<flow name=\"java\"><http:listener config-ref=\"A\" path=\"/java\"/><set-payload value=\"#[attributes.method]\"/></flow>\n"
+               "<flow name=\"st\"><http:listener config-ref=\"A\" path=\"/st\"><http:response statusCode=\"#[attributes.queryParams.s]\"/></http:listener><set-payload value=\"b\"/></flow>\n"
+               "<flow name=\"fail\"><http:listener config-ref=\"A\" path=\"/fail\"/><raise-error type=\"APP:X\" description=\"went wrong\"/><error-handler><on-error-propagate><set-payload value=\"ignored\"/></on-error-propagate></error-handler></flow>\n"
+               "<flow name=\"same-a\"><http:listener config-ref=\"A\" path=\"/same\"/><set-payload value=\"from A\"/></flow>\n"
+               "<flow name=\"same-b\"><http:listener config-ref=\"B\" path=\"/same\"/><set-payload value=\"from B\"/></flow>\n"))
+
+(defn- app m/App []
+  (:app (ld/load-texts "t" ["a.xml"] [(str HEAD BODY "</mule>")] (res/res-none) (ld/->LoadOpts [] false (creg/hints)))))
+
+(defn- req hm/Request [method: Str uri: Str port: Int]
+  (hm/->Request method uri [(hm/->Header "Host" (str "localhost:" port))] "" "127.0.0.1:5000" port "" "HTTP/1.1" (hm/->NoStream)))
+
+;; 応答の Content-Type (無ければ "")
+(defn- resp-ct Str [r: &hm/Response] (match (hm/header-of (:headers r) "content-type") (Some v) v (None) ""))
+
+(defn- call Str [method: Str uri: Str port: Int]
+  (let [a (app)
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        r (run/handle c rs (req method uri port))]
+    ;; 204 の本文は run-server が送らない
+    (str (:status r) "|" (resp-ct r) "|" (if (= (:status r) 204) "" (:body r)))))
+
+(deftest listener-responses
+  (is (= (count (:diags (app))) 0))
+  (is (= (call "GET" "/lit" 9001) "200||hi"))
+  (is (= (call "POST" "/lit" 9001) "405|text/plain|Method not allowed for endpoint: /lit"))
+  (is (= (call "GET" "/nope" 9001) "404|text/plain|No listener for endpoint: /nope"))
+  (is (= (call "GET" "/java" 9001) "200|application/java; charset=UTF-8|GET"))
+  (is (= (call "GET" "/st?s=201" 9001) "201||b"))
+  (is (= (call "GET" "/st?s=204" 9001) "204||"))
+  (is (= (call "GET" "/st?s=abc" 9001) "500|text/plain; charset=UTF-8|\"Unable to convert 'abc' with class 'java.lang.String' to class 'Integer', while writing Java at queryParams.s.\" evaluating expression: \"attributes.queryParams.s\"."))
+  (is (= (call "GET" "/st?s=99" 9001) "500|text/plain; charset=UTF-8|java.lang.IllegalArgumentException: Cannot send a status code lower than 200"))
+  ;; 捕まらなかったエラー: 500 と error.description (on-error-propagate で作った payload は使われない)
+  (is (= (call "GET" "/fail" 9001) "500|text/plain; charset=UTF-8|went wrong"))
+  ;; 同じパスを別のポートの listener が持つ: Host のポートで選ぶ
+  (is (= (call "GET" "/same" 9001) "200||from A"))
+  (is (= (call "GET" "/same" 9002) "200||from B")))
+
+(deftest listener-ports
+  (let [[rs errs] (run/routes (app) (creg/all))]
+    (is (= (run/ports rs) [9001 9002]))))
+
+;; listener-connection の host に bind する (実 Mule と同じ)。以前は読まずに全インターフェースで待っていた
+;; ので、host="127.0.0.1" の内部向けの API が外から届いた。localhost は 127.0.0.1、0.0.0.0 は全インターフェース。
+(def HOSTS (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\">\n"
+                "<http:listener-config name=\"L\"><http:listener-connection host=\"127.0.0.1\" port=\"9003\"/></http:listener-config>\n"
+                "<http:listener-config name=\"Z\"><http:listener-connection host=\"0.0.0.0\" port=\"9004\"/></http:listener-config>\n"
+                "<http:listener-config name=\"H\"><http:listener-connection host=\"localhost\" port=\"9005\"/></http:listener-config>\n"
+                "<http:listener-config name=\"N\"><http:listener-connection port=\"9006\"/></http:listener-config>\n"
+                "<flow name=\"l\"><http:listener config-ref=\"L\" path=\"/\"/><set-payload value=\"l\"/></flow>\n"
+                "<flow name=\"z\"><http:listener config-ref=\"Z\" path=\"/\"/><set-payload value=\"z\"/></flow>\n"
+                "<flow name=\"h\"><http:listener config-ref=\"H\" path=\"/\"/><set-payload value=\"h\"/></flow>\n"
+                "<flow name=\"n\"><http:listener config-ref=\"N\" path=\"/\"/><set-payload value=\"n\"/></flow>\n</mule>"))
+
+(defn- route-host Str [r: run/Route] (str (:port r) "=" (:host (:srv r))))
+
+(deftest listener-host
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [HOSTS] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))]
+    (is (= errs []))
+    (is (= (mapv route-host rs) ["9003=127.0.0.1" "9004=0.0.0.0" "9005=127.0.0.1" "9006="]))))
+
+(def CLASH (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\">\n"
+                "<http:listener-config name=\"P\"><http:listener-connection host=\"127.0.0.1\" port=\"9007\"/></http:listener-config>\n"
+                "<http:listener-config name=\"Q\"><http:listener-connection host=\"0.0.0.0\" port=\"9007\"/></http:listener-config>\n"
+                "<flow name=\"p\"><http:listener config-ref=\"P\" path=\"/p\"/><set-payload value=\"p\"/></flow>\n"
+                "<flow name=\"q\"><http:listener config-ref=\"Q\" path=\"/q\"/><set-payload value=\"q\"/></flow>\n</mule>"))
+
+;; 同じポートで host が違うと、片方の host が黙って無視される (ポートごとに 1 回しか待たない) ので起動の失敗にする
+(deftest listener-host-clash
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [CLASH] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))]
+    (is (= errs ["Listener configs on port 9007 bind different hosts ('127.0.0.1' and '0.0.0.0'): mulay listens once per port"]))))
+
+;; uriParams は 1 回だけデコードする (実 Mule: HttpEncoderDecoderUtils.decodeUriParams で生のパスの区切りを 1 回)。
+;; 以前はパス全体を戻した後に区切りごとにもう一度戻していたので、%252e%252e%252f が ../ になり、前段で 1 回だけ
+;; 戻して確かめる WAF をすり抜けた。
+(def URIP (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\">\n"
+               "<http:listener-config name=\"U\"><http:listener-connection host=\"0.0.0.0\" port=\"9010\"/></http:listener-config>\n"
+               "<flow name=\"f\"><http:listener config-ref=\"U\" path=\"/files/{name}\"/><set-payload value=\"#[attributes.uriParams.name]\"/></flow>\n</mule>"))
+
+(defn- urip Str [uri: Str]
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [URIP] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        r (run/handle c rs (req "GET" uri 9010))]
+    (:body r)))
+
+(deftest uri-params-decoded-once
+  (is (= (urip "/files/a%20b") "a b"))
+  (is (= (urip "/files/%252e%252e%252fetc") "%2e%2e%2fetc")))
+
+;; 要求の対象は java.net.URI と同じ規則で調べ、読めなければ 400 を返して接続を閉じる。文言の先頭は
+;; http://<listener の IP>:<port> (localhost は 127.0.0.1)。404 / 405 の文言は受け取ったままのパスを escapeHtml4 する (ADR 074)
+(defn- target-resp Str [xml: Str uri: Str port: Int]
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [xml] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        r (run/handle c rs (req "GET" uri port))]
+    (str (:status r) "|" (resp-ct r) "|" (:close r) "|" (:body r))))
+
+;; 起動の失敗は全部出す (実 Mule は配備の検査で見つけたものを 1 行ずつ全部出す)。存在しない listener の設定の参照は
+;; 実 Mule と同じ文言 (場所は http:listener の行)
+(def MISSING (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\">\n"
+                  "<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"9011\"/></http:listener-config>\n"
+                  "<flow name=\"a\"><http:listener config-ref=\"MissingA\" path=\"/a\"/><set-payload value=\"a\"/></flow>\n"
+                  "<flow name=\"b\">\n<http:listener config-ref=\"MissingB\" path=\"/b\"/><set-payload value=\"b\"/></flow>\n"
+                  "<flow name=\"c\"><http:listener config-ref=\"L\" path=\"/c\"/><set-payload value=\"c\"/></flow>\n</mule>"))
+
+(deftest startup-errors-all
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [MISSING] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        s (run/prepare a 5 (creg/all))]
+    (is (= (:err s) (str "[a.xml:3]: Referenced component 'MissingA' must be one of stereotypes [HTTP:LISTENER_CONFIG].\n"
+                         "[a.xml:5]: Referenced component 'MissingB' must be one of stereotypes [HTTP:LISTENER_CONFIG].")))))
+
+(deftest malformed-target
+  (is (= (call "GET" "/nope/%zz" 9001) "400||HTTP request parsing failed with error: \"Malformed escape pair at index 25: http://0.0.0.0:9001/nope/%zz\""))
+  (is (= (call "GET" "/lit?x=a{b" 9001) "400||HTTP request parsing failed with error: \"Illegal character in query at index 27: http://0.0.0.0:9001/lit?x=a{b\""))
+  (is (= (target-resp HOSTS "/%zz" 9005) "400||true|HTTP request parsing failed with error: \"Malformed escape pair at index 22: http://127.0.0.1:9005/%zz\""))
+  (is (= (target-resp HOSTS "/a#b#c" 9004) "400||true|HTTP request parsing failed with error: \"Illegal character in fragment at index 23: http://0.0.0.0:9004/a#b#c\""))
+  (is (= (call "GET" "/nope/a&b%41" 9001) "404|text/plain|No listener for endpoint: /nope/a&amp;b%41"))
+  (is (= (call "POST" "/li%74" 9001) "405|text/plain|Method not allowed for endpoint: /li%74")))
+
+;; 運用の端点 (/__/metrics など) は mulay.admin.port のポートだけで答え、アプリの listener では指定の有無にかかわらず
+;; アプリの経路として扱う (以前は admin のポートが無いとアプリの listener で認証なしに計測を返し、アプリの /__/ を隠した)
+(defn- admin-status Int [overrides: Vec(m/Param) path: Str]
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [URIP] (res/res-none) (ld/->LoadOpts overrides false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        r (run/handle c rs (req "GET" path 9010))]
+    (:status r)))
+
+(deftest admin-endpoints
+  (is (= (admin-status [] "/__/metrics") 404))
+  (is (= (admin-status [] "/__/ready") 404))
+  (is (= (admin-status [] "/__/health") 404))
+  (is (= (admin-status [(m/->Param "mulay.admin.port" (m/->PLit "19990"))] "/__/metrics") 404))
+  (is (= (admin-status [(m/->Param "mulay.admin.port" (m/->PLit "19990"))] "/__/health") 404)))
+
+;; RTF の ready (mulay.admin.port のポートだけ) は Mule エージェント (mule-agent-web-interface 2.7.13 の HealthCheckRequestHandler) と同じ:
+;; 準備ができれば 200 で本文も Content-Type も無い、まだなら 409 text/plain の "Not ready. Status: <ApplicationStatus>"、別のアプリ名は 404 で本文が空
+(defn- rtf-ready Str [state: Int path: Str]
+  (let [z (ops/set-state state)
+        r (run/admin-resp path path "orders")
+        z2 (ops/set-state ops/STARTING)
+        ct: Str (match (hm/header-of (:headers r) "content-type") (Some x) x (None) "-")]
+    (str (:status r) " " (:reason r) " " ct " [" (:body r) "]")))
+
+(deftest rtf-ready-endpoint
+  (is (= (rtf-ready ops/STARTING "/mule/healthcheck/applications/orders/ready") "409 Conflict text/plain [Not ready. Status: CREATED]"))
+  (is (= (rtf-ready ops/READY "/mule/healthcheck/applications/orders/ready") "200 OK - []"))
+  (is (= (rtf-ready ops/DRAINING "/mule/healthcheck/applications/orders/ready") "409 Conflict text/plain [Not ready. Status: STOPPED]"))
+  (is (= (rtf-ready ops/READY "/mule/healthcheck/applications/other/ready") "404 Not Found text/plain []"))
+  ;; 名前を指定しなければ (空) RTF の経路は無い
+  (is (= (:status (run/admin-resp "/mule/healthcheck/applications/orders/ready" "/mule/healthcheck/applications/orders/ready" "")) 404)))
+
+;; コネクタが :mounts で listener のポートに経路を足す (ADR 081 の段 5)。経路は listener の basePath の下に付き、
+;; 処理は Host の run でフローを動かせる。listener の設定が無ければ起動の誤りになる。
+(def TOY-BASE "<http:listener-config name=\"T\" basePath=\"/api\"><http:listener-connection host=\"0.0.0.0\" port=\"9007\"/></http:listener-config>\n")
+
+(defn- toy-mounts Values(Vec(conn/Mount) Vec(Str)) [a: m/App]
+  (let [fi (loop [i 0] (if (= (:name (nth (:flows a) i)) "lit") i (recur (+ i 1))))]
+    (values [(conn/->Mount "T" "/toy" ["GET"] true false
+                           (fn hm/Response [h: conn/Host at: conn/At q: hm/Request]
+                             (let [[e x] ((:run h) fi (ev/new-event (ev/tv-null) (ev/tv-null) "c" "lit"))
+                                   [b be] (ev/wire-bytes (:payload e))]
+                               (hm/response 200 [] (str b " " (:port at) " " (:base at) " " (:scheme at) " " (:uri q)) false))))
+             (conn/->Mount "T" "/raw" [] false false (fn hm/Response [h: conn/Host at: conn/At q: hm/Request] (hm/response 200 [] "raw" false)))
+             (conn/->Mount "Q" "/q" [] true false (fn hm/Response [h: conn/Host at: conn/At q: hm/Request] (hm/response 200 [] "q" false)))]
+            ["toy: checked"])))
+
+(defn- toy-conns Vec(conn/Connector) []
+  (conj (creg/all) (assoc (conn/connector "toy" "urn:toy" (fn conn/OpResult [c: conn/OpCall] (conn/keep-result c))) :mounts toy-mounts)))
+
+(defn- toy-call Str [uri: Str]
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [(str HEAD TOY-BASE BODY "</mule>")] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        cs (toy-conns)
+        [rs errs] (run/routes a cs)
+        c (en/new-ctx a cs 5)
+        r (run/handle c rs (req "GET" uri 9007))]
+    (str (:status r) "|" (:body r) "|" (str/join ";" errs))))
+
+(deftest connector-mounts
+  (is (= (toy-call "/api/toy?x=1") "200|hi 9007 /api http /api/toy?x=1|toy: checked;Listener config 'Q' not found"))
+  (is (= (toy-call "/raw") "200|raw|toy: checked;Listener config 'Q' not found"))
+  (is (= (toy-call "/api/raw") "404|No listener for endpoint: /api/raw|toy: checked;Listener config 'Q' not found")))
+
+(defn- tls-alpn Str [h2: Str]
+  (let [x (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\" xmlns:tls=\"http://www.mulesoft.org/schema/mule/tls\">\n"
+               "<http:listener-config name=\"T\"><http:listener-connection host=\"0.0.0.0\" port=\"9443\" protocol=\"HTTPS\">"
+               "<tls:context><tls:key-store type=\"pkcs12\" path=\"server.p12\" password=\"changeit\" keyPassword=\"changeit\"/></tls:context>"
+               h2 "</http:listener-connection></http:listener-config>\n"
+               "<flow name=\"f\"><http:listener config-ref=\"T\" path=\"/x\"/><set-payload value=\"x\"/></flow>\n</mule>")
+        a (:app (ld/load-texts "t" ["a.xml"] [x] (res/res-dir "test/fixtures/apps/https-test/src/main/resources") (ld/->LoadOpts [] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))]
+    (if (or (> (count errs) 0) (= (count rs) 0)) (str "ERR " (str/join ";" errs)) (str/join "," (:alpn (:tls (:srv (nth rs 0))))))))
+
+;; 実 Mule 4.11.3: http2-support を有効にした HTTPS の listener は ALPN で h2 を選ぶ (curl --http2 が HTTP/2 になる。2026-10-25 に確かめた)
+(deftest tls-listener-offers-h2-with-http2-support
+  (is (= (tls-alpn "<http:protocol-support><http:http2-support enable=\"true\"/></http:protocol-support>") "h2,http/1.1"))
+  (is (= (tls-alpn "") "http/1.1")))
+
+(defn- streamed-req hm/Request [method: Str uri: Str body: Str]
+  (let [[x sk] (hm/stream-response 200 [])
+        w (hm/sink-write sk body)
+        c (hm/sink-close sk)]
+    (hm/->Request method uri [(hm/->Header "Host" "localhost:9001")] "" "127.0.0.1:5000" 9001 "" "HTTP/1.1" (hm/->Streaming sk))))
+
+(defn- left-unread Int [q: &hm/Request] (let [[p done why] (hm/body-next q)] (count p)))
+
+;; 経路の無い要求と method の違う要求の大きな本文は、読まずに 404 / 405 で答えて閉じる (ADR 118)
+(deftest streamed-bodies-of-unrouted-requests-are-not-read
+  (let [a (app)
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        big (loop [i 0 s ""] (if (>= i 1000) s (recur (+ i 1) (str s "0123456789"))))
+        q1 (streamed-req "POST" "/nope" big)
+        r1 (run/handle c rs q1)
+        q2 (streamed-req "POST" "/lit" big)
+        r2 (run/handle c rs q2)
+        q3 (streamed-req "POST" "/java" big)
+        r3 (run/handle c rs q3)]
+    (is (= (:status r1) 404))
+    (is (= (:body r1) "No listener for endpoint: /nope"))
+    (is (:close r1))
+    (is (= (left-unread q1) 10000))
+    (is (= (:status r2) 405))
+    (is (= (:body r2) "Method not allowed for endpoint: /lit"))
+    (is (:close r2))
+    (is (= (left-unread q2) 10000))
+    (is (= (:status r3) 200))
+    (is (= (left-unread q3) 0))))
+
+;; ディスクの空きが mulay.http.spoolMinFree を下回るなら、本文をそれ以上ディスクに溜めずに 503 で閉じ、溜めた分を消す (ADR 118)
+(deftest spooling-stops-when-the-disk-runs-low
+  (let [work (str "/tmp/mulay-run-test-spool-" (unsafe (getpid)))
+        a (:app (ld/load-texts "t" ["a.xml"] [(str HEAD BODY "</mule>")] (res/res-none)
+                               (ld/->LoadOpts [(m/->Param "mulay.work.dir" (m/->PLit work))
+                                               (m/->Param "mulay.http.spoolMinFree" (m/->PLit "4000000000000000000"))] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        ze (ps/clear-spools a)
+        big (loop [i 0 s ""] (if (>= i 60000) s (recur (+ i 1) (str s "0123456789"))))
+        r (run/handle c rs (streamed-req "POST" "/java" big))
+        [left le] (host/file-list (ps/spool-dir a))
+        z (fs/remove-tree work)]
+    (is (= ze ""))
+    (is (= (:status r) 503))
+    (is (= (:body r) "Not enough free disk space to receive the request body (mulay.http.spoolMinFree)"))
+    (is (:close r))
+    (is (= (count left) 0))))
+
+(deftest small-reserve-still-spools
+  (let [work (str "/tmp/mulay-run-test-spool2-" (unsafe (getpid)))
+        a (:app (ld/load-texts "t" ["a.xml"] [(str HEAD BODY "</mule>")] (res/res-none)
+                               (ld/->LoadOpts [(m/->Param "mulay.work.dir" (m/->PLit work))
+                                               (m/->Param "mulay.http.spoolMinFree" (m/->PLit "1"))] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        ze (ps/clear-spools a)
+        big (loop [i 0 s ""] (if (>= i 60000) s (recur (+ i 1) (str s "0123456789"))))
+        r (run/handle c rs (streamed-req "POST" "/java" big))
+        z (fs/remove-tree work)]
+    (is (= (:status r) 200))))

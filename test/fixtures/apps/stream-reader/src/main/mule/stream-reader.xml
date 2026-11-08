@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18194"/>
+    </http:listener-config>
+
+    <file:config name="F">
+        <file:connection workingDir="/tmp/mulay-oracle-stream-reader"/>
+    </file:config>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description, seen: vars.seen default []}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <flow name="seed">
+        <http:listener config-ref="HTTP" path="/seed"/>
+        <file:write config-ref="F" path="arr.json"><file:content>[{"id": 1, "v": "a"}, {"id": 2, "v": "b"}, {"id": 3, "v": "c"}, {"id": 4, "v": "d"}, {"id": 5, "v": "e"}, {"id": 6, "v": "f"}, {"id": 7, "v": "g"}]</file:content></file:write>
+        <file:write config-ref="F" path="obj.json"><file:content>{"a": 1, "b": 2}</file:content></file:write>
+        <file:write config-ref="F" path="bad.json"><file:content>[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4} {"id": 5}]</file:content></file:write>
+        <file:write config-ref="F" path="nested.json"><file:content>[[1, 2], {"k": [true, null]}, "s", 1.5e2, null]</file:content></file:write>
+        <file:write config-ref="F" path="rows.csv"><file:content>id,v
+1,a
+2,b
+3,c
+4,d
+5,e</file:content></file:write>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- foreach の batchSize で分ける -->
+    <flow name="foreach">
+        <http:listener config-ref="HTTP" path="/foreach"/>
+        <file:read config-ref="F" path="#[attributes.queryParams.path default 'arr.json']" outputMimeType="#[attributes.queryParams.mime default 'application/json; streaming=true']"/>
+        <set-variable variableName="seen" value="#[[]]"/>
+        <foreach batchSize="3">
+            <set-variable variableName="seen" value="#[output application/java --- vars.seen + {counter: vars.counter, n: sizeOf(payload), first: write(payload[0], 'application/json', {indent: false}), cls: payload.^class default 'none', mime: payload.^mimeType default 'none'}]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- vars.seen]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="foreach-one">
+        <http:listener config-ref="HTTP" path="/foreach-one"/>
+        <file:read config-ref="F" path="#[attributes.queryParams.path default 'arr.json']" outputMimeType="application/json; streaming=true"/>
+        <set-variable variableName="seen" value="#[[]]"/>
+        <foreach>
+            <set-variable variableName="seen" value="#[output application/java --- vars.seen + write(payload, 'application/json', {indent: false})]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- vars.seen]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 値として読む -->
+    <flow name="value">
+        <http:listener config-ref="HTTP" path="/value"/>
+        <file:read config-ref="F" path="arr.json" outputMimeType="application/json; streaming=true"/>
+        <set-payload value="#[output application/json --- {size: sizeOf(payload), third: payload[2].id, ids: payload.id}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="map">
+        <http:listener config-ref="HTTP" path="/map"/>
+        <file:read config-ref="F" path="arr.json" outputMimeType="application/json; streaming=true"/>
+        <set-payload value="#[output application/json --- payload map ($.id * 10)]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- 2 回読む: 値として読んでから foreach、foreach の後で値として読む -->
+    <flow name="twice">
+        <http:listener config-ref="HTTP" path="/twice"/>
+        <file:read config-ref="F" path="arr.json" outputMimeType="application/json; streaming=true"/>
+        <set-variable variableName="before" value="#[sizeOf(payload)]"/>
+        <set-variable variableName="seen" value="#[0]"/>
+        <foreach batchSize="2">
+            <set-variable variableName="seen" value="#[vars.seen + sizeOf(payload)]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- {before: vars.before, seen: vars.seen, after: sizeOf(payload)}]"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <flow name="twice-foreach">
+        <http:listener config-ref="HTTP" path="/twice-foreach"/>
+        <file:read config-ref="F" path="arr.json" outputMimeType="application/json; streaming=true"/>
+        <set-variable variableName="a" value="#[0]"/>
+        <foreach batchSize="2"><set-variable variableName="a" value="#[vars.a + sizeOf(payload)]"/></foreach>
+        <set-variable variableName="b" value="#[0]"/>
+        <foreach batchSize="4"><set-variable variableName="b" value="#[vars.b + sizeOf(payload)]"/></foreach>
+        <set-payload value="#[output application/json --- {a: vars.a, b: vars.b}]"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

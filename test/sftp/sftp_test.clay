@@ -1,0 +1,111 @@
+(ns sftp-test (:require [mulay.lib.sftp :as sf]))
+
+;; 検査用の SFTP サーバー (docker の mulay-sftp: 127.0.0.1:2222、mulay / mulay、/upload だけ書ける)。
+;; つながらなければ (skip) 何も確かめない
+
+(defrecord R [skip: Bool kind: Int m: Int m2: Int w: Int w2: Int w3: Int d: Str at: sf/Attrs dt: sf/Attrs me: Int mde: Int r: Int
+              names: Vec(Str) u: Int rd: Int])
+
+(defn- run R []
+  (let [[s kind msg] (sf/connect "127.0.0.1" 2222 "mulay" "mulay" 10000 [])]
+    (if (= kind sf/CANNOT-REACH) (->R true kind 0 0 0 0 0 "" (sf/->Attrs 0 0 0 false false false) (sf/->Attrs 0 0 0 false false false) 0 0 0 [] 0 0)
+      (let [z0 (sf/unlink s "/upload/ut/a.txt")
+            z00 (sf/unlink s "/upload/ut/b.txt")
+            z1 (sf/rmdir s "/upload/ut")
+            m (sf/mkdir s "/upload/ut")
+            m2 (sf/mkdir s "/upload/ut")
+            w (sf/put-file s "/upload/ut/a.txt" "hello" "OVERWRITE")
+            w2 (sf/put-file s "/upload/ut/a.txt" "-more" "APPEND")
+            w3 (sf/put-file s "/upload/ut/a.txt" "x" "CREATE_NEW")
+            [d de] (sf/get-file s "/upload/ut/a.txt")
+            [at ae] (sf/stat s "/upload/ut/a.txt" true)
+            [dt dte] (sf/stat s "/upload/ut" true)
+            [mt me] (sf/stat s "/upload/ut/none" true)
+            [md mde] (sf/get-file s "/upload/ut/none")
+            r (sf/rename s "/upload/ut/a.txt" "/upload/ut/b.txt" false)
+            [es ee] (sf/list-dir s "/upload/ut")
+            names (loop [i 0 acc: Vec(Str) []] (if (>= i (count es)) acc (recur (+ i 1) (conj acc (:name (nth es i))))))
+            u (sf/unlink s "/upload/ut/b.txt")
+            rd (sf/rmdir s "/upload/ut")
+            z9 (sf/close s)]
+        (->R false kind m m2 w w2 w3 d at dt me mde r names u rd)))))
+
+(deftest roundtrip
+  (let [x (run) k (:skip x)]
+    (is (or k (= (:kind x) 0)))
+    (is (or k (= (:m x) 0)))
+    (is (or k (not= (:m2 x) 0)))
+    (is (or k (= (:w x) 0)))
+    (is (or k (= (:w2 x) 0)))
+    (is (or k (not= (:w3 x) 0)))
+    (is (or k (= (:d x) "hello-more")))
+    (is (or k (= (:size (:at x)) 10)))
+    (is (or k (:reg (:at x))))
+    (is (or k (:dir (:dt x))))
+    (is (or k (= (:me x) sf/NO-SUCH-FILE)))
+    (is (or k (= (:mde x) sf/NO-SUCH-FILE)))
+    (is (or k (= (:r x) 0)))
+    (is (or k (= (:names x) ["b.txt"])))
+    (is (or k (= (:u x) 0)))
+    (is (or k (= (:rd x) 0)))))
+
+(deftest bad-password
+  (let [[s kind msg] (sf/connect "127.0.0.1" 2222 "mulay" "wrong" 10000 [])]
+    (is (or (= kind sf/CANNOT-REACH) (= kind sf/AUTH)))))
+
+(deftest no-server
+  (let [[s kind msg] (sf/connect "127.0.0.1" 2299 "mulay" "mulay" 2000 [])]
+    (is (= kind sf/CANNOT-REACH))))
+
+;; known_hosts を渡すと、ハンドシェイクの後 (パスワードを送る前) にサーバーの鍵を確かめる。行の無いホストも
+;; 鍵の違うホストも拒む (実 Mule: knownHostsFile を指定すると RejectAllServerKeyVerifier に落ちる)。
+;; 鍵はコネクタの記録 (test/fixtures/apps/sftp-ops) と同じファイル。
+(defn- kh Str [name: Str] (let [[s e] (read-file (str "test/fixtures/apps/sftp-ops/src/main/resources/" name))] s))
+
+(defn- kh-kind Int [host: Str name: Str]
+  (let [[s kind msg] (sf/connect host 2222 "mulay" "mulay" 10000 [(kh name)])
+        z (if (= kind 0) (sf/close s) 0)]
+    kind))
+
+(deftest known-hosts
+  (let [up (not= (kh-kind "127.0.0.1" "known_hosts_good") sf/CANNOT-REACH)]
+    (is (or (not up) (= (kh-kind "127.0.0.1" "known_hosts_good") 0)))
+    (is (or (not up) (= (kh-kind "localhost" "known_hosts_good") 0)))
+    (is (or (not up) (= (kh-kind "127.0.0.1" "known_hosts_bad") sf/HOSTKEY)))
+    (is (or (not up) (= (kh-kind "localhost" "known_hosts_bad") sf/HOSTKEY)))
+    (is (or (not up) (= (kh-kind "127.0.0.1" "known_hosts_other") sf/HOSTKEY)))
+    ;; 中身が空・壊れた行だけ: どのホストも知らないので拒む
+    (is (or (not up) (= (let [[s kind msg] (sf/connect "127.0.0.1" 2222 "mulay" "mulay" 10000 ["# none\n\nnot a line\n"])] kind) sf/HOSTKEY)))))
+
+;; つながらなかった Sess と閉じた後の Sess の操作は落ちずに CONNECTION-LOST
+(deftest dead-session
+  (let [[s kind msg] (sf/connect "127.0.0.1" 2299 "mulay" "mulay" 2000 [])
+        [a code] (sf/stat s "/upload" true)
+        [s2 kind2 msg2] (sf/connect "127.0.0.1" 2222 "mulay" "mulay" 10000 [])
+        z (sf/close s2)
+        [a2 code2] (sf/stat s2 "/upload" true)]
+    (is (= code sf/CONNECTION-LOST))
+    (is (= (sf/mkdir s "/x") sf/CONNECTION-LOST))
+    (is (= (sf/last-error s) sf/CONNECTION-LOST))
+    (is (= code2 sf/CONNECTION-LOST))))
+
+;; known_hosts にそのサーバーの RSA の行しか無ければ、鍵交換で RSA のホスト鍵を先に頼んで受け入れる
+;; (サーバーの好む ed25519 で交渉すると HOSTKEY で断ることになる)
+(defn- rsa-only Str [text: &Str]
+  (loop [p 0 out ""]
+    (if (>= p (count text)) out
+      (let [nl (let [i (index-of-from text "\n" p)] (if (< i 0) (count text) i))
+            line (subs text p nl)]
+        (recur (+ nl 1) (if (> (count (str-split-rsa line)) 0) (str out line "\n") out))))))
+
+(defn- str-split-rsa Str [line: &Str] (if (and (> (count line) 0) (not= (nth line 0) 35) (>= (index-of-from line " ssh-rsa " 0) 0)) "x" ""))
+
+(defn- index-of-from Int [s: &Str needle: &Str from: Int]
+  (loop [i from] (cond (> (+ i (count needle)) (count s)) -1 (= (subs s i (+ i (count needle))) needle) i :else (recur (+ i 1)))))
+
+(deftest known-hosts-rsa-only
+  (let [t (rsa-only (kh "known_hosts_good"))
+        [s kind msg] (sf/connect "localhost" 2222 "mulay" "mulay" 10000 [t])
+        z (sf/close s)]
+    (is (> (count t) 0))
+    (is (or (= kind sf/CANNOT-REACH) (= kind 0)))))

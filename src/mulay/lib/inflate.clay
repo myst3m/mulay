@@ -1,0 +1,311 @@
+(ns mulay.lib.inflate
+  (:require [clay.core]))
+
+(def LEN-BASE [3 4 5 6 7 8 9 10 11 13 15 17 19 23 27 31 35 43 51 59 67 83 99 115 131 163 195 227 258])
+(def LEN-EXTRA [0 0 0 0 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3 4 4 4 4 5 5 5 5 0])
+(def DIST-BASE [1 2 3 4 5 7 9 13 17 25 33 49 65 97 129 193 257 385 513 769 1025 1537 2049 3073 4097 6145 8193 12289 16385 24577])
+(def DIST-EXTRA [0 0 0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13])
+(def CL-ORDER [16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15])
+
+(defn- make-crc-table Vec(Int) []
+  (loop [n 0 t: Vec(Int) []]
+    (if (>= n 256) t
+      (let [c (loop [k 0 c n] (if (>= k 8) c (recur (+ k 1) (if (= (bit-and c 1) 1) (bit-xor 3988292384 (bit-shift-right c 1)) (bit-shift-right c 1)))))]
+        (recur (+ n 1) (conj t c))))))
+
+(def CRC-TABLE (make-crc-table))
+
+(defn crc32-update Int [crc: Int data: &Str start: Int end: Int]
+  (let [t CRC-TABLE]
+    (loop [i start c (bit-xor crc 4294967295)]
+      (if (>= i end) (bit-xor c 4294967295)
+        (recur (+ i 1) (bit-xor (nth t (bit-and (bit-xor c (nth data i)) 255)) (bit-shift-right c 8)))))))
+
+(defn crc32 Int [data: &Str] (crc32-update 0 data 0 (count data)))
+
+(defn- rev-bits Int [code: Int len: Int]
+  (loop [i 0 c code r 0] (if (>= i len) r (recur (+ i 1) (bit-shift-right c 1) (bit-or (bit-shift-left r 1) (bit-and c 1))))))
+
+(defn- build-table Values(Vec(Int) Int Str) [lens: &Vec(Int) n: Int]
+  (let [maxlen (loop [i 0 m 0] (if (>= i n) m (recur (+ i 1) (let [l (nth lens i)] (if (> l m) l m)))))
+        counts (loop [i 0 c: Vec(Int) [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]]
+                 (if (>= i n) c (let [l (nth lens i)] (recur (+ i 1) (if (> l 0) (assoc c l (+ (nth c l) 1)) c)))))
+        over (loop [l 1 left 1] (if (> l 15) false (let [lf (- (* left 2) (nth counts l))] (if (< lf 0) true (recur (+ l 1) lf)))))
+        next0 (loop [l 1 code 0 nx: Vec(Int) [0]]
+                (if (> l 15) nx
+                  (let [c2 (bit-shift-left (+ code (nth counts (- l 1))) 1)
+                        c3 (if (= l 1) 0 c2)]
+                    (recur (+ l 1) c3 (conj nx c3)))))
+        mlen (if (= maxlen 0) 1 maxlen)
+        size (bit-shift-left 1 mlen)]
+    (if over (values [] 0 "over-subscribed Huffman code")
+      (loop [s 0 nx next0 t: Vec(Int) (repeat size 0)]
+        (if (>= s n) (values t mlen "")
+          (let [l (nth lens s)]
+            (if (= l 0) (recur (+ s 1) nx t)
+              (let [code (nth nx l)
+                    r (rev-bits code l)
+                    step (bit-shift-left 1 l)
+                    v (+ (* s 16) l)
+                    t2 (loop [k r t t] (if (>= k size) t (recur (+ k step) (assoc t k v))))]
+                (recur (+ s 1) (assoc nx l (+ code 1)) t2)))))))))
+
+(defn- fixed-lit-lens Vec(Int) []
+  (loop [i 0 v: Vec(Int) []]
+    (if (>= i 288) v (recur (+ i 1) (conj v (cond (< i 144) 8 (< i 256) 9 (< i 280) 7 :else 8))))))
+
+(def FIXED-LIT (let [[t m e] (build-table (fixed-lit-lens) 288)] t))
+(def FIXED-DIST (let [[t m e] (build-table (repeat 30 5) 30)] t))
+
+(defn- fill Values(Int Int Int) [data: &Str pos: Int buf: Int cnt: Int need: Int]
+  (loop [p pos b buf c cnt]
+    (if (>= c need) (values p b c)
+      (let [byte (if (< p (count data)) (nth data p) 0)]
+        (recur (+ p 1) (bit-or b (bit-shift-left byte c)) (+ c 8))))))
+
+(defn- decode Values(Int Int Int Int) [data: &Str t: &Vec(Int) maxlen: Int pos: Int buf: Int cnt: Int]
+  (let [[p b c] (fill data pos buf cnt maxlen)
+        e (nth t (bit-and b (- (bit-shift-left 1 maxlen) 1)))
+        l (bit-and e 15)]
+    (if (= l 0) (values -1 p b c)
+      (values (bit-shift-right e 4) p (bit-shift-right b l) (- c l)))))
+
+(defn- inflate-codes Values(Str Int Int Int Str)
+  [data: &Str out0: Str lt: &Vec(Int) lmax: Int dt: &Vec(Int) dmax: Int pos0: Int buf0: Int cnt0: Int limit: Int]
+  (let [lbase LEN-BASE lext LEN-EXTRA dbase DIST-BASE dext DIST-EXTRA
+        n (count data)
+        lmask (- (bit-shift-left 1 lmax) 1)
+        dmask (- (bit-shift-left 1 dmax) 1)]
+    (loop [out out0 pend: Vec(Int) [] pos pos0 buf buf0 cnt cnt0]
+      (if (>= (count pend) 65536)
+        (recur (str out (str-from-bytes pend)) (let [z: Vec(Int) []] z) pos buf cnt)
+        (let [[p b c] (fill data pos buf cnt 48)
+              e (nth lt (bit-and b lmask))
+              l (bit-and e 15)
+              sym (bit-shift-right e 4)
+              b1 (bit-shift-right b l)
+              c1 (- c l)]
+          (cond
+            (> (- p (/ c1 8)) n) (values (str out (str-from-bytes pend)) p b1 c1 "unexpected end of compressed data")
+            (= l 0) (values out p b c "invalid literal/length code")
+            (< sym 256)
+            (if (>= (+ (count out) (count pend)) limit) (values out p b1 c1 "decompressed size exceeds the limit")
+              (recur out (conj pend sym) p b1 c1))
+            (= sym 256) (values (str out (str-from-bytes pend)) p b1 c1 "")
+            (> sym 285) (values out p b1 c1 "invalid length symbol")
+            :else
+            (let [li (- sym 257)
+                  eb (nth lext li)
+                  len (+ (nth lbase li) (bit-and b1 (- (bit-shift-left 1 eb) 1)))
+                  b2 (bit-shift-right b1 eb) c2 (- c1 eb)
+                  de (nth dt (bit-and b2 dmask))
+                  dl (bit-and de 15)
+                  dsym (bit-shift-right de 4)
+                  b3 (bit-shift-right b2 dl) c3 (- c2 dl)]
+              (if (or (= dl 0) (> dsym 29)) (values out p b3 c3 "invalid distance code")
+                (let [deb (nth dext dsym)
+                      dist (+ (nth dbase dsym) (bit-and b3 (- (bit-shift-left 1 deb) 1)))
+                      b4 (bit-shift-right b3 deb) c4 (- c3 deb)
+                      no (count out)
+                      total (+ no (count pend))
+                      from (- total dist)]
+                  (cond
+                    (> dist total) (values out p b4 c4 "distance too far back")
+                    (> (+ total len) limit) (values out p b4 c4 "decompressed size exceeds the limit")
+                    :else
+                    (recur out
+                           (loop [k 0 v pend]
+                             (if (>= k len) v
+                               (let [j (+ from k)]
+                                 (recur (+ k 1) (conj v (if (< j no) (nth out j) (nth v (- j no))))))))
+                           p b4 c4)))))))))))
+
+(defn- read-lengths Values(Vec(Int) Int Int Int Str) [data: &Str ct: &Vec(Int) cmax: Int total: Int pos0: Int buf0: Int cnt0: Int]
+  (loop [lens: Vec(Int) [] pos pos0 buf buf0 cnt cnt0]
+    (if (>= (count lens) total) (values lens pos buf cnt "")
+      (let [[sym p b c] (decode data ct cmax pos buf cnt)]
+        (cond
+          (< sym 0) (values lens p b c "invalid code length code")
+          (< sym 16) (recur (conj lens sym) p b c)
+          :else
+          (let [[eb base] (cond (= sym 16) (values 2 3) (= sym 17) (values 3 3) :else (values 7 11))
+                [p2 b2 c2] (fill data p b c eb)
+                rep (+ base (bit-and b2 (- (bit-shift-left 1 eb) 1)))
+                val (if (= sym 16) (if (= (count lens) 0) -1 (nth lens (- (count lens) 1))) 0)]
+            (if (or (< val 0) (> (+ (count lens) rep) total)) (values lens p2 b2 c2 "invalid code length repeat")
+              (recur (loop [k 0 v lens] (if (>= k rep) v (recur (+ k 1) (conj v val))))
+                     p2 (bit-shift-right b2 eb) (- c2 eb)))))))))
+
+(defn- consumed Int [p: Int c: Int] (- p (/ c 8)))
+
+(defn inflate-limit Values(Str Int Str) [data: &Str start: Int limit: Int]
+  (loop [out "" pos start buf 0 cnt 0]
+    (let [[p b c] (fill data pos buf cnt 3)
+          final (bit-and b 1)
+          btype (bit-and (bit-shift-right b 1) 3)
+          b1 (bit-shift-right b 3) c1 (- c 3)]
+      (cond
+        (> p (count data)) (values out p "unexpected end of compressed data")
+        (= btype 0)
+        (let [
+              skip (bit-and c1 7)
+              bp (- p (/ (- c1 skip) 8))
+              ok4 (<= (+ bp 4) (count data))
+              len (if ok4 (+ (nth data bp) (* 256 (nth data (+ bp 1)))) 0)
+              nlen (if ok4 (+ (nth data (+ bp 2)) (* 256 (nth data (+ bp 3)))) 0)
+              ds (+ bp 4)]
+          (cond
+            (not ok4) (values out bp "unexpected end of stored block")
+            (> (+ ds len) (count data)) (values out ds "unexpected end of stored block")
+            (not (= (bit-xor len 65535) nlen)) (values out bp "stored block length check failed")
+            (> (+ (count out) len) limit) (values out ds "decompressed size exceeds the limit")
+            :else
+            (let [out2 (str out (subs data ds (+ ds len)))]
+              (if (= final 1) (values out2 (+ ds len) "") (recur out2 (+ ds len) 0 0)))))
+        (= btype 1)
+        (let [[out2 p2 b2 c2 err] (inflate-codes data out FIXED-LIT 9 FIXED-DIST 5 p b1 c1 limit)]
+          (cond (not (= err "")) (values out2 p2 err)
+                (= final 1) (values out2 (consumed p2 c2) "")
+                :else (recur out2 p2 b2 c2)))
+        (= btype 2)
+        (let [[p2 b2 c2] (fill data p b1 c1 14)
+              hlit (+ 257 (bit-and b2 31))
+              hdist (+ 1 (bit-and (bit-shift-right b2 5) 31))
+              hclen (+ 4 (bit-and (bit-shift-right b2 10) 15))
+              [cl p3 b3 c3] (loop [i 0 cl: Vec(Int) (repeat 19 0) p p2 b (bit-shift-right b2 14) c (- c2 14)]
+                              (if (>= i hclen) (values cl p b c)
+                                (let [[pp bb cc] (fill data p b c 3)]
+                                  (recur (+ i 1) (assoc cl (nth CL-ORDER i) (bit-and bb 7)) pp (bit-shift-right bb 3) (- cc 3)))))
+              [ct cmax cerr] (build-table cl 19)]
+          (if (not (= cerr "")) (values out p3 cerr)
+            (let [[lens p4 b4 c4 lerr] (read-lengths data ct cmax (+ hlit hdist) p3 b3 c3)]
+              (if (not (= lerr "")) (values out p4 lerr)
+                (let [ll (subvec lens 0 hlit)
+                      dl (subvec lens hlit (+ hlit hdist))
+                      [lt lmax e1] (build-table ll hlit)
+                      [dt dmax e2] (build-table dl hdist)]
+                  (cond
+                    (not (= e1 "")) (values out p4 e1)
+                    (not (= e2 "")) (values out p4 e2)
+                    (= (nth ll 256) 0) (values out p4 "missing end-of-block code")
+                    :else
+                    (let [[out2 p5 b5 c5 err] (inflate-codes data out lt lmax dt dmax p4 b4 c4 limit)]
+                      (cond (not (= err "")) (values out2 p5 err)
+                            (= final 1) (values out2 (consumed p5 c5) "")
+                            :else (recur out2 p5 b5 c5)))))))))
+        :else (values out p "invalid block type")))))
+
+(defn inflate Values(Str Int Str) [data: &Str start: Int]
+  (inflate-limit data start 4611686018427387904))
+
+(defn- put-bits Values(Vec(Int) Int Int) [out: Vec(Int) buf: Int cnt: Int v: Int nbits: Int]
+  (loop [o out b (bit-or buf (bit-shift-left v cnt)) c (+ cnt nbits)]
+    (if (< c 8) (values o b c)
+      (recur (conj o (bit-and b 255)) (bit-shift-right b 8) (- c 8)))))
+
+(defn- fixed-codes Vec(Int) []
+  (loop [sym 0 v: Vec(Int) []]
+    (if (>= sym 288) v
+      (let [[code len] (cond (< sym 144) (values (+ 48 sym) 8)
+                             (< sym 256) (values (+ 400 (- sym 144)) 9)
+                             (< sym 280) (values (- sym 256) 7)
+                             :else (values (+ 192 (- sym 280)) 8))]
+        (recur (+ sym 1) (conj v (+ (* (rev-bits code len) 16) len)))))))
+
+(def FIX-CODES (fixed-codes))
+
+(defn- put-sym Values(Vec(Int) Int Int) [out: Vec(Int) buf: Int cnt: Int sym: Int]
+  (let [e (nth FIX-CODES sym)] (put-bits out buf cnt (bit-shift-right e 4) (bit-and e 15))))
+
+(defn- len-index Int [len: Int]
+  (let [t LEN-BASE] (loop [i 28] (if (<= (nth t i) len) i (recur (- i 1))))))
+
+(defn- dist-index Int [dist: Int]
+  (let [t DIST-BASE] (loop [i 29] (if (<= (nth t i) dist) i (recur (- i 1))))))
+
+(defn deflate-stored Str [data: &Str]
+  (let [n (count data)]
+    (loop [i 0 out ""]
+      (let [len (if (> (- n i) 65535) 65535 (- n i))
+            final (if (>= (+ i len) n) 1 0)
+            hdr (str (chr final) (chr (bit-and len 255)) (chr (bit-shift-right len 8))
+                     (chr (bit-and (bit-xor len 65535) 255)) (chr (bit-shift-right (bit-xor len 65535) 8)))
+            out2 (str out hdr (subs data i (+ i len)))]
+        (if (= final 1) out2 (recur (+ i len) out2))))))
+
+(defn- hash3 Int [data: &Str i: Int]
+  (bit-and (bit-xor (bit-shift-left (nth data i) 10) (bit-xor (bit-shift-left (nth data (+ i 1)) 5) (nth data (+ i 2)))) 32767))
+
+(defn- match-len Int [data: &Str a: Int b: Int max: Int]
+  (loop [k 0] (if (and (< k max) (= (nth data (+ a k)) (nth data (+ b k)))) (recur (+ k 1)) k)))
+
+(defn- deflate-fixed Str [data: &Str]
+  (let [n (count data)
+        [o0 b0 c0] (put-bits (let [z: Vec(Int) []] z) 0 0 3 3)]
+    (loop [i 0 head: Vec(Int) (repeat 32768 -1) prev: Vec(Int) (repeat 32768 -1) out o0 buf b0 cnt c0]
+      (if (>= i n)
+        (let [[o b c] (put-sym out buf cnt 256)]
+          (str-from-bytes (if (> c 0) (conj o (bit-and b 255)) o)))
+        (if (> (+ i 3) n)
+          (let [[o b c] (put-sym out buf cnt (nth data i))] (recur (+ i 1) head prev o b c))
+          (let [h (hash3 data i)
+                maxl (if (> (- n i) 258) 258 (- n i))
+                c0 (nth data i)
+                [best bdist] (loop [c (nth head h) depth 0 best 0 bdist 0]
+                               (if (or (< c 0) (>= c i) (> (- i c) 32768) (>= depth 16) (>= best maxl)) (values best bdist)
+                                 (let [l (if (and (= (nth data c) c0) (= (nth data (+ c best)) (nth data (+ i best)))) (match-len data c i maxl) 0)
+                                       nx (nth prev (bit-and c 32767))]
+                                   (recur (if (< nx c) nx -1) (+ depth 1) (if (> l best) l best) (if (> l best) (- i c) bdist)))))
+                prev2 (assoc prev (bit-and i 32767) (nth head h))
+                head2 (assoc head h i)]
+            (if (< best 3)
+              (let [[o b c] (put-sym out buf cnt c0)] (recur (+ i 1) head2 prev2 o b c))
+              (let [li (len-index best)
+                    [o1 b1 c1] (put-sym out buf cnt (+ 257 li))
+                    [o2 b2 c2] (put-bits o1 b1 c1 (- best (nth LEN-BASE li)) (nth LEN-EXTRA li))
+                    di (dist-index bdist)
+                    [o3 b3 c3] (put-bits o2 b2 c2 (rev-bits di 5) 5)
+                    [o4 b4 c4] (put-bits o3 b3 c3 (- bdist (nth DIST-BASE di)) (nth DIST-EXTRA di))
+                    end (+ i best)
+                    [hd pv] (loop [k (+ i 1) hd head2 pv prev2]
+                              (if (or (>= k end) (> (+ k 3) n)) (values hd pv)
+                                (let [hk (hash3 data k)
+                                      old (nth hd hk)
+                                      pv2 (assoc pv (bit-and k 32767) old)]
+                                  (recur (+ k 1) (assoc hd hk k) pv2))))]
+                (recur end hd pv o4 b4 c4)))))))))
+
+(defn deflate Str [data: &Str]
+  (if (= (count data) 0) (str (chr 3) (chr 0))
+    (let [f (deflate-fixed data)]
+      (if (< (count f) (+ (count data) (* 5 (+ 1 (/ (count data) 65535))))) f (deflate-stored data)))))
+
+(defn- le32 Str [v: Int]
+  (str (chr (bit-and v 255)) (chr (bit-and (bit-shift-right v 8) 255))
+       (chr (bit-and (bit-shift-right v 16) 255)) (chr (bit-and (bit-shift-right v 24) 255))))
+
+(defn- rd32 Int [s: &Str p: Int]
+  (+ (nth s p) (* 256 (nth s (+ p 1))) (* 65536 (nth s (+ p 2))) (* 16777216 (nth s (+ p 3)))))
+
+(defn gzip Str [data: &Str]
+  (str (chr 31) (chr 139) (chr 8) (chr 0) (le32 0) (chr 0) (chr 255)
+       (deflate data) (le32 (crc32 data)) (le32 (bit-and (count data) 4294967295))))
+
+(defn gunzip Values(Str Str) [data: &Str]
+  (let [n (count data)]
+    (if (or (< n 18) (not (= (nth data 0) 31)) (not (= (nth data 1) 139))) (values "" "not gzip data")
+      (if (not (= (nth data 2) 8)) (values "" "unsupported gzip compression method")
+        (let [flg (nth data 3)
+              p1 10
+              p2 (if (= (bit-and flg 4) 4) (+ p1 2 (+ (nth data p1) (* 256 (nth data (+ p1 1))))) p1)
+              p3 (if (= (bit-and flg 8) 8) (loop [i p2] (if (or (>= i n) (= (nth data i) 0)) (+ i 1) (recur (+ i 1)))) p2)
+              p4 (if (= (bit-and flg 16) 16) (loop [i p3] (if (or (>= i n) (= (nth data i) 0)) (+ i 1) (recur (+ i 1)))) p3)
+              p5 (if (= (bit-and flg 2) 2) (+ p4 2) p4)]
+          (if (>= p5 n) (values "" "truncated gzip header")
+            (let [[out end err] (inflate data p5)]
+              (cond
+                (not (= err "")) (values "" err)
+                (> (+ end 8) n) (values "" "truncated gzip trailer")
+                (not (= (rd32 data end) (crc32 out))) (values "" "gzip CRC mismatch")
+                (not (= (rd32 data (+ end 4)) (bit-and (count out) 4294967295))) (values "" "gzip size mismatch")
+                :else (values out "")))))))))

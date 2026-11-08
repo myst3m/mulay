@@ -1,0 +1,40 @@
+(ns mulay.lib.secure
+  (:require [clay.utf8 :as u8] [mulay.lib.crypto :as cr] [mulay.lib.uni :as uni] [clay.base64 :as b64] [clay.string :as str]))
+
+(def FAIL "Could not encrypt or decrypt the data.")
+
+(defn encrypted? Bool [s: &Str]
+  (and (>= (count s) 3) (str/starts-with? s "![") (str/ends-with? s "]")))
+
+(defn- unpad Values(Str Bool) [s: &Str]
+  (let [n (count s)]
+    (if (= n 0) (values "" false)
+      (let [p (nth s (- n 1))]
+        (if (or (< p 1) (> p 16) (> p n)) (values "" false)
+          (if (loop [i (- n p)] (if (>= i n) true (if (= (nth s i) p) (recur (+ i 1)) false)))
+            (values (subs s 0 (- n p)) true)
+            (values "" false)))))))
+
+(defn- key-error Str [key: &Str]
+  (str "The key is invalid, please make sure it's of a supported size (actual is " (u8/codepoint-count key) ")"))
+
+(defn decrypt-bytes Values(Str Str) [alg: &Str mode: &Str random-iv: Bool key: &Str raw: &Str]
+  (cond
+    (not= alg "AES") (values "" (str "secure-properties: algorithm '" alg "' is not supported by mulay (AES only)"))
+    (not (or (= (count key) 16) (= (count key) 24) (= (count key) 32))) (values "" (key-error key))
+    :else
+    (let [ecb (= mode "ECB")
+          iv-in-data (and random-iv (not ecb))
+          ok1 (or (not iv-in-data) (>= (count raw) 16))
+          iv (cond ecb "" iv-in-data (if ok1 (subs raw 0 16) "") :else (subs key 0 16))
+          ct (if iv-in-data (if ok1 (subs raw 16 (count raw)) "") raw)]
+      (if (or (not ok1) (= (count ct) 0) (not= (mod (count ct) 16) 0)) (values "" FAIL)
+        (let [[pt ok] (cr/aes-raw mode false key iv ct)]
+          (if (not ok) (values "" FAIL)
+            (let [[plain ok2] (unpad pt)]
+              (if ok2 (values plain "") (values "" FAIL)))))))))
+
+(defn decrypt-value Values(Str Str) [alg: &Str mode: &Str random-iv: Bool key: &Str text: &Str]
+  (let [inner (subs text 2 (- (count text) 1))
+        [raw de] (b64/decode (str inner))]
+    (if (not= de "") (values "" de) (decrypt-bytes alg mode random-iv key raw))))

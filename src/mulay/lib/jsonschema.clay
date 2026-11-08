@@ -1,0 +1,676 @@
+(ns mulay.lib.jsonschema
+  (:require [clay.utf8 :as u8] [clay.core] [clay.string :as str] [mulay.lib.yaml :as y] [mulay.lib.dec :as d]
+            [mulay.lib.regex :as rx] [mulay.lib.uni :as uni] [mulay.lib.jhash :as jh]))
+
+(defvariant Fail
+  (FLeaf msg: Str)
+  (FGroup kids: Vec(Fail)))
+
+(defn- leaf Vec(Fail) [ptr: &Str msg: Str] [(->FLeaf (if (= ptr "") msg (str ptr " " msg)))])
+
+(defn- as-one Vec(Fail) [fs: Vec(Fail)]
+  (cond (= (count fs) 0) [] (= (count fs) 1) fs :else [(->FGroup fs)]))
+
+(defn- cat Vec(Fail) [a: Vec(Fail) b: Vec(Fail)]
+  (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- key Values(y/YVal Bool) [m: &y/YVal k: &Str] (y/get-key m k))
+
+(defrecord RxBudget [left: Int err: Str])
+
+(defn rx-budget Atom(RxBudget) [] (atom (->RxBudget rx/DEFAULT-LIMIT "")))
+
+(defn rx-find Values(Bool Str) [bud: &Atom(RxBudget) re: &rx/Pattern x: &Str]
+  (let [b (deref bud)
+        own (* 64 (count x))
+        left (max 0 (:left b))
+        [ms e used] (rx/search-within re x 0 (+ left own))
+        z (reset! bud (->RxBudget (- left (max 0 (- used own))) (if (= (:err b) "") e (:err b))))]
+    (values (> (count ms) 0) e)))
+
+(defn rx-error Str [bud: &Atom(RxBudget)] (:err (deref bud)))
+
+(defn- str-of Str [v: &y/YVal] (match v (y/YStr s) (str s) _ (y/scalar-text v)))
+
+(defn- dec-of Values(d/Dec Bool) [v: &y/YVal]
+  (match v
+    (y/YInt t) (let [[x e] (d/parse t)] (values x (= e "")))
+    (y/YFloat t) (let [[x e] (d/parse t)] (values x (= e "")))
+    _ (values (d/zero) false)))
+
+(defn found-name Str [x: &y/YVal]
+  (match x
+    (y/YNull) "Null"
+    (y/YBool b) "Boolean"
+    (y/YInt t) (let [[n ok] (y/int-value x)]
+                 (cond (not ok) "BigInteger"
+                       (and (>= n -2147483648) (<= n 2147483647)) "Integer"
+                       :else "Long"))
+    (y/YFloat t) "Double"
+    (y/YStr s) "String"
+    (y/YSeq xs) "JSONArray"
+    (y/YMap ks vs) "JSONObject"
+    (y/YTagged t y) (found-name y)))
+
+(defn- json-str Str [out: Str s: &Str]
+  (loop [i 0 o (str out "\"")]
+    (if (>= i (count s)) (str o "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (cond (= c 34) (str o "\\\"") (= c 92) (str o "\\\\") (= c 10) (str o "\\n") (= c 13) (str o "\\r") (= c 9) (str o "\\t")
+                     (< c 32) (str o "\\u00" (subs "0123456789abcdef" (quot c 16) (+ (quot c 16) 1)) (subs "0123456789abcdef" (mod c 16) (+ (mod c 16) 1)))
+                     :else (str o (subs s i (+ i 1)))))))))
+
+(defn- json-into Str [out: Str x: &y/YVal]
+  (match x
+    (y/YTagged t y) (json-into out y)
+    (y/YNull) (str out "null")
+    (y/YBool b) (str out (if b "true" "false"))
+    (y/YInt t) (str out t)
+    (y/YFloat t) (str out t)
+    (y/YStr s) (json-str out s)
+    (y/YSeq xs) (let [o (loop [i 0 o (str out "[")] (if (>= i (count xs)) o (recur (+ i 1) (json-into (if (= i 0) o (str o ",")) (nth xs i)))))] (str o "]"))
+    (y/YMap ks vs) (let [o (loop [i 0 o (str out "{")]
+                            (if (>= i (count ks)) o
+                              (let [o1 (json-str (if (= i 0) o (str o ",")) (str-of (nth ks i)))]
+                                (recur (+ i 1) (json-into (str o1 ":") (nth vs i))))))]
+                     (str o "}"))))
+
+(defn to-json Str [x: &y/YVal] (json-into "" x))
+
+(defn- show Str [x: &y/YVal] (match x (y/YStr s) (str s) _ (to-json x)))
+
+(defn- same? Bool [a: &y/YVal b: &y/YVal]
+  (let [[da oka] (dec-of a) [db okb] (dec-of b)]
+    (if (and oka okb) (d/eq-numeric? da db)
+      (match a
+        (y/YSeq xs) (match b (y/YSeq ys) (and (= (count xs) (count ys)) (loop [i 0] (if (>= i (count xs)) true (if (same? (nth xs i) (nth ys i)) (recur (+ i 1)) false)))) _ false)
+        (y/YMap ks vs) (match b
+                         (y/YMap ks2 vs2) (and (= (count ks) (count ks2))
+                                               (loop [i 0] (if (>= i (count ks)) true
+                                                             (let [[bv found] (key b (str-of (nth ks i)))]
+                                                               (if (and found (same? (nth vs i) bv)) (recur (+ i 1)) false)))))
+                         _ false)
+        _ (= (to-json a) (to-json b))))))
+
+(defn- canon-into Str [out: Str x: &y/YVal]
+  (let [[dx ok] (dec-of x)]
+    (if ok (str out "n" (if (d/is-zero? dx) "0" (d/to-string (d/strip-trailing-zeros dx))) ";")
+      (match x
+        (y/YSeq xs) (str (loop [i 0 o (str out "[")] (if (>= i (count xs)) o (recur (+ i 1) (canon-into o (nth xs i))))) "]")
+        (y/YMap ks vs) (let [ents (loop [i 0 acc: Vec(Str) []]
+                                    (if (>= i (count ks)) acc
+                                      (recur (+ i 1) (conj acc (canon-into (str (json-str "" (str-of (nth ks i))) ":") (nth vs i))))))
+                             sorted (sort ents)]
+                         (str (loop [i 0 o (str out "{")] (if (>= i (count sorted)) o (recur (+ i 1) (str o (nth sorted i) ",")))) "}"))
+        _ (str out "j" (to-json x) ";")))))
+
+(defn- has-duplicate? Bool [xs: &Vec(y/YVal)]
+  (loop [i 0 seen: Map(Str Bool) {}]
+    (if (>= i (count xs)) false
+      (let [c (canon-into "" (nth xs i))]
+        (if (contains? seen c) true (recur (+ i 1) (assoc seen c true)))))))
+
+(defn- unescape-ptr Str [s: &Str] (str/replace (str/replace s "~1" "/") "~0" "~"))
+
+(defn- ptr-index Int [p: &Str]
+  (if (or (= (count p) 0) (> (count p) 18)) -1
+    (loop [j 0 n 0]
+      (if (>= j (count p)) n
+        (let [c (nth p j)] (if (and (>= c 48) (<= c 57)) (recur (+ j 1) (+ (* n 10) (- c 48))) -1))))))
+
+(defn deref-ptr Values(y/YVal Bool) [root: &y/YVal ref: &Str]
+  (if (not (str/starts-with? ref "#")) (values (y/->YNull) false)
+    (let [parts: Vec(Str) (str/split (subs ref 1 (count ref)) "/")]
+      (loop [i 0 cur root]
+        (if (>= i (count parts)) (values cur true)
+          (let [p (nth parts i)]
+            (if (= p "") (recur (+ i 1) cur)
+              (let [[nx found] (match cur
+                                 (y/YSeq xs) (let [k (ptr-index p)]
+                                               (if (and (>= k 0) (< k (count xs))) (values (nth xs k) true) (values (y/->YNull) false)))
+                                 _ (key cur (unescape-ptr p)))]
+                (if found (recur (+ i 1) nx) (values (y/->YNull) false))))))))))
+
+(defn resolve y/YVal [s: &y/YVal root: &y/YVal]
+  (loop [k 0 cur s]
+    (let [[r has] (key cur "$ref")]
+      (if (or (not has) (>= k 64)) cur
+        (let [[t found] (deref-ptr root (str-of r))] (if found (recur (+ k 1) t) cur))))))
+
+(defn- digits? Bool [s: &Str a: Int b: Int]
+  (and (<= b (count s)) (loop [i a] (if (>= i b) true (if (and (>= (nth s i) 48) (<= (nth s i) 57)) (recur (+ i 1)) false)))))
+
+(defn- num-at Int [s: &Str a: Int b: Int] (loop [i a n 0] (if (>= i b) n (recur (+ i 1) (+ (* n 10) (- (nth s i) 48))))))
+
+(defn- leap? Bool [yr: Int] (and (= (mod yr 4) 0) (or (not= (mod yr 100) 0) (= (mod yr 400) 0))))
+
+(defn- date-ok? Bool [s: &Str]
+  (and (= (count s) 10) (digits? s 0 4) (= (nth s 4) 45) (digits? s 5 7) (= (nth s 7) 45) (digits? s 8 10)
+       (let [yr (num-at s 0 4) mo (num-at s 5 7) dd (num-at s 8 10)
+             mdays (case mo 2 (if (leap? yr) 29 28) 4 30 6 30 9 30 11 30 31)]
+         (and (>= mo 1) (<= mo 12) (>= dd 1) (<= dd mdays)))))
+
+(defn- time-ok? Bool [s: &Str a: Int]
+  (and (>= (count s) (+ a 9)) (digits? s a (+ a 2)) (= (nth s (+ a 2)) 58) (digits? s (+ a 3) (+ a 5)) (= (nth s (+ a 5)) 58) (digits? s (+ a 6) (+ a 8))
+       (<= (num-at s a (+ a 2)) 23) (<= (num-at s (+ a 3) (+ a 5)) 59) (<= (num-at s (+ a 6) (+ a 8)) 60)
+       (let [f (if (= (nth s (+ a 8)) 46)
+                 (let [e (loop [i (+ a 9)] (if (and (< i (count s)) (>= (nth s i) 48) (<= (nth s i) 57)) (recur (+ i 1)) i))
+                       n (- e (+ a 9))]
+                   (if (and (>= n 1) (<= n 9)) e -1))
+                 (+ a 8))]
+         (and (>= f 0) (< f (count s))
+              (or (and (= (nth s f) 90) (= (count s) (+ f 1)))
+                  (and (or (= (nth s f) 43) (= (nth s f) 45)) (= (count s) (+ f 6)) (digits? s (+ f 1) (+ f 3)) (= (nth s (+ f 3)) 58) (digits? s (+ f 4) (+ f 6))))))))
+
+(defn- ipv4-ok? Bool [s: &Str]
+  (let [parts: Vec(Str) (str/split s ".")]
+    (and (= (count parts) 4)
+         (loop [i 0] (if (>= i 4) true
+                       (let [p (nth parts i)]
+                         (if (and (> (count p) 0) (<= (count p) 3) (digits? p 0 (count p)) (<= (num-at p 0 (count p)) 255)) (recur (+ i 1)) false)))))))
+
+(defn- hex? Bool [c: Int] (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)) (and (>= c 65) (<= c 70))))
+
+(defn- ipv6-ok? Bool [s: &Str]
+  (let [groups: Vec(Str) (str/split s ":")
+        dbl (str/index-of s "::")]
+    (and (> (count s) 1) (<= (count groups) 8)
+         (or (>= dbl 0) (= (count groups) 8))
+         (loop [i 0] (if (>= i (count groups)) true
+                       (let [g (nth groups i)]
+                         (if (and (<= (count g) 4) (loop [k 0] (if (>= k (count g)) true (if (hex? (nth g k)) (recur (+ k 1)) false)))) (recur (+ i 1)) false)))))))
+
+(defn- label-ok? Bool [l: &Str]
+  (and (> (count l) 0) (<= (count l) 63) (not= (nth l 0) 45) (not= (nth l (- (count l) 1)) 45)
+       (loop [i 0] (if (>= i (count l)) true
+                     (let [c (nth l i)] (if (or (hex? c) (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (= c 45)) (recur (+ i 1)) false))))))
+
+(defn- hostname-ok? Bool [s: &Str]
+  (let [ls: Vec(Str) (str/split s ".")]
+    (and (> (count s) 0) (<= (count s) 255) (loop [i 0] (if (>= i (count ls)) true (if (label-ok? (nth ls i)) (recur (+ i 1)) false))))))
+
+(defn- email-ok? Bool [s: &Str]
+  (let [at (str/last-index-of s "@")]
+    (and (> at 0) (< at (- (count s) 1))
+         (let [local (subs s 0 at) dom (subs s (+ at 1) (count s))]
+           (and (<= (count local) 64) (not (str/includes? local " ")) (not (str/includes? local "@"))
+                (not (str/starts-with? local ".")) (not (str/ends-with? local ".")) (not (str/includes? local ".."))
+                (str/includes? dom ".") (hostname-ok? dom)
+                (let [tld (subs dom (+ (str/last-index-of dom ".") 1) (count dom))]
+                  (and (>= (count tld) 2) (not (digits? tld 0 (count tld))))))))))
+
+(defn- uri-ok? Bool [s: &Str]
+  (let [c (str/index-of s ":")]
+    (and (> c 0)
+         (let [a (nth s 0)] (or (and (>= a 97) (<= a 122)) (and (>= a 65) (<= a 90))))
+         (loop [i 1] (if (>= i c) true
+                       (let [ch (nth s i)] (if (or (hex? ch) (and (>= ch 97) (<= ch 122)) (and (>= ch 65) (<= ch 90)) (= ch 43) (= ch 45) (= ch 46)) (recur (+ i 1)) false))))
+         (loop [i 0] (if (>= i (count s)) true
+                       (let [ch (nth s i)] (if (or (<= ch 32) (= ch 34) (= ch 60) (= ch 62) (= ch 92) (= ch 94) (= ch 96) (= ch 123) (= ch 124) (= ch 125)) false (recur (+ i 1)))))))))
+
+(def DT-EXPECT "[yyyy-MM-dd'T'HH:mm:ssZ, yyyy-MM-dd'T'HH:mm:ss.[0-9]{1,9}Z, yyyy-MM-dd'T'HH:mm:ss[+-]HH:mm, yyyy-MM-dd'T'HH:mm:ss.[0-9]{1,9}[+-]HH:mm]")
+(def T-EXPECT "[HH:mm:ssZ, HH:mm:ss.[0-9]{1,9}Z, HH:mm:ss[+-]HH:mm, HH:mm:ss.[0-9]{1,9}[+-]HH:mm]")
+
+(defn format-ok? Bool [fmt: &Str s: &Str]
+  (cond
+    (= fmt "date") (date-ok? s)
+    (= fmt "date-time") (and (> (count s) 11) (date-ok? (subs s 0 10)) (or (= (nth s 10) 84) (= (nth s 10) 116)) (time-ok? s 11))
+    (= fmt "time") (time-ok? s 0)
+    (= fmt "email") (email-ok? s)
+    (= fmt "uri") (uri-ok? s)
+    (= fmt "ipv4") (ipv4-ok? s)
+    (= fmt "ipv6") (ipv6-ok? s)
+    (= fmt "hostname") (hostname-ok? s)
+    :else true))
+
+(defn- format-fail Vec(Fail) [fmt: &Str s: &Str ptr: &Str]
+  (cond
+    (= fmt "date") (if (date-ok? s) [] (leaf ptr (str "[" s "] is not a valid date. Expected [yyyy-MM-dd]")))
+    (= fmt "date-time") (if (and (> (count s) 11) (date-ok? (subs s 0 10)) (= (nth s 10) 84) (time-ok? s 11)) []
+                          (leaf ptr (str "[" s "] is not a valid date-time. Expected " DT-EXPECT)))
+    (= fmt "time") (if (time-ok? s 0) [] (leaf ptr (str "[" s "] is not a valid time. Expected " T-EXPECT)))
+    (= fmt "email") (if (email-ok? s) [] (leaf ptr (str "[" s "] is not a valid email address")))
+    (= fmt "uri") (if (uri-ok? s) [] (leaf ptr (str "[" s "] is not a valid URI")))
+    (= fmt "ipv4") (if (ipv4-ok? s) [] (leaf ptr (str "[" s "] is not a valid ipv4 address")))
+    (= fmt "ipv6") (if (ipv6-ok? s) [] (leaf ptr (str "[" s "] is not a valid ipv6 address")))
+    (= fmt "hostname") (if (hostname-ok? s) [] (leaf ptr (str "[" s "] is not a valid hostname")))
+    :else []))
+
+(defn- type-label Str [t: &Str]
+  (cond (= t "string") "String" (= t "integer") "Integer" (= t "number") "Number" (= t "boolean") "Boolean"
+        (= t "object") "JSONObject" (= t "array") "JSONArray" (= t "null") "Null" :else (str t)))
+
+(defn- type-ok? Bool [t: &Str x: &y/YVal]
+  (match x
+    (y/YNull) (= t "null")
+    (y/YBool b) (= t "boolean")
+    (y/YInt s) (or (= t "integer") (= t "number"))
+    (y/YFloat s) (= t "number")
+    (y/YStr s) (= t "string")
+    (y/YSeq xs) (= t "array")
+    (y/YMap ks vs) (= t "object")
+    (y/YTagged tg y) (type-ok? t y)))
+
+(defn- type-fail Vec(Fail) [s: &y/YVal x: &y/YVal ptr: &Str]
+  (let [[t has] (key s "type")
+        [nl hn] (key s "nullable")
+        nullable (and hn (match nl (y/YBool b) b _ false))]
+    (cond
+      (not has) []
+      (and nullable (match x (y/YNull) true _ false)) []
+      :else
+      (match t
+        (y/YSeq ts) (if (loop [i 0] (if (>= i (count ts)) false (if (type-ok? (str-of (nth ts i)) x) true (recur (+ i 1))))) []
+                      (loop [i 0 acc: Vec(Fail) []]
+                        (if (>= i (count ts)) acc
+                          (let [t1 (str-of (nth ts i))]
+                            (recur (+ i 1) (conj acc (nth (leaf ptr (if (= t1 "null") (str "expected: null, found: " (found-name x))
+                                                                    (str "expected type: " (type-label t1) ", found: " (found-name x)))) 0)))))))
+        _ (cond (type-ok? (str-of t) x) []
+                (= (str-of t) "null") (leaf ptr (str "expected: null, found: " (found-name x)))
+                :else (leaf ptr (str "expected type: " (type-label (str-of t)) ", found: " (found-name x))))))))
+
+(defn- labels Vec(Str) [ts: &Vec(y/YVal)] (loop [i 0 acc: Vec(Str) []] (if (>= i (count ts)) acc (recur (+ i 1) (conj acc (type-label (str-of (nth ts i))))))))
+
+(defn- int-key Values(Int Bool) [s: &y/YVal k: &Str]
+  (let [[v has] (key s k)] (if has (let [[n ok] (y/int-value v)] (values n ok)) (values 0 false))))
+
+(defn- string-fails Vec(Fail) [s: &y/YVal x: &Str ptr: &Str bud: &Atom(RxBudget)]
+  (let [n (u8/codepoint-count x)
+        [mn hmn] (int-key s "minLength")
+        [mx hmx] (int-key s "maxLength")
+        [pt hpt] (key s "pattern")
+        [fm hfm] (key s "format")
+        f1: Vec(Fail) (if (and hmn (< n mn)) (leaf ptr (str "expected minLength: " mn ", actual: " n)) [])
+        f2 (cat f1 (if (and hmx (> n mx)) (leaf ptr (str "expected maxLength: " mx ", actual: " n)) []))
+        f3 (cat f2 (if hpt
+                     (let [p (str-of pt) [re e] (rx/compile p 0)]
+                       (if (not= e "") []
+                         (let [[hit me] (rx-find bud re x)]
+                           (cond (not= me "") (leaf ptr me)
+                                 hit []
+                                 :else (leaf ptr (str "string [" x "] does not match pattern " p))))))
+                     []))]
+    (cat f3 (if hfm (format-fail (str-of fm) x ptr) []))))
+
+(defn- num-text Str [v: &y/YVal] (y/scalar-text v))
+
+(defn- number-fails Vec(Fail) [s: &y/YVal x: &y/YVal ptr: &Str]
+  (let [[xv xok] (dec-of x)
+        xt (num-text x)
+        [mn hmn] (key s "minimum")
+        [emn hemn] (key s "exclusiveMinimum")
+        [mx hmx] (key s "maximum")
+        [emx hemx] (key s "exclusiveMaximum")
+        [mo hmo] (key s "multipleOf")
+        excl-min (and hemn (match emn (y/YBool b) b _ false))
+        excl-max (and hemx (match emx (y/YBool b) b _ false))
+        f1: Vec(Fail) (if (and xok hmn)
+                        (let [[m ok] (dec-of mn) c (d/cmp xv m)]
+                          (cond (not ok) []
+                                (and excl-min (<= c 0)) (leaf ptr (str xt " is not greater than " (num-text mn)))
+                                (< c 0) (leaf ptr (str xt " is not greater or equal to " (num-text mn)))
+                                :else []))
+                        [])
+        f2 (cat f1 (if (and xok hemn (not (match emn (y/YBool b) true _ false)))
+                     (let [[m ok] (dec-of emn)] (if (and ok (<= (d/cmp xv m) 0)) (leaf ptr (str xt " is not greater than " (num-text emn))) []))
+                     []))
+        f3 (cat f2 (if (and xok hmx)
+                     (let [[m ok] (dec-of mx) c (d/cmp xv m)]
+                       (cond (not ok) []
+                             (and excl-max (>= c 0)) (leaf ptr (str xt " is not less than " (num-text mx)))
+                             (> c 0) (leaf ptr (str xt " is not less or equal to " (num-text mx)))
+                             :else []))
+                     []))
+        f4 (cat f3 (if (and xok hemx (not (match emx (y/YBool b) true _ false)))
+                     (let [[m ok] (dec-of emx)] (if (and ok (>= (d/cmp xv m) 0)) (leaf ptr (str xt " is not less than " (num-text emx))) []))
+                     []))]
+    (cat f4 (if (and xok hmo)
+              (let [[m ok] (dec-of mo)]
+                (if (or (not ok) (d/is-zero? m)) []
+                  (let [[r e] (d/rem-dec xv m)]
+                    (if (or (not= e "") (not (d/is-zero? r))) (leaf ptr (str xt " is not a multiple of " (num-text mo))) []))))
+              []))))
+
+(defn- esc-ptr Str [k: &Str] (str/replace (str/replace k "~" "~0") "/" "~1"))
+
+(defn- array-fails Vec(Fail) [s: &y/YVal root: &y/YVal xs: &Vec(y/YVal) ptr: &Str bud: &Atom(RxBudget)]
+  (let [n (count xs)
+        [mn hmn] (int-key s "minItems")
+        [mx hmx] (int-key s "maxItems")
+        [un hun] (key s "uniqueItems")
+        [it hit] (key s "items")
+        f1: Vec(Fail) (if (and hmn (< n mn)) (leaf ptr (str "expected minimum item count: " mn ", found: " n)) [])
+        f2 (cat f1 (if (and hmx (> n mx)) (leaf ptr (str "expected maximum item count: " mx ", found: " n)) []))
+        uniq (and hun (match un (y/YBool b) b _ false))
+        f3 (cat f2 (if (and uniq (has-duplicate? xs))
+                     (leaf ptr "array items are not unique") []))]
+    (if (not hit) f3
+      (match it
+        (y/YSeq ss) (loop [i 0 acc f3] (if (or (>= i n) (>= i (count ss))) acc (recur (+ i 1) (cat acc (as-one (check (nth ss i) root (nth xs i) (str ptr "/" i) bud))))))
+        _ (loop [i 0 acc f3] (if (>= i n) acc (recur (+ i 1) (cat acc (as-one (check it root (nth xs i) (str ptr "/" i) bud))))))))))
+
+(defn- object-fails Vec(Fail) [s: &y/YVal root: &y/YVal x: &y/YVal ks: &Vec(y/YVal) ptr: &Str bud: &Atom(RxBudget)]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (str-of (nth ks i))))))
+        [rq hrq] (key s "required")
+        f1: Vec(Fail) (match rq
+                        (y/YSeq rs) (loop [i 0 acc: Vec(Fail) []]
+                                      (if (>= i (count rs)) acc
+                                        (let [[v found] (key x (str-of (nth rs i)))]
+                                          (recur (+ i 1) (if found acc (cat acc (leaf ptr (str "required key [" (str-of (nth rs i)) "] not found"))))))))
+                        _ [])
+        [mn hmn] (int-key s "minProperties")
+        [mx hmx] (int-key s "maxProperties")
+        np (count (distinct-names names))
+        f2 (cat f1 (if (and hmn (< np mn)) (leaf ptr (str "minimum size: [" mn "], found: [" np "]")) []))
+        f3 (cat f2 (if (and hmx (> np mx)) (leaf ptr (str "maximum size: [" mx "], found: [" np "]")) []))
+        [props hp] (key s "properties")
+        pnames (match props (y/YMap pk pv) (loop [i 0 acc: Vec(Str) []] (if (>= i (count pk)) acc (recur (+ i 1) (conj acc (str-of (nth pk i)))))) _ [])
+        [ap hap] (key s "additionalProperties")
+        f4 (cat f3 (if (not hap) []
+                     (loop [i 0 acc: Vec(Fail) []]
+                       (if (>= i (count names)) acc
+                         (let [k (nth names i)
+                               known (loop [j 0] (if (>= j (count pnames)) false (if (= (nth pnames j) k) true (recur (+ j 1)))))]
+                           (if known (recur (+ i 1) acc)
+                             (match ap
+                               (y/YBool b) (recur (+ i 1) (if b acc (cat acc (leaf ptr (str "extraneous key [" k "] is not permitted")))))
+                               _ (let [[v found] (key x k)] (recur (+ i 1) (cat acc (as-one (check ap root v (str ptr "/" (esc-ptr k)) bud))))))))))))
+        order (jh/hashmap-order pnames)]
+    (loop [i 0 acc f4]
+      (if (>= i (count order)) acc
+        (let [k (nth order i)
+              [v found] (key x k)]
+          (if (not found) (recur (+ i 1) acc)
+            (let [[ps hps] (key props k)]
+              (recur (+ i 1) (cat acc (as-one (check ps root v (str ptr "/" (esc-ptr k)) bud)))))))))))
+
+(defn- distinct-names Vec(Str) [ns: &Vec(Str)]
+  (loop [i 0 acc: Vec(Str) [] seen: Map(Str Bool) {}]
+    (if (>= i (count ns)) acc
+      (let [n (nth ns i)]
+        (if (contains? seen n) (recur (+ i 1) acc seen) (recur (+ i 1) (conj acc n) (assoc seen n true)))))))
+
+(defn- combinator-fails Vec(Fail) [s: &y/YVal root: &y/YVal x: &y/YVal ptr: &Str bud: &Atom(RxBudget)]
+  (let [[al hal] (key s "allOf")
+        [an han] (key s "anyOf")
+        [on hon] (key s "oneOf")
+        [nt hnt] (key s "not")
+        f1: Vec(Fail) (if (not hal) []
+                        (let [rs (subs-of al root x ptr bud) bad (failed rs)] (if (= (count bad) 0) [] [(->FGroup bad)])))
+        f2 (cat f1 (if (not han) []
+                     (let [rs (subs-of an root x ptr bud) bad (failed rs)] (if (< (count bad) (count rs)) [] [(->FGroup bad)]))))
+        f3 (cat f2 (if (not hon) []
+                     (let [rs (subs-of on root x ptr bud) bad (failed rs) ok (- (count rs) (count bad))]
+                       (cond (= ok 1) []
+                             (= ok 0) [(->FGroup bad)]
+                             :else (leaf ptr (str "#: " ok " subschemas matched instead of one"))))))]
+    (cat f3 (if (not hnt) []
+              (if (> (count (check nt root x ptr bud)) 0) []
+                (leaf ptr (str "subject must not be valid against schema " (to-json (resolve nt root)))))))))
+
+(defn- subs-of Vec(Vec(Fail)) [v: &y/YVal root: &y/YVal x: &y/YVal ptr: &Str bud: &Atom(RxBudget)]
+  (match v
+    (y/YSeq ss) (loop [i 0 acc: Vec(Vec(Fail)) []] (if (>= i (count ss)) acc (recur (+ i 1) (conj acc (as-one (check (nth ss i) root x ptr bud))))))
+    _ []))
+
+(defn- failed Vec(Fail) [rs: &Vec(Vec(Fail))]
+  (loop [i 0 acc: Vec(Fail) []] (if (>= i (count rs)) acc (recur (+ i 1) (cat acc (nth rs i))))))
+
+(defn- branch-fails Vec(Fail) [s: &y/YVal x: &y/YVal base: &Vec(Fail) ptr: &Str]
+  (let [[t has] (key s "type")]
+    (match t
+      (y/YSeq ts) (if (< (count ts) 2) (copy base)
+                    (loop [i 0 acc: Vec(Fail) []]
+                      (if (>= i (count ts)) acc
+                        (let [t1 (str-of (nth ts i))]
+                          (recur (+ i 1) (cond (type-ok? t1 x) (cat acc base)
+                                               (= t1 "null") (cat acc (leaf ptr (str "expected: null, found: " (found-name x))))
+                                               :else (cat acc (leaf ptr (str "expected type: " (type-label t1) ", found: " (found-name x))))))))))
+      _ (copy base))))
+
+(defn- check Vec(Fail) [s0: &y/YVal root: &y/YVal x: &y/YVal ptr: &Str bud: &Atom(RxBudget)]
+  (let [s (resolve s0 root)
+        tf (type-fail s x ptr)]
+    (if (> (count tf) 0) tf
+      (let [base: Vec(Fail) (match x
+                              (y/YStr v) (string-fails s v ptr bud)
+                              (y/YInt t) (number-fails s x ptr)
+                              (y/YFloat t) (number-fails s x ptr)
+                              (y/YSeq xs) (array-fails s root xs ptr bud)
+                              (y/YMap ks vs) (object-fails s root x ks ptr bud)
+                              _ [])
+            base2 (if (= (count base) 0) base (branch-fails s x base ptr))
+            [en hen] (key s "enum")
+            f2 (cat base2 (match en
+                           (y/YSeq es) (if (loop [i 0] (if (>= i (count es)) false (if (same? (nth es i) x) true (recur (+ i 1))))) []
+                                         (leaf ptr (str (show x) " is not a valid enum value")))
+                           _ []))]
+        (cat f2 (combinator-fails s root x ptr bud))))))
+
+(defn- all-messages Vec(Str) [fs: &Vec(Fail)]
+  (let [leaves (loop [i 0 acc: Vec(Str) []]
+                 (if (>= i (count fs)) acc
+                   (recur (+ i 1) (match (nth fs i) (FLeaf m) (conj acc m) _ acc))))]
+    (loop [i 0 acc leaves]
+      (if (>= i (count fs)) acc
+        (recur (+ i 1) (match (nth fs i)
+                         (FGroup ks) (let [sub (all-messages ks)] (loop [j 0 a acc] (if (>= j (count sub)) a (recur (+ j 1) (conj a (nth sub j))))))
+                         _ acc))))))
+
+(defn validate Vec(Str) [schema: &y/YVal root: &y/YVal x: &y/YVal]
+  (let [bud (rx-budget)
+        fs (check schema root x "" bud)
+        ms (all-messages fs)
+        out (loop [i (- (count ms) 1) acc: Vec(Str) []] (if (< i 0) acc (recur (- i 1) (conj acc (nth ms i)))))
+        re (rx-error bud)]
+    (if (and (= (count out) 0) (not= re "")) [re] out)))
+
+(defn- yput y/YVal [m: &y/YVal k: &Str v: y/YVal]
+  (match m
+    (y/YMap ks vs) (let [i (loop [j 0] (if (>= j (count ks)) -1 (if (= (str-of (nth ks j)) k) j (recur (+ j 1)))))]
+                     (if (< i 0) (y/->YMap (conj (copy-vals ks) (y/->YStr (str k))) (conj (copy-vals vs) v))
+                       (y/->YMap (copy-vals ks) (assoc (copy-vals vs) i v))))
+    _ (y/->YMap [(y/->YStr (str k))] [v])))
+
+(defn- copy-vals Vec(y/YVal) [xs: &Vec(y/YVal)] (loop [i 0 acc: Vec(y/YVal) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (nth xs i))))))
+
+(defn- seq-of Vec(y/YVal) [x: &y/YVal] (match x (y/YSeq xs) (copy-vals xs) _ []))
+
+(defn- merge-schema y/YVal [a: &y/YVal b: &y/YVal]
+  (match b
+    (y/YMap ks vs)
+    (loop [i 0 m (match a (y/YMap x z) a _ (y/->YMap [] []))]
+      (if (>= i (count ks)) m
+        (let [k (str-of (nth ks i)) v (nth vs i)
+              [old has] (key m k)]
+          (recur (+ i 1)
+                 (cond (= k "properties") (yput m k (if has (merge-schema old v) v))
+                       (= k "required") (yput m k (y/->YSeq (loop [j 0 acc (seq-of old)] (let [xs (seq-of v)] (if (>= j (count xs)) acc (recur (+ j 1) (conj acc (nth xs j))))))))
+                       (or (= k "allOf") (= k "anyOf") (= k "oneOf")) m
+                       has m
+                       :else (yput m k v))))))
+    _ a))
+
+(defn- flatten-schema y/YVal [s0: &y/YVal root: &y/YVal depth: Int]
+  (let [s (resolve s0 root)]
+    (if (> depth 32) s
+      (let [[al hal] (key s "allOf")
+            [an han] (key s "anyOf")
+            [on hon] (key s "oneOf")
+            base (merge-schema (y/->YMap [] []) s)
+            m1 (if hal (loop [i 0 m base] (let [xs (seq-of al)] (if (>= i (count xs)) m (recur (+ i 1) (merge-schema m (flatten-schema (nth xs i) root (+ depth 1))))))) base)
+            pick (cond (and han (> (count (seq-of an)) 0)) (nth (seq-of an) 0)
+                       (and hon (> (count (seq-of on)) 0)) (nth (seq-of on) 0)
+                       :else (y/->YNull))]
+        (match pick (y/YNull) m1 _ (merge-schema m1 (flatten-schema pick root (+ depth 1))))))))
+
+(defn- type-of Str [s: &y/YVal]
+  (let [[t ht] (key s "type")]
+    (cond (not ht) (cond (let [[x h] (key s "properties")] h) "object"
+                         (let [[x h] (key s "items")] h) "array"
+                         :else "")
+          :else (match t
+                  (y/YSeq xs) (loop [i 0] (if (>= i (count xs)) "" (if (not= (str-of (nth xs i)) "null") (str-of (nth xs i)) (recur (+ i 1)))))
+                  _ (str-of t)))))
+
+(defn- class-pick Values(Str Int) [p: &Str i: Int]
+  (let [neg (and (< i (count p)) (= (nth p i) 94))
+        st (if neg (+ i 1) i)
+        e (loop [k (+ st 1)] (cond (>= k (count p)) -1 (= (nth p k) 92) (recur (+ k 2)) (= (nth p k) 93) k :else (recur (+ k 1))))]
+    (cond (< e 0) (values "" -1)
+          neg (values "" -1)
+          (= (nth p st) 92) (values (let [c (nth p (+ st 1))] (cond (= c 100) "1" (= c 119) "a" (= c 115) " " :else (subs p (+ st 1) (+ st 2)))) (+ e 1))
+          :else (values (subs p st (+ st 1)) (+ e 1)))))
+
+(defn- group-end Int [p: &Str i: Int]
+  (loop [k i depth 0]
+    (cond (>= k (count p)) -1
+          (= (nth p k) 92) (recur (+ k 2) depth)
+          (= (nth p k) 91) (let [[s e] (class-pick p (+ k 1))] (if (< e 0) -1 (recur e depth)))
+          (= (nth p k) 40) (recur (+ k 1) (+ depth 1))
+          (= (nth p k) 41) (if (= depth 0) k (recur (+ k 1) (- depth 1)))
+          :else (recur (+ k 1) depth))))
+
+(defn- first-alt Str [p: &Str]
+  (let [e (loop [k 0 depth 0]
+            (cond (>= k (count p)) (count p)
+                  (= (nth p k) 92) (recur (+ k 2) depth)
+                  (= (nth p k) 40) (recur (+ k 1) (+ depth 1))
+                  (= (nth p k) 41) (recur (+ k 1) (- depth 1))
+                  (and (= (nth p k) 124) (= depth 0)) k
+                  :else (recur (+ k 1) depth)))]
+    (subs p 0 (if (> e (count p)) (count p) e))))
+
+(defn- quant Values(Int Int) [p: &Str i: Int]
+  (if (>= i (count p)) (values 1 i)
+    (let [c (nth p i)
+          [n j] (cond (= c 43) (values 1 (+ i 1))
+                      (= c 42) (values 0 (+ i 1))
+                      (= c 63) (values 0 (+ i 1))
+                      (= c 123) (let [e (str/index-of-after p "}" i)
+                                      body (if (< e 0) "" (subs p (+ i 1) e))
+                                      cm (str/index-of body ",")
+                                      [n ne] (parse-long (if (< cm 0) body (subs body 0 cm)))]
+                                  (if (or (< e 0) (not= ne "") (< n 0) (> n 1000)) (values -1 i) (values n (+ e 1))))
+                      :else (values 1 i))]
+      (if (and (>= n 0) (< j (count p)) (> j i) (= (nth p j) 63)) (values n (+ j 1)) (values n j)))))
+
+(defn- rep-str Str [s: &Str n: Int] (loop [k 0 o ""] (if (>= k n) o (recur (+ k 1) (str o s)))))
+
+(defn- pattern-sample Values(Str Bool) [p0: &Str depth: Int]
+  (let [p1 (first-alt p0)
+        p2 (if (str/starts-with? p1 "^") (subs p1 1 (count p1)) p1)
+        p (if (and (str/ends-with? p2 "$") (not (str/ends-with? p2 "\\$"))) (subs p2 0 (- (count p2) 1)) p2)]
+    (if (> depth 16) (values "" false)
+      (loop [i 0 out ""]
+        (if (>= i (count p)) (values out true)
+          (let [c (nth p i)
+                [atom j ok] (cond
+                              (= c 92) (if (>= (+ i 1) (count p)) (values "" i false)
+                                         (let [d (nth p (+ i 1))]
+                                           (values (cond (= d 100) "1" (= d 119) "a" (= d 115) " " (or (= d 68) (= d 87) (= d 83) (= d 98) (= d 66)) "" :else (subs p (+ i 1) (+ i 2)))
+                                                   (+ i 2) (not (or (= d 68) (= d 87) (= d 83) (= d 98) (= d 66))))))
+                              (= c 91) (let [[s e] (class-pick p (+ i 1))] (values s e (>= e 0)))
+                              (= c 40) (let [e (group-end p (+ i 1))]
+                                         (if (< e 0) (values "" i false)
+                                           (let [inner (subs p (+ i 1) e)
+                                                 body (cond (str/starts-with? inner "?:") (subs inner 2 (count inner))
+                                                            (str/starts-with? inner "?") ""
+                                                            :else inner)
+                                                 [s ok2] (if (and (str/starts-with? inner "?") (not (str/starts-with? inner "?:"))) (values "" false) (pattern-sample body (+ depth 1)))]
+                                             (values s (+ e 1) ok2))))
+                              (= c 46) (values "a" (+ i 1) true)
+                              (or (= c 41) (= c 124) (= c 42) (= c 43) (= c 63) (= c 123)) (values "" i false)
+                              :else (values (subs p i (+ i 1)) (+ i 1) true))]
+            (if (not ok) (values "" false)
+              (let [[n k] (quant p j)]
+                (if (< n 0) (values "" false) (recur k (str out (rep-str atom n))))))))))))
+
+(defn- string-sample Str [s: &y/YVal]
+  (let [[fm hfm] (key s "format")
+        f (if hfm (str-of fm) "")
+        [pt hpt] (key s "pattern")
+        [ps pok] (if hpt (pattern-sample (str-of pt) 0) (values "" false))
+        [mn hmn] (int-key s "minLength")
+        [mx hmx] (int-key s "maxLength")
+        base (cond (= f "date") "2024-01-01"
+                   (= f "date-time") "2024-01-01T00:00:00Z"
+                   (= f "datetime-only") "2024-01-01T00:00:00"
+                   (or (= f "time") (= f "time-only")) "00:00:00"
+                   (= f "email") "user@example.com"
+                   (= f "uuid") "00000000-0000-4000-8000-000000000000"
+                   (= f "uri") "https://example.com"
+                   (= f "hostname") "example.com"
+                   (= f "ipv4") "127.0.0.1"
+                   (= f "ipv6") "::1"
+                   pok ps
+                   :else "sample")
+        b2 (if (and hmn (< (count base) mn) (not pok) (= f "")) (str base (rep-str "x" (- mn (count base)))) base)]
+    (if (and hmx (>= mx 0) (> (count b2) mx) (not pok) (= f "")) (subs b2 0 mx) b2)))
+
+(defn- number-sample y/YVal [s: &y/YVal int?: Bool]
+  (let [[mn hmn] (key s "minimum")
+        [mx hmx] (key s "maximum")
+        [emn hemn] (key s "exclusiveMinimum")
+        [emx hemx] (key s "exclusiveMaximum")
+        [mo hmo] (key s "multipleOf")
+        one (d/from-int 1)
+        [lo lok] (if hmn (dec-of mn) (if (and hemn (not (match emn (y/YBool b) true _ false))) (dec-of emn) (values one false)))
+        lo-ex (or (and hemn (match emn (y/YBool b) b _ false)) (and (not hmn) hemn (not (match emn (y/YBool b) true _ false))))
+        [hi hok] (if hmx (dec-of mx) (if (and hemx (not (match emx (y/YBool b) true _ false))) (dec-of emx) (values one false)))
+        hi-ex (or (and hemx (match emx (y/YBool b) b _ false)) (and (not hmx) hemx (not (match emx (y/YBool b) true _ false))))
+        [m0 mok] (if hmo (dec-of mo) (values one false))
+        c0 (if mok m0 one)
+        c1 (if (and lok (or (< (d/cmp c0 lo) 0) (and lo-ex (= (d/cmp c0 lo) 0)))) (let [[x e] (d/add lo one)] (if lo-ex x lo)) c0)
+        c2 (if (and hok (or (> (d/cmp c1 hi) 0) (and hi-ex (= (d/cmp c1 hi) 0)))) (let [[x e] (d/sub hi one)] (if hi-ex x hi)) c1)
+        [c3 e3] (if int? (d/ceil-int c2) (values c2 ""))
+        t (d/to-plain-str c3)]
+    (if (or int? (not (str/includes? t "."))) (y/->YInt t) (y/->YFloat t))))
+
+(defn- sample-of y/YVal [s0: &y/YVal root: &y/YVal depth: Int]
+  (let [s (flatten-schema s0 root 0)
+        [ex hex] (key s "example")
+        [df hdf] (key s "default")
+        [en hen] (key s "enum")
+        [cn hcn] (key s "const")]
+    (cond
+      (> depth 32) (y/->YNull)
+      hcn cn
+      (and hen (> (count (seq-of en)) 0)) (nth (seq-of en) 0)
+      hex ex
+      hdf df
+      :else
+      (let [t (type-of s)]
+        (cond
+          (= t "string") (y/->YStr (string-sample s))
+          (= t "integer") (number-sample s true)
+          (= t "number") (number-sample s false)
+          (= t "boolean") (y/->YBool true)
+          (= t "null") (y/->YNull)
+          (= t "array")
+          (let [[it hit] (key s "items")
+                [mn hmn] (int-key s "minItems")
+                [mx hmx] (int-key s "maxItems")
+                n0 (if (and hmn (> mn 1)) mn 1)
+                n (if (and hmx (< mx n0)) mx n0)
+                x (if hit (sample-of it root (+ depth 1)) (y/->YStr "sample"))]
+            (y/->YSeq (loop [k 0 acc: Vec(y/YVal) []] (if (>= k (if (> n 1000) 1000 n)) acc (recur (+ k 1) (conj acc x))))))
+          :else
+          (let [[ps hps] (key s "properties")
+                rq (seq-of (let [[r h] (key s "required")] r))]
+            (loop [i 0 m (y/->YMap [] [])]
+              (if (>= i (count rq)) m
+                (let [nm (str-of (nth rq i))
+                      [ps1 hp] (key ps nm)]
+                  (recur (+ i 1) (yput m nm (if (and hps hp) (sample-of ps1 root (+ depth 1)) (y/->YStr "sample")))))))))))))
+
+(defn sample Values(Str Bool) [schema: &y/YVal root: &y/YVal]
+  (let [x (sample-of schema root 0)]
+    (if (= (count (validate schema root x)) 0) (values (to-json x) true) (values "" false))))
+
+(defn required-names Vec(Str) [schema: &y/YVal root: &y/YVal]
+  (let [s (flatten-schema schema root 0)
+        rq (seq-of (let [[r h] (key s "required")] r))]
+    (loop [i 0 acc: Vec(Str) []] (if (>= i (count rq)) acc (recur (+ i 1) (conj acc (str-of (nth rq i))))))))

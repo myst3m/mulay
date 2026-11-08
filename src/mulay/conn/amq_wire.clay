@@ -1,0 +1,476 @@
+(ns mulay.conn.amq_wire
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.lib.dec :as dec] [mulay.lib.jhash :as jh]
+            [mulay.lib.uni :as uni] [clay.base64 :as b64] [clay.string :as str]))
+
+(defn- hex-digit Str [d: Int] (subs "0123456789ABCDEF" d (+ d 1)))
+
+(defn url-encode Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (cond (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57))
+                  (= c 46) (= c 45) (= c 42) (= c 95))
+              (recur (+ i 1) (str out (subs s i (+ i 1))))
+              (= c 32) (recur (+ i 1) (str out "+"))
+              :else (let [h (hex-digit (bit-shift-right c 4)) l (hex-digit (bit-and c 15))] (recur (+ i 1) (str out "%" h l))))))))
+
+(defn- host-char? Bool [c: Int]
+  (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57)) (= c 58) (= c 46) (= c 45)))
+
+(defn- id-char? Bool [c: Int]
+  (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57)) (= c 45)))
+
+(defn- skip-while-host Int [s: &Str i: Int] (loop [k i] (if (and (< k (count s)) (host-char? (nth s k))) (recur (+ k 1)) k)))
+(defn- skip-while-id Int [s: &Str i: Int] (loop [k i] (if (and (< k (count s)) (id-char? (nth s k))) (recur (+ k 1)) k)))
+
+(defn- at? Bool [s: &Str i: Int lit: &Str] (and (<= (+ i (count lit)) (count s)) (= (subs s i (+ i (count lit))) lit)))
+
+(defn base-of Values(Str Str Str Str) [url: &Str]
+  (let [p0 (cond (at? url 0 "https://") 8 (at? url 0 "http://") 7 :else -1)
+        p1 (if (< p0 0) -1 (skip-while-host url p0))
+        p2 (if (and (>= p1 0) (at? url p1 "/api/v1/organizations/")) (skip-while-id url (+ p1 22)) -1)
+        ok (and (>= p2 0) (at? url p2 "/environments/"))
+        bad (str "Invalid api url provided " url)]
+    (if (not ok) (values "" "" "" bad)
+      (let [k (str/index-of url "/organizations")
+            toks (str/split (subs url (+ k 1) (count url)) "/")]
+        (if (or (< (count toks) 4) (not= (nth toks 0) "organizations") (not= (nth toks 2) "environments"))
+          (values "" "" "" (str "Can not get org and env information from " url))
+          (values (subs url 0 k) (nth toks 1) (nth toks 3) ""))))))
+
+(defn dest-url Str [base: &Str org: &Str env: &Str dest: &Str]
+  (str base "/organizations/" org "/environments/" env "/destinations/" dest))
+
+(defn messages-url Str [base: &Str org: &Str env: &Str dest: &Str]
+  (let [u (dest-url base org env dest)] (str u "/messages")))
+
+(defn message-url Str [base: &Str org: &Str env: &Str dest: &Str id: &Str]
+  (let [u (dest-url base org env dest) e (url-encode id)] (str u "/messages/" e)))
+
+(defn lock-url Str [base: &Str org: &Str env: &Str dest: &Str id: &Str lock: &Str]
+  (let [u (dest-url base org env dest) e (url-encode id) l (url-encode lock)] (str u "/messages/" e "/locks/" l)))
+
+(defn locks-url Str [base: &Str org: &Str env: &Str dest: &Str]
+  (let [u (dest-url base org env dest)] (str u "/messages/locks")))
+
+(defn- hex4 Str [n: Int]
+  (let [h "0123456789abcdef"]
+    (str (subs h (bit-and (bit-shift-right n 12) 15) (+ (bit-and (bit-shift-right n 12) 15) 1))
+         (subs h (bit-and (bit-shift-right n 8) 15) (+ (bit-and (bit-shift-right n 8) 15) 1))
+         (subs h (bit-and (bit-shift-right n 4) 15) (+ (bit-and (bit-shift-right n 4) 15) 1))
+         (subs h (bit-and n 15) (+ (bit-and n 15) 1)))))
+
+(defn gson-str Str [out: Str s: &Str]
+  (let [n (count s)]
+    (loop [i 0 o (str out "\"")]
+      (if (>= i n) (str o "\"")
+        (let [c (nth s i)]
+          (cond
+            (= c 34) (recur (+ i 1) (str o "\\\""))
+            (= c 92) (recur (+ i 1) (str o "\\\\"))
+            (= c 9) (recur (+ i 1) (str o "\\t"))
+            (= c 8) (recur (+ i 1) (str o "\\b"))
+            (= c 10) (recur (+ i 1) (str o "\\n"))
+            (= c 13) (recur (+ i 1) (str o "\\r"))
+            (= c 12) (recur (+ i 1) (str o "\\f"))
+            (or (< c 32) (= c 60) (= c 62) (= c 38) (= c 61) (= c 39)) (let [h (hex4 c)] (recur (+ i 1) (str o "\\u" h)))
+            (and (= c 226) (< (+ i 2) n) (= (nth s (+ i 1)) 128) (or (= (nth s (+ i 2)) 168) (= (nth s (+ i 2)) 169)))
+            (recur (+ i 3) (str o (if (= (nth s (+ i 2)) 168) "\\u2028" "\\u2029")))
+            :else (recur (+ i 1) (str o (subs s i (+ i 1))))))))))
+
+(defvariant JV (JStr s: Str) (JNum s: Str))
+(defrecord Kv [k: Str v: JV])
+
+(defn- jv-out Str [out: Str x: &JV]
+  (match x (JStr s) (gson-str out s) (JNum s) (str out s)))
+
+(defn hashmap-json Str [out: Str kvs: &Vec(Kv)]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count kvs)) acc (recur (+ i 1) (conj acc (:k (nth kvs i))))))
+        order (jh/hashmap-order names)]
+    (loop [i 0 o (str out "{")]
+      (if (>= i (count order)) (str o "}")
+        (let [k (nth order i)
+              x (loop [j (- (count kvs) 1)] (if (= (:k (nth kvs j)) k) (:v (nth kvs j)) (recur (- j 1))))
+              o1 (gson-str (if (= i 0) o (str o ",")) k)]
+          (recur (+ i 1) (jv-out (str o1 ":") x)))))))
+
+(defn publish-json Str [body: &Str headers: &Vec(Kv) props: &Vec(Kv)]
+  (let [o1 (gson-str "{\"body\":" body)
+        o2 (hashmap-json (str o1 ",\"headers\":") headers)
+        o3 (hashmap-json (str o2 ",\"properties\":") props)]
+    (str o3 "}")))
+
+(defn lock-json Str [lock: &Str] (let [o (gson-str "{\"lockId\":" lock)] (str o "}")))
+
+(defn locks-json Str [ids: &Vec(Str) locks: &Vec(Str)]
+  (loop [i 0 o "["]
+    (if (>= i (count ids)) (str o "]")
+      (let [o1 (gson-str (str (if (= i 0) o (str o ",")) "{\"messageId\":") (nth ids i))
+            o2 (gson-str (str o1 ",\"lockId\":") (nth locks i))]
+        (recur (+ i 1) (str o2 "}"))))))
+
+(defn ttls-json Str [ids: &Vec(Str) locks: &Vec(Str) ttl: Int]
+  (loop [i 0 o "["]
+    (if (>= i (count ids)) (str o "]")
+      (let [o1 (gson-str (str (if (= i 0) o (str o ",")) "{\"ttl\":" ttl ",\"messageId\":") (nth ids i))
+            o2 (gson-str (str o1 ",\"lockId\":") (nth locks i))]
+        (recur (+ i 1) (str o2 "}"))))))
+
+(defn- b64-val Int [c: Int]
+  (cond (and (>= c 65) (<= c 90)) (- c 65) (and (>= c 97) (<= c 122)) (+ (- c 97) 26) (and (>= c 48) (<= c 57)) (+ (- c 48) 52)
+        (= c 43) 62 (= c 47) 63 (= c 61) -2 :else -1))
+
+(defn- byte-hex Str [c: Int]
+  (let [h "0123456789abcdef"
+        neg (>= c 128)
+        m (if neg (- 256 c) c)
+        d (if (>= m 16) (str (subs h (bit-shift-right m 4) (+ (bit-shift-right m 4) 1)) (subs h (bit-and m 15) (+ (bit-and m 15) 1)))
+            (subs h m (+ m 1)))]
+    (if neg (str "-" d) d)))
+
+(defn b64-decode Values(Str Str) [s: &Str]
+  (let [n (count s)]
+    (cond
+      (= n 0) (values "" "")
+      (< n 2) (values "" "Input byte[] should at least have 2 bytes for base64 bytes")
+      :else
+      (let [[out bits shiftto sp err]
+            (loop [sp 0 bits 0 shiftto 18 out ""]
+              (if (>= sp n) (values out bits shiftto sp "")
+                (let [c (nth s sp) b (b64-val c) sp1 (+ sp 1)]
+                  (cond
+                    (= b -2) (if (or (and (= shiftto 6) (or (= sp1 n) (not= (nth s sp1) 61))) (= shiftto 18))
+                               (values out bits shiftto sp1 "Input byte array has wrong 4-byte ending unit")
+                               (values out bits shiftto (if (= shiftto 6) (+ sp1 1) sp1) ""))
+                    (< b 0) (values out bits shiftto sp1 (str "Illegal base64 character " (byte-hex c)))
+                    :else
+                    (let [bits2 (bit-or bits (bit-shift-left b shiftto)) st2 (- shiftto 6)]
+                      (if (< st2 0)
+                        (recur sp1 0 18 (str out (chr (bit-and (bit-shift-right bits2 16) 255)) (chr (bit-and (bit-shift-right bits2 8) 255)) (chr (bit-and bits2 255))))
+                        (recur sp1 bits2 st2 out)))))))]
+        (cond
+          (not= err "") (values "" err)
+          (= shiftto 12) (values "" "Last unit does not have enough valid bits")
+          (< sp n) (values "" (str "Input byte array has incorrect ending byte at " sp))
+          (= shiftto 6) (values (str out (chr (bit-and (bit-shift-right bits 16) 255))) "")
+          (= shiftto 0) (values (str out (chr (bit-and (bit-shift-right bits 16) 255)) (chr (bit-and (bit-shift-right bits 8) 255))) "")
+          :else (values out ""))))))
+
+(defvariant JT
+  (TNull at: Int)
+  (TBool b: Bool at: Int)
+  (TNum s: Str at: Int)
+  (TStr s: Str at: Int)
+  (TArr xs: Vec(JT) at: Int)
+  (TObj ks: Vec(Str) vs: Vec(JT) at: Int))
+
+(def SEE-MALFORMED "\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json")
+(def SEE-STRUCTURE "\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#unexpected-json-structure")
+
+(defn- location Str [s: &Str pos: Int path: &Str]
+  (let [p (if (> pos (count s)) (count s) pos)
+        [line start] (loop [i 0 ln 1 st 0] (if (>= i p) (values ln st) (if (= (nth s i) 10) (recur (+ i 1) (+ ln 1) (+ i 1)) (recur (+ i 1) ln st))))
+        col (loop [i start k 0]
+              (if (>= i p) k
+                (let [c (nth s i)] (recur (+ i 1) (cond (< c 128) (+ k 1) (< c 192) k (< c 240) (+ k 1) :else (+ k 2))))))]
+    (str " at line " line " column " (+ col 1) " path " path)))
+
+(defn- malformed Str [msg: &Str s: &Str pos: Int path: &Str]
+  (let [l (location s pos path)] (str "com.google.gson.stream.MalformedJsonException: " msg l SEE-MALFORMED)))
+
+(defn- eof-err Str [s: &Str path: &Str]
+  (let [l (location s (count s) path)] (str "java.io.EOFException: End of input" l)))
+
+(defn- structure-err Str [msg: &Str s: &Str pos: Int path: &Str]
+  (let [l (location s pos path)] (str "java.lang.IllegalStateException: " msg l SEE-STRUCTURE)))
+
+(defn- ws? Bool [c: Int] (or (= c 32) (= c 9) (= c 10) (= c 13)))
+(defn- skip-ws Int [s: &Str p: Int] (loop [i p] (if (and (< i (count s)) (ws? (nth s i))) (recur (+ i 1)) i)))
+
+(defn- literal? Bool [c: Int]
+  (not (or (= c 47) (= c 92) (= c 59) (= c 35) (= c 61) (= c 123) (= c 125) (= c 91) (= c 93) (= c 58) (= c 44)
+           (= c 32) (= c 9) (= c 12) (= c 13) (= c 10))))
+
+(defn- hexv Int [c: Int] (cond (and (>= c 48) (<= c 57)) (- c 48) (and (>= c 97) (<= c 102)) (- c 87) (and (>= c 65) (<= c 70)) (- c 55) :else -1))
+
+(defn- read-quoted Values(Str Int Str) [s: &Str p0: Int q: Int path: &Str]
+  (let [n (count s)]
+    (loop [p p0 out "" hi -1]
+      (if (>= p n) (values "" n (malformed "Unterminated string" s n path))
+        (let [c (nth s p)]
+          (cond
+            (= c q) (values (if (>= hi 0) (str out (uni/encode 0xFFFD)) out) (+ p 1) "")
+            (= c 92)
+            (if (>= (+ p 1) n) (values "" n (malformed "Unterminated escape sequence" s n path))
+              (let [e (nth s (+ p 1))]
+                (if (= e 117)
+                  (if (> (+ p 6) n) (values "" n (malformed "Unterminated escape sequence" s n path))
+                    (let [d0 (hexv (nth s (+ p 2))) d1 (hexv (nth s (+ p 3))) d2 (hexv (nth s (+ p 4))) d3 (hexv (nth s (+ p 5)))]
+                      (if (or (< d0 0) (< d1 0) (< d2 0) (< d3 0))
+                        (values "" (+ p 6) (malformed (str "Malformed Unicode escape \\u" (subs s (+ p 2) (+ p 6))) s (+ p 2) path))
+                        (let [u (+ (* d0 4096) (* d1 256) (* d2 16) d3)]
+                          (cond
+                            (and (>= u 0xD800) (<= u 0xDBFF)) (recur (+ p 6) (if (>= hi 0) (str out (uni/encode 0xFFFD)) out) u)
+                            (and (>= u 0xDC00) (<= u 0xDFFF))
+                            (if (>= hi 0) (recur (+ p 6) (str out (uni/encode (+ 0x10000 (* (- hi 0xD800) 1024) (- u 0xDC00)))) -1)
+                              (recur (+ p 6) (str out (uni/encode 0xFFFD)) -1))
+                            :else (recur (+ p 6) (str (if (>= hi 0) (str out (uni/encode 0xFFFD)) out) (uni/encode u)) -1))))))
+                  (let [o2 (if (>= hi 0) (str out (uni/encode 0xFFFD)) out)
+                        ch (cond (= e 116) "\t" (= e 98) (chr 8) (= e 110) "\n" (= e 114) "\r" (= e 102) (chr 12) :else (subs s (+ p 1) (+ p 2)))]
+                    (recur (+ p 2) (str o2 ch) -1)))))
+            :else (recur (+ p 1) (str (if (>= hi 0) (str out (uni/encode 0xFFFD)) out) (subs s p (+ p 1))) -1)))))))
+
+(defn- read-unquoted Values(Str Int) [s: &Str p: Int]
+  (let [e (loop [i p] (if (and (< i (count s)) (literal? (nth s i))) (recur (+ i 1)) i))] (values (subs s p e) e)))
+
+(defn- dig? Bool [c: Int] (and (>= c 48) (<= c 57)))
+
+(defn- number-len Int [s: &Str p: Int]
+  (let [n (count s)
+        i0 (if (and (< p n) (= (nth s p) 45)) (+ p 1) p)
+        i1 (cond (and (< i0 n) (= (nth s i0) 48)) (+ i0 1)
+                 (and (< i0 n) (dig? (nth s i0))) (loop [k i0] (if (and (< k n) (dig? (nth s k))) (recur (+ k 1)) k))
+                 :else -1)
+        i2 (if (< i1 0) -1
+             (if (and (< i1 n) (= (nth s i1) 46))
+               (let [k (loop [k (+ i1 1)] (if (and (< k n) (dig? (nth s k))) (recur (+ k 1)) k))] (if (= k (+ i1 1)) -1 k))
+               i1))
+        i3 (if (< i2 0) -1
+             (if (and (< i2 n) (or (= (nth s i2) 101) (= (nth s i2) 69)))
+               (let [j (if (and (< (+ i2 1) n) (or (= (nth s (+ i2 1)) 43) (= (nth s (+ i2 1)) 45))) (+ i2 2) (+ i2 1))
+                     k (loop [k j] (if (and (< k n) (dig? (nth s k))) (recur (+ k 1)) k))]
+                 (if (= k j) -1 k))
+               i2))]
+    (if (or (< i3 0) (and (< i3 n) (literal? (nth s i3)))) 0 (- i3 p))))
+
+(defn- keyword-at Bool [s: &Str p: Int w: &Str]
+  (let [k (count w)]
+    (and (<= (+ p k) (count s))
+         (= (str/lower-case (subs s p (+ p k))) w)
+         (or (= (+ p k) (count s)) (not (literal? (nth s (+ p k))))))))
+
+(defn read-value Values(JT Int Str) [s: &Str p0: Int path: &Str]
+  (let [n (count s)
+        p (skip-ws s p0)]
+    (if (>= p n) (values (->TNull n) n (eof-err s path))
+      (let [c (nth s p)]
+        (cond
+          (= c 123) (read-object s (+ p 1) path)
+          (= c 91) (read-array s (+ p 1) path)
+          (or (= c 34) (= c 39)) (let [[x e err] (read-quoted s (+ p 1) c path)] (values (->TStr x (+ p 1)) e err))
+          (keyword-at s p "true") (values (->TBool true (+ p 4)) (+ p 4) "")
+          (keyword-at s p "false") (values (->TBool false (+ p 5)) (+ p 5) "")
+          (keyword-at s p "null") (values (->TNull (+ p 4)) (+ p 4) "")
+          :else
+          (let [k (number-len s p)]
+            (cond (> k 0) (values (->TNum (subs s p (+ p k)) (+ p k)) (+ p k) "")
+                  (literal? c) (let [[x e] (read-unquoted s p)] (values (->TStr x p) e ""))
+                  :else (values (->TNull p) (+ p 1) (malformed "Expected value" s (+ p 1) path)))))))))
+
+(defn- read-array Values(JT Int Str) [s: &Str p0: Int path: &Str]
+  (let [n (count s) at p0]
+    (loop [p p0 xs: Vec(JT) []]
+      (let [q (skip-ws s p)]
+        (cond
+          (>= q n) (values (->TNull at) n (eof-err s path))
+          (= (nth s q) 93) (values (->TArr xs at) (+ q 1) "")
+          :else
+          (let [q2 (if (= (count xs) 0) q
+                     (if (or (= (nth s q) 44) (= (nth s q) 59)) (+ q 1) -1))]
+            (if (< q2 0) (values (->TNull at) (+ q 1) (malformed "Unterminated array" s (+ q 1) path))
+              (let [ip (str path "[" (count xs) "]")
+                    [x e err] (read-value s q2 ip)]
+                (if (not= err "") (values x e err) (recur e (conj xs x)))))))))))
+
+(defn- read-name Values(Str Int Str) [s: &Str q: Int path: &Str]
+  (let [c (nth s q)]
+    (cond (or (= c 34) (= c 39)) (read-quoted s (+ q 1) c path)
+          (literal? c) (let [[x e] (read-unquoted s q)] (values x e ""))
+          :else (values "" (+ q 1) (malformed "Expected name" s (+ q 1) path)))))
+
+(defn- read-object Values(JT Int Str) [s: &Str p0: Int path: &Str]
+  (let [n (count s) at p0]
+    (loop [p p0 ks: Vec(Str) [] vs: Vec(JT) [] cur path]
+      (let [q (skip-ws s p)]
+        (cond
+          (>= q n) (values (->TNull at) n (eof-err s cur))
+          (and (= (nth s q) 125) (= (count ks) 0)) (values (->TObj ks vs at) (+ q 1) "")
+          :else
+          (let [
+                [q2 done err0] (if (= (count ks) 0) (values q false "")
+                                 (let [c (nth s q)]
+                                   (cond (= c 125) (values (+ q 1) true "")
+                                         (or (= c 44) (= c 59)) (let [r (skip-ws s (+ q 1))]
+                                                                   (cond (>= r n) (values n false (eof-err s cur))
+                                                                         (= (nth s r) 125) (values (+ r 1) false (malformed "Expected name" s (+ r 1) cur))
+                                                                         :else (values r false "")))
+                                         :else (values (+ q 1) false (malformed "Unterminated object" s (+ q 1) cur)))))]
+            (cond
+              (not= err0 "") (values (->TNull at) q2 err0)
+              done (values (->TObj ks vs at) q2 "")
+              :else
+              (let [[name e1 err1] (read-name s q2 cur)]
+                (if (not= err1 "") (values (->TNull at) e1 err1)
+                  (let [r (skip-ws s e1)
+                        np (str path "." name)]
+                    (cond
+                      (>= r n) (values (->TNull at) n (eof-err s np))
+                      (or (= (nth s r) 58) (= (nth s r) 61))
+                      (let [r2 (if (and (= (nth s r) 61) (< (+ r 1) n) (= (nth s (+ r 1)) 62)) (+ r 2) (+ r 1))
+                            [x e2 err2] (read-value s r2 np)]
+                        (if (not= err2 "") (values x e2 err2) (recur e2 (conj ks name) (conj vs x) np)))
+                      :else (values (->TNull at) (+ r 1) (malformed "Expected ':'" s (+ r 1) np)))))))))))))
+
+(defn- kind-name Str [x: &JT]
+  (match x (TNull a) "NULL" (TBool b a) "BOOLEAN" (TNum t a) "NUMBER" (TStr t a) "STRING" (TArr xs a) "BEGIN_ARRAY" (TObj ks vs a) "BEGIN_OBJECT"))
+
+(defn- at-of Int [x: &JT]
+  (match x (TNull a) a (TBool b a) a (TNum t a) a (TStr t a) a (TArr xs a) a (TObj ks vs a) a))
+
+(defn read-doc Values(JT Bool Str) [s: &Str]
+  (let [p (skip-ws s 0)]
+    (if (>= p (count s)) (values (->TNull 0) true "")
+      (let [[x e err] (read-value s p "$")]
+        (if (not= err "") (values x false err)
+          (let [r (skip-ws s e)
+                is-null (match x (TNull a) true _ false)]
+            (if (and (< r (count s)) (not is-null))
+              (values x false (malformed "Use JsonReader.setStrictness(Strictness.LENIENT) to accept malformed JSON" s (+ r 1) "$"))
+              (values x false ""))))))))
+
+(defn ack-token Str [dest: &Str id: &Str lock: &Str]
+  (let [o1 (gson-str "{\"destination\":" dest)
+        o2 (gson-str (str o1 ",\"messageId\":") id)
+        o3 (gson-str (str o2 ",\"lockId\":") lock)]
+    (b64/encode (str o3 "}"))))
+
+(defrecord Tok [null: Bool dest: Vec(Str) id: Vec(Str) lock: Vec(Str)])
+
+(defn- field-str Values(Vec(Str) Str) [x: &JT s: &Str path: &Str]
+  (match x
+    (TNull a) (values [] "")
+    (TBool b a) (values [(if b "true" "false")] "")
+    (TNum t a) (values [(str t)] "")
+    (TStr t a) (values [(str t)] "")
+    _ (values [] (structure-err (str "Expected a string but was " (kind-name x)) s (at-of x) path))))
+
+(defn ack-token-decode Values(Tok Str) [tok: &Str]
+  (let [z: Vec(Str) []
+        none (->Tok true z z z)
+        [raw berr] (b64-decode tok)]
+    (if (not= berr "") (values none berr)
+      (let [s (uni/sanitize raw)
+            [root empty err] (read-doc s)]
+        (cond
+          (not= err "") (values none err)
+          empty (values none "")
+          :else
+          (match root
+            (TNull a) (values none "")
+            (TObj ks vs a)
+            (loop [i 0 d: Vec(Str) [] m: Vec(Str) [] l: Vec(Str) []]
+              (if (>= i (count ks)) (values (->Tok false d m l) "")
+                (let [k (nth ks i)]
+                  (if (or (= k "destination") (= k "messageId") (= k "lockId"))
+                    (let [[x e] (field-str (nth vs i) s (str "$." k))]
+                      (cond (not= e "") (values none e)
+                            (= k "destination") (recur (+ i 1) x m l)
+                            (= k "messageId") (recur (+ i 1) d x l)
+                            :else (recur (+ i 1) d m x)))
+                    (recur (+ i 1) d m l)))))
+            _ (values none (structure-err (str "Expected BEGIN_OBJECT but was " (kind-name root)) s (at-of root) "$"))))))))
+
+(defn- opt-str Str [x: &Vec(Str)] (if (= (count x) 0) "null" (str (nth x 0))))
+
+(defn token-str Str [t: &Tok]
+  (if (:null t) "NULL"
+    (let [d (opt-str (:dest t)) i (opt-str (:id t)) l (opt-str (:lock t))] (str d "|" i "|" l))))
+
+(defrecord RMsg [headers: Vec(v/Field) props: Vec(v/Field) body: Str])
+
+(defn- class-meta Vec(v/Field) [cls: &Str] [(v/field "class" (v/->VStr (str cls)))])
+(def CM-LONG (class-meta "java.lang.Long"))
+(def CM-DOUBLE (class-meta "java.lang.Double"))
+
+(defn- number-val v/Val [t: &Str]
+  (let [[n e] (parse-long t)]
+    (if (= e "") (v/->VMeta (v/int-v n) CM-LONG)
+      (let [[f fe] (parse-double t)
+            [x xe] (num/from-float f)]
+        (v/->VMeta (if (= xe "") (v/num-v x) (v/->VStr (str t))) CM-DOUBLE)))))
+
+(defn- scalar-val Values(v/Val Str) [x: &JT what: &Str]
+  (match x
+    (TNull a) (values (v/null-v) (str what " value can not be null"))
+    (TBool b a) (values (v/->VStr (if b "true" "false")) "")
+    (TNum t a) (values (number-val t) "")
+    (TStr t a) (values (v/->VStr (str t)) "")
+    _ (values (v/null-v) (str what " value accept only string or number or boolean as values"))))
+
+(defn- hashmap-fields Values(Vec(v/Field) Str) [ks: &Vec(Str) vs: &Vec(JT) what: &Str]
+  (let [order (jh/hashmap-order ks)]
+    (loop [i 0 acc: Vec(v/Field) []]
+      (if (>= i (count order)) (values acc "")
+        (let [k (nth order i)
+              j (loop [j (- (count ks) 1)] (if (= (nth ks j) k) j (recur (- j 1))))
+              [x e] (scalar-val (nth vs j) what)]
+          (if (not= e "") (values acc e) (recur (+ i 1) (conj acc (v/field k x)))))))))
+
+(defn- obj-parts Values(Vec(Str) Vec(JT) Bool) [x: &JT]
+  (match x (TObj ks vs a) (values ks vs true) _ (let [k: Vec(Str) [] w: Vec(JT) []] (values k w false))))
+
+(defn parse-receive Values(Vec(RMsg) Str) [json: &Str]
+  (let [[root empty err] (read-doc json)
+        none: Vec(RMsg) []]
+    (cond
+      (not= err "") (values none (str "Json deserialization error - " err))
+      empty (values none "")
+      :else
+      (match root
+        (TArr xs a)
+        (loop [i 0 acc: Vec(RMsg) []]
+          (if (>= i (count xs)) (values acc "")
+            (let [[ks vs ok] (obj-parts (nth xs i))]
+              (if (not ok) (values none (str "Json deserialization error - " (structure-err (str "Expected BEGIN_OBJECT but was " (kind-name (nth xs i))) json (at-of (nth xs i)) (str "$[" i "]"))))
+                (let [hj (loop [j 0] (if (>= j (count ks)) -1 (if (= (nth ks j) "headers") j (recur (+ j 1)))))
+                      pj (loop [j 0] (if (>= j (count ks)) -1 (if (= (nth ks j) "properties") j (recur (+ j 1)))))
+                      bj (loop [j 0] (if (>= j (count ks)) -1 (if (= (nth ks j) "body") j (recur (+ j 1)))))
+                      [hk hv hok] (if (>= hj 0) (obj-parts (nth vs hj)) (let [k: Vec(Str) [] w: Vec(JT) []] (values k w true)))
+                      [pk pv pok] (if (>= pj 0) (obj-parts (nth vs pj)) (let [k: Vec(Str) [] w: Vec(JT) []] (values k w true)))
+                      [hs he] (hashmap-fields hk hv "Header")
+                      [ps pe] (hashmap-fields pk pv "Property")
+                      body (if (< bj 0) "" (match (nth vs bj) (TStr t a) (str t) (TNum t a) (str t) _ ""))]
+                  (cond (not= he "") (values none he)
+                        (not= pe "") (values none pe)
+                        :else (recur (+ i 1) (conj acc (->RMsg hs ps body)))))))))
+        _ (values none (str "Json deserialization error - " (structure-err (str "Expected BEGIN_ARRAY but was " (kind-name root)) json (at-of root) "$")))))))
+
+(defn- class-of Str [x: &v/Val]
+  (match x (v/VMeta y ms) (let [c (v/obj-get ms "class")] (if (= (count c) 0) "" (match (nth c 0) (v/VStr s) (str s) _ ""))) _ ""))
+
+(defn java-str Str [x: &v/Val]
+  (let [cls (class-of x)]
+    (match (v/unmeta x)
+      (v/VStr s) (str s)
+      (v/VInt i) (if (= cls "java.lang.Double") (str i ".0") (str i))
+      (v/VNum n) (if (= cls "java.lang.Double") (dec/float->shortest-str (num/to-float n)) (num/to-plain-str n))
+      _ "")))
+
+(defn- simple-class Str [x: &v/Val]
+  (let [c (class-of x)] (cond (= c "java.lang.Long") "Long" (= c "java.lang.Double") "Double" :else "String")))
+
+(defn msgs-str Str [ms: &Vec(RMsg)]
+  (loop [i 0 out ""]
+    (if (>= i (count ms)) out
+      (let [m (nth ms i)
+            hs (:headers m)
+            ps (:props m)
+            o1 (loop [j 0 o (str out "H")] (if (>= j (count hs)) o (let [f (nth hs j) t (java-str (:value f))] (recur (+ j 1) (str o " " (:name (:key f)) "=" t)))))
+            o2 (loop [j 0 o (str o1 " P")] (if (>= j (count ps)) o (let [f (nth ps j) c (simple-class (:value f)) t (java-str (:value f))] (recur (+ j 1) (str o " " (:name (:key f)) "=" c ":" t)))))]
+        (recur (+ i 1) (str o2 " B " (:body m) ";"))))))
+
+(defn group-id-ok? Bool [g: &Str]
+  (and (>= (count g) 1) (<= (count g) 128)
+       (loop [i 0]
+         (if (>= i (count g)) true
+           (let [c (nth g i)] (if (and (>= c 33) (<= c 126)) (recur (+ i 1)) false))))))

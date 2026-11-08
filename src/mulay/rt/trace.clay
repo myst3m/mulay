@@ -1,0 +1,137 @@
+(ns mulay.rt.trace
+  (:require [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.lib.otlp :as o] [mulay.lib.tracectx :as tc] [mulay.lib.host :as host]))
+
+(def OVERVIEW 0)
+(def MONITORING 1)
+(def DEBUG 2)
+
+(defrecord Conf [on: Bool level: Int sampler: Str ratio: Float app: Str queue-size: Int])
+
+(def CONF (atom (->Conf false MONITORING "parentbased_traceidratio" 0.1 "" 2048)))
+(def ON (atom false))
+(def QUEUE (atom (let [v: Vec(o/Span) []] v)))
+(def DROPPED (atom 0))
+
+(defn configure! Int [c: Conf] (let [a (reset! CONF c) b (reset! ON (:on c))] 0))
+
+(defn on? Bool [] (deref ON))
+
+(defn level Int [] (:level (deref CONF)))
+
+(defrecord Open [live: Bool root: Bool prov: Bool trace: Str id: Str parent: Str state: Str flags: Int name: Str kind: Int
+                 location: Str start: Int thread: Str tid: Int base: Vec(o/Attr) mod: Atom(ev/SpanMod)])
+
+(def DEAD (->Open false false false "" "" "" "" 0 "" o/INTERNAL "" 0 "" 0 [] (:mod ev/NO-SPAN)))
+
+(defn now-ns Int [] (let [[s ns] (host/real-now-ns)] (+ (* s 1000000000) ns)))
+
+(defn- thread-name Str [e: &ev/Event] (str "[" (:app (deref CONF)) "]." (:flow e)))
+
+(defn- kind-overridden? Bool [m: &ev/SpanMod]
+  (let [as (:attrs m)] (loop [i 0] (if (>= i (count as)) false (if (= (:key (nth as i)) "span.kind.override") true (recur (+ i 1)))))))
+
+(defn- parent-for-child Str [sc: &ev/SpanCtx]
+  (if (and (not= (:up sc) "") (not (kind-overridden? (deref (:mod sc))))) (str (:up sc)) (str (:span sc))))
+
+(defn- open-span Values(Open ev/Event) [e: ev/Event trace: Str parent: Str state: Str flags: Int sampled: Bool name: &Str kind: Int
+                                        location: &Str root: Bool prov: Bool base: Vec(o/Attr)]
+  (let [id (tc/new-span-id)
+        md (atom (ev/->SpanMod "" []))
+        sc (ev/->SpanCtx trace id (if sampled 1 0) state sampled md (if prov parent ""))
+        op (->Open sampled root prov trace id parent state flags (str name) kind (str location) (now-ns) (thread-name e) (host/thread-id) base md)]
+    (values op (ev/with-span e sc))))
+
+(defn start Values(Open ev/Event) [e: ev/Event name: &Str location: &Str]
+  (let [sc (:span e)]
+    (if (not (:sampled sc)) (values DEAD e)
+      (open-span e (str (:trace sc)) (parent-for-child sc) (str (:state sc)) 257 true name o/INTERNAL location false false []))))
+
+(defn start-provisional Values(Open ev/Event) [e: ev/Event name: &Str location: &Str]
+  (let [sc (:span e)]
+    (if (not (:sampled sc)) (values DEAD e)
+      (open-span e (str (:trace sc)) (parent-for-child sc) (str (:state sc)) 257 true name o/INTERNAL location false true []))))
+
+(defn start-root Values(Open ev/Event) [e: ev/Event name: &Str kind: Int location: &Str traceparent: &Str tracestate: &Str base: Vec(o/Attr)]
+  (if (not (on?)) (values DEAD e)
+    (let [c (deref CONF)
+          [pk ptr psp pfl] (tc/parse-parent traceparent)
+          trace (if (= pk tc/VALID) ptr (tc/new-trace-id))
+          sampled (tc/sample? (:sampler c) (:ratio c) pk (= (bit-and pfl 1) 1) trace)
+          state (if (= pk tc/VALID) (tc/parse-state tracestate) "")
+          flags (bit-or (if (= pk tc/NONE) 256 768) (if sampled 1 0))]
+      (open-span e trace (if (= pk tc/VALID) psp "") state flags sampled name kind location true false base))))
+
+(defn restore ev/Event [e: ev/Event sc: ev/SpanCtx] (ev/with-span e sc))
+
+(defn set-name! Int [e: &ev/Event name: &Str]
+  (let [sc (:span e)]
+    (if (not (:sampled sc)) 0
+      (let [z (swap! (:mod sc) (fn ev/SpanMod [m: ev/SpanMod] (assoc m :name (str name))))] 0))))
+
+(defn add-attr! Int [e: &ev/Event k: &Str v: &Str]
+  (let [sc (:span e)]
+    (if (not (:sampled sc)) 0
+      (let [z (swap! (:mod sc) (fn ev/SpanMod [m: ev/SpanMod] (assoc m :attrs (conj (:attrs m) (o/attr k v)))))] 0))))
+
+(defn traceparent Str [e: &ev/Event]
+  (let [sc (:span e)]
+    (if (not (ev/traced? sc)) "" (tc/format-parent (:trace sc) (:span sc) (:sampled sc)))))
+
+(defn tracestate Str [e: &ev/Event] (str (:state (:span e))))
+
+(defn- kind-of Int [s: &Str]
+  (cond (= s "SERVER") o/SERVER (= s "CLIENT") o/CLIENT :else o/INTERNAL))
+
+(defn- status-of Int [s: &Str]
+  (cond (= s "ERROR") o/ERROR (= s "OK") o/OK :else o/UNSET))
+
+(defn- exception-event o/SEvent [x: &err/MErr t: Int]
+  (o/->SEvent t "exception" [(o/attr "exception.type" (err/type-str x)) (o/attr "exception.message" (:description x))
+                             (o/attr "exception.stacktrace" (:stack x)) (o/battr "exception.escaped" true)]))
+
+(defn- enqueue Int [s: o/Span]
+  (let [cap (:queue-size (deref CONF))]
+    (if (>= (count (deref QUEUE)) cap) (let [z (swap! DROPPED (fn Int [n: Int] (+ n 1)))] 0)
+      (let [z (swap! QUEUE (fn Vec(o/Span) [q: Vec(o/Span)] (conj q s)))] 0))))
+
+(defn take-dropped Int [] (let [n (deref DROPPED) z (swap! DROPPED (fn Int [k: Int] (- k n)))] n))
+
+(defn finish Int [op: &Open e: &ev/Event x: &Vec(err/MErr)]
+  (if (not (:live op)) 0
+    (let [m (deref (:mod op))
+          end (now-ns)
+          c (deref CONF)
+          as (:attrs m)
+          [kind ov extra]
+          (loop [i 0 k (:kind op) ov "" acc: Vec(o/Attr) []]
+            (if (>= i (count as)) (values k ov acc)
+              (let [a (nth as i) key (:key a)]
+                (cond (= key "span.kind.override") (recur (+ i 1) (match (:val a) (o/AStr s) (kind-of s) _ k) ov acc)
+                      (= key "status.override") (recur (+ i 1) k (match (:val a) (o/AStr s) (str s) _ "") acc)
+                      :else (recur (+ i 1) k ov (conj acc a))))))
+          failed (> (count x) 0)
+          [st msg] (cond (and (:root op) (not= ov "")) (values (status-of ov) "")
+                         failed (values o/ERROR "Exceptions have been recorded.")
+                         (not= ov "") (values (status-of ov) "")
+                         :else (values o/UNSET ""))
+          evs: Vec(o/SEvent) (if failed [(exception-event (nth x 0) end)] [])
+          base (loop [i 0 acc [(o/attr "artifact.id" (:app c)) (o/attr "artifact.type" "app") (o/attr "location" (:location op))
+                                (o/attr "correlation.id" (:corr e)) (o/attr "thread.start.id" (str (:tid op)))
+                                (o/attr "thread.start.name" (:thread op)) (o/attr "thread.end.name" (thread-name e))]]
+                 (if (>= i (count (:base op))) acc (recur (+ i 1) (conj acc (nth (:base op) i)))))
+          all (loop [i 0 acc base] (if (>= i (count extra)) acc (recur (+ i 1) (conj acc (nth extra i)))))
+          name (if (= (:name m) "") (str (:name op)) (str (:name m)))]
+      (if (and (:prov op) (= kind o/INTERNAL)) 0
+        (enqueue (o/->Span (str (:trace op)) (str (:id op)) (str (:parent op)) (str (:state op)) (:flags op) name kind
+                           (:start op) end all evs st msg))))))
+
+(defn take-batch Vec(o/Span) [max: Int]
+  (let [taken (atom (let [v: Vec(o/Span) []] v))
+        z (swap! QUEUE (fn Vec(o/Span) [q: Vec(o/Span)]
+                         (let [n (min max (count q))
+                               head (loop [i 0 acc: Vec(o/Span) []] (if (>= i n) acc (recur (+ i 1) (conj acc (nth q i)))))
+                               z2 (reset! taken head)]
+                           (loop [i n acc: Vec(o/Span) []] (if (>= i (count q)) acc (recur (+ i 1) (conj acc (nth q i))))))))]
+    (deref taken)))
+
+(defn queued Int [] (count (deref QUEUE)))

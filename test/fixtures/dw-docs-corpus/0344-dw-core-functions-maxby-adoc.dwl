@@ -1,0 +1,1 @@
+[ "A", "B", "C" ] maxBy ((item) -> item)

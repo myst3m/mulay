@@ -1,0 +1,31 @@
+(ns xsdtype-test (:require [mulay.dw.xsdtype :as xt] [clay.string :as str]))
+
+(defn- lines Vec(Str) [s: &Str]
+  (let [ls: Vec(Str) (str/split (str s) "\n")]
+    (sort (loop [i 0 acc: Vec(Str) []] (if (>= i (count ls)) acc (recur (+ i 1) (let [l (str/trim (nth ls i))] (if (or (= l "") (str/starts-with? l "type Root =")) acc (conj acc l)))))))))
+
+(defn- path-of Str [m: &Str] (str "test/fixtures/xsd/" (str/replace (str m) "::" "/")))
+
+(defn- loader Values(Str Bool) [m: Str]
+  (let [[t e] (read-file (str (path-of (if (str/starts-with? m "xmlschema!") (subs m 10 (count m)) m)) ".xsd"))] (values t (= e ""))))
+
+(defn- same Str [name: Str]
+  (let [[x xe] (read-file (str (path-of name) ".xsd"))
+        [want we] (read-file (str (path-of name) ".dwl"))
+        [got e] (xt/xml-schema-module x (str "xmlschema!" name) loader)
+        a (lines got) b (lines want)]
+    (if (not= e "") e
+      (loop [i 0]
+        (cond (and (>= i (count a)) (>= i (count b))) ""
+              (>= i (count a)) (str "missing: " (nth b i))
+              (>= i (count b)) (str "extra: " (nth a i))
+              (not= (nth a i) (nth b i)) (str "got:  " (nth a i) "\nwant: " (nth b i))
+              :else (recur (+ i 1)))))))
+
+(deftest same-declarations-as-real-dw
+  (is (= (same "Order") ""))
+  (is (= (same "Mix") ""))
+  (is (= (same "Edge") ""))
+  (is (= (same "schemas::Main") ""))
+  (is (= (same "schemas::Part") ""))
+  (is (= (same "schemas::common::Types") "")))

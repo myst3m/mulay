@@ -1,0 +1,126 @@
+(ns session-test (:require [mulay.conn.mcp :as mcp] [clay.httpmsg :as hm] [clay.string :as str]))
+
+;; on-new-session-listener と default-response-headers。期待値は実 Mule (mcp 1.5.0) の記録 (test/fixtures/apps/mcp-sess)。
+
+(def SRV (mcp/->Server "S" "L" "/mcp" false "Sess" "1.0.0" [] [] [] [(hm/->Header "X-Default" "yes")] 0 [7] "" []))
+(def PLAIN (mcp/->Server "P" "L" "/p" false "Plain" "1.0.0" [] [] [] [(hm/->Header "X-Default" "yes")] 0 [] "" []))
+
+(def ACCEPT [(hm/->Header "Accept" "application/json, text/event-stream")])
+(def INIT "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}")
+(def PING "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}")
+
+(defn- hv Str [a: &mcp/Answer name: &Str]
+  (match (hm/header-of (:headers a) name) (Some v) v (None) "<none>"))
+
+(defn- with-session Vec(hm/Header) [sid: &Str] [(hm/->Header "Accept" "application/json, text/event-stream") (hm/->Header "Mcp-Session-Id" sid)])
+
+(deftest initialize-waits-for-the-new-session-flow
+  (let [st (mcp/begin SRV "POST" ACCEPT INIT)]
+    (is (= (:kind st) "session"))
+    (is (= (:tool st) 7))
+    (is (= (count (:sid st)) 36))
+    (is (= (:ver st) "2025-06-18"))
+    ;; フローが終わるまでセッションは無い
+    (is (= (:status (:answer (mcp/begin SRV "POST" (with-session (:sid st)) PING))) 404))))
+
+(deftest finish-session-opens-the-session
+  (let [st (mcp/begin SRV "POST" ACCEPT INIT)
+        a (mcp/finish-session SRV st)]
+    (is (= (:status a) 200))
+    (is (= (hv a "mcp-session-id") (:sid st)))
+    (is (= (:status (:answer (mcp/begin SRV "POST" (with-session (:sid st)) PING))) 200))))
+
+(deftest rejection-does-not-open-a-session
+  (let [st (mcp/begin SRV "POST" ACCEPT INIT)
+        a (mcp/reject-answer 403 [(hm/->Header "X-Why" "denied")] "no entry")]
+    (is (= (:status a) 403))
+    (is (= (hv a "x-why") "denied"))
+    (is (= (:body a) "no entry"))
+    (is (= (:status (:answer (mcp/begin SRV "POST" (with-session (:sid st)) PING))) 404))))
+
+(deftest flow-failure-is-a-plain-500
+  (let [a (mcp/session-failure "not welcome")]
+    (is (= (:status a) 500))
+    (is (= (:body a) "org.mule.runtime.api.exception.DefaultMuleException: not welcome"))
+    (is (= (count (:headers a)) 0))))
+
+(deftest default-headers-go-first-on-valid-answers
+  (let [st (mcp/begin PLAIN "POST" ACCEPT INIT)
+        a (:answer st)
+        sid (hv a "mcp-session-id")]
+    (is (= (:hd-name (nth (:headers a) 0)) "X-Default"))
+    (is (= (hv a "x-default") "yes"))
+    (is (= (hv (:answer (mcp/begin PLAIN "POST" (with-session sid) PING)) "x-default") "yes"))
+    (is (= (hv (:answer (mcp/begin PLAIN "POST" (with-session sid) "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")) "x-default") "yes"))))
+
+(deftest default-headers-skip-rejected-and-missing-session-answers
+  (let [sid (hv (:answer (mcp/begin PLAIN "POST" ACCEPT INIT)) "mcp-session-id")]
+    (is (= (hv (:answer (mcp/begin PLAIN "POST" (with-session "zzz") PING)) "x-default") "<none>"))
+    (is (= (hv (:answer (mcp/begin PLAIN "POST" [(hm/->Header "Accept" "text/plain")] PING)) "x-default") "<none>"))
+    (is (= (hv (:answer (mcp/begin PLAIN "DELETE" [(hm/->Header "Mcp-Session-Id" sid)] "")) "x-default") "<none>"))
+    (is (= (hv (:answer (mcp/begin PLAIN "GET" ACCEPT "")) "x-default") "<none>"))))
+
+(def SSE2 (mcp/->Server "Q" "L" "/q" true "Sse" "1.0.0" [] [] [] [(hm/->Header "X-One" "1") (hm/->Header "X-Two" "2")] 0 [] "" []))
+
+;; SSE モードでは、固定のヘッダの後、Mcp-Session-Id の前に、書いた順の逆で入る (実 Mule の記録。JSON モードの並びは起動のたびに変わる)
+(deftest sse-default-headers-sit-before-the-session-id
+  (let [a (:answer (mcp/begin SSE2 "POST" ACCEPT INIT))
+        names (mapv (fn Str [h: hm/Header] (str (:hd-name h))) (:headers a))]
+    (is (= names ["Content-Type" "Cache-Control" "Pragma" "Access-Control-Allow-Origin" "X-Two" "X-One" "Mcp-Session-Id"]))))
+
+(def IDLE (mcp/->Server "I" "L" "/i" false "Idle" "1.0.0" [] [] [] [] 1000 [] "" []))
+
+(deftest an-idle-session-expires-after-the-session-idle-timeout
+  (let [sid (hv (:answer (mcp/begin IDLE "POST" ACCEPT INIT)) "mcp-session-id")
+        a1 (:status (:answer (mcp/begin IDLE "POST" (with-session sid) PING)))
+        z1 (sleep-ms 300)
+        a2 (:status (:answer (mcp/begin IDLE "POST" (with-session sid) PING)))
+        z2 (sleep-ms 300)
+        a3 (:status (:answer (mcp/begin IDLE "POST" (with-session sid) PING)))
+        z3 (sleep-ms 1300)
+        a4 (:status (:answer (mcp/begin IDLE "POST" (with-session sid) PING)))]
+    (is (= a1 200))
+    (is (= a2 200))
+    (is (= a3 200))
+    (is (= a4 404))))
+
+(defn- seen Map(Str mcp/Seen) []
+  (let [m: Map(Str mcp/Seen) {}]
+    (assoc (assoc (assoc (assoc m "S/a" (mcp/->Seen 100 0)) "S/b" (mcp/->Seen 200 50)) "S/c" (mcp/->Seen 300 0)) "S/d" (mcp/->Seen 400 1000))))
+
+(deftest sessions-past-their-idle-timeout-go
+  (let [none: Map(Str Bool) {}]
+    (is (= (mcp/stale-sessions (seen) none 1000 100) ["S/b"]))))
+
+(deftest over-the-cap-the-least-recently-used-go-but-not-open-sse-streams
+  (let [none: Map(Str Bool) {}
+        live (assoc none "S/a" true)]
+    (is (= (mcp/stale-sessions (seen) none 1000 2) ["S/b" "S/a"]))
+    (is (= (mcp/stale-sessions (seen) live 1000 2) ["S/b" "S/c"]))))
+
+(defn- origin Vec(hm/Header) [o: Str] [(hm/->Header "Origin" o)])
+
+(deftest requests-without-an-origin-or-from-loopback-pass
+  (let [none: Vec(Str) []]
+    (is (mcp/origin-ok? [] none))
+    (is (mcp/origin-ok? (origin "http://localhost:6274") none))
+    (is (mcp/origin-ok? (origin "http://127.0.0.1") none))
+    (is (mcp/origin-ok? (origin "https://127.3.4.5:8443") none))
+    (is (mcp/origin-ok? (origin "http://[::1]:3000") none))
+    (is (mcp/origin-ok? (origin "HTTP://LOCALHOST") none))))
+
+(deftest other-origins-need-the-allow-list
+  (let [none: Vec(Str) []]
+    (is (not (mcp/origin-ok? (origin "http://evil.example") none)))
+    (is (not (mcp/origin-ok? (origin "http://localhost.evil.example") none)))
+    (is (not (mcp/origin-ok? (origin "http://127.0.0.1.evil.example") none)))
+    (is (not (mcp/origin-ok? (origin "null") none)))
+    (is (not (mcp/origin-ok? (origin "http://192.168.1.5:8081") none)))
+    (is (mcp/origin-ok? (origin "https://app.example.com") ["https://app.example.com"]))
+    (is (not (mcp/origin-ok? (origin "https://app.example.com:444") ["https://app.example.com"])))
+    (is (mcp/origin-ok? (origin "http://anything") ["*"]))))
+
+(deftest a-refused-origin-is-a-403
+  (let [a (mcp/origin-refused "http://evil.example")]
+    (is (= (:status a) 403))
+    (is (= (:body a) "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"Origin not allowed: http://evil.example (mulay.mcp.allowedOrigins)\"}}"))))

@@ -1,0 +1,37 @@
+(ns mulay.dw.lib.timer
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.lib.time.tz :as tz] [mulay.lib.time.zoned :as zd]))
+
+(def M "dw::util::Timer")
+
+(defn now-millis Int []
+  (let [[s ns] (tz/now-instant)] (+ (* s 1000) (quot ns 1000000))))
+
+(defn- current-ms Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (rt/ret (v/int-v (now-millis))))
+
+(defn- to-millis Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (match (v/unmeta (nth a 0))
+    (v/VDateTime z) (let [[ms e] (zd/zdt-epoch-milli z)] (if (= e "") (rt/ret (v/int-v ms)) (rt/failure "DateTimeException" e)))
+    _ (rt/failure "InvalidArgs" "toMilliseconds")))
+
+(defn- time-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [start (v/->VDateTime (zd/now-zdt))
+        [r e] (core/call env (core/arg-fn a 0) [])
+        end (v/->VDateTime (zd/now-zdt))]
+    (if (not (dwe/ok? e)) (values r e)
+      (rt/ret (v/->VObj [(v/field "start" start) (v/field "result" r) (v/field "end" end)])))))
+
+(defn- duration Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [t0 (now-millis)
+        [x e] (rt/env-call env (core/arg-fn a 0) [])
+        t1 (now-millis)]
+    (if (not (dwe/ok? e)) (values x e)
+      (rt/ret (v/->VObj [(v/field "time" (v/int-v (- t1 t0))) (v/field "result" x)])))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "currentMilliseconds" [(rt/overload [] current-ms)])
+   (B "toMilliseconds" [(rt/b1 "DateTime" to-millis)])
+   (B "duration" [(rt/b1 "Function" duration)])
+   (B "time" [(rt/b1 "Function" time-fn)])])

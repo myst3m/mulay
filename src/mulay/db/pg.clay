@@ -1,0 +1,421 @@
+(ns mulay.db.pg (:require [mulay.db.sql :as sql] [mulay.lib.host :as host] [clay.postgres :as pg] [clay.tls :as tls] [clay.string :as str]
+                          [mulay.lib.time.tz :as tz] [mulay.lib.time.types :as tt] [mulay.lib.dec :as dec]))
+
+(defn parse-url Values(Str Int Str Vec(Str) Str) [u: &Str]
+  (if (not (str/starts-with? u "//")) (values "" 0 "" [] (str "Invalid PostgreSQL URL: jdbc:postgresql:" u))
+    (let [rest (subs u 2 (count u))
+          q (str/index-of rest "?")
+          main (if (< q 0) rest (subs rest 0 q))
+          query (if (< q 0) "" (subs rest (+ q 1) (count rest)))
+          sl (str/index-of main "/")
+          hostport (if (< sl 0) main (subs main 0 sl))
+          db (if (< sl 0) "" (subs main (+ sl 1) (count main)))
+          co (str/index-of hostport ":")
+          host (if (< co 0) hostport (subs hostport 0 co))
+          port-s (if (< co 0) "5432" (subs hostport (+ co 1) (count hostport)))
+          digits (and (> (count port-s) 0) (loop [i 0] (if (>= i (count port-s)) true (if (and (>= (nth port-s i) 48) (<= (nth port-s i) 57)) (recur (+ i 1)) false))))
+          [port pe] (if digits (parse-long port-s) (values 0 "bad"))
+          kvs (if (= query "") [] (str/split query "&"))]
+      (if (or (not digits) (not= pe "") (> port 65535)) (values "" 0 "" [] (str "Invalid port number: " port-s))
+        (values (if (= host "") "localhost" host) port db kvs "")))))
+
+(defn- has-param? Bool [kvs: &Vec(Str) key: &Str]
+  (loop [i 0]
+    (if (>= i (count kvs)) false
+      (let [kv (nth kvs i) eq (str/index-of kv "=")]
+        (if (or (and (> eq 0) (= (subs kv 0 eq) key)) (= kv key)) true (recur (+ i 1)))))))
+
+(defn- query-param Str [kvs: &Vec(Str) key: &Str]
+  (loop [i 0]
+    (if (>= i (count kvs)) ""
+      (let [kv (nth kvs i) eq (str/index-of kv "=")]
+        (if (and (> eq 0) (= (subs kv 0 eq) key)) (subs kv (+ eq 1) (count kv)) (recur (+ i 1)))))))
+
+(defn ssl-of Values(pg/SslMode tls/Config Str) [kvs: &Vec(Str)]
+  (let [mode (if (has-param? kvs "sslmode") (query-param kvs "sslmode")
+               (if (and (has-param? kvs "ssl") (let [v (query-param kvs "ssl")] (or (= v "") (= (str/lower-case v) "true"))))
+                 "verify-full" "prefer"))
+        factory (query-param kvs "sslfactory")
+        no-verify (= factory "org.postgresql.ssl.NonValidatingFactory")
+        c0 (tls/default-config)
+        none (pg/->SslDisable)]
+    (cond
+      (not (or (= mode "disable") (= mode "allow") (= mode "prefer") (= mode "require") (= mode "verify-ca") (= mode "verify-full")))
+      (values none c0 (str "Invalid sslmode value: " mode))
+      (and (not= factory "") (not no-verify))
+      (values none c0 (str "sslfactory " factory " is not supported by mulay (only org.postgresql.ssl.NonValidatingFactory)"))
+      (or (has-param? kvs "sslcert") (has-param? kvs "sslkey"))
+      (values none c0 "sslcert / sslkey (client certificates) are not supported by mulay")
+      (= mode "disable") (values none (assoc c0 :verify (tls/->VerifyNone)) "")
+      (or no-verify (= mode "allow") (= mode "prefer") (= mode "require"))
+      (values (if (= mode "require") (pg/->SslRequire) (if (or (= mode "allow") (= mode "prefer")) (pg/->SslPrefer) (pg/->SslRequire)))
+              (assoc c0 :verify (tls/->VerifyNone)) "")
+      :else
+      (let [root (query-param kvs "sslrootcert")
+            c1 (if (= mode "verify-ca") (assoc c0 :verify (tls/->VerifyCa)) c0)]
+        (if (= root "") (values (pg/->SslRequire) c1 "")
+          (let [[pem re] (host/file-read root)]
+            (if (not= re "") (values none c0 (str "Could not open SSL root certificate file " root "."))
+              (values (pg/->SslRequire) (assoc c1 :ca pem) ""))))))))
+
+(def PSQL "org.postgresql.util.PSQLException")
+
+(defn- add-field Str [out: Str label: &Str v: &Str] (if (= v "") out (str out "\n  " label ": " v)))
+
+(defn error-text Str [e: &pg/PgError]
+  (let [sev (if (= (:severity e) "") (:severity-v e) (:severity e))
+        head (if (= sev "") (:message e) (str sev ": " (:message e)))
+        o1 (add-field head "Detail" (:detail e))
+        o2 (add-field o1 "Hint" (:hint e))
+        o3 (add-field o2 "Position" (:position e))]
+    (add-field o3 "Where" (:where e))))
+
+(defn- err-of sql/DbErr [f: &pg/Failure]
+  (match f
+    (pg/NoFailure) (sql/ok-err)
+    (pg/Failed e) (sql/->DbErr (error-text e) (if (:broken e) "08006" (:code e)) 0 PSQL)))
+
+(defn open Values(Vec(pg/Conn) sql/DbErr) [url: &Str user0: &Str password0: &Str]
+  (let [[host port db kvs ue] (parse-url url)
+        user (if (= user0 "") (query-param kvs "user") (str user0))
+        password (if (= password0 "") (query-param kvs "password") (str password0))
+        o (pg/opts host port user (if (= db "") user db) password)
+        [ssl tc se] (ssl-of kvs)
+        zone (tt/zone-id (tz/system-zone))
+        o2 (pg/->Opts (:host o) (:port o) (:user o) (:db o) (:password o)
+                      ssl tc (:connect-timeout-ms o) (:read-timeout-ms o)
+                      [(pg/->Setting "client_encoding" "UTF8") (pg/->Setting "DateStyle" "ISO") (pg/->Setting "TimeZone" zone)
+                       (pg/->Setting "extra_float_digits" "3")])]
+    (cond
+      (not= ue "") (values [] (sql/->DbErr ue "08001" 0 PSQL))
+      (not= se "") (values [] (sql/->DbErr se "08001" 0 PSQL))
+      :else
+      (let [[c f] (pg/connect o2)
+            e (connect-err (err-of f))]
+        (if (sql/ok? e) (values [c] e) (values [] e))))))
+
+(defn- connect-err sql/DbErr [e: sql/DbErr]
+  (if (= (:msg e) "FATAL: the server does not support SSL")
+    (sql/->DbErr "The server does not support SSL." "08004" 0 PSQL)
+    e))
+
+(defn batch-err sql/DbErr [i: Int sqltext: &Str e: &sql/DbErr]
+  (sql/->DbErr (str "Batch entry " i " " sqltext " was aborted: " (:msg e) "  Call getNextException to see other errors in the batch.")
+               (:state e) (:code e) "java.sql.BatchUpdateException"))
+
+(defn close Int [c: &pg/Conn] (let [e (pg/close c)] 0))
+
+(defn- hexd Int [c: Int] (cond (<= c 57) (- c 48) (>= c 97) (- c 87) :else (- c 55)))
+
+(defn bytea Str [t: &Str]
+  (if (not (str/starts-with? t "\\x")) (str t)
+    (loop [i 2 out ""]
+      (if (>= (+ i 1) (count t)) out
+        (recur (+ i 2) (str out (chr (+ (* 16 (hexd (nth t i))) (hexd (nth t (+ i 1)))))))))))
+
+(defn timestamp Str [t: &Str with-zone: Bool]
+  (let [n (count t)
+        e (if (not with-zone) n
+            (loop [i (- n 1)] (cond (< i 19) n (or (= (nth t i) 43) (= (nth t i) 45)) i :else (recur (- i 1)))))
+        body (subs t 0 e)
+        sp (str/index-of body " ")]
+    (if (< sp 0) body (str (subs body 0 sp) "T" (subs body (+ sp 1) (count body))))))
+
+(defn- cell-of sql/Cell [oid: Int t: &Str]
+  (cond
+    (or (= oid 21) (= oid 23)) (let [[n e] (parse-long t)] (sql/->CInt n))
+    (or (= oid 20) (= oid 26)) (let [[n e] (parse-long t)] (sql/->CLong n))
+    (= oid 700) (sql/->CFloat t)
+    (= oid 701) (let [[f e] (parse-double t)] (sql/->CDouble f))
+    (= oid 1700) (sql/->CDecimal t)
+    (= oid 16) (sql/->CBool (= t "t"))
+    (= oid 17) (sql/->CBytes (bytea t))
+    (= oid 1082) (sql/->CDate t)
+    (= oid 1114) (sql/->CTimestamp (timestamp t false))
+    (= oid 1184) (sql/->CTimestamp (timestamp t true))
+    :else (sql/->CStr t)))
+
+(defn- rows-of sql/Rows [r: &pg/Result]
+  (let [cols (:columns r)
+        names (loop [i 0 acc: Vec(Str) []] (if (>= i (count cols)) acc (recur (+ i 1) (conj acc (:name (nth cols i))))))
+        rows (loop [j 0 acc: Vec(Vec(sql/Cell)) []]
+               (if (>= j (:nrows r)) acc
+                 (recur (+ j 1)
+                        (conj acc (loop [i 0 row: Vec(sql/Cell) []]
+                                    (if (>= i (count cols)) row
+                                      (let [[cl ce] (pg/cell r j i)]
+                                        (recur (+ i 1) (conj row (match cl
+                                                                   (pg/CellText t) (cell-of (:type-oid (nth cols i)) t)
+                                                                   _ (sql/->CNull)))))))))))]
+    (sql/->Rows names rows)))
+
+(defn- param-of Values(Int pg/Param) [x: &sql/Cell]
+  (match x
+    (sql/CNull) (values 0 (pg/->PNull))
+    (sql/CInt n) (values 23 (pg/->PText (str n)))
+    (sql/CLong n) (values 20 (pg/->PText (str n)))
+    (sql/CDouble f) (values 701 (pg/->PText (dec/float->shortest-str f)))
+    (sql/CFloat s) (values 700 (pg/->PText s))
+    (sql/CDecimal s) (values 1700 (pg/->PText s))
+    (sql/CStr s) (values 1043 (pg/->PText s))
+    (sql/CBytes b) (values 17 (pg/->PBinary b))
+    (sql/CBool b) (values 16 (pg/->PText (if b "t" "f")))
+    (sql/CDate s) (values 1082 (pg/->PText s))
+    (sql/CTimestamp s) (values 1114 (pg/->PText s))
+    (sql/CLdt s) (values 1114 (pg/->PText s))
+    (sql/CBigInt s) (values 1700 (pg/->PText s))
+    (sql/CTime s) (values 1043 (pg/->PText s))
+    (sql/CZoned s) (values 1043 (pg/->PText s))
+    (sql/CDatum c b z) (values 17 (pg/->PBinary b))
+    (sql/CClob s) (values 25 (pg/->PText s))))
+
+(defn number-params Str [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 k 1 out ""]
+      (if (>= i n) out
+        (let [c (nth s i)]
+          (cond
+            (or (= c 39) (= c 34))
+            (let [e (str/index-of-after s (subs s i (+ i 1)) (+ i 1))
+                  j (if (< e 0) n (+ e 1))]
+              (recur j k (str out (subs s i j))))
+            (and (= c 45) (< (+ i 1) n) (= (nth s (+ i 1)) 45))
+            (let [e (str/index-of-after s "\n" i) j (if (< e 0) n e)] (recur j k (str out (subs s i j))))
+            (and (= c 47) (< (+ i 1) n) (= (nth s (+ i 1)) 42))
+            (let [e (str/index-of-after s "*/" (+ i 2)) j (if (< e 0) n (+ e 2))] (recur j k (str out (subs s i j))))
+            (= c 63) (recur (+ i 1) (+ k 1) (str out "$" k))
+            :else (recur (+ i 1) k (str out (subs s i (+ i 1))))))))))
+
+(defn run Values(sql/Outcome sql/DbErr) [c: &pg/Conn text: &Str params: &Vec(sql/Cell) want-keys: Bool key-cols: &Vec(Str)]
+  (let [body (number-params text)
+        q (if want-keys (str body "\nRETURNING " (if (= (count key-cols) 0) "*" (str/join ", " key-cols))) body)
+        [oids ps] (loop [i 0 os: Vec(Int) [] vs: Vec(pg/Param) []]
+                    (if (>= i (count params)) (values os vs)
+                      (let [[o p] (param-of (nth params i))] (recur (+ i 1) (conj os o) (conj vs p)))))
+        [r out] (pg/execute c (pg/->Request q "" oids "" ps [] 0))
+        e (err-of (:failure out))]
+    (if (not (sql/ok? e)) (values (sql/->Outcome (sql/no-rows) 0 (sql/no-rows)) e)
+      (let [select (and (> (count (:columns r)) 0) (not want-keys))]
+        (values (sql/->Outcome (if select (rows-of r) (sql/no-rows))
+                               (if select -1 (match (pg/affected-rows r) (Some n) n (None) 0))
+                               (if want-keys (rows-of r) (sql/no-rows)))
+                e)))))
+
+(defn- java-text Str [x: &sql/Cell]
+  (match x
+    (sql/CNull) ""
+    (sql/CInt n) (str n)
+    (sql/CLong n) (str n)
+    (sql/CDouble f) (dec/float->shortest-str f)
+    (sql/CFloat s) (str s)
+    (sql/CDecimal s) (str s)
+    (sql/CStr s) (str s)
+    (sql/CBytes b) (str b)
+    (sql/CBool b) (if b "true" "false")
+    (sql/CDate s) (str s)
+    (sql/CTimestamp s) (str s)
+    (sql/CLdt s) (str s)
+    (sql/CBigInt s) (str s)
+    (sql/CTime s) (str s)
+    (sql/CZoned s) (str s)
+    (sql/CDatum c b z) (str b)
+    (sql/CClob s) (str s)))
+
+(defn- batch-param pg/Param [x: &sql/Cell]
+  (match x
+    (sql/CNull) (pg/->PNull)
+    (sql/CBytes b) (pg/->PBinary b)
+    (sql/CDatum c b z) (pg/->PBinary b)
+    _ (pg/->PText (java-text x))))
+
+(defn- type-suffix Str [oid: Int]
+  (cond (= oid 21) "::int2" (= oid 23) "::int4" (= oid 20) "::int8" (= oid 700) "::real" (= oid 701) "::double precision"
+        (= oid 1700) "::numeric" (= oid 1082) "::date" (= oid 1114) "::timestamp" (= oid 1184) "::timestamp with time zone"
+        (= oid 1083) "::time" (= oid 1266) "::time with time zone" (= oid 1186) "::interval" (= oid 2950) "::uuid"
+        :else ""))
+
+(defn- render-param Str [x: &sql/Cell oid: Int]
+  (match x
+    (sql/CNull) "(NULL)"
+    _ (str "('" (str/replace (java-text x) "'" "''") "'" (type-suffix oid) ")")))
+
+(defn render-sql Str [q: &Str row: &Vec(sql/Cell) oids: &Vec(Int)]
+  (let [n (count q)]
+    (loop [i 0 out ""]
+      (if (>= i n) out
+        (let [c (nth q i)]
+          (if (and (= c 36) (< (+ i 1) n) (>= (nth q (+ i 1)) 48) (<= (nth q (+ i 1)) 57))
+            (let [j (loop [j (+ i 1)] (if (and (< j n) (>= (nth q j) 48) (<= (nth q j) 57)) (recur (+ j 1)) j))
+                  [k ke] (parse-long (subs q (+ i 1) j))
+                  idx (- k 1)]
+              (if (and (>= idx 0) (< idx (count row)))
+                (recur j (str out (render-param (nth row idx) (if (< idx (count oids)) (nth oids idx) 0))))
+                (recur j (str out (subs q i j)))))
+            (recur (+ i 1) (str out (subs q i (+ i 1))))))))))
+
+(defn batch-segments Vec(Int) [n: Int]
+  (loop [end 255 acc: Vec(Int) []]
+    (if (>= end n) (if (> n 0) (conj acc n) acc)
+      (recur (+ end 256) (conj acc end)))))
+
+(defn run-batch Values(Vec(Int) sql/DbErr) [c: &pg/Conn text: &Str rows: &Vec(Vec(sql/Cell))]
+  (if (= (count rows) 0) (values [] (sql/ok-err))
+    (let [q (number-params text)
+          np (count (nth rows 0))
+          zeros (loop [i 0 acc: Vec(Int) []] (if (>= i np) acc (recur (+ i 1) (conj acc 0))))
+          [pr pout] (pg/prepare c "" q zeros)
+          pe (err-of (:failure pout))
+          typed (loop [i 0 acc: Vec(Int) []] (if (>= i np) acc (recur (+ i 1) (let [[o p] (param-of (nth (nth rows 0) i))] (conj acc o)))))]
+      (if (not (sql/ok? pe))
+        (if (= (:state pe) "08006") (values [] pe)
+          (values [] (batch-err 0 (render-sql q (nth rows 0) typed) pe)))
+        (let [oids (:param-oids pr)
+              ends (batch-segments (count rows))]
+          (loop [k 0 from 0 counts: Vec(Int) []]
+            (if (>= k (count ends)) (values counts (sql/ok-err))
+              (let [to (nth ends k)
+                    ps (loop [i from acc: Vec(Vec(pg/Param)) []]
+                         (if (>= i to) acc
+                           (recur (+ i 1) (conj acc (loop [j 0 r: Vec(pg/Param) []]
+                                                      (if (>= j (count (nth rows i))) r (recur (+ j 1) (conj r (batch-param (nth (nth rows i) j))))))))))
+                    [rs oids2 out] (pg/execute-batch c q oids ps)
+                    e (err-of (:failure out))
+                    counts2 (loop [i 0 acc counts]
+                              (if (>= i (count rs)) acc (recur (+ i 1) (conj acc (match (pg/affected-rows (nth rs i)) (Some n) n (None) 0)))))]
+                (cond
+                  (sql/ok? e) (recur (+ k 1) to counts2)
+                  (= (:state e) "08006") (values [] e)
+                  :else (let [i (+ from (count rs))]
+                          (values [] (batch-err i (render-sql q (nth rows (if (< i (count rows)) i 0)) oids) e))))))))))))
+
+(defn- result-count Int [r: &pg/Result]
+  (if (> (count (:columns r)) 0) -1 (match (pg/affected-rows r) (Some n) n (None) 0)))
+
+(defn- letter? Bool [c: Int] (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (= c 95) (>= c 128)))
+
+(defn- ident-cont? Bool [c: Int] (or (letter? c) (and (>= c 48) (<= c 57)) (= c 36)))
+
+(defn- skip-quoted Int [s: &Str i: Int q: Int esc: Bool]
+  (let [n (count s)]
+    (loop [j (+ i 1)]
+      (cond (>= j n) n
+            (and esc (= (nth s j) 92)) (recur (+ j 2))
+            (= (nth s j) q) (if (and (< (+ j 1) n) (= (nth s (+ j 1)) q)) (recur (+ j 2)) (+ j 1))
+            :else (recur (+ j 1))))))
+
+(defn- skip-line Int [s: &Str i: Int]
+  (let [k (str/index-of-after s "\n" i)] (if (< k 0) (count s) (+ k 1))))
+
+(defn- skip-block Int [s: &Str i: Int]
+  (let [n (count s)]
+    (loop [j (+ i 2) depth 1]
+      (cond (= depth 0) j
+            (>= (+ j 1) n) n
+            (and (= (nth s j) 47) (= (nth s (+ j 1)) 42)) (recur (+ j 2) (+ depth 1))
+            (and (= (nth s j) 42) (= (nth s (+ j 1)) 47)) (recur (+ j 2) (- depth 1))
+            :else (recur (+ j 1) depth)))))
+
+(defn- skip-dollar Int [s: &Str i: Int]
+  (let [n (count s)
+        e (if (and (< (+ i 1) n) (= (nth s (+ i 1)) 36)) (+ i 1)
+            (if (and (< (+ i 1) n) (letter? (nth s (+ i 1))))
+              (loop [j (+ i 2)] (cond (>= j n) -1 (= (nth s j) 36) j (ident-cont? (nth s j)) (recur (+ j 1)) :else -1))
+              -1))]
+    (if (< e 0) (+ i 1)
+      (let [tag (subs s i (+ e 1))
+            k (str/index-of-after s tag (+ e 1))]
+        (if (< k 0) n (+ k (count tag)))))))
+
+(defn- add-frag Vec(Str) [acc: Vec(Str) s: &Str a: Int b: Int]
+  (let [f (subs s a b)] (if (= (str/trim f) "") acc (conj acc f))))
+
+(defn native-stmts Vec(Str) [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 start 0 acc: Vec(Str) []]
+      (if (>= i n) (add-frag acc s start n)
+        (let [c (nth s i)]
+          (cond
+            (= c 39) (recur (skip-quoted s i 39 (and (> i 0) (or (= (nth s (- i 1)) 69) (= (nth s (- i 1)) 101))
+                                                     (or (= i 1) (not (ident-cont? (nth s (- i 2))))))) start acc)
+            (= c 34) (recur (skip-quoted s i 34 false) start acc)
+            (and (= c 45) (< (+ i 1) n) (= (nth s (+ i 1)) 45)) (recur (skip-line s i) start acc)
+            (and (= c 47) (< (+ i 1) n) (= (nth s (+ i 1)) 42)) (recur (skip-block s i) start acc)
+            (and (= c 36) (or (= i 0) (not (ident-cont? (nth s (- i 1)))))) (recur (skip-dollar s i) start acc)
+            (= c 59) (recur (+ i 1) (+ i 1) (add-frag acc s start i))
+            :else (recur (+ i 1) start acc)))))))
+
+(defn- script-requests Vec(pg/Request) [sqls: &Vec(Str) from: Int to: Int]
+  (loop [i from acc: Vec(pg/Request) []]
+    (if (>= i to) acc (recur (+ i 1) (conj acc (pg/request (number-params (nth sqls i)) []))))))
+
+(defn- one-stmt Str [s: &Str]
+  (let [t (str/trim s) ns (native-stmts t)] (if (= (count ns) 1) (nth ns 0) t)))
+
+(defn- one-stmts Vec(Str) [xs: &Vec(Str)]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (one-stmt (nth xs i)))))))
+
+(defn run-script Values(Vec(Int) sql/DbErr) [c: &pg/Conn sqls0: &Vec(Str) texts0: &Vec(Str)]
+  (let [sqls (one-stmts sqls0)
+        texts (one-stmts texts0)
+        ends (batch-segments (count sqls))]
+    (loop [k 0 from 0 acc: Vec(Int) []]
+      (if (>= k (count ends)) (values acc (sql/ok-err))
+        (let [to (nth ends k)
+              reqs (script-requests sqls from to)
+              [results out] (pg/execute-pipeline c reqs)
+              e (err-of (:failure out))
+              acc2 (loop [i 0 a acc] (if (>= i (count results)) a (recur (+ i 1) (conj a (result-count (nth results i))))))]
+          (cond
+            (sql/ok? e) (recur (+ k 1) to acc2)
+            (= (:state e) "08006") (values acc2 e)
+            :else (let [i (+ from (count results))]
+                    (values acc2 (batch-err i (nth texts (if (< i (count texts)) i (- (count texts) 1))) e)))))))))
+
+(defn call-sql Values(Str Vec(Int)) [sql0: &Str dirs: &Vec(Int)]
+  (let [s (str/trim sql0)
+        all (loop [i 0 acc: Vec(Int) []] (if (>= i (count dirs)) acc (recur (+ i 1) (conj acc i))))]
+    (if (not (and (str/starts-with? s "{") (str/ends-with? s "}")))
+      (values (number-params s) all)
+      (let [inner (subs s 1 (- (count s) 1))
+            i0 (skip-ws inner 0)
+            ret (and (< i0 (count inner)) (= (nth inner i0) 63))
+            eq (if ret (skip-ws inner (+ i0 1)) i0)
+            i1 (if (and ret (< eq (count inner)) (= (nth inner eq) 61)) (skip-ws inner (+ eq 1)) i0)
+            i2 (if (and (<= (+ i1 4) (count inner)) (= (str/upper-case (subs inner i1 (+ i1 4))) "CALL")) (+ i1 4) i1)
+            tail (subs inner i2 (count inner))
+            op (str/index-of tail "(")
+            tail2 (cond
+                    (< op 0) (str (str/trimr tail) (if ret "(?)" "()"))
+                    (not ret) tail
+                    :else (let [after (subs tail (+ op 1) (count tail))
+                                cp (str/index-of after ")")
+                                empty (and (>= cp 0) (= (str/trim (subs after 0 cp)) ""))]
+                            (str (subs tail 0 (+ op 1)) (if empty "?" "?,") after)))]
+        (values (number-params (str "select * from" tail2 " as result")) all)))))
+
+(defn- skip-ws Int [s: &Str i: Int]
+  (loop [k i] (if (and (< k (count s)) (let [ch (nth s k)] (or (= ch 32) (= ch 9) (= ch 10) (= ch 13)))) (recur (+ k 1)) k)))
+
+(def VOID-OID 2278)
+
+(defn call-proc Values(sql/SpResult sql/DbErr) [c: &pg/Conn text: &Str params: &Vec(sql/SpParam)]
+  (let [dirs (loop [i 0 acc: Vec(Int) []] (if (>= i (count params)) acc (recur (+ i 1) (conj acc (:dir (nth params i))))))
+        [q sent] (call-sql text dirs)
+        [oids ps] (loop [i 0 os: Vec(Int) [] vs: Vec(pg/Param) []]
+                    (if (>= i (count sent)) (values os vs)
+                      (let [sp (nth params (nth sent i))
+                            [o p] (if (= (:dir sp) sql/OUT) (values VOID-OID (pg/->PNull)) (param-of (:value sp)))]
+                        (recur (+ i 1) (conj os o) (conj vs p)))))
+        [r out] (pg/execute c (pg/->Request q "" oids "" ps [] 0))
+        e (err-of (:failure out))
+        outs (loop [i 0 acc: Vec(Int) []] (if (>= i (count params)) acc (recur (+ i 1) (if (= (:dir (nth params i)) sql/IN) acc (conj acc i)))))]
+    (cond
+      (not (sql/ok? e)) (values (sql/no-sp) e)
+      (= (count outs) 0) (values (sql/->SpResult [(rows-of r)] [] [] []) e)
+      :else
+      (let [rows (rows-of r)
+            row (if (> (count (:rows rows)) 0) (nth (:rows rows) 0) [])]
+        (loop [k 0 names: Vec(Str) [] vs: Vec(sql/SpVal) []]
+          (if (>= k (count outs)) (values (sql/->SpResult [] [] names vs) e)
+            (recur (+ k 1) (conj names (:name (nth params (nth outs k))))
+                   (conj vs (sql/->SpCell (if (< k (count row)) (nth row k) (sql/->CNull)))))))))))

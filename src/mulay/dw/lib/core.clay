@@ -1,0 +1,231 @@
+(ns mulay.dw.lib.core
+  (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.lib.uni :as uni]
+            [clay.string :as str] [mulay.lib.time.types :as tt] [mulay.lib.time.local :as tl]
+            [mulay.lib.time.zoned :as tz] [mulay.lib.time.amount :as tam]))
+
+(def M "dw::Core")
+
+(defn arg-num num/Num [args: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth args i)) (v/VNum n) n (v/VInt n-i) (num/from-int n-i) _ (num/from-int 0)))
+(defn arg-str Str [args: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth args i)) (v/VStr s) s (v/VKey k) (:name k) _ ""))
+(defn arg-bool Bool [args: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth args i)) (v/VBool b) b _ false))
+(defn arg-items Vec(v/Val) [args: &Vec(v/Val) i: Int] (v/items (v/unmeta (nth args i))))
+(defn arg-fields Vec(v/Field) [args: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth args i)) (v/VObj fs) fs _ []))
+(defn arg-fn v/FnV [args: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth args i)) (v/VFn f) f _ (v/->FnV 0 [] (->None) 0)))
+
+(defn nv v/Val [n: num/Num] (v/num-v n))
+(defn ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+
+(defn call Values(v/Val dwe/DwErr) [env: &rt/Env f: &v/FnV args: Vec(v/Val)]
+  (rt/env-call env f args))
+
+(defn- add-nn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (arith 1 (arg-num a 0) (arg-num a 1)))
+(defn- sub-nn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (arith 2 (arg-num a 0) (arg-num a 1)))
+(defn- mul-nn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (arith 3 (arg-num a 0) (arg-num a 1)))
+
+(defn arith-num Values(num/Num dwe/DwErr) [op: Int x: &num/Num y: &num/Num]
+  (let [[r e] (cond (= op 1) (num/add x y) (= op 2) (num/sub x y) :else (num/mul x y))]
+    (if (= e "") (values r (dwe/ok)) (values r (dwe/err "ArithmeticException" (num/op-error op x y e))))))
+
+(defn arith Values(v/Val dwe/DwErr) [op: Int x: &num/Num y: &num/Num]
+  (let [[r e] (arith-num op x y)] (if (dwe/ok? e) (ok (nv r)) (values (v/null-v) e))))
+(defn- div-nn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[q e] (num/div (arg-num a 0) (arg-num a 1))]
+    (if (= e "") (ok (nv q)) (rt/failure (rt/arith-kind e) e))))
+(defn- mod-nn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[q e] (num/rem-num (arg-num a 0) (arg-num a 1))]
+    (if (= e "") (ok (nv q)) (rt/failure (rt/arith-kind e) e))))
+(defn- neg-n Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (nv (num/neg (arg-num a 0)))))
+
+(defn- add-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/->VArr (conj (arg-items a 0) (nth a 1)))))
+(defn- sub-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (arg-items a 0) y (nth a 1)]
+    (ok (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (if (v/equal? (nth xs i) y) acc (conj acc (nth xs i))))))))))
+(defn- sub-obj Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (arg-fields a 0) k (arg-str a 1)]
+    (ok (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count fs)) acc (recur (+ i 1) (if (= (:name (:key (nth fs i))) k) acc (conj acc (nth fs i))))))))))
+
+(defn- cat-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [ys (arg-items a 1)]
+    (ok (v/->VArr (loop [acc (arg-items a 0) i 0] (if (>= i (count ys)) acc (recur (conj acc (nth ys i)) (+ i 1))))))))
+(defn- cat-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (let [x (arg-str a 0)] (ok (v/->VStr (str x (arg-str a 1))))))
+(defn- cat-obj Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [gs (arg-fields a 1)]
+    (ok (v/->VObj (loop [acc (arg-fields a 0) i 0] (if (>= i (count gs)) acc (recur (conj acc (nth gs i)) (+ i 1))))))))
+
+(defn- prepend Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (arg-items a 1)] (ok (v/->VArr (loop [acc: Vec(v/Val) [(nth a 0)] i 0] (if (>= i (count xs)) acc (recur (conj acc (nth xs i)) (+ i 1))))))))
+(defn- append Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/->VArr (conj (arg-items a 0) (nth a 1)))))
+
+(defn- dterr Values(v/Val dwe/DwErr) [e: Str] (rt/failure "DateTimeException" e))
+(defn- arg-period tt/DwPeriod [a: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth a i)) (v/VPeriod p) p _ (tt/->PerDate (tam/period 0 0 0))))
+
+(defn- add-period Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [p (arg-period a 1)]
+    (match (v/unmeta (nth a 0))
+      (v/VDate d) (match p
+                    (tt/PerDate q) (let [[r e] (tl/date-plus-period d q)] (if (= e "") (ok (v/->VDate r)) (dterr e)))
+                    (tt/PerTime du) (let [[r e] (tl/date-plus-duration d du)] (if (= e "") (ok (v/->VDate r)) (dterr e))))
+      (v/VDateTime z) (let [[r e] (tz/zdt-plus-dw z p)] (if (= e "") (ok (v/->VDateTime r)) (dterr e)))
+      (v/VLocalDateTime x) (let [[r e] (tl/ldt-plus-dw x p)] (if (= e "") (ok (v/->VLocalDateTime r)) (dterr e)))
+      (v/VLocalTime t) (match p
+                         (tt/PerTime du) (ok (v/->VLocalTime (tl/time-plus-duration t du)))
+                         (tt/PerDate q) (let [[r e] (tl/time-plus-period t q)] (if (= e "") (ok (v/->VLocalTime r)) (dterr e))))
+      (v/VTime o) (match p
+                    (tt/PerTime du) (ok (v/->VTime (tz/ot-plus-duration o du)))
+                    _ (ok (v/->VTime o)))
+      _ (rt/failure "InvalidArgs" "+"))))
+
+(defn- neg-period tt/DwPeriod [p: &tt/DwPeriod]
+  (match p
+    (tt/PerDate q) (tt/->PerDate (tam/period-negated q))
+    (tt/PerTime d) (tt/->PerTime (tam/duration-negated d))))
+
+(defn- sub-period Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (add-period env [(nth a 0) (v/->VPeriod (neg-period (arg-period a 1)))]))
+
+(defn- sub-temporal Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [x (v/unmeta (nth a 0)) y (v/unmeta (nth a 1))]
+    (match x
+      (v/VDate d) (match y
+                    (v/VDate e) (ok (v/->VPeriod (tt/->PerTime (tam/duration-of-days (- (tl/date-epoch-day d) (tl/date-epoch-day e))))))
+                    _ (rt/failure "InvalidArgs" "-"))
+      (v/VDateTime z) (match y (v/VDateTime w) (ok (v/->VPeriod (tt/->PerTime (tz/duration-between-zdts w z)))) _ (rt/failure "InvalidArgs" "-"))
+      (v/VLocalDateTime p) (match y (v/VLocalDateTime q) (ok (v/->VPeriod (tt/->PerTime (tl/duration-between-ldts q p)))) _ (rt/failure "InvalidArgs" "-"))
+      (v/VLocalTime p) (match y (v/VLocalTime q) (ok (v/->VPeriod (tt/->PerTime (tl/duration-between-times q p)))) _ (rt/failure "InvalidArgs" "-"))
+      (v/VTime p) (match y (v/VTime q) (ok (v/->VPeriod (tt/->PerTime (tz/duration-between-ots q p)))) _ (rt/failure "InvalidArgs" "-"))
+      _ (rt/failure "InvalidArgs" "-"))))
+
+(defn- cat-temporal Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [x (v/unmeta (nth a 0)) y (v/unmeta (nth a 1))]
+    (match x
+      (v/VDate d) (match y
+                    (v/VLocalTime t) (ok (v/->VLocalDateTime (tl/ldt d t)))
+                    (v/VTime o) (ok (v/->VDateTime (tz/zdt-of-offset (tl/ldt d (:time o)) (:offset o))))
+                    _ (rt/failure "InvalidArgs" "++"))
+      (v/VLocalTime t) (match y (v/VDate d) (ok (v/->VLocalDateTime (tl/ldt d t))) _ (rt/failure "InvalidArgs" "++"))
+      (v/VTime o) (match y (v/VDate d) (ok (v/->VDateTime (tz/zdt-of-offset (tl/ldt d (:time o)) (:offset o)))) _ (rt/failure "InvalidArgs" "++"))
+      (v/VLocalDateTime p) (match y (v/VTimeZone z) (ok (v/->VDateTime (tz/zdt-of-local p z []))) _ (rt/failure "InvalidArgs" "++"))
+      _ (rt/failure "InvalidArgs" "++"))))
+
+(defn- cmp-vals Values(Int Bool) [x0: &v/Val y0: &v/Val]
+  (let [x (v/unmeta x0) y (v/unmeta y0)]
+    (match x
+      (v/VNum a) (if (v/num-val? y) (values (num/cmp a (v/num-of y)) true) (values 0 false))
+      (v/VInt a) (if (v/num-val? y) (values (num/cmp (num/from-int a) (v/num-of y)) true) (values 0 false))
+      (v/VStr a) (match y (v/VStr b) (values (str-cmp a b) true) _ (values 0 false))
+      (v/VBool a) (match y (v/VBool b) (values (if (= a b) 0 (if a 1 -1)) true) _ (values 0 false))
+      (v/VDate a) (match y (v/VDate b) (values (tl/date-compare a b) true) _ (values 0 false))
+      (v/VDateTime a) (match y (v/VDateTime b) (values (tz/zdt-instant-compare a b) true) _ (values 0 false))
+      (v/VLocalDateTime a) (match y (v/VLocalDateTime b) (values (tl/ldt-compare a b) true) _ (values 0 false))
+      (v/VLocalTime a) (match y (v/VLocalTime b) (values (tl/time-compare a b) true) _ (values 0 false))
+      (v/VTime a) (match y (v/VTime b) (values (tz/ot-compare a b) true) _ (values 0 false))
+      _ (values 0 false))))
+
+(defn str-cmp Int [a: &Str b: &Str]
+  (let [n (min (count a) (count b))]
+    (loop [i 0]
+      (if (>= i n) (if (< (count a) (count b)) -1 (if (> (count a) (count b)) 1 0))
+        (let [c (nth a i) d (nth b i)]
+          (if (< c d) -1 (if (> c d) 1 (recur (+ i 1)))))))))
+
+(defn- rel-coerce Values(v/Val v/Val dwe/DwErr) [env: &rt/Env x: &v/Val y: &v/Val]
+  (let [xs (match (v/unmeta x) (v/VStr s) true _ false)
+        ys (match (v/unmeta y) (v/VStr s) true _ false)]
+    (cond (and xs (not ys)) (let [[x2 e] (rt/env-coerce env x (v/type-name (v/unmeta y)))] (values x2 y e))
+          (and ys (not xs)) (let [[y2 e] (rt/env-coerce env y (v/type-name (v/unmeta x)))] (values x y2 e))
+          :else (values x y (dwe/ok)))))
+
+(defn- rel Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [op: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a0: Vec(v/Val)]
+    (let [[x y ce] (rel-coerce env (nth a0 0) (nth a0 1))
+          a: Vec(v/Val) [x y]
+          [c ok2] (cmp-vals x y)]
+     (if (not (dwe/ok? ce)) (values (v/null-v) ce)
+      (if (not ok2)
+        (let [ta (v/type-name (v/unmeta (nth a 0))) tb (v/type-name (v/unmeta (nth a 1)))]
+          (rt/failure "InvalidComparison" (if (not= ta tb) (str "Types `" ta "` and `" tb "` can not be compared.")
+                                         (str "You cannot compare a value of type :" ta))))
+        (ok (v/bool-v (if (= op "<") (< c 0) (if (= op ">") (> c 0) (if (= op "<=") (<= c 0) (>= c 0)))))))))))
+
+(defn- eq-any Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/bool-v (v/equal? (nth a 0) (nth a 1)))))
+(defn- neq-any Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/bool-v (not (v/equal? (nth a 0) (nth a 1))))))
+(defn sim-equal? Bool [x0: &v/Val y0: &v/Val]
+  (if (v/equal? x0 y0) true
+    (let [x (v/unmeta x0) y (v/unmeta y0)]
+      (match x
+        (v/VArr xs) (match y
+                      (v/VArr ys) (and (= (count xs) (count ys))
+                                       (loop [i 0] (if (>= i (count xs)) true (if (sim-equal? (nth xs i) (nth ys i)) (recur (+ i 1)) false))))
+                      _ false)
+        (v/VObj fs) (match y
+                      (v/VObj gs) (and (= (count fs) (count gs))
+                                       (loop [i 0] (if (>= i (count fs)) true
+                                                     (if (and (= (:name (:key (nth fs i))) (:name (:key (nth gs i))))
+                                                              (sim-equal? (:value (nth fs i)) (:value (nth gs i))))
+                                                       (recur (+ i 1)) false))))
+                      _ false)
+        _ (let [[s e] (rt/to-text x) [t e2] (rt/to-text y)] (and (dwe/ok? e) (dwe/ok? e2) (= s t)))))))
+
+(defn- sim-eq Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/bool-v (sim-equal? (nth a 0) (nth a 1)))))
+
+(defn- to-range Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[x e1] (num/to-int (arg-num a 0)) [y e2] (num/to-int (arg-num a 1))]
+    (if (and (= e1 "") (= e2 "")) (ok (v/->VRange x y)) (rt/failure "InvalidRange" "Range bounds must be integers"))))
+
+(defn- size-of Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (match (v/unmeta (nth a 0))
+    (v/VArr xs) (ok (v/int-v (count xs)))
+    (v/VSeq q) (let [nx ((:open q) 0)]
+                 (loop [n 0] (let [[x done e] (nx 0)] (cond (not (dwe/ok? e)) (values (v/null-v) e) done (ok (v/int-v n)) :else (recur (+ n 1))))))
+    (v/VRange x y) (ok (v/num-v (v/range-count x y)))
+    (v/VObj fs) (ok (v/int-v (count fs)))
+    (v/VStr s) (ok (v/int-v (u8/codepoint-count s)))
+    (v/VBin b) (ok (v/int-v (count b)))
+    _ (rt/failure "InvalidArgs" "sizeOf")))
+
+(defn- upper-s Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/->VStr (uni/upper (arg-str a 0)))))
+(defn- lower-s Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/->VStr (uni/lower (arg-str a 0)))))
+(defn- null-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/null-v)))
+
+(defn- type-of Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (ok (v/->VType (v/->TypeV "name" (v/type-name (v/unmeta (nth a 0))) [] [] [] []))))
+
+(defn- fail-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (rt/failure "UserException" (arg-str a 0)))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "+" [(rt/b2 "Number" "Number" add-nn) (rt/b2 "Array" "Any" add-arr)
+           (rt/b2 "Date" "Period" add-period) (rt/b2 "DateTime" "Period" add-period) (rt/b2 "LocalDateTime" "Period" add-period)
+           (rt/b2 "LocalTime" "Period" add-period) (rt/b2 "Time" "Period" add-period)])
+   (B "-" [(rt/b2 "Number" "Number" sub-nn) (rt/b1 "Number" neg-n) (rt/b2 "Array" "Any" sub-arr) (rt/b2 "Object" "String" sub-obj) (rt/b2 "Object" "Key" sub-obj)
+           (rt/b2 "Date" "Period" sub-period) (rt/b2 "DateTime" "Period" sub-period) (rt/b2 "LocalDateTime" "Period" sub-period)
+           (rt/b2 "LocalTime" "Period" sub-period) (rt/b2 "Time" "Period" sub-period)
+           (rt/b2 "Date" "Date" sub-temporal) (rt/b2 "DateTime" "DateTime" sub-temporal) (rt/b2 "LocalDateTime" "LocalDateTime" sub-temporal)
+           (rt/b2 "LocalTime" "LocalTime" sub-temporal) (rt/b2 "Time" "Time" sub-temporal)])
+   (B "*" [(rt/b2 "Number" "Number" mul-nn)])
+   (B "/" [(rt/b2 "Number" "Number" div-nn)])
+   (B "mod" [(rt/b2 "Number" "Number" mod-nn)])
+   (B "++" [(rt/b2 "Array" "Array" cat-arr) (rt/b2 "String" "String" cat-str) (rt/b2 "Object" "Object" cat-obj)
+            (rt/b2 "Date" "LocalTime" cat-temporal) (rt/b2 "LocalTime" "Date" cat-temporal) (rt/b2 "Date" "Time" cat-temporal)
+            (rt/b2 "Time" "Date" cat-temporal) (rt/b2 "LocalDateTime" "TimeZone" cat-temporal)])
+   (B "==" [(rt/b2 "Any" "Any" eq-any)])
+   (B "!=" [(rt/b2 "Any" "Any" neq-any)])
+   (B "~=" [(rt/b2 "Any" "Any" sim-eq)])
+   (B "<" [(rt/b2 "Any" "Any" (rel "<"))])
+   (B ">" [(rt/b2 "Any" "Any" (rel ">"))])
+   (B "<=" [(rt/b2 "Any" "Any" (rel "<="))])
+   (B ">=" [(rt/b2 "Any" "Any" (rel ">="))])
+   (B "to" [(rt/b2 "Number" "Number" to-range)])
+   (B "sizeOf" [(rt/overload-seq ["Array"] size-of) (rt/b1 "Object" size-of) (rt/b1 "Binary" size-of) (rt/b1 "String" size-of) (rt/b1 "Null" null-fn)])
+   (B ">>" [(rt/b2 "Any" "Array" prepend)])
+   (B "<<" [(rt/b2 "Array" "Any" append)])
+   (B "upper" [(rt/b1 "String" upper-s) (rt/b1 "Null" null-fn)])
+   (B "lower" [(rt/b1 "String" lower-s) (rt/b1 "Null" null-fn)])
+   (B "typeOf" [(rt/b1 "Any" type-of)])])

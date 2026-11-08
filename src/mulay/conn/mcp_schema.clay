@@ -1,0 +1,170 @@
+(ns mulay.conn.mcp_schema
+  (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.lib.regex :as rx] [mulay.lib.uni :as uni] [clay.string :as str]))
+
+(defn- cat Vec(Str) [a: Vec(Str) b: Vec(Str)] (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- esc-key Str [k: &Str] (str/replace (str/replace k "~" "~0") "/" "~1"))
+
+(defn- field-of Vec(v/Val) [fs: &Vec(v/Field) k: &Str] (v/obj-get fs k))
+
+(defn- obj-fields Vec(v/Field) [x: &v/Val] (match (v/unmeta x) (v/VObj fs) fs _ (let [e: Vec(v/Field) []] e)))
+
+(defn- str-of Str [x: &v/Val] (match (v/unmeta x) (v/VStr s) (str s) _ ""))
+
+(defn found-name Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VNull) "null"
+    (v/VBool b) "boolean"
+    (v/VInt i) "integer"
+    (v/VNum n) (if (num-integral? n) "integer" "number")
+    (v/VStr s) "string"
+    (v/VArr xs) "array"
+    (v/VObj fs) "object"
+    _ "string"))
+
+(defn- num-integral? Bool [n: &num/Num]
+  (match n
+    (num/NInt i) true
+    _ (let [t (num/to-string n)] (not (str/includes? t ".")))))
+
+(defn- type-ok? Bool [t: &Str x: &v/Val]
+  (let [f (found-name x)]
+    (cond (= t "number") (or (= f "integer") (= f "number"))
+          :else (= t f))))
+
+(defn- type-names Vec(Str) [s: &v/Val]
+  (match (v/unmeta s)
+    (v/VStr t) [(str t)]
+    (v/VArr xs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (str-of (nth xs i))))))
+    _ (let [e: Vec(Str) []] e)))
+
+(defn- join-with Str [xs: &Vec(Str) sep: &Str]
+  (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (if (= i 0) (str (nth xs i)) (str out sep (nth xs i)))))))
+
+(defn- jstr Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1)
+               (cond (= c 34) (str out "\\\"") (= c 92) (str out "\\\\") (= c 10) (str out "\\n") (= c 9) (str out "\\t") (= c 13) (str out "\\r")
+                     :else (str out (subs s i (+ i 1)))))))))
+
+(defn- show Str [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VNull) "null"
+    (v/VBool b) (if b "true" "false")
+    (v/VInt i) (str i)
+    (v/VNum n) (num/to-string n)
+    (v/VStr s) (jstr s)
+    (v/VArr xs) (str "[" (join-with (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (show (nth xs i)))))) ", ") "]")
+    _ ""))
+
+(defn- same? Bool [a: &v/Val b: &v/Val]
+  (match (v/unmeta a)
+    (v/VStr x) (match (v/unmeta b) (v/VStr y) (= x y) _ false)
+    (v/VBool x) (match (v/unmeta b) (v/VBool y) (= x y) _ false)
+    (v/VNull) (v/null? b)
+    _ (if (and (v/num-val? a) (v/num-val? b)) (= (num/cmp (v/num-of a) (v/num-of b)) 0) false)))
+
+(defn- msg Vec(Str) [ptr: &Str m: Str] [(str ptr ": " m)])
+
+(defn- num-text Str [x: &v/Val] (match (v/unmeta x) (v/VInt i) (str i) (v/VNum n) (num/to-string n) _ ""))
+
+(defn- cps Int [s: &Str] (u8/codepoint-count s))
+
+(defn- kw-type Vec(Str) [ptr: &Str kv: &v/Val x: &v/Val]
+  (let [ts (type-names kv)]
+    (if (or (= (count ts) 0) (loop [i 0] (if (>= i (count ts)) false (if (type-ok? (nth ts i) x) true (recur (+ i 1))))))
+      []
+      (msg ptr (str (found-name x) " found, " (if (= (count ts) 1) (nth ts 0) (str "[" (join-with ts ", ") "]")) " expected")))))
+
+(defn- kw-enum Vec(Str) [ptr: &Str kv: &v/Val x: &v/Val]
+  (match (v/unmeta kv)
+    (v/VArr xs) (if (loop [i 0] (if (>= i (count xs)) false (if (same? (nth xs i) x) true (recur (+ i 1)))))
+                  []
+                  (msg ptr (str "does not have a value in the enumeration " (show kv))))
+    _ []))
+
+(defn- kw-bound Vec(Str) [ptr: &Str kv: &v/Val x: &v/Val max: Bool]
+  (if (not (and (v/num-val? kv) (v/num-val? x))) []
+    (let [c (num/cmp (v/num-of x) (v/num-of kv))]
+      (if (if max (> c 0) (< c 0))
+        (msg ptr (str "must have a " (if max "maximum" "minimum") " value of " (num-text kv)))
+        []))))
+
+(defn- int-of Int [x: &v/Val] (match (v/unmeta x) (v/VInt i) i _ 0))
+
+(defn- kw-length Vec(Str) [ptr: &Str kv: &v/Val s: &Str max: Bool]
+  (let [n (cps s) lim (int-of kv)]
+    (if (if max (> n lim) (< n lim))
+      (msg ptr (str "must be at " (if max "most" "least") " " lim " characters long"))
+      [])))
+
+(defn- kw-pattern Vec(Str) [ptr: &Str kv: &v/Val s: &Str]
+  (let [p (str-of kv) [re e] (rx/compile p 0)]
+    (if (not= e "") []
+      (let [[ms me] (rx/search re s 0)]
+        (if (or (not= me "") (> (count ms) 0)) [] (msg ptr (str "does not match the regex pattern " p)))))))
+
+(defn- kw-items-count Vec(Str) [ptr: &Str kv: &v/Val xs: &Vec(v/Val) max: Bool]
+  (let [lim (int-of kv) n (count xs)]
+    (if (if max (> n lim) (< n lim))
+      (msg ptr (str "must have at " (if max "most" "least") " " lim " items but found " n))
+      [])))
+
+(defn validate Vec(Str) [schema: &v/Val x: &v/Val] (check schema x ""))
+
+(defn- check Vec(Str) [schema: &v/Val x: &v/Val ptr: &Str]
+  (let [fs (obj-fields schema)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count fs)) acc
+        (let [k (:name (:key (nth fs i)))
+              kv (:value (nth fs i))
+              r (cond
+                  (= k "type") (kw-type ptr kv x)
+                  (= k "enum") (kw-enum ptr kv x)
+                  (= k "minimum") (kw-bound ptr kv x false)
+                  (= k "maximum") (kw-bound ptr kv x true)
+                  (= k "minLength") (match (v/unmeta x) (v/VStr s) (kw-length ptr kv s false) _ [])
+                  (= k "maxLength") (match (v/unmeta x) (v/VStr s) (kw-length ptr kv s true) _ [])
+                  (= k "pattern") (match (v/unmeta x) (v/VStr s) (kw-pattern ptr kv s) _ [])
+                  (= k "minItems") (match (v/unmeta x) (v/VArr xs) (kw-items-count ptr kv xs false) _ [])
+                  (= k "maxItems") (match (v/unmeta x) (v/VArr xs) (kw-items-count ptr kv xs true) _ [])
+                  (= k "items") (match (v/unmeta x) (v/VArr xs) (check-items kv xs ptr) _ [])
+                  (= k "properties") (match (v/unmeta x) (v/VObj xf) (check-props kv xf ptr) _ [])
+                  (= k "required") (match (v/unmeta x) (v/VObj xf) (check-required kv xf ptr) _ [])
+                  (= k "additionalProperties") (match (v/unmeta x) (v/VObj xf) (check-additional schema kv xf ptr) _ [])
+                  :else [])]
+          (recur (+ i 1) (cat acc r)))))))
+
+(defn- check-items Vec(Str) [sub: &v/Val xs: &Vec(v/Val) ptr: &Str]
+  (loop [i 0 acc: Vec(Str) []]
+    (if (>= i (count xs)) acc
+      (recur (+ i 1) (cat acc (check sub (nth xs i) (str ptr "/" i)))))))
+
+(defn- check-props Vec(Str) [props: &v/Val xf: &Vec(v/Field) ptr: &Str]
+  (let [pf (obj-fields props)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count pf)) acc
+        (let [k (:name (:key (nth pf i)))
+              hit (field-of xf k)]
+          (recur (+ i 1) (if (= (count hit) 0) acc (cat acc (check (:value (nth pf i)) (nth hit 0) (str ptr "/" (esc-key k)))))))))))
+
+(defn- check-required Vec(Str) [req: &v/Val xf: &Vec(v/Field) ptr: &Str]
+  (match (v/unmeta req)
+    (v/VArr rs) (loop [i 0 acc: Vec(Str) []]
+                  (if (>= i (count rs)) acc
+                    (let [k (str-of (nth rs i))]
+                      (recur (+ i 1) (if (> (count (field-of xf k)) 0) acc (cat acc (msg ptr (str "required property '" k "' not found"))))))))
+    _ []))
+
+(defn- check-additional Vec(Str) [schema: &v/Val kv: &v/Val xf: &Vec(v/Field) ptr: &Str]
+  (match (v/unmeta kv)
+    (v/VBool b)
+    (if b [] (let [props (let [p (field-of (obj-fields schema) "properties")] (if (= (count p) 0) (let [e: Vec(v/Field) []] e) (obj-fields (nth p 0))))]
+               (loop [i 0 acc: Vec(Str) []]
+                 (if (>= i (count xf)) acc
+                   (let [k (:name (:key (nth xf i)))]
+                     (recur (+ i 1) (if (> (count (field-of props k)) 0) acc
+                                      (cat acc (msg ptr (str "property '" k "' is not defined in the schema and the schema does not allow additional properties"))))))))))
+    _ []))

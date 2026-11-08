@@ -1,0 +1,707 @@
+(ns mulay.conn.wsc
+  (:require [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.fmt.registry :as reg] [mulay.dw.fmt.xml :as dxml]
+            [mulay.dw.lib.core_misc :as dmisc] [mulay.dw.lib.binaries :as bin]
+            [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.conn :as conn]
+            [mulay.lib.xml :as xml] [mulay.lib.wsdl :as wsdl] [mulay.lib.jhash :as jh] [mulay.lib.crypto :as lc]
+            [mulay.lib.time.tz :as tz] [mulay.lib.time.iso :as iso] [mulay.lib.time.types :as tt]
+            [clay.http :as http] [clay.httpmsg :as hm] [clay.io :as io] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/wsc")
+(def ENV11 "http://schemas.xmlsoap.org/soap/envelope/")
+(def ENV12 "http://www.w3.org/2003/05/soap-envelope")
+(def WSSE "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd")
+(def WSU "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd")
+(def PW-TEXT "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText")
+(def PW-DIGEST "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest")
+(def B64-BIN "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary")
+(def XML-DECL "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+
+(def DEFAULT-TIMEOUT 5000)
+
+(defn- failure conn/OpResult [id: &Str msg: &Str] (conn/fail-result (err/mk "WSC" (str id) (str msg))))
+
+(defrecord UserTok [user: Str pass: Str digest: Bool nonce: Bool created: Bool])
+
+(defrecord Cfg [wsdl: Str service: Str port: Str address: Str v12: Bool timeout: Int
+                users: Vec(UserTok) ts: Vec(Int) must: Bool ts-first: Bool actor: Str])
+
+(defn- cfg-node Vec(m/Config) [c: &conn/OpCall] (:config c))
+
+(defn- cattr Values(Str Vec(err/MErr)) [c: &conn/OpCall path: &Str attr: &Str default: Str]
+  (let [cf (:config c)]
+    (if (= (count cf) 0) (values default [])
+      (let [px (conn/param (:exprs (nth cf 0)) (str path "@" attr))]
+        (if (> (count px) 0)
+          (let [[x e] ((:eval c) (nth px 0) (:event c))]
+            (cond (not= e "") (values "" [(err/mk "MULE" "EXPRESSION" e)])
+                  (v/null? x) (values default [])
+                  :else (values (text-of x) [])))
+          (let [n (elem-at (:children (nth cf 0)) path)]
+            (if (= (count n) 0) (values default []) (values (xml/attr (nth n 0) "" attr default) []))))))))
+
+(defn- elem-at Vec(xml/XNode) [ch: &Vec(xml/XNode) path: &Str]
+  (let [segs: Vec(Str) (str/split path "/")]
+    (loop [i 0 cur: Vec(xml/XNode) (subvec ch 0 (count ch)) found: Vec(xml/XNode) []]
+      (if (>= i (count segs)) found
+        (let [e (conn/child-elem cur (nth segs i))]
+          (if (= (count e) 0) []
+            (recur (+ i 1) (xml/elem-children (nth e 0)) e)))))))
+
+(defn- text-of Str [x: &v/Val] (match (v/unmeta x) (v/VStr s) (str s) _ (let [[t e] (drt/to-text x)] t)))
+
+(defn- truthy? Bool [s: &Str] (= (str/lower-case (str/trim s)) "true"))
+
+(defn- to-int Int [s: &Str default: Int] (let [[n e] (parse-long (str/trim s))] (if (= e "") n default)))
+
+(defn- unit-ms Int [n: Int unit: &Str]
+  (let [u (str/upper-case unit)]
+    (cond (= u "MILLISECONDS") n (= u "MINUTES") (* n 60000) (= u "HOURS") (* n 3600000) (= u "DAYS") (* n 86400000)
+          (= u "MICROSECONDS") (quot n 1000) (= u "NANOSECONDS") (quot n 1000000) :else (* n 1000))))
+
+(def UNSUPPORTED-SEC ["sign-security-strategy" "verify-signature-security-strategy" "decrypt-security-strategy"
+                      "encrypt-security-strategy" "incoming-timestamp-security-strategy"])
+
+(defn- cfg-of Values(Cfg Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[wl x1] (cattr c "connection" "wsdlLocation" "")
+        [sv x2] (cattr c "connection" "service" "")
+        [pt x3] (cattr c "connection" "port" "")
+        [ad x4] (cattr c "connection" "address" "")
+        [ver x5] (cattr c "connection" "soapVersion" "SOAP11")
+        [to x6] (cattr c "connection/custom-transport-configuration/default-http-transport-configuration" "timeout" "")
+        [un x7] (cattr c "connection/web-service-security/username-token-security-strategy" "username" "")
+        [pw x8] (cattr c "connection/web-service-security/username-token-security-strategy" "password" "")
+        [ptype x9] (cattr c "connection/web-service-security/username-token-security-strategy" "passwordType" "TEXT")
+        [nonce x10] (cattr c "connection/web-service-security/username-token-security-strategy" "addNonce" "false")
+        [created x11] (cattr c "connection/web-service-security/username-token-security-strategy" "addCreated" "false")
+        [ttl x12] (cattr c "connection/web-service-security/timestamp-security-strategy" "timeToLive" "60")
+        [ttlu x13] (cattr c "connection/web-service-security/timestamp-security-strategy" "timeToLiveUnit" "SECONDS")
+        [must x14] (cattr c "connection/web-service-security" "mustUnderstand" "true")
+        [order x15] (cattr c "connection/web-service-security" "securityHeadersOrder" "")
+        [actor x16] (cattr c "connection/web-service-security" "actor" "")
+        xs: Vec(Vec(err/MErr)) [x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15 x16]
+        first-x (loop [i 0] (if (>= i (count xs)) [] (if (> (count (nth xs i)) 0) (nth xs i) (recur (+ i 1)))))
+        ch (if (= (count (:config c)) 0) [] (:children (nth (:config c) 0)))
+        sec (elem-at ch "connection/web-service-security")
+        bad (if (= (count sec) 0) ""
+              (let [ks (xml/child-elems (nth sec 0))]
+                (loop [i 0] (if (>= i (count ks)) ""
+                              (let [l (xml/elem-local (nth ks i))]
+                                (if (has? UNSUPPORTED-SEC l) l (recur (+ i 1))))))))
+        has-ut (> (count (elem-at ch "connection/web-service-security/username-token-security-strategy")) 0)
+        has-ts (> (count (elem-at ch "connection/web-service-security/timestamp-security-strategy")) 0)]
+    (cond
+      (> (count first-x) 0) (values (empty-cfg) first-x)
+      (not= bad "") (values (empty-cfg) [(err/mk "WSC" "SECURITY" (str "mulay does not support the WS-Security strategy " bad))])
+      (> (count (elem-at ch "connection/custom-transport-configuration/http-transport-configuration")) 0)
+      (values (empty-cfg) [(err/mk "WSC" "CANNOT_DISPATCH" "mulay does not support the custom HTTP transport (http-transport-configuration requesterConfig)")])
+      :else
+      (values (->Cfg wl sv pt ad (= (str/upper-case ver) "SOAP12") (if (= to "") DEFAULT-TIMEOUT (to-int to DEFAULT-TIMEOUT))
+                     (if has-ut [(->UserTok un pw (= (str/upper-case ptype) "DIGEST") (truthy? nonce) (truthy? created))] [])
+                     (if has-ts [(unit-ms (to-int ttl 60) ttlu)] [])
+                     (truthy? must) (= order "TimestampAtStart") actor)
+              []))))
+
+(defn- empty-cfg Cfg [] (->Cfg "" "" "" "" false DEFAULT-TIMEOUT [] [] true false ""))
+
+(defn- has? Bool [xs: &Vec(Str) s: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) s) true (recur (+ i 1))))))
+
+(defn- load-loc Values(Str Str) [c: &conn/OpCall url: &Str]
+  (cond
+    (str/starts-with? url "classpath:") (let [[t ok] ((:res c) (subs url 10 (count url)))] (values t (if ok "" "not found")))
+    (str/starts-with? url "file:")
+    (let [p (subs url 5 (count url)) [t e] (read-file p)] (values t (if (= e "") "" (str p " (No such file or directory)"))))
+    (or (str/starts-with? url "http://") (str/starts-with? url "https://"))
+    (let [[r e] (http/request (assoc (http/request-opts (str url)) :timeout-ms 30000))]
+      (cond (not= e "") (values "" (if (str/includes? (str/lower-case e) "refused") "Connection refused" (str e)))
+            (or (= (:status r) 404) (= (:status r) 410)) (values "" (str url))
+            (>= (:status r) 400) (values "" (str "Server returned HTTP response code: " (:status r) " for URL: " url))
+            :else (values (:body r) "")))
+    :else (values "" "not found")))
+
+(defn- wsdl-url Vec(Str) [c: &conn/OpCall loc: &Str]
+  (let [u ((:res-url c) (str loc))]
+    (cond (not= u "") [u]
+          (let [[t ok] ((:res c) (str loc))] ok) [(str "classpath:" loc)]
+          (or (str/starts-with? loc "http://") (str/starts-with? loc "https://") (str/starts-with? loc "file:")) [(str loc)]
+          :else (let [[d de] (io/cwd)
+                      p (if (str/starts-with? loc "/") (str loc) (str d "/" loc))]
+                  (if (and (io/exists? p) (not (io/dir? p))) [(str "file:" p)] [])))))
+
+(def WSDL-CACHE-MAX 32)
+(def WSDL-CACHE (atom (empty-wsdl-cache)))
+
+(defn- empty-wsdl-cache Map(Str wsdl/Wsdl) [] (let [m: Map(Str wsdl/Wsdl) {}] m))
+
+(defn- cached-wsdl Vec(wsdl/Wsdl) [url: &Str]
+  (let [m (deref WSDL-CACHE)] (if (contains? m url) [(get! m url)] [])))
+
+(defn- remember-wsdl Int [url: &Str w: &wsdl/Wsdl]
+  (let [z (swap! WSDL-CACHE (fn Map(Str wsdl/Wsdl) [m: Map(Str wsdl/Wsdl)]
+                              (if (or (contains? m url) (>= (count (keys m)) WSDL-CACHE-MAX)) m (assoc m (str url) w))))]
+    0))
+
+(defn- wsdl-err Vec(err/MErr) [e: &Str]
+  (cond (str/starts-with? e "WsdlParsingException: ") [(err/mk "WSC" "INVALID_WSDL" (subs e 22 (count e)))]
+        (str/starts-with? e "WsdlGettingException: ") (conn-err-of (str "org.mule.wsdl.parser.exception." e))
+        (str/starts-with? e "NullPointerException: ") (conn-err-of (subs e 22 (count e)))
+        :else (conn-err-of e)))
+
+(defrecord Target [url: Str op: wsdl/Op address: Str])
+
+(defn- target-of Values(Target Vec(err/MErr)) [c: &conn/OpCall cfg: &Cfg opname: &Str]
+  (let [none (->Target "" (wsdl/->Op "" false "" false) "")
+        us (wsdl-url c (:wsdl cfg))]
+    (if (= (count us) 0)
+      (values none [(err/mk "WSC" "INVALID_WSDL" (str "Error fetching the resource [" (:wsdl cfg) "]: Cannot resolve URL: [" (:wsdl cfg) "]"))])
+      (let [url (nth us 0)
+            cc c
+            hit (cached-wsdl url)
+            [w we] (if (> (count hit) 0) (values (nth hit 0) "") (wsdl/parse url (fn Values(Str Str) [u: Str] (load-loc cc u))))
+            z (if (and (= we "") (= (count hit) 0)) (remember-wsdl url w) 0)]
+        (if (not= we "") (values none (wsdl-err we))
+          (if (= (:style w) "RPC") (values none (conn-err-of (str "The provided WSDL [" url "] is RPC style, RPC WSDLs are not supported")))
+            (let [ss (wsdl/find-service w (:service cfg))]
+              (if (= (count ss) 0) (values none (conn-err-of (str "Service [" (:service cfg) "] is not defined in the wsdl")))
+                (let [ps (wsdl/find-port (nth ss 0) (:port cfg))]
+                  (if (= (count ps) 0) (values none (conn-err-of (str "Port [" (:port cfg) "] not found in service [" (:service cfg) "]")))
+                    (let [p (nth ps 0)
+                          os (wsdl/find-op p opname)
+                          addr (if (not= (:address cfg) "") (:address cfg) (if (= (count (:address p)) 0) "" (nth (:address p) 0)))]
+                      (cond
+                        (= addr "") (values none (conn-err-of "No address was specified and no one was found for the given configuration"))
+                        (= (count os) 0)
+                        (values none [(err/mk "WSC" "BAD_REQUEST" (str "The provided operation [" opname "] does not exist in the WSDL file [" url "]"))])
+                        :else (values (->Target url (nth os 0) addr) [])))))))))))))
+
+(defn- conn-err-of Vec(err/MErr) [msg: &Str] [(err/mk "WSC" "CONNECTIVITY" (str "Error trying to acquire a new connection:" msg))])
+
+(defn- esc-text Str [out: Str s: &Str]
+  (loop [i 0 start 0 o out]
+    (if (>= i (count s)) (if (= start 0) (str o s) (let [rest (subs s start (count s))] (str o rest)))
+      (let [ch (nth s i)
+            rep (cond (= ch 38) "&amp;" (= ch 60) "&lt;"
+                      (and (= ch 62) (or (= i 0) (and (>= i 2) (= (nth s (- i 1)) 93) (= (nth s (- i 2)) 93)))) "&gt;"
+                      :else "")]
+        (if (= rep "") (recur (+ i 1) start o)
+          (let [run (subs s start i)] (recur (+ i 1) (+ i 1) (str o run rep))))))))
+
+(defn- esc-attr Str [out: Str s: &Str]
+  (loop [i 0 start 0 o out]
+    (if (>= i (count s)) (if (= start 0) (str o s) (let [rest (subs s start (count s))] (str o rest)))
+      (let [ch (nth s i)
+            rep (cond (= ch 38) "&amp;" (= ch 60) "&lt;" (= ch 34) "&quot;" :else "")]
+        (if (= rep "") (recur (+ i 1) start o)
+          (let [run (subs s start i)] (recur (+ i 1) (+ i 1) (str o run rep))))))))
+
+(defn- bound? Bool [scope: &Vec(xml/XNs) prefix: &Str uri: &Str]
+  (let [k (loop [i (- (count scope) 1)] (if (< i 0) -1 (if (= (:prefix (nth scope i)) prefix) i (recur (- i 1)))))]
+    (if (< k 0) (= uri "") (= (:uri (nth scope k)) uri))))
+
+(defn- decl Str [out: Str n: &xml/XNs]
+  (let [o (if (= (:prefix n) "") (str out " xmlns=\"") (str out " xmlns:" (:prefix n) "=\""))
+        o2 (esc-attr o (:uri n))]
+    (str o2 "\"")))
+
+(defn- need Vec(xml/XNs) [ds: Vec(xml/XNs) scope: &Vec(xml/XNs) q: &xml/QName attr: Bool]
+  (if (and attr (= (:prefix q) "")) ds
+    (let [all (cat-ns (subvec scope 0 (count scope)) ds)]
+      (if (bound? all (:prefix q) (:uri q)) ds (conj ds (xml/->XNs (:prefix q) (:uri q)))))))
+
+(defn- cat-ns Vec(xml/XNs) [a: Vec(xml/XNs) b: &Vec(xml/XNs)]
+  (loop [i 0 acc a] (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- has-prefix? Bool [ds: &Vec(xml/XNs) p: &Str] (loop [i 0] (if (>= i (count ds)) false (if (= (:prefix (nth ds i)) p) true (recur (+ i 1))))))
+
+(defn- decls-of Vec(xml/XNs) [n: &xml/XNode scope: &Vec(xml/XNs) inherited: &Vec(xml/XNs) mode: Int]
+  (let [q (xml/elem-name n)
+        own (xml/elem-ns n)
+        attrs (xml/elem-attrs n)]
+    (cond
+      (= mode 0)
+      (let [d0 (need (subvec own 0 (count own)) scope q false)]
+        (loop [i 0 ds d0] (if (>= i (count attrs)) ds (recur (+ i 1) (need ds scope (:name (nth attrs i)) true)))))
+      (= mode 1)
+      (let [elem-own (loop [i 0] (if (>= i (count own)) -1 (if (= (:prefix (nth own i)) (:prefix q)) i (recur (+ i 1)))))
+            d0: Vec(xml/XNs) (cond (>= elem-own 0) [(nth own elem-own)]
+                                   (bound? scope (:prefix q) (:uri q)) []
+                                   :else [(xml/->XNs (:prefix q) (:uri q))])
+            d1 (loop [i 0 ds d0] (if (>= i (count own)) ds (recur (+ i 1) (if (= i elem-own) ds (conj ds (nth own i))))))]
+        (loop [i 0 ds d1] (if (>= i (count attrs)) ds (recur (+ i 1) (need ds scope (:name (nth attrs i)) true)))))
+      :else
+      (let [all (cat-ns (subvec inherited 0 (count inherited)) own)
+            uniq (loop [i (- (count all) 1) acc: Vec(xml/XNs) []]
+                   (if (< i 0) acc (recur (- i 1) (if (has-prefix? acc (:prefix (nth all i))) acc (conj acc (nth all i))))))
+            withq (if (has-prefix? uniq (:prefix q)) uniq (conj uniq (xml/->XNs (:prefix q) (:uri q))))]
+        (sort-ns withq)))))
+
+(defn- sort-ns Vec(xml/XNs) [xs: &Vec(xml/XNs)]
+  (loop [i 0 acc: Vec(xml/XNs) []]
+    (if (>= i (count xs)) acc
+      (let [x (nth xs i)
+            pos (loop [k 0] (if (or (>= k (count acc)) (< (str-cmp (:prefix x) (:prefix (nth acc k))) 0)) k (recur (+ k 1))))
+            acc2 (loop [k 0 a: Vec(xml/XNs) []] (if (>= k (count acc)) (if (= pos (count acc)) (conj a x) a)
+                                                  (recur (+ k 1) (if (= k pos) (conj (conj a x) (nth acc k)) (conj a (nth acc k))))))]
+        (recur (+ i 1) acc2)))))
+
+(defn- str-cmp Int [a: &Str b: &Str]
+  (let [n (if (< (count a) (count b)) (count a) (count b))]
+    (loop [i 0] (if (>= i n) (- (count a) (count b)) (if (not= (nth a i) (nth b i)) (- (nth a i) (nth b i)) (recur (+ i 1)))))))
+
+(defn- write-elem Str [out: Str n: &xml/XNode scope: &Vec(xml/XNs) inherited: &Vec(xml/XNs) mode: Int keep-pi: Bool]
+  (let [q (xml/elem-name n)
+        ds (decls-of n scope inherited mode)
+        o0 (str out "<" (xml/qname-str q))
+        o1 (loop [i 0 o o0] (if (>= i (count ds)) o (recur (+ i 1) (decl o (nth ds i)))))
+        attrs (xml/elem-attrs n)
+        o2 (loop [i 0 o o1]
+             (if (>= i (count attrs)) o
+               (let [a (nth attrs i)
+                     o3 (str o " " (xml/qname-str (:name a)) "=\"")
+                     o4 (esc-attr o3 (:value a))]
+                 (recur (+ i 1) (str o4 "\"")))))
+        kids (xml/elem-children n)
+        sc (cat-ns (subvec scope 0 (count scope)) ds)]
+    (if (= (count kids) 0) (str o2 "/>")
+      (let [o5 (write-kids (str o2 ">") kids sc (if (= mode 2) 1 mode) keep-pi)]
+        (str o5 "</" (xml/qname-str q) ">")))))
+
+(defn- write-kids Str [out: Str kids: &Vec(xml/XNode) scope: &Vec(xml/XNs) mode: Int keep-pi: Bool]
+  (let [none: Vec(xml/XNs) []]
+    (loop [i 0 o out]
+      (if (>= i (count kids)) o
+        (let [k (nth kids i)]
+          (recur (+ i 1)
+                 (match k
+                   (xml/XnElem nm as ns ch) (write-elem o k scope none mode keep-pi)
+                   (xml/XnText t) (esc-text o t)
+                   (xml/XnCData t) (str o "<![CDATA[" t "]]>")
+                   (xml/XnComment t) (str o "<!--" t "-->")
+                   (xml/XnPI tg d) (if keep-pi (str o "<?" tg (if (= d "") "" (str " " d)) "?>") o))))))))
+
+(defn- parse-doc Vec(xml/XDoc) [bytes: &Str]
+  (let [[d e] (xml/parse bytes)] (if (not= e "") [] [d])))
+
+(defn- copy-doc Str [d: &xml/XDoc]
+  (let [none: Vec(xml/XNs) []] (write-kids "" (:children d) none 0 false)))
+
+(defn- copy-headers Str [d: &xml/XDoc]
+  (let [none: Vec(xml/XNs) []
+        root (xml/doc-root d)
+        ks (xml/child-elems root)]
+    (loop [i 0 o ""] (if (>= i (count ks)) o (recur (+ i 1) (write-elem o (strip-node (nth ks i)) none none 0 false))))))
+
+(defn- strip-node xml/XNode [n: &xml/XNode]
+  (match n
+    (xml/XnElem nm as ns ch)
+    (xml/->XnElem nm as ns (loop [i 0 acc: Vec(xml/XNode) []]
+                             (if (>= i (count ch)) acc
+                               (let [k (nth ch i)]
+                                 (recur (+ i 1)
+                                        (match k
+                                          (xml/XnText s) (if (= (str/trim s) "") acc (conj acc k))
+                                          (xml/XnComment s) acc
+                                          (xml/XnPI tg dd) acc
+                                          (xml/XnElem a b c dd) (conj acc (strip-node k))
+                                          _ (conj acc k)))))))
+    _ n))
+
+(defn- ts-str Str [ms: Int]
+  (let [sec (if (>= ms 0) (quot ms 1000) (- (quot (+ ms 1) 1000) 1))
+        frac (- ms (* sec 1000))
+        base (iso/instant-str (tt/->Instant sec 0))
+        head (subs base 0 (- (count base) 1))
+        f3 (cond (< frac 10) (str "00" frac) (< frac 100) (str "0" frac) :else (str frac))]
+    (str head "." f3 "Z")))
+
+(defn- now-ms Int [] (let [[s ns] (tz/now-instant-ns)] (+ (* s 1000) (quot ns 1000000))))
+
+(defn- esc Str [s: &Str] (esc-text "" s))
+
+(defn- security-header Str [cfg: &Cfg]
+  (if (and (= (count (:users cfg)) 0) (= (count (:ts cfg)) 0)) ""
+    (let [ms (now-ms)
+          created (ts-str ms)
+          ut (if (= (count (:users cfg)) 0) ""
+               (let [u (nth (:users cfg) 0)
+                     [nb nok] (lc/random-bytes 16)
+                     nonce (bin/b64-encode nb)
+                     with-nonce (or (:digest u) (:nonce u))
+                     with-created (or (:digest u) (:nonce u))
+                     [dg dok] (lc/digest "SHA1" (str nb created (:pass u)))
+                     pw (if (:digest u) (bin/b64-encode dg) (:pass u))]
+                 (str "<wsse:UsernameToken wsu:Id=\"UsernameToken-" (dmisc/uuid4) "\"><wsse:Username>" (esc (:user u)) "</wsse:Username>"
+                      "<wsse:Password Type=\"" (if (:digest u) PW-DIGEST PW-TEXT) "\">" (esc pw) "</wsse:Password>"
+                      (if with-nonce (str "<wsse:Nonce EncodingType=\"" B64-BIN "\">" nonce "</wsse:Nonce>") "")
+                      (if with-created (str "<wsu:Created>" created "</wsu:Created>") "")
+                      "</wsse:UsernameToken>")))
+          ts (if (= (count (:ts cfg)) 0) ""
+               (str "<wsu:Timestamp wsu:Id=\"TS-" (dmisc/uuid4) "\"><wsu:Created>" created "</wsu:Created><wsu:Expires>"
+                    (ts-str (+ ms (nth (:ts cfg) 0))) "</wsu:Expires></wsu:Timestamp>"))]
+      (str "<wsse:Security xmlns:wsse=\"" WSSE "\" xmlns:wsu=\"" WSU "\""
+           (if (:must cfg) (if (:v12 cfg) " soap:mustUnderstand=\"true\"" " soap:mustUnderstand=\"1\"") "")
+           (if (= (:actor cfg) "") "" (let [a (esc-attr "" (:actor cfg))] (str (if (:v12 cfg) " soap:role=\"" " soap:actor=\"") a "\""))) ">"
+           (if (:ts-first cfg) (str ts ut) (str ut ts)) "</wsse:Security>"))))
+
+(defn- envelope Str [cfg: &Cfg header: &Str body: &Str prolog: Bool cs: &Str]
+  (str (if prolog (str "<?xml version='1.0' encoding='" cs "'?>") "")
+       "<soap:Envelope xmlns:soap=\"" (if (:v12 cfg) ENV12 ENV11) "\">"
+       (if (= header "") "" (str "<soap:Header>" header "</soap:Header>"))
+       "<soap:Body>" body "</soap:Body></soap:Envelope>"))
+
+(defn- message-tv Values(Vec(ev/TV) Vec(err/MErr)) [c: &conn/OpCall local: &Str]
+  (let [msg (conn/child-elem (:children c) "message")
+        px (conn/param (:exprs c) (str "message/" local))]
+    (cond
+      (> (count px) 0) (let [[t e] ((:eval-tv c) (nth px 0) (:event c))]
+                         (if (not= e "") (values [] [(err/mk "MULE" "EXPRESSION" e)]) (values [t] [])))
+      (and (> (count msg) 0) (> (count (conn/child-elem (xml/elem-children (nth msg 0)) local)) 0))
+      (let [[ts x] (conn/child-tv c local)] (values ts x))
+      (= local "body") (values [(:payload (:event c))] [])
+      :else (values [] []))))
+
+(defn- tv-bytes Values(Str Str) [t: &ev/TV]
+  (let [[b e] (ev/wire-bytes t)] (values b e)))
+
+(defn- transport-headers Values(Vec(Str) Vec(Str) Vec(err/MErr)) [c: &conn/OpCall]
+  (let [th (conn/child-elem (:children c) "transport-headers")
+        [ek ev2 ex] (if (= (count th) 0) (values [] [] [])
+                      (let [ks (xml/child-elems (nth th 0))
+                            n (count ks)]
+                        (loop [i 0 a: Vec(Str) [] b: Vec(Str) []]
+                          (if (>= i n) (values a b [])
+                            (let [path (if (> n 1) (str "transport-headers/transport-header[" i "]") "transport-headers/transport-header")
+                                  [k kx] (expr-or c path "key" (xml/attr (nth ks i) "" "key" ""))
+                                  [vv vx] (expr-or c path "value" (xml/attr (nth ks i) "" "value" ""))]
+                              (if (> (count kx) 0) (values [] [] kx)
+                                (if (> (count vx) 0) (values [] [] vx) (recur (+ i 1) (conj a k) (conj b vv)))))))))
+        [mv mx] (conn/attr-val c "transportHeaders")]
+    (cond
+      (> (count ex) 0) (values [] [] ex)
+      (> (count mx) 0) (values [] [] mx)
+      (= (count mv) 0) (values ek ev2 [])
+      :else (match (v/unmeta (nth mv 0))
+              (v/VObj fs) (loop [i 0 a ek b ev2] (if (>= i (count fs)) (values a b [])
+                                                   (recur (+ i 1) (conj a (:name (:key (nth fs i)))) (conj b (text-of (:value (nth fs i)))))))
+              _ (values ek ev2 [])))))
+
+(defn- expr-or Values(Str Vec(err/MErr)) [c: &conn/OpCall path: &Str attr: &Str lit: &Str]
+  (let [px (conn/param (:exprs c) (str path "@" attr))]
+    (if (= (count px) 0) (values (str lit) [])
+      (let [[x e] ((:eval c) (nth px 0) (:event c))]
+        (if (not= e "") (values "" [(err/mk "MULE" "EXPRESSION" e)]) (values (if (v/null? x) "" (text-of x)) []))))))
+
+(defn- mime-quote Str [v: &Str]
+  (let [special (or (= (count v) 0)
+                    (loop [i 0] (if (>= i (count v)) false
+                                  (let [ch (nth v i)]
+                                    (if (or (< ch 33) (>= ch 127) (str/includes? "()<>@,;:\\\"/[]?=" (subs v i (+ i 1)))) true (recur (+ i 1)))))))]
+    (if (not special) (str v)
+      (let [body (str/replace (str/replace v "\\" "\\\\") "\"" "\\\"")] (str "\"" body "\"")))))
+
+(defn- mime-ct Str [base: &Str names: &Vec(Str) vals: &Vec(Str)]
+  (loop [i 0 out (str base) used (+ (count base) 14)]
+    (if (>= i (count names)) out
+      (let [nm (nth names i) v (nth vals i)
+            segs (if (<= (count v) 60) 1 (quot (+ (count v) 59) 60))
+            [o2 u2] (loop [k 0 o out u used]
+                      (if (>= k segs) (values o u)
+                        (let [n (if (= segs 1) nm (str nm "*" k))
+                              part (if (= segs 1) v (subs v (* k 60) (if (< (* (+ k 1) 60) (count v)) (* (+ k 1) 60) (count v))))
+                              q (mime-quote part)
+                              u1 (+ u 2)
+                              fold (> (+ u1 (count n) (count q) 1) 76)
+                              o1 (str o "; " (if fold "  \t" ""))
+                              ub (if fold 8 u1)]
+                          (recur (+ k 1) (str o1 n "=" q) (+ ub (count n) 1 (count q))))))]
+        (recur (+ i 1) o2 u2)))))
+
+(defn- request-headers Vec(hm/Header) [cfg: &Cfg op: &wsdl/Op cs: &Str tk: &Vec(Str) tv: &Vec(Str)]
+  (let [act (:action op)
+        ct (if (:v12 cfg)
+             (if (and (:has-action op) (not= act "")) (mime-ct "application/soap+xml" ["action" "charset"] [act cs]) (mime-ct "application/soap+xml" ["charset"] [cs]))
+             (mime-ct "text/xml" ["charset"] [cs]))
+        ks0: Vec(Str) (if (:has-action op) ["content-type" "soapaction"] ["content-type"])
+        vs0: Vec(Str) (if (:has-action op) [ct act] [ct])
+        [ks vs] (loop [i 0 a ks0 b vs0]
+                  (if (>= i (count tk)) (values a b)
+                    (let [k (str/lower-case (nth tk i))
+                          j (loop [x 0] (if (>= x (count a)) -1 (if (= (nth a x) k) x (recur (+ x 1)))))]
+                      (if (>= j 0) (recur (+ i 1) a (assoc b j (nth tv i))) (recur (+ i 1) (conj a k) (conj b (nth tv i)))))))
+        order (jh/commons-order ks)
+        h0: Vec(hm/Header) [(hm/->Header "User-Agent" "Mule HTTP Client")]
+        h1 (loop [i 0 acc h0]
+             (if (>= i (count order)) acc
+               (let [k (nth order i)
+                     j (loop [x 0] (if (>= x (count ks)) 0 (if (= (nth ks x) k) x (recur (+ x 1)))))]
+                 (recur (+ i 1) (conj acc (hm/->Header k (nth vs j)))))))]
+    (conj (conj (conj h1 (hm/->Header "Transfer-Encoding" "chunked")) (hm/->Header "Accept" "*/*")) (hm/->Header "Connection" "keep-alive"))))
+
+(defn- java-obj v/Val [cls: &Str fs: Vec(v/Field)]
+  (v/->VMeta (v/->VObj fs) [(v/field "class" (v/->VStr cls)) (v/field "mimeType" (v/->VStr "*/*"))]))
+
+(defn- qname-v v/Val [local: &Str uri: &Str prefix: &Str]
+  (v/->VMeta (v/->VObj [(v/field "localPart" (v/->VStr local)) (v/field "namespaceURI" (v/->VStr uri)) (v/field "prefix" (v/->VStr prefix))])
+             [(v/field "class" (v/->VStr "javax.xml.namespace.QName"))]))
+
+(defn- str-or-null v/Val [xs: &Vec(Str)] (if (= (count xs) 0) (v/null-v) (v/->VStr (nth xs 0))))
+
+(defn- fault-result conn/OpResult [code: &v/Val reason: &Str detail: &Str role: Vec(Str) node: Vec(Str)] (fault-result-sub code (v/null-v) reason detail role node))
+
+(defn- fault-result-sub conn/OpResult [code: &v/Val sub: &v/Val reason: &Str detail: &Str role: Vec(Str) node: Vec(Str)]
+  (let [p (java-obj "org.mule.soap.api.exception.SoapFaultException"
+                    [(v/field "faultCode" code) (v/field "subCode" sub) (v/field "reason" (v/->VStr reason))
+                     (v/field "detail" (v/->VStr detail)) (v/field "role" (str-or-null role)) (v/field "node" (str-or-null node))
+                     (v/field "message" (v/->VStr reason))])]
+    (conn/fail-result (err/->MErr "WSC" "SOAP_FAULT" (str reason) (str reason) [p] [] "" [] "" "" "" false [] []))))
+
+(defn- unexpected conn/OpResult [opname: &Str]
+  (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unexpected error while consuming web service: Unexpected error while consuming the web service operation [" opname "]"))))
+
+(defn- client-fault conn/OpResult [cfg: &Cfg reason: &Str]
+  (fault-result (if (:v12 cfg) (qname-v "Sender" ENV12 "") (qname-v "Client" ENV11 "")) reason "" [] []))
+
+(defn- mismatch conn/OpResult [reason: &Str] (fault-result (qname-v "VersionMismatch" ENV11 "") reason "" [] []))
+
+(defn- scope-of Vec(xml/XNs) [path: &Vec(xml/XNode)]
+  (loop [i 0 acc: Vec(xml/XNs) []] (if (>= i (count path)) acc (recur (+ i 1) (cat-ns acc (xml/elem-ns (nth path i)))))))
+
+(defn- child Vec(xml/XNode) [n: &xml/XNode uri: &Str local: &Str]
+  (let [ks (xml/child-elems n)]
+    (loop [i 0] (if (>= i (count ks)) [] (let [k (nth ks i)] (if (and (= (xml/elem-uri k) uri) (= (xml/elem-local k) local)) [k] (recur (+ i 1))))))))
+
+(defn- child-local Vec(xml/XNode) [n: &xml/XNode local: &Str]
+  (let [ks (xml/child-elems n)]
+    (loop [i 0] (if (>= i (count ks)) [] (let [k (nth ks i)] (if (= (xml/elem-local k) local) [k] (recur (+ i 1))))))))
+
+(defn- code-qname v/Val [text0: &Str scope: &Vec(xml/XNs)]
+  (let [text (str/trim text0)
+        k (str/index-of text ":")
+        prefix (if (< k 0) "" (subs text 0 k))
+        local (if (< k 0) text (subs text (+ k 1) (count text)))
+        j (loop [i (- (count scope) 1)] (if (< i 0) -1 (if (= (:prefix (nth scope i)) prefix) i (recur (- i 1)))))]
+    (qname-v local (if (< j 0) "" (:uri (nth scope j))) prefix)))
+
+(defn- detail-str Str [d: &Vec(xml/XNode) scope: &Vec(xml/XNs)]
+  (if (= (count d) 0) ""
+    (let [none: Vec(xml/XNs) []
+          o (write-elem XML-DECL (nth d 0) (out-scope-for (nth d 0) scope) none 1 true)]
+      o)))
+
+(defn- out-scope-for Vec(xml/XNs) [n: &xml/XNode scope: &Vec(xml/XNs)] (let [none: Vec(xml/XNs) []] none))
+
+(defn- parse-fault conn/OpResult [f: &xml/XNode env: &Str scope: &Vec(xml/XNs)]
+  (let [sc (cat-ns (subvec scope 0 (count scope)) (xml/elem-ns f))]
+    (if (= env ENV11)
+      (let [fc (child-local f "faultcode")
+            fs (child-local f "faultstring")
+            fa (child-local f "faultactor")
+            dt (child-local f "detail")
+            code (if (= (count fc) 0) (qname-v "" "" "") (code-qname (xml/text-content (nth fc 0)) (cat-ns (subvec sc 0 (count sc)) (xml/elem-ns (nth fc 0)))))]
+        (fault-result code (if (= (count fs) 0) "" (xml/text-content (nth fs 0))) (detail-str dt sc)
+                      (if (= (count fa) 0) [] [(xml/text-content (nth fa 0))]) []))
+      (let [cd (child f ENV12 "Code")
+            vl (if (= (count cd) 0) [] (child (nth cd 0) ENV12 "Value"))
+            rs (child f ENV12 "Reason")
+            tx (if (= (count rs) 0) [] (child (nth rs 0) ENV12 "Text"))
+            rl (child f ENV12 "Role")
+            nd (child f ENV12 "Node")
+            dt (child f ENV12 "Detail")
+            code (if (= (count vl) 0) (qname-v "" "" "") (code-qname (xml/text-content (nth vl 0)) (cat-ns (subvec sc 0 (count sc)) (xml/elem-ns (nth vl 0)))))
+            sc1 (if (= (count cd) 0) [] (child (nth cd 0) ENV12 "Subcode"))
+            sv (if (= (count sc1) 0) [] (child (nth sc1 0) ENV12 "Value"))
+            sub (if (= (count sv) 0) (v/null-v)
+                  (code-qname (xml/text-content (nth sv 0))
+                              (cat-ns (cat-ns (cat-ns (subvec sc 0 (count sc)) (xml/elem-ns (nth cd 0))) (xml/elem-ns (nth sc1 0))) (xml/elem-ns (nth sv 0)))))]
+        (fault-result-sub code sub (if (= (count tx) 0) "" (xml/text-content (nth tx 0))) (detail-str dt sc)
+                      [(if (= (count rl) 0) "" (xml/text-content (nth rl 0)))]
+                      [(if (= (count nd) 0) "" (xml/text-content (nth nd 0)))])))))
+
+(defn- xml-tv-val v/Val [bytes: &Str]
+  (let [[x e] (reg/read-fmt "application/xml" [] bytes)
+        meta [(v/field "mimeType" (v/->VStr "application/xml")) (v/field "raw" (v/->VBin (str bytes)))]]
+    (if (not= e "") (v/->VMeta (v/->VBin (str bytes)) meta) (v/->VMeta (v/unmeta x) meta))))
+
+(defn- attrs-val v/Val [status: Int reason: &Str hs: &Vec(hm/Header) one-way: Bool]
+  (let [atd (if one-way (v/->VObj []) (v/->VObj [(v/field "reasonPhrase" (v/->VStr reason)) (v/field "statusCode" (v/->VStr (str status)))]))
+        [ks vs] (loop [i 0 a: Vec(Str) [] b: Vec(Str) []]
+                  (if (>= i (count hs)) (values a b)
+                    (let [k (str/lower-case (:hd-name (nth hs i)))
+                          j (loop [x 0] (if (>= x (count a)) -1 (if (= (nth a x) k) x (recur (+ x 1)))))]
+                      (if (>= j 0) (recur (+ i 1) a (assoc b j (str (nth b j) " " (:hd-value (nth hs i)))))
+                        (recur (+ i 1) (conj a k) (conj b (str (:hd-value (nth hs i)))))))))
+        order (jh/commons-order ks)
+        ph (if one-way (v/->VObj [])
+             (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                         (if (>= i (count order)) acc
+                           (let [k (nth order i)
+                                 j (loop [x 0] (if (>= x (count ks)) 0 (if (= (nth ks x) k) x (recur (+ x 1)))))]
+                             (recur (+ i 1) (conj acc (v/field k (v/->VStr (nth vs j))))))))))]
+    (v/->VMeta (v/->VObj [(v/field "additionalTransportData" atd) (v/field "protocolHeaders" ph)])
+               [(v/field "class" (v/->VStr "org.mule.extension.ws.api.SoapAttributes"))])))
+
+(defn- out-result conn/OpResult [body: &v/Val headers: Vec(v/Field) attrs: &v/Val]
+  (let [p (v/->VMeta (v/->VObj [(v/field "body" body) (v/field "headers" (v/->VObj headers)) (v/field "attachments" (v/->VObj []))])
+                     [(v/field "class" (v/->VStr "org.mule.extension.ws.api.SoapOutputEnvelope"))])]
+    (conn/ok-result (ev/tv-val p ev/JAVA) (ev/tv-val attrs ev/JAVA))))
+
+(defn- header-of Str [ct: &Vec(hm/Header) name: &Str]
+  (loop [i 0] (if (>= i (count ct)) "" (if (= (str/lower-case (:hd-name (nth ct i))) name) (:hd-value (nth ct i)) (recur (+ i 1))))))
+
+(defrecord Scan [err: Str in-body: Bool root-local: Str root-uri: Str has-root: Bool])
+
+(defn- scan Scan [bytes: &Str]
+  (let [[r0 e0] (xml/reader bytes (xml/default-opts))]
+    (if (not= e0 "") (->Scan e0 false "" "" false)
+      (loop [r r0 depth 0 in-body false local "" uri "" has false guard 0]
+        (if (> guard 100000000) (->Scan "" in-body local uri has)
+          (let [[r2 ev e] (xml/next-event r)]
+            (if (not= e "") (->Scan e in-body local uri has)
+              (match ev
+                (xml/XeStart nm as ns)
+                (cond (= depth 0) (recur r2 1 in-body (:local nm) (:uri nm) true (+ guard 1))
+                      (and (= depth 1) (= (:local nm) "Body")) (recur r2 2 true local uri has (+ guard 1))
+                      :else (recur r2 (+ depth 1) in-body local uri has (+ guard 1)))
+                (xml/XeEnd nm) (recur r2 (- depth 1) in-body local uri has (+ guard 1))
+                (xml/XeEndDoc) (->Scan "" in-body local uri has)
+                _ (recur r2 depth in-body local uri has (+ guard 1))))))))))
+
+(defn- response-text Str [raw: &Str ct: &Str req-cs: &Str]
+  (let [cs (if (str/includes? (str/lower-case ct) "charset=") (ev/charset-of ct) (str req-cs))
+        t (ev/decode-text raw (str "text/plain; charset=" cs))]
+    (if (or (= (str/upper-case cs) "UTF-8") (not (str/starts-with? t "<?xml"))) t
+      (let [e (str/index-of t "?>")
+            decl (if (< e 0) "" (subs t 0 e))
+            k (str/index-of decl "encoding")]
+        (if (< k 0) t
+          (let [q (loop [i (+ k 8)] (if (>= i (count decl)) -1 (let [ch (nth decl i)] (if (or (= ch 34) (= ch 39)) i (recur (+ i 1))))))
+                q2 (if (< q 0) -1 (str/index-of-after decl (subs decl q (+ q 1)) (+ q 1)))]
+            (if (< q2 0) t (str (subs t 0 (+ q 1)) "UTF-8" (subs t q2 (count t))))))))))
+
+(defn- ws-text? Bool [n: &xml/XNode]
+  (match n (xml/XnText s) (= (str/trim s) "") _ false))
+
+(defn- response conn/OpResult [cfg: &Cfg opname: &Str status: Int reason: &Str hs: &Vec(hm/Header) raw: &Str req-cs: &Str]
+  (let [ct (str/lower-case (header-of hs "content-type"))
+        body (response-text raw (header-of hs "content-type") req-cs)]
+    (if (str/starts-with? ct "text/html") (fault-result (qname-v "server" "http://cxf.apache.org/faultcode" "") "" "" [] [])
+      (let [s (scan body)
+            env (:root-uri s)]
+        (cond
+          (and (:has-root s) (= env "")) (mismatch (str "No namespace on \"" (:root-local s) "\" element. You must send a SOAP message."))
+          (and (:has-root s) (not= env ENV11) (not= env ENV12))
+          (mismatch (str "\"" env "\", the namespace on the \"" (:root-local s) "\" element, is not a valid SOAP version."))
+          (and (:has-root s) (= env ENV12) (not (:v12 cfg))) (mismatch "A SOAP 1.2 message is not valid when sent to a SOAP 1.1 only endpoint.")
+          (and (not= (:err s) "") (:in-body s)) (failure "BAD_RESPONSE" "Error transforming the XML web service response to be processed")
+          (not= (:err s) "")
+          (let [[text det de] (xml/decode-to-utf8 body)
+                [why line col] (dxml/woodstox-at text (:err s))]
+            (client-fault cfg (str "Error reading XMLStreamReader: " why "\n at [row,col {unknown-source}]: [" line "," col "]")))
+          :else
+          (let [[doc pe] (xml/parse body)
+                root (xml/doc-root doc)
+                hd (child root env "Header")
+                bd (child root env "Body")
+                rscope (xml/elem-ns root)]
+            (if (= (count bd) 0) (unexpected opname)
+              (let [b (nth bd 0)
+                    bscope (cat-ns (subvec rscope 0 (count rscope)) (xml/elem-ns b))
+                    kids (xml/child-elems b)
+                    all (xml/elem-children b)
+                    start (loop [i 0] (if (>= i (count all)) (count all) (if (xml/elem? (nth all i)) i (recur (+ i 1)))))
+                    end (loop [i (- (count all) 1)] (if (< i start) start (if (ws-text? (nth all i)) (recur (- i 1)) (+ i 1))))
+                    hks0 (if (= (count hd) 0) [] (xml/child-elems (nth hd 0)))
+                    dup (loop [i 0] (if (>= i (count hks0)) false
+                                      (if (loop [j 0] (if (>= j i) false (if (= (xml/elem-local (nth hks0 j)) (xml/elem-local (nth hks0 i))) true (recur (+ j 1))))) true (recur (+ i 1)))))]
+                (cond
+                  (and (> (count kids) 0) (= (xml/elem-uri (nth kids 0)) env) (= (xml/elem-local (nth kids 0)) "Fault"))
+                  (parse-fault (nth kids 0) env bscope)
+                  (= (count kids) 0)
+                  (failure "EMPTY_RESPONSE" "Response message did not contain proper response data. Expected: {http://client.internal.soap.mule.org/}invokeResponse")
+                  dup (unexpected opname)
+                  :else
+                  (let [none: Vec(xml/XNs) []
+                        bytes (write-kids "" (subvec all start end) none 1 true)
+                        hscope (if (= (count hd) 0) rscope (cat-ns (subvec rscope 0 (count rscope)) (xml/elem-ns (nth hd 0))))
+                        hks (if (= (count hd) 0) [] (xml/child-elems (nth hd 0)))
+                        headers (loop [i 0 acc: Vec(v/Field) []]
+                                  (if (>= i (count hks)) acc
+                                    (let [h (nth hks i)
+                                          hb (write-elem XML-DECL h none hscope 2 true)]
+                                      (recur (+ i 1) (conj acc (v/field (xml/elem-local h) (xml-tv-val hb)))))))]
+                    (out-result (xml-tv-val bytes) headers (attrs-val status reason hs false))))))))))))
+
+(defn- host-port Str [url: &Str]
+  (let [k (str/index-of url "://")
+        rest (if (< k 0) (str url) (subs url (+ k 3) (count url)))
+        e (loop [i 0] (if (>= i (count rest)) i (let [ch (nth rest i)] (if (or (= ch 47) (= ch 63)) i (recur (+ i 1))))))
+        hp (subs rest 0 e)
+        c (str/index-of hp ":")
+        host (if (< c 0) hp (subs hp 0 c))
+        port (if (< c 0) (if (str/starts-with? url "https") "443" "80") (subs hp (+ c 1) (count hp)))]
+    (str (if (= host "localhost") "localhost/127.0.0.1" (str host "/" host)) ":" port)))
+
+(defn- consume conn/OpResult [c: &conn/OpCall]
+  (let [[opname ox] (conn/attr-str c "operation" "")
+        [cfg cx] (if (> (count ox) 0) (values (empty-cfg) []) (cfg-of c))]
+    (cond
+      (> (count ox) 0) (conn/fail-result (nth ox 0))
+      (> (count cx) 0) (conn/fail-result (nth cx 0))
+      :else
+      (let [[tg tx] (target-of c cfg opname)]
+        (if (> (count tx) 0) (conn/fail-result (nth tx 0))
+          (let [[bt bx] (message-tv c "body")
+                [ht hx] (message-tv c "headers")
+                [tk tv th] (transport-headers c)
+                mc (conn/child-elem (:children c) "message-customizations")
+                prolog (and (> (count mc) 0) (truthy? (xml/attr (nth mc 0) "" "forceXMLProlog" "false")))
+                [bbytes be] (if (= (count bt) 0) (values "" "") (tv-bytes (nth bt 0)))]
+            (cond
+              (> (count bx) 0) (conn/fail-result (nth bx 0))
+              (> (count hx) 0) (conn/fail-result (nth hx 0))
+              (> (count th) 0) (conn/fail-result (nth th 0))
+              (= (str/trim bbytes) "") (failure "BAD_REQUEST" (str "Cannot build default body request for operation [" opname "], it requires input parameters"))
+              :else
+              (let [bdoc (parse-doc bbytes)
+                    [hbytes he] (if (= (count ht) 0) (values "" "") (tv-bytes (nth ht 0)))
+                    hdoc (if (= (str/trim hbytes) "") [] (parse-doc hbytes))
+                    cs (ev/charset-of (:mime (nth bt 0)))]
+                (cond
+                  (or (not= be "") (= (count bdoc) 0)) (bad-request opname "the request body is not a valid XML")
+                  (and (not= (str/trim hbytes) "") (= (count hdoc) 0)) (bad-request opname "the request headers are not a valid XML")
+                  (and (> (count hdoc) 0) (not= (xml/elem-local (xml/doc-root (nth hdoc 0))) "headers"))
+                  (failure "BAD_REQUEST" "Invalid input headers XML: It must be an xml with the root tag named 'headers'.")
+                  :else
+                  (let [user-h (if (= (count hdoc) 0) "" (copy-headers (nth hdoc 0)))
+                        sec (security-header cfg)
+                        env0 (envelope cfg (str sec user-h) (copy-doc (nth bdoc 0)) prolog cs)
+                        [env ee] (if (= (str/upper-case cs) "UTF-8") (values env0 "") (xml/encode-from-utf8 env0 cs))
+                        hs (request-headers cfg (:op tg) cs tk tv)
+                        req (assoc (http/request-opts (:address tg)) :method "POST" :headers hs :body env :max-redirects 0 :timeout-ms (:timeout cfg))
+                        [resp re] (http/request req)]
+                    (cond
+                      (not= re "")
+                      (let [m (str/lower-case re)]
+                        (if (or (str/includes? m "timed out") (str/includes? m "timeout") (str/includes? m "deadline"))
+                          (failure "TIMEOUT" "The SOAP request timed out")
+                          (let [msg (str "Connection refused: " (host-port (:address tg)))]
+                            (conn/fail-result (err/->MErr "WSC" "CANNOT_DISPATCH" msg msg
+                                                          [(java-obj "org.mule.soap.api.transport.DispatcherException" [])] [] "" [] "" "" "" false [] [])))))
+                      (:one-way (:op tg))
+                      (out-result (v/->VMeta (v/->VBin "") [(v/field "mimeType" (v/->VStr "*/*")) (v/field "raw" (v/->VBin ""))]) []
+                                  (attrs-val 0 "" [] true))
+                      :else (response cfg opname (:status resp) (:reason resp) (:headers resp) (:body resp) cs))))))))))))
+
+(defn- bad-request conn/OpResult [opname: &Str why: &Str] (failure "BAD_REQUEST" (str "Error consuming the operation [" opname "], " why)))
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (if (= (:op c) "consume") (consume c)
+    (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported connector operation wsc:" (:op c))))))
+
+(def ERROR-PARENTS
+  [
+   "WSC:EMPTY_RESPONSE" "WSC:BAD_RESPONSE"
+   "WSC:CONNECTIVITY" "MULE:CONNECTIVITY"
+   "WSC:RETRY_EXHAUSTED" "MULE:RETRY_EXHAUSTED"])
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "wsc" NS (fn conn/OpResult [c: conn/OpCall] (run-op c))) :error-parents ERROR-PARENTS))

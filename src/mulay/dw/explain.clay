@@ -1,0 +1,226 @@
+(ns mulay.dw.explain
+  (:require [mulay.lib.diag :as d] [mulay.dw.ast :as a] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.engine :as eng] [clay.string :as str]))
+
+(defrecord Ctx [inputs: Vec(Str) cli: Bool])
+
+(defn- ident-start? Bool [c: Int] (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (= c 95)))
+(defn- ident-char? Bool [c: Int] (or (ident-start? c) (and (>= c 48) (<= c 57))))
+
+(defn- word-at Str [s: &Str i: Int]
+  (let [e (loop [j i] (if (and (< j (count s)) (ident-char? (nth s j))) (recur (+ j 1)) j))] (subs s i e)))
+
+(defn- skip-ws Int [s: &Str i: Int] (loop [j i] (if (and (< j (count s)) (or (= (nth s j) 32) (= (nth s j) 9) (= (nth s j) 10) (= (nth s j) 13))) (recur (+ j 1)) j)))
+
+(defn- add-new Vec(Str) [xs: Vec(Str) x: Str]
+  (if (or (= x "") (loop [k 0] (if (>= k (count xs)) false (if (= (nth xs k) x) true (recur (+ k 1)))))) xs (conj xs x)))
+
+(defn script-names Vec(Str) [text: &Str]
+  (let [n (count text)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i n) acc
+        (let [c (nth text i)
+              prev (if (> i 0) (nth text (- i 1)) 32)]
+          (if (and (ident-start? c) (not (ident-char? prev)))
+            (let [w (word-at text i) j (+ i (count w))]
+              (if (or (= w "var") (= w "fun") (= w "as") (= w "type") (= w "ns"))
+                (let [k (skip-ws text j)] (recur k (if (and (< k n) (ident-start? (nth text k))) (add-new acc (word-at text k)) acc)))
+                (let [k (skip-ws text j)
+                      param (and (< k n) (or (= (nth text k) 44) (= (nth text k) 41) (= (nth text k) 58))
+                                 (let [b (loop [m (- i 1)] (if (and (>= m 0) (or (= (nth text m) 32) (= (nth text m) 9))) (recur (- m 1)) m))]
+                                   (and (>= b 0) (or (= (nth text b) 40) (= (nth text b) 44)))))]
+                  (recur j (if param (add-new acc w) acc)))))
+            (recur (+ i 1) acc)))))))
+
+(defn candidates Vec(Str) [text: &Str bs: &Vec(rt/Builtin) ctx: &Ctx]
+  (let [a0 (script-names text)
+        a1 (loop [i 0 acc a0] (if (>= i (count (:inputs ctx))) acc (recur (+ i 1) (add-new acc (nth (:inputs ctx) i)))))]
+    (loop [i 0 acc a1] (if (>= i (count bs)) acc (recur (+ i 1) (add-new acc (str (:name (nth bs i)))))))))
+
+(defn- between Str [s: &Str a: &Str b: &Str]
+  (let [i (str/index-of s a)]
+    (if (< i 0) ""
+      (let [j (str/index-of-after s b (+ i (count a)))] (if (< j 0) "" (subs s (+ i (count a)) j))))))
+
+(defn- first-line Str [s: &Str] (let [i (str/index-of s "\n")] (if (< i 0) (str s) (subs s 0 i))))
+
+(defn- strip-pos Str [s: &Str]
+  (let [i (str/index-of s " (line ")] (if (< i 0) (str s) (str/trim (subs s 0 i)))))
+
+(defn- backticked Vec(Str) [s: &Str]
+  (loop [i 0 acc: Vec(Str) []]
+    (let [a (str/index-of-after s "`" i)]
+      (if (< a 0) acc
+        (let [b (str/index-of-after s "`" (+ a 1))] (if (< b 0) acc (recur (+ b 1) (conj acc (subs s (+ a 1) b)))))))))
+
+(defrecord Arg [ty: Str val: Str])
+
+(defn- call-args Vec(Arg) [msg: &Str]
+  (let [ls (str/split msg "\n")]
+    (loop [i 0 acc: Vec(Arg) [] on false]
+      (if (>= i (count ls)) acc
+        (let [l (str/trim (nth ls i))]
+          (cond (str/starts-with? l "But it expects") acc
+                (str/starts-with? l "You called the function") (recur (+ i 1) acc true)
+                (and on (> (count l) 2) (>= (nth l 0) 48) (<= (nth l 0) 57) (>= (str/index-of l ": ") 0))
+                (let [body (subs l (+ (str/index-of l ": ") 2) (count l))
+                      sp (str/index-of body " (")]
+                  (recur (+ i 1) (conj acc (if (< sp 0) (->Arg body "") (->Arg (subs body 0 sp) (subs body (+ sp 2) (- (count body) 1))))) on))
+                :else (recur (+ i 1) acc on)))))))
+
+(defn- expected-combos Vec(Str) [msg: &Str]
+  (let [ls (str/split msg "\n")]
+    (loop [i 0 acc: Vec(Str) [] on false]
+      (if (>= i (count ls)) acc
+        (let [l (str/trim (nth ls i))]
+          (cond (str/starts-with? l "But it expects") (recur (+ i 1) acc true)
+                (and on (str/starts-with? l "(")) (recur (+ i 1) (conj acc l) on)
+                :else (recur (+ i 1) acc on)))))))
+
+(defn- types-of Str [as: &Vec(Arg)]
+  (str "(" (str/join ", " (loop [i 0 acc: Vec(Str) []] (if (>= i (count as)) acc (recur (+ i 1) (conj acc (:ty (nth as i))))))) ")"))
+
+(defn- has-ty? Bool [as: &Vec(Arg) t: &Str] (loop [i 0] (if (>= i (count as)) false (if (= (:ty (nth as i)) t) true (recur (+ i 1))))))
+
+(defn- null-help d/Report [r: d/Report] (d/help r "the value is null (a missing or misspelled field?); give a fallback with `default`, e.g. `payload.x default 0`"))
+
+(defn- did-you-mean d/Report [r: d/Report word: &Str cands: &Vec(Str)]
+  (let [c (d/closest word cands)] (if (= (count c) 0) r (d/help r (str "a similar name exists: `" (nth c 0) "`")))))
+
+(defn- set-label d/Report [r: d/Report text: Str]
+  (let [ls (:labels r)]
+    (if (= (count ls) 0) r (assoc r :labels (assoc ls 0 (assoc (nth ls 0) :text text))))))
+
+(defn- reword d/Report [r: d/Report head: Str orig: &Str]
+  (d/note (assoc r :msg head) (str "DataWeave: " (first-line orig))))
+
+(defn- declared-at Int [text: &Str name: &Str after: Int]
+  (let [i (str/index-of-after text (str "var " name) after)] i))
+
+(defn- line-no Int [text: &Str off: Int] (loop [i 0 k 1] (if (>= i off) k (recur (+ i 1) (if (= (nth text i) 10) (+ k 1) k)))))
+
+(defn- callee-at Str [src: &Str start: Int]
+  (if (or (< start 0) (>= start (count src)) (not (ident-start? (nth src start)))) ""
+    (let [w (word-at src start) k (skip-ws src (+ start (count w)))]
+      (if (and (< k (count src)) (= (nth src k) 40)) w ""))))
+
+(defn explain d/Report [r: d/Report msg: &Str cands: &Vec(Str) ctx: &Ctx]
+  (let [fl (first-line msg)
+        src (:src r)
+        start (let [ls (:labels r)] (if (= (count ls) 0) -1 (:start (nth ls 0))))]
+    (cond
+      (str/starts-with? fl "Unable to resolve reference of: `")
+      (let [name (between fl "`" "`")
+            r1 (set-label (reword r (str "cannot find `" name "` in this scope") msg) "not found in this scope")
+            r2 (did-you-mean r1 name cands)
+            input (or (= name "payload") (= name "attributes") (= name "vars"))]
+        (if (and input (:cli ctx))
+          (d/help r2 (str "`" name "` is an input; pass it on the command line: mulay dw <script> " name "=application/json:<file>"))
+          r2))
+
+      (or (str/starts-with? fl "There is no variable named '") (str/starts-with? fl "Variable: `"))
+      (let [name (if (str/starts-with? fl "Variable: `") (between fl "`" "`") (between fl "'" "'"))
+            later (if (>= start 0) (declared-at src name start) -1)
+            r1 (set-label (reword r (str "`" name "` is used before it is defined") msg) "used here")]
+        (if (>= later 0)
+          (d/label (d/help r1 (str "move `var " name "` above its first use (variables are defined top to bottom)")) later (+ later 4 (count name)) "defined here, later" false)
+          (did-you-mean r1 name cands)))
+
+      (str/starts-with? fl "Invalid field name identifier. Reason: The name `")
+      (let [name (between fl "`" "`")]
+        (d/help (set-label (assoc r :msg (str "`" name "` is a reserved word and can't be used as a bare key")) "reserved word")
+                (str "quote the key: \"" name "\": ...")))
+
+      (str/starts-with? fl "Option `")
+      (let [bt (backticked fl)
+            name (if (> (count bt) 0) (nth bt 0) "")
+            valid (loop [i 1 acc: Vec(Str) []] (if (>= i (count bt)) acc (recur (+ i 1) (conj acc (nth bt i)))))]
+        (if (str/includes? fl "is not valid")
+          (let [at (if (and (= (count (:labels r)) 0) (not= name "")) (str/index-of src name) -1)
+                r0 (if (>= at 0) (d/label r at (+ at (count name)) "" true) r)
+                r1 (set-label (reword r0 (str "unknown option `" name "`") msg) "unknown option")
+                c (d/closest name valid)]
+            (if (> (count c) 0) (d/help r1 (str "did you mean `" (nth c 0) "`?"))
+              (d/note r1 (str "valid options: " (str/join ", " valid)))))
+          r))
+
+      (str/starts-with? fl "Cannot coerce ")
+      (let [rest (subs fl (count "Cannot coerce ") (count fl))
+            from (let [i (str/index-of rest " ")] (if (< i 0) rest (subs rest 0 i)))
+            to (let [i (str/last-index-of rest " to ")] (if (< i 0) "" (subs rest (+ i 4) (count rest))))
+            val (between rest "(" ")")
+            r1 (set-label (reword r (str "can't convert " from (if (= val "") "" (str " `" val "`")) " to " to) msg) (str "this is " from))]
+        (cond (= from "Null") (null-help r1)
+              (and (= from "String") (= to "Number")) (d/help r1 (str "`" val "` isn't a number; check first with `isNumeric(...)`, or parse with a format: `as Number {format: \"#,##0\"}`"))
+              (= to "Object") (d/help r1 "an Object is written { key: value }; to read JSON text, use `read(text, \"application/json\")`")
+              :else r1))
+
+      (str/starts-with? fl "You called the function '")
+      (let [f (between fl "'" "'")
+            as (call-args msg)
+            combos (expected-combos msg)
+            inner (callee-at src start)
+            outer (and (not= inner "") (not= inner f))
+            r1 (set-label (reword r (str "`" f "` can't take " (types-of as) (if outer (str " (inside `" inner "`)") "")) msg)
+                          (if outer (str "`" f "` failed inside this call") (str "called with " (types-of as))))
+            r2 (cond (has-ty? as "Null") (null-help r1)
+                     (and (= f "+") (has-ty? as "String")) (d/help (d/help r1 "to join text, use `++`: \"a\" ++ \"b\"") "to add numbers, convert first: `x as Number`")
+                     (and (= f "-") (has-ty? as "String")) (d/help r1 "convert text to a number first: `x as Number`")
+                     (and (= f "++") (has-ty? as "Number")) (d/help r1 "convert numbers to text first: `n as String`")
+                     :else r1)]
+        (if (> (count combos) 0) (d/note r2 (str "`" f "` accepts: " (str/join ", " combos))) r2))
+
+      (str/starts-with? fl "Expecting Type: `")
+      (let [bt (backticked fl)
+            want (if (> (count bt) 0) (nth bt 0) "")
+            got (if (> (count bt) 1) (nth bt 1) "")
+            r1 (set-label (reword r (str "expected `" want "`, found `" got "`") msg) (str "this is `" got "`"))]
+        (if (= got "Null") (null-help r1) r1))
+
+      (str/includes? fl " (line ")
+      (let [h (strip-pos fl)
+            k0 (str/index-of h " expected ")
+            k (if (< k0 0) -1 (+ k0 1))
+            lab (if (< k 0) "here" (let [t (subs h k (count h)) f (str/index-of t " for ")] (if (< f 0) (if (str/ends-with? t ".") (subs t 0 (- (count t) 1)) t) (subs t 0 f))))]
+        (set-label (assoc r :msg h) lab))
+
+      :else
+      (let [ls (str/split msg "\n")
+            r1 (assoc r :msg fl)]
+        (if (> (count ls) 1) (d/note r1 (str/trim (str/join "\n" (loop [i 1 acc: Vec(Str) []] (if (>= i (count ls)) acc (recur (+ i 1) (conj acc (nth ls i)))))))) r1)))))
+
+(defn compile-report d/Report [file: Str text: Str c: &eng/Compiled ctx: &Ctx]
+  (let [ds (:diags c)
+        cands (candidates text (:builtins c) ctx)]
+    (if (= (count ds) 0)
+      (explain (d/report "error" "DW" (if (> (count (:errors c)) 0) (nth (:errors c) 0) "")) (if (> (count (:errors c)) 0) (nth (:errors c) 0) "") cands ctx)
+      (let [dg (nth ds 0)
+            sp (:sp dg)
+            r0 (d/with-src (d/report "error" "DW" (:msg dg)) file text)
+            r1 (if (and (>= (:start sp) 0) (<= (:start sp) (count text))) (d/label r0 (:start sp) (:end sp) "" true) r0)]
+        (explain r1 (:msg dg) cands ctx)))))
+
+(defn run-report d/Report [file: Str text: Str c: &eng/Compiled e: &dwe/DwErr ctx: &Ctx]
+  (let [sp (if (or (= (:origin e) "") (dwe/unset? (:pend e))) (:sp e) (:pend e))
+        cands (candidates text (:builtins c) ctx)
+        r0 (d/report "error" "DW" (:msg e))
+        r1 (cond (and (>= (:start sp) 0) (< (:start sp) (count text)))
+                 (d/label (d/with-src r0 file text) (:start sp) (:end sp) "" true)
+                 (>= (:start sp) (count text))
+                 (let [srcs (:srcs (:code c))
+                       [ln col x id] (rt/excerpt-in srcs sp)]
+                   (d/with-src r0 (str id ":" ln ":" col) ""))
+                 :else (d/with-src r0 file ""))]
+    (explain r1 (:msg e) cands ctx)))
+
+(defn script-report d/Report [file: Str raw: Str base: Int off: Int script: &Str c: &eng/Compiled ctx: &Ctx what: Str line: Int]
+  (let [ds (:diags c)
+        msg (if (> (count ds) 0) (:msg (nth ds 0)) (if (> (count (:errors c)) 0) (nth (:errors c) 0) ""))
+        sp (if (> (count ds) 0) (:sp (nth ds 0)) (a/->Span -1 -1))
+        cands (candidates script (:builtins c) ctx)
+        r0 (d/report "error" "DW" msg)
+        ok-span (and (>= base 0) (>= (:start sp) off) (<= (:start sp) (count script)))
+        r1 (if ok-span
+             (d/label (d/with-src r0 file raw) (+ base (- (:start sp) off)) (+ base (- (if (< (:end sp) (:start sp)) (:start sp) (:end sp)) off)) "" true)
+             (d/with-src r0 (if (> line 0) (str file ":" line) file) ""))
+        r2 (explain r1 msg cands ctx)]
+    (if (= what "") r2 (d/note r2 (str "in " what)))))

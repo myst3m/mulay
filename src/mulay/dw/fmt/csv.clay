@@ -1,0 +1,216 @@
+(ns mulay.dw.fmt.csv
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.fmt.props :as p] [clay.string :as str]
+            [mulay.dw.fmt.scalar :as sc]))
+
+(defrecord COpts [sep: Str quote: Str esc: Str header: Bool ignore-empty: Bool header-line: Int body-line: Int
+                  line-sep: Str quote-header: Bool quote-values: Bool])
+
+(defn opts-of Values(COpts Str) [props: &Vec(v/Field)]
+  (let [[sep e1a] (p/pstr props "separator" ",")
+        e1 (if (and (= e1a "") (p/has? props "separator") (= sep "") (not (v/null? (nth (v/obj-get props "separator") 0)))) "Value for `separator` is not valid." e1a)
+        [q e2] (p/pstr props "quote" "\"")
+        [es e3] (p/pstr props "escape" "\\")
+        [hd e4] (p/pbool props "header" true)
+        [ie e5] (p/pbool props "ignoreEmptyLine" true)
+        [hl e6] (p/pint props "headerLineNumber" 0)
+        [bl e7] (p/pint props "bodyStartLineNumber" 0)
+        [ls e8] (p/pstr props "lineSeparator" "\n")
+        [qh e9] (p/pbool props "quoteHeader" false)
+        [qv e10] (p/pbool props "quoteValues" false)
+        e (p/either-err (p/either-err (p/either-err e1 e2) (p/either-err e3 e4)) (p/either-err (p/either-err e5 e6) (p/either-err e7 e8)))]
+    (values (->COpts (if (= sep "") "," (subs sep 0 1)) (if (> (count q) 1) (subs q 0 1) q) (if (> (count es) 1) (subs es 0 1) es)
+                     hd ie hl bl ls qh qv)
+            (p/either-err e (p/either-err e9 e10)))))
+
+(defn- ch Int [s: &Str] (if (= (count s) 0) -1 (nth s 0)))
+
+(defn- read-record Values(Vec(Str) Int Bool) [s: &Str i0: Int o: &COpts]
+  (let [n (count s) sep (ch (:sep o)) q (ch (:quote o)) es (ch (:esc o))]
+    (if (or (>= i0 n) (= (nth s i0) 10) (= (nth s i0) 13))
+      (values [] (skip-eol s i0) true)
+      (loop [i i0 fs: Vec(Str) [] cur "" rs i0 quoted false after false]
+        (if (>= i n) (values (conj fs (str cur (subs s rs n))) n false)
+          (let [c (nth s i)]
+            (if quoted
+              (cond (and (= c es) (not= es q) (< (+ i 1) n)) (recur (+ i 2) fs (str cur (subs s rs i)) (+ i 1) true false)
+                    (and (= c q) (= es q) (< (+ i 1) n) (= (nth s (+ i 1)) q)) (recur (+ i 2) fs (str cur (subs s rs i)) (+ i 1) true false)
+                    (= c q) (recur (+ i 1) fs (str cur (subs s rs i)) (+ i 1) false true)
+                    :else (recur (+ i 1) fs cur rs true false))
+              (cond (= c sep) (recur (+ i 1) (conj fs (str cur (subs s rs i))) "" (+ i 1) false false)
+                    (or (= c 10) (= c 13)) (values (conj fs (str cur (subs s rs i))) (skip-eol s i) false)
+                    after (recur (+ i 1) fs cur (+ i 1) false true)
+                    (and (= c q) (= (count cur) 0) (= rs i)) (recur (+ i 1) fs cur (+ i 1) true false)
+                    (and (= c es) (< (+ i 1) n) (not= (nth s (+ i 1)) 10) (not= (nth s (+ i 1)) 13))
+                    (recur (+ i 2) fs (str cur (subs s rs i)) (+ i 1) false false)
+                    :else (recur (+ i 1) fs cur rs false false)))))))))
+
+(defn- skip-eol Int [s: &Str i: Int]
+  (if (>= i (count s)) i
+    (if (= (nth s i) 13) (if (and (< (+ i 1) (count s)) (= (nth s (+ i 1)) 10)) (+ i 2) (+ i 1))
+      (if (= (nth s i) 10) (+ i 1) i))))
+
+(defn- col-name Str [hdr: &Vec(Str) i: Int]
+  (if (< i (count hdr)) (str (nth hdr i)) (str "column_" i)))
+
+(defn read Values(v/Val Str) [text: &Str props: &Vec(v/Field) mime: &Str]
+  (let [[o e] (opts-of props)]
+    (if (not= e "") (values (v/null-v) e)
+      (let [start (if (and (>= (count text) 3) (= (nth text 0) 239) (= (nth text 1) 187) (= (nth text 2) 191)) 3 0)
+            recs (loop [i start acc: Vec(Vec(Str)) []]
+                   (if (>= i (count text)) acc
+                     (let [[fs j empty] (read-record text i o)]
+                       (recur j (if empty (if (:ignore-empty o) acc (conj acc [""])) (conj acc fs))))))
+            hidx (if (:header o) (if (> (:header-line o) 1) (- (:header-line o) 1) 0) -1)
+            hdr: Vec(Str) (if (and (>= hidx 0) (< hidx (count recs))) (nth recs hidx) [])
+            bidx (max (+ hidx 1) (- (:body-line o) 1))
+            rows (loop [i bidx acc: Vec(v/Val) []]
+                   (if (>= i (count recs)) acc
+                     (let [fs (nth recs i)]
+                       (recur (+ i 1)
+                              (conj acc (v/->VObj (loop [k 0 a: Vec(v/Field) []]
+                                                    (if (>= k (count fs)) a
+                                                      (recur (+ k 1) (conj a (v/field (col-name hdr k) (v/->VStr (nth fs k)))))))))))))]
+        (values (v/->VMeta (v/->VArr rows) (p/reader-meta mime)) "")))))
+
+(defn show Str [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VNull) "null"
+      (v/VBool b) (if b "true" "false")
+      (v/VNum n) (num/to-string n)
+      (v/VInt n-i) (let [n (num/from-int n-i)] (num/to-string n))
+      (v/VStr s) (str s)
+      (v/VArr xs) (str "[" (loop [i 0 acc ""] (if (>= i (count xs)) acc (recur (+ i 1) (str acc (if (> i 0) ", " "") (show-in (nth xs i)))))) "]")
+      (v/VRange a b) (show (v/materialize x))
+      (v/VObj fs) (str "{" (loop [i 0 acc ""] (if (>= i (count fs)) acc (recur (+ i 1) (str acc (if (> i 0) ", " "") (:name (:key (nth fs i))) ": " (show-in (:value (nth fs i))))))) "}")
+      _ (v/type-name x))))
+
+(defn- show-in Str [x: &v/Val]
+  (match (v/unmeta x) (v/VStr s) (str "\"" s "\"") _ (show x)))
+
+(defn- cell Values(Str Str) [x0: &v/Val]
+  (let [x (v/unmeta x0)
+        [ns nf ne] (sc/number-text x0)
+        [ts tt te] (if nf (values "" false "") (sc/temporal-text x0 true))]
+    (cond
+      nf (values ns ne)
+      tt (values ts te)
+      :else
+    (match x
+      (v/VNull) (values "" "")
+      (v/VStr s) (values s "")
+      (v/VNum n) (values (num/to-string n) "")
+      (v/VInt n-i) (let [n (num/from-int n-i)] (values (num/to-string n) ""))
+      (v/VBool b) (values (if b "true" "false") "")
+      (v/VKey k) (values (:name k) "")
+      (v/VRegex s f) (values s "")
+      (v/VBin b) (values b "")
+      (v/VNsV n) (values (:uri n) "")
+      _ (values "" (str "Cannot coerce " (v/type-name x) " to String"))))))
+
+(defn- esc-into Str [out: Str s: &Str o: &COpts quoted: Bool]
+  (let [sep (ch (:sep o)) q (ch (:quote o)) es (ch (:esc o))]
+    (loop [acc out i 0]
+      (if (>= i (count s)) acc
+        (let [c (nth s i)
+              special (if quoted (or (= c q) (= c es))
+                        (or (= c sep) (= c q) (= c es) (= c 10) (= c 13)))
+              a1 (if (and special (>= es 0)) (str acc (:esc o)) acc)]
+          (recur (str a1 (subs s i (+ i 1))) (+ i 1)))))))
+
+(defn- write-row Values(Str Str) [out: Str cells: &Vec(v/Val) o: &COpts]
+  (loop [acc out i 0]
+    (if (>= i (count cells)) (values (str acc (:line-sep o)) "")
+      (let [[t e] (cell (nth cells i))]
+        (if (not= e "") (values acc e)
+          (let [a1 (if (> i 0) (str acc (:sep o)) acc)
+                a2 (if (:quote-values o)
+                     (let [b1 (str a1 (:quote o)) b2 (esc-into b1 t o true)] (str b2 (:quote o)))
+                     (esc-into a1 t o false))]
+            (recur a2 (+ i 1))))))))
+
+(defn- row-of Values(Vec(v/Field) Str) [x0: &v/Val]
+  (match (v/unmeta x0)
+    (v/VObj fs) (values fs "")
+    _ (values [] (str "Cannot coerce " (v/type-name (v/unmeta x0)) " (" (show x0) ") to Object"))))
+
+(defn write Values(Str Str) [x0: &v/Val props: &Vec(v/Field)]
+  (let [[o oe] (opts-of props)]
+    (if (not= oe "") (values "" oe)
+      (let [x (v/unmeta x0)
+            [rows re] (match x
+                        (v/VArr xs) (values xs "")
+                        (v/VRange a b) (values (v/items x) "")
+                        (v/VObj fs) (values [x] "")
+                        (v/VNull) (values [] "CSV Structure should be either an `Array<Object>` or an `Object` but got Null, while writing CSV.")
+                        _ (values [] (str "CSV Structure should be either an `Array<Object>` or an `Object` but got " (v/type-name x) ", while writing CSV at ")))]
+        (if (not= re "") (values "" re)
+          (if (= (count rows) 0) (values "" "")
+            (let [[f0 e0] (row-of (nth rows 0))]
+              (if (not= e0 "") (values "" e0)
+                (let [hdr (if (:header o)
+                            (loop [acc "" i 0]
+                              (if (>= i (count f0)) (str acc (:line-sep o))
+                                (let [k (:name (:key (nth f0 i)))
+                                      a1 (if (> i 0) (str acc (:sep o)) acc)]
+                                  (recur (if (:quote-header o)
+                                           (let [b1 (str a1 (:quote o)) b2 (esc-into b1 k o true)] (str b2 (:quote o)))
+                                           (str a1 k))
+                                         (+ i 1)))))
+                            "")]
+                  (loop [acc hdr i 0]
+                    (if (>= i (count rows)) (values acc "")
+                      (let [[fs e] (row-of (nth rows i))]
+                        (if (not= e "") (values "" e)
+                          (let [cells (loop [k 0 c: Vec(v/Val) []] (if (>= k (count fs)) c (recur (+ k 1) (conj c (:value (nth fs k))))))
+                                [a2 e2] (write-row acc cells o)]
+                            (if (not= e2 "") (values "" e2) (recur a2 (+ i 1)))))))))))))))))
+
+(defrecord CRd [buf: Str pos: Int eof: Bool rec: Int hdr: Vec(Str) o: COpts hidx: Int bidx: Int started: Bool])
+
+(def STREAM-BLOCK 1024)
+
+(defn stream-open Values(CRd Str) [props: &Vec(v/Field)]
+  (let [[o e] (opts-of props)
+        hidx (if (:header o) (if (> (:header-line o) 1) (- (:header-line o) 1) 0) -1)
+        bidx (max (+ hidx 1) (- (:body-line o) 1))]
+    (values (->CRd "" 0 false 0 [] o hidx bidx false) e)))
+
+(defn- more Values(CRd Str) [rd: &CRd fetch: &Fn(Int Values(Str Bool Str))]
+  (let [[t done e] (fetch 0)
+        b (:buf rd)
+        nb (str (subs b (:pos rd) (count b)) t)]
+    (values (assoc rd :buf nb :pos 0 :eof (or done (not= e ""))) e)))
+
+(defn- row-val v/Val [hdr: &Vec(Str) fs: &Vec(Str)]
+  (v/->VObj (loop [k 0 a: Vec(v/Field) []]
+              (if (>= k (count fs)) a
+                (recur (+ k 1) (conj a (v/field (col-name hdr k) (v/->VStr (nth fs k)))))))))
+
+(defn stream-next Values(Vec(v/Val) CRd Bool Str) [rd0: CRd fetch: &Fn(Int Values(Str Bool Str))]
+  (loop [rd rd0 acc: Vec(v/Val) []]
+    (let [b (:buf rd) i (:pos rd) n (count b)]
+      (cond
+        (>= (count acc) STREAM-BLOCK) (values acc rd false "")
+        (and (not (:started rd)) (< n 3) (not (:eof rd)))
+        (let [[r2 e] (more rd fetch)] (if (not= e "") (values acc r2 true e) (recur r2 acc)))
+        (not (:started rd))
+        (let [bom (and (>= n 3) (= (nth b 0) 239) (= (nth b 1) 187) (= (nth b 2) 191))]
+          (recur (assoc rd :started true :pos (if bom 3 0)) acc))
+        (>= i n) (if (:eof rd) (values acc rd true "")
+                   (let [[r2 e] (more rd fetch)] (if (not= e "") (values acc r2 true e) (recur r2 acc))))
+        :else
+        (let [[fs j empty] (read-record b i (:o rd))]
+          (if (and (>= j n) (not (:eof rd)))
+            (let [[r2 e] (more rd fetch)] (if (not= e "") (values acc r2 true e) (recur r2 acc)))
+            (let [o (:o rd)]
+              (if (and empty (:ignore-empty o)) (recur (assoc rd :pos j) acc)
+                (let [r (:rec rd)
+                      hidx (:hidx rd)
+                      bidx (:bidx rd)
+                      hdr (:hdr rd)
+                      rec: Vec(Str) (if empty [""] fs)
+                      rd2 (assoc rd :pos j :rec (+ r 1))]
+                  (cond (= r hidx) (recur (assoc rd2 :hdr rec) acc)
+                        (>= r bidx) (recur rd2 (conj acc (row-val hdr rec)))
+                        :else (recur rd2 acc)))))))))))

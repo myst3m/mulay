@@ -1,0 +1,1473 @@
+(ns mulay.dw.resolve
+  (:require [mulay.dw.ast :as a] [mulay.dw.rir :as r] [mulay.dw.val :as v] [mulay.dw.num :as num]
+            [mulay.dw.rt :as rt] [mulay.dw.fnarity :as fa] [mulay.dw.sty :as ty] [clay.string :as str] [mulay.lib.time.iso :as ti]))
+
+(defrecord Bind [name: Str kind: Int idx: Int group: Int orig: Vec(a/Node) sty: Vec(ty/STy) ps: Vec(Str)
+                 scope: Int dk: Int dsp: a/Span])
+(def DK-OTHER 0)
+(def DK-VAR 1)
+(def DK-FUN 2)
+(defrecord Frame [binds: Vec(Bind) nslots: Int maxslots: Int group: Int cap-names: Vec(Str) cap-srcs: Vec(r/R)])
+(defrecord Group [cap-names: Vec(Str) cap-srcs: Vec(r/R)])
+(defrecord Imp [local: Str module: Str name: Str])
+(defrecord TypeDef [name: Str t: v/TypeV gens: Vec(Str) ast: Vec(a/Ty)])
+
+(defrecord St
+  [fns: Vec(r/FnDef)
+   frames: Vec(Frame)
+   groups: Vec(Group)
+   gvars: Vec(Str)
+   gfuns: Vec(Str)
+   gfun-defs: Vec(Int)
+   types: Vec(TypeDef)
+   nss: Vec(v/Ns)
+   imports: Vec(Imp)
+   star-mods: Vec(Str)
+   mod-alias: Vec(Imp)
+   inputs: Vec(Str)
+   diags: Vec(a/Diag)
+   builtins: Vec(rt/Builtin)
+   gvar-orig: Vec(Vec(a/Node))
+   gfun-orig: Vec(Vec(a/Node))
+   gfun-ps: Vec(Vec(Str))
+   umods: Vec(Str)
+   ctxs: Vec(ModCtx)
+   cur: Int
+   scope: Int
+   nscope: Int
+   gvar-sp: Vec(a/Span)
+   gfun-sp: Vec(a/Span)
+   lazy: a/Span
+   gfun-pty: Vec(Vec(Vec(a/Ty)))
+   later: Vec(LaterTy)
+   done-ty: Vec(Str)])
+
+(defrecord LaterTy [mod: Int name: Str da: a/DeclAt])
+
+(defrecord ModCtx [imports: Vec(Imp) star-mods: Vec(Str) mod-alias: Vec(Imp) nss: Vec(v/Ns)])
+
+(defrecord ModSrc [name: Str decls: Vec(a/DeclAt)])
+
+(defn- sp0 a/Span [] (a/->Span 0 0))
+(defn- mk r/R [x: r/Rx sp: &a/Span] (r/->R x sp))
+(defn- diag St [st: St msg: Str sp: &a/Span]
+  (let [ds (conj (:diags st) (a/->Diag msg sp))] (assoc st :diags ds)))
+
+(defn- top Frame [st: &St] (nth (:frames st) (- (count (:frames st)) 1)))
+(defn- set-top St [st: St f: Frame]
+  (let [fs (:frames st)] (assoc st :frames (assoc fs (- (count fs) 1) f))))
+
+(defn- bind-slot Values(Int St) [st: St name: Str] (bind-slot-orig st name []))
+
+(defn- bind-slot-orig Values(Int St) [st: St name: Str orig: Vec(a/Node)] (bind-slot-full st name orig []))
+
+(defn- bind-slot-full Values(Int St) [st: St name: Str orig: Vec(a/Node) sty: Vec(ty/STy)]
+  (bind-slot-decl st name orig sty DK-OTHER (sp0)))
+
+(defn- bind-slot-decl Values(Int St) [st: St name: Str orig: Vec(a/Node) sty: Vec(ty/STy) dk: Int dsp: a/Span]
+  (let [f (top st)
+        i (:nslots f)
+        f2 (->Frame (conj (:binds f) (->Bind name 0 i -1 orig sty [] (:scope st) dk dsp)) (+ i 1) (max (:maxslots f) (+ i 1)) (:group f) (:cap-names f) (:cap-srcs f))]
+    (values i (set-top st f2))))
+
+(defn- push-scope Values(Int St) [st: St]
+  (values (:scope st) (assoc (assoc st :scope (:nscope st)) :nscope (+ (:nscope st) 1))))
+
+(defn- pop-binds St [st: St n: Int]
+  (let [f (top st)]
+    (set-top st (->Frame (subvec (:binds f) 0 n) (:nslots f) (:maxslots f) (:group f) (:cap-names f) (:cap-srcs f)))))
+
+(defn- nbinds Int [st: &St] (count (:binds (top st))))
+
+(defn- find-bind Int [f: &Frame name: &Str]
+  (let [bs (:binds f)]
+    (loop [i (- (count bs) 1)]
+      (if (< i 0) -1 (if (= (:name (nth bs i)) name) i (recur (- i 1)))))))
+
+(defn- idx-of Int [xs: &Vec(Str) name: &Str]
+  (loop [i 0] (if (>= i (count xs)) -1 (if (= (nth xs i) name) i (recur (+ i 1))))))
+
+(defn- frame-caps Vec(Str) [st: &St f: &Frame]
+  (if (>= (:group f) 0) (:cap-names (nth (:groups st) (:group f))) (:cap-names f)))
+
+(defn- add-cap Values(Int St) [st: St fi: Int name: Str src: r/R]
+  (let [f (nth (:frames st) fi)]
+    (if (>= (:group f) 0)
+      (let [g (nth (:groups st) (:group f))
+            i (count (:cap-names g))
+            g2 (->Group (conj (:cap-names g) name) (conj (:cap-srcs g) src))]
+        (values i (assoc st :groups (assoc (:groups st) (:group f) g2))))
+      (let [i (count (:cap-names f))
+            f2 (->Frame (:binds f) (:nslots f) (:maxslots f) (:group f) (conj (:cap-names f) name) (conj (:cap-srcs f) src))]
+        (values i (assoc st :frames (assoc (:frames st) fi f2)))))))
+
+(defn- lookup-in Values(Bool r/Rx St) [st: St fi: Int name: Str sp: &a/Span from-group: Int]
+  (if (< fi 0) (values false (r/->RFail "") st)
+    (let [f (nth (:frames st) fi)
+          bi (find-bind f name)]
+      (if (>= bi 0) (bind-rx st f bi from-group) (lookup-caps st fi name sp)))))
+
+(defn- bind-rx Values(Bool r/Rx St) [st: St f: &Frame bi: Int from-group: Int]
+  (let [b (nth (:binds f) bi)]
+    (if (= (:kind b) 0) (values true (r/->RSlot (:idx b)) st)
+      (if (= from-group (:group b)) (values true (r/->RSibling (:idx b)) st)
+        (values true (r/->RClosure (:idx b) (:cap-srcs (nth (:groups st) (:group b)))) st)))))
+
+(defn- lookup-caps Values(Bool r/Rx St) [st: St fi: Int name: Str sp: &a/Span]
+  (let [f (nth (:frames st) fi)
+        ci (idx-of (frame-caps st f) name)]
+    (if (>= ci 0) (values true (r/->RCap ci) st)
+      (let [[found src st2] (lookup-in st (- fi 1) name sp (:group f))]
+        (if (not found) (values false src st2)
+          (match src
+            (r/RSibling d) (values true src st2)
+            _ (let [[k st3] (add-cap st2 fi name (mk src sp))] (values true (r/->RCap k) st3))))))))
+
+(defn- lookup-ref Values(Bool r/Rx St Bool) [st: St name: Str sp: &a/Span]
+  (let [fi (- (count (:frames st)) 1)
+        f (nth (:frames st) fi)
+        [bi skipped] (find-init-bind f name (:start sp) (:lazy st))]
+    (if (>= bi 0)
+      (let [[found x st2] (bind-rx st f bi (:group f))] (values found x st2 skipped))
+      (let [[found x st2] (lookup-caps st fi name sp)] (values found x st2 skipped)))))
+
+(defn- find-init-bind Values(Int Bool) [f: &Frame name: &Str pos: Int lazy: &a/Span]
+  (let [bs (:binds f)]
+    (loop [i (- (count bs) 1) skipped false]
+      (if (< i 0) (values -1 skipped)
+        (let [b (nth bs i)
+              dsp (:dsp b)]
+          (if (not= (:name b) name) (recur (- i 1) skipped)
+            (if (and (not= (:dk b) DK-OTHER) (< pos (:end dsp))
+                     (or (< (:start lazy) 0) (and (>= (:start dsp) (:start lazy)) (<= (:end dsp) (:end lazy)))))
+              (recur (- i 1) true)
+              (values i skipped))))))))
+
+(defn- skipped-ref Values(r/Rx St) [st: St name: &Str]
+  (let [own (qual st name)
+        gi (idx-of (:gvars st) own)
+        fi (idx-of (:gfuns st) own)]
+    (cond (>= gi 0) (values (r/->RGlob gi) st)
+          (>= fi 0) (values (r/->RClosure (nth (:gfun-defs st) fi) []) st)
+          :else (values (r/->RNoVar (str name)) st))))
+
+(defn- builtin-id Int [st: &St module: &Str name: &Str]
+  (let [bs (:builtins st)]
+    (loop [i 0]
+      (if (>= i (count bs)) -1
+        (let [b (nth bs i)]
+          (if (and (= (:name b) name) (= (:module b) module)) i (recur (+ i 1))))))))
+
+(defn- norm-module Str [m: &Str]
+  (if (str/starts-with? m "dw::") (str m) (str "dw::" m)))
+
+(defn- split-qname Values(Str Str) [q: &Str]
+  (let [i (str/last-index-of q "::")]
+    (if (< i 0) (values "" (str q)) (values (subs q 0 i) (subs q (+ i 2) (count q))))))
+
+(defn- import-builtin Int [st: &St name: &Str]
+  (let [ims (:imports st)
+        e (loop [i 0] (if (>= i (count ims)) -1 (if (= (:local (nth ims i)) name) i (recur (+ i 1)))))]
+    (if (>= e 0) (builtin-id st (:module (nth ims e)) (:name (nth ims e)))
+      (let [c0 (builtin-id st "dw::Core" name)
+            c (if (>= c0 0) c0 (builtin-id st "dw::Mule" name))]
+        (if (>= c 0) c
+          (let [sm (:star-mods st)]
+            (loop [i 0] (if (>= i (count sm)) -1
+                          (let [x (builtin-id st (nth sm i) name)] (if (>= x 0) x (recur (+ i 1))))))))))))
+
+(defn- resolve-builtin Int [st: &St q: &Str]
+  (let [[m n] (split-qname q)]
+    (if (= m "") (import-builtin st n)
+      (let [x (builtin-id st (norm-module m) n)]
+        (if (>= x 0) x
+          (let [al (:mod-alias st)]
+            (loop [i 0] (if (>= i (count al)) -1
+                          (if (= (:local (nth al i)) m) (builtin-id st (:module (nth al i)) n) (recur (+ i 1)))))))))))
+
+(def STDLIB-OBJECT-TYPES ["Attribute" "DataFormat" "DataFormatDescriptor" "DataFormatProperty" "Diff" "Difference" "DocType"
+                          "EmptySettings" "EncodingSettings" "EvalSuccess" "ExecutionFailure" "Field" "FunctionParam" "Location"
+                          "LogEntry" "MimeType" "MimeTypeError" "MimeTypeParameter" "Multipart" "MultipartPart"
+                          "OperationContext" "Pair" "Position" "QName" "ReaderInput" "RunSuccess" "RuntimeExecutionConfiguration"
+                          "Settings" "TryResult" "TryResultFailure"])
+
+(def STDLIB-TYPES ["Attribute" "Comparable" "DataFormat" "DataFormatDescriptor" "DataFormatProperty" "DateFactory"
+                   "DateTimeFactory" "Dictionary" "Diff" "Difference" "DocType" "DurationMeasurement" "EmptySettings"
+                   "EncodingSettings" "Enum" "EvalResult" "EvalSuccess" "ExecutionFailure" "Field" "Formatter"
+                   "FunctionParam" "Iterator" "LocalDateTimeFactory" "LocalTimeFactory" "Location" "LogEntry"
+                   "LoggerService" "LogLevel" "MillisOrSecs" "MimeType" "MimeTypeError" "MimeTypeParameter" "Multipart"
+                   "MultipartPart" "NaN" "OperationContext" "Pair" "Path" "PathElement" "PeriodUnits" "Position" "QName"
+                   "ReaderInput" "Result" "RoundCeiling" "RoundDown" "RoundFloor" "RoundHalfDown" "RoundHalfEven"
+                   "RoundHalfUp" "RoundingMode" "RoundUnnecessary" "RoundUp" "RunResult" "RunSuccess"
+                   "RuntimeExecutionConfiguration" "SecurityManager" "Settings" "StringCoerceable" "TimeFactory"
+                   "TimeMeasurement" "TryResult" "TryResultFailure" "UpdaterValueProvider" "URI" "Zoned"])
+
+(defn- type-by-name Vec(v/TypeV) [st: &St name: &Str]
+  (let [builtin ["String" "Number" "Boolean" "Null" "Array" "Object" "Any" "Nothing" "Range" "Binary"
+                 "Regex" "Key" "Type" "Date" "DateTime" "LocalDateTime" "Time" "LocalTime"
+                 "TimeZone" "Period" "Namespace" "Uri" "SimpleType" "CData"]]
+    (if (>= (idx-of builtin name) 0) [(v/->TypeV "name" (str name) [] [] [] [])]
+      (let [ts (:types st)
+            found (loop [i (- (count ts) 1)] (if (< i 0) []
+                                               (if (= (:name (nth ts i)) name) [(:t (nth ts i))] (recur (- i 1)))))]
+        (if (> (count found) 0) found
+          (cond
+            (>= (idx-of STDLIB-OBJECT-TYPES name) 0) [(v/->TypeV "alias" (str name) [(v/->TypeV "name" "Object" [] [] [] [])] [] [] [])]
+            (>= (idx-of STDLIB-TYPES name) 0) [(v/->TypeV "any" (str name) [] [] [] [])]
+            :else []))))))
+
+(defn- global? Bool [st: &St q: &Str] (or (>= (idx-of (:gvars st) q) 0) (>= (idx-of (:gfuns st) q) 0)))
+
+(defn- cur-mod Str [st: &St] (nth (:umods st) (:cur st)))
+
+(defn- user-mod? Bool [st: &St m: &Str] (>= (idx-of (:umods st) m) 1))
+
+(defn- global-name Str [st: &St name: &Str]
+  (let [[m n] (split-qname name)
+        cm (cur-mod st)]
+    (if (= m "")
+      (let [own (if (= cm "") (str name) (str cm "::" name))]
+        (if (global? st own) own
+          (let [ims (:imports st)
+                ie (loop [i (- (count ims) 1)] (if (< i 0) -1 (if (and (= (:local (nth ims i)) name) (user-mod? st (:module (nth ims i)))) i (recur (- i 1)))))]
+            (if (>= ie 0) (let [q (str (:module (nth ims ie)) "::" (:name (nth ims ie)))] (if (global? st q) q ""))
+              (let [sm (:star-mods st)]
+                (loop [i 0] (if (>= i (count sm)) ""
+                              (let [q (str (nth sm i) "::" name)] (if (and (user-mod? st (nth sm i)) (global? st q)) q (recur (+ i 1)))))))))))
+      (let [al (:mod-alias st)
+            ai (loop [i 0] (if (>= i (count al)) -1 (if (and (= (:local (nth al i)) m) (user-mod? st (:module (nth al i)))) i (recur (+ i 1)))))
+            m2 (if (>= ai 0) (:module (nth al ai)) m)
+            q (str m2 "::" n)]
+        (if (and (user-mod? st m2) (global? st q)) q "")))))
+
+(defn- qual Str [st: &St name: &Str] (let [cm (cur-mod st)] (if (= cm "") (str name) (str cm "::" name))))
+
+(defn- switch-mod St [st: St k: Int]
+  (if (= k (:cur st)) st
+    (let [saved (assoc (:ctxs st) (:cur st) (->ModCtx (:imports st) (:star-mods st) (:mod-alias st) (:nss st)))
+          c (nth saved k)]
+      (assoc (assoc (assoc (assoc (assoc (assoc st :ctxs saved) :cur k) :imports (:imports c)) :star-mods (:star-mods c)) :mod-alias (:mod-alias c)) :nss (:nss c)))))
+
+(defn- fwd-ref? Bool [scope: Int dk: Int dsp: &a/Span cur: Int sp: &a/Span]
+  (and (= scope cur)
+       (if (= dk DK-VAR) (and (<= (:start dsp) (:start sp)) (<= (:end sp) (:end dsp)))
+         (> (:start dsp) (:start sp)))))
+
+(defn- mod-of Int [st: &St gn: &Str]
+  (let [[m n] (split-qname gn)] (idx-of (:umods st) m)))
+
+(defn- check-fwd Values(Bool St) [st: St name: &Str sp: &a/Span]
+  (let [[found b] (find-bind-any st name)
+        bad (if found
+              (let [bd (nth b 0)] (fwd-ref? (:scope bd) (:dk bd) (:dsp bd) (:scope st) sp))
+              (let [gn (global-name st name)
+                    gi (idx-of (:gvars st) gn)
+                    fi (idx-of (:gfuns st) gn)]
+                (cond (>= gi 0) (fwd-ref? (mod-of st gn) DK-VAR (nth (:gvar-sp st) gi) (:scope st) sp)
+                      (>= fi 0) (fwd-ref? (mod-of st gn) DK-FUN (nth (:gfun-sp st) fi) (:scope st) sp)
+                      :else false)))]
+    (if bad (values true (diag st (fwd-msg name) sp)) (values false st))))
+
+(defn- fwd-msg Str [name: &Str] (str "Variable: `" name "` is not yet initialized."))
+
+(defn- resolve-ref Values(r/Rx St) [st: St name: Str sp: &a/Span]
+  (let [[bad st1] (check-fwd st name sp)]
+    (if bad (values (r/->RFail (fwd-msg name)) st1) (resolve-ref-ok st1 name sp))))
+
+(defn- resolve-ref-ok Values(r/Rx St) [st: St name: Str sp: &a/Span]
+  (let [[found x st2 skipped] (lookup-ref st name sp)]
+    (if found (values x st2)
+    (if skipped (skipped-ref st2 name)
+      (let [gn (global-name st2 name)
+            gi (idx-of (:gvars st2) gn)]
+        (if (>= gi 0) (values (r/->RGlob gi) st2)
+          (let [fi (idx-of (:gfuns st2) gn)]
+            (if (>= fi 0) (values (r/->RClosure (nth (:gfun-defs st2) fi) []) st2)
+              (let [ii (idx-of (:inputs st2) name)
+                    nsi (loop [k 0] (if (>= k (count (:nss st2))) -1 (if (= (:prefix (nth (:nss st2) k)) name) k (recur (+ k 1)))))]
+                (if (>= ii 0) (values (r/->RInput ii) st2)
+                  (if (>= nsi 0) (values (r/->RConst (v/->VNsV (nth (:nss st2) nsi))) st2)
+                  (let [bi (resolve-builtin st2 name)]
+                    (if (>= bi 0) (values (if (rt/constant? (nth (:builtins st2) bi)) (r/->RCallB bi []) (r/->RBuiltinRef bi)) st2)
+                      (let [ty (type-by-name st2 name)]
+                        (if (> (count ty) 0) (values (r/->RTypeV (r/->RType (nth ty 0))) st2)
+                          (values (r/->RFail (str "Unable to resolve reference of: `" name "`."))
+                                  (diag st2 (str "Unable to resolve reference of: `" name "`.") sp)))))))))))))))))
+
+(defn- uses-dollar? Bool [n: &a/Node]
+  (match (:e n)
+    (a/ERef name) (or (= name "$") (= name "$$") (= name "$$$"))
+    (a/ELambda ps rt0 body) false
+    (a/EArr els) (loop [i 0] (if (>= i (count els)) false (if (or (uses-dollar? (:value (nth els i))) (any-dollar? (:cond (nth els i)))) true (recur (+ i 1)))))
+    (a/EObj es) (loop [i 0] (if (>= i (count es)) false (if (entry-dollar? (nth es i)) true (recur (+ i 1)))))
+    (a/EStr ps) (loop [i 0] (if (>= i (count ps)) false (if (match (nth ps i) (a/SPExpr e) (uses-dollar? e) _ false) true (recur (+ i 1)))))
+    (a/EUnary op e) (uses-dollar? e)
+    (a/EBin op l rr osp) (or (uses-dollar? l) (uses-dollar? rr))
+    (a/ECall f args) (or (uses-dollar? f)
+                         (any-dollar? args))
+    (a/ESelect t s) (or (uses-dollar? t) (match s (a/SelDyn e) (uses-dollar? e) (a/SelQDyn ns e) (uses-dollar? e) (a/SelRange x y) (or (uses-dollar? x) (uses-dollar? y)) _ false))
+    (a/EExists t) (uses-dollar? t)
+    (a/EAssert t) (uses-dollar? t)
+    (a/EIf c th el) (or (uses-dollar? c) (uses-dollar? th) (uses-dollar? el))
+    (a/EMatch t cs) (or (uses-dollar? t) (loop [i 0] (if (>= i (count cs)) false (if (uses-dollar? (:body (nth cs i))) true (recur (+ i 1))))))
+    (a/EAs e ty) (uses-dollar? e)
+    (a/EIs e ty) (uses-dollar? e)
+    (a/EMetaSet e s) (or (uses-dollar? e) (uses-dollar? s))
+    (a/EDo ds body) (or (uses-dollar? body) (decls-dollar? ds))
+    (a/EUsing ds body) (or (uses-dollar? body) (decls-dollar? ds))
+    (a/EUpdate t cs) (uses-dollar? t)
+    _ false))
+
+(defn- decls-dollar? Bool [ds: &Vec(a/DeclAt)]
+  (loop [i 0]
+    (if (>= i (count ds)) false
+      (if (match (:d (nth ds i)) (a/DVar name ty value) (uses-dollar? value) _ false) true (recur (+ i 1))))))
+
+(defn- any-dollar? Bool [ns: &Vec(a/Node)]
+  (loop [i 0] (if (>= i (count ns)) false (if (uses-dollar? (nth ns i)) true (recur (+ i 1))))))
+
+(defn- entry-dollar? Bool [e: &a/Entry]
+  (match e
+    (a/EKV k attrs value cnd) (or (uses-dollar? value) (any-dollar? cnd)
+                                  (match k (a/KExpr ns x) (uses-dollar? x) _ false))
+    (a/ESpread x cnd) (or (uses-dollar? x) (any-dollar? cnd))))
+
+(defn- dollar-params Vec(a/Param) [sp: &a/Span]
+  (let [nul (a/->Node (a/->ENull) sp)]
+    [(a/->Param "$" [] [nul]) (a/->Param "$$" [] [nul]) (a/->Param "$$$" [] [nul])]))
+
+(defn- fn-valued-call? Bool [n: &a/Node]
+  (match (:e n)
+    (a/EBin op l rr osp) (= op "replace")
+    (a/ECall f args) (and (= (count args) 2) (match (:e f) (a/ERef name) (= name "replace") _ false))
+    _ false))
+
+(defn- maybe-fn? Bool [n: &a/Node]
+  (match (:e n)
+    (a/ERef name) true
+    (a/ELambda ps rty body) true
+    (a/ECall f args) true
+    (a/EDo ds body) true
+    (a/EUsing ds body) true
+    (a/EIf c th el) (or (maybe-fn? th) (maybe-fn? el))
+    (a/EMatch t cs) true
+    _ false))
+
+(defn- wants-fn? Bool [st: &St bid: Int i: Int]
+  (if (< bid 0) false
+    (let [os (:overloads (nth (:builtins st) bid))]
+      (loop [k 0]
+        (if (>= k (count os)) false
+          (let [ps (:params (nth os k))]
+            (if (and (< i (count ps)) (= (nth ps i) "Function")) true (recur (+ k 1)))))))))
+
+(def LAZY-ARGS ["dw::Runtime orElse 1" "dw::Runtime orElseTry 1" "dw::Core onNull 1"])
+
+(defn- lazy-arg? Bool [st: &St bid: Int i: Int]
+  (if (< bid 0) false
+    (let [b (nth (:builtins st) bid)
+          key (str (:module b) " " (:name b) " " i)]
+      (loop [k 0] (if (>= k (count LAZY-ARGS)) false (if (= (nth LAZY-ARGS k) key) true (recur (+ k 1))))))))
+
+(defn- lambda-or-ref? Bool [n: &a/Node]
+  (match (:e n) (a/ELambda ps rty body) true (a/ERef name) true _ false))
+
+(defn- static-type Str [n: &a/Node]
+  (match (:e n)
+    (a/ENull) "Null"
+    (a/ENum t) (str t)
+    (a/EStr ps) (let [[plain txt] (plain-parts ps)] (if plain (str "\"" txt "\"") ""))
+    (a/EUnary op e) (if (= op "-") (let [t (static-type e)] (if (and (not= t "") (numeric-lit? e)) (str "-" t) "")) "")
+    (a/EArr els) (if (= (count els) 0) ""
+                   (loop [i 0 ts: Vec(Str) []]
+                     (if (>= i (count els))
+                       (str "Array<" (str/join " | " ts) ">")
+                       (let [el (nth els i) t (static-type (:value el))]
+                         (if (or (= t "") (> (count (:cond el)) 0)) ""
+                           (recur (+ i 1) (if (loop [k 0] (if (>= k (count ts)) false (if (= (nth ts k) t) true (recur (+ k 1))))) ts (conj ts t))))))))
+    (a/EObj es) (if (= (count es) 0) "Object" "")
+    (a/EBin op l rr osp) (if (and (or (= op "+") (= op "-") (= op "*") (= op "/")) (numeric-lit? l) (numeric-lit? rr)) "Number" "")
+    _ ""))
+
+(defn- numeric-lit? Bool [n: &a/Node]
+  (match (:e n)
+    (a/ENum t) true
+    (a/EUnary op e) (and (= op "-") (numeric-lit? e))
+    (a/EBin op l rr osp) (and (or (= op "+") (= op "-") (= op "*") (= op "/")) (numeric-lit? l) (numeric-lit? rr))
+    _ false))
+
+(defn- plain-parts Values(Bool Str) [ps: &Vec(a/StrPart)]
+  (loop [i 0 out ""]
+    (if (>= i (count ps)) (values true out)
+      (match (nth ps i) (a/SPText t) (recur (+ i 1) (str out t)) _ (values false "")))))
+
+(defn- check-bool St [st: St n: &a/Node]
+  (let [t (static-type n)]
+    (if (= t "") st (diag st (str "Expecting Type: `Boolean`, but got: `" t "`.") (:sp n)))))
+
+(defn- origin-bind Values(Bool Vec(a/Node)) [st: &St name: &Str]
+  (loop [fi (- (count (:frames st)) 1)]
+    (if (< fi 0) (values false [])
+      (let [f (nth (:frames st) fi) bi (find-bind f name)]
+        (if (>= bi 0) (values true (:orig (nth (:binds f) bi))) (recur (- fi 1)))))))
+
+(defn- origin-of v/Val [st: &St n: &a/Node]
+  (let [builtin (match (:e n)
+                  (a/ERef name) (let [[found o] (origin-bind st name)]
+                                  (if (or found (not= (global-name st name) "")) -1
+                                    (resolve-builtin st name)))
+                  _ -1)]
+    (if (>= builtin 0)
+      (let [b (nth (:builtins st) builtin)]
+        (v/->VObj [(v/field "m" (v/->VStr (:module b))) (v/field "n" (v/->VStr (:name b)))]))
+      (let [on (origin-node st n 0)]
+        (if (= (count on) 0) (v/->VObj [])
+          (let [sp (:sp (nth on 0))]
+            (v/->VObj [(v/field "s" (v/int-v (:start sp))) (v/field "e" (v/int-v (:end sp)))])))))))
+
+(defn- origin-node Vec(a/Node) [st: &St n: &a/Node depth: Int]
+  (if (> depth 16) []
+    (match (:e n)
+      (a/ERef name)
+      (let [[found o] (origin-bind st name)]
+        (if found (if (= (count o) 0) [] (origin-node st (nth o 0) (+ depth 1)))
+          (let [gn (global-name st name) gi (idx-of (:gvars st) gn) fi (idx-of (:gfuns st) gn)]
+            (cond (>= gi 0) (origin-node st (nth (nth (:gvar-orig st) gi) 0) (+ depth 1))
+                  (>= fi 0) (nth (:gfun-orig st) fi)
+                  :else []))))
+      (a/ESelect t sel)
+      (let [tn (origin-node st t (+ depth 1))]
+        (if (= (count tn) 0) []
+          (let [picked (match (:e (nth tn 0))
+                         (a/EObj es) (match sel (a/SelKey ns nm) (obj-field-node es nm) _ [])
+                         (a/EArr els) (match sel (a/SelDyn ix) (match (:e ix) (a/ENum t0) (arr-elem-node els t0) _ []) _ [])
+                         _ [])]
+            (if (= (count picked) 0) [] (origin-node st (nth picked 0) (+ depth 1))))))
+      _ [n])))
+
+(defn- obj-field-node Vec(a/Node) [es: &Vec(a/Entry) nm: &Str]
+  (loop [i 0]
+    (if (>= i (count es)) []
+      (match (nth es i)
+        (a/EKV k attrs v c) (let [kn (match k (a/KName ns x) (str x) (a/KStr ps) (let [[plain txt] (plain-parts ps)] (if plain txt "")) _ "")]
+                              (if (and (= kn nm) (= (count c) 0)) [v] (recur (+ i 1))))
+        _ (recur (+ i 1))))))
+
+(defn- arr-elem-node Vec(a/Node) [els: &Vec(a/Elem) t: &Str]
+  (let [[k ok] (let [[n e] (num/parse-lit t)] (let [[i e2] (num/to-int n)] (values i (and (= e "") (= e2 "")))))]
+    (if (or (not ok) (< k 0) (>= k (count els))) []
+      (loop [i 0] (if (>= i (count els)) (if (> (count (:cond (nth els k))) 0) [] [(:value (nth els k))])
+                    (if (> (count (:cond (nth els i))) 0) [] (recur (+ i 1))))))))
+
+(defn- with-origin Vec(r/R) [st: &St bid: Int args: &Vec(a/Node) xs: Vec(r/R) sp: &a/Span]
+  (let [b (nth (:builtins st) bid)]
+    (if (and (= (:module b) "dw::Runtime") (or (= (:name b) "location") (= (:name b) "locationString"))
+             (= (count args) 1))
+      (conj xs (mk (r/->RConst (origin-of st (nth args 0))) sp))
+      xs)))
+
+(defn- param-names-of Vec(Str) [ps: &Vec(a/Param)]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (:name (nth ps i)))))))
+
+(defn- sty-of ty/STy [st: &St n: &a/Node ov-n: &Vec(Str) ov-t: &Vec(ty/STy) glob: Bool depth: Int]
+  (if (> depth 12) (ty/any)
+    (match (:e n)
+      (a/ENull) (ty/null-t)
+      (a/ENum t) (ty/num [(str t)])
+      (a/EBool b) (ty/bool-t [(if b "true" "false")])
+      (a/EStr ps) (let [[plain txt] (plain-parts ps)] (ty/str-t (if plain [txt] [])))
+      (a/EUnary op e) (if (and (= op "-") (numeric-lit? n)) (ty/num []) (ty/any))
+      (a/EArr els) (if (= (count els) 0) (ty/any)
+                     (loop [i 0 acc (ty/null-t) first true]
+                       (if (>= i (count els)) (ty/arr acc)
+                         (let [el (nth els i)]
+                           (if (> (count (:cond el)) 0) (ty/arr (ty/any))
+                             (let [t (sty-of st (:value el) ov-n ov-t glob (+ depth 1))]
+                               (recur (+ i 1) (if first t (ty/union acc t)) false)))))))
+      (a/EObj es) (obj-sty st es ov-n ov-t glob depth)
+      (a/EIf c th el) (ty/union (sty-of st th ov-n ov-t glob (+ depth 1)) (sty-of st el ov-n ov-t glob (+ depth 1)))
+      (a/EBin op l rr osp)
+      (cond (= op "default") (ty/union (ty/drop-null (sty-of st l ov-n ov-t glob (+ depth 1))) (sty-of st rr ov-n ov-t glob (+ depth 1)))
+            (or (= op "/") (= op "*")) (ty/num [])
+            :else (ty/any))
+      (a/ERef name) (ref-sty st name ov-n ov-t glob depth)
+      (a/ESelect t sel)
+      (match sel
+        (a/SelDyn ix) (if (numeric-lit? ix) (ty/elem (sty-of st t ov-n ov-t glob (+ depth 1))) (ty/any))
+        (a/SelRange x y) (let [tt (sty-of st t ov-n ov-t glob (+ depth 1))] (match tt (ty/SArr e) tt _ (ty/any)))
+        _ (ty/any))
+      (a/ECall f args) (call-sty st f args ov-n ov-t glob depth)
+      (a/EDo decls body)
+      (let [[ns ts] (loop [i 0 ns ov-n ts ov-t]
+                      (if (>= i (count decls)) (values ns ts)
+                        (match (:d (nth decls i))
+                          (a/DVar name tyv value) (recur (+ i 1) (conj ns name) (conj ts (sty-of st value ns ts glob (+ depth 1))))
+                          (a/DFun name ps rty b annots gens) (recur (+ i 1) (conj ns name) (conj ts (ty/any)))
+                          _ (recur (+ i 1) ns ts))))]
+        (sty-of st body ns ts glob (+ depth 1)))
+      _ (ty/any))))
+
+(defn- obj-sty ty/STy [st: &St es: &Vec(a/Entry) ov-n: &Vec(Str) ov-t: &Vec(ty/STy) glob: Bool depth: Int]
+  (loop [i 0 ks: Vec(Str) [] vs: Vec(ty/STy) []]
+    (if (>= i (count es)) (ty/obj-of ks vs)
+      (match (nth es i)
+        (a/EKV key attrs value cnd)
+        (let [k (match key
+                  (a/KName ns name) (if (= ns "") [name] [])
+                  (a/KStr ps) (let [[plain txt] (plain-parts ps)] (if plain [txt] []))
+                  _ [])]
+          (if (or (= (count k) 0) (> (count attrs) 0) (> (count cnd) 0)) (ty/obj)
+            (recur (+ i 1) (conj ks (nth k 0)) (conj vs (sty-of st value ov-n ov-t glob (+ depth 1))))))
+        _ (ty/obj)))))
+
+(defn- ov-find Int [ov-n: &Vec(Str) name: &Str]
+  (loop [i (- (count ov-n) 1)] (if (< i 0) -1 (if (= (nth ov-n i) name) i (recur (- i 1))))))
+
+(defn- ref-sty ty/STy [st: &St name: &Str ov-n: &Vec(Str) ov-t: &Vec(ty/STy) glob: Bool depth: Int]
+  (let [oi (ov-find ov-n name)]
+    (if (>= oi 0) (nth ov-t oi)
+      (let [[found b] (if glob (values false []) (find-bind-any st name))]
+        (cond
+          found (let [bd (nth b 0)]
+                  (cond (> (count (:sty bd)) 0) (nth (:sty bd) 0)
+                        (and (= (:kind bd) 0) (> (count (:orig bd)) 0)) (sty-of st (nth (:orig bd) 0) ov-n ov-t false (+ depth 1))
+                        :else (ty/any)))
+          :else (let [gi (idx-of (:gvars st) (global-name st name))]
+                  (if (>= gi 0) (sty-of st (nth (nth (:gvar-orig st) gi) 0) [] [] true (+ depth 1)) (ty/any))))))))
+
+(defn- find-bind-any Values(Bool Vec(Bind)) [st: &St name: &Str]
+  (loop [fi (- (count (:frames st)) 1)]
+    (if (< fi 0) (values false [])
+      (let [f (nth (:frames st) fi) bi (find-bind f name)]
+        (if (>= bi 0) (values true [(nth (:binds f) bi)]) (recur (- fi 1)))))))
+
+(defn- ret-sty ty/STy [r: &Str]
+  (cond (= r "Number") (ty/num []) (= r "String") (ty/str-t []) (= r "Boolean") (ty/bool-t [])
+        (= r "Array") (ty/arr (ty/any)) (= r "Object") (ty/obj) :else (ty/any)))
+
+(defn- call-sty ty/STy [st: &St f: &a/Node args: &Vec(a/Node) ov-n: &Vec(Str) ov-t: &Vec(ty/STy) glob: Bool depth: Int]
+  (match (:e f)
+    (a/ERef name)
+    (let [[found b] (if glob (values false []) (find-bind-any st name))]
+      (cond
+        (>= (ov-find ov-n name) 0) (ty/any)
+        found (let [bd (nth b 0)]
+                (if (and (= (:kind bd) 1) (> (count (:orig bd)) 0))
+                  (let [ps (:ps bd)
+                        ts (loop [k 0 acc: Vec(ty/STy) []] (if (>= k (count ps)) acc (recur (+ k 1) (conj acc (ty/any)))))]
+                    (sty-of st (nth (:orig bd) 0) ps ts false (+ depth 1)))
+                  (ty/any)))
+        :else
+        (let [gn (global-name st name)
+              fi (idx-of (:gfuns st) gn)
+              nsame (loop [k 0 c 0] (if (>= k (count (:gfuns st))) c (recur (+ k 1) (if (= (nth (:gfuns st) k) gn) (+ c 1) c))))]
+          (cond
+            (and (>= fi 0) (= nsame 1))
+            (let [ps (nth (:gfun-ps st) fi)
+                  ts (loop [k 0 acc: Vec(ty/STy) []] (if (>= k (count ps)) acc (recur (+ k 1) (conj acc (ty/any)))))]
+              (sty-of st (nth (nth (:gfun-orig st) fi) 0) ps ts true (+ depth 1)))
+            (>= fi 0) (ty/any)
+            :else
+            (let [bid (resolve-builtin st name)]
+              (if (< bid 0) (ty/any)
+                (let [bb (nth (:builtins st) bid)]
+                  (match (get fa/FN-RET (str (:module bb) " " (:name bb))) (Some r) (ret-sty r) (None) (ty/any)))))))))
+    _ (ty/any)))
+
+(defn- arg-sty-str Str [st: &St n: &a/Node t: &ty/STy]
+  (let [l (lambda-shape n)] (if (not= l "") l (str "`" (clip-type (ty/show t)) "`"))))
+
+(defn- overload-tags Vec(Vec(Int)) [st: &St b: &rt/Builtin n: Int]
+  (let [bs (:builtins st)]
+    (loop [i 0 acc: Vec(Vec(Int)) []]
+      (if (>= i (count bs)) acc
+        (let [x (nth bs i)]
+          (recur (+ i 1)
+                 (if (and (= (:name x) (:name b)) (= (:module x) (:module b)))
+                   (let [os (:overloads x)]
+                     (loop [k 0 a2 acc] (if (>= k (count os)) a2
+                                          (recur (+ k 1) (if (= (count (:tags (nth os k))) n) (conj a2 (:tags (nth os k))) a2)))))
+                   acc)))))))
+
+(defn- member-fits? Bool [m: &ty/STy t: Int]
+  (if (< t 0) true (rt/tag-fits? (ty/tag m) t)))
+
+(defn- some-fits? Bool [x: &ty/STy t: Int]
+  (let [ms (ty/members x)] (loop [k 0] (if (>= k (count ms)) false (if (member-fits? (nth ms k) t) true (recur (+ k 1)))))))
+
+(defn- member-callable? Bool [os: &Vec(Vec(Int)) ts: &Vec(ty/STy) i: Int m: &ty/STy]
+  (loop [k 0]
+    (if (>= k (count os)) false
+      (let [o (nth os k)
+            ok (and (member-fits? m (nth o i))
+                    (loop [j 0] (if (>= j (count ts)) true (if (or (= j i) (some-fits? (nth ts j) (nth o j))) (recur (+ j 1)) false))))]
+        (if ok true (recur (+ k 1)))))))
+
+(defn- non-null-overloads Vec(Vec(Int)) [os: &Vec(Vec(Int))]
+  (loop [k 0 acc: Vec(Vec(Int)) []]
+    (if (>= k (count os)) acc
+      (let [o (nth os k) has-null (loop [j 0] (if (>= j (count o)) false (if (= (nth o j) 1) true (recur (+ j 1)))))]
+        (recur (+ k 1) (if has-null acc (conj acc o)))))))
+
+(defn- implicit-fn? Bool [st: &St bid: Int i: Int arg: &a/Node]
+  (or (and (wants-fn? st bid i) (not (fn-valued-call? arg)) (or (uses-dollar? arg) (not (maybe-fn? arg)) (empty-lambda-dollar? arg)))
+      (and (lazy-arg? st bid i) (not (lambda-or-ref? arg)))))
+
+(defn- arity-fits? Bool [st: &St bid: Int n: Int]
+  (let [b (nth (:builtins st) bid)
+        key (str (:module b) " " (:name b))]
+    (if (not (contains? fa/FN-SIG key)) true
+      (let [sigs (get! fa/FN-SIG key)]
+        (loop [i 0] (if (>= i (count sigs)) false
+                      (let [[lo hi t] (sig-parts (nth sigs i))] (if (and (>= n lo) (<= n hi)) true (recur (+ i 1))))))))))
+
+(defn- check-arity Values(St Bool) [st: St bid: Int args: &Vec(a/Node) sp: &a/Span]
+  (let [b (nth (:builtins st) bid)
+        key (str (:module b) " " (:name b))
+        n (count args)]
+    (if (arity-fits? st bid n) (values st false)
+      (let [sigs (get! fa/FN-SIG key)
+            [lo hi t] (sig-parts (nth sigs 0))
+            got (loop [i 0 acc: Vec(Str) []]
+                  (if (>= i n) acc (recur (+ i 1) (conj acc (arity-arg-str st (nth args i))))))]
+        (values (diag st (str "Expects `" hi "` argument but got `" n "`. Expecting: " (clip-params t) ", but got: (" (str/join ", " got) ").") sp)
+                true)))))
+
+(defn- declared-param Str [b: &rt/Builtin n: Int i: Int]
+  (let [key (str (:module b) " " (:name b))]
+    (if (not (contains? fa/FN-SIG key)) ""
+      (let [sigs (get! fa/FN-SIG key)
+            hits (loop [k 0 acc: Vec(Vec(Str)) []]
+                   (if (>= k (count sigs)) acc
+                     (let [[lo hi m t] (sig-fields (nth sigs k))
+                           ps (bound-params (split-top-commas (subs t 1 (- (count t) 1))) m n)]
+                       (recur (+ k 1) (if (and (>= n lo) (<= n hi) (> (count ps) 0) (not= (nth ps 0) "Null")) (conj acc ps) acc)))))]
+        (if (and (= (count hits) 1) (< i (count (nth hits 0)))) (nth (nth hits 0) i) "")))))
+
+(defn- bound-params Vec(Str) [ps: Vec(Str) m: &Str n: Int]
+  (let [skip (- (count ps) n)]
+    (if (or (<= skip 0) (not= (count m) (count ps))) ps
+      (loop [i 0 left skip acc: Vec(Str) []]
+        (if (>= i (count ps)) acc
+          (if (and (> left 0) (= (nth m i) 49)) (recur (+ i 1) (- left 1) acc)
+            (recur (+ i 1) left (conj acc (nth ps i)))))))))
+
+(defn- sig-parts Values(Int Int Str) [s: &Str]
+  (let [[lo hi m t] (sig-fields s)] (values lo hi t)))
+
+(defn- sig-fields Values(Int Int Str Str) [s: &Str]
+  (let [a (str/index-of s " ")
+        b (str/index-of-after s " " (+ a 1))
+        c (str/index-of-after s " " (+ b 1))
+        [lo e1] (parse-long (subs s 0 a))
+        [hi e2] (parse-long (subs s (+ a 1) b))
+        m (subs s (+ b 1) c)]
+    (values lo hi (if (= m "-") "" m) (subs s (+ c 1) (count s)))))
+
+(defn- clip-params Str [t: &Str]
+  (let [inner (subs t 1 (- (count t) 1))
+        ps (split-top-commas inner)]
+    (str "(" (str/join ", " (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (clip-type (nth ps i))))))) ")")))
+
+(defn- split-top-commas Vec(Str) [s: &Str]
+  (loop [i 0 d 0 start 0 acc: Vec(Str) []]
+    (if (>= i (count s)) (if (= (count s) 0) acc (conj acc (subs s start (count s))))
+      (let [c (nth s i)]
+        (cond
+          (or (= c 40) (= c 60) (= c 91) (= c 123)) (recur (+ i 1) (+ d 1) start acc)
+          (and (= c 62) (> i 0) (= (nth s (- i 1)) 45)) (recur (+ i 1) d start acc)
+          (or (= c 41) (= c 62) (= c 93) (= c 125)) (recur (+ i 1) (- d 1) start acc)
+          (and (= c 44) (= d 0)) (recur (+ i 2) d (+ i 2) (conj acc (subs s start i)))
+          :else (recur (+ i 1) d start acc))))))
+
+(defn- arity-arg-str Str [st: &St n: &a/Node]
+  (let [l (lambda-shape n)]
+    (cond
+      (not= l "") l
+      (match (:e n) (a/EArr els) (= (count els) 0) _ false) "Array<Nothing>"
+      :else (clip-type (ty/show (sty-of st n [] [] false 0))))))
+
+(defn- check-types St [st: St bid: Int args: &Vec(a/Node) sp: &a/Span]
+  (if (< bid 0) st
+    (if (arity-fits? st bid (count args)) (check-overload-types st bid args sp) st)))
+
+(defn- arity-diag St [st: St bid: Int args: &Vec(a/Node) sp: &a/Span]
+  (if (< bid 0) st (let [[s2 bad] (check-arity st bid args sp)] s2)))
+
+(defn- check-overload-types St [st: St bid: Int args: &Vec(a/Node) sp: &a/Span]
+  (if (< bid 0) st
+    (let [b (nth (:builtins st) bid)
+          n (count args)
+          os (overload-tags st b n)
+          ts (loop [i 0 acc: Vec(ty/STy) []]
+               (if (>= i n) acc
+                 (recur (+ i 1) (conj acc (if (or (not= (lambda-shape (nth args i)) "") (implicit-fn? st bid i (nth args i))) (ty/any)
+                                            (sty-of st (nth args i) [] [] false 0))))))
+          [bi bm] (loop [i 0]
+                    (if (>= i n) (values -1 (ty/any))
+                      (let [ms (ty/members (nth ts i))
+                            bad (loop [k 0] (if (>= k (count ms)) -1 (if (member-callable? os ts i (nth ms k)) (recur (+ k 1)) k)))]
+                        (if (>= bad 0) (values i (nth ms bad)) (recur (+ i 1))))))]
+      (cond
+        (or (= (count os) 0) (< bi 0)) st
+        (= (count (non-null-overloads os)) 1)
+        (let [dt (declared-param b n bi)]
+          (diag st (str "Expecting Type: `" (if (= dt "") (nth rt/TYPE-NAMES (nth (nth (non-null-overloads os) 0) bi)) dt)
+                        "`, but got: `" (ty/show bm) "`.") sp))
+        :else
+        (diag st (str "Unable to call: `" (:name b) "` with arguments: ("
+                      (str/join ", " (loop [i 0 acc: Vec(Str) []] (if (>= i n) acc (recur (+ i 1) (conj acc (arg-sty-str st (nth args i) (nth ts i)))))))
+                      ").") sp)))))
+
+(defn- fn-arities Vec(Int) [key: &Str i: Int]
+  (match (get fa/FN-ARITY key)
+    (Some os) (loop [k 0 acc: Vec(Int) []]
+      (if (>= k (count os)) acc
+        (let [ps (nth os k)
+              a (if (< i (count ps)) (nth ps i) -1)]
+          (if (< a 0) [] (recur (+ k 1) (conj acc a))))))
+    (None) []))
+
+(defn- lambda-shape Str [n: &a/Node]
+  (match (:e n)
+    (a/ELambda ps rty body) (str "(" (str/join ", " (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (:name (nth ps i))))))) ") -> ?")
+    _ ""))
+
+(defn- lit-type Str [n: &a/Node]
+  (match (:e n)
+    (a/EBool b) (if b "true" "false")
+    (a/EArr els) (if (= (count els) 0) "Array<Nothing>"
+                   (loop [i 0 ts: Vec(Str) []]
+                     (if (>= i (count els)) (str "Array<" (str/join " | " ts) ">")
+                       (let [el (nth els i) t (lit-type (:value el))]
+                         (if (or (= t "") (> (count (:cond el)) 0)) ""
+                           (recur (+ i 1) (if (loop [k 0] (if (>= k (count ts)) false (if (= (nth ts k) t) true (recur (+ k 1))))) ts (conj ts t))))))))
+    (a/EObj es) (if (= (count es) 0) "Object"
+                  (let [fs (loop [i 0 acc: Vec(Str) []]
+                             (if (>= i (count es)) acc
+                               (match (nth es i)
+                                 (a/EKV k attrs v c)
+                                 (let [kn (match k (a/KName ns nm) (if (= ns "") (str nm) "")
+                                                   (a/KStr ps) (let [[plain txt] (plain-parts ps)] (if plain txt ""))
+                                                   _ "")
+                                       t (lit-type v)]
+                                   (if (or (= kn "") (= t "") (> (count attrs) 0) (> (count c) 0)) []
+                                     (recur (+ i 1) (conj acc (str kn ": " t)))))
+                                 _ [])))]
+                    (cond (< (count fs) (count es)) ""
+                          (= (count fs) 1) (str "{| " (nth fs 0) " |}")
+                          :else (str "{|" (str/join ", " fs) "|}"))))
+    _ (static-type n)))
+
+(defn- clip-type Str [t: &Str]
+  (if (<= (count t) 43) (str t) (str (subs t 0 20) "..." (subs t (- (count t) 20) (count t)))))
+
+(defn- arg-type-str Str [n: &a/Node]
+  (let [l (lambda-shape n)]
+    (if (not= l "") l
+      (let [t (lit-type n)] (if (= t "") "Any" (str "`" (clip-type t) "`"))))))
+
+(defn- prefix-call? Bool [f: &a/Node sp: &a/Span] (= (:start (:sp f)) (:start sp)))
+
+(defn- param-tys Vec(Vec(a/Ty)) [ps: &Vec(a/Param)]
+  (loop [i 0 acc: Vec(Vec(a/Ty)) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (:ty (nth ps i)))))))
+
+(defn- alias-ast Vec(a/Ty) [st: &St name: &Str]
+  (let [ts (:types st)]
+    (loop [i (- (count ts) 1)] (if (< i 0) [] (if (= (:name (nth ts i)) name) (:ast (nth ts i)) (recur (- i 1)))))))
+
+(defn- fn-ty? Bool [st: &St t: &a/Ty depth: Int]
+  (if (> depth 16) false
+    (match (:t t)
+      (a/TFn ps r) true
+      (a/TUnion alts) (loop [i 0] (if (>= i (count alts)) false (if (fn-ty? st (nth alts i) (+ depth 1)) true (recur (+ i 1)))))
+      (a/TName n args) (let [al (alias-ast st n)] (and (> (count al) 0) (fn-ty? st (nth al 0) (+ depth 1))))
+      _ false)))
+
+(defn- fn-array-ty? Bool [st: &St t: &a/Ty depth: Int]
+  (if (> depth 16) false
+    (match (:t t)
+      (a/TName n args) (if (and (= n "Array") (= (count args) 1)) (fn-ty? st (nth args 0) 0)
+                         (let [al (alias-ast st n)] (and (> (count al) 0) (fn-array-ty? st (nth al 0) (+ depth 1)))))
+      (a/TUnion alts) (loop [i 0] (if (>= i (count alts)) false (if (fn-array-ty? st (nth alts i) (+ depth 1)) true (recur (+ i 1)))))
+      _ false)))
+
+(defn- wrap-flags Int [st: &St gn: &Str i: Int]
+  (loop [k 0 fl 0]
+    (if (>= k (count (:gfuns st))) fl
+      (if (not= (nth (:gfuns st) k) gn) (recur (+ k 1) fl)
+        (let [pts (nth (:gfun-pty st) k)
+              ty (if (< i (count pts)) (nth pts i) [])
+              f1 (if (and (> (count ty) 0) (fn-ty? st (nth ty 0) 0)) (bit-or fl 1) fl)
+              f2 (if (and (> (count ty) 0) (fn-array-ty? st (nth ty 0) 0)) (bit-or f1 2) f1)]
+          (recur (+ k 1) f2))))))
+
+(defn- dollar-lambda a/Node [n: &a/Node]
+  (match (:e n)
+    (a/ELambda ps rty body) (str-node n)
+    _ (a/->Node (a/->ELambda (dollar-params (:sp n)) [] n) (:sp n))))
+
+(defn- str-node a/Node [n: &a/Node] (a/->Node (:e n) (:sp n)))
+
+(defn- wrap-infix-args Vec(a/Node) [st: &St gn: &Str args: &Vec(a/Node)]
+  (loop [i 0 acc: Vec(a/Node) []]
+    (if (>= i (count args)) acc
+      (let [a (nth args i)
+            fl (if (= i 0) 0 (wrap-flags st gn i))
+            w (cond
+                (= fl 0) (str-node a)
+                (match (:e a) (a/ELambda ps rty body) true _ false) (str-node a)
+                (and (> (bit-and fl 2) 0) (match (:e a) (a/EArr els) true _ false))
+                (match (:e a)
+                  (a/EArr els) (a/->Node (a/->EArr (loop [j 0 out: Vec(a/Elem) []]
+                                                      (if (>= j (count els)) out
+                                                        (let [el (nth els j)] (recur (+ j 1) (conj out (a/->Elem (dollar-lambda (:value el)) (:cond el))))))))
+                                         (:sp a))
+                  _ (str-node a))
+                (> (bit-and fl 1) 0) (dollar-lambda a)
+                :else (str-node a))]
+        (recur (+ i 1) (conj acc w))))))
+
+(defn- check-fn-args St [st: St bid: Int f: &a/Node args: &Vec(a/Node) sp: &a/Span]
+  (if (or (< bid 0) (not (prefix-call? f sp))) st
+    (let [b (nth (:builtins st) bid)
+          key (str (:module b) " " (:name b))
+          nov (match (get fa/FN-ARITY key) (Some os) (count os) (None) 0)
+          bad (loop [i 0]
+                (if (>= i (count args)) -1
+                  (let [ar (fn-arities key i)
+                        arg (nth args i)]
+                    (if (= (count ar) 0) (recur (+ i 1))
+                      (let [ok (match (:e arg)
+                                 (a/ELambda ps rty body)
+                                 (let [tot (count ps)
+                                       req (loop [k 0 c 0] (if (>= k tot) c (recur (+ k 1) (if (= (count (:default (nth ps k))) 0) (+ c 1) c))))]
+                                   (loop [k 0] (if (>= k (count ar)) false (if (and (<= req (nth ar k)) (<= (nth ar k) tot)) true (recur (+ k 1))))))
+                                 _ (= (lit-type arg) ""))]
+                        (if ok (recur (+ i 1)) i))))))]
+      (cond
+        (< bad 0) st
+        (and (= nov 1) (= (lambda-shape (nth args bad)) ""))
+        (let [ft (match (get fa/FN-TYPE (str key " " bad)) (Some t) t (None) "")]
+          (diag st (str "Expecting Type: " ft ", but got: `" (clip-type (lit-type (nth args bad))) "`.") (:sp (nth args bad))))
+        :else
+        (diag st (str "Unable to call: `" (:name b) "` with arguments: ("
+                      (str/join ", " (loop [i 0 acc: Vec(Str) []] (if (>= i (count args)) acc (recur (+ i 1) (conj acc (arg-type-str (nth args i)))))))
+                      ").")
+              sp)))))
+
+(def BIN-BUILTINS ["+" "-" "*" "/" "++" "--" "==" "!=" "~=" "<" ">" "<=" ">=" ">>" "<<" "mod" "to" "as" "is"])
+
+(defn- const-num Values(r/Rx Str) [t: &Str]
+  (let [[n e] (num/parse-lit t)] (values (r/->RConst (v/num-v n)) e)))
+
+(defn rx Values(r/R St) [st: St n: &a/Node]
+  (let [sp (:sp n)]
+    (match (:e n)
+      (a/ENull) (values (mk (r/->RConst (v/null-v)) sp) st)
+      (a/EBool b) (values (mk (r/->RConst (v/bool-v b)) sp) st)
+      (a/ENum t) (let [[x e] (const-num t)]
+                   (if (= e "") (values (mk x sp) st) (values (mk (r/->RFail e) sp) (diag st (str "Invalid number: " t) sp))))
+      (a/EStr parts) (rx-str st parts sp)
+      (a/ERegex p fl) (values (mk (r/->RConst (v/->VRegex p fl)) sp) st)
+      (a/ETemporal k t) (let [[x ok] (temporal-lit t)]
+                          (if ok (values (mk (r/->RConst x) sp) st)
+                            (values (mk (r/->RFail (str "Invalid date literal |" t "|")) sp) (diag st (str "Invalid date literal |" t "|") sp))))
+      (a/ERef name) (let [[x st2] (resolve-ref st name sp)] (values (mk x sp) st2))
+      (a/EArr els) (rx-arr st els sp)
+      (a/EObj es) (rx-obj st es sp)
+      (a/EUnary op e) (let [[x st1] (rx st e)
+                            st2 (if (or (= op "not") (= op "!")) (check-bool st1 e) st1)]
+                        (if (or (= op "not") (= op "!")) (values (mk (r/->RNot x) sp) st2)
+                          (let [bid (resolve-builtin st2 "-")]
+                            (values (mk (r/->RCallB bid [x]) sp) st2))))
+      (a/EBin op l rr osp) (rx-bin st op l rr sp osp)
+      (a/ECall f args) (rx-call st f args sp)
+      (a/ELambda ps rty body) (rx-lambda st "<anonymous>" ps body sp)
+      (a/ESelect t s) (let [[x st2] (rx st t) [s2 st3] (rx-sel st2 s sp)] (values (mk (r/->RSel x s2) sp) st3))
+      (a/EExists t) (let [[x st2] (rx st t)] (values (mk (r/->RExists x) sp) st2))
+      (a/EAssert t) (let [[x st2] (rx st t)] (values (mk (r/->RAssert x) sp) st2))
+      (a/EIf c th el) (let [[x1 st1] (rx st c) [x2 st2] (rx st1 th) [x3 st3] (rx st2 el)] (values (mk (r/->RIf x1 x2 x3) sp) st3))
+      (a/EMatch t cs) (rx-match st t cs sp)
+      (a/EAs e ty) (let [[x st2] (rx st e) [t2 st3] (rtype st2 ty)] (values (mk (r/->RAs x t2) sp) st3))
+      (a/EIs e ty) (let [[x st2] (rx st e) [t2 st3] (rtype st2 ty)] (values (mk (r/->RIs x t2) sp) st3))
+      (a/EMetaSet e s) (let [[x st2] (rx st e) [y st3] (rx st2 s)] (values (mk (r/->RMetaSet x y) sp) st3))
+      (a/EDo ds body) (rx-do st ds body sp)
+      (a/EUsing ds body) (rx-do st ds body sp)
+      (a/EUpdate t cs) (rx-update st t cs sp)
+      (a/ETypeRef ty) (let [[t2 st2] (rtype st ty)] (values (mk (r/->RTypeV t2) sp) st2))
+      (a/EErr msg) (values (mk (r/->RFail msg) sp) (diag st msg sp)))))
+
+(defn- rx-list Values(Vec(r/R) St) [st: St ns: &Vec(a/Node)]
+  (loop [i 0 acc: Vec(r/R) [] s st]
+    (if (>= i (count ns)) (values acc s)
+      (let [[x s2] (rx s (nth ns i))] (recur (+ i 1) (conj acc x) s2)))))
+
+(defn- rx-str Values(r/R St) [st: St parts: &Vec(a/StrPart) sp: &a/Span]
+  (let [all-text (loop [i 0] (if (>= i (count parts)) true (if (match (nth parts i) (a/SPText t) true _ false) (recur (+ i 1)) false)))]
+    (if all-text
+      (values (mk (r/->RConst (v/->VStr (loop [i 0 out ""] (if (>= i (count parts)) out (recur (+ i 1) (str out (match (nth parts i) (a/SPText t) t _ ""))))))) sp) st)
+      (loop [i 0 acc: Vec(r/R) [] s st]
+        (if (>= i (count parts)) (values (mk (r/->RInterp acc) sp) s)
+          (match (nth parts i)
+            (a/SPText t) (recur (+ i 1) (conj acc (mk (r/->RConst (v/->VStr t)) sp)) s)
+            (a/SPExpr e) (let [[x s2] (rx s e)] (recur (+ i 1) (conj acc x) s2))))))))
+
+(defn- rx-cond Values(Vec(r/R) St) [st: St c: &Vec(a/Node)]
+  (if (= (count c) 0) (values [] st) (let [[x s2] (rx st (nth c 0))] (values [x] s2))))
+
+(defn- rx-arr Values(r/R St) [st: St els: &Vec(a/Elem) sp: &a/Span]
+  (loop [i 0 acc: Vec(r/RElem) [] s st]
+    (if (>= i (count els)) (values (mk (r/->RArr acc) sp) s)
+      (let [el (nth els i)
+            [x s2] (rx s (:value el))
+            [c s3] (rx-cond s2 (:cond el))]
+        (recur (+ i 1) (conj acc (r/->RElem x c)) s3)))))
+
+(defn- ns-expr Values(Vec(r/R) St) [st: St prefix: &Str sp: &a/Span]
+  (if (= prefix "") (values [] st)
+    (let [nss (:nss st)
+          i (loop [k 0] (if (>= k (count nss)) -1 (if (= (:prefix (nth nss k)) prefix) k (recur (+ k 1)))))]
+      (if (>= i 0) (values [(mk (r/->RConst (v/->VNsV (nth nss i))) sp)] st)
+        (let [[x s2] (resolve-ref st (str prefix) sp)] (values [(mk x sp)] s2))))))
+
+(defn- rx-obj Values(r/R St) [st: St es: &Vec(a/Entry) sp: &a/Span]
+  (loop [i 0 acc: Vec(r/REntry) [] s st]
+    (if (>= i (count es)) (values (mk (r/->RObj acc) sp) s)
+      (match (nth es i)
+        (a/EKV k attrs value cnd)
+        (let [[rk s1] (rx-key s k sp)
+              [ras s2] (rx-attrs s1 attrs sp)
+              [x s3] (rx s2 value)
+              [c s4] (rx-cond s3 cnd)]
+          (recur (+ i 1) (conj acc (r/->REKV rk ras x c)) s4))
+        (a/ESpread x0 cnd)
+        (let [[x s1] (rx s x0) [c s2] (rx-cond s1 cnd)]
+          (recur (+ i 1) (conj acc (r/->RESpread x c)) s2))))))
+
+(defn- rx-key Values(r/RKey St) [st: St k: &a/Key sp: &a/Span]
+  (match k
+    (a/KName ns name) (let [[nx s1] (ns-expr st ns sp)] (values (r/->RKName nx name) s1))
+    (a/KStr parts) (let [[x s1] (rx-str st parts sp)] (values (r/->RKExpr [] x) s1))
+    (a/KExpr ns e) (let [[nx s1] (ns-expr st ns sp) [x s2] (rx s1 e)] (values (r/->RKExpr nx x) s2))))
+
+(defn- rx-attrs Values(Vec(r/RAttr) St) [st: St attrs: &Vec(a/Attr) sp: &a/Span]
+  (loop [i 0 acc: Vec(r/RAttr) [] s st]
+    (if (>= i (count attrs)) (values acc s)
+      (let [at (nth attrs i)
+            [nx s1] (ns-expr s (:ns at) sp)
+            [x s2] (rx s1 (:value at))
+            [c s3] (rx-cond s2 (:cond at))]
+        (recur (+ i 1) (conj acc (r/->RAttr nx (:name at) x c (:spread at))) s3)))))
+
+(defn- rx-bin Values(r/R St) [st: St op: &Str l: &a/Node rr: &a/Node sp: &a/Span osp: &a/Span]
+  (if (= op "and") (let [[x s1] (rx st l) [y s2] (rx s1 rr)] (values (mk (r/->RAnd x y) sp) (check-bool (check-bool s2 l) rr)))
+    (if (= op "or") (let [[x s1] (rx st l) [y s2] (rx s1 rr)] (values (mk (r/->ROr x y) sp) (check-bool (check-bool s2 l) rr)))
+      (if (= op "default") (let [[x s1] (rx st l) [y s2] (rx s1 rr)] (values (mk (r/->RDefault x y) sp) s2))
+        (let [bid (resolve-builtin st op)
+              [xs s2a] (rx-args (check-types st bid [l rr] sp) bid [l rr] sp false)
+              s2 (arity-diag s2a bid [l rr] sp)]
+          (if (< bid 0) (values (mk (r/->RFail (str "Unknown operator " op)) sp) (diag s2 (str "Unknown operator " op) sp))
+            (values (mk (builtin-call s2 bid op xs) (if (or (= op "++") (= op "--")) osp sp)) s2)))))))
+
+(defn- builtin-call r/Rx [st: &St bid: Int name: &Str xs: Vec(r/R)]
+  (let [k (r/num-op name)]
+    (if (and (> k 0) (= (count xs) 2) (= (:module (nth (:builtins st) bid)) "dw::Core"))
+      (r/->RNumOp k bid (nth xs 0) (nth xs 1))
+      (r/->RCallB bid xs))))
+
+(defn- rx-args Values(Vec(r/R) St) [st: St bid: Int args: &Vec(a/Node) sp: &a/Span prefix: Bool]
+  (loop [i 0 acc: Vec(r/R) [] s st]
+    (if (>= i (count args)) (values acc s)
+      (let [arg (nth args i)]
+        (if (and (not prefix) (wants-fn? s bid i) (not (fn-valued-call? arg)) (or (uses-dollar? arg) (not (maybe-fn? arg))))
+          (let [[x s2] (rx-lambda s "<anonymous>" (dollar-params (:sp arg)) arg (:sp arg))]
+            (recur (+ i 1) (conj acc x) s2))
+          (if (and (lazy-arg? s bid i) (not (lambda-or-ref? arg)))
+            (let [[x s2] (rx-lambda s "<anonymous>" [] arg (:sp arg))]
+              (recur (+ i 1) (conj acc x) s2))
+          (if (and (not prefix) (wants-fn? s bid i) (empty-lambda-dollar? arg))
+            (let [body (match (:e arg) (a/ELambda ps rty b) b _ arg)
+                  [x s2] (rx-lambda s "<anonymous>" (dollar-params (:sp arg)) body (:sp arg))]
+              (recur (+ i 1) (conj acc x) s2))
+          (let [[x s2] (rx s arg)] (recur (+ i 1) (conj acc x) s2)))))))))
+
+(defn- empty-lambda-dollar? Bool [n: &a/Node]
+  (match (:e n) (a/ELambda ps rty body) (and (= (count ps) 0) (uses-dollar? body)) _ false))
+
+(defn- rx-call Values(r/R St) [st: St f: &a/Node args: &Vec(a/Node) sp: &a/Span]
+  (match (:e f)
+    (a/ERef name)
+    (let [[bad st0] (check-fwd st name (:sp f))]
+      (if bad (let [[xs s3] (rx-list st0 args)] (values (mk (r/->RCall (mk (r/->RFail (fwd-msg name)) (:sp f)) xs) (:sp f)) s3))
+        (rx-call-ref st0 f name args sp)))
+    _ (let [[fx s1] (rx st f) [xs s2] (rx-list s1 args)] (values (mk (r/->RCall fx xs) sp) s2))))
+
+(defn- rx-call-ref Values(r/R St) [st: St f: &a/Node name: &Str args: &Vec(a/Node) sp: &a/Span]
+    (let [csp (:sp f)
+          [found lx st2 skipped] (lookup-ref st name csp)
+          gn (if found "" (global-name st2 name))]
+      (if (or found skipped)
+        (let [[fx s2] (if found (values lx st2) (skipped-ref st2 name))
+              [xs s3] (rx-list s2 args)]
+          (values (mk (r/->RCall (mk fx csp) xs) csp) s3))
+        (let [fi (idx-of (:gfuns st2) gn)]
+          (if (>= (idx-of (:gvars st2) gn) 0)
+            (let [[fx s3] (rx st2 f) [xs s4] (rx-list s3 args)] (values (mk (r/->RCall fx xs) csp) s4))
+          (if (>= fi 0)
+            (let [d (nth (:gfun-defs st2) fi)
+                  args2 (if (prefix-call? f sp) args (wrap-infix-args st2 gn args))
+                  [xs s3] (rx-list st2 args2)]
+              (values (mk (r/->RCallG d xs) csp) s3))
+            (let [bid (resolve-builtin st2 name)]
+              (if (>= bid 0)
+                (let [[xs0 s3a] (rx-args (check-types (check-fn-args st2 bid f args sp) bid args sp) bid args sp (prefix-call? f sp)) s3 (arity-diag s3a bid args sp) xs (with-origin s3 bid args xs0 sp)] (values (mk (builtin-call s3 bid name xs) csp) s3))
+                (let [[fx s3] (rx st2 f) [xs s4] (rx-list s3 args)] (values (mk (r/->RCall fx xs) csp) s4))))))))))
+
+(defn- rx-var-value Values(r/R St) [st: St name: &Str value: &a/Node]
+  (match (:e value)
+    (a/ELambda ps rty body) (rx-lambda st (str name) ps body (:sp value))
+    _ (rx st value)))
+
+(defn- rx-lambda Values(r/R St) [st: St name: Str ps: &Vec(a/Param) body: &a/Node sp: &a/Span]
+  (let [[osc s0] (push-scope st)
+        s1 (assoc s0 :frames (conj (:frames s0) (->Frame [] 0 0 -1 [] [])))
+        [params s2] (bind-params s1 ps)
+        [b s3] (rx s2 body)
+        f (top s3)
+        s4 (assoc (assoc s3 :frames (subvec (:frames s3) 0 (- (count (:frames s3)) 1))) :scope osc)
+        d (count (:fns s4))
+        fd (r/->FnDef name params (:maxslots f) (count (:cap-names f)) b sp [])]
+    (values (mk (r/->RClosure d (:cap-srcs f)) sp) (assoc s4 :fns (conj (:fns s4) fd)))))
+
+(defn- push-generics St [st: St gens: &Vec(Str)]
+  (loop [i 0 s st] (if (>= i (count gens)) s (recur (+ i 1) (assoc s :types (conj (:types s) (->TypeDef (nth gens i) (any-type) [] [])))))))
+
+(defn- pop-types St [st: St n: Int] (assoc st :types (subvec (:types st) 0 n)))
+
+(defn- bind-params Values(Vec(r/Param) St) [st: St ps: &Vec(a/Param)]
+  (let [[defs s1] (loop [i 0 acc: Vec(r/Param) [] s st]
+                    (if (>= i (count ps)) (values acc s)
+                      (let [p (nth ps i)
+                            [dv s2] (if (= (count (:default p)) 0) (values [] s)
+                                      (let [[x s3] (rx s (nth (:default p) 0))] (values [x] s3)))
+                            [tv s4] (if (= (count (:ty p)) 0) (values [] s2)
+                                      (let [[t s5] (rtype s2 (nth (:ty p) 0))] (values [t] s5)))]
+                        (recur (+ i 1) (conj acc (r/->Param (:name p) tv dv)) s4))))]
+    (loop [i 0 s s1]
+      (if (>= i (count ps)) (values defs s)
+        (let [[k s2] (bind-slot s (:name (nth ps i)))] (recur (+ i 1) s2))))))
+
+(defn- rx-sel Values(r/RSelK St) [st: St s: &a/Sel sp: &a/Span]
+  (match s
+    (a/SelKey ns name) (let [[nx s1] (ns-expr st ns sp)] (values (r/->SKey nx name) s1))
+    (a/SelMulti ns name) (let [[nx s1] (ns-expr st ns sp)] (values (r/->SMulti nx name) s1))
+    (a/SelDesc ns name) (let [[nx s1] (ns-expr st ns sp)] (values (r/->SDesc nx name) s1))
+    (a/SelDescMulti ns name) (let [[nx s1] (ns-expr st ns sp)] (values (r/->SDescMulti nx name) s1))
+    (a/SelAttr name) (values (r/->SAttr name) st)
+    (a/SelAllAttrs) (values (r/->SAllAttrs) st)
+    (a/SelKV name) (values (r/->SKV name) st)
+    (a/SelDescKV name) (values (r/->SDescKV name) st)
+    (a/SelAllKV) (values (r/->SAllKV) st)
+    (a/SelNs) (values (r/->SNs) st)
+    (a/SelMeta name) (values (r/->SMeta name) st)
+    (a/SelDyn e) (let [[x s1] (rx st e)] (values (r/->SDyn x) s1))
+    (a/SelQDyn ns e) (let [[nx s1] (ns-expr st ns sp) [x s2] (rx s1 e)] (values (r/->SQDyn nx x) s2))
+    (a/SelMultiDyn e) (let [[x s1] (rx st e)] (values (r/->SDyn x) s1))
+    (a/SelRange f t) (let [[x s1] (rx st f) [y s2] (rx s1 t)] (values (r/->SRange x y) s2))
+    (a/SelFilter p) (let [[x s1] (rx-lambda st "<filter>" (dollar-params sp) p sp)] (values (r/->SFilter x) s1))
+    (a/SelAttrDyn e) (let [[x s1] (rx st e)] (values (r/->SAttrDyn x) s1))
+    (a/SelAttrQ ns name multi) (values (r/->SAttr name) st)))
+
+(defn- rx-match Values(r/R St) [st: St t: &a/Node cs: &Vec(a/Case) sp: &a/Span]
+  (let [[tx s1] (rx st t)
+        [tslot s2] (bind-slot s1 "<match>")]
+    (loop [i 0 acc: Vec(r/RCase) [] s s2]
+      (if (>= i (count cs)) (values (mk (r/->RMatch tx tslot acc) sp) s)
+        (let [c (nth cs i)
+              n0 (nbinds s)
+              [osc sc] (push-scope s)
+              [bslot s3] (bind-slot-full sc (if (= (:bind c) "") "$" (:bind c)) []
+                                         (match (:pat c) (a/PRegex re) [(ty/arr (ty/arr (ty/str-t [])))] _ []))
+              [p s4] (rx-pat s3 (:pat c) sp)
+              [body s5] (rx s4 (:body c))
+              s6 (assoc (pop-binds s5 n0) :scope osc)]
+          (recur (+ i 1) (conj acc (r/->RCase bslot p body (:sp c))) s6))))))
+
+(defn- rx-pat Values(r/RPat St) [st: St p: &a/Pat sp: &a/Span]
+  (match p
+    (a/PLit x) (let [[y s1] (rx st x)] (values (r/->PLitR y) s1))
+    (a/PGuard x) (let [[y s1] (rx st x)] (values (r/->PGuardR y) s1))
+    (a/PType ty) (let [[t s1] (rtype st ty)] (values (r/->PTypeR t) s1))
+    (a/PRegex x) (let [[y s1] (rx st x)] (values (r/->PRegexR y) s1))
+    (a/PArrDestr h t) (let [[hs s1] (bind-slot st h) [ts s2] (bind-slot s1 t)] (values (r/->PArrR hs ts) s2))
+    (a/PObjDestr k vv t) (let [[ks s1] (bind-slot st k) [vs s2] (bind-slot s1 vv) [ts s3] (bind-slot s2 t)] (values (r/->PObjR ks vs ts) s3))
+    (a/PElse) (values (r/->PElseR) st)))
+
+(defn- rx-update Values(r/R St) [st: St t: &a/Node cs: &Vec(a/UpdCase) sp: &a/Span]
+  (let [[tx s1] (rx st t)]
+    (loop [i 0 acc: Vec(r/RUpd) [] s s1]
+      (if (>= i (count cs)) (values (mk (r/->RUpdate tx -1 acc) sp) s)
+        (let [c (nth cs i)
+              n0 (nbinds s)
+              [osc sc0] (push-scope s)
+              olz (:lazy sc0)
+              sc (assoc sc0 :lazy (:sp c))
+              [bslot s2] (bind-slot sc (if (= (:bind c) "") "$" (:bind c)))
+              [islot s3] (if (= (:index c) "") (values -1 s2) (bind-slot s2 (:index c)))
+              [path s4] (loop [k 0 ps: Vec(r/RSelK) [] ss s3]
+                          (if (>= k (count (:path c))) (values ps ss)
+                            (let [[x ss2] (rx-sel ss (nth (:path c) k) sp)] (recur (+ k 1) (conj ps x) ss2))))
+              [cnd s5] (rx-cond s4 (:cond c))
+              [body s6] (rx s5 (:body c))]
+          (recur (+ i 1) (conj acc (r/->RUpd bslot islot path cnd body (:upsert c) (:sp c))) (assoc (assoc (pop-binds s6 n0) :scope osc) :lazy olz)))))))
+
+(defn temporal-lit Values(v/Val Bool) [t: &Str]
+  (let [[x e] (ti/parse-temporal t)]
+    (if (not= e "") (values (v/null-v) false)
+      (match x
+        (ti/TmDate d) (values (v/->VDate d) true)
+        (ti/TmTime y) (values (v/->VLocalTime y) true)
+        (ti/TmLdt y) (values (v/->VLocalDateTime y) true)
+        (ti/TmOffTime o) (values (v/->VTime o) true)
+        (ti/TmZdt z) (values (v/->VDateTime z) true)
+        (ti/TmZone z) (values (v/->VTimeZone z) true)
+        (ti/TmPeriod p) (values (v/->VPeriod p) true)))))
+
+(defn- any-type v/TypeV [] (v/->TypeV "any" "Any" [] [] [] []))
+
+(defn const-val Values(v/Val Bool) [n: &a/Node]
+  (match (:e n)
+    (a/ENull) (values (v/null-v) true)
+    (a/EBool b) (values (v/bool-v b) true)
+    (a/ENum t) (let [[x e] (num/parse-lit t)] (values (v/num-v x) (= e "")))
+    (a/EStr ps) (if (and (= (count ps) 1) (match (nth ps 0) (a/SPText t) true _ false))
+                  (values (v/->VStr (match (nth ps 0) (a/SPText t) t _ "")) true)
+                  (if (= (count ps) 0) (values (v/->VStr "") true) (values (v/null-v) false)))
+    (a/EUnary op e) (if (= op "-")
+                      (let [[x ok] (const-val e)]
+                        (match x (v/VNum m) (values (v/num-v (num/neg m)) ok) (v/VInt m-i) (let [m (num/from-int m-i)] (values (v/num-v (num/neg m)) ok)) _ (values x false)))
+                      (values (v/null-v) false))
+    (a/EArr els) (loop [i 0 acc: Vec(v/Val) []]
+                   (if (>= i (count els)) (values (v/->VArr acc) true)
+                     (let [[x ok] (const-val (:value (nth els i)))] (if ok (recur (+ i 1) (conj acc x)) (values (v/null-v) false)))))
+    (a/EObj es) (loop [i 0 acc: Vec(v/Field) []]
+                  (if (>= i (count es)) (values (v/->VObj acc) true)
+                    (match (nth es i)
+                      (a/EKV k attrs value cnd) (match k
+                                                  (a/KName ns name) (let [[x ok] (const-val value)] (if ok (recur (+ i 1) (conj acc (v/field name x))) (values (v/null-v) false)))
+                                                  _ (values (v/null-v) false))
+                      _ (values (v/null-v) false))))
+    _ (values (v/null-v) false)))
+
+(defn- ty-of Values(v/TypeV St) [st: St ty: &a/Ty]
+  (let [sp (:sp ty)]
+    (match (:t ty)
+      (a/TName name args) (let [[m n] (split-qname name)
+                                gd (generic-def st n)]
+                            (if (and (> (count gd) 0) (= (count args) (count (:gens (nth gd 0)))))
+                              (instantiate st (nth gd 0) args)
+                              (let [found (type-by-name st n)]
+                                (if (> (count found) 0)
+                                  (let [t (nth found 0)]
+                                    (cond
+                                      (= (:kind t) "alias") (values (v/->TypeV "ref" (:name t) (:args t) [] [] []) st)
+                                      (and (= (:kind t) "name") (> (count args) 0))
+                                      (let [[ats s1] (ty-list st args)] (values (v/->TypeV "name" (:name t) ats [] [] []) s1))
+                                      :else (values t st)))
+                                  (let [lt (later-type st n)]
+                                    (if (> (count lt) 0) (ty-of (register-decl st (nth lt 0)) ty)
+                                      (values (any-type) (diag st (str "Unable to resolve reference of: `" name "`.") sp))))))))
+      (a/TObj fields closed ordered)
+      (let [[fs s1] (type-fields st fields)]
+        (values (v/->TypeV "obj" (if closed "closed" "open") [] fs [] []) s1))
+      (a/TUnion alts) (let [[ts s1] (ty-list st alts)] (values (v/->TypeV "union" "" ts [] [] []) s1))
+      (a/TInter parts) (let [[ts s1] (ty-list st parts)] (values (v/->TypeV "inter" "" ts [] [] []) s1))
+      (a/TLit x) (let [[val ok] (const-val x)]
+                   (if ok (values (v/->TypeV "lit" "" [] [] [val] []) st)
+                     (values (any-type) (diag st "Literal types must be constant" sp))))
+      (a/TFn ps rt0) (let [[pts s1] (ty-list st ps)
+                           [rt1 s2] (ty-of s1 rt0)
+                           fs (loop [i 0 acc: Vec(v/TypeField) []] (if (>= i (count pts)) acc (recur (+ i 1) (conj acc (v/->TypeField "" false false (nth pts i) "" [])))))]
+                       (values (v/->TypeV "fn" "Function" [rt1] fs [] []) s2))
+      (a/TSel base ns name)
+      (let [[t s1] (ty-of st base)
+            fs (:fields (deref-type t))
+            i (loop [k 0] (if (>= k (count fs)) -1 (if (= (:key (nth fs k)) name) k (recur (+ k 1)))))]
+        (if (>= i 0) (values (:ty (nth fs i)) s1)
+          (values (any-type) (diag s1 (str "Type has no field `" name "`.") sp))))
+      (a/TMeta base sch) (let [[t s1] (ty-of st base) [m ok] (const-val sch)]
+                           (match m
+                             (v/VObj fs) (values (v/->TypeV (:kind t) (:name t) (:args t) (:fields t) (:lits t) fs) s1)
+                             _ (values t (diag s1 "Type metadata must be a constant Object" sp)))))))
+
+(defn- generic-def Vec(TypeDef) [st: &St n: &Str]
+  (let [ts (:types st)]
+    (loop [i (- (count ts) 1)]
+      (if (< i 0) []
+        (let [d (nth ts i)]
+          (if (= (:name d) n)
+            (if (and (> (count (:gens d)) 0) (> (count (:ast d)) 0)) [d] [])
+            (recur (- i 1))))))))
+
+(defn- instantiate Values(v/TypeV St) [st: St d: &TypeDef args: &Vec(a/Ty)]
+  (let [nty (count (:types st))
+        [ats s1] (ty-list st args)
+        s2 (loop [i 0 s s1] (if (>= i (count ats)) s
+                              (recur (+ i 1) (assoc s :types (conj (:types s) (->TypeDef (nth (:gens d) i) (nth ats i) [] []))))))
+        [t s3] (ty-of s2 (nth (:ast d) 0))]
+    (values (v/->TypeV "ref" (:name d) [t] [] [] []) (pop-types s3 nty))))
+
+(defn- type-fields Values(Vec(v/TypeField) St) [st: St fields: &Vec(a/TField)]
+  (loop [i 0 acc: Vec(v/TypeField) [] s st]
+    (if (>= i (count fields)) (values acc s)
+      (let [fd (nth fields i)
+            [t s2] (ty-of s (:ty fd))
+            [as s3] (type-fields s2 (:attrs fd))
+            pre (:ns fd)
+            uri (if (= pre "") ""
+                  (loop [k 0] (if (>= k (count (:nss s3))) "" (if (= (:prefix (nth (:nss s3) k)) pre) (:uri (nth (:nss s3) k)) (recur (+ k 1))))))]
+        (recur (+ i 1) (conj acc (v/->TypeField (:key fd) (:optional fd) (:repeated fd) t uri as)) s3)))))
+
+(defn- deref-type v/TypeV [t: &v/TypeV]
+  (if (and (or (= (:kind t) "alias") (= (:kind t) "ref")) (> (count (:args t)) 0))
+    (deref-type (nth (:args t) 0)) t))
+
+(defn- ty-list Values(Vec(v/TypeV) St) [st: St ts: &Vec(a/Ty)]
+  (loop [i 0 acc: Vec(v/TypeV) [] s st]
+    (if (>= i (count ts)) (values acc s)
+      (let [[t s2] (ty-of s (nth ts i))] (recur (+ i 1) (conj acc t) s2)))))
+
+(defn- rtype Values(r/RType St) [st: St ty: &a/Ty]
+  (let [[t s1] (ty-of st ty)] (values (r/->RType t) s1)))
+
+(defn- rx-do Values(r/R St) [st: St ds: &Vec(a/DeclAt) body: &a/Node sp: &a/Span]
+  (let [n0 (nbinds st)
+        [osc st0] (push-scope st)
+        [var-slots s1] (loop [i 0 acc: Vec(Int) [] s st0]
+                         (if (>= i (count ds)) (values acc s)
+                           (match (:d (nth ds i))
+                             (a/DVar name ty value) (let [[k s2] (bind-slot-decl s name [value] [] DK-VAR (:sp (nth ds i)))] (recur (+ i 1) (conj acc k) s2))
+                             _ (recur (+ i 1) (conj acc -1) s))))
+        s2 (loop [i 0 s s1] (if (>= i (count ds)) s (recur (+ i 1) (register-decl s (nth ds i)))))
+        s3 (rx-fun-group s2 ds)
+        [lets s4] (loop [i 0 acc: Vec(r/R) [] s s3]
+                    (if (>= i (count ds)) (values acc s)
+                      (match (:d (nth ds i))
+                        (a/DVar name ty value) (let [[x s5] (rx-var-value s name value)] (recur (+ i 1) (conj acc x) s5))
+                        _ (recur (+ i 1) acc s))))
+        [b s5] (rx s4 body)
+        slots (loop [i 0 acc: Vec(Int) []] (if (>= i (count var-slots)) acc (recur (+ i 1) (if (>= (nth var-slots i) 0) (conj acc (nth var-slots i)) acc))))
+        chained (loop [k (- (count lets) 1) acc b]
+                  (if (< k 0) acc (recur (- k 1) (mk (r/->RLet (nth slots k) (nth lets k) acc) sp))))]
+    (values chained (assoc (pop-binds s5 n0) :scope osc))))
+
+(defn- rx-fun-group St [st: St ds: &Vec(a/DeclAt)]
+  (let [gid (count (:groups st))
+        s0 (assoc st :groups (conj (:groups st) (->Group [] [])))
+        [defs s1] (loop [i 0 acc: Vec(Int) [] s s0]
+                    (if (>= i (count ds)) (values acc s)
+                      (match (:d (nth ds i))
+                        (a/DFun name ps rty body annots gens)
+                        (let [d (count (:fns s))
+                              ph (r/->FnDef name [] 0 0 (mk (r/->RConst (v/null-v)) (:sp (nth ds i))) (:sp (nth ds i)) [])
+                              f (top s)
+                              f2 (->Frame (conj (:binds f) (->Bind name 1 d gid [body] [] (param-names-of ps) (:scope s) DK-FUN (:sp (nth ds i)))) (:nslots f) (:maxslots f) (:group f) (:cap-names f) (:cap-srcs f))]
+                          (recur (+ i 1) (conj acc d) (set-top (assoc s :fns (conj (:fns s) ph)) f2)))
+                        _ (recur (+ i 1) acc s))))]
+    (loop [i 0 k 0 s s1]
+      (if (>= i (count ds)) s
+        (match (:d (nth ds i))
+          (a/DFun name ps rty body annots gens)
+          (let [d (nth defs k)
+                nty (count (:types s))
+                [osc s00] (push-scope s)
+                sa (push-generics (assoc s00 :frames (conj (:frames s00) (->Frame [] 0 0 gid [] []))) gens)
+                [params sb] (bind-params sa ps)
+                [b sc0] (rx sb body)
+                sc (pop-types sc0 nty)
+                f (top sc)
+                sd (assoc (assoc sc :frames (subvec (:frames sc) 0 (- (count (:frames sc)) 1))) :scope osc)
+                fd (r/->FnDef name params (:maxslots f) 0 b (:sp (nth ds i)) [])]
+            (recur (+ i 1) (+ k 1) (assoc sd :fns (assoc (:fns sd) d fd))))
+          _ (recur (+ i 1) k s))))))
+
+(defn- ty-done? Bool [st: &St name: &Str]
+  (let [k (str (:cur st) "|" name) ds (:done-ty st)]
+    (loop [i 0] (if (>= i (count ds)) false (if (= (nth ds i) k) true (recur (+ i 1)))))))
+
+(defn- register-type St [st: St name: &Str gens: &Vec(Str) ty: &a/Ty]
+  (let [nty (count (:types st))
+        s0 (assoc st :types (conj (:types st) (->TypeDef name (v/->TypeV "rec" name [] [] [] []) [] [])))
+        [t s1] (ty-of (push-generics s0 gens) ty)
+        kept (loop [i nty acc: Vec(TypeDef) (subvec (:types s1) 0 nty)]
+               (if (>= i (count (:types s1))) acc
+                 (let [d (nth (:types s1) i)] (recur (+ i 1) (if (> (count (:ast d)) 0) (conj acc d) acc)))))]
+    (assoc s1 :types (conj kept (->TypeDef name (v/->TypeV "alias" name [t] [] [] []) gens [ty])))))
+
+(defn- later-type Vec(a/DeclAt) [st: &St name: &Str]
+  (if (ty-done? st name) []
+    (let [ls (:later st)]
+      (loop [i 0] (if (>= i (count ls)) [] (let [l (nth ls i)] (if (and (= (:mod l) (:cur st)) (= (:name l) name)) [(:da l)] (recur (+ i 1)))))))))
+
+(defn- register-decl St [st: St da: &a/DeclAt]
+  (let [sp (:sp da)]
+    (match (:d da)
+      (a/DType name gens ty) (if (ty-done? st name) st (register-type (assoc st :done-ty (conj (:done-ty st) (str (:cur st) "|" name))) name gens ty))
+      (a/DNs prefix uri) (assoc st :nss (conj (:nss st) (v/->Ns prefix uri)))
+      (a/DImport m names star alias)
+      (let [nm (if (user-mod? st m) (str m) (norm-module m))]
+        (if (or (user-mod? st nm) (builtin-module? st nm)) (register-import st nm names star alias sp)
+          (diag st (str "Unable to resolve module with identifier " m ".") sp)))
+      _ st)))
+
+(defn- builtin-module? Bool [st: &St m: &Str]
+  (loop [i 0] (if (>= i (count (:builtins st))) false (if (= (:module (nth (:builtins st) i)) m) true (recur (+ i 1))))))
+
+(defn- register-import St [st: St m: Str names: &Vec(a/ImportName) star: Bool alias: &Str sp: &a/Span]
+  (let [known (loop [i 0] (if (>= i (count (:builtins st))) false (if (= (:module (nth (:builtins st) i)) m) true (recur (+ i 1)))))]
+    (cond
+      (user-mod? st m) (register-user-import st m names star alias sp)
+      (not known) (diag st (str "Unable to resolve module with identifier " m ".") sp)
+      :else
+      (if star (assoc st :star-mods (conj (:star-mods st) m))
+        (if (> (count names) 0)
+          (loop [i 0 s st]
+            (if (>= i (count names)) s
+              (let [nm (nth names i)
+                    local (if (= (:alias nm) "") (:name nm) (:alias nm))]
+                (if (>= (builtin-id s m (:name nm)) 0)
+                  (recur (+ i 1) (assoc s :imports (conj (:imports s) (->Imp local m (:name nm)))))
+                  (if (>= (builtin-id s "dw::Core" (:name nm)) 0)
+                    (recur (+ i 1) (assoc s :imports (conj (:imports s) (->Imp local "dw::Core" (:name nm)))))
+                    (recur (+ i 1) (diag s (str "Unable to resolve reference of: `" (:name nm) "`.") sp)))))))
+          (let [[q last] (split-qname m)
+                al (if (= alias "") last (str alias))]
+            (assoc st :mod-alias (conj (:mod-alias st) (->Imp al m "")))))))))
+
+(defn- register-user-import St [st: St m: Str names: &Vec(a/ImportName) star: Bool alias: &Str sp: &a/Span]
+  (cond
+    star (assoc st :star-mods (conj (:star-mods st) m))
+    (> (count names) 0)
+    (loop [i 0 s st]
+      (if (>= i (count names)) s
+        (let [nm (nth names i)
+              local (if (= (:alias nm) "") (:name nm) (:alias nm))]
+          (if (global? s (str m "::" (:name nm)))
+            (recur (+ i 1) (assoc s :imports (conj (:imports s) (->Imp local m (:name nm)))))
+            (let [ty (type-by-name s (:name nm))]
+              (cond
+                (= (count ty) 0) (recur (+ i 1) (diag s (str "Unable to resolve reference of: `" (:name nm) "`.") sp))
+                (= local (:name nm)) (recur (+ i 1) s)
+                :else (recur (+ i 1) (assoc s :types (conj (:types s) (->TypeDef local (v/->TypeV "alias" local [(nth ty 0)] [] [] []) [] []))))))))))
+    :else (let [[q last] (split-qname m)
+                al (if (= alias "") last (str alias))]
+            (assoc st :mod-alias (conj (:mod-alias st) (->Imp al m ""))))))
+
+(defrecord Result [prog: r/Prog diags: Vec(a/Diag)])
+
+(defn- group-overloads St [st: St]
+  (let [names (:gfuns st) defs (:gfun-defs st)]
+    (loop [i 0 fns (:fns st)]
+      (if (>= i (count names)) (assoc st :fns fns)
+        (let [g (loop [k 0 acc: Vec(Int) []] (if (>= k (count names)) acc (recur (+ k 1) (if (= (nth names k) (nth names i)) (conj acc (nth defs k)) acc))))
+              d (nth defs i)
+              fd (nth fns d)]
+          (recur (+ i 1) (if (< (count g) 2) fns
+                           (assoc fns d (r/->FnDef (:name fd) (:params fd) (:nslots fd) (:ncaps fd) (:body fd) (:sp fd) g)))))))))
+
+(defn- output-of Values(Vec(r/Output) St) [st: St dirs: &Vec(a/Directive)]
+  (loop [i 0 s st]
+    (if (>= i (count dirs)) (values [] s)
+      (let [d (nth dirs i)]
+        (if (= (:kind d) "output")
+          (let [[props ok] (const-val (:props d))
+                fs (match props (v/VObj f) f _ [])]
+            (values [(r/->Output (if (= (:fmt d) "binary") "application/octet-stream" (:mime d)) fs (:nss s))]
+                    (if ok s (diag s "Output properties must be constant" (:sp d)))))
+          (recur (+ i 1) s))))))
+
+(defn resolve-script Result [sc: &a/Script inputs: Vec(Str) builtins: Vec(rt/Builtin)]
+  (resolve-with sc inputs builtins []))
+
+(defrecord- TDecl [mod: Int da: a/DeclAt])
+
+(defn resolve-with Result [sc: &a/Script inputs: Vec(Str) builtins: Vec(rt/Builtin) mods: Vec(ModSrc)]
+  (let [umods (loop [i 0 acc: Vec(Str) [""]] (if (>= i (count mods)) acc (recur (+ i 1) (conj acc (:name (nth mods i))))))
+        ctxs (loop [i 0 acc: Vec(ModCtx) []] (if (>= i (count umods)) acc (recur (+ i 1) (conj acc (->ModCtx [] [] [] [])))))
+        ds (loop [i 0 acc: Vec(TDecl) []]
+             (if (> i (count mods))
+               acc
+               (if (= i (count mods))
+                 (recur (+ i 1) (loop [k 0 a2 acc] (if (>= k (count (:decls sc))) a2 (recur (+ k 1) (conj a2 (->TDecl 0 (nth (:decls sc) k)))))))
+                 (let [md (:decls (nth mods i))]
+                   (recur (+ i 1) (loop [k 0 a2 acc] (if (>= k (count md)) a2 (recur (+ k 1) (conj a2 (->TDecl (+ i 1) (nth md k)))))))))))
+        st0 (->St [] [(->Frame [] 0 0 -1 [] [])] [] [] [] [] [] [] [] [] [] inputs [] builtins [] [] [] umods ctxs 0
+                  0 (count umods) [] [] (a/->Span -1 -1) []
+                  (loop [i 0 acc: Vec(LaterTy) []]
+                    (if (>= i (count ds)) acc
+                      (recur (+ i 1) (match (:d (:da (nth ds i)))
+                                       (a/DType name gens ty) (conj acc (->LaterTy (:mod (nth ds i)) name (:da (nth ds i))))
+                                       _ acc))))
+                  [])
+        st1 (loop [i 0 s st0]
+              (if (>= i (count ds)) s
+                (let [td (nth ds i)
+                      da (:da td)
+                      s0 (switch-mod s (:mod td))]
+                  (match (:d da)
+                    (a/DVar name ty value) (recur (+ i 1) (assoc (assoc (assoc s0 :gvars (conj (:gvars s0) (qual s0 name))) :gvar-orig (conj (:gvar-orig s0) [value]))
+                                                                 :gvar-sp (conj (:gvar-sp s0) (:sp da))))
+                    (a/DFun name ps rty body annots gens)
+                    (let [d (count (:fns s0))
+                          ph (r/->FnDef (qual s0 name) [] 0 0 (mk (r/->RConst (v/null-v)) (:sp da)) (:sp da) [])]
+                      (recur (+ i 1) (assoc (assoc (assoc (assoc (assoc (assoc s0 :fns (conj (:fns s0) ph)) :gfuns (conj (:gfuns s0) (qual s0 name))) :gfun-defs (conj (:gfun-defs s0) d))
+                                                   :gfun-orig (conj (:gfun-orig s0) [body])) :gfun-ps (conj (:gfun-ps s0) (param-names-of ps)))
+                                            :gfun-sp (conj (:gfun-sp s0) (:sp da)) :gfun-pty (conj (:gfun-pty s0) (param-tys ps)))))
+                    _ (recur (+ i 1) (register-decl s0 da))))))
+        st2
+        (loop [i 0 k 0 s st1]
+          (if (>= i (count ds)) s
+            (let [td (nth ds i)]
+              (match (:d (:da td))
+                (a/DFun name ps rty body annots gens)
+                (let [s0 (switch-mod s (:mod td))
+                      d (nth (:gfun-defs s0) k)
+                      nty (count (:types s0))
+                      [osc s01] (push-scope s0)
+                      sa (push-generics (assoc s01 :frames [(->Frame [] 0 0 -1 [] [])]) gens)
+                      [params sb] (bind-params sa ps)
+                      [b sc20] (rx sb body)
+                      sc2 (pop-types sc20 nty)
+                      f (top sc2)
+                      fdef (r/->FnDef (qual sc2 name) params (:maxslots f) 0 b (:sp (:da td)) [])]
+                  (recur (+ i 1) (+ k 1) (assoc (assoc sc2 :fns (assoc (:fns sc2) d fdef)) :scope osc)))
+                _ (recur (+ i 1) k s)))))
+        [globals st3]
+        (loop [i 0 gs: Vec(r/Global) [] s st2]
+          (if (>= i (count ds)) (values gs s)
+            (let [td (nth ds i)]
+              (match (:d (:da td))
+                (a/DVar name ty value)
+                (let [s0 (assoc (switch-mod s (:mod td)) :scope (:mod td))
+                      sa (assoc s0 :frames [(->Frame [] 0 0 -1 [] [])])
+                      [b sb] (rx-var-value sa name value)
+                      f (top sb)]
+                  (recur (+ i 1) (conj gs (r/->Global (qual sb name) b (:maxslots f))) sb))
+                _ (recur (+ i 1) gs s)))))
+        st4 (assoc (assoc (group-overloads (switch-mod st3 0)) :frames [(->Frame [] 0 0 -1 [] [])]) :scope 0)
+        [body st5] (rx st4 (:body sc))
+        top-frame (top st5)
+        [out st7] (output-of st5 (:directives sc))
+        [ins st8] (input-decls-of st7 (:directives sc))]
+    (->Result (r/->Prog (:fns st8) globals inputs body (:maxslots top-frame) out ins) (:diags st8))))
+
+(defn- input-decls-of Values(Vec(r/InputDecl) St) [st: St dirs: &Vec(a/Directive)]
+  (loop [i 0 acc: Vec(r/InputDecl) [] s st]
+    (if (>= i (count dirs)) (values acc s)
+      (let [d (nth dirs i)]
+        (if (and (= (:kind d) "input") (not= (:mime d) ""))
+          (let [[props ok] (const-val (:props d))
+                fs (match props (v/VObj f) f _ [])]
+            (recur (+ i 1) (conj acc (r/->InputDecl (:name d) (:mime d) fs)) s))
+          (recur (+ i 1) acc s))))))

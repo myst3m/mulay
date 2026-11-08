@@ -1,0 +1,108 @@
+(ns mulay.dw.lib.core_num
+  (:require [mulay.lib.random :as lr] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.lib.dec :as d] [mulay.lib.bigint :as bi]))
+
+(def M "dw::Core")
+
+(defn- nv v/Val [n: num/Num] (v/num-v n))
+(defn- ok Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+
+(defn norm num/Num [x: &d/Dec] (num/norm-result (d/of (d/unscaled x) (d/scale x))))
+
+(defn norm-pos num/Num [x: &d/Dec] (if (> (d/scale x) 0) (norm x) (num/mk x)))
+
+(defn- nonfinite-msg Str [f: Float]
+  (str "Character " (if (= f f) "I" "N") " is neither a decimal digit number, decimal point, nor \"e\" notation exponential mark."))
+
+(defn float-result Values(v/Val dwe/DwErr) [f: Float]
+  (let [[n e] (num/from-float f)]
+    (if (= e "") (ok (nv n)) (rt/failure "NumberFormatException" (nonfinite-msg f)))))
+
+(defn- abs-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [n (core/arg-num a 0)]
+    (match n
+      (num/NInt i) (if (= i bi/INT-MIN) (ok (nv n)) (ok (nv (num/abs-num n))))
+      (num/NDec x) (ok (nv (num/abs-num n))))))
+
+(defn- to-int-mode Values(v/Val dwe/DwErr) [n: &num/Num mode: Int]
+  (match n
+    (num/NInt i) (ok (nv (num/from-int i)))
+    (num/NDec x) (let [[r e] (d/set-scale x 0 mode)]
+                   (if (= e "") (ok (nv (num/mk r))) (rt/failure "ArithmeticException" (str "java.lang.ArithmeticException " e))))))
+
+(defn- ceil-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (to-int-mode (core/arg-num a 0) d/CEILING))
+(defn- floor-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (to-int-mode (core/arg-num a 0) d/FLOOR))
+(defn- round-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (to-int-mode (core/arg-num a 0) d/HALF-UP))
+
+(defn- sqrt-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (float-result (sqrt (num/to-float (core/arg-num a 0)))))
+
+(def POW-MAX 99999999)
+
+(defn- pow-fail Values(v/Val dwe/DwErr) [b: &num/Num x: &num/Num e: &Str]
+  (if (or (= e "Underflow") (= e "Overflow"))
+    (rt/failure "ArithmeticException" (str "Unable to resolve " (num/to-string b) " ^ " (num/to-string x) ". Reason: " e "."))
+    (rt/failure "ArithmeticException" e)))
+
+(defn pow-num Values(v/Val dwe/DwErr) [b: &num/Num x: &num/Num]
+  (if (< (num/signum x) 0)
+    (rt/failure "ArithmeticException" (str "Negative exponent: " (num/to-string x) "."))
+    (if (num/integer? x)
+      (let [[k e] (num/to-int x)]
+        (if (or (not= e "") (> k POW-MAX))
+          (rt/failure "ArithmeticException" (str "Exponent: `" (num/to-string x) "` is out of bound max value is: `" POW-MAX "` and min value is `0`."))
+          (let [[r e2] (d/pow-exact (num/to-dec b) k)]
+            (if (= e2 "") (ok (nv (norm r))) (pow-fail b x e2)))))
+      (let [xd (num/to-dec x) [ip ie] (d/floor-int xd) [k ke] (d/to-int-exact ip)]
+        (if (or (not= ie "") (not= ke "") (> k POW-MAX))
+          (rt/failure "ArithmeticException" (str "Exponent: `" (num/to-string x) "` is out of bound max value is: `" POW-MAX "` and min value is `0`."))
+          (let [f (prim/fpow (num/to-float b) (d/to-float (let [[fr fe] (d/sub xd ip)] fr)))
+                [fd fe] (d/from-float f)]
+            (if (not= fe "") (rt/failure "NumberFormatException" (nonfinite-msg f))
+              (let [[ipow pe] (d/pow-exact (num/to-dec b) k)]
+                (if (not= pe "") (pow-fail b x pe)
+                  (ok (nv (norm-pos (d/mul ipow fd)))))))))))))
+
+(defn- pow-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (pow-num (core/arg-num a 0) (core/arg-num a 1)))
+
+(defn- num-even? Bool [n: &num/Num]
+  (match n
+    (num/NInt i) (= (mod i 2) 0)
+    (num/NDec x) (let [[r e] (num/rem-num n (num/from-int 2))] (= (num/signum r) 0))))
+
+(defn- is-even Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/bool-v (num-even? (core/arg-num a 0)))))
+(defn- is-odd Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/bool-v (not (num-even? (core/arg-num a 0))))))
+(defn- is-integer Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/bool-v (num/integer? (core/arg-num a 0)))))
+(defn- is-decimal Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (ok (v/bool-v (not (num/integer? (core/arg-num a 0))))))
+
+(defn random-float Float []
+  (let [[bs ok] (lr/seeded-bytes 7)]
+    (if (not ok) (rand)
+      (let [u (loop [i 0 acc 0] (if (>= i 7) acc (recur (+ i 1) (+ (* acc 256) (nth bs i)))))]
+        (* (float (bit-shift-right u 3)) (/ 1.0 9007199254740992.0))))))
+
+(defn- random-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (float-result (random-float)))
+
+(defn- random-int Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[r e] (float-result (random-float))]
+    (if (not (dwe/ok? e)) (values r e)
+      (match r
+        (v/VNum x) (let [[y ye] (core/arith-num 3 x (core/arg-num a 0))] (if (dwe/ok? ye) (to-int-mode y d/FLOOR) (values (v/null-v) ye)))
+        (v/VInt x-i) (let [[y ye] (core/arith-num 3 (num/from-int x-i) (core/arg-num a 0))] (if (dwe/ok? ye) (to-int-mode y d/FLOOR) (values (v/null-v) ye)))
+        _ (values r e)))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "abs" [(rt/b1 "Number" abs-fn)])
+   (B "ceil" [(rt/b1 "Number" ceil-fn)])
+   (B "floor" [(rt/b1 "Number" floor-fn)])
+   (B "round" [(rt/b1 "Number" round-fn)])
+   (B "sqrt" [(rt/b1 "Number" sqrt-fn)])
+   (B "pow" [(rt/b2 "Number" "Number" pow-fn)])
+   (B "isEven" [(rt/b1 "Number" is-even)])
+   (B "isOdd" [(rt/b1 "Number" is-odd)])
+   (B "isInteger" [(rt/b1 "Number" is-integer)])
+   (B "isDecimal" [(rt/b1 "Number" is-decimal)])
+   (B "random" [(rt/overload [] random-fn)])
+   (B "randomInt" [(rt/b1 "Number" random-int)])])

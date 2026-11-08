@@ -1,0 +1,118 @@
+(ns http-test (:require [clay.httpmsg :as hm] [mulay.conn.http :as h] [mulay.conn.http_req :as hr] [mulay.conn.httpmsg :as hx] [mulay.dw.val :as v] [mulay.rt.engine :as en]))
+
+(defn- field-str Str [x: &v/Val k: &Str]
+  (match (v/unmeta x) (v/VObj fs) (let [r (v/obj-get fs k)] (if (= (count r) 0) "<none>" (en/java-str (nth r 0)))) _ "<not obj>"))
+
+(deftest paths
+  (is (let [[ok ps] (hr/match-path "/api/users/{id}" "/api/users/42")] (and ok (= (count ps) 1))))
+  (is (let [[ok ps] (hr/match-path "/api/*" "/api/a/b")] ok))
+  (is (let [[ok ps] (hr/match-path "/api/users" "/api/users/1")] (not ok)))
+  (is (= (hx/join-path "/api" "/users") "/api/users"))
+  (is (= (hx/join-path "" "/") "/"))
+  (is (= (hx/url-decode "a%20b+c") "a b c"))
+  (is (= (hx/url-decode-path "a%20b+c") "a b+c")))
+
+(deftest origin-target
+  ;; 実 Mule (4.11.3) の listener: absolute-form は scheme と authority を外し、# から後ろは捨てる。
+  ;; 大文字の HTTP:// は absolute-form として扱わない
+  (is (= (hx/origin-target "/a/7?x=1") "/a/7?x=1"))
+  (is (= (hx/origin-target "http://localhost:18165/a/7?x=1") "/a/7?x=1"))
+  (is (= (hx/origin-target "https://h/a/7") "/a/7"))
+  (is (= (hx/origin-target "http://user@h:1/a/7") "/a/7"))
+  (is (= (hx/origin-target "http://h") "/"))
+  (is (= (hx/origin-target "http://h?x=1") "/?x=1"))
+  (is (= (hx/origin-target "/a/7#f") "/a/7"))
+  (is (= (hx/origin-target "/a/7?x=1#f") "/a/7?x=1"))
+  (is (= (hx/origin-target "http://h/a/7#f") "/a/7"))
+  (is (= (hx/origin-target "http://h#f") "/"))
+  (is (= (hx/origin-target "HTTP://H/a/7") "HTTP://H/a/7"))
+  (is (= (hx/origin-target "*") "*")))
+
+(deftest conn-fail-text
+  ;; clay.http (0.79.0) の失敗の文言を、実 Mule 4.11.3 の http:request の文言にする。期待値は壊れた応答を返す
+  ;; 偽のサーバに実 Mule の http:request を向けて測ったもの (2026-10-10)
+  (is (= (h/conn-fail-text "connect 127.0.0.1:18991: Connection refused" "localhost" "18991") "Connection refused: localhost/127.0.0.1:18991."))
+  (is (= (h/conn-fail-text "http: the connection closed before the response head" "localhost" "1") "Remotely closed."))
+  (is (= (h/conn-fail-text "http: the response body ended before Content-Length bytes" "localhost" "1") "Remotely closed."))
+  (is (= (h/conn-fail-text "http: the chunked response ended early" "localhost" "1") "Remotely closed."))
+  (is (= (h/conn-fail-text "http: the response's Content-Length '+3' is not a valid length" "localhost" "1") "Content-Length value is not a number: +3."))
+  (is (= (h/conn-fail-text "http: the response's Content-Length '-3' is not a valid length" "localhost" "1") "Content-Length value is not a number: -3."))
+  (is (= (h/conn-fail-text "http: a field line of the response is not name: value" "localhost" "1") "No colon found."))
+  ;; clay 0.79.1 から値と受けた行が付く。実 Mule (Netty) は値を [] で並べ、状態行の最初の語を大文字にして出す
+  (is (= (h/conn-fail-text "http: the response has more than one Content-Length: 3, 3" "localhost" "1") "Multiple Content-Length values found: [3, 3]."))
+  (is (= (h/conn-fail-text "http: the response has no status line: xyHTTP/1.1 200 OK" "localhost" "1") "invalid version format: XYHTTP/1.1."))
+  (is (= (h/conn-fail-text "http: the response has no status line: garbage" "localhost" "1") "invalid version format: GARBAGE."))
+  ;; 実 Mule は読むもの (deviations): clay の文言を出す
+  (is (= (h/conn-fail-text "http: the response has both Transfer-Encoding and Content-Length" "localhost" "1")
+         "the response has both Transfer-Encoding and Content-Length."))
+  (is (= (h/conn-fail-text "http: the response's Transfer-Encoding 'gzip, chunked' is not chunked alone" "localhost" "1")
+         "the response's Transfer-Encoding 'gzip, chunked' is not chunked alone."))
+  (is (= (h/conn-fail-text "http: the chunked response is malformed" "localhost" "1") "the chunked response is malformed."))
+  ;; clay 0.86.0 (TLS は clay.tls.engine) の文言。証明書を信頼できない、相手が版や暗号スイートを断った
+  (is (= (h/conn-fail-text "tls: the server's certificate: x509: untrusted: no path to a trusted certificate" "localhost" "1")
+         "(certificate_unknown) PKIX path building failed: sun.security.provider.certpath.SunCertPathBuilderException: unable to find valid certification path to requested target."))
+  (is (= (h/conn-fail-text "tls: the server sent the alert protocol_version (70)" "localhost" "1") "(protocol_version) Received fatal alert: protocol_version."))
+  (is (= (h/conn-fail-text "tls: the server sent the alert handshake_failure (40)" "localhost" "1") "(handshake_failure) Received fatal alert: handshake_failure."))
+  (is (= (h/conn-fail-text "tls: the connection closed without close_notify" "localhost" "1") "Remotely closed."))
+  ;; 送る途中で相手が切った、頭や本文が上限を超えた: 実 Mule (Netty) は接続を閉じて Remotely closed (2026-10-17 に
+  ;; 要求を読まずに閉じる相手と、8,192 バイトを超えるヘッダーを返す相手で測った)。これまでは Connection refused だった
+  (is (= (h/conn-fail-text "http: write failed" "localhost" "1") "Remotely closed."))
+  (is (= (h/conn-fail-text "http: the trailer lines of the response are over the head's limit" "localhost" "1") "Remotely closed."))
+  (is (= (h/conn-fail-text "http: the response body is over the 8388608 byte limit" "localhost" "1") "Remotely closed."))
+  (is (= (h/conn-fail-text "http: the chunked response is too large to hold" "localhost" "1") "Remotely closed.")))
+
+(deftest request-attributes
+  ;; requestUri と queryString はデコードした形、raw* は受け取ったまま。
+  ;; queryParams は同じキーの値がまとまる (実 Mule の MultiMap)
+  (let [hs: Vec(hm/Header) [(hm/->Header "Host" "localhost:1") (hm/->Header "X-A" "1") (hm/->Header "X-A" "2")]
+        a (hx/request-attributes "GET" "/b/x%20y?x=1&y=%20a&x=2" "/x/*" "/b" hs [] 1 "10.0.0.5:4321" "http" "" "HTTP/2")]
+    (is (= (field-str a "version") "HTTP/2"))
+    (is (= (field-str a "remoteAddress") "/10.0.0.5:4321"))
+    (is (= (field-str a "requestUri") "/b/x y?x=1&y= a&x=2"))
+    (is (= (field-str a "rawRequestUri") "/b/x%20y?x=1&y=%20a&x=2"))
+    (is (= (field-str a "queryString") "x=1&y= a&x=2"))
+    (is (= (field-str a "requestPath") "/b/x y"))
+    (is (= (field-str a "rawRequestPath") "/b/x%20y"))
+    (is (= (field-str a "listenerPath") "/b/x/*"))
+    (is (= (field-str a "relativePath") "/x y"))
+    (is (= (field-str a "queryParams") "{x=1, x=2, y= a}"))
+    (is (= (field-str a "scheme") "http"))
+    (is (= (field-str a "clientCertificate") "null"))))
+
+(defn- sub v/Val [x: &v/Val k: &Str]
+  (match (v/unmeta x) (v/VObj fs) (let [r (v/obj-get fs k)] (if (= (count r) 0) (v/null-v) (nth r 0))) _ (v/null-v)))
+
+(defn- keys-of Vec(Str) [x: &v/Val]
+  (match (v/unmeta x) (v/VObj fs) (loop [i 0 acc: Vec(Str) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (:name (:key (nth fs i))))))) _ []))
+
+;; 実 Mule の attributes.clientCertificate (test/fixtures/apps/https-test の /cert の記録)
+(deftest client-certificate
+  (let [[pem e] (read-file "test/fixtures/apps/https-test/certs/client.pem")
+        hs: Vec(hm/Header) []
+        a (hx/request-attributes "GET" "/cert" "/cert" "" hs [] 18142 "127.0.0.1:5000" "https" pem "HTTP/1.1")
+        c (sub a "clientCertificate")]
+    (is (= (field-str a "scheme") "https"))
+    (is (= (keys-of c) ["basicConstraints" "criticalExtensionOIDs" "encoded" "extendedKeyUsage" "extensions"
+                        "issuerAlternativeNames" "issuerDN" "issuerUniqueID" "issuerX500Principal" "keyUsage" "name"
+                        "nonCriticalExtensionOIDs" "notAfter" "notBefore" "publicKey" "serialNumber" "serialNumberObject"
+                        "sigAlgName" "sigAlgOID" "sigAlgParams" "signature" "subjectAlternativeNames" "subjectDN"
+                        "subjectX500Principal" "type" "version"]))
+    (is (= (field-str (sub c "subjectDN") "name") "O=mulay, CN=mulay client"))
+    (is (= (field-str (sub c "issuerDN") "name") "CN=mulay test CA"))
+    (is (= (field-str (sub c "subjectX500Principal") "name") "O=mulay, CN=mulay client"))
+    (is (= (field-str c "type") "X.509"))
+    (is (= (field-str c "version") "3"))
+    (is (= (field-str c "sigAlgName") "SHA256withRSA"))
+    (is (= (field-str c "serialNumber") "470691020887658211209772108376539068939075997124"))
+    (is (= (v/type-name (sub c "notAfter")) "LocalDateTime"))))
+
+(deftest response-validator
+  (is (hr/status-ok? "" 200))
+  (is (hr/status-ok? "" 302))
+  (is (not (hr/status-ok? "" 404)))
+  (is (hr/status-ok? "200..499" 404))
+  (is (not (hr/status-ok? "200..499" 500)))
+  (is (hr/status-ok? "200, 201" 201))
+  (is (= (hx/mule-reason 200) "OK"))
+  (is (= (hx/mule-reason 500) "Server Error"))
+  (is (= (hx/mule-reason 418) "")))

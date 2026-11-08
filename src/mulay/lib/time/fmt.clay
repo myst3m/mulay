@@ -1,0 +1,1170 @@
+(ns mulay.lib.time.fmt
+  (:require [mulay.lib.time.types :as t]
+            [mulay.lib.time.civil :as cv]
+            [mulay.lib.time.num :as n]
+            [mulay.lib.time.amount :as am]
+            [mulay.lib.time.local :as l]
+            [mulay.lib.time.tz :as tz]
+            [mulay.lib.time.zoned :as zd]
+            [mulay.lib.time.iso :as iso]
+            [mulay.lib.time.names :as nm]
+            [mulay.lib.time.locales :as lc]
+            [clay.string :as str]))
+
+(def F-ERA 0) (def F-YEAR 1) (def F-YOE 2) (def F-MONTH 3) (def F-DOM 4) (def F-DOY 5) (def F-DOW 6)
+(def F-AMPM 7) (def F-HOD 8) (def F-CHOD 9) (def F-HOAP 10) (def F-CHOAP 11) (def F-MOH 12) (def F-SOM 13)
+(def F-NOS 14) (def F-MOD 15) (def F-NOD 16) (def F-QOY 17) (def F-WBY 18) (def F-WOWBY 19) (def F-WOM 20)
+(def F-LDOW 21) (def F-ADOWM 22) (def F-OFFSET 23) (def F-SOD 24) (def F-MOS 25) (def F-DAYPERIOD 26) (def F-MJD 27)
+(def NF 28)
+
+(defrecord Fmt [items: Vec(FItem) ends: Vec(Int) first: Int min: Int names: Vec(Str) ci: Bool resolver: Int])
+
+(defn with-resolver Fmt [f: Fmt style: Int]
+  (->Fmt (:items f) (:ends f) (:first f) (:min f) (:names f) (:ci f) style))
+
+(defvariant FItem
+  (FLit s: Str)
+  (FNum field: Int minw: Int maxw: Int sign: Int sub: Int)
+  (FReduced field: Int sub: Int)
+  (FText field: Int style: Int)
+  (FFrac minw: Int maxw: Int dp: Bool)
+  (FOffset ty: Int noff: Str)
+  (FLocOffset full: Bool)
+  (FZoneId)
+  (FZoneText full: Bool generic: Bool)
+  (FDayPeriod style: Int)
+  (FOptStart)
+  (FOptEnd)
+  (FPad width: Int))
+
+(defn- week-def-str Str [first: Int min: Int]
+  (str "WeekFields[" (case first 1 "MONDAY" 2 "TUESDAY" 3 "WEDNESDAY" 4 "THURSDAY" 5 "FRIDAY" 6 "SATURDAY" "SUNDAY") "," min "]"))
+
+(defn- field-name Str [f: Int first: Int min: Int]
+  (case f
+    0 "Era" 1 "Year" 2 "YearOfEra" 3 "MonthOfYear" 4 "DayOfMonth" 5 "DayOfYear" 6 "DayOfWeek"
+    7 "AmPmOfDay" 8 "HourOfDay" 9 "ClockHourOfDay" 10 "HourOfAmPm" 11 "ClockHourOfAmPm" 12 "MinuteOfHour"
+    13 "SecondOfMinute" 14 "NanoOfSecond" 15 "MilliOfDay" 16 "NanoOfDay" 17 "QuarterOfYear"
+    18 (str "WeekBasedYear[" (week-def-str first min) "]")
+    19 (str "WeekOfWeekBasedYear[" (week-def-str first min) "]")
+    20 (str "WeekOfMonth[" (week-def-str first min) "]")
+    21 (str "DayOfWeek[" (week-def-str first min) "]")
+    22 "AlignedDayOfWeekInMonth" 23 "OffsetSeconds" 24 "SecondOfDay" 25 "MilliOfSecond"
+    27 "ModifiedJulianDay"
+    "DayPeriod"))
+
+(defn- field-range Values(Int Int Str) [f: Int]
+  (case f
+    0 (values 0 1 "0 - 1")
+    1 (values -999999999 999999999 "-999999999 - 999999999")
+    2 (values 1 1000000000 "1 - 999999999/1000000000")
+    3 (values 1 12 "1 - 12")
+    4 (values 1 31 "1 - 28/31")
+    5 (values 1 366 "1 - 365/366")
+    6 (values 1 7 "1 - 7")
+    7 (values 0 1 "0 - 1")
+    8 (values 0 23 "0 - 23")
+    9 (values 1 24 "1 - 24")
+    10 (values 0 11 "0 - 11")
+    11 (values 1 12 "1 - 12")
+    12 (values 0 59 "0 - 59")
+    13 (values 0 59 "0 - 59")
+    14 (values 0 999999999 "0 - 999999999")
+    15 (values 0 86399999 "0 - 86399999")
+    16 (values 0 86399999999999 "0 - 86399999999999")
+    17 (values 1 4 "1 - 4")
+    18 (values -999999999 999999999 "-999999999 - 999999999")
+    19 (values 1 53 "1 - 52/53")
+    20 (values 0 6 "0/1 - 4/6")
+    21 (values 1 7 "1 - 7")
+    22 (values 1 7 "1 - 7")
+    23 (values -64800 64800 "-64800 - 64800")
+    24 (values 0 86399 "0 - 86399")
+    25 (values 0 999 "0 - 999")
+    27 (values -365243219162 365241780471 "-365243178620 - 365241821091")
+    (values n/LMIN n/LMAX "")))
+
+(defn- check-valid Str [f: Int v: Int first: Int min: Int]
+  (let [[lo hi s] (field-range f)]
+    (if (and (>= v lo) (<= v hi)) ""
+      (str "Invalid value for " (field-name f first min) " (valid values " s "): " v))))
+
+(def MONTH-NAMES-UC ["JANUARY" "FEBRUARY" "MARCH" "APRIL" "MAY" "JUNE" "JULY" "AUGUST" "SEPTEMBER" "OCTOBER" "NOVEMBER" "DECEMBER"])
+
+(def EN-US (let [m: Map(Str Vec(Str)) lc/locale-data] (get m "en-us" [])))
+
+(defn locale-names Vec(Str) [tag0: &Str]
+  (let [t (loop [i 0 acc ""]
+            (if (>= i (count tag0)) acc
+              (let [c (nth tag0 i)]
+                (recur (+ i 1) (str acc (cond (= c 95) "-" (and (>= c 65) (<= c 90)) (chr (+ c 32)) :else (subs tag0 i (+ i 1))))))))
+        m: Map(Str Vec(Str)) lc/locale-data]
+    (loop [k t]
+      (cond (= k "") EN-US
+            (contains? m k) (get! m k)
+            :else (let [d (str/last-index-of k "-")] (if (> d 0) (recur (subs k 0 d)) EN-US))))))
+
+(defn- name-at Values(Str Bool) [nms: &Vec(Str) i: Int]
+  (if (< i (count nms)) (values (nth nms i) true) (values "" false)))
+
+(defn- text-of Values(Str Bool) [nms: &Vec(Str) f: Int style: Int v: Int]
+  (cond
+    (= f F-MONTH) (if (or (< v 1) (> v 12)) (values "" false) (name-at nms (+ (* 12 style) (- v 1))))
+    (= f F-DOW) (if (or (< v 1) (> v 7)) (values "" false) (name-at nms (+ 72 (* 7 style) (- v 1))))
+    (= f F-AMPM) (if (or (< v 0) (> v 1)) (values "" false) (name-at nms (+ 114 v)))
+    (= f F-ERA) (if (or (< v 0) (> v 1)) (values "" false) (name-at nms (+ 116 (* 2 (rem style 3)) v)))
+    (= f F-QOY) (if (or (< v 1) (> v 4)) (values "" false) (name-at nms (+ 122 (* 4 style) (- v 1))))
+    :else (values "" false)))
+
+(defn- text-range Values(Int Int) [f: Int]
+  (case f 3 (values 1 12) 6 (values 1 7) 7 (values 0 1) 0 (values 0 1) 17 (values 1 4) (values 1 0)))
+
+(defn- match-text Values(Int Int) [fm: &Fmt f: Int style: Int s: &Str pos: Int]
+  (let [[lo hi] (text-range f)]
+    (loop [v lo best-len -1 best-v 0]
+      (if (> v hi) (values best-v (if (< best-len 0) -1 (+ pos best-len)))
+        (let [[tx ok] (text-of (:names fm) f style v)
+              len (count tx)
+              hit (and ok (> len 0) (n/region-eq? s pos tx (:ci fm)))]
+          (recur (+ v 1)
+                 (if (and hit (>= len best-len)) len best-len)
+                 (if (and hit (>= len best-len)) v best-v)))))))
+
+(defn- letter? Bool [c: Int] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+
+(defrecord Bld [items: Vec(FItem) active: Vec(Int) pad: Int])
+
+(defn- b-push-raw Bld [b: Bld it: FItem]
+  (let [items (:items b)
+        withpad (if (> (:pad b) 0) (conj items (->FPad (:pad b))) items)
+        act (:active b)
+        depth (- (count act) 1)]
+    (->Bld (conj withpad it) (assoc act depth -1) 0)))
+
+(defn- add-sub FItem [it: &FItem w: Int]
+  (match it
+    (FNum f mn mx sg sb) (->FNum f mn mx sg (+ (if (< sb 0) 0 sb) w))
+    (FReduced f sb) (->FReduced f (+ (if (< sb 0) 0 sb) w))
+    (FFrac mn mx dp) (->FFrac mn mx dp)
+    (FLit s) (->FLit s)
+    _ (->FLit "")))
+
+(defn- b-push-value Bld [b: Bld it: FItem fixed-outer: Bool width-outer: Int]
+  (let [act (:active b)
+        depth (- (count act) 1)
+        ai (nth act depth)]
+    (if (and (>= ai 0) (= (:pad b) 0))
+      (if fixed-outer
+        (let [items (:items b)
+              base: FItem (nth items ai)
+              items2 (assoc items ai (add-sub base width-outer))]
+          (->Bld (conj items2 it) act 0))
+        (let [b2 (b-push-raw b it)
+              act2 (:active b2)]
+          (->Bld (:items b2) (assoc act2 depth (- (count (:items b2)) 1)) 0)))
+      (let [b2 (b-push-raw b it)
+            act2 (:active b2)]
+        (->Bld (:items b2) (assoc act2 depth (- (count (:items b2)) 1)) 0)))))
+
+(defn- num FItem [f: Int mn: Int mx: Int sg: Int] (->FNum f mn mx sg 0))
+
+(defn- push-num Bld [b: Bld f: Int mn: Int mx: Int sg: Int]
+  (b-push-value b (num f mn mx sg) (and (= mn mx) (= sg 3)) mx))
+
+(defn- letter-items Values(Bld Str) [b: Bld c: Int cnt: Int]
+  (let [ch (chr c)
+        too (str "Too many pattern letters: " ch)]
+    (case ch
+      "u" (if (= cnt 2) (values (b-push-value b (->FReduced F-YEAR 0) true 2) "")
+            (values (push-num b F-YEAR cnt 19 (if (< cnt 4) 0 4)) ""))
+      "y" (if (= cnt 2) (values (b-push-value b (->FReduced F-YOE 0) true 2) "")
+            (values (push-num b F-YOE cnt 19 (if (< cnt 4) 0 4)) ""))
+      "Y" (if (= cnt 2) (values (b-push-value b (->FReduced F-WBY 0) true 2) "")
+            (values (b-push-value b (num F-WBY cnt 19 (if (< cnt 4) 0 4)) false 19) ""))
+      "G" (if (<= cnt 3) (values (b-push-raw b (->FText F-ERA 0)) "")
+            (if (= cnt 4) (values (b-push-raw b (->FText F-ERA 1)) "")
+              (if (= cnt 5) (values (b-push-raw b (->FText F-ERA 2)) "") (values b too))))
+      "c" (if (= cnt 1) (values (b-push-value b (num F-LDOW 1 2 3) true 1) "")
+            (if (= cnt 2) (values b "Invalid pattern \"cc\"")
+              (if (<= cnt 5) (values (b-push-raw b (->FText F-DOW (case cnt 3 3 4 4 5))) "") (values b too))))
+      "e" (if (<= cnt 2) (values (b-push-value b (num F-LDOW (if (= cnt 2) 2 1) 2 3) true cnt) "")
+            (if (<= cnt 5) (values (b-push-raw b (->FText F-DOW (case cnt 3 0 4 1 2))) "") (values b too)))
+      "E" (if (<= cnt 3) (values (b-push-raw b (->FText F-DOW 0)) "")
+            (if (= cnt 4) (values (b-push-raw b (->FText F-DOW 1)) "")
+              (if (= cnt 5) (values (b-push-raw b (->FText F-DOW 2)) "") (values b too))))
+      "a" (if (= cnt 1) (values (b-push-raw b (->FText F-AMPM 0)) "") (values b too))
+      "B" (if (= cnt 1) (values (b-push-raw b (->FDayPeriod 0)) "")
+            (if (= cnt 4) (values (b-push-raw b (->FDayPeriod 1)) "")
+              (if (= cnt 5) (values (b-push-raw b (->FDayPeriod 2)) "") (values b (str "Wrong number of pattern letters: " ch)))))
+      "S" (if (> cnt 9) (values b (str "Minimum width must be from 0 to 9 inclusive but was " cnt))
+            (values (b-push-value b (->FFrac cnt cnt false) true cnt) ""))
+      "F" (if (= cnt 1) (values (push-num b F-ADOWM 1 19 0) "") (values b too))
+      "D" (if (= cnt 1) (values (push-num b F-DOY 1 19 0) "")
+            (if (<= cnt 3) (values (push-num b F-DOY cnt 3 3) "") (values b too)))
+      "A" (if (> cnt 19) (values b (str "The minimum width must be from 1 to 19 inclusive but was " cnt))
+            (values (push-num b F-MOD cnt 19 3) ""))
+      "n" (if (> cnt 19) (values b (str "The minimum width must be from 1 to 19 inclusive but was " cnt))
+            (values (push-num b F-NOS cnt 19 3) ""))
+      "N" (if (> cnt 19) (values b (str "The minimum width must be from 1 to 19 inclusive but was " cnt))
+            (values (push-num b F-NOD cnt 19 3) ""))
+      "W" (if (= cnt 1) (values (b-push-value b (num F-WOM 1 2 3) true 1) "") (values b too))
+      "w" (if (<= cnt 2) (values (b-push-value b (num F-WOWBY (if (= cnt 2) 2 1) 2 3) (= cnt 2) (if (= cnt 2) 2 2)) "") (values b too))
+      "z" (if (> cnt 4) (values b too) (values (b-push-raw b (->FZoneText (= cnt 4) false)) ""))
+      "v" (if (= cnt 1) (values (b-push-raw b (->FZoneText false true)) "")
+            (if (= cnt 4) (values (b-push-raw b (->FZoneText true true)) "")
+              (values b (str "Wrong number of pattern letters: " ch))))
+      "g" (values (push-num b F-MJD cnt 19 0) "")
+      "V" (if (not= cnt 2) (values b (str "Pattern letter count must be 2: " ch)) (values (b-push-raw b (->FZoneId)) ""))
+      "Z" (if (< cnt 4) (values (b-push-raw b (->FOffset 3 "+0000")) "")
+            (if (= cnt 4) (values (b-push-raw b (->FLocOffset true)) "")
+              (if (= cnt 5) (values (b-push-raw b (->FOffset 6 "Z")) "") (values b too))))
+      "O" (if (= cnt 1) (values (b-push-raw b (->FLocOffset false)) "")
+            (if (= cnt 4) (values (b-push-raw b (->FLocOffset true)) "")
+              (values b (str "Pattern letter count must be 1 or 4: " ch))))
+      "X" (if (> cnt 5) (values b too) (values (b-push-raw b (->FOffset (+ cnt (if (= cnt 1) 0 1)) "Z")) ""))
+      "x" (if (> cnt 5) (values b too)
+            (values (b-push-raw b (->FOffset (+ cnt (if (= cnt 1) 0 1)) (if (= cnt 1) "+00" (if (= (rem cnt 2) 0) "+0000" "+00:00")))) ""))
+      (if (or (= ch "M") (= ch "L") (= ch "Q") (= ch "q"))
+        (let [f (if (or (= ch "M") (= ch "L")) F-MONTH F-QOY)]
+          (if (= cnt 1) (values (push-num b f 1 19 0) "")
+            (if (= cnt 2) (values (push-num b f 2 2 3) "")
+              (if (<= cnt 5) (values (b-push-raw b (->FText f (+ (case cnt 3 0 4 1 2) (if (or (= ch "L") (= ch "q")) 3 0)))) "") (values b too)))))
+        (let [f (case ch "d" F-DOM "h" F-CHOAP "H" F-HOD "k" F-CHOD "K" F-HOAP "m" F-MOH "s" F-SOM -1)]
+          (if (>= f 0)
+            (if (= cnt 1) (values (push-num b f 1 19 0) "")
+              (if (= cnt 2) (values (push-num b f 2 2 3) "") (values b too)))
+            (values b (str "Unknown pattern letter: " ch))))))))
+
+(defn- opt-ends Vec(Int) [items: &Vec(FItem)]
+  (let [nn (count items)]
+    (loop [i 0 stack: Vec(Int) [] ends: Vec(Int) []]
+      (if (>= i nn)
+        ends
+        (let [it: FItem (nth items i)
+              ends1 (conj ends -1)]
+          (match it
+            (FOptStart) (recur (+ i 1) (conj stack i) ends1)
+            (FOptEnd) (let [o (nth stack (- (count stack) 1))]
+                        (recur (+ i 1) (subvec stack 0 (- (count stack) 1)) (assoc ends1 o i)))
+            _ (recur (+ i 1) stack ends1)))))))
+
+(defn compile-weeks Values(Fmt Str) [p: &Str first: Int min: Int]
+  (compile-with p first min EN-US false))
+
+(defn compile-locale Values(Fmt Str) [p: &Str tag: &Str ci: Bool]
+  (let [nms (locale-names tag)
+        first (if (> (count nms) 147) (let [x (nth nms 146)] (- (nth x 0) 48)) 7)
+        min (if (> (count nms) 147) (let [x (nth nms 147)] (- (nth x 0) 48)) 1)]
+    (compile-with p first min nms ci)))
+
+(defn- compile-with Values(Fmt Str) [p: &Str first: Int min: Int nms: Vec(Str) ci: Bool]
+  (let [len (count p)
+        empty (->Fmt [] [] first min nms ci 0)]
+    (loop [pos 0 b (->Bld [] [-1] 0)]
+      (if (>= pos len)
+        (if (> (count (:active b)) 1)
+          (let [b2 (loop [bb b] (if (> (count (:active bb)) 1)
+                                  (recur (->Bld (conj (:items bb) (->FOptEnd)) (subvec (:active bb) 0 (- (count (:active bb)) 1)) 0))
+                                  bb))]
+            (values (->Fmt (:items b2) (opt-ends (:items b2)) first min nms ci 0) ""))
+          (values (->Fmt (:items b) (opt-ends (:items b)) first min nms ci 0) ""))
+        (let [c (nth p pos)]
+          (if (letter? c)
+            (let [e (loop [i pos] (if (and (< i len) (= (nth p i) c)) (recur (+ i 1)) i))
+                  cnt (- e pos)]
+              (if (= c 112)
+                (let [c2 (n/byte-at p e)]
+                  (if (not (letter? c2))
+                    (values empty (str "Pad letter 'p' must be followed by valid pad pattern: " p))
+                    (let [e2 (loop [i e] (if (and (< i len) (= (nth p i) c2)) (recur (+ i 1)) i))
+                          [b2 err] (letter-items (->Bld (:items b) (:active b) cnt) c2 (- e2 e))]
+                      (if (not= err "") (values empty err) (recur e2 b2)))))
+                (let [[b2 err] (letter-items b c cnt)]
+                  (if (not= err "") (values empty err) (recur e b2)))))
+            (if (= c 39)
+              (let [[lit e ok] (loop [i (+ pos 1) acc ""]
+                                 (if (>= i len) (values acc i false)
+                                   (if (= (nth p i) 39)
+                                     (if (= (n/byte-at p (+ i 1)) 39) (recur (+ i 2) (str acc "'"))
+                                       (values acc i true))
+                                     (recur (+ i 1) (str acc (subs p i (+ i 1)))))))]
+                (if (not ok) (values empty (str "Pattern ends with an incomplete string literal: " p))
+                  (recur (+ e 1) (b-push-raw b (->FLit (if (= (- e pos) 1) "'" lit))))))
+              (if (= c 91)
+                (let [items (:items b)
+                      withpad (if (> (:pad b) 0) (conj items (->FPad (:pad b))) items)]
+                  (recur (+ pos 1) (->Bld (conj withpad (->FOptStart)) (conj (:active b) -1) 0)))
+                (if (= c 93)
+                  (if (<= (count (:active b)) 1)
+                    (values empty "Pattern invalid as it contains ] without previous [")
+                    (let [act (subvec (:active b) 0 (- (count (:active b)) 1))]
+                      (recur (+ pos 1) (->Bld (conj (:items b) (->FOptEnd)) (assoc act (- (count act) 1) -1) 0))))
+                  (if (or (= c 123) (= c 125) (= c 35))
+                    (values empty (str "Pattern includes reserved character: '" (chr c) "'"))
+                    (let [e (if (< c 128) (+ pos 1)
+                              (loop [i (+ pos 1)] (if (and (< i len) (= (bit-and (nth p i) 192) 128)) (recur (+ i 1)) i)))]
+                      (recur e (b-push-raw b (->FLit (subs p pos e)))))))))))))))
+
+(defn compile Values(Fmt Str) [p: &Str] (compile-weeks p 7 1))
+
+(defrecord Tacc [kind: Int date: t/LocalDate time: t/LocalTime off: Int zone: t/TimeZone])
+
+(defn- tacc-str Str [a: &Tacc]
+  (case (:kind a)
+    0 (iso/date-str (:date a))
+    1 (iso/time-str (:time a))
+    2 (iso/ldt-str (t/->LocalDateTime (:date a) (:time a)))
+    3 (iso/ot-str (t/->OffsetTime (:time a) (:off a)))
+    (iso/zdt-str (t/->ZonedDateTime (t/->LocalDateTime (:date a) (:time a)) (:off a) (:zone a)))))
+
+(defn- has-date? Bool [a: &Tacc] (let [k (:kind a)] (or (= k 0) (= k 2) (= k 4))))
+(defn- has-time? Bool [a: &Tacc] (> (:kind a) 0))
+(defn- has-off? Bool [a: &Tacc] (>= (:kind a) 3))
+
+(defn- date-field Int [d: &t/LocalDate f: Int first: Int min: Int]
+  (let [y (:year d) m (:month d) dd (:day d)]
+    (case f
+      0 (if (>= y 1) 1 0)
+      1 y
+      2 (if (>= y 1) y (- 1 y))
+      3 m
+      4 dd
+      5 (cv/day-of-year y m dd)
+      6 (cv/day-of-week (cv/epoch-day y m dd))
+      17 (+ (/ (- m 1) 3) 1)
+      18 (cv/week-based-year y m dd first min)
+      19 (cv/week-of-wby y m dd first min)
+      20 (cv/week-of-month y m dd first min)
+      21 (cv/localized-dow (cv/epoch-day y m dd) first)
+      22 (+ (rem (- dd 1) 7) 1)
+      27 (+ (cv/epoch-day y m dd) 40587)
+      0)))
+
+(defn- time-field Int [x: &t/LocalTime f: Int]
+  (let [h (:hour x) mi (:minute x) s (:second x) ns (:nano x)]
+    (case f
+      7 (/ h 12)
+      8 h
+      9 (if (= h 0) 24 h)
+      10 (rem h 12)
+      11 (if (= (rem h 12) 0) 12 (rem h 12))
+      12 mi
+      13 s
+      14 ns
+      15 (+ (* (+ (* h 3600) (* mi 60) s) 1000) (/ ns 1000000))
+      16 (l/time-nano-of-day x)
+      24 (+ (* h 3600) (* mi 60) s)
+      25 (/ ns 1000000)
+      0)))
+
+(defn- date-field? Bool [f: Int] (or (<= f 6) (and (>= f 17) (<= f 22)) (= f 27)))
+(defn- time-field? Bool [f: Int] (or (and (>= f 7) (<= f 16)) (= f 24) (= f 25)))
+
+(defn- tacc-get Values(Int Bool) [a: &Tacc f: Int first: Int min: Int]
+  (if (date-field? f)
+    (if (has-date? a) (values (date-field (:date a) f first min) true) (values 0 false))
+    (if (time-field? f)
+      (if (has-time? a) (values (time-field (:time a) f) true) (values 0 false))
+      (if (= f F-OFFSET)
+        (if (has-off? a) (values (:off a) true) (values 0 false))
+        (values 0 false)))))
+
+(defn- pow10 Int [k: Int] (loop [i 0 acc 1] (if (>= i k) acc (recur (+ i 1) (* acc 10)))))
+
+(defn- zeros Str [k: Int] (loop [i 0 acc ""] (if (>= i k) acc (recur (+ i 1) (str acc "0")))))
+
+(defn- fmt-number Values(Str Str) [fname: &Str v: Int minw: Int maxw: Int sign: Int]
+  (let [digits (if (= v n/LMIN) "9223372036854775808" (str (if (< v 0) (- 0 v) v)))]
+    (if (> (count digits) maxw)
+      (values "" (str "Field " fname " cannot be printed as the value " v " exceeds the maximum print width of " maxw))
+      (if (and (< v 0) (= sign 3))
+        (values "" (str "Field " fname " cannot be printed as the value " v " cannot be negative according to the SignStyle"))
+        (let [prefix (if (>= v 0)
+                       (if (= sign 1) "+" (if (and (= sign 4) (< minw 19) (>= v (pow10 minw))) "+" ""))
+                       (if (or (= sign 0) (= sign 4) (= sign 1)) "-" ""))]
+          (values (str prefix (zeros (- minw (count digits))) digits) ""))))))
+
+(defn- fmt-offset Str [ty: Int noff: &Str secs: Int]
+  (if (= secs 0) (str noff)
+    (let [a (if (< secs 0) (- 0 secs) secs)
+          h (rem (/ a 3600) 100) m (rem (/ a 60) 60) s (rem a 60)
+          colon (or (= ty 2) (= ty 4) (= ty 6) (= ty 8) (= ty 10))
+          sep (if colon ":" "")
+          hs (str (if (< secs 0) "-" "+") (n/pad-num h 2))
+          with-min (or (and (>= ty 3) (<= ty 8)) (and (>= ty 9) (> s 0)) (and (>= ty 1) (> m 0)))
+          with-sec (and with-min (or (= ty 7) (= ty 8) (and (>= ty 5) (> s 0))))
+          out (str hs (if with-min (str sep (n/pad-num m 2)) "") (if with-sec (str sep (n/pad-num s 2)) ""))
+          total (+ h (if with-min m 0) (if with-sec s 0))]
+      (if (= total 0) (str noff) out))))
+
+(defn- fmt-loc-offset Str [full: Bool secs: Int]
+  (if (= secs 0) "GMT"
+    (let [a (if (< secs 0) (- 0 secs) secs)
+          h (rem (/ a 3600) 100) m (rem (/ a 60) 60) s (rem a 60)
+          sg (if (< secs 0) "-" "+")]
+      (if full
+        (str "GMT" sg (n/pad-num h 2) ":" (n/pad-num m 2) (if (= s 0) "" (str ":" (n/pad-num s 2))))
+        (str "GMT" sg h (if (or (> m 0) (> s 0)) (str ":" (n/pad-num m 2) (if (= s 0) "" (str ":" (n/pad-num s 2)))) ""))))))
+
+(defn- fmt-frac Str [ns: Int minw: Int maxw: Int dp: Bool]
+  (if (= ns 0)
+    (if (> minw 0) (str (if dp "." "") (zeros minw)) "")
+    (let [s9 (n/pad-num ns 9)
+          scale (loop [k 9] (if (and (> k 0) (= (nth s9 (- k 1)) 48)) (recur (- k 1)) k))
+          outs (if (< scale minw) minw (if (> scale maxw) maxw scale))]
+      (str (if dp "." "") (subs s9 0 outs)))))
+
+(defn- zone-name Str [a: &Tacc full: Bool generic: Bool]
+  (match (:zone a)
+    (t/TzOffset o) (t/offset-id o)
+    (t/TzRegion id)
+    (let [names: Map(Str Vec(Str)) nm/zone-names]
+      (if (not (contains? names id)) (str id)
+        (let [v: Vec(Str) (get! names id)
+              z (t/->ZonedDateTime (t/->LocalDateTime (:date a) (:time a)) (:off a) (t/->TzRegion id))
+              dst (tz/dst-at? (tz/rules-of (:zone a)) (zd/zdt-epoch-second z))]
+          (nth v (+ (if generic 4 (if dst 2 0)) (if full 1 0))))))))
+
+(defn- day-period Str [mod: Int style: Int]
+  (if (= mod 0) (if (= style 2) "mi" "midnight")
+    (if (= mod 720) (if (= style 2) "n" "noon")
+      (if (and (>= mod 360) (< mod 720)) "in the morning"
+        (if (and (> mod 720) (< mod 1080)) "in the afternoon"
+          (if (and (>= mod 1080) (< mod 1260)) "in the evening" "at night"))))))
+
+(defn- fmt-item Values(Str Bool Str) [f: &Fmt it: &FItem a: &Tacc opt: Bool]
+  (let [first (:first f) min (:min f)
+        unsup (fn Values(Str Bool Str) [fld: Int]
+                (if opt (values "" false "")
+                  (values "" false (str "Unsupported field: " (if (= fld F-MJD) "EpochDay"
+                                                                   (field-name (if (and (>= fld 18) (<= fld 21)) F-DOW fld) first min))))))
+        nozone (fn Values(Str Bool Str) []
+                 (if opt (values "" false "") (values "" false (str "Unable to extract ZoneId from temporal " (tacc-str a)))))]
+    (match it
+      (FLit s) (values (str s) true "")
+      (FNum fld mn mx sg sb)
+      (let [[v ok] (tacc-get a fld first min)]
+        (if (not ok) (unsup fld)
+          (let [[s e] (fmt-number (field-name fld first min) v mn mx sg)] (values s (= e "") e))))
+      (FReduced fld sb)
+      (let [[v ok] (tacc-get a fld first min)]
+        (if (not ok) (unsup fld)
+          (let [av (if (< v 0) (- 0 v) v)
+                r (if (and (>= v 2000) (< v 2100)) (rem av 100) (rem av 100))]
+            (values (n/pad-num r 2) true ""))))
+      (FText fld st)
+      (let [[v ok] (tacc-get a fld first min)]
+        (if (not ok) (unsup fld)
+          (let [[tx ok2] (text-of (:names f) fld st v)]
+            (if ok2 (values tx true "")
+              (let [[s e] (fmt-number (field-name fld first min) v 1 19 0)] (values s (= e "") e))))))
+      (FFrac mn mx dp)
+      (let [[v ok] (tacc-get a F-NOS first min)]
+        (if (not ok) (unsup F-NOS) (values (fmt-frac v mn mx dp) true "")))
+      (FOffset ty no)
+      (let [[v ok] (tacc-get a F-OFFSET first min)]
+        (if (not ok) (unsup F-OFFSET) (values (fmt-offset ty no v) true "")))
+      (FLocOffset fu)
+      (let [[v ok] (tacc-get a F-OFFSET first min)]
+        (if (not ok) (unsup F-OFFSET) (values (fmt-loc-offset fu v) true "")))
+      (FZoneId) (if (= (:kind a) 4) (values (t/zone-id (:zone a)) true "") (nozone))
+      (FZoneText fu ge) (if (= (:kind a) 4) (values (zone-name a fu ge) true "") (nozone))
+      (FDayPeriod st)
+      (let [[h ok] (tacc-get a F-HOD first min)
+            [mi ok2] (tacc-get a F-MOH first min)]
+        (if (not ok) (unsup F-HOD) (values (day-period (+ (* h 60) mi) st) true "")))
+      _ (values "" true ""))))
+
+(defn- fmt-range Values(Str Bool Str) [f: &Fmt from: Int to: Int a: &Tacc opt: Bool]
+  (let [items (:items f)]
+    (loop [i from acc "" pad 0]
+      (if (>= i to) (values acc true "")
+        (let [it: FItem (nth items i)]
+          (match it
+            (FPad w) (recur (+ i 1) acc w)
+            (FOptStart)
+            (let [e (nth (:ends f) i)
+                  [s ok err] (fmt-range f (+ i 1) e a true)]
+              (if (not= err "") (values "" false err)
+                (recur (+ e 1) (if ok (str acc s) acc) 0)))
+            (FOptEnd) (recur (+ i 1) acc 0)
+            _ (let [[s ok err] (fmt-item f it a opt)]
+                (if (not= err "") (values "" false err)
+                  (if (not ok) (values "" false "")
+                    (if (> pad 0)
+                      (if (> (count s) pad)
+                        (values "" false (str "Cannot print as output of " (count s) " characters exceeds pad width of " pad))
+                        (recur (+ i 1) (str acc (str/join "" (repeat-str " " (- pad (count s)))) s) 0))
+                      (recur (+ i 1) (str acc s) 0)))))))))))
+
+(defn- repeat-str Vec(Str) [s: &Str k: Int]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i k) acc (recur (+ i 1) (conj acc (str s))))))
+
+(defn- fmt-tacc Values(Str Str) [f: &Fmt a: &Tacc]
+  (let [[s ok err] (fmt-range f 0 (count (:items f)) a false)] (values s err)))
+
+(defn- dummy-date t/LocalDate [] (t/->LocalDate 1970 1 1))
+(defn- dummy-time t/LocalTime [] (t/->LocalTime 0 0 0 0))
+
+(defn format-date Values(Str Str) [f: &Fmt d: &t/LocalDate]
+  (fmt-tacc f (->Tacc 0 (t/->LocalDate (:year d) (:month d) (:day d)) (dummy-time) 0 (t/utc))))
+
+(defn format-time Values(Str Str) [f: &Fmt x: &t/LocalTime]
+  (fmt-tacc f (->Tacc 1 (dummy-date) (t/->LocalTime (:hour x) (:minute x) (:second x) (:nano x)) 0 (t/utc))))
+
+(defn format-ldt Values(Str Str) [f: &Fmt x: &t/LocalDateTime]
+  (fmt-tacc f (->Tacc 2 (:date x) (:time x) 0 (t/utc))))
+
+(defn format-ot Values(Str Str) [f: &Fmt o: &t/OffsetTime]
+  (fmt-tacc f (->Tacc 3 (dummy-date) (:time o) (:offset o) (t/utc))))
+
+(defn format-zdt Values(Str Str) [f: &Fmt z: &t/ZonedDateTime]
+  (let [x (:dt z)]
+    (fmt-tacc f (->Tacc 4 (:date x) (:time x) (:offset z) (:zone z)))))
+
+(defn format-pattern-zdt Values(Str Str) [p: &Str z: &t/ZonedDateTime]
+  (let [[f e] (compile p)] (if (not= e "") (values "" e) (format-zdt f z))))
+(defn format-pattern-date Values(Str Str) [p: &Str d: &t/LocalDate]
+  (let [[f e] (compile p)] (if (not= e "") (values "" e) (format-date f d))))
+(defn format-pattern-time Values(Str Str) [p: &Str x: &t/LocalTime]
+  (let [[f e] (compile p)] (if (not= e "") (values "" e) (format-time f x))))
+(defn format-pattern-ldt Values(Str Str) [p: &Str x: &t/LocalDateTime]
+  (let [[f e] (compile p)] (if (not= e "") (values "" e) (format-ldt f x))))
+(defn format-pattern-ot Values(Str Str) [p: &Str o: &t/OffsetTime]
+  (let [[f e] (compile p)] (if (not= e "") (values "" e) (format-ot f o))))
+
+(defrecord PCtx [vals: Vec(Int) has: Vec(Int) zone: Vec(t/TimeZone)])
+
+(defn- nf-zeros Vec(Int) [] (loop [i 0 acc: Vec(Int) []] (if (>= i NF) acc (recur (+ i 1) (conj acc 0)))))
+
+(defn- failure Int [pos: Int] (- -1 pos))
+
+(defn- setf Values(Int PCtx) [c: PCtx f: Int v: Int errpos: Int okpos: Int]
+  (if (and (= (nth (:has c) f) 1) (not= (nth (:vals c) f) v)) (values (failure errpos) c)
+    (values okpos (->PCtx (assoc (:vals c) f v) (assoc (:has c) f 1) (:zone c)))))
+
+(defn- set-zone PCtx [c: PCtx z: t/TimeZone] (->PCtx (:vals c) (:has c) [z]))
+
+(defn- parse-number Values(Int Int Int) [s: &Str pos: Int minw: Int maxw: Int sign: Int sub: Int]
+  (let [len (count s)]
+    (if (>= pos len) (values (failure pos) 0 pos)
+      (let [c (nth s pos)
+            fixedw (= minw maxw)
+            plus (= c 43) minus (= c 45)
+            sign-ok (if plus (or (= sign 1) (= sign 4))
+                      (if minus (or (= sign 0) (= sign 1) (= sign 4)) true))]
+        (if (not sign-ok) (values (failure pos) 0 pos)
+          (if (and (not plus) (not minus) (= sign 1)) (values (failure pos) 0 pos)
+            (let [p0 (if (or plus minus) (+ pos 1) pos)
+                  eff-max0 (+ maxw (if (> sub 0) sub 0))
+                  e1 (loop [i p0] (if (and (< i len) (< (- i p0) eff-max0) (digit? (nth s i))) (recur (+ i 1)) i))]
+              (if (< (- e1 p0) minw) (values (failure p0) 0 p0)
+                (let [e2 (if (> sub 0)
+                           (let [plen (- e1 p0)
+                                 em (let [x (- plen sub)] (if (> minw x) minw x))]
+                             (+ p0 (if (< em plen) em plen)))
+                           e1)
+                      ndig (- e2 p0)
+                      [v ev ovf] (n/scan-digits s p0 ndig)
+                      [v2 e3] (if ovf (let [[vv ee oo] (n/scan-digits s p0 (- ndig 1))] (values vv ee)) (values v e2))
+                      plen (- e3 p0)]
+                  (if minus
+                    (if (= v2 0) (values (failure (- p0 1)) 0 pos) (values e3 (- 0 v2) pos))
+                    (if (= sign 4)
+                      (if plus
+                        (if (<= plen minw) (values (failure (- p0 1)) 0 pos) (values e3 v2 pos))
+                        (if (> plen minw) (values (failure p0) 0 pos) (values e3 v2 pos)))
+                      (values e3 v2 pos))))))))))))
+
+(defn- parse-frac Values(Int Int) [s: &Str pos: Int minw: Int maxw: Int dp: Bool]
+  (let [len (count s)]
+    (if (and dp (not= (n/byte-at s pos) 46))
+      (if (> minw 0) (values (failure pos) 0) (values pos 0))
+      (let [p0 (if dp (+ pos 1) pos)
+            min-end (+ p0 minw)]
+        (if (> min-end len) (values (failure p0) 0)
+          (let [max-end (if (< (+ p0 maxw) len) (+ p0 maxw) len)
+                [e bad] (loop [i p0]
+                          (if (>= i max-end) (values i false)
+                            (if (digit? (nth s i)) (recur (+ i 1))
+                              (values i (< i min-end)))))]
+            (if bad (values (failure p0) 0)
+              (let [nd (- e p0)
+                    [v ee oo] (n/scan-digits s p0 nd)
+                    scaled (loop [x v k nd] (if (>= k 9) x (recur (* x 10) (+ k 1))))]
+                (values e scaled)))))))))
+
+(defn- off-digits Values(Int Int Bool) [s: &Str pos: Int colon: Bool first: Bool]
+  (let [p (if (and colon (not first)) (+ pos 1) pos)]
+    (if (and colon (not first) (not= (n/byte-at s pos) 58)) (values 0 pos false)
+      (let [a (n/byte-at s p) b (n/byte-at s (+ p 1))]
+        (if (and (digit? a) (digit? b))
+          (let [v (+ (* (- a 48) 10) (- b 48))] (if (> v 59) (values 0 pos false) (values v (+ p 2) true)))
+          (values 0 pos false))))))
+
+(defn- parse-offset Values(Int Int Str) [s: &Str pos: Int ty: Int noff: &Str]
+  (let [len (count s) nl (count noff)]
+    (if (and (= nl 0) (= pos len)) (values pos 0 "")
+      (if (= pos len) (values (failure pos) 0 "")
+        (if (and (> nl 0) (n/region-eq? s pos noff false)) (values (+ pos nl) 0 "")
+          (let [c (nth s pos)]
+            (if (not (or (= c 43) (= c 45)))
+              (if (= nl 0) (values pos 0 "") (values (failure pos) 0 ""))
+              (let [neg (= c 45)
+                    colon (or (= ty 2) (= ty 4) (= ty 6) (= ty 8) (= ty 10))
+                    [h p1 okh] (off-digits s (+ pos 1) colon true)]
+                (if (not okh) (if (= nl 0) (values pos 0 "") (values (failure pos) 0 ""))
+                  (let [
+                        min-mand (and (>= ty 3) (<= ty 8))
+                        min-opt (or (= ty 1) (= ty 2) (= ty 9) (= ty 10))
+                        [m p2 okm] (if (or min-mand min-opt) (off-digits s p1 colon false) (values 0 p1 true))
+                        bad1 (and min-mand (not okm))
+                        sec-mand (or (= ty 7) (= ty 8))
+                        sec-opt (or (= ty 5) (= ty 6) (and (or (= ty 9) (= ty 10)) okm))
+                        [x p3 oks] (if (and (not bad1) (or sec-mand sec-opt) (or okm min-mand)) (off-digits s p2 colon false) (values 0 p2 true))
+                        bad2 (and sec-mand (not oks))
+                        endp (if (and (or sec-mand sec-opt) oks (or okm min-mand)) p3 p2)
+                        mm (if okm m 0) ss (if (and oks (or sec-mand sec-opt)) x 0)]
+                    (if (or bad1 bad2) (if (= nl 0) (values pos 0 "") (values (failure pos) 0 ""))
+                      (if (> h 23) (values pos 0 "Value out of range: Hour[0-23], Minute[0-59], Second[0-59]")
+                        (let [tot (+ (* h 3600) (* mm 60) ss)]
+                          (if (> tot 64800) (values pos 0 "Zone offset not in valid range: -18:00 to +18:00")
+                            (values endp (if neg (- 0 tot) tot) "")))))))))))))))
+
+(defn- parse-loc-offset Values(Int Int) [s: &Str pos: Int full: Bool]
+  (let [len (count s)]
+    (if (not (n/region-eq? s pos "GMT" false)) (values (failure pos) 0)
+      (let [p (+ pos 3)]
+        (if (= p len) (values p 0)
+          (let [c (nth s p)
+                neg (if (= c 45) -1 (if (= c 43) 1 0))]
+            (if (= neg 0) (values p 0)
+              (let [q (+ p 1)
+                    dg (fn Int [i: Int] (let [b (n/byte-at s i)] (if (digit? b) (- b 48) -1)))]
+                (if full
+                  (let [h1 (dg q) h2 (dg (+ q 1))]
+                    (if (or (< h1 0) (< h2 0) (not= (n/byte-at s (+ q 2)) 58)) (values (failure pos) 0)
+                      (let [m1 (dg (+ q 3)) m2 (dg (+ q 4))]
+                        (if (or (< m1 0) (< m2 0)) (values (failure pos) 0)
+                          (let [q2 (+ q 5)
+                                [sec q3] (if (and (< (+ q2 2) len) (= (n/byte-at s q2) 58) (>= (dg (+ q2 1)) 0) (>= (dg (+ q2 2)) 0))
+                                           (values (+ (* (dg (+ q2 1)) 10) (dg (+ q2 2))) (+ q2 3))
+                                           (values 0 q2))]
+                            (values q3 (* neg (+ (* (+ (* h1 10) h2) 3600) (* (+ (* m1 10) m2) 60) sec))))))))
+                  (let [h1 (dg q)]
+                    (if (< h1 0) (values (failure pos) 0)
+                      (let [q1 (+ q 1)
+                            [h q2] (if (and (< q1 len) (>= (dg q1) 0)) (values (+ (* h1 10) (dg q1)) (+ q1 1)) (values h1 q1))
+                            [m q3] (if (and (< (+ q2 2) len) (= (n/byte-at s q2) 58) (>= (dg (+ q2 1)) 0) (>= (dg (+ q2 2)) 0))
+                                     (values (+ (* (dg (+ q2 1)) 10) (dg (+ q2 2))) (+ q2 3))
+                                     (values 0 q2))
+                            [sec q4] (if (and (> q3 q2) (< (+ q3 2) len) (= (n/byte-at s q3) 58) (>= (dg (+ q3 1)) 0) (>= (dg (+ q3 2)) 0))
+                                       (values (+ (* (dg (+ q3 1)) 10) (dg (+ q3 2))) (+ q3 3))
+                                       (values 0 q3))]
+                        (values q4 (* neg (+ (* h 3600) (* m 60) sec)))))))))))))))
+
+(defn- zone-char? Bool [c: Int]
+  (or (letter? c) (digit? c) (= c 126) (= c 47) (= c 46) (= c 95) (= c 43) (= c 45)))
+
+(defn- longest-zone-id Values(Str Int) [s: &Str pos: Int]
+  (let [e (loop [i pos] (if (and (< i (count s)) (zone-char? (nth s i))) (recur (+ i 1)) i))]
+    (loop [k e]
+      (if (< (- k pos) 2) (values "" -1)
+        (let [cand (subs s pos k)]
+          (if (and (not (str/starts-with? cand "UTC")) (not (str/starts-with? cand "GMT")) (not (str/starts-with? cand "UT"))
+                   (tz/zone-available? cand))
+            (values cand k)
+            (recur (- k 1))))))))
+
+(defn- longest-name Values(Str Int) [s: &Str pos: Int full: Bool]
+  (let [rev: Map(Str Str) (if full nm/long-names nm/short-names)
+        ks (keys rev)
+        ik: Vec(Str) nm/text-ids
+        [b1 e1] (loop [i 0 best "" be -1]
+                  (if (>= i (count ks)) (values best be)
+                    (let [k: Str (nth ks i)]
+                      (if (and (> (+ pos (count k)) be) (n/region-eq? s pos k false))
+                        (recur (+ i 1) (get! rev k) (+ pos (count k)))
+                        (recur (+ i 1) best be)))))]
+    (loop [i 0 best b1 be e1]
+      (if (>= i (count ik)) (values best be)
+        (let [k: Str (nth ik i)]
+          (if (and (> (+ pos (count k)) be) (n/region-eq? s pos k false))
+            (recur (+ i 1) (str k) (+ pos (count k)))
+            (recur (+ i 1) best be)))))))
+
+(defn- parse-offset-based Values(Int PCtx) [c: PCtx s: &Str prefix-pos: Int pos: Int id-z: Bool]
+  (let [prefix (str/upper-case (subs s prefix-pos pos))
+        len (count s)]
+    (if (>= pos len) (values pos (set-zone c (t/->TzRegion prefix)))
+      (let [ch (nth s pos)]
+        (if (or (= ch 48) (= ch 90)) (values pos (set-zone c (t/->TzRegion prefix)))
+          (let [[e off err] (parse-offset s pos 6 (if id-z "Z" "0"))]
+            (if (or (< e 0) (not= err ""))
+              (if id-z (values (failure prefix-pos) c) (values pos (set-zone c (t/->TzRegion prefix))))
+              (if (= (count prefix) 0)
+                (values e (set-zone c (t/->TzOffset off)))
+                (values e (set-zone c (t/->TzRegion (if (= off 0) prefix (str prefix (t/offset-id off))))))))))))))
+
+(defn- parse-zone Values(Int PCtx) [c: PCtx s: &Str pos: Int text: Bool full: Bool]
+  (let [len (count s)]
+    (if (>= pos len) (values (failure pos) c)
+      (let [ch (nth s pos)
+            c1 (n/byte-at s (+ pos 1))
+            c2 (n/byte-at s (+ pos 2))]
+        (if (or (= ch 43) (= ch 45)) (parse-offset-based c s pos pos true)
+          (if (and (= ch 85) (= c1 84) (not= c2 67)) (parse-offset-based c s pos (+ pos 2) false)
+            (if (and (= ch 85) (= c1 84) (= c2 67)
+                     (or (not text) (>= (+ pos 3) len) (= (n/byte-at s (+ pos 3)) 43) (= (n/byte-at s (+ pos 3)) 45)))
+              (parse-offset-based c s pos (+ pos 3) false)
+              (if (and (= ch 85) (= c1 84) (= c2 67))
+                (values (+ pos 3) (set-zone c (t/->TzRegion "Etc/UTC")))
+              (if (and (= ch 71) (= c1 77) (= c2 84))
+                (if (= (n/byte-at s (+ pos 3)) 48) (values (+ pos 4) (set-zone c (t/->TzRegion "GMT0")))
+                  (parse-offset-based c s pos (+ pos 3) false))
+                (let [[id e] (if text (longest-name s pos full) (longest-zone-id s pos))]
+                  (if (< e 0)
+                    (if (= ch 90) (values (+ pos 1) (set-zone c (t/->TzOffset 0))) (values (failure pos) c))
+                    (let [[z err] (tz/zone-of-id id)]
+                      (if (not= err "") (values (failure pos) c) (values e (set-zone c z)))))))))))))))
+
+(defn- parse-item Values(Int PCtx Str) [f: &Fmt it: &FItem s: &Str pos: Int c: PCtx]
+  (match it
+    (FLit lit) (if (n/region-eq? s pos lit (:ci f)) (values (+ pos (count lit)) c "") (values (failure pos) c ""))
+    (FNum fld mn mx sg sb)
+    (let [[e v start] (parse-number s pos mn mx sg sb)]
+      (if (< e 0) (values e c "")
+        (let [[r c2] (setf c fld v start e)] (values r c2 ""))))
+    (FReduced fld sb)
+    (let [[e v start] (parse-number s pos 2 2 3 sb)]
+      (if (< e 0) (values e c "")
+        (let [v2 (if (and (= (- e pos) 2) (>= v 0))
+                   (let [x (+ 2000 v)] x)
+                   v)
+              [r c2] (setf c fld v2 pos e)]
+          (values r c2 ""))))
+    (FText fld st)
+    (let [[v e] (match-text f fld st s pos)]
+      (if (< e 0) (values (failure pos) c "")
+        (let [[r c2] (setf c fld v pos e)] (values r c2 ""))))
+    (FFrac mn mx dp)
+    (let [[e v] (parse-frac s pos mn mx dp)]
+      (if (< e 0) (values e c "")
+        (let [[r c2] (setf c F-NOS v pos e)] (values r c2 ""))))
+    (FOffset ty no)
+    (let [[e v err] (parse-offset s pos ty no)]
+      (if (not= err "") (values pos c err)
+        (if (< e 0) (values e c "")
+          (let [[r c2] (setf c F-OFFSET v pos e)] (values r c2 "")))))
+    (FLocOffset fu)
+    (let [[e v] (parse-loc-offset s pos fu)]
+      (if (< e 0) (values e c "")
+        (let [[r c2] (setf c F-OFFSET v pos e)] (values r c2 ""))))
+    (FZoneId) (let [[e c2] (parse-zone c s pos false false)] (values e c2 ""))
+    (FZoneText fu ge) (let [[e c2] (parse-zone c s pos true fu)] (values e c2 ""))
+    (FDayPeriod st)
+    (let [[v e] (match-day-period s pos st)]
+      (if (< e 0) (values (failure pos) c "")
+        (let [[r c2] (setf c F-DAYPERIOD v pos e)] (values r c2 ""))))
+    _ (values pos c "")))
+
+(defn- match-day-period Values(Int Int) [s: &Str pos: Int st: Int]
+  (let [names (if (= st 2) ["mi" "n" "in the morning" "in the afternoon" "in the evening" "at night"]
+                ["midnight" "noon" "in the morning" "in the afternoon" "in the evening" "at night"])]
+    (loop [i 0 best -1 be -1]
+      (if (>= i 6) (values best be)
+        (let [k: Str (nth names i)]
+          (if (and (> (+ pos (count k)) be) (n/region-eq? s pos k false))
+            (recur (+ i 1) i (+ pos (count k)))
+            (recur (+ i 1) best be)))))))
+
+(defn- parse-range Values(Int PCtx Str) [f: &Fmt from: Int to: Int s: &Str pos0: Int c0: PCtx]
+  (let [items (:items f)]
+    (loop [i from pos pos0 c c0 pad 0]
+      (if (>= i to) (values pos c "")
+        (let [it: FItem (nth items i)]
+          (match it
+            (FPad w) (recur (+ i 1) pos c w)
+            (FOptStart)
+            (let [e (nth (:ends f) i)
+                  [p2 c2 err] (parse-range f (+ i 1) e s pos (->PCtx (:vals c) (:has c) (:zone c)))]
+              (if (not= err "") (values p2 c2 err)
+                (if (< p2 0) (recur (+ e 1) pos c 0) (recur (+ e 1) p2 c2 0))))
+            (FOptEnd) (recur (+ i 1) pos c 0)
+            _ (if (> pad 0)
+                (if (>= pos (count s)) (values (failure pos) c "")
+                  (let [endp (+ pos pad)]
+                    (if (> endp (count s)) (values (failure pos) c "")
+                      (let [pp (loop [k pos] (if (and (< k endp) (= (nth s k) 32)) (recur (+ k 1)) k))
+                            sub (subs s 0 endp)
+                            [r c2 err] (parse-item f it sub pp (copy c))]
+                        (if (not= err "") (values r c2 err)
+                          (if (not= r endp) (values (failure (+ pos pp)) c "")
+                            (recur (+ i 1) r c2 0)))))))
+                (let [[r c2 err] (parse-item f it s pos c)]
+                  (if (not= err "") (values r c2 err)
+                    (if (< r 0) (values r c2 "") (recur (+ i 1) r c2 0)))))))))))
+
+(defrecord Parsed [vals: Vec(Int) has: Vec(Int) zone: Vec(t/TimeZone) date: Vec(t/LocalDate) time: Vec(t/LocalTime)
+                   excess: Int first: Int min: Int style: Int])
+
+(def SMART 0) (def LENIENT 1) (def STRICT 2)
+(defn- lenient? Bool [p: &Parsed] (= (:style p) 1))
+(defn- strict? Bool [p: &Parsed] (= (:style p) 2))
+(defn- lvalid Str [p: &Parsed f: Int v: Int] (if (lenient? p) "" (valid p f v)))
+
+(defn- hasf? Bool [p: &Parsed f: Int] (= (nth (:has p) f) 1))
+(defn- getf Int [p: &Parsed f: Int] (nth (:vals p) f))
+(defn- remf Parsed [p: Parsed f: Int]
+  (->Parsed (:vals p) (assoc (:has p) f 0) (:zone p) (:date p) (:time p) (:excess p) (:first p) (:min p) (:style p)))
+(defn- putf Parsed [p: Parsed f: Int v: Int]
+  (->Parsed (assoc (:vals p) f v) (assoc (:has p) f 1) (:zone p) (:date p) (:time p) (:excess p) (:first p) (:min p) (:style p)))
+(defn- with-date Parsed [p: Parsed d: t/LocalDate]
+  (->Parsed (:vals p) (:has p) (:zone p) [d] (:time p) (:excess p) (:first p) (:min p) (:style p)))
+(defn- with-time Parsed [p: Parsed x: t/LocalTime ex: Int]
+  (->Parsed (:vals p) (:has p) (:zone p) (:date p) [x] ex (:first p) (:min p) (:style p)))
+(defn- fname Str [p: &Parsed f: Int] (field-name f (:first p) (:min p)))
+(defn- valid Str [p: &Parsed f: Int v: Int] (check-valid f v (:first p) (:min p)))
+
+(defn- add-field Values(Parsed Str) [p: Parsed f: Int v: Int]
+  (if (and (hasf? p f) (not= (getf p f) v))
+    (values p (str "Conflict found: " (fname p f) " " (getf p f) " differs from " (fname p f) " " v))
+    (values (putf p f v) "")))
+
+(defn- upd-field Values(Parsed Str) [p: Parsed target: Int f: Int v: Int]
+  (if (and (hasf? p f) (not= (getf p f) v))
+    (values p (str "Conflict found: " (fname p f) " " (getf p f) " differs from " (fname p f) " " v " while resolving  " (fname p target)))
+    (values (putf p f v) "")))
+
+(defn- upd-date Values(Parsed Str) [p: Parsed d: t/LocalDate]
+  (if (> (count (:date p)) 0)
+    (let [old: t/LocalDate (nth (:date p) 0)]
+      (if (= old d) (values p "")
+        (values p (str "Conflict found: Fields resolved to two different dates: " (iso/date-str old) " " (iso/date-str d)))))
+    (values (with-date p d) "")))
+
+(defn- upd-time Values(Parsed Str) [p: Parsed x: t/LocalTime ex: Int]
+  (if (> (count (:time p)) 0)
+    (let [old: t/LocalTime (nth (:time p) 0)]
+      (if (= old x)
+        (if (and (not= (:excess p) ex) (not= ex 0) (not= (:excess p) 0))
+          (values p (str "Conflict found: Fields resolved to different excess periods: P" (:excess p) "D P" ex "D"))
+          (values (with-time p x (if (= ex 0) (:excess p) ex)) ""))
+        (values p (str "Conflict found: Fields resolved to two different times: " (iso/time-str old) " " (iso/time-str x)))))
+    (values (with-time p x ex) "")))
+
+(defn- resolve-date-fields Values(Parsed Str) [pm: Parsed]
+  (let [
+        [p0 em] (if (hasf? pm F-MJD)
+                  (let [v (getf pm F-MJD) ev (valid pm F-MJD v)]
+                    (if (not= ev "") (values pm ev) (upd-date (remf pm F-MJD) (l/date-of-epoch-day (- v 40587)))))
+                  (values pm ""))
+        [p1 e1]
+        (if (hasf? p0 F-YOE)
+          (let [yoe (getf p0 F-YOE)
+                ev (lvalid p0 F-YOE yoe)]
+            (if (not= ev "") (values p0 ev)
+              (let [pa (remf p0 F-YOE)]
+                (if (hasf? pa F-ERA)
+                  (let [era (getf pa F-ERA) pb (remf pa F-ERA)]
+                    (if (= era 1) (add-field pb F-YEAR yoe)
+                      (if (= era 0) (add-field pb F-YEAR (- 1 yoe))
+                        (values pb (str "Invalid value for era: " era)))))
+                  (if (strict? pa)
+                    (if (hasf? pa F-YEAR)
+                      (let [y (getf pa F-YEAR)] (add-field pa F-YEAR (if (> y 0) yoe (- 1 yoe))))
+                      (values p0 ""))
+                    (add-field pa F-YEAR (if (or (not (hasf? pa F-YEAR)) (> (getf pa F-YEAR) 0)) yoe (- 1 yoe))))))))
+          (if (hasf? p0 F-ERA)
+            (values p0 (valid p0 F-ERA (getf p0 F-ERA)))
+            (values p0 "")))]
+    (if (not= em "") (values p0 em)
+    (if (not= e1 "") (values p1 e1)
+      (if (not (hasf? p1 F-YEAR)) (values p1 "")
+        (if (and (hasf? p1 F-MONTH) (hasf? p1 F-DOM))
+          (let [y (getf p1 F-YEAR) m (getf p1 F-MONTH) d (getf p1 F-DOM)
+                ey (valid p1 F-YEAR y) em (lvalid p1 F-MONTH m) ed (lvalid p1 F-DOM d)
+                rest (remf (remf (remf p1 F-YEAR) F-MONTH) F-DOM)]
+            (cond
+              (not= ey "") (values p1 ey)
+              (not= em "") (values p1 em)
+              (not= ed "") (values p1 ed)
+              (lenient? p1) (let [[d1 e1] (l/date-plus-months (t/->LocalDate y 1 1) (- m 1))
+                                  [d2 e2] (if (= e1 "") (l/date-plus-days d1 (- d 1)) (values d1 e1))]
+                              (if (not= e2 "") (values p1 e2) (upd-date rest d2)))
+              :else
+              (let [ml (cv/month-length y m)]
+                (if (and (> d ml) (strict? p1))
+                  (values p1 (if (and (= m 2) (= d 29))
+                               (str "Invalid date 'February 29' as '" y "' is not a leap year")
+                               (str "Invalid date '" (nth MONTH-NAMES-UC (- m 1)) " " d "'")))
+                  (upd-date rest (t/->LocalDate y m (if (> d ml) ml d)))))))
+          (if (hasf? p1 F-DOY)
+            (let [y (getf p1 F-YEAR) doy (getf p1 F-DOY)
+                  ey (valid p1 F-YEAR y) ed (lvalid p1 F-DOY doy)]
+              (if (not= ey "") (values p1 ey)
+                (if (not= ed "") (values p1 ed)
+                  (let [[d err] (if (lenient? p1)
+                                  (l/date-plus-days (t/->LocalDate y 1 1) (- doy 1))
+                                  (l/of-year-day y doy))]
+                    (if (not= err "") (values p1 err)
+                      (upd-date (remf (remf p1 F-YEAR) F-DOY) d))))))
+            (values p1 ""))))))))
+
+(defn- resolve-time4 Values(Parsed Str) [p: Parsed hod: Int moh: Int som: Int nos: Int]
+  (if (lenient? p)
+    (let [tot (+ (* hod 3600000000000) (* moh 60000000000) (* som 1000000000) nos)
+          day 86400000000000
+          ex (let [q (/ tot day)] (if (and (< tot 0) (not= (* q day) tot)) (- q 1) q))
+          nod (- tot (* ex day))]
+      (upd-time p (t/->LocalTime (/ nod 3600000000000) (rem (/ nod 60000000000) 60) (rem (/ nod 1000000000) 60) (rem nod 1000000000)) ex))
+  (let [em (valid p F-MOH moh) en (valid p F-NOS nos)]
+    (if (not= em "") (values p em)
+      (if (not= en "") (values p en)
+        (if (and (not (strict? p)) (= hod 24) (= moh 0) (= som 0) (= nos 0))
+          (upd-time p (t/->LocalTime 0 0 0 0) 1)
+          (let [eh (valid p F-HOD hod) es (valid p F-SOM som)]
+            (if (not= eh "") (values p eh)
+              (if (not= es "") (values p es)
+                (upd-time p (t/->LocalTime hod moh som nos) 0))))))))))
+
+(defn- resolve-time-fields Values(Parsed Str) [p0: Parsed]
+  (let [[p1 e1] (if (hasf? p0 F-CHOD)
+                  (let [ch (getf p0 F-CHOD) ev (if (or (strict? p0) (and (not (lenient? p0)) (not= ch 0))) (valid p0 F-CHOD ch) "")]
+                    (if (not= ev "") (values p0 ev) (upd-field (remf p0 F-CHOD) F-CHOD F-HOD (if (= ch 24) 0 ch))))
+                  (values p0 ""))
+        [p2 e2] (if (not= e1 "") (values p1 e1)
+                  (if (hasf? p1 F-CHOAP)
+                    (let [ch (getf p1 F-CHOAP) ev (if (or (strict? p1) (and (not (lenient? p1)) (not= ch 0))) (valid p1 F-CHOAP ch) "")]
+                      (if (not= ev "") (values p1 ev) (upd-field (remf p1 F-CHOAP) F-CHOAP F-HOAP (if (= ch 12) 0 ch))))
+                    (values p1 "")))
+        [p3 e3] (if (not= e2 "") (values p2 e2)
+                  (if (and (hasf? p2 F-AMPM) (hasf? p2 F-HOAP))
+                    (let [ap (getf p2 F-AMPM) hap (getf p2 F-HOAP)
+                          ea (lvalid p2 F-AMPM ap) eh (lvalid p2 F-HOAP hap)]
+                      (if (not= ea "") (values p2 ea)
+                        (if (not= eh "") (values p2 eh)
+                          (upd-field (remf (remf p2 F-AMPM) F-HOAP) F-AMPM F-HOD (+ (* ap 12) hap)))))
+                    (values p2 "")))
+        [p4 e4] (if (not= e3 "") (values p3 e3)
+                  (if (hasf? p3 F-NOD)
+                    (let [nod (getf p3 F-NOD) ev (lvalid p3 F-NOD nod)]
+                      (if (not= ev "") (values p3 ev)
+                        (let [q (remf p3 F-NOD)
+                              [a ea] (upd-field q F-NOD F-HOD (/ nod 3600000000000))
+                              [b eb] (if (= ea "") (upd-field a F-NOD F-MOH (rem (/ nod 60000000000) 60)) (values a ea))
+                              [c ec] (if (= eb "") (upd-field b F-NOD F-SOM (rem (/ nod 1000000000) 60)) (values b eb))]
+                          (if (= ec "") (upd-field c F-NOD F-NOS (rem nod 1000000000)) (values c ec)))))
+                    (values p3 "")))
+        [p5 e5] (if (not= e4 "") (values p4 e4)
+                  (if (hasf? p4 F-MOD)
+                    (let [lod (getf p4 F-MOD) ev (lvalid p4 F-MOD lod)]
+                      (if (not= ev "") (values p4 ev)
+                        (let [q (remf p4 F-MOD)
+                              [a ea] (upd-field q F-MOD F-SOD (/ lod 1000))]
+                          (if (= ea "") (upd-field a F-MOD F-MOS (rem lod 1000)) (values a ea)))))
+                    (values p4 "")))
+        [p6 e6] (if (not= e5 "") (values p5 e5)
+                  (if (hasf? p5 F-SOD)
+                    (let [sod (getf p5 F-SOD) ev (lvalid p5 F-SOD sod)]
+                      (if (not= ev "") (values p5 ev)
+                        (let [q (remf p5 F-SOD)
+                              [a ea] (upd-field q F-SOD F-HOD (/ sod 3600))
+                              [b eb] (if (= ea "") (upd-field a F-SOD F-MOH (rem (/ sod 60) 60)) (values a ea))]
+                          (if (= eb "") (upd-field b F-SOD F-SOM (rem sod 60)) (values b eb)))))
+                    (values p5 "")))
+        [p7 e7] (if (not= e6 "") (values p6 e6)
+                  (if (hasf? p6 F-NOS)
+                    (let [nos (getf p6 F-NOS) ev (lvalid p6 F-NOS nos)]
+                      (if (not= ev "") (values p6 ev)
+                        (if (hasf? p6 F-MOS)
+                          (let [los (getf p6 F-MOS) el (lvalid p6 F-MOS los)]
+                            (if (not= el "") (values p6 el)
+                              (upd-field (remf p6 F-MOS) F-MOS F-NOS (+ (* los 1000000) (rem nos 1000000)))))
+                          (values p6 ""))))
+                    (values p6 "")))]
+    (if (not= e7 "") (values p7 e7)
+      (if (and (hasf? p7 F-HOD) (hasf? p7 F-MOH) (hasf? p7 F-SOM) (hasf? p7 F-NOS))
+        (let [hod (getf p7 F-HOD) moh (getf p7 F-MOH) som (getf p7 F-SOM) nos (getf p7 F-NOS)]
+          (resolve-time4 (remf (remf (remf (remf p7 F-HOD) F-MOH) F-SOM) F-NOS) hod moh som nos))
+        (values p7 "")))))
+
+(defn- resolve-weeks Values(Parsed Bool Str) [p: Parsed]
+  (let [first (:first p) min (:min p)]
+    (if (hasf? p F-LDOW)
+      (let [v (getf p F-LDOW) ev (valid p F-LDOW v)]
+        (if (not= ev "") (values p false ev)
+          (values (putf (remf p F-LDOW) F-DOW (+ (mod (+ (- first 1) (- v 1)) 7) 1)) true "")))
+      (if (and (hasf? p F-DOW) (or (hasf? p F-WOM) (hasf? p F-WOWBY) (hasf? p F-WBY)))
+        (let [idow (getf p F-DOW) edw (valid p F-DOW idow)]
+          (if (not= edw "") (values p false edw)
+            (let [ldow (+ (mod (- idow first) 7) 1)]
+              (if (hasf? p F-YEAR)
+                (if (and (hasf? p F-WOM) (hasf? p F-MONTH))
+                  (let [y (getf p F-YEAR) m (getf p F-MONTH) wom (getf p F-WOM)
+                        ey (valid p F-YEAR y) em (valid p F-MONTH m) ew (valid p F-WOM wom)]
+                    (if (not= ey "") (values p false ey)
+                      (if (not= em "") (values p false em)
+                        (if (not= ew "") (values p false ew)
+                          (let [ed0 (cv/epoch-day y m 1)
+                                w0 (cv/week-of-month y m 1 first min)
+                                l0 (cv/localized-dow ed0 first)
+                                ed (+ ed0 (* (- wom w0) 7) (- ldow l0))
+                                q (remf (remf (remf (remf p F-WOM) F-YEAR) F-MONTH) F-DOW)
+                                [q2 e2] (upd-date q (l/date-of-epoch-day ed))]
+                            (values q2 true e2))))))
+                  (values p false ""))
+                (if (and (hasf? p F-WBY) (hasf? p F-WOWBY))
+                  (let [yw (getf p F-WBY) ww (getf p F-WOWBY)
+                        ey (valid p F-WBY yw) ew (valid p F-WOWBY ww)]
+                    (if (not= ey "") (values p false ey)
+                      (if (not= ew "") (values p false ew)
+                        (let [ed (cv/date-of-week-based yw ww ldow first min)
+                              q (remf (remf (remf p F-WBY) F-WOWBY) F-DOW)
+                              [q2 e2] (upd-date q (l/date-of-epoch-day ed))]
+                          (values q2 true e2)))))
+                  (values p false ""))))))
+        (values p false "")))))
+
+(defn- resolve-time-lenient Values(Parsed Str) [p0: Parsed]
+  (let [[p1 e1]
+        (if (> (count (:time p0)) 0) (values p0 "")
+          (let [pa (if (hasf? p0 F-MOS) (putf (remf p0 F-MOS) F-NOS (* (getf p0 F-MOS) 1000000)) p0)]
+            (if (hasf? pa F-HOD)
+              (let [hm (hasf? pa F-MOH) hs (hasf? pa F-SOM) hn (hasf? pa F-NOS)]
+                (if (or (and (not hm) (or hs hn)) (and hm (not hs) hn)) (values pa "")
+                  (let [hod (getf pa F-HOD)
+                        moh (if hm (getf pa F-MOH) 0) som (if hs (getf pa F-SOM) 0) nos (if hn (getf pa F-NOS) 0)
+                        [q e] (resolve-time4 pa hod moh som nos)]
+                    (if (not= e "") (values q e)
+                      (values (remf (remf (remf (remf q F-HOD) F-MOH) F-SOM) F-NOS) "")))))
+              (if (and (not (hasf? pa F-HOAP)) (not (hasf? pa F-MOH)) (not (hasf? pa F-SOM)) (not (hasf? pa F-NOS)))
+                (if (hasf? pa F-DAYPERIOD)
+                  (let [mid (case (getf pa F-DAYPERIOD) 0 0 1 720 2 540 3 900 4 1170 90)]
+                    (upd-time (remf (remf pa F-DAYPERIOD) F-AMPM) (t/->LocalTime (/ mid 60) (rem mid 60) 0 0) 0))
+                  (if (hasf? pa F-AMPM)
+                    (let [ap (getf pa F-AMPM) ea (valid pa F-AMPM ap)]
+                      (if (not= ea "") (values pa ea)
+                        (upd-time (remf pa F-AMPM) (t/->LocalTime (if (= ap 0) 6 18) 0 0 0) 0)))
+                    (values pa "")))
+                (values pa "")))))]
+    (if (not= e1 "") (values p1 e1)
+      (loop [f 0]
+        (if (>= f NF) (values p1 "")
+          (if (and (hasf? p1 f) (time-field? f))
+            (let [ev (lvalid p1 f (getf p1 f))] (if (not= ev "") (values p1 ev) (recur (+ f 1))))
+            (recur (+ f 1))))))))
+
+(defn- cross-check Values(Parsed Str) [p0: Parsed]
+  (let [first (:first p0) min (:min p0)
+        hd (> (count (:date p0)) 0)
+        ht (> (count (:time p0)) 0)]
+    (loop [f 0 p p0]
+      (if (>= f NF) (values p "")
+        (if (not (hasf? p f)) (recur (+ f 1) p)
+          (let [dsup (and hd (date-field? f))
+                tsup (and ht (time-field? f))]
+            (if (not (or dsup tsup)) (recur (+ f 1) p)
+              (let [target (if dsup (let [d: t/LocalDate (nth (:date p) 0)] (date-field d f first min))
+                             (let [x: t/LocalTime (nth (:time p) 0)] (time-field x f)))
+                    v (getf p f)]
+                (if (= target v) (recur (+ f 1) (remf p f))
+                  (values p (str "Conflict found: Field " (fname p f) " " target " differs from " (fname p f) " " v
+                                 " derived from " (if dsup (iso/date-str (nth (:date p) 0)) (iso/time-str (nth (:time p) 0))))))))))))))
+
+(defn- resolve Values(Parsed Str) [p0: Parsed]
+  (let [[p1 e1] (resolve-date-fields p0)
+        [p2 e2] (if (= e1 "") (resolve-time-fields p1) (values p1 e1))
+        [p3 changed e3] (if (= e2 "")
+                          (loop [p p2 ch false k 0]
+                            (if (>= k 8) (values p ch "")
+                              (let [[q c e] (resolve-weeks p)]
+                                (if (not= e "") (values q ch e)
+                                  (if c (recur q true (+ k 1)) (values q ch ""))))))
+                          (values p2 false e2))
+        [p4 e4] (if (and (= e3 "") changed)
+                  (let [[a ea] (resolve-date-fields p3)] (if (= ea "") (resolve-time-fields a) (values a ea)))
+                  (values p3 e3))
+        [p5 e5] (if (= e4 "") (resolve-time-lenient p4) (values p4 e4))
+        [p6 e6] (if (= e5 "") (cross-check p5) (values p5 e5))]
+    (if (not= e6 "") (values p6 e6)
+      (if (and (> (count (:date p6)) 0) (> (count (:time p6)) 0) (not= (:excess p6) 0))
+        (let [d: t/LocalDate (nth (:date p6) 0)
+              [d2 e] (l/date-plus-days d (:excess p6))]
+          (if (not= e "") (values p6 e)
+            (values (->Parsed (:vals p6) (:has p6) (:zone p6) [d2] (:time p6) 0 (:first p6) (:min p6) (:style p6)) "")))
+        (values p6 "")))))
+
+(defn parse Values(Parsed Str) [f: &Fmt text: &Str]
+  (let [c0 (->PCtx (nf-zeros) (nf-zeros) [])
+        [pos c err] (parse-range f 0 (count (:items f)) text 0 c0)
+        abbr (if (> (count text) 64) (str (subs text 0 64) "...") (str text))
+        empty (->Parsed (nf-zeros) (nf-zeros) [] [] [] 0 (:first f) (:min f) (:resolver f))]
+    (if (not= err "") (values empty (str "Text '" abbr "' could not be parsed: " err))
+      (if (< pos 0) (values empty (str "Text '" abbr "' could not be parsed at index " (- -1 pos)))
+        (if (< pos (count text)) (values empty (str "Text '" abbr "' could not be parsed, unparsed text found at index " pos))
+          (let [[p e] (resolve (->Parsed (:vals c) (:has c) (:zone c) [] [] 0 (:first f) (:min f) (:resolver f)))]
+            (if (not= e "") (values p (str "Text '" abbr "' could not be parsed: " e))
+              (values p ""))))))))
+
+(defn parsed-date Values(t/LocalDate Bool) [p: &Parsed]
+  (if (> (count (:date p)) 0) (values (nth (:date p) 0) true) (values (t/->LocalDate 1970 1 1) false)))
+
+(defn parsed-time Values(t/LocalTime Bool) [p: &Parsed]
+  (if (> (count (:time p)) 0) (values (nth (:time p) 0) true) (values (t/->LocalTime 0 0 0 0) false)))
+
+(defn parsed-ldt Values(t/LocalDateTime Bool) [p: &Parsed]
+  (let [[d ok1] (parsed-date p) [x ok2] (parsed-time p)]
+    (values (t/->LocalDateTime d x) (and ok1 ok2))))
+
+(defn parsed-offset Values(Int Bool) [p: &Parsed]
+  (if (hasf? p F-OFFSET) (values (getf p F-OFFSET) true) (values 0 false)))
+
+(defn parsed-zone Values(t/TimeZone Bool) [p: &Parsed]
+  (if (> (count (:zone p)) 0)
+    (let [z: t/TimeZone (nth (:zone p) 0)] (values (zd-copy z) true))
+    (if (hasf? p F-OFFSET) (values (t/->TzOffset (getf p F-OFFSET)) true) (values (t/utc) false))))
+
+(defn- zd-copy t/TimeZone [z: &t/TimeZone]
+  (match z (t/TzOffset o) (t/->TzOffset o) (t/TzRegion id) (t/->TzRegion id)))
+
+(defn parsed-zdt Values(t/ZonedDateTime Bool) [p: &Parsed]
+  (let [[zone okz] (parsed-zone p)
+        [x okx] (parsed-ldt p)]
+    (if (not (and okz okx)) (values (t/->ZonedDateTime x 0 (t/utc)) false)
+      (let [secs (if (hasf? p F-OFFSET)
+                   (l/ldt-to-epoch-second x (getf p F-OFFSET))
+                   (zd/zdt-epoch-second (zd/zdt-of-local x zone [])))]
+        (values (zd/zdt-of-instant secs (:nano (:time x)) zone) true)))))
+
+(defn parsed-ot Values(t/OffsetTime Bool) [p: &Parsed]
+  (let [[x okx] (parsed-time p) [o oko] (parsed-offset p)]
+    (values (t/->OffsetTime x o) (and okx oko))))
+
+(defn- unable Str [text: &Str what: &Str]
+  (str "Text '" (if (> (count text) 64) (str (subs text 0 64) "...") text) "' could not be parsed: Unable to obtain " what " from TemporalAccessor"))
+
+(defn parse-date Values(t/LocalDate Str) [f: &Fmt text: &Str]
+  (let [[p e] (parse f text)]
+    (if (not= e "") (values (t/->LocalDate 1970 1 1) e)
+      (let [[d ok] (parsed-date p)] (values d (if ok "" (unable text "LocalDate")))))))
+
+(defn parse-time Values(t/LocalTime Str) [f: &Fmt text: &Str]
+  (let [[p e] (parse f text)]
+    (if (not= e "") (values (t/->LocalTime 0 0 0 0) e)
+      (let [[x ok] (parsed-time p)] (values x (if ok "" (unable text "LocalTime")))))))
+
+(defn parse-ldt Values(t/LocalDateTime Str) [f: &Fmt text: &Str]
+  (let [[p e] (parse f text)
+        [x ok] (parsed-ldt p)]
+    (if (not= e "") (values x e) (values x (if ok "" (unable text "LocalDateTime"))))))
+
+(defn parse-zdt Values(t/ZonedDateTime Str) [f: &Fmt text: &Str]
+  (let [[p e] (parse f text)
+        [z ok] (parsed-zdt p)]
+    (if (not= e "") (values z e) (values z (if ok "" (unable text "ZonedDateTime"))))))
+
+(defn parse-ot Values(t/OffsetTime Str) [f: &Fmt text: &Str]
+  (let [[p e] (parse f text)
+        [o ok] (parsed-ot p)]
+    (if (not= e "") (values o e) (values o (if ok "" (unable text "OffsetTime"))))))

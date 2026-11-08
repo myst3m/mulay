@@ -1,0 +1,99 @@
+(ns meter-test (:require [mulay.rt.meter :as mt] [mulay.app.run :as run] [mulay.rt.engine :as en] [mulay.mule.load :as ld]
+                         [mulay.lib.res :as res] [mulay.conn.registry :as creg] [clay.httpmsg :as hm]))
+
+;; Mule のメトリクス (OpenTelemetry の meter) の数え方。期待値は実 Mule 4.12.0 で確かめたもの
+;; (test/fixtures/apps/otel-metrics と、フロー 1 つずつのアプリ):
+;;   received.events      フローに入るたび (flow-ref で呼ばれたフローも)。sub-flow は数えない
+;;   dispatched.*         source から来た 1 件ごと (source の無いフローは 0)
+;;   execution.errors     フローのエラーハンドラ (既定のものも) がエラーを受けたとき。try の中で扱ったものは数えない
+;;   error-count          エラー 1 つにつき 1 回 (扱ったハンドラの数によらない)。エラーの型ごと
+;; フローの数は mule.enable.statistics が true のときだけ数える。error-count はいつも数える。
+
+(defn- fc Str [name: Str]
+  (let [c (mt/flow-count name)]
+    (str (:received c) "/" (:dispatched c) "/" (:errors c))))
+
+(deftest off-counts-nothing
+  (let [z0 (mt/clear!)
+        z1 (mt/enable! false true)
+        z2 (mt/flow-received "f")
+        z3 (mt/flow-dispatched "f")
+        z4 (mt/flow-error "f")
+        z5 (mt/error-raised "APP:X")]
+    (is (= (fc "f") "0/0/0"))
+    (is (= (mt/error-count "APP:X") 0))))
+
+(deftest counts
+  (let [z0 (mt/clear!)
+        z1 (mt/enable! true true)
+        z2 (mt/flow-received "f")
+        z3 (mt/flow-received "f")
+        z4 (mt/flow-dispatched "f")
+        z5 (mt/flow-error "f")
+        z6 (mt/error-raised "APP:X")
+        z7 (mt/error-raised "APP:X")
+        z8 (mt/error-raised "APP:Y")]
+    (is (= (fc "f") "2/1/1"))
+    (is (= (fc "g") "0/0/0"))
+    (is (= (mt/error-count "APP:X") 2))
+    (is (= (mt/error-count "APP:Y") 1))
+    (is (= (mt/error-types) ["APP:X" "APP:Y"]))))
+
+;; mule.enable.statistics が無い: フローの数は 0 のまま、error-count は数える
+(deftest statistics-off
+  (let [z0 (mt/clear!)
+        z1 (mt/enable! true false)
+        z2 (mt/flow-received "f")
+        z3 (mt/flow-dispatched "f")
+        z4 (mt/flow-error "f")
+        z5 (mt/error-raised "APP:X")]
+    (is (= (fc "f") "0/0/0"))
+    (is (= (mt/error-count "APP:X") 1))))
+
+(def XML (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\">\n"
+              "<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"9001\"/></http:listener-config>\n"
+              "<sub-flow name=\"sub\"><set-payload value=\"sub\"/></sub-flow>\n"
+              "<flow name=\"private-ok\"><flow-ref name=\"sub\"/></flow>\n"
+              "<flow name=\"private-propagates\"><raise-error type=\"APP:CHILD\"/><error-handler><on-error-propagate/></error-handler></flow>\n"
+              "<flow name=\"private-no-handler\"><raise-error type=\"APP:CHILD_BARE\"/></flow>\n"
+              "<flow name=\"ok\"><http:listener config-ref=\"L\" path=\"/ok\"/><flow-ref name=\"private-ok\"/></flow>\n"
+              "<flow name=\"continue\"><http:listener config-ref=\"L\" path=\"/continue\"/><raise-error type=\"APP:CONTINUED\"/>"
+              "<error-handler><on-error-continue><set-payload value=\"continued\"/></on-error-continue></error-handler></flow>\n"
+              "<flow name=\"propagate\"><http:listener config-ref=\"L\" path=\"/propagate\"/><flow-ref name=\"private-propagates\"/>"
+              "<error-handler><on-error-continue><set-payload value=\"caught\"/></on-error-continue></error-handler></flow>\n"
+              "<flow name=\"bare\"><http:listener config-ref=\"L\" path=\"/bare\"/><flow-ref name=\"private-no-handler\"/>"
+              "<error-handler><on-error-continue><set-payload value=\"caught\"/></on-error-continue></error-handler></flow>\n"
+              "<flow name=\"try\"><http:listener config-ref=\"L\" path=\"/try\"/><try><raise-error type=\"APP:TRIED\"/>"
+              "<error-handler><on-error-continue><set-payload value=\"tried\"/></on-error-continue></error-handler></try></flow>\n"
+              "<flow name=\"unhandled\"><http:listener config-ref=\"L\" path=\"/unhandled\"/><raise-error type=\"APP:UNHANDLED\"/></flow>\n"
+              "</mule>"))
+
+(defn- call Int [c: &en/Ctx rs: &Vec(run/Route) path: Str]
+  (let [r (run/handle c rs (hm/->Request "GET" path [(hm/->Header "Host" "localhost:9001")] "" "127.0.0.1:5000" 9001 "" "HTTP/1.1" (hm/->NoStream)))]
+    (:status r)))
+
+(deftest flows-and-errors
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [XML] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        z0 (mt/clear!)
+        z1 (mt/enable! true true)
+        st (str (call c rs "/ok") (call c rs "/ok") (call c rs "/continue") (call c rs "/propagate") (call c rs "/bare")
+                (call c rs "/try") (call c rs "/unhandled"))]
+    (is (= st "200200200200200200500"))
+    (is (= (fc "ok") "2/2/0"))
+    (is (= (fc "private-ok") "2/0/0"))
+    (is (= (fc "sub") "0/0/0"))
+    (is (= (fc "continue") "1/1/1"))
+    (is (= (fc "propagate") "1/1/1"))
+    (is (= (fc "private-propagates") "1/0/1"))
+    (is (= (fc "bare") "1/1/1"))
+    (is (= (fc "private-no-handler") "1/0/1"))
+    (is (= (fc "try") "1/1/0"))
+    (is (= (fc "unhandled") "1/1/1"))
+    (is (= (mt/error-types) ["APP:CHILD" "APP:CHILD_BARE" "APP:CONTINUED" "APP:TRIED" "APP:UNHANDLED"]))
+    (is (= (mt/error-count "APP:CHILD") 1))
+    (is (= (mt/error-count "APP:CHILD_BARE") 1))
+    (is (= (mt/error-count "APP:CONTINUED") 1))
+    (is (= (mt/error-count "APP:TRIED") 1))
+    (is (= (mt/error-count "APP:UNHANDLED") 1))))

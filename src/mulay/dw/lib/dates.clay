@@ -1,0 +1,120 @@
+(ns mulay.dw.lib.dates
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.lib.dec :as d]
+            [mulay.dw.coerce_time :as ct] [mulay.lib.time.types :as tt] [mulay.lib.time.local :as tl]
+            [mulay.lib.time.zoned :as tz]))
+
+(def M "dw::core::Dates")
+
+(defn- today-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (rt/ret (v/->VDate (tz/today))))
+(defn- shift-today Values(v/Val dwe/DwErr) [k: Int]
+  (let [[r e] (tl/date-plus-days (tz/today) k)]
+    (if (= e "") (rt/ret (v/->VDate r)) (rt/failure "DateTimeException" e))))
+(defn- yesterday-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (shift-today -1))
+(defn- tomorrow-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (shift-today 1))
+
+(defn- two Str [n: &num/Num]
+  (let [[r e] (d/set-scale (num/to-dec n) 0 d/HALF-UP)
+        s (d/to-plain-str r)]
+    (if (= (count s) 1) (str "0" s) s)))
+
+(defrecord Parts [ok: Bool nums: Vec(num/Num) zone: Vec(tt/TimeZone)])
+
+(defn- parts Parts [x: &v/Val names: &Vec(Str) zoned: Bool]
+  (match (v/unmeta x)
+    (v/VObj fs)
+    (let [[ns ok] (loop [i 0 acc: Vec(num/Num) []]
+                    (if (>= i (count names)) (values acc true)
+                      (let [vs (v/obj-get fs (nth names i))]
+                        (if (= (count vs) 0) (values acc false)
+                          (match (v/unmeta (nth vs 0))
+                            (v/VNum n) (recur (+ i 1) (conj acc n))
+                            (v/VInt n-i) (let [n (num/from-int n-i)] (recur (+ i 1) (conj acc n)))
+                            _ (values acc false))))))
+          zs: Vec(tt/TimeZone) (if (not zoned) []
+                                 (let [vs (v/obj-get fs "timeZone")]
+                                   (if (= (count vs) 0) []
+                                     (match (v/unmeta (nth vs 0)) (v/VTimeZone z) [z] _ []))))]
+      (->Parts (and ok (or (not zoned) (= (count zs) 1))) ns zs))
+    _ (->Parts false [] [])))
+
+(defn- range-err Str [n: &num/Num field: &Str lo: Int hi: Int]
+  (if (or (< (num/cmp n (num/from-int lo)) 0) (> (num/cmp n (num/from-int hi)) 0))
+    (str "Field '" field "': `" (num/to-string n) "` must be between " lo " and " hi ".")
+    ""))
+
+(defn- date-str Values(Str Str) [ns: &Vec(num/Num) at: Int]
+  (let [y (nth ns at) m (nth ns (+ at 1)) dd (nth ns (+ at 2))
+        e (first-err [(range-err m "month" 1 12) (range-err dd "day" 1 31)])
+        ys (num/to-string y) ms (two m) ds (two dd)]
+    (values (str ys "-" ms "-" ds) e)))
+
+(defn- time-str Values(Str Str) [ns: &Vec(num/Num) at: Int]
+  (let [h (nth ns at) mi (nth ns (+ at 1)) s (nth ns (+ at 2))
+        e (first-err [(range-err h "hours" 0 23) (range-err mi "minutes" 0 59) (range-err s "seconds" 0 59)])
+        hs (two h) mis (two mi) ss (two s)]
+    (values (str hs ":" mis ":" ss) e)))
+
+(defn- build Values(v/Val dwe/DwErr) [a: &Vec(v/Val) fname: Str target: Str has-date: Bool has-time: Bool zoned: Bool]
+  (let [names: Vec(Str) (if has-date (if has-time ["year" "month" "day" "hour" "minutes" "seconds"] ["year" "month" "day"])
+                          ["hour" "minutes" "seconds"])
+        p (parts (nth a 0) names zoned)]
+    (if (not (:ok p)) (ct/bad-args fname a)
+      (let [ns (:nums p)
+            [ds de] (if has-date (date-str ns 0) (values "" ""))
+            [ts te] (if has-time (time-str ns (if has-date 3 0)) (values "" ""))
+            e (if (not= de "") de te)]
+        (if (not= e "") (rt/failure "UserException" e)
+          (let [zs (if zoned (tt/zone-id (nth (:zone p) 0)) "")
+                s (str ds (if (and has-date has-time) "T" "") ts zs)]
+            (ct/to-type (v/->VStr s) target)))))))
+
+(defn- date-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (build a "date" "Date" true false false))
+(defn- datetime-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (build a "dateTime" "DateTime" true true true))
+(defn- ldt-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (build a "localDateTime" "LocalDateTime" true true false))
+(defn- lt-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (build a "localTime" "LocalTime" false true false))
+(defn- time-f Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (build a "time" "Time" false true true))
+
+(defn- midnight tt/LocalTime [] (tt/->LocalTime 0 0 0 0))
+
+(defn- start-date tt/LocalDate [dd: &tt/LocalDate kind: &Str]
+  (let [back (cond
+               (= kind "week") (mod (tl/date-dow dd) 7)
+               (= kind "month") (- (:day dd) 1)
+               (= kind "year") (- (tl/date-doy dd) 1)
+               :else 0)
+        [r e] (tl/date-plus-days dd (- 0 back))]
+    r))
+
+(defn- start-ldt tt/LocalDateTime [x: &tt/LocalDateTime kind: &Str]
+  (let [dd (start-date (tl/ldt-date x) kind)
+        tm (if (= kind "hour") (tt/->LocalTime (:hour (tl/ldt-time x)) 0 0 0) (midnight))]
+    (tl/ldt dd tm)))
+
+(defn- at-begin Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr)) [kind: Str]
+  (fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+    (match (v/unmeta (nth a 0))
+      (v/VDateTime z) (rt/ret (v/->VDateTime (tz/zdt-of-offset (start-ldt (tz/zdt-ldt z) kind) (tz/zdt-offset z))))
+      (v/VLocalDateTime x) (rt/ret (v/->VLocalDateTime (start-ldt x kind)))
+      (v/VDate dd) (rt/ret (v/->VDate (start-date dd kind)))
+      (v/VLocalTime t) (rt/ret (v/->VLocalTime (tt/->LocalTime (:hour t) 0 0 0)))
+      (v/VTime o) (rt/ret (v/->VTime (tt/->OffsetTime (tt/->LocalTime (:hour (:time o)) 0 0 0) (:offset o))))
+      _ (rt/failure "InvalidArgs" kind))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+(defn- b0 rt/Overload [f: Fn(rt/Env Vec(v/Val) Values(v/Val dwe/DwErr))] (rt/overload [] f))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "today" [(b0 today-f)])
+   (B "yesterday" [(b0 yesterday-f)])
+   (B "tomorrow" [(b0 tomorrow-f)])
+   (B "date" [(rt/b1 "Object" date-f)])
+   (B "dateTime" [(rt/b1 "Object" datetime-f)])
+   (B "localDateTime" [(rt/b1 "Object" ldt-f)])
+   (B "localTime" [(rt/b1 "Object" lt-f)])
+   (B "time" [(rt/b1 "Object" time-f)])
+   (B "atBeginningOfHour" [(rt/b1 "DateTime" (at-begin "hour")) (rt/b1 "LocalDateTime" (at-begin "hour"))
+                           (rt/b1 "LocalTime" (at-begin "hour")) (rt/b1 "Time" (at-begin "hour"))])
+   (B "atBeginningOfDay" [(rt/b1 "DateTime" (at-begin "day")) (rt/b1 "LocalDateTime" (at-begin "day"))])
+   (B "atBeginningOfMonth" [(rt/b1 "DateTime" (at-begin "month")) (rt/b1 "LocalDateTime" (at-begin "month")) (rt/b1 "Date" (at-begin "month"))])
+   (B "atBeginningOfWeek" [(rt/b1 "DateTime" (at-begin "week")) (rt/b1 "LocalDateTime" (at-begin "week")) (rt/b1 "Date" (at-begin "week"))])
+   (B "atBeginningOfYear" [(rt/b1 "DateTime" (at-begin "year")) (rt/b1 "LocalDateTime" (at-begin "year")) (rt/b1 "Date" (at-begin "year"))])])

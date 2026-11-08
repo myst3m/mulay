@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:db="http://www.mulesoft.org/schema/mule/db" xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+    <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18196"/></http:listener-config>
+    <db:config name="D"><db:generic-connection url="jdbc:sqlite:${soak.db}" driverClassName="org.sqlite.JDBC"/></db:config>
+    <flow name="g1">
+        <http:listener config-ref="L" path="/g1"/>
+        <set-payload value="#[(1 to 1000000) map {id: $, name: 'name-' ++ $, v: $ * 1.5}]"/>
+        <set-payload value="ok"/>
+    </flow>
+    <flow name="sum">
+        <http:listener config-ref="L" path="/sum"/>
+        <db:select config-ref="D"><db:sql>SELECT id, name, v FROM t</db:sql></db:select>
+        <set-payload value="#[sum(payload.v) as String]"/>
+    </flow>
+    <flow name="gen">
+        <http:listener config-ref="L" path="/gen"/>
+        <set-payload value="#[(1 to 1000000) map {id: $, name: 'name-' ++ $, v: $ * 1.5}]"/>
+        <set-payload value="#[sum(payload.v) as String]"/>
+    </flow>
+    <flow name="fe">
+        <http:listener config-ref="L" path="/fe"/>
+        <db:select config-ref="D"><db:sql>SELECT id, name, v FROM t</db:sql></db:select>
+        <set-variable variableName="n" value="#[0]"/>
+        <foreach batchSize="1000">
+            <set-variable variableName="n" value="#[vars.n + sizeOf(payload)]"/>
+        </foreach>
+        <set-payload value="#[vars.n as String]"/>
+    </flow>
+    <flow name="small">
+        <http:listener config-ref="L" path="/small"/>
+        <db:select config-ref="D"><db:sql>SELECT id, name, v FROM t WHERE id &lt;= 100</db:sql></db:select>
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload map {id: $.id, n: upper($.name), v: $.v * 2}]]></ee:set-payload></ee:message></ee:transform>
+    </flow>
+</mule>

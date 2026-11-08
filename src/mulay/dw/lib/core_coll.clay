@@ -1,0 +1,794 @@
+(ns mulay.dw.lib.core_coll
+  (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.ast :as ast]
+            [mulay.dw.lib.core :as core] [mulay.lib.uni :as uni] [mulay.lib.dec :as d] [clay.string :as str]
+            [mulay.lib.bigint :as bi]))
+
+(def M "dw::Core")
+
+(defn- okv Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- nul v/Val [] (v/null-v))
+
+(defn call Values(v/Val dwe/DwErr) [env: &rt/Env f: &v/FnV args: Vec(v/Val)] (core/call env f args))
+
+(defn op Values(v/Val dwe/DwErr) [env: &rt/Env name: Str args: Vec(v/Val)]
+  (let [id (rt/env-find env "dw::Core" name)]
+    (if (< id 0) (rt/failure "InternalError" (str "missing builtin dw::Core::" name))
+      (core/call env (v/->FnV (- -1 id) [] (->None) (count args)) args))))
+
+(defn show Str [x0: &v/Val q: Bool]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VNull) "null"
+      (v/VBool b) (if b "true" "false")
+      (v/VNum n) (num/to-string n)
+      (v/VInt n-i) (let [n (num/from-int n-i)] (num/to-string n))
+      (v/VStr s) (if q (str "\"" s "\"") (str s))
+      (v/VArr xs) (show-items xs)
+      (v/VRange a b) (show-items (v/items x))
+      (v/VObj fs) (loop [i 0 out "{"]
+                    (if (>= i (count fs)) (str out "}")
+                      (let [f (nth fs i) sv (show (:value f) true)]
+                        (recur (+ i 1) (str out (if (> i 0) "," "") (:name (:key f)) ": " sv)))))
+      (v/VKey k) (str (:name k))
+      (v/VRegex s f) (str s)
+      _ (v/type-name x))))
+
+(defn- show-items Str [xs: &Vec(v/Val)]
+  (loop [i 0 out "["]
+    (if (>= i (count xs)) (str out "]")
+      (let [sv (show (nth xs i) true)] (recur (+ i 1) (str out (if (> i 0) ", " "") sv))))))
+
+(defn to-bool Values(Bool dwe/DwErr) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VBool b) (values b (dwe/ok))
+      (v/VStr s) (if (= s "true") (values true (dwe/ok))
+                   (if (= s "false") (values false (dwe/ok)) (values false (bool-err x))))
+      _ (values false (bool-err x)))))
+
+(defn- bool-err dwe/DwErr [x: &v/Val]
+  (dwe/err "CoercionException" (str "Cannot coerce " (v/type-name x) " (" (show x false) ") to Boolean")))
+
+(defn if-bool Values(Bool dwe/DwErr) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VBool b) (values b (dwe/ok))
+      _ (values false (dwe/err "InvalidIfCondition"
+                              (str "Invalid if condition type. Expecting type `Boolean` but got `" (v/type-name x) "(" (show x true) ")`"))))))
+
+(defn to-fields Values(Vec(v/Field) dwe/DwErr) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VObj fs) (values fs (dwe/ok))
+      _ (values [] (dwe/err "CoercionException" (str "Cannot coerce " (v/type-name x) " (" (show x true) ") to Object"))))))
+
+(defn to-key Values(v/Key dwe/DwErr) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VKey k) (values (v/simple-key (:name k)) (dwe/ok))
+      (v/VStr s) (values (v/simple-key s) (dwe/ok))
+      (v/VNum n) (values (v/simple-key (num/to-string n)) (dwe/ok))
+      (v/VInt n-i) (let [n (num/from-int n-i)] (values (v/simple-key (num/to-string n)) (dwe/ok)))
+      (v/VBool b) (values (v/simple-key (if b "true" "false")) (dwe/ok))
+      _ (values (v/simple-key "") (dwe/err "CoercionException" (str "Cannot coerce " (v/type-name x) " to String"))))))
+
+(defn as-text Values(Str dwe/DwErr) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VStr s) (values s (dwe/ok))
+      (v/VNum n) (values (num/to-string n) (dwe/ok))
+      (v/VInt n-i) (let [n (num/from-int n-i)] (values (num/to-string n) (dwe/ok)))
+      (v/VBool b) (values (if b "true" "false") (dwe/ok))
+      (v/VKey k) (values (:name k) (dwe/ok))
+      (v/VRegex s f) (values s (dwe/ok))
+      _ (values "" (dwe/err "CoercionException" (str "Cannot coerce " (v/type-name x) " to String"))))))
+
+(defn trunc-int Int [n: &num/Num]
+  (match n
+    (num/NInt i) i
+    (num/NDec x) (if (> (- (d/precision x) (d/scale x)) 19) (if (< (d/signum x) 0) -9223372036854775807 9223372036854775807)
+                   (let [[t e] (d/set-scale x 0 d/DOWN)
+                         [i e2] (d/to-int-exact t)]
+                     (if (= e2 "") i (if (< (d/signum x) 0) -9223372036854775807 9223372036854775807))))))
+
+(defn dw-cmp Values(Int dwe/DwErr) [a0: &v/Val b0: &v/Val]
+  (let [a (v/unmeta a0) b (v/unmeta b0) ta (v/type-name a) tb (v/type-name b)]
+    (if (not= ta tb) (values 0 (dwe/err "InvalidComparison" (str "Types `" ta "` and `" tb "` can not be compared.")))
+      (match a
+        (v/VNum x) (values (num/cmp x (v/num-of b)) (dwe/ok))
+        (v/VInt x) (values (num/cmp (num/from-int x) (v/num-of b)) (dwe/ok))
+        (v/VStr x) (values (core/str-cmp x (match b (v/VStr y) y _ "")) (dwe/ok))
+        (v/VKey k) (values (core/str-cmp (:name k) (match b (v/VKey l) (:name l) _ "")) (dwe/ok))
+        (v/VBool x) (let [y (match b (v/VBool y) y _ false)] (values (if (= x y) 0 (if x 1 -1)) (dwe/ok)))
+        _ (values 0 (dwe/err "InvalidComparison" (str "You cannot compare a value of type :" ta)))))))
+
+(defn sort-by-keys Values(Vec(Int) dwe/DwErr) [ks: &Vec(v/Val)]
+  (let [n (count ks)
+        idx (loop [acc: Vec(Int) [] i 0] (if (>= i n) acc (recur (conj acc i) (+ i 1))))]
+    (if (< n 2) (values idx (dwe/ok))
+      (if (< n 32) (binary-sort ks idx)
+        (merge-sort ks idx)))))
+
+(defn- rev-prefix Vec(Int) [a: Vec(Int) k: Int]
+  (loop [acc: Vec(Int) [] i (- k 1)]
+    (if (< i 0) (loop [r acc j k] (if (>= j (count a)) r (recur (conj r (nth a j)) (+ j 1))))
+      (recur (conj acc (nth a i)) (- i 1)))))
+
+(defn- binary-sort Values(Vec(Int) dwe/DwErr) [ks: &Vec(v/Val) a0: Vec(Int)]
+  (let [n (count a0)
+        [c0 e0] (dw-cmp (nth ks (nth a0 1)) (nth ks (nth a0 0)))]
+    (if (not (dwe/ok? e0)) (values a0 e0)
+      (let [[run a1 e1] (if (< c0 0)
+                          (let [[hi e] (loop [hi 2]
+                                         (if (>= hi n) (values hi (dwe/ok))
+                                           (let [[c ce] (dw-cmp (nth ks (nth a0 hi)) (nth ks (nth a0 (- hi 1))))]
+                                             (if (not (dwe/ok? ce)) (values hi ce)
+                                               (if (< c 0) (recur (+ hi 1)) (values hi (dwe/ok)))))))]
+                            (values hi (rev-prefix a0 hi) e))
+                          (let [[hi e] (loop [hi 2]
+                                         (if (>= hi n) (values hi (dwe/ok))
+                                           (let [[c ce] (dw-cmp (nth ks (nth a0 hi)) (nth ks (nth a0 (- hi 1))))]
+                                             (if (not (dwe/ok? ce)) (values hi ce)
+                                               (if (>= c 0) (recur (+ hi 1)) (values hi (dwe/ok)))))))]
+                            (values hi a0 e)))]
+        (if (not (dwe/ok? e1)) (values a1 e1)
+          (loop [a a1 start run]
+            (if (>= start n) (values a (dwe/ok))
+              (let [pivot (nth a start)
+                    [pos pe] (loop [lo 0 hi start]
+                               (if (>= lo hi) (values lo (dwe/ok))
+                                 (let [mid (quot (+ lo hi) 2)
+                                       [c ce] (dw-cmp (nth ks pivot) (nth ks (nth a mid)))]
+                                   (if (not (dwe/ok? ce)) (values lo ce)
+                                     (if (< c 0) (recur lo mid) (recur (+ mid 1) hi))))))]
+                (if (not (dwe/ok? pe)) (values a pe)
+                  (recur (insert-at a start pos) (+ start 1)))))))))))
+
+(defn- insert-at Vec(Int) [a: Vec(Int) start: Int pos: Int]
+  (if (= pos start) a
+    (let [pivot (nth a start)]
+      (loop [acc: Vec(Int) [] i 0]
+        (if (>= i (count a)) acc
+          (if (= i pos) (recur (conj (conj acc pivot) (nth a i)) (+ i 1))
+            (if (= i start) (recur acc (+ i 1))
+              (recur (conj acc (nth a i)) (+ i 1)))))))))
+
+(defn- merge-sort Values(Vec(Int) dwe/DwErr) [ks: &Vec(v/Val) a0: Vec(Int)]
+  (let [n (count a0)]
+    (loop [a a0 w 1]
+      (if (>= w n) (values a (dwe/ok))
+        (let [[b e] (loop [acc: Vec(Int) [] lo 0]
+                      (if (>= lo n) (values acc (dwe/ok))
+                        (let [mid (min (+ lo w) n) hi (min (+ lo (* 2 w)) n)
+                              [acc2 me] (merge-run ks a acc lo mid hi)]
+                          (if (dwe/ok? me) (recur acc2 hi) (values acc2 me)))))]
+          (if (dwe/ok? e) (recur b (* w 2)) (values a e)))))))
+
+(defn- merge-run Values(Vec(Int) dwe/DwErr) [ks: &Vec(v/Val) a: &Vec(Int) acc0: Vec(Int) lo: Int mid: Int hi: Int]
+  (loop [acc acc0 i lo j mid]
+    (if (>= i mid) (values (loop [r acc k j] (if (>= k hi) r (recur (conj r (nth a k)) (+ k 1)))) (dwe/ok))
+      (if (>= j hi) (values (loop [r acc k i] (if (>= k mid) r (recur (conj r (nth a k)) (+ k 1)))) (dwe/ok))
+        (let [[c ce] (dw-cmp (nth ks (nth a j)) (nth ks (nth a i)))]
+          (if (not (dwe/ok? ce)) (values acc ce)
+            (if (< c 0) (recur (conj acc (nth a j)) i (+ j 1))
+              (recur (conj acc (nth a i)) (+ i 1) j))))))))
+
+(defn fold Values(v/Val dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val) f: &v/FnV]
+  (let [n (count xs)
+        [pd pe] (rt/env-param-default env f 1)]
+    (if (not (dwe/ok? pe)) (values (nul) pe)
+      (if (= n 0) (okv (if (= (count pd) 0) (nul) (nth pd 0)))
+        (let [[acc0 i0] (if (= (count pd) 0) (values (nth xs 0) 1) (values (nth pd 0) 0)) g (rt/env-prep2 env f)]
+          (loop [i i0 acc acc0]
+            (if (>= i n) (okv acc)
+              (let [[y e] (g (nth xs i) acc)]
+                (if (dwe/ok? e) (recur (+ i 1) y) (values y e))))))))))
+
+(defn chars Vec(v/Val) [s: &Str]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count s)) acc
+      (let [j (uni/next-index s i)] (recur j (conj acc (v/->VStr (subs s i j))))))))
+
+(defn- reduce-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (fold env (core/arg-items a 0) (core/arg-fn a 1)))
+
+(defn- reduce-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0)]
+    (if (= (count s) 0) (okv (v/->VStr ""))
+      (fold env (chars s) (core/arg-fn a 1)))))
+
+(defn- null-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (nul)))
+(defn- false-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/bool-v false)))
+(defn- true-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/bool-v true)))
+(defn- minus-one-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/int-v -1)))
+(defn- empty-arr-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr [])))
+
+(defn map-items Values(v/Val dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val) f: &v/FnV]
+  (let [g (rt/env-prep-ix env f)]
+    (loop [i 0 acc: Vec(v/Val) []]
+      (if (>= i (count xs)) (okv (v/->VArr acc))
+        (let [[y e] (g (nth xs i) i)]
+          (if (dwe/ok? e) (recur (+ i 1) (conj acc y)) (values y e)))))))
+
+(defn- map-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (map-items env (core/arg-items a 0) (core/arg-fn a 1)))
+
+(defn filter-items Values(Vec(v/Val) dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val) f: &v/FnV]
+  (let [g (rt/env-prep-ix env f)]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count xs)) (values acc (dwe/ok))
+      (let [[y e] (g (nth xs i) i)]
+        (if (not (dwe/ok? e)) (values acc e)
+          (let [[b be] (to-bool y)]
+            (if (not (dwe/ok? be)) (values acc be)
+              (recur (+ i 1) (if b (conj acc (nth xs i)) acc))))))))))
+
+(defn- filter-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[xs e] (filter-items env (core/arg-items a 0) (core/arg-fn a 1))] (values (v/->VArr xs) e)))
+
+(defn- filter-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [s (core/arg-str a 0) f (core/arg-fn a 1)]
+    (loop [i 0 k 0 out ""]
+      (if (>= i (count s)) (okv (v/->VStr out))
+        (let [j (uni/next-index s i)
+              c (subs s i j)
+              [y e] (call env f [(v/->VStr c) (v/int-v k)])]
+          (if (not (dwe/ok? e)) (values y e)
+            (let [[b be] (to-bool y)]
+              (if (not (dwe/ok? be)) (values (nul) be)
+                (recur j (+ k 1) (if b (str out c) out))))))))))
+
+(defn flatten-items Vec(v/Val) [xs: &Vec(v/Val)]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count xs)) acc
+      (let [x (nth xs i)]
+        (match (v/unmeta x)
+          (v/VArr ys) (recur (+ i 1) (loop [r acc k 0] (if (>= k (count ys)) r (recur (conj r (nth ys k)) (+ k 1)))))
+          _ (recur (+ i 1) (conj acc x)))))))
+
+(defn- flatten-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr (flatten-items (core/arg-items a 0)))))
+
+(defn- flat-map-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [[y e] (map-items env (core/arg-items a 0) (core/arg-fn a 1))]
+    (if (dwe/ok? e) (okv (v/->VArr (flatten-items (v/items y)))) (values y e))))
+
+
+(defn- seq-of-arg Vec(v/Seq) [a: &Vec(v/Val) i: Int] (match (v/unmeta (nth a i)) (v/VSeq q) [q] _ []))
+
+(defn- whole-arg Values(Vec(v/Val) dwe/DwErr) [a: &Vec(v/Val) i: Int]
+  (match (v/unmeta (nth a i))
+    (v/VSeq q) (v/seq-vec q)
+    _ (values (core/arg-items a i) (dwe/ok))))
+
+(defn- seq-map v/Val [env: &rt/Env q: &v/Seq f: &v/FnV]
+  (let [e1 env f1 f q1 q]
+    (v/->VSeq (v/->Seq (fn Fn(Int Values(v/Val Bool dwe/DwErr)) [k: Int]
+                         (let [src ((:open q1) 0) i (atom 0) g (rt/env-prep-ix e1 f1)]
+                           (fn Values(v/Val Bool dwe/DwErr) [k2: Int]
+                             (let [[x done e] (src 0)]
+                               (cond (not (dwe/ok? e)) (values (nul) true e)
+                                     done (values (nul) true (dwe/ok))
+                                     :else (let [ix (deref i) z (reset! i (+ ix 1)) [y ye] (g x ix)]
+                                             (if (dwe/ok? ye) (values y false (dwe/ok)) (values (nul) true ye))))))))))))
+
+(defn- seq-filter v/Val [env: &rt/Env q: &v/Seq f: &v/FnV]
+  (let [e1 env f1 f q1 q]
+    (v/->VSeq (v/->Seq (fn Fn(Int Values(v/Val Bool dwe/DwErr)) [k: Int]
+                         (let [src ((:open q1) 0) i (atom 0) g (rt/env-prep-ix e1 f1)]
+                           (fn Values(v/Val Bool dwe/DwErr) [k2: Int]
+                             (loop []
+                               (let [[x done e] (src 0)]
+                                 (cond (not (dwe/ok? e)) (values (nul) true e)
+                                       done (values (nul) true (dwe/ok))
+                                       :else (let [ix (deref i) z (reset! i (+ ix 1)) [y ye] (g x ix)]
+                                               (if (not (dwe/ok? ye)) (values (nul) true ye)
+                                                 (let [[b be] (to-bool y)]
+                                                   (cond (not (dwe/ok? be)) (values (nul) true be)
+                                                         b (values x false (dwe/ok))
+                                                         :else (recur)))))))))))))))
+
+(defn- seq-flat-map v/Val [env: &rt/Env q: &v/Seq f: &v/FnV]
+  (let [e1 env f1 f q1 q]
+    (v/->VSeq (v/->Seq (fn Fn(Int Values(v/Val Bool dwe/DwErr)) [k: Int]
+                         (let [src ((:open q1) 0) i (atom 0) buf: Atom(Vec(v/Val)) (atom []) bi (atom 0) g (rt/env-prep-ix e1 f1)]
+                           (fn Values(v/Val Bool dwe/DwErr) [k2: Int]
+                             (loop []
+                               (let [b (deref buf) j (deref bi)]
+                                 (if (< j (count b)) (let [z (reset! bi (+ j 1))] (values (nth b j) false (dwe/ok)))
+                                   (let [[x done e] (src 0)]
+                                     (cond (not (dwe/ok? e)) (values (nul) true e)
+                                           done (values (nul) true (dwe/ok))
+                                           :else (let [n (deref i) z (reset! i (+ n 1)) [y ye] (g x n)
+                                                       [ys we] (if (dwe/ok? ye) (flat-part y) (values [] ye))]
+                                                   (if (not (dwe/ok? we)) (values (nul) true we)
+                                                     (let [z2 (reset! buf ys) z3 (reset! bi 0)] (recur))))))))))))))))
+
+(defn- flat-part Values(Vec(v/Val) dwe/DwErr) [y: &v/Val]
+  (match (v/unmeta y)
+    (v/VSeq iq) (v/seq-vec iq)
+    (v/VArr ys) (values ys (dwe/ok))
+    _ (values [y] (dwe/ok))))
+
+(defn- map-any Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [qs (seq-of-arg a 0) f (core/arg-fn a 1)]
+    (cond (= (count qs) 0) (map-items env (core/arg-items a 0) f)
+          (rt/env-pure? env f) (okv (seq-map env (nth qs 0) f))
+          :else (let [[xs e] (v/seq-vec (nth qs 0))] (if (dwe/ok? e) (map-items env xs f) (values (nul) e))))))
+
+(defn- filter-any Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [qs (seq-of-arg a 0) f (core/arg-fn a 1)]
+    (cond (= (count qs) 0) (filter-arr env a)
+          (rt/env-pure? env f) (okv (seq-filter env (nth qs 0) f))
+          :else (let [[xs e] (v/seq-vec (nth qs 0))]
+                  (if (not (dwe/ok? e)) (values (nul) e) (let [[ys fe] (filter-items env xs f)] (values (v/->VArr ys) fe)))))))
+
+(defn- flat-map-any Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [qs (seq-of-arg a 0) f (core/arg-fn a 1)]
+    (cond (= (count qs) 0) (flat-map-arr env a)
+          (rt/env-pure? env f) (okv (seq-flat-map env (nth qs 0) f))
+          :else (let [[xs e] (v/seq-vec (nth qs 0))]
+                  (if (not (dwe/ok? e)) (values (nul) e) (flat-map-arr env [(v/->VArr xs) (nth a 1)]))))))
+
+(defn- reduce-any Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [qs (seq-of-arg a 0)]
+    (if (= (count qs) 0) (reduce-arr env a)
+      (let [f (core/arg-fn a 1)
+            [pd pe] (rt/env-param-default env f 1)
+            nx ((:open (nth qs 0)) 0) g (rt/env-prep2 env f)]
+        (if (not (dwe/ok? pe)) (values (nul) pe)
+          (let [[x0 d0 e0] (if (= (count pd) 0) (nx 0) (values (nth pd 0) false (dwe/ok)))]
+            (cond (not (dwe/ok? e0)) (values (nul) e0)
+                  d0 (okv (nul))
+                  :else (loop [acc x0]
+                          (let [[x done e] (nx 0)]
+                            (cond (not (dwe/ok? e)) (values (nul) e)
+                                  done (okv acc)
+                                  :else (let [[y ye] (g x acc)] (if (dwe/ok? ye) (recur y) (values y ye)))))))))))))
+
+(defn- join-by-any Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [qs (seq-of-arg a 0)]
+    (if (= (count qs) 0) (join-by env a)
+      (let [sep (core/arg-str a 1) nx ((:open (nth qs 0)) 0)]
+        (loop [first true out ""]
+          (let [[x done e] (nx 0)]
+            (cond (not (dwe/ok? e)) (values (nul) e)
+                  done (okv (v/->VStr out))
+                  :else (let [[s te] (as-text x)]
+                          (if (not (dwe/ok? te)) (values (nul) te) (recur false (if first (str out s) (str out sep s))))))))))))
+
+(defn- is-empty-any Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [qs (seq-of-arg a 0)]
+    (if (= (count qs) 0) (is-empty-arr env a)
+      (let [[x done e] (((:open (nth qs 0)) 0) 0)] (if (dwe/ok? e) (okv (v/bool-v done)) (values (nul) e))))))
+
+(defn- key-v v/Val [f: &v/Field] (v/->VKey (:key f)))
+
+(defn- map-object Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0) f (core/arg-fn a 1) g (rt/env-prep env f 3)]
+    (loop [i 0 acc: Vec(v/Field) []]
+      (if (>= i (count fs)) (okv (v/->VObj acc))
+        (let [fl (nth fs i)
+              [y e] (g [(:value fl) (key-v fl) (v/int-v i)])]
+          (if (not (dwe/ok? e)) (values y e)
+            (let [[gs ge] (to-fields y)]
+              (if (not (dwe/ok? ge)) (values (nul) ge)
+                (recur (+ i 1) (loop [acc2 acc k 0] (if (>= k (count gs)) acc2 (recur (conj acc2 (nth gs k)) (+ k 1)))))))))))))
+
+(defn pluck-fields Values(v/Val dwe/DwErr) [env: &rt/Env fs: &Vec(v/Field) f: &v/FnV]
+  (let [g (rt/env-prep env f 3)]
+    (loop [i 0 acc: Vec(v/Val) []]
+      (if (>= i (count fs)) (okv (v/->VArr acc))
+        (let [fl (nth fs i)
+              [y e] (g [(:value fl) (key-v fl) (v/int-v i)])]
+          (if (dwe/ok? e) (recur (+ i 1) (conj acc y)) (values y e)))))))
+
+(defn- pluck Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (pluck-fields env (core/arg-fields a 0) (core/arg-fn a 1)))
+
+(defn- filter-object Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0) f (core/arg-fn a 1) g (rt/env-prep env f 3)]
+    (loop [i 0 acc: Vec(v/Field) []]
+      (if (>= i (count fs)) (okv (v/->VObj acc))
+        (let [fl (nth fs i)
+              [y e] (g [(:value fl) (key-v fl) (v/int-v i)])]
+          (if (not (dwe/ok? e)) (values y e)
+            (let [[b be] (to-bool y)]
+              (if (not (dwe/ok? be)) (values (nul) be)
+                (recur (+ i 1) (if b (conj acc fl) acc))))))))))
+
+(defn entries Vec(v/Val) [fs: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count fs)) acc
+      (let [fl (nth fs i)
+            k (:key fl)
+            attrs (loop [j 0 out: Vec(v/Field) []]
+                    (if (>= j (count (:attrs k))) out
+                      (let [at (nth (:attrs k) j)]
+                        (recur (+ j 1) (conj out (v/->Field (v/->Key (:ns at) (:name at) []) (:value at)))))))]
+        (recur (+ i 1) (conj acc (v/->VObj [(v/field "key" (v/->VKey k)) (v/field "value" (:value fl)) (v/field "attributes" (v/->VObj attrs))])))))))
+
+(defn- entries-of Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr (entries (core/arg-fields a 0)))))
+
+(defn names Vec(v/Val) [fs: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (v/->VStr (:name (:key (nth fs i)))))))))
+(defn keys-v Vec(v/Val) [fs: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (key-v (nth fs i)))))))
+(defn vals-v Vec(v/Val) [fs: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(v/Val) []] (if (>= i (count fs)) acc (recur (+ i 1) (conj acc (:value (nth fs i)))))))
+
+(defn- names-of Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr (names (core/arg-fields a 0)))))
+(defn- keys-of Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr (keys-v (core/arg-fields a 0)))))
+(defn- values-of Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr (vals-v (core/arg-fields a 0)))))
+
+(defn- group-ids Values(Vec(v/Key) Vec(Int) dwe/DwErr) [ys: &Vec(v/Val)]
+  (loop [i 0 m: Map(Str Int) {} ks: Vec(v/Key) [] gi: Vec(Int) []]
+    (if (>= i (count ys)) (values ks gi (dwe/ok))
+      (let [[k e] (to-key (nth ys i))]
+        (if (not (dwe/ok? e)) (values ks gi e)
+          (let [name (:name k)
+                j (get m name -1)]
+            (if (>= j 0) (recur (+ i 1) m ks (conj gi j))
+              (let [nj (count ks)] (recur (+ i 1) (assoc m name nj) (conj ks k) (conj gi nj))))))))))
+
+(defn- group-members Vec(Vec(Int)) [ng: Int gi: &Vec(Int)]
+  (let [empty0 (loop [acc: Vec(Vec(Int)) [] j 0] (if (>= j ng) acc (recur (conj acc []) (+ j 1))))]
+    (loop [acc empty0 i 0]
+      (if (>= i (count gi)) acc
+        (let [j (nth gi i)
+              cur (nth acc j)
+              acc2 (assoc acc j [])]
+          (recur (assoc acc2 j (conj cur i)) (+ i 1)))))))
+
+(defn- group-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (core/arg-items a 0)
+        [ys e] (map-items env xs (core/arg-fn a 1))]
+    (if (not (dwe/ok? e)) (values ys e)
+      (let [[ks gi ke] (group-ids (v/items ys))]
+        (if (not (dwe/ok? ke)) (values (nul) ke)
+          (let [mem (group-members (count ks) gi)]
+            (okv (v/->VObj (loop [j 0 acc: Vec(v/Field) []]
+                             (if (>= j (count ks)) acc
+                               (let [ms (nth mem j)
+                                     items (loop [k 0 out: Vec(v/Val) []] (if (>= k (count ms)) out (recur (+ k 1) (conj out (nth xs (nth ms k))))))]
+                                 (recur (+ j 1) (conj acc (v/->Field (nth ks j) (v/->VArr items)))))))))))))))
+
+(defn- group-str Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (chars (core/arg-str a 0))
+        [ys e] (map-items env xs (core/arg-fn a 1))]
+    (if (not (dwe/ok? e)) (values ys e)
+      (let [[ks gi ke] (group-ids (v/items ys))]
+        (if (not (dwe/ok? ke)) (values (nul) ke)
+          (let [mem (group-members (count ks) gi)]
+            (okv (v/->VObj (loop [j 0 acc: Vec(v/Field) []]
+                             (if (>= j (count ks)) acc
+                               (let [ms (nth mem j)
+                                     s (loop [k 0 out ""] (if (>= k (count ms)) out (recur (+ k 1) (str out (core/arg-str xs (nth ms k))))))]
+                                 (recur (+ j 1) (conj acc (v/->Field (nth ks j) (v/->VStr s)))))))))))))))
+
+(defn map-fields2 Values(Vec(v/Val) dwe/DwErr) [env: &rt/Env fs: &Vec(v/Field) f: &v/FnV]
+  (let [g (rt/env-prep2 env f)]
+    (loop [i 0 acc: Vec(v/Val) []]
+      (if (>= i (count fs)) (values acc (dwe/ok))
+        (let [fl (nth fs i)
+              [y e] (g (:value fl) (key-v fl))]
+          (if (dwe/ok? e) (recur (+ i 1) (conj acc y)) (values acc e)))))))
+
+(defn- group-obj Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0)
+        [ys e] (map-fields2 env fs (core/arg-fn a 1))]
+    (if (not (dwe/ok? e)) (values (nul) e)
+      (let [[ks gi ke] (group-ids ys)]
+        (if (not (dwe/ok? ke)) (values (nul) ke)
+          (let [mem (group-members (count ks) gi)]
+            (okv (v/->VObj (loop [j 0 acc: Vec(v/Field) []]
+                             (if (>= j (count ks)) acc
+                               (let [ms (nth mem j)
+                                     sub (loop [k 0 out: Vec(v/Field) []] (if (>= k (count ms)) out (recur (+ k 1) (conj out (nth fs (nth ms k))))))]
+                                 (recur (+ j 1) (conj acc (v/->Field (nth ks j) (v/->VObj sub)))))))))))))))
+
+(defn- bucket-key Str [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VNull) "n"
+      (v/VBool b) (if b "bt" "bf")
+      (v/VNum n) (str "#" (d/to-string (d/strip-trailing-zeros (num/to-dec n))))
+      (v/VInt n-i) (let [n (num/from-int n-i)] (str "#" (d/to-string (d/strip-trailing-zeros (num/to-dec n)))))
+      (v/VStr s) (str "s" s)
+      (v/VKey k) (str "s" (:name k))
+      (v/VArr xs) (str "a" (count xs))
+      (v/VRange p q) (str "a" (v/range-size p q))
+      (v/VObj fs) (str "o" (count fs))
+      _ (v/type-name x))))
+
+(defn distinct-idx Vec(Int) [ys: &Vec(v/Val)]
+  (loop [i 0 m: Map(Str Vec(Int)) {} keep: Vec(Int) []]
+    (if (>= i (count ys)) keep
+      (let [y (nth ys i)
+            bk (bucket-key y)
+            bucket: Vec(Int) (get m bk [])
+            dup (loop [k 0] (if (>= k (count bucket)) false (if (v/equal? (nth ys (nth bucket k)) y) true (recur (+ k 1)))))]
+        (if dup (recur (+ i 1) m keep)
+          (recur (+ i 1) (assoc m bk (conj bucket i)) (conj keep i)))))))
+
+(defn- distinct-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (core/arg-items a 0)
+        [ys e] (map-items env xs (core/arg-fn a 1))]
+    (if (not (dwe/ok? e)) (values ys e)
+      (let [keep (distinct-idx (v/items ys))]
+        (okv (v/->VArr (loop [k 0 out: Vec(v/Val) []] (if (>= k (count keep)) out (recur (+ k 1) (conj out (nth xs (nth keep k))))))))))))
+
+(defn- distinct-obj Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0)
+        [ys e] (map-fields2 env fs (core/arg-fn a 1))]
+    (if (not (dwe/ok? e)) (values (nul) e)
+      (let [keep (distinct-idx ys)]
+        (okv (v/->VObj (loop [k 0 out: Vec(v/Field) []] (if (>= k (count keep)) out (recur (+ k 1) (conj out (nth fs (nth keep k))))))))))))
+
+(defn- order-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (core/arg-items a 0)]
+    (if (<= (count xs) 1) (okv (v/->VArr xs))
+      (let [[ys e] (map-items env xs (core/arg-fn a 1))]
+        (if (not (dwe/ok? e)) (values ys e)
+          (let [[idx se] (sort-by-keys (v/items ys))]
+            (if (not (dwe/ok? se)) (values (nul) se)
+              (okv (v/->VArr (loop [k 0 out: Vec(v/Val) []] (if (>= k (count idx)) out (recur (+ k 1) (conj out (nth xs (nth idx k)))))))))))))))
+
+(defn- order-obj Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0)]
+    (if (<= (count fs) 1) (okv (v/->VObj fs))
+      (let [[ys e] (map-fields2 env fs (core/arg-fn a 1))]
+        (if (not (dwe/ok? e)) (values (nul) e)
+          (let [[idx se] (sort-by-keys ys)]
+            (if (not (dwe/ok? se)) (values (nul) se)
+              (okv (v/->VObj (loop [k 0 out: Vec(v/Field) []] (if (>= k (count idx)) out (recur (+ k 1) (conj out (nth fs (nth idx k)))))))))))))))
+
+(defn find-idx Vec(Int) [xs: &Vec(v/Val) y: &v/Val]
+  (loop [i 0 acc: Vec(Int) []]
+    (if (>= i (count xs)) acc
+      (recur (+ i 1) (if (v/equal? (nth xs i) y) (conj acc i) acc)))))
+
+(defn- find-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [is (find-idx (core/arg-items a 0) (nth a 1))]
+    (okv (v/->VArr (loop [k 0 out: Vec(v/Val) []] (if (>= k (count is)) out (recur (+ k 1) (conj out (v/int-v (nth is k))))))))))
+
+(defn index-of-items Int [xs: &Vec(v/Val) y: &v/Val]
+  (loop [i 0] (if (>= i (count xs)) -1 (if (v/equal? (nth xs i) y) i (recur (+ i 1))))))
+
+(defn- index-of-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (okv (v/int-v (index-of-items (core/arg-items a 0) (nth a 1)))))
+
+(defn- last-index-of-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (core/arg-items a 0) y (nth a 1)]
+    (okv (v/int-v (loop [i (- (count xs) 1)] (if (< i 0) -1 (if (v/equal? (nth xs i) y) i (recur (- i 1)))))))))
+
+(defn- contains-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (okv (v/bool-v (>= (index-of-items (core/arg-items a 0) (nth a 1)) 0))))
+
+(defn- is-empty-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/bool-v (= (count (core/arg-items a 0)) 0))))
+(defn- is-empty-obj Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/bool-v (= (count (core/arg-fields a 0)) 0))))
+
+(defn- zip-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (core/arg-items a 0) ys (core/arg-items a 1) n (min (count xs) (count ys))]
+    (okv (v/->VArr (loop [i 0 acc: Vec(v/Val) []] (if (>= i n) acc (recur (+ i 1) (conj acc (v/->VArr [(nth xs i) (nth ys i)])))))))))
+
+(defn- unzip-size Values(Int dwe/DwErr) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VArr ys) (values (count ys) (dwe/ok))
+      (v/VRange p q) (values (v/range-size p q) (dwe/ok))
+      (v/VStr s) (values (u8/codepoint-count s) (dwe/ok))
+      (v/VNum n) (values (u8/codepoint-count (num/to-string n)) (dwe/ok))
+      (v/VInt n-i) (let [n (num/from-int n-i)] (values (u8/codepoint-count (num/to-string n)) (dwe/ok)))
+      (v/VObj fs) (values (count fs) (dwe/ok))
+      _ (values 0 (dwe/err "InvalidArgs" (str "Expecting Type: `Array<T>`, but got: `" (show x true) "`."))))))
+
+(defn- unzip-at v/Val [x0: &v/Val i: Int]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VStr s) (let [n (u8/codepoint-count s) ii (if (< i 0) (+ n i) i)]
+                   (if (and (>= ii 0) (< ii n)) (v/->VStr (uni/sub-cp s ii (+ ii 1))) (nul)))
+      (v/VNum m) (unzip-at (v/->VStr (num/to-string m)) i)
+      (v/VInt m-i) (let [m (num/from-int m-i)] (unzip-at (v/->VStr (num/to-string m)) i))
+      (v/VObj fs) (let [n (count fs) ii (if (< i 0) (+ n i) i)]
+                    (if (and (>= ii 0) (< ii n)) (:value (nth fs ii)) (nul)))
+      _ (let [ys (v/items x) n (count ys) ii (if (< i 0) (+ n i) i)]
+          (if (and (>= ii 0) (< ii n)) (nth ys ii) (nul))))))
+
+(defn- unzip-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xss (core/arg-items a 0)
+        [minsz me] (loop [i 0 m -1]
+                     (if (>= i (count xss)) (values (if (< m 0) 0 m) (dwe/ok))
+                       (let [[sz e] (unzip-size (nth xss i))]
+                         (if (not (dwe/ok? e)) (values 0 e)
+                           (recur (+ i 1) (if (or (< m 0) (< sz m)) sz m))))))]
+    (if (not (dwe/ok? me)) (values (nul) me)
+      (let [idxs (v/items (v/->VRange 0 (- minsz 1)))]
+        (okv (v/->VArr (loop [k 0 acc: Vec(v/Val) []]
+                         (if (>= k (count idxs)) acc
+                           (let [i (match (nth idxs k) (v/VNum n) (trunc-int n) (v/VInt n-i) (let [n (num/from-int n-i)] (trunc-int n)) _ 0)
+                                 col (loop [j 0 out: Vec(v/Val) []]
+                                       (if (>= j (count xss)) out (recur (+ j 1) (conj out (unzip-at (nth xss j) i)))))]
+                             (recur (+ k 1) (conj acc (v/->VArr col))))))))))))
+
+(defn- join-by Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (core/arg-items a 0) sep (core/arg-str a 1)]
+    (loop [i 0 out ""]
+      (if (>= i (count xs)) (okv (v/->VStr out))
+        (let [[s e] (as-text (nth xs i))]
+          (if (not (dwe/ok? e)) (values (nul) e)
+            (recur (+ i 1) (if (= i 0) (str out s) (str out sep s)))))))))
+
+(defn sum-items Values(v/Val dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val)]
+  (if (= (count xs) 0) (okv (v/int-v 0))
+    (let [[s e] (loop [i 1 acc (nth xs 0)]
+                  (if (>= i (count xs)) (okv acc)
+                    (let [[y e] (op env "+" [(nth xs i) acc])]
+                      (if (dwe/ok? e) (recur (+ i 1) y) (values y e)))))]
+      (if (not (dwe/ok? e)) (values s e) (as-number s)))))
+
+(defn- as-number Values(v/Val dwe/DwErr) [x0: &v/Val]
+  (let [x (v/unmeta x0)]
+    (match x
+      (v/VNum n) (okv x)
+      (v/VInt n-i) (okv x)
+      (v/VNull) (okv (v/int-v 0))
+      (v/VStr s) (let [[n e] (num/parse-lit s)]
+                   (if (= e "") (okv (v/num-v n))
+                     (rt/failure "CoercionException" (str "Cannot coerce String (" s ") to Number"))))
+      _ (rt/failure "CoercionException" (str "Cannot coerce " (v/type-name x) " (" (show x true) ") to Number")))))
+
+(defn- sum-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (sum-items env (core/arg-items a 0)))
+
+(defn- avg-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (core/arg-items a 0)
+        [s e] (sum-items env xs)]
+    (if (not (dwe/ok? e)) (values s e)
+      (op env "/" [s (v/int-v (count xs))]))))
+
+(defn- best-by Values(v/Val dwe/DwErr) [env: &rt/Env xs: &Vec(v/Val) crit: &Vec(v/FnV) opn: Str]
+  (if (= (count xs) 0) (okv (nul))
+    (loop [i 1 best (nth xs 0) bkey: Vec(v/Val) []]
+      (if (>= i (count xs)) (okv best)
+        (let [x (nth xs i)
+              [kx e1] (if (= (count crit) 0) (okv x) (call env (nth crit 0) [x]))]
+          (if (not (dwe/ok? e1)) (values kx e1)
+            (let [[kb e2] (if (> (count bkey) 0) (okv (nth bkey 0))
+                            (if (= (count crit) 0) (okv best) (call env (nth crit 0) [best])))]
+              (if (not (dwe/ok? e2)) (values kb e2)
+                (let [[r e3] (op env opn [kx kb])]
+                  (if (not (dwe/ok? e3)) (values r e3)
+                    (let [[b e4] (if-bool r)]
+                      (if (not (dwe/ok? e4)) (values (nul) e4)
+                        (if b (recur (+ i 1) x [kx]) (recur (+ i 1) best [kb]))))))))))))))
+
+(defn- max-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (best-by env (core/arg-items a 0) [] ">"))
+(defn- min-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (best-by env (core/arg-items a 0) [] "<"))
+(defn- max-by Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (best-by env (core/arg-items a 0) [(core/arg-fn a 1)] ">"))
+(defn- min-by Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (best-by env (core/arg-items a 0) [(core/arg-fn a 1)] "<"))
+
+(defn fold-op v/FnV [env: &rt/Env kind: Int]
+  (let [name (cond (= kind 4) ">" (= kind 5) "<" :else "+")
+        id (rt/env-find env "dw::Core" name)]
+    (v/->FnV (- -1 id) [] (->None) 2)))
+
+(defn fold-add Values(v/Val dwe/DwErr) [env: &rt/Env kind: Int opf: &v/FnV n: Int acc: v/Val y: v/Val]
+  (cond
+    (= kind 1) (values acc (dwe/ok))
+    (= n 0) (values y (dwe/ok))
+    (or (= kind 2) (= kind 3)) (if (and (v/num-val? y) (v/num-val? acc)) (num-add y acc) (core/call env opf [y acc]))
+    :else
+    (let [[r e] (core/call env opf [y acc])]
+      (if (not (dwe/ok? e)) (values acc e)
+        (let [[b e2] (if-bool r)]
+          (if (not (dwe/ok? e2)) (values acc e2) (values (if b y acc) (dwe/ok))))))))
+
+(defn- num-add Values(v/Val dwe/DwErr) [x: &v/Val y: &v/Val]
+  (match x
+    (v/VInt a) (match y
+                 (v/VInt b) (if (bi/add-ov? a b) (core/arith 1 (v/num-of x) (v/num-of y)) (values (v/int-v (+ a b)) (dwe/ok)))
+                 _ (core/arith 1 (v/num-of x) (v/num-of y)))
+    _ (core/arith 1 (v/num-of x) (v/num-of y))))
+
+(defn fold-end Values(v/Val dwe/DwErr) [env: &rt/Env kind: Int n: Int acc: &v/Val]
+  (cond
+    (= kind 1) (okv (v/int-v n))
+    (= kind 2) (if (= n 0) (okv (v/int-v 0)) (as-number acc))
+    (= kind 3) (let [[s e] (if (= n 0) (okv (v/int-v 0)) (as-number acc))]
+                 (if (not (dwe/ok? e)) (values s e) (op env "/" [s (v/int-v n)])))
+    :else (if (= n 0) (okv (nul)) (okv acc))))
+
+(defn fold-run Values(v/Val dwe/DwErr Int) [env: &rt/Env kind: Int pipe: Int src: &v/Val f: &v/FnV]
+  (let [u (v/unmeta src)
+        [isr lo hi] (match u (v/VRange a b) (values true a b) _ (values false 0 0))
+        xs (match u (v/VArr q) q _ (let [z: Vec(v/Val) []] z))
+        len (if isr (v/range-size lo hi) (count xs))
+        opf (fold-op env kind)
+        g (rt/env-prep-ix env f)]
+    (loop [i 0 n 0 acc (nul)]
+      (if (>= i len)
+        (let [[r e] (fold-end env kind n acc)] (values r e (if (dwe/ok? e) 0 2)))
+        (let [x (if isr (v/int-v (v/range-at lo hi i)) (nth xs i))
+              [y e] (g x i)]
+          (if (not (dwe/ok? e)) (values y e 1)
+            (if (= pipe 1)
+              (let [[a2 e2] (fold-add env kind opf n acc y)] (if (dwe/ok? e2) (recur (+ i 1) (+ n 1) a2) (values (nul) e2 2)))
+              (let [[b be] (to-bool y)]
+                (if (not (dwe/ok? be)) (values (nul) be 1)
+                  (if (not b) (recur (+ i 1) n acc)
+                    (let [[a2 e2] (fold-add env kind opf n acc x)] (if (dwe/ok? e2) (recur (+ i 1) (+ n 1) a2) (values (nul) e2 2)))))))))))))
+
+(defn- rem-arr Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [xs (core/arg-items a 0) ys (core/arg-items a 1)]
+    (okv (v/->VArr (loop [i 0 acc: Vec(v/Val) []]
+                     (if (>= i (count xs)) acc
+                       (recur (+ i 1) (if (>= (index-of-items ys (nth xs i)) 0) acc (conj acc (nth xs i))))))))))
+
+(defn- attrs-equal? Bool [as: &Vec(v/Attr) bs: &Vec(v/Attr)]
+  (if (not= (count as) (count bs)) false
+    (loop [i 0]
+      (if (>= i (count as)) true
+        (let [x (nth as i) y (nth bs i)]
+          (if (and (= (:name x) (:name y)) (v/equal? (:value x) (:value y))) (recur (+ i 1)) false))))))
+
+(defn- key-full-eq? Bool [a: &v/Key b: &v/Key]
+  (and (v/equal? (v/->VKey a) (v/->VKey b)) (attrs-equal? (:attrs a) (:attrs b))))
+
+(defn- rem-obj Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0) gs (core/arg-fields a 1)]
+    (okv (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                     (if (>= i (count fs)) acc
+                       (let [f (nth fs i)
+                             hit (loop [k 0]
+                                   (if (>= k (count gs)) false
+                                     (let [g (nth gs k)]
+                                       (if (and (key-full-eq? (:key f) (:key g)) (v/equal? (:value f) (:value g)))
+                                         true (recur (+ k 1))))))]
+                         (recur (+ i 1) (if hit acc (conj acc f))))))))))
+
+(defn- rem-obj-keys Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0) ks (core/arg-items a 1)
+        [names ok] (loop [i 0 acc: Vec(Str) []]
+                     (if (>= i (count ks)) (values acc true)
+                       (match (v/unmeta (nth ks i))
+                         (v/VStr s) (recur (+ i 1) (conj acc s))
+                         (v/VKey k) (recur (+ i 1) (conj acc (:name k)))
+                         _ (values acc false))))]
+    (if (not ok) (rt/failure "InvalidFunctionArgs" "You called the function '--' with these arguments:\n  1: Object\n  2: Array")
+      (okv (v/->VObj (loop [i 0 acc: Vec(v/Field) []]
+                       (if (>= i (count fs)) acc
+                         (let [f (nth fs i)
+                               nm (:name (:key f))
+                               hit (loop [k 0] (if (>= k (count names)) false (if (= (nth names k) nm) true (recur (+ k 1)))))]
+                           (recur (+ i 1) (if hit acc (conj acc f)))))))))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "map" [(rt/overload-seq ["Array" "Function"] map-any) (rt/b2 "Null" "Function" null-fn)])
+   (B "filter" [(rt/overload-seq ["Array" "Function"] filter-any) (rt/b2 "String" "Function" filter-str) (rt/b2 "Null" "Function" null-fn)])
+   (B "mapObject" [(rt/b2 "Object" "Function" map-object) (rt/b2 "Null" "Function" null-fn)])
+   (B "pluck" [(rt/b2 "Object" "Function" pluck) (rt/b2 "Null" "Function" null-fn)])
+   (B "zip" [(rt/b2 "Array" "Array" zip-arr)])
+   (B "flatMap" [(rt/overload-seq ["Array" "Function"] flat-map-any) (rt/b2 "Null" "Function" null-fn)])
+   (B "filterObject" [(rt/b2 "Object" "Function" filter-object) (rt/b2 "Null" "Function" null-fn)])
+   (B "entriesOf" [(rt/b1 "Object" entries-of) (rt/b1 "Null" null-fn)])
+   (B "namesOf" [(rt/b1 "Object" names-of) (rt/b1 "Null" null-fn)])
+   (B "keysOf" [(rt/b1 "Object" keys-of) (rt/b1 "Null" null-fn)])
+   (B "valuesOf" [(rt/b1 "Object" values-of) (rt/b1 "Null" null-fn)])
+   (B "reduce" [(rt/overload-seq ["Array" "Function"] reduce-any) (rt/b2 "String" "Function" reduce-str) (rt/b2 "Null" "Function" null-fn)])
+   (B "groupBy" [(rt/b2 "Array" "Function" group-arr) (rt/b2 "String" "Function" group-str) (rt/b2 "Object" "Function" group-obj) (rt/b2 "Null" "Function" null-fn)])
+   (B "find" [(rt/b2 "Array" "Any" find-arr) (rt/b2 "Null" "Any" empty-arr-fn)])
+   (B "distinctBy" [(rt/b2 "Array" "Function" distinct-arr) (rt/b2 "Object" "Function" distinct-obj) (rt/b2 "Null" "Function" null-fn)])
+   (B "contains" [(rt/b2 "Array" "Any" contains-arr) (rt/b2 "Null" "Any" false-fn)])
+   (B "orderBy" [(rt/b2 "Object" "Function" order-obj) (rt/b2 "Array" "Function" order-arr) (rt/b2 "Null" "Function" null-fn)])
+   (B "avg" [(rt/b1 "Array" avg-arr)])
+   (B "max" [(rt/b1 "Array" max-arr)])
+   (B "min" [(rt/b1 "Array" min-arr)])
+   (B "sum" [(rt/b1 "Array" sum-arr)])
+   (B "flatten" [(rt/b1 "Array" flatten-arr) (rt/b1 "Null" null-fn)])
+   (B "unzip" [(rt/b1 "Array" unzip-arr)])
+   (B "joinBy" [(rt/overload-seq ["Array" "String"] join-by-any) (rt/b2 "Null" "Any" null-fn)])
+   (B "isEmpty" [(rt/overload-seq ["Array"] is-empty-any) (rt/b1 "Object" is-empty-obj) (rt/b1 "Null" true-fn)])
+   (B "minBy" [(rt/b2 "Array" "Function" min-by)])
+   (B "maxBy" [(rt/b2 "Array" "Function" max-by)])
+   (B "indexOf" [(rt/b2 "Array" "Any" index-of-arr) (rt/b2 "Null" "Any" minus-one-fn)])
+   (B "--" [(rt/b2 "Array" "Array" rem-arr) (rt/b2 "Object" "Object" rem-obj) (rt/b2 "Object" "Array" rem-obj-keys) (rt/b2 "Null" "Any" null-fn)])
+   (B "lastIndexOf" [(rt/b2 "Array" "Any" last-index-of-arr) (rt/b2 "Null" "Any" minus-one-fn)])])

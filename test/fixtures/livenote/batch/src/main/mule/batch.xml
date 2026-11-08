@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:batch="http://www.mulesoft.org/schema/mule/batch">
+  <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="8081"/></http:listener-config>
+  <flow name="sync">
+    <http:listener config-ref="L" path="/sync"/>
+    <batch:job jobName="sync-customers" blockSize="2">
+      <batch:process-records>
+        <batch:step name="validate">
+          <validation:is-true xmlns:validation="http://www.mulesoft.org/schema/mule/validation" expression="#[payload.email contains '.']"/>
+          <set-payload value="#[payload ++ {ok: true}]"/>
+        </batch:step>
+        <batch:step name="upsert" acceptPolicy="NO_FAILURES">
+          <set-variable variableName="id" value="#[payload.id]"/>
+          <batch:aggregator size="2">
+            <logger message="#[sizeOf(payload)]"/>
+          </batch:aggregator>
+        </batch:step>
+        <batch:step name="failures" acceptPolicy="ONLY_FAILURES" acceptExpression="#[true]">
+          <logger message="#[payload.id]"/>
+        </batch:step>
+      </batch:process-records>
+      <batch:on-complete>
+        <logger message="#[payload.successfulRecords]"/>
+      </batch:on-complete>
+    </batch:job>
+  </flow>
+</mule>

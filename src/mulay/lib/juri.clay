@@ -1,0 +1,107 @@
+(ns mulay.lib.juri)
+
+(def C-PATH 0)
+(def C-URIC 1)
+(def C-REG 2)
+(def C-SCHEME 3)
+(def C-ALPHA 4)
+
+(defn- ch-alpha? Bool [c: Int] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))
+
+(defn- ch-alnum? Bool [c: Int] (or (ch-alpha? c) (and (>= c 48) (<= c 57))))
+
+(defn- ch-hex? Bool [c: Int] (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 70)) (and (>= c 97) (<= c 102))))
+
+(defn- one-of? Bool [c: Int set: &Str]
+  (loop [i 0] (if (>= i (count set)) false (if (= (nth set i) c) true (recur (+ i 1))))))
+
+(defn- unreserved? Bool [c: Int] (or (ch-alnum? c) (one-of? c "-_.!~*'()")))
+
+(defn- in-class? Bool [c: Int cls: Int]
+  (cond (= cls C-PATH) (or (unreserved? c) (one-of? c ":@&=+$,;/"))
+        (= cls C-URIC) (or (unreserved? c) (one-of? c ";/?:@&=+$,[]"))
+        (= cls C-REG) (or (unreserved? c) (one-of? c "$,;:@&=+"))
+        (= cls C-SCHEME) (or (ch-alnum? c) (one-of? c "+-."))
+        :else (ch-alpha? c)))
+
+(defn- escapes? Bool [cls: Int] (< cls C-SCHEME))
+
+(defn- scan-class Values(Int Int) [s: &Str start: Int end: Int cls: Int]
+  (loop [p start]
+    (if (>= p end) (values p -1)
+      (let [c (nth s p)]
+        (cond (in-class? c cls) (recur (+ p 1))
+              (not (escapes? cls)) (values p -1)
+              (= c 37) (if (and (<= (+ p 3) end) (ch-hex? (nth s (+ p 1))) (ch-hex? (nth s (+ p 2)))) (recur (+ p 3)) (values p p))
+              (>= c 161) (recur (+ p 1))
+              :else (values p -1))))))
+
+(defn- check-chars Values(Str Int) [s: &Str start: Int end: Int cls: Int what: &Str]
+  (let [[p e] (scan-class s start end cls)]
+    (cond (>= e 0) (values "Malformed escape pair" e)
+          (< p end) (values (str "Illegal character in " what) p)
+          :else (values "" -1))))
+
+(defn- scan-until Int [s: &Str start: Int end: Int stop: &Str]
+  (loop [p start] (if (or (>= p end) (one-of? (nth s p) stop)) p (recur (+ p 1)))))
+
+(defn- scheme-colon Int [s: &Str n: Int]
+  (loop [p 0]
+    (cond (>= p n) -1
+          (= (nth s p) 58) p
+          (one-of? (nth s p) "/?#") -1
+          :else (recur (+ p 1)))))
+
+(defn- at? Bool [s: &Str p: Int n: Int c: Int] (and (>= p 0) (< p n) (= (nth s p) c)))
+
+(defn- authority Values(Str Int) [s: &Str a: Int q: Int]
+  (if (< (scan-until s a q "[]") q) (values "" -1)
+    (let [[p e] (scan-class s a q C-REG)]
+      (cond (>= e 0) (values "Malformed escape pair" e)
+            (< p q) (values "Illegal character in authority" a)
+            :else (values "" -1)))))
+
+(defn- hierarchical Values(Int Str Int) [s: &Str start: Int n: Int]
+  (let [[p r i] (if (and (at? s start n 47) (at? s (+ start 1) n 47))
+                  (let [a (+ start 2)
+                        q (scan-until s a n "/?#")]
+                    (cond (> q a) (let [[r1 i1] (authority s a q)] (values q r1 i1))
+                          (< q n) (values a "" -1)
+                          :else (values a "Expected authority" a)))
+                  (values start "" -1))]
+    (if (not= r "") (values p r i)
+      (let [q (scan-until s p n "?#")
+            [r2 i2] (check-chars s p q C-PATH "path")]
+        (cond (not= r2 "") (values q r2 i2)
+              (at? s q n 63) (let [q2 (scan-until s (+ q 1) n "#")
+                                   [r3 i3] (check-chars s (+ q 1) q2 C-URIC "query")]
+                               (values q2 r3 i3))
+              :else (values q "" -1))))))
+
+(defn- after-scheme Values(Int Str Int) [s: &Str p: Int n: Int]
+  (if (at? s p n 47) (hierarchical s p n)
+    (let [q (scan-until s p n "#")]
+      (if (<= q p) (values q "Expected scheme-specific part" p)
+        (let [[r i] (check-chars s p q C-URIC "opaque part")] (values q r i))))))
+
+(defn check Values(Str Int) [s: &Str]
+  (let [n (count s)
+        c (scheme-colon s n)
+        [p r i] (cond (< c 0) (hierarchical s 0 n)
+                      (= c 0) (values 0 "Expected scheme name" 0)
+                      :else (let [[r1 i1] (check-chars s 0 1 C-ALPHA "scheme name")
+                                  [r2 i2] (if (= r1 "") (check-chars s 1 c C-SCHEME "scheme name") (values r1 i1))]
+                              (if (not= r2 "") (values c r2 i2) (after-scheme s (+ c 1) n))))]
+    (cond (not= r "") (values r i)
+          (at? s p n 35) (check-chars s (+ p 1) n C-URIC "fragment")
+          :else (values "" -1))))
+
+(defn- latin1-utf8 Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1) (if (< c 128) (str out (chr c)) (str out (chr (+ 192 (quot c 64))) (chr (+ 128 (mod c 64))))))))))
+
+(defn message Str [s: &Str]
+  (let [[r i] (check s)]
+    (if (= r "") "" (let [u (latin1-utf8 s)] (str r " at index " i ": " u)))))

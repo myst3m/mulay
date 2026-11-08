@@ -1,0 +1,496 @@
+(ns mulay.dw.fmt.protobuf
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.fmt.props :as p] [mulay.dw.urls :as urls]
+            [mulay.dw.coerce :as co] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.lib.protobuf :as pb] [mulay.lib.dec :as d]
+            [mulay.lib.bigint :as bi] [mulay.lib.ieee :as ieee] [mulay.lib.time.local :as lt] [mulay.lib.time.types :as tt]
+            [clay.string :as str]))
+
+(def DESCS (atom (let [m: Map(Str pb/Desc) {}] m)))
+
+(defn- no-desc pb/Desc [] (pb/->Desc [] [] [] []))
+
+(defn load-desc Values(pb/Desc Str) [url: &Str]
+  (let [m (deref DESCS)]
+    (if (contains? m url) (values (get! m url) "")
+      (let [plain (and (not (str/starts-with? url "classpath://")) (not (str/starts-with? url "file://")) (< (str/index-of url "://") 0))
+            [t0 e0] (if plain (urls/load-url (str "classpath://" url)) (values "" "-"))
+            [t e] (if (and plain (= e0 "")) (values t0 e0) (urls/load-url url))]
+        (if (not= e "") (values (no-desc) (str "Schema could not be found at " url "."))
+          (let [[dd de] (pb/parse-unlinked t)
+                le (if (= de "") (pb/link-error dd) "")]
+            (cond (not= de "") (values dd de)
+                  (not= le "") (values (no-desc) (str "com.google.protobuf.Descriptors$DescriptorValidationException - " le))
+                  :else (let [k (str url)
+                              z (swap! DESCS (fn Map(Str pb/Desc) [old: Map(Str pb/Desc)] (assoc old k dd)))]
+                          (values dd "")))))))))
+
+(defn settings Values(pb/Desc Int Str) [props: &Vec(v/Field)]
+  (let [url-v (v/obj-get props "descriptorUrl")
+        mt-v (v/obj-get props "messageType")
+        [url ue] (p/pstr props "descriptorUrl" "")
+        [mt me] (p/pstr props "messageType" "")]
+    (if (= (count url-v) 0) (values (no-desc) -1 "Missing required ProtoBuf setting `descriptorUrl`.")
+      (let [[dd de] (load-desc url)]
+        (cond (not= de "") (values dd -1 de)
+              (= (count mt-v) 0) (values dd -1 "Missing required ProtoBuf setting `messageType`.")
+              (not (pb/top-level? dd mt)) (values dd -1 (str "Message Type " mt " not found on given descriptor."))
+              :else (values dd (pb/message-index dd mt) ""))))))
+
+(defn- num-of-double v/Val [x: Float]
+  (cond
+    (not= x x) (v/->VMeta (v/null-v) [(v/field "NaN" (v/bool-v true))])
+    (and (> x 0.0) (= x (* x 2.0))) (v/->VMeta (v/null-v) [(v/field "NaN" (v/bool-v true)) (v/field "inf" (v/str-v "positive"))])
+    (and (< x 0.0) (= x (* x 2.0))) (v/->VMeta (v/null-v) [(v/field "NaN" (v/bool-v true)) (v/field "inf" (v/str-v "negative"))])
+    :else (let [[n e] (num/from-float x)] (v/num-v n))))
+
+(defn- num-exact v/Val [x: Float] (let [[n e] (num/from-float x)] (v/num-v n)))
+
+(defn- field-index Int [msg: &pb/Message name: &Str]
+  (loop [i 0] (if (>= i (count (:fields msg))) -1 (if (= (:name (nth (:fields msg) i)) name) i (recur (+ i 1))))))
+
+(defn- no-field Str [msg: &pb/Message name: &Str] (str "Message " (:full msg) " has no field `" name "`."))
+
+(defn- entry-of Values(Int Int Int Str) [dd: &pb/Desc f: &pb/Field]
+  (let [si (pb/message-index dd (:type-name f))]
+    (if (< si 0) (values -1 -1 -1 (str "Field " (:name f) " is not a map field."))
+      (let [emsg (nth (:messages dd) si) ki (field-index emsg "key") vi (field-index emsg "value")]
+        (cond (< ki 0) (values si ki vi (no-field emsg "key"))
+              (< vi 0) (values si ki vi (no-field emsg "value"))
+              :else (values si ki vi ""))))))
+
+(defn- val-or-default pb/PVal [dd: &pb/Desc m: &pb/DynMsg name: &Str]
+  (let [msg (nth (:messages dd) (:mi m))
+        i (field-index msg name)]
+    (if (< i 0) (pb/->PInt 0)
+      (let [vs (pb/field-vals m i) f (nth (:fields msg) i)]
+        (cond (> (count vs) 0) (nth vs (- (count vs) 1))
+              (or (= (:type f) pb/T-MESSAGE) (= (:type f) pb/T-GROUP))
+              (let [si (pb/message-index dd (:type-name f))] (pb/->PMsg (pb/empty-msg dd si)))
+              :else (pb/default-scalar dd f))))))
+
+(defn- pint Int [x: &pb/PVal] (match x (pb/PInt i) i (pb/PEnum n) n _ 0))
+(defn- pfloat Float [x: &pb/PVal] (match x (pb/PFloat f) f _ 0.0))
+(defn- pstr Str [x: &pb/PVal] (match x (pb/PStr s) (str s) _ ""))
+(defn- pbool Bool [x: &pb/PVal] (match x (pb/PBool b) b _ false))
+
+(defn- int-type? Bool [t: Int]
+  (not (or (= t pb/T-DOUBLE) (= t pb/T-FLOAT) (= t pb/T-BOOL) (= t pb/T-STRING) (= t pb/T-BYTES)
+           (= t pb/T-MESSAGE) (= t pb/T-GROUP) (= t pb/T-ENUM))))
+
+(defn- key-text Str [f: &pb/Field x: &pb/PVal]
+  (match x
+    (pb/PInt i) (str i)
+    (pb/PBool b) (if b "true" "false")
+    (pb/PStr s) (str s)
+    (pb/PEnum n) (str n)
+    (pb/PFloat x) (str x)
+    (pb/PMsg m) ""))
+
+(def WKT ["google.protobuf.BoolValue" "google.protobuf.DoubleValue" "google.protobuf.FloatValue" "google.protobuf.Int32Value"
+          "google.protobuf.Int64Value" "google.protobuf.UInt32Value" "google.protobuf.UInt64Value" "google.protobuf.BytesValue"
+          "google.protobuf.Duration" "google.protobuf.Timestamp" "google.protobuf.Empty" "google.protobuf.Value"
+          "google.protobuf.ListValue" "google.protobuf.StringValue" "google.protobuf.Struct"])
+
+(defn- wkt? Bool [full: &Str] (loop [i 0] (if (>= i (count WKT)) false (if (= (nth WKT i) full) true (recur (+ i 1))))))
+
+(defn- msg->dw Values(v/Val Str) [dd: &pb/Desc m: &pb/DynMsg depth: Int]
+  (if (> depth 200) (values (v/null-v) "Stack overflow while reading ProtoBuf")
+    (let [msg (nth (:messages dd) (:mi m))]
+      (if (wkt? (:full msg)) (wkt->dw dd m (:full msg) depth)
+        (let [fs (:fields msg)
+              [acc e] (loop [i 0 out: Vec(v/Field) []]
+                        (if (>= i (count fs)) (values out "")
+                          (let [f (nth fs i) vs (pb/field-vals m i)
+                                [o2 fe] (field->dw dd msg f vs out depth)]
+                            (if (not= fe "") (values o2 fe) (recur (+ i 1) o2)))))]
+          (if (not= e "") (values (v/null-v) e)
+            (values (v/->VObj (unknown->dw (:unknown m) acc)) "")))))))
+
+(defn- map-field? Bool [dd: &pb/Desc f: &pb/Field]
+  (and (pb/repeated? f) (= (:type f) pb/T-MESSAGE)
+       (let [si (pb/message-index dd (:type-name f))] (and (>= si 0) (:map-entry (nth (:messages dd) si))))))
+
+(defn- map->dw Values(Vec(v/Field) Str) [dd: &pb/Desc f: &pb/Field emsg: &pb/Message ki: Int vi: Int vs: &Vec(pb/PVal) out: Vec(v/Field) depth: Int]
+  (let [kf (nth (:fields emsg) ki)
+        vf (nth (:fields emsg) vi)
+        [ents e] (loop [j 0 acc: Vec(v/Field) []]
+                   (if (>= j (count vs)) (values acc "")
+                     (match (nth vs j)
+                       (pb/PMsg em)
+                       (let [kv (val-or-default dd em "key")
+                             vv (val-or-default dd em "value")
+                             [x xe] (pval->dw dd vf vv depth)]
+                         (if (not= xe "") (values acc xe) (recur (+ j 1) (conj acc (v/field (key-text kf kv) x)))))
+                       _ (recur (+ j 1) acc))))]
+    (values (conj out (v/field (:name f) (v/->VObj ents))) e)))
+
+(defn- field->dw Values(Vec(v/Field) Str) [dd: &pb/Desc msg: &pb/Message f: &pb/Field vs: &Vec(pb/PVal) out: Vec(v/Field) depth: Int]
+  (cond
+    (map-field? dd f)
+    (let [[si ki vi ee] (entry-of dd f)]
+      (if (not= ee "") (values out ee) (map->dw dd f (nth (:messages dd) si) ki vi vs out depth)))
+    (pb/repeated? f)
+    (loop [j 0 o out]
+      (if (>= j (count vs)) (values o "")
+        (let [[x xe] (pval->dw dd f (nth vs j) depth)]
+          (if (not= xe "") (values o xe) (recur (+ j 1) (conj o (v/field (:name f) x)))))))
+    (or (> (count vs) 0) (< (:oneof f) 0))
+    (let [pv (if (> (count vs) 0) (nth vs (- (count vs) 1))
+               (if (or (= (:type f) pb/T-MESSAGE) (= (:type f) pb/T-GROUP))
+                 (pb/->PMsg (pb/empty-msg dd (pb/message-index dd (:type-name f))))
+                 (pb/default-scalar dd f)))
+          [x xe] (pval->dw dd f pv depth)]
+      (values (conj out (v/field (:name f) x)) xe))
+    :else (values out "")))
+
+(defn- pval->dw Values(v/Val Str) [dd: &pb/Desc f: &pb/Field x: &pb/PVal depth: Int]
+  (match x
+    (pb/PInt i) (values (num-of-double (float i)) "")
+    (pb/PFloat y) (values (num-of-double y) "")
+    (pb/PBool b) (values (v/bool-v b) "")
+    (pb/PStr s) (values (if (= (:type f) pb/T-BYTES) (v/->VBin (str s)) (v/str-v (str s))) "")
+    (pb/PEnum n)
+    (let [ei (pb/enum-index dd (:type-name f))]
+      (if (< ei 0) (values (v/int-v n) "")
+        (let [en (nth (:enums dd) ei)
+              names (pb/enum-name en n)]
+          (if (= (:full en) "google.protobuf.NullValue")
+            (if (and (> (count names) 0) (= (nth names 0) "NULL_VALUE")) (values (v/null-v) "")
+              (values (v/null-v) (str "Can't parse " (:full en) "." (if (> (count names) 0) (nth names 0) (str n)) " as null")))
+            (values (v/->VMeta (v/str-v (if (> (count names) 0) (nth names 0) "-UNRECOGNIZED")) [(v/field "protobufEnumIndex" (v/int-v n))]) "")))))
+    (pb/PMsg sub) (msg->dw dd sub (+ depth 1))))
+
+(defn- wkt->dw Values(v/Val Str) [dd: &pb/Desc m: &pb/DynMsg full: &Str depth: Int]
+  (let [val (val-or-default dd m "value")]
+    (cond
+      (= full "google.protobuf.BoolValue") (values (v/bool-v (pbool val)) "")
+      (or (= full "google.protobuf.DoubleValue") (= full "google.protobuf.FloatValue")) (values (num-exact (pfloat val)) "")
+      (or (= full "google.protobuf.Int32Value") (= full "google.protobuf.UInt32Value")
+          (= full "google.protobuf.Int64Value") (= full "google.protobuf.UInt64Value")) (values (v/int-v (pint val)) "")
+      (= full "google.protobuf.StringValue") (values (v/str-v (pstr val)) "")
+      (= full "google.protobuf.BytesValue") (values (v/->VBin (pstr val)) "")
+      (= full "google.protobuf.Empty") (values (v/->VObj []) "")
+      (= full "google.protobuf.Timestamp")
+      (values (v/->VLocalDateTime (lt/ldt-of-epoch-second (pint (val-or-default dd m "seconds")) (pint (val-or-default dd m "nanos")) 0)) "")
+      (= full "google.protobuf.Duration")
+      (let [s (pint (val-or-default dd m "seconds"))
+            n (pint (val-or-default dd m "nanos"))
+            fl (if (< n 0) (- (quot (+ n 1) 1000000000) 1) (quot n 1000000000))
+            nn (- n (* fl 1000000000))]
+        (values (v/->VPeriod (tt/->PerTime (tt/->Duration (+ s fl) nn))) ""))
+      (= full "google.protobuf.Struct")
+      (let [msg (nth (:messages dd) (:mi m))
+            fi (field-index msg "fields")]
+        (if (< fi 0) (values (v/null-v) (no-field msg "fields"))
+          (let [[acc e] (field->dw dd msg (nth (:fields msg) fi) (pb/field-vals m fi) [] depth)]
+            (cond (not= e "") (values (v/null-v) e)
+                  (= (count acc) 0) (values (v/->VObj []) "")
+                  :else (values (match (:value (nth acc 0)) (v/VObj fs) (v/->VObj fs) _ (v/->VObj [])) "")))))
+      (= full "google.protobuf.ListValue")
+      (let [msg (nth (:messages dd) (:mi m))
+            fi (field-index msg "values")]
+        (if (< fi 0) (values (v/null-v) (no-field msg "values"))
+          (let [vs (pb/field-vals m fi)]
+            (loop [j 0 acc: Vec(v/Val) []]
+              (if (>= j (count vs)) (values (v/->VArr acc) "")
+                (match (nth vs j)
+                  (pb/PMsg sub) (let [[x e] (msg->dw dd sub (+ depth 1))] (if (not= e "") (values (v/null-v) e) (recur (+ j 1) (conj acc x))))
+                  _ (recur (+ j 1) acc)))))))
+      :else (value->dw dd m depth))))
+
+(defn- value->dw Values(v/Val Str) [dd: &pb/Desc m: &pb/DynMsg depth: Int]
+  (let [msg (nth (:messages dd) (:mi m))
+        has (fn Bool [name: Str] (let [i (field-index msg name)] (and (>= i 0) (> (count (pb/field-vals m i)) 0))))
+        get1 (fn pb/PVal [name: Str] (let [vs (pb/field-vals m (field-index msg name))] (nth vs (- (count vs) 1))))]
+    (cond
+      (has "null_value") (values (v/null-v) "")
+      (has "number_value") (values (num-exact (pfloat (get1 "number_value"))) "")
+      (has "string_value") (values (v/str-v (pstr (get1 "string_value"))) "")
+      (has "bool_value") (values (v/bool-v (pbool (get1 "bool_value"))) "")
+      (has "struct_value") (match (get1 "struct_value") (pb/PMsg sub) (msg->dw dd sub (+ depth 1)) _ (values (v/null-v) ""))
+      (has "list_value") (match (get1 "list_value") (pb/PMsg sub) (msg->dw dd sub (+ depth 1)) _ (values (v/null-v) ""))
+      :else (values (v/null-v) "Can't read as Value since none of the fields was set."))))
+
+(def READ-WIRES [3 0 5 1 2])
+
+(defn- wire-name Str [w: Int]
+  (cond (= w 0) "Varint" (= w 1) "64Bit" (= w 2) "LengthDelimited" (= w 3) "Group" :else "32Bit"))
+
+(defn- unknown->dw Vec(v/Field) [us: &Vec(pb/Unknown) acc: Vec(v/Field)]
+  (let [sorted (pb/unknown-sorted us READ-WIRES)]
+    (loop [i 0 out acc]
+      (if (>= i (count sorted)) out
+        (let [u (nth sorted i)
+              w (:wire u)
+              sch [(v/field "wireType" (v/str-v (wire-name w)))]
+              x (cond (= w 0) (v/int-v (:ival u))
+                      (= w 5) (v/int-v (pb/to-i32 (:ival u)))
+                      (= w 1) (v/int-v (:ival u))
+                      (= w 2) (v/->VBin (:bytes u))
+                      :else (let [[rs e] (pb/scan (:bytes u))]
+                              (v/->VObj (unknown->dw (loop [j 0 a: Vec(pb/Unknown) []] (if (>= j (count rs)) a (recur (+ j 1) (let [r (nth rs j)] (conj a (pb/->Unknown (:num r) (:wire r) (:ival r) (:bytes r))))))) []))))]
+          (recur (+ i 1) (conj out (v/field (str "-" (:num u)) (v/->VMeta x sch)))))))))
+
+(defn read Values(v/Val Str) [text: &Str props: &Vec(v/Field)]
+  (let [[dd mi se] (settings props)]
+    (if (not= se "") (values (v/null-v) se)
+      (let [[m e] (pb/decode dd mi text)]
+        (if (not= e "") (values (v/null-v) e)
+          (msg->dw dd m 0))))))
+
+(defn- wfail Str [msg: &Str x: &v/Val]
+  (let [m (if (str/ends-with? msg ".") (subs msg 0 (- (count msg) 1)) (str msg))]
+    (match (v/unmeta x)
+      (v/VNull) (str m ", while writing ProtoBuf.")
+      _ (str m ", while writing ProtoBuf at "))))
+
+(defn- kfail Str [msg: &Str]
+  (let [m (if (str/ends-with? msg ".") (subs msg 0 (- (count msg) 1)) (str msg))] (str m ", while writing ProtoBuf at ")))
+
+(def TWO64 (let [[b e] (bi/parse "18446744073709551616")] b))
+(def TWO63 (let [[b e] (bi/parse "9223372036854775808")] b))
+
+(defn java-long Int [n: &num/Num]
+  (match n
+    (num/NInt i) i
+    _ (let [dec (num/to-dec n)]
+        (if (<= (d/scale dec) -64) 0
+          (let [[b be] (d/to-big dec)
+                [r re] (bi/rem-big b TWO64)
+                r2 (if (< (bi/sign r) 0) (bi/add r TWO64) r)
+                r3 (if (>= (bi/cmp r2 TWO63) 0) (bi/sub r2 TWO64) r2)
+                [k ke] (bi/to-int r3)]
+            k)))))
+
+(defn- num-of Values(num/Num Bool) [x: &v/Val]
+  (match (v/unmeta x)
+    (v/VInt i) (values (num/from-int i) true)
+    (v/VNum n) (values n true)
+    _ (values (num/from-int 0) false)))
+
+(defn- key-num Values(num/Num Bool) [s: &Str]
+  (let [[n e] (num/parse-lit (str/trim s))] (values n (= e ""))))
+
+(defn- scalar Values(pb/PVal Str) [dd: &pb/Desc f: &pb/Field x: &v/Val is-key: Bool key: &Str]
+  (let [t (:type f) [n isnum] (num-of x)]
+    (cond
+      (= t pb/T-DOUBLE) (if isnum (values (pb/->PFloat (num/to-float n)) "") (values (pb/->PInt 0) (wfail "Can't write as a Double" x)))
+      (= t pb/T-FLOAT) (if isnum (values (pb/->PFloat (ieee/to-float32 (num/to-float n))) "") (values (pb/->PInt 0) (wfail "Can't write as a Float" x)))
+      (= t pb/T-BOOL)
+      (cond is-key (cond (= key "true") (values (pb/->PBool true) "") (= key "false") (values (pb/->PBool false) "") :else (values (pb/->PInt 0) (kfail "Can't parse as a Boolean")))
+            :else (match (v/unmeta x) (v/VBool b) (values (pb/->PBool b) "") _ (values (pb/->PInt 0) (wfail "Can't write as a Boolean" x))))
+      (= t pb/T-STRING)
+      (if is-key (values (pb/->PStr (str key)) "")
+        (match (v/unmeta x) (v/VStr s) (values (pb/->PStr (str s)) "") _ (values (pb/->PInt 0) (wfail "Can't write as a String" x))))
+      (= t pb/T-BYTES)
+      (match (v/unmeta x) (v/VBin b) (values (pb/->PStr (str b)) "") _ (values (pb/->PInt 0) (wfail "Can't write as a Binary" x)))
+      (int-type? t)
+      (let [long? (or (= t pb/T-INT64) (= t pb/T-UINT64) (= t pb/T-SINT64) (= t pb/T-FIXED64) (= t pb/T-SFIXED64))
+            [kn kok] (if is-key (key-num key) (values n isnum))]
+        (cond (and is-key (not kok)) (values (pb/->PInt 0) (kfail (if long? "Can't parse as a Long" "Can't parse as an Int")))
+              (or is-key isnum) (let [l (java-long kn)] (values (pb/->PInt (if long? l (pb/to-i32 l))) ""))
+              :else (values (pb/->PInt 0) (wfail (if long? "Can't write as a Long" "Can't write as an Int") x))))
+      :else (values (pb/->PInt 0) (wfail "Can't write as an Enum" x)))))
+
+(defn- enum-of Values(pb/PVal Str) [dd: &pb/Desc f: &pb/Field x: &v/Val]
+  (let [ei (pb/enum-index dd (:type-name f))
+        en (nth (:enums dd) ei)
+        idx (match x (v/VMeta y ms) (let [r (v/obj-get ms "protobufEnumIndex")] (if (= (count r) 0) [] (let [[n ok] (num-of (nth r 0))] (if ok [(java-long n)] []))))
+              _ (let [z: Vec(Int) []] z))]
+    (if (= (:full en) "google.protobuf.NullValue")
+      (match (v/unmeta x) (v/VNull) (values (pb/->PEnum 0) "") _ (values (pb/->PInt 0) (wfail "Could not write as NullValue." x)))
+      (match (v/unmeta x)
+        (v/VStr s)
+        (if (= s "-UNRECOGNIZED")
+          (if (= (count idx) 0) (values (pb/->PInt 0) (wfail "Can't write as an Enum since no index was specified" x))
+            (values (pb/->PEnum (pb/to-i32 (nth idx 0))) ""))
+          (let [ns (pb/enum-number en s)]
+            (cond (= (count ns) 0) (values (pb/->PInt 0) (wfail (str "Can't find Enum value " s) x))
+                  (and (> (count idx) 0) (not= (pb/to-i32 (nth idx 0)) (nth ns 0)))
+                  (values (pb/->PInt 0) (wfail (str "Enum " s " value has index " (nth ns 0) ", but " (nth idx 0) " was specified") x))
+                  :else (values (pb/->PEnum (nth ns 0)) ""))))
+        _ (values (pb/->PInt 0) (wfail "Can't write as an Enum" x))))))
+
+(defn- to-proto Values(pb/PVal Str) [dd: &pb/Desc f: &pb/Field x: &v/Val]
+  (cond
+    (or (= (:type f) pb/T-MESSAGE) (= (:type f) pb/T-GROUP))
+    (let [[m e] (dw->msg dd (pb/message-index dd (:type-name f)) x)] (values (pb/->PMsg m) e))
+    (= (:type f) pb/T-ENUM) (enum-of dd f x)
+    :else (scalar dd f x false "")))
+
+(defn- with-val pb/DynMsg [m: pb/DynMsg i: Int rep: Bool x: pb/PVal]
+  (let [old (pb/field-vals m i)
+        nv (if rep (conj old x) [x])]
+    (assoc m :vals (assoc (:vals m) i nv))))
+
+(defn- unknown-of Values(pb/Unknown Str) [num: Int x: &v/Val]
+  (let [wt (match x (v/VMeta y ms) (let [r (v/obj-get ms "wireType")] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) (str s) _ ""))) _ "")
+        [n isnum] (num-of x)]
+    (cond
+      isnum
+      (cond (or (= wt "") (= wt "Varint")) (values (pb/->Unknown num 0 (java-long n) "") "")
+            (= wt "32Bit") (values (pb/->Unknown num 5 (bit-and (java-long n) 4294967295) "") "")
+            (= wt "64Bit") (values (pb/->Unknown num 1 (java-long n) "") "")
+            :else (values (pb/->Unknown num 0 0 "") (wfail (str "Can't set it to an unknown number with wireType " wt) x)))
+      :else
+      (match (v/unmeta x)
+        (v/VBin b) (if (and (not= wt "") (not= wt "LengthDelimited")) (values (pb/->Unknown num 2 0 "") (wfail "Can only set Binaries to length delimited wire types." x))
+                     (values (pb/->Unknown num 2 0 (str b)) ""))
+        _ (values (pb/->Unknown num 0 0 "") (wfail "Can't set it to an unknown. Only Numbers and Binaries are allowed" x))))))
+
+(defn- unknown-num Int [name: &Str]
+  (if (or (< (count name) 2) (not= (nth name 0) 45)) -1
+    (let [digits (loop [i 1] (if (>= i (count name)) true (let [c (nth name i)] (if (and (>= c 48) (<= c 57)) (recur (+ i 1)) false))))]
+      (if (not digits) -1 (let [[n e] (parse-long (subs name 1 (count name)))] (if (= e "") n -1))))))
+
+(defn- has-int Bool [xs: &Vec(Int) k: Int] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) k) true (recur (+ i 1))))))
+
+(defn- map-entries Values(Vec(pb/PVal) Str) [dd: &pb/Desc f: &pb/Field x: &v/Val]
+  (let [[si ki vi ee] (entry-of dd f)]
+    (if (not= ee "") (values [] ee) (map-entries-of dd si ki vi x))))
+
+(defn- map-entries-of Values(Vec(pb/PVal) Str) [dd: &pb/Desc si: Int ki: Int vi: Int x: &v/Val]
+  (let [emsg (nth (:messages dd) si)
+        kf (nth (:fields emsg) ki)
+        vf (nth (:fields emsg) vi)]
+    (match (v/unmeta x)
+      (v/VObj fs)
+      (loop [j 0 acc: Vec(pb/PVal) []]
+        (if (>= j (count fs)) (values acc "")
+          (let [kv (nth fs j)
+                kname (:name (:key kv))
+                [kp ke] (if (or (= (:type kf) pb/T-MESSAGE) (= (:type kf) pb/T-ENUM)) (to-proto dd kf (v/str-v (str kname))) (scalar dd kf (v/str-v (str kname)) true kname))
+                [vp ve] (if (= ke "") (to-proto dd vf (:value kv)) (values (pb/->PInt 0) ""))]
+            (cond (not= ke "") (values acc ke)
+                  (not= ve "") (values acc ve)
+                  :else (let [e0 (pb/empty-msg dd si)
+                              e1 (with-val e0 ki false kp)
+                              e2 (with-val e1 vi false vp)]
+                          (recur (+ j 1) (conj acc (pb/->PMsg e2))))))))
+      _ (let [[y ye] (co/coerce x (v/->TypeV "name" "Object" [] [] [] []))] (values [] (:msg ye))))))
+
+(defn- dw->msg Values(pb/DynMsg Str) [dd: &pb/Desc mi: Int x: &v/Val]
+  (let [msg (nth (:messages dd) mi)]
+    (if (wkt? (:full msg)) (wkt-of dd mi (:full msg) x)
+      (match (v/unmeta x)
+        (v/VObj fs)
+        (loop [j 0 m (pb/empty-msg dd mi) present: Vec(Int) [] oneofs: Vec(Int) []]
+          (if (>= j (count fs)) (values m "")
+            (let [kv (nth fs j)
+                  name (:name (:key kv))
+                  fi (field-index msg name)]
+              (if (< fi 0)
+                (let [un (unknown-num name)]
+                  (if (< un 0) (values m (kfail "Field name not supported. Only field names present in the schema and unknowns are valid."))
+                    (let [[u ue] (unknown-of un (:value kv))]
+                      (if (not= ue "") (values m ue) (recur (+ j 1) (assoc m :unknown (conj (:unknown m) u)) present oneofs)))))
+                (let [f (nth (:fields msg) fi)]
+                  (cond
+                    (and (not (pb/repeated? f)) (has-int present fi))
+                    (values m (kfail (str "The field " (:full msg) "." name " has already been set and is not repeated")))
+                    (map-field? dd f)
+                    (let [[es ee] (map-entries dd f (:value kv))]
+                      (if (not= ee "") (values m ee) (recur (+ j 1) (assoc m :vals (assoc (:vals m) fi es)) present oneofs)))
+                    (and (>= (:oneof f) 0) (has-int oneofs (:oneof f)))
+                    (values m (kfail (str "The oneof " (:full msg) "." (nth (:oneofs msg) (:oneof f)) " has already been set with another field name.")))
+                    :else
+                    (let [[pv pe] (to-proto dd f (:value kv))
+                          oneofs2 (if (>= (:oneof f) 0) (conj oneofs (:oneof f)) oneofs)]
+                      (cond (not= pe "") (values m pe)
+                            (pb/repeated? f) (recur (+ j 1) (with-val m fi true pv) present oneofs2)
+                            :else (recur (+ j 1) (with-val m fi false pv) (conj present fi) oneofs2)))))))))
+        _ (values (pb/empty-msg dd mi) (wfail "Can't write as an Object" x))))))
+
+(defn- set-named pb/DynMsg [dd: &pb/Desc m: pb/DynMsg name: &Str x: pb/PVal]
+  (let [i (field-index (nth (:messages dd) (:mi m)) name)] (if (< i 0) m (with-val m i false x))))
+
+(defn- coerce-to Values(v/Val Str) [x: &v/Val t: &Str]
+  (let [[y e] (co/coerce x (v/->TypeV "name" t [] [] [] []))] (values y (if (dwe/ok? e) "" (:msg e)))))
+
+(defn- wkt-of Values(pb/DynMsg Str) [dd: &pb/Desc mi: Int full: &Str x: &v/Val]
+  (let [m0 (pb/empty-msg dd mi)]
+    (cond
+      (= full "google.protobuf.Timestamp")
+      (let [[y e] (coerce-to x "LocalDateTime")]
+        (if (not= e "") (values m0 e)
+          (match (v/unmeta y)
+            (v/VLocalDateTime ldt) (let [s (lt/ldt-to-epoch-second ldt 0) n (:nano (:time ldt))]
+                                     (values (set-named dd (set-named dd m0 "seconds" (pb/->PInt s)) "nanos" (pb/->PInt n)) ""))
+            _ (values m0 (wfail "Can't write as protobuf.Timestamp" x)))))
+      (= full "google.protobuf.Duration")
+      (let [[y e] (coerce-to x "Period")]
+        (if (not= e "") (values m0 e)
+          (match (v/unmeta y)
+            (v/VPeriod pp) (match pp
+                             (tt/PerTime du) (values (set-named dd (set-named dd m0 "seconds" (pb/->PInt (:seconds du))) "nanos" (pb/->PInt (:nanos du))) "")
+                             _ (values m0 (wfail "Can't write as protobuf.Duration" x)))
+            _ (values m0 (wfail "Can't write as protobuf.Duration" x)))))
+      (or (= full "google.protobuf.DoubleValue") (= full "google.protobuf.FloatValue") (= full "google.protobuf.Int32Value")
+          (= full "google.protobuf.Int64Value") (= full "google.protobuf.UInt32Value") (= full "google.protobuf.UInt64Value"))
+      (let [[y e] (coerce-to x "Number")]
+        (if (not= e "") (values m0 e)
+          (let [[n ok] (num-of y)
+                pv (cond (= full "google.protobuf.DoubleValue") (pb/->PFloat (num/to-float n))
+                         (= full "google.protobuf.FloatValue") (pb/->PFloat (ieee/to-float32 (num/to-float n)))
+                         (or (= full "google.protobuf.Int64Value") (= full "google.protobuf.UInt64Value")) (pb/->PInt (java-long n))
+                         :else (pb/->PInt (pb/to-i32 (java-long n))))]
+            (values (set-named dd m0 "value" pv) ""))))
+      (= full "google.protobuf.StringValue")
+      (let [[y e] (coerce-to x "String")] (if (not= e "") (values m0 e) (values (set-named dd m0 "value" (pb/->PStr (match (v/unmeta y) (v/VStr s) (str s) _ ""))) "")))
+      (= full "google.protobuf.BoolValue")
+      (let [[y e] (coerce-to x "Boolean")] (if (not= e "") (values m0 e) (values (set-named dd m0 "value" (pb/->PBool (match (v/unmeta y) (v/VBool b) b _ false))) "")))
+      (= full "google.protobuf.BytesValue")
+      (let [[y e] (coerce-to x "Binary")] (if (not= e "") (values m0 e) (values (set-named dd m0 "value" (pb/->PStr (match (v/unmeta y) (v/VBin b) (str b) _ ""))) "")))
+      (= full "google.protobuf.Empty")
+      (let [[y e] (coerce-to x "Object")]
+        (cond (not= e "") (values m0 e)
+              (match (v/unmeta y) (v/VObj fs) (= (count fs) 0) _ false) (values m0 "")
+              :else (values m0 (wfail "Can't write as protobuf.Empty, since the object is not empty." x))))
+      (= full "google.protobuf.Struct")
+      (let [[y e] (coerce-to x "Object")]
+        (if (not= e "") (values m0 e)
+          (let [msg (nth (:messages dd) mi)
+                fi (field-index msg "fields")]
+            (if (< fi 0) (values m0 (no-field msg "fields"))
+              (let [[es ee] (map-entries dd (nth (:fields msg) fi) y)]
+                (values (assoc m0 :vals (assoc (:vals m0) fi es)) ee))))))
+      (= full "google.protobuf.ListValue")
+      (let [[y e] (coerce-to x "Array")]
+        (if (not= e "") (values m0 e)
+          (let [msg (nth (:messages dd) mi)
+                fi (field-index msg "values")]
+            (if (< fi 0) (values m0 (no-field msg "values"))
+              (let [f (nth (:fields msg) fi)
+                    xs (match (v/unmeta y) (v/VArr a) a _ [])]
+                (loop [j 0 m m0]
+                  (if (>= j (count xs)) (values m "")
+                    (let [[pv pe] (to-proto dd f (nth xs j))] (if (not= pe "") (values m pe) (recur (+ j 1) (with-val m fi true pv)))))))))))
+      :else (value-of dd mi x))))
+
+(defn- value-of Values(pb/DynMsg Str) [dd: &pb/Desc mi: Int x: &v/Val]
+  (let [m0 (pb/empty-msg dd mi)
+        msg (nth (:messages dd) mi)
+        sub (fn Values(pb/DynMsg Str) [name: Str y: v/Val]
+              (let [fi (field-index msg name)
+                    si (if (< fi 0) -1 (pb/message-index dd (:type-name (nth (:fields msg) fi))))]
+                (cond (< fi 0) (values m0 (no-field msg name))
+                      (< si 0) (values m0 (str "Field " (:full msg) "." name " is not a message field."))
+                      :else (let [[s e] (dw->msg dd si y)] (values (set-named dd m0 name (pb/->PMsg s)) e)))))]
+    (match (v/unmeta x)
+      (v/VNull) (values (set-named dd m0 "null_value" (pb/->PEnum 0)) "")
+      (v/VInt i) (values (set-named dd m0 "number_value" (pb/->PFloat (float i))) "")
+      (v/VNum n) (values (set-named dd m0 "number_value" (pb/->PFloat (num/to-float n))) "")
+      (v/VBool b) (values (set-named dd m0 "bool_value" (pb/->PBool b)) "")
+      (v/VStr s) (values (set-named dd m0 "string_value" (pb/->PStr (str s))) "")
+      (v/VObj fs) (sub "struct_value" x)
+      (v/VArr xs) (sub "list_value" x)
+      _ (values m0 (wfail "Can't write as Value, since it's not any of Null, Number, Boolean, String, Object or Array" x)))))
+
+(defn write Values(Str Str) [x: &v/Val props: &Vec(v/Field)]
+  (let [[dd mi se] (settings props)]
+    (if (not= se "") (values "" se)
+      (let [[m e] (dw->msg dd mi x)]
+        (if (not= e "") (values "" e)
+          (let [miss (pb/missing-required dd m "")]
+            (if (> (count miss) 0)
+              (values "" (str "com.google.protobuf.UninitializedMessageException - Message missing required fields: " (str/join ", " miss)))
+              (values (pb/encode dd m) ""))))))))

@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""OpenTelemetry のトレースを実 Mule と mulay で比べる。
+
+  tools/otlp/trace-oracle fill  [case...]   実 Mule (MULE_ORACLE_HOME、既定 ~/srv/mule-enterprise-standalone-4.11.3) で
+                                            記録して <case>.expected に書く
+  tools/otlp/trace-oracle check [-v] [case...]   mulay (target/mulay、古ければ作り直す。MULAY_BIN で替えられる) で回して
+                                            <case>.expected と比べる (違えば終了コード 1、-v で差分)
+
+場面は test/fixtures/otel/traces/<case>.case。アプリは test/fixtures/apps/otel-traces (app の行で替えられる)。
+  app <name>                   test/fixtures/apps/<name> のアプリで回す
+  prop <name>=<value>          アプリに渡す設定 (実 Mule には -D で渡す)。送り先 (enabled、type=HTTP、endpoint) は道具が足す
+  <METHOD> <path|url> [| <Header>: <value>]...   要求。path は http://localhost:18590 に付ける。User-Agent の既定は test-agent。
+                                本文は疑似ヘッダー body: で渡す
+
+<case>.expected は、要求ごとの状態コードと本文 (UUID は <uuid>、小数の秒を持つ時刻は <now> に伏せる。traceparent の ID は、受けた traceparent と同じなら same、違えば new に
+伏せる。アプリが自分で付ける traceparent (trace ID が OWN、span ID が OWN_SPAN) なら own) と、受けたスパンを `otlp tree` の形にしたもの。
+"""
+import http.client, http.server, importlib.machinery, importlib.util, os, re, shutil, signal, socket, subprocess
+import sys, threading, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+CASES = os.path.join(REPO, "test", "fixtures", "otel", "traces")
+APPS = os.path.join(REPO, "test", "fixtures", "apps")
+PORT = 18590
+SINK = 18591
+SETTLE = 7.0
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+otlp = load("otlp", os.path.join(HERE, "otlp"))
+
+
+def parse_case(path):
+    app, props, reqs = "otel-traces", [], []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            if line.startswith("app "):
+                app = line[4:].strip()
+                continue
+            if line.startswith("prop "):
+                props.append(line[5:].strip())
+                continue
+            parts = [p.strip() for p in line.split(" | ")]
+            method, target = parts[0].split(None, 1)
+            hs = []
+            for h in parts[1:]:
+                k, v = h.split(":", 1)
+                hs.append((k.strip(), v.strip()))
+            reqs.append((method, target, hs))
+    return app, props, reqs
+
+
+def base_props():
+    return ["mule.openTelemetry.tracer.exporter.enabled=true", "mule.openTelemetry.tracer.exporter.type=HTTP",
+            "mule.openTelemetry.tracer.exporter.endpoint=http://localhost:%d/v1/traces" % SINK]
+
+
+class Sink:
+    def __init__(self):
+        self.bodies = []
+        lock = threading.Lock()
+        bodies = self.bodies
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                b = self.rfile.read(int(self.headers.get("content-length", 0)))
+                with lock:
+                    bodies.append(b)
+                self.send_response(200)
+                self.send_header("content-type", "application/x-protobuf")
+                self.send_header("content-length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", SINK), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+OWN = "0af7651916cd43dd8448eb211c80319c"
+OWN_SPAN = "b7ad6b7169203331"
+TP = re.compile(r"00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})")
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+NOW = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z")
+
+
+def mask(body, hs):
+    sent = dict((k.lower(), v) for k, v in hs).get("traceparent", "")
+    m0 = TP.fullmatch(sent)
+    tid = m0.group(1) if m0 else None
+
+    def one(m):
+        kind = "same" if m.group(1) == tid else "own" if m.group(1) == OWN else "new"
+        return "00-%s-%s-%s" % (kind, "own" if m.group(2) == OWN_SPAN else "span", m.group(3))
+
+    return NOW.sub("<now>", UUID.sub("<uuid>", TP.sub(one, body)))
+
+
+def send(method, target, hs):
+    if target.startswith("http://"):
+        rest = target[7:]
+        hostport, _, path = rest.partition("/")
+        host, _, port = hostport.partition(":")
+        path = "/" + path
+        port = int(port or 80)
+    else:
+        host, port, path = "localhost", PORT, target
+    body = None
+    headers = {"User-Agent": "test-agent"}
+    for k, v in hs:
+        if k.lower() == "body":
+            body = v.encode()
+        else:
+            headers[k] = v
+    c = http.client.HTTPConnection(host, port, timeout=30)
+    c.request(method, path, body=body, headers=headers)
+    r = c.getresponse()
+    data = r.read().decode("utf-8", "replace")
+    c.close()
+    return r.status, data
+
+
+def run_requests(reqs):
+    out = []
+    for method, target, hs in reqs:
+        st, body = send(method, target, hs)
+        out.append("%s %s -> %d %s" % (method, target, st, mask(body, hs).replace("\n", "\\n")))
+        time.sleep(0.3)
+    return out
+
+
+def wait_port(port, limit, alive):
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        if not alive():
+            return False
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+            return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
+
+def render(resps, bodies):
+    reqs = []
+    for b in bodies:
+        reqs += otlp.trace_request(b)
+    return "%%% responses\n" + "\n".join(resps) + "\n%%% spans\n" + "\n".join(otlp.tree_lines(reqs)) + "\n"
+
+
+def run_mule(case_name, app_name, props, reqs):
+    work = os.path.join(REPO, "target", "trace-oracle")
+    app = os.path.join(work, app_name)
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.copytree(os.path.join(APPS, app_name), app)
+    with open(os.path.join(app, "scenario.scn"), "w", encoding="utf-8") as f:
+        jvm = " ".join("-D" + p for p in base_props() + props)
+        f.write("%%%%%% port %d\n%%%%%% jvm %s\n%%%%%% request GET /hello\n" % (PORT, jvm))
+    env = dict(os.environ)
+    env.setdefault("MULE_ORACLE_HOME", os.path.expanduser("~/srv/mule-enterprise-standalone-4.11.3"))
+    env.setdefault("MULE_ORACLE_RUNTIME", os.path.join(REPO, "target", "mule-oracle-runtime-trace"))
+    sink = Sink()
+    p = subprocess.Popen([sys.executable, os.path.join(REPO, "tools", "mule-oracle", "mule-oracle"), "run", app], cwd=REPO,
+                         env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines = []
+    try:
+        for line in p.stdout:
+            lines.append(line)
+            if "Ctrl-C to stop" in line:
+                break
+        else:
+            raise SystemExit("%s: Mule did not start:\n%s" % (case_name, "".join(lines[-30:])))
+        time.sleep(2)
+        resps = run_requests(reqs)
+        time.sleep(SETTLE)
+    finally:
+        p.send_signal(signal.SIGINT)
+        try:
+            p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        sink.close()
+        shutil.rmtree(work, ignore_errors=True)
+    return render(resps, sink.bodies)
+
+
+def run_mulay(case_name, app_name, props, reqs, mo):
+    err = mo.ensure_mulay()
+    if err:
+        raise SystemExit(err)
+    sink = Sink()
+    p = subprocess.Popen([mo.MULAY, "run", os.path.join(APPS, app_name), *base_props(), *props], cwd=REPO, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, text=True)
+    log = []
+    threading.Thread(target=lambda: log.extend(p.stdout), daemon=True).start()
+    try:
+        if not wait_port(PORT, 30, lambda: p.poll() is None):
+            raise SystemExit("%s: mulay did not start:\n%s" % (case_name, "".join(log[-30:])))
+        resps = run_requests(reqs)
+        time.sleep(SETTLE)
+    finally:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+            p.wait(timeout=10)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        sink.close()
+    return render(resps, sink.bodies), "".join(log)
+
+
+def case_names(args):
+    names = args or sorted(f[:-5] for f in os.listdir(CASES) if f.endswith(".case"))
+    return [os.path.basename(n).removesuffix(".case") for n in names]
+
+
+def main(argv):
+    if not argv or argv[0] not in ("fill", "check"):
+        sys.stderr.write(__doc__)
+        return 2
+    mode, rest = argv[0], argv[1:]
+    verbose = "-v" in rest
+    rest = [a for a in rest if a != "-v"]
+    mo = load("mule_oracle", os.path.join(REPO, "tools", "mule-oracle", "mule-oracle")) if mode == "check" else None
+    rc = 0
+    for name in case_names(rest):
+        app, props, reqs = parse_case(os.path.join(CASES, name + ".case"))
+        exp_path = os.path.join(CASES, name + ".expected")
+        if mode == "fill":
+            text = run_mule(name, app, props, reqs)
+            with open(exp_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            print("FILLED   %s" % name)
+            continue
+        got, log = run_mulay(name, app, props, reqs, mo)
+        with open(exp_path, encoding="utf-8") as f:
+            exp = f.read()
+        if got == exp:
+            print("PASS     %s" % name)
+        else:
+            rc = 1
+            print("FAIL     %s" % name)
+            if verbose:
+                import difflib
+                sys.stdout.writelines(difflib.unified_diff(exp.splitlines(True), got.splitlines(True), "expected", "mulay"))
+                print("--- mulay log (tail)\n" + log[-3000:])
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

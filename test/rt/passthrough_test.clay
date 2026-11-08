@@ -1,0 +1,72 @@
+(ns passthrough-test (:require [mulay.app.run :as run] [mulay.rt.engine :as en] [mulay.mule.load :as ld] [mulay.lib.res :as res]
+                               [mulay.conn.registry :as creg] [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]))
+
+(c-flags "-DCLAY_PARALLEL")
+
+;; http:request の streamResponse="true" と listener の AUTO: 上流の本文は、届いた分からそのまま返る。
+;; 上流は "one\n" を送って 800 ms 待ち、"two\n" を送る。1 つ目の断片が 2 つ目より先に (上流が終わる前に) 着く
+
+(def UP-PORT 19988)
+(def FWD-PORT 19989)
+
+(def APP (str "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\">\n"
+              "<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"19989\"/></http:listener-config>\n"
+              "<http:request-config name=\"R\"><http:request-connection host=\"127.0.0.1\" port=\"19988\" streamResponse=\"true\"/></http:request-config>\n"
+              "<flow name=\"up\"><http:listener config-ref=\"L\" path=\"/up\"/><http:request config-ref=\"R\" path=\"/s\" method=\"GET\"/></flow>\n"
+              "<flow name=\"down\"><http:listener config-ref=\"L\" path=\"/down\"/><http:request config-ref=\"R\" path=\"/s\" method=\"GET\"/>"
+              "<set-payload value=\"#[upper(payload)]\"/></flow>\n</mule>"))
+
+;; 上流: 断片を 800 ms 空けて 2 つ
+(defn- upstream hm/Response [req: hm/Request]
+  (let [[resp sk] (hm/stream-response 200 [(hm/->Header "Content-Type" "text/plain")])
+        f (future-detach (future (fn Int [k: Int]
+                                   (let [a (hm/sink-write sk "one\n")
+                                         z (sleep-ms 800)
+                                         b (hm/sink-write sk "two\n")
+                                         c (hm/sink-close sk)]
+                                     0)) 0))]
+    resp))
+
+(def STAMPS (atom (let [v: Vec(Int) []] v)))
+(def PARTS (atom (let [v: Vec(Str) []] v)))
+(def TE (atom ""))
+
+(defn- on-head http/Flow [r: hm/Resp]
+  (let [te: Str (match (hm/header-of (:headers r) "transfer-encoding") (Some x) x (None) "")
+        z (reset! TE te)]
+    (http/->Continue)))
+
+(defn- on-chunk http/Flow [c: Str]
+  (let [z (swap! STAMPS (fn Vec(Int) [o: Vec(Int)] (conj o (quot (mono-us) 1000))))
+        z2 (swap! PARTS (fn Vec(Str) [o: Vec(Str)] (conj o (str c))))]
+    (http/->Continue)))
+
+(deftest passthrough-streams-the-first-chunk-early
+  (let [a (:app (ld/load-texts "t" ["a.xml"] [APP] (res/res-none) (ld/->LoadOpts [] false (creg/hints))))
+        [rs errs] (run/routes a (creg/all))
+        c (en/new-ctx a (creg/all) 5)
+        usv (http/new-server)
+        fsv (http/new-server)
+        uf (future (fn Int [k: Int] (let [[rc e] (http/run-server upstream (assoc (assoc (http/default-server-opts) :port UP-PORT) :server usv))] rc)) 0)
+        ff (future (fn Int [k: Int] (let [[rc e] (http/run-server (fn hm/Response [q: hm/Request] (run/handle c rs q))
+                                                                   (assoc (assoc (http/default-server-opts) :port FWD-PORT) :server fsv))] rc)) 0)
+        z0 (sleep-ms 300)
+        t0 (quot (mono-us) 1000)
+        o (assoc (http/request-opts "http://127.0.0.1:19989/up") :as (http/->ChunkStream on-head on-chunk))
+        [r e] (http/request o)
+        ts (deref STAMPS)
+        ps (deref PARTS)
+        [dr de] (http/request (http/request-opts "http://127.0.0.1:19989/down"))
+        z1 (http/stop usv 1000)
+        z2 (http/stop fsv 1000)
+        z3 (deref uf)
+        z4 (deref ff)]
+    (is (= e ""))
+    ;; DW が読むときは全部届くのを待つ
+    (is (= (:body dr) "ONE\nTWO\n"))
+    (is (= (:status r) 200))
+    (is (= (deref TE) "chunked"))
+    (is (= (str/join "" ps) "one\ntwo\n"))
+    (is (>= (count ts) 2))
+    (is (< (- (nth ts 0) t0) 600))
+    (is (>= (- (nth ts (- (count ts) 1)) (nth ts 0)) 600))))

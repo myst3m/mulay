@@ -1,0 +1,78 @@
+(ns mulay.dw.lib.objects
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.lib.core :as core]
+            [mulay.dw.lib.core_coll :as cc]))
+
+(def M "dw::core::Objects")
+
+(defn- okv Values(v/Val dwe/DwErr) [x: v/Val] (rt/ret x))
+(defn- nul v/Val [] (v/null-v))
+(defn- false-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/bool-v false)))
+(defn- true-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/bool-v true)))
+
+(defn- test-entry Values(Bool dwe/DwErr) [env: &rt/Env f: &v/FnV fl: &v/Field]
+  (let [[y e] (cc/call env f [(:value fl) (v/->VKey (:key fl))])]
+    (if (dwe/ok? e) (cc/if-bool y) (values false e))))
+
+(defn- entry-set Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr (cc/entries (core/arg-fields a 0)))))
+(defn- name-set Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr (cc/names (core/arg-fields a 0)))))
+(defn- key-set Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr (cc/keys-v (core/arg-fields a 0)))))
+(defn- value-set Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (v/->VArr (cc/vals-v (core/arg-fields a 0)))))
+
+(defn- merge-with-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0) gs (core/arg-fields a 1)
+        names (loop [i 0 m: Map(Str Bool) {}] (if (>= i (count gs)) m (recur (+ i 1) (assoc m (str (:name (:key (nth gs i)))) true))))
+        kept (loop [i 0 acc: Vec(v/Field) []]
+               (if (>= i (count fs)) acc
+                 (let [f (nth fs i)]
+                   (recur (+ i 1) (if (contains? names (:name (:key f))) acc (conj acc f))))))]
+    (okv (v/->VObj (loop [acc kept i 0] (if (>= i (count gs)) acc (recur (conj acc (nth gs i)) (+ i 1))))))))
+
+(defn- first-arg Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (nth a 0)))
+(defn- second-arg Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)] (okv (nth a 1)))
+
+(defn- divide-by Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0)
+        [lim le] (core/arith-num 2 (core/arg-num a 1) (num/from-int 1))]
+   (if (not (dwe/ok? le)) (values (v/null-v) le)
+    (loop [i 0 carry: Vec(v/Field) [] acc: Vec(v/Val) []]
+      (if (>= i (count fs)) (okv (v/->VArr (if (= (count carry) 0) acc (conj acc (v/->VObj carry)))))
+        (if (num/eq? (num/from-int (count carry)) lim)
+          (recur (+ i 1) [] (conj acc (v/->VObj (conj carry (nth fs i)))))
+          (recur (+ i 1) (conj carry (nth fs i)) acc)))))))
+
+(defn- take-while-fn Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0) f (core/arg-fn a 1)]
+    (loop [i 0 acc: Vec(v/Field) []]
+      (if (>= i (count fs)) (okv (v/->VObj acc))
+        (let [[b e] (test-entry env f (nth fs i))]
+          (if (not (dwe/ok? e)) (values (nul) e)
+            (if b (recur (+ i 1) (conj acc (nth fs i))) (okv (v/->VObj acc)))))))))
+
+(defn- every-entry Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0) f (core/arg-fn a 1)]
+    (loop [i 0]
+      (if (>= i (count fs)) (okv (v/bool-v true))
+        (let [[b e] (test-entry env f (nth fs i))]
+          (if (not (dwe/ok? e)) (values (nul) e)
+            (if b (recur (+ i 1)) (okv (v/bool-v false)))))))))
+
+(defn- some-entry Values(v/Val dwe/DwErr) [env: rt/Env a: Vec(v/Val)]
+  (let [fs (core/arg-fields a 0) f (core/arg-fn a 1)]
+    (loop [i 0]
+      (if (>= i (count fs)) (okv (v/bool-v false))
+        (let [[b e] (test-entry env f (nth fs i))]
+          (if (not (dwe/ok? e)) (values (nul) e)
+            (if b (okv (v/bool-v true)) (recur (+ i 1)))))))))
+
+(defn- B rt/Builtin [name: Str os: Vec(rt/Overload)] (rt/builtin name M os))
+
+(defn builtins Vec(rt/Builtin) []
+  [(B "entrySet" [(rt/b1 "Object" entry-set)])
+   (B "nameSet" [(rt/b1 "Object" name-set)])
+   (B "keySet" [(rt/b1 "Object" key-set)])
+   (B "valueSet" [(rt/b1 "Object" value-set)])
+   (B "mergeWith" [(rt/b2 "Object" "Object" merge-with-fn) (rt/b2 "Null" "Object" second-arg) (rt/b2 "Object" "Null" first-arg)])
+   (B "divideBy" [(rt/b2 "Object" "Number" divide-by)])
+   (B "takeWhile" [(rt/b2 "Object" "Function" take-while-fn)])
+   (B "everyEntry" [(rt/b2 "Object" "Function" every-entry) (rt/b2 "Null" "Function" true-fn)])
+   (B "someEntry" [(rt/b2 "Object" "Function" some-entry) (rt/b2 "Null" "Function" false-fn)])])

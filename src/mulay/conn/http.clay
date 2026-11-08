@@ -1,0 +1,571 @@
+(ns mulay.conn.http
+  (:require [mulay.rt.trace :as tr] [mulay.lib.numparse :as npz] [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.err :as dwe] [mulay.dw.fmt.registry :as reg]
+            [mulay.mule.model :as m] [mulay.lib.res :as res] [mulay.conn.http_static :as hs] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.rt.engine :as en]
+            [mulay.conn.tls :as tls] [clay.tls :as ctls] [mulay.lib.x509 :as x509] [mulay.dw.num :as num] [mulay.lib.time.tz :as tz]
+            [mulay.lib.time.zoned :as zd] [mulay.lib.xml :as xml] [clay.http :as http] [clay.httpmsg :as hm] [clay.string :as str]
+            [clay.base64 :as b64] [mulay.lib.crypto :as lc] [clay.async :as async] [mulay.rt.stream :as stream] [mulay.dw.engine :as eng] [mulay.lib.uni :as uni] [mulay.rt.poll :as rp] [mulay.conn.httpmsg :as hx] [mulay.conn.http_req :as hr]))
+
+(def NS "http://www.mulesoft.org/schema/mule/http")
+
+(defn mime-of Str [ct: &Str] (if (= (count ct) 0) "*/*" (str ct)))
+
+(def LOCALHOST-ADDR (atom "127.0.0.1"))
+
+(defn localhost-ipv6! Int [] (let [z (reset! LOCALHOST-ADDR "[0:0:0:0:0:0:0:1]")] 0))
+
+(defn- sock-addr Str [host: &Str port: &Str]
+  (str (if (= host "localhost") (str "localhost/" (deref LOCALHOST-ADDR)) (str "/" host)) ":" port))
+
+(defn tls-opts ctls/Config [t: &tls/Tls]
+  (let [tr (:trust t)
+        ky (:key t)
+        c0 (assoc (assoc (ctls/default-config) :protocols (:protocols t)) :suites (:suites t))
+        c1 (if (= (count tr) 0) c0
+             (let [x (nth tr 0)]
+               (cond (:insecure x) (assoc c0 :verify (ctls/->VerifyNone))
+                     (not= (:ca-pem x) "") (assoc c0 :ca (:ca-pem x))
+                     (not= (:p12 x) "") (assoc (assoc c0 :ca-pkcs12 (:p12 x)) :ca-pkcs12-password (:p12-pw x))
+                     :else c0)))]
+    (if (= (count ky) 0) c1
+      (let [k (nth ky 0)]
+        (if (not= (:key-pem k) "")
+          (assoc (assoc c1 :cert (:chain-pem k)) :key (:key-pem k))
+          (assoc (assoc (assoc c1 :pkcs12 (:p12 k)) :pkcs12-password (:p12-pw k)) :key-password (:key-pw k)))))))
+
+(defn listener-tls Values(ctls/ServerConfig Str) [t: &tls/Tls]
+  (let [c0 (assoc (assoc (assoc (ctls/default-server-config) :alpn ["http/1.1"]) :protocols (:protocols t)) :suites (:suites t))
+        ky (:key t)
+        tr (:trust t)]
+    (if (= (count ky) 0) (values c0 "KeyStore must be configured for server side SSL")
+      (let [k (nth ky 0)
+            c1 (if (not= (:key-pem k) "")
+                 (assoc (assoc c0 :cert (:chain-pem k)) :key (:key-pem k))
+                 (let [c2 (assoc (assoc c0 :pkcs12 (:p12 k)) :pkcs12-password (:p12-pw k))]
+                   (if (= (:key-pw k) "") c2 (assoc c2 :key-password (:key-pw k)))))
+            c3 (if (= (count tr) 0) c1
+                 (let [x (nth tr 0)]
+                   (cond (:insecure x) c1
+                         (not= (:ca-pem x) "") (assoc (assoc c1 :client-ca (:ca-pem x)) :client-auth (ctls/->CaRequire))
+                         (not= (:p12 x) "")
+                         (assoc (assoc (assoc c1 :client-ca-pkcs12 (:p12 x)) :client-ca-pkcs12-password (:p12-pw x))
+                                :client-auth (ctls/->CaRequire))
+                         :else c1)))]
+        (values c3 "")))))
+
+(def FRAME-ERRS ["http: the response has both " "http: the response's Transfer-Encoding " "http: an HTTP/1.0 response "
+                 "http: a field line of the response has " "http: the response's first field line " "http: a line of the response head "
+                 "http: the server switched protocols" "http: over 100 interim" "http: the chunked response is malformed"
+                 "http: the chunk size " "http: a chunk " "http: a malformed chunk size line"])
+
+(defn- frame-err? Bool [emsg: &Str]
+  (loop [i 0] (cond (>= i (count FRAME-ERRS)) false (str/starts-with? emsg (nth FRAME-ERRS i)) true :else (recur (+ i 1)))))
+
+(def CL-BAD "http: the response's Content-Length '")
+(def MULTI-CL "http: the response has more than one Content-Length: ")
+(def NO-STATUS "http: the response has no status line: ")
+
+(def MAX-STATUS-LINE 4096)
+(def MAX-FIELD-SECTION 8192)
+
+(defn conn-fail-text Str [raw: &Str host: &Str port: &Str]
+  (let [emsg (str/lower-case raw)]
+  (cond
+    (str/starts-with? emsg "tls: the server's certificate")
+    "(certificate_unknown) PKIX path building failed: sun.security.provider.certpath.SunCertPathBuilderException: unable to find valid certification path to requested target."
+    (str/includes? emsg "sent the alert protocol_version") "(protocol_version) Received fatal alert: protocol_version."
+    (str/includes? emsg "sent the alert handshake_failure") "(handshake_failure) Received fatal alert: handshake_failure."
+    (str/starts-with? emsg "http: stopped after") "org.mule.service.http.netty.impl.client.MaxRedirectException: Max redirects limit reached.."
+    (or (str/starts-with? emsg "tls") (str/includes? emsg "closed") (str/includes? emsg "reset") (str/includes? emsg "eof")
+        (str/includes? emsg "no response") (str/starts-with? emsg "http: the response body ended before")
+        (str/starts-with? emsg "http: the chunked response ended early") (str/starts-with? emsg "http: write failed")
+        (str/includes? emsg " byte limit") (str/includes? emsg "over the head's limit") (str/includes? emsg "too large to hold"))
+    "Remotely closed."
+    (and (str/starts-with? raw CL-BAD) (str/ends-with? raw "' is not a valid length"))
+    (str "Content-Length value is not a number: " (subs raw (count CL-BAD) (- (count raw) 23)) ".")
+    (str/starts-with? raw "http: a field line of the response is not name: value") "No colon found."
+    (str/starts-with? raw MULTI-CL) (str "Multiple Content-Length values found: [" (subs raw (count MULTI-CL) (count raw)) "].")
+    (str/starts-with? raw NO-STATUS)
+    (let [l (subs raw (count NO-STATUS) (count raw))
+          sp (str/index-of l " ")
+          w (if (< sp 0) l (subs l 0 sp))]
+      (str "invalid version format: " (str/upper-case w) "."))
+    (frame-err? raw) (str (subs raw 6 (count raw)) ".")
+    :else (str "Connection refused: " (sock-addr host port) "."))))
+
+(defn- pump Int [o: http/RequestOpts head: Chan(hm/Resp) body: Chan(Str) err: Atom(Str) sent: Atom(Bool)]
+  (let [oc (assoc o :as (http/->ChunkStream
+                          (fn http/Flow [r: hm/Resp] (let [z (reset! sent true) z2 (>! head r)] (http/->Continue)))
+                          (fn http/Flow [ck: Str] (if (>! body ck) (http/->Continue) (http/->Stop)))))
+        [r e] (http/request oc)
+        z (reset! err e)
+        z2 (if (deref sent) true (>! head (hm/->Resp -1 [] "" e [])))
+        z3 (close! body)]
+    0))
+
+(defn- pipe-next Values(Vec(v/Val) Bool Str) [body: &Chan(Str) err: &Atom(Str)]
+  (<! [ck body]
+    (values [(v/->VStr ck)] false "")
+    (values [] true (deref err))
+    (values [] true "timed out")))
+
+(defn- stream-timed-out Values(hm/Resp Str Str) [body: &Chan(Str)]
+  (let [z2 (async/no-deadline) z3 (close! body)] (values (hm/->Resp -1 [] "" "" []) "timed out" "")))
+
+(defn- fetch-stream Values(hm/Resp Str Str) [o: &http/RequestOpts wait-ms: Int owner: &Str]
+  (let [head: Chan(hm/Resp) (chan-buf 1)
+        body: Chan(Str) (chan)
+        err (atom "")
+        sent (atom false)
+        o1 (assoc o :timeout-ms 0)
+        z (future-detach (future (fn Int [k: Int] (pump o1 head body err sent)) 1))
+        z1 (if (> wait-ms 0) (async/deadline-in wait-ms) 0)]
+    (<! [h head]
+      (let [z2 (async/no-deadline)]
+        (if (= (:status h) -1) (values h (:reason h) "")
+          (let [bc body ec err
+                id (stream/open owner (stream/->Source (fn Values(Vec(v/Val) Bool Str) [n: Int] (pipe-next bc ec))
+                                                       (fn Int [broken: Bool] (do (close! bc) 0)) false))]
+            (values h "" id))))
+      (stream-timed-out body)
+      (stream-timed-out body))))
+
+(defn- fetch Values(hm/Resp Str Str) [o: &http/RequestOpts timeout: Int stream?: Bool owner: &Str]
+  (if stream? (fetch-stream o timeout owner)
+    (let [[r e] (http/request (if (> timeout 0) (assoc o :timeout-ms timeout) o))] (values r e ""))))
+
+(defn- bypass? Bool [hosts: &Str target: &Str]
+  (let [xs: Vec(Str) (str/split hosts ",")]
+    (loop [i 0] (if (>= i (count xs)) false (if (= (str/trim (nth xs i)) target) true (recur (+ i 1)))))))
+
+(defn- url-host Str [url: &Str]
+  (let [k (str/index-of url "://")
+        rest (if (< k 0) (str url) (subs url (+ k 3) (count url)))
+        e (loop [i 0] (if (>= i (count rest)) i (let [ch (nth rest i)] (if (or (= ch 47) (= ch 58) (= ch 63)) i (recur (+ i 1))))))]
+    (subs rest 0 e)))
+
+(defn- proxy-of Vec(http/Proxy) [c: &conn/OpCall conn-node: &Vec(xml/XNode) target: &Str]
+  (if (= (count conn-node) 0) []
+    (let [cn (nth conn-node 0)
+          pc (hr/child-elem (xml/elem-children cn) "proxy-config")
+          inline (if (= (count pc) 0) [] (hr/child-elem (xml/elem-children (nth pc 0)) "proxy"))
+          ref (hr/attr-of cn "proxyConfig" "")
+          g (if (= ref "") [] (conn/find-config (:configs c) "http:proxy" ref))
+          host (cond (> (count inline) 0) (hr/attr-of (nth inline 0) "host" "")
+                     (> (count g) 0) (conn/param-lit (:params (nth g 0)) "host" "")
+                     :else "")
+          get (fn Str [k: Str] (cond (> (count inline) 0) (hr/attr-of (nth inline 0) k "")
+                                     (> (count g) 0) (conn/param-lit (:params (nth g 0)) k "")
+                                     :else ""))
+          port (npz/int-or (get "port") 0)
+          npk (get "nonProxyHosts")]
+      (if (or (= host "") (bypass? npk target)) []
+        [(http/->Proxy host port (get "username") (get "password") (let [none: Vec(Str) []] none))]))))
+
+(defn- trace-headers Vec(hm/Header) [hs: Vec(hm/Header) e: &ev/Event]
+  (let [tp (tr/traceparent e)]
+    (if (= tp "") hs
+      (conj (conj hs (hr/hpair "traceparent" tp)) (hr/hpair "tracestate" (tr/tracestate e))))))
+
+(defn- url-sans-query Str [url: &Str]
+  (let [q (str/index-of url "?")
+        f (str/index-of url "#")
+        e (cond (and (>= q 0) (or (< f 0) (< q f))) q (>= f 0) f :else (count url))]
+    (subs url 0 e)))
+
+(defn- client-span! Int [e: &ev/Event method: &Str url: &Str host0: &Str port0: &Str scheme: &Str]
+  (if (not (:sampled (:span e))) 0
+  (let [m (str/upper-case method)
+        [u uerr] (http/parse-url url)
+        host (if (= uerr "") (:host u) (str host0))
+        port (cond (= uerr "") (str (:port u)) (not= port0 "") (str port0) (= scheme "https") "443" :else "80")
+        z0 (tr/set-name! e m)
+        z1 (tr/add-attr! e "http.method" m)
+        z2 (tr/add-attr! e "span.kind.override" "CLIENT")
+        z3 (tr/add-attr! e "http.flavor" "1.1")
+        z4 (tr/add-attr! e "http.url" (url-sans-query url))
+        z5 (tr/add-attr! e "net.peer.port" port)]
+    (tr/add-attr! e "net.peer.name" host))))
+
+(defn- client-status! Int [e: &ev/Event st: Int]
+  (let [z (tr/add-attr! e "http.status_code" (str st))]
+    (tr/add-attr! e "status.override" (if (>= st 400) "ERROR" "UNSET"))))
+
+(defn run-request conn/OpResult [c: conn/OpCall]
+  (let [ps (:params c)
+        cfg-params (hr/cfg-params c)
+        conn-node (hr/conn-node c)
+        app-cfg (conn/find-config (:configs c) "mule:configuration" "")
+        default-to (if (= (count app-cfg) 0) "10000" (conn/param-lit (:params (nth app-cfg 0)) "defaultResponseTimeout" "10000"))
+        timeout (npz/int-or (conn/param-lit ps "responseTimeout" (conn/param-lit cfg-params "responseTimeout" default-to)) 0)
+        [follow fe] (conn/attr-bool c "followRedirects" (= (str/lower-case (conn/param-lit cfg-params "followRedirects" "true")) "true"))
+        [t te0] (hr/target c)
+        method (:method t)
+        url (:url t)
+        host (:host t)
+        port (:port t)
+        scheme (:scheme t)
+        [b be] (hr/body-of c method)
+        body (:bytes b)
+        chunked (:chunked b)
+        ct (:ct b)
+        no-body-method (:no-body-method b)
+        [uh he] (hr/user-headers c)
+        h0: Vec(hm/Header) [(hr/hpair "User-Agent" "Mule HTTP Client")]
+        h1 (loop [i 0 acc h0] (if (>= i (count (:headers uh))) acc (recur (+ i 1) (conj acc (nth (:headers uh) i)))))
+        [au aue] (if (= (count conn-node) 0) (values (no-auth) "") (auth-of c (nth conn-node 0)))
+        auth (if (:auth uh) (no-auth) au)
+        path-only (:path-only t)
+        [otok oterr] (if (= (:kind auth) "oauth") (oauth-token auth false) (values "" ""))
+        h1a (if (= (:kind auth) "oauth") (conj h1 (hr/hpair "Authorization" (str "Bearer " otok))) (first-auth-header h1 auth path-only))
+        [cids cidx] (conn/outbound-corr c cfg-params)
+        h1b (if (= (count cids) 0) h1a (conj h1a (hr/hpair "X-Correlation-ID" (nth cids 0))))
+        h1c (trace-headers h1b (:event c))
+        h2 (if (or (and (= (count body) 0) (not chunked)) (= ct "") (:ct uh)) h1c (conj h1c (hr/hpair "Content-Type" ct)))
+        h3 (cond chunked (conj h2 (hr/hpair "Transfer-Encoding" "chunked"))
+                 (= (count body) 0) h2
+                 :else (conj h2 (hr/hpair "Content-Length" (str (count body)))))
+        h4 (conj h3 (hr/hpair "Accept" "*/*"))
+        h5 (if (and (= (count body) 0) (not chunked) (not no-body-method)) (conj h4 (hr/hpair "Content-Length" "0")) h4)
+        hmap (conj h5 (hr/hpair "Connection" "keep-alive"))
+        first-err (loop [es: Vec(Str) [te0 he be aue] i 0] (if (>= i (count es)) "" (if (not= (nth es i) "") (nth es i) (recur es (+ i 1)))))
+        what (str "HTTP " method " on resource '" url "' failed")
+        [tl te] (if (or (= (count conn-node) 0) (not= scheme "https")) (values [] "")
+                  (tls/of-connection (:configs c) (:res c) (nth conn-node 0)))]
+    (cond
+      (not= first-err "") (conn/fail-result (err/mk "MULE" "EXPRESSION" first-err))
+      (> (count cidx) 0) (conn/fail-result (nth cidx 0))
+      (> (count fe) 0) (conn/fail-result (nth fe 0))
+      (not= te "") (conn/fail-result (err/mk "MULE" "UNKNOWN" te))
+      (not= oterr "") (conn/fail-result (err/mk "HTTP" "SECURITY" oterr))
+      :else
+      (let [zs (client-span! (:event c) method url host port scheme)
+            tcfg (assoc (if (= (count tl) 0) (ctls/default-config) (tls-opts (nth tl 0))) :alpn ["http/1.1"])
+            o0 (assoc (http/request-opts url) :method method :headers hmap :body body :max-redirects (if follow 5 0)
+                      :max-status-line MAX-STATUS-LINE :max-field-section MAX-FIELD-SECTION)
+            px (proxy-of c conn-node (if (> (count (:url0 t)) 0) (url-host (:url0 t)) host))
+            o0p (if (> (count px) 0) (assoc o0 :proxy (nth px 0)) o0)
+            o1 (if (= scheme "https") (assoc o0p :tls tcfg) o0p)
+            stream? (and (> (count conn-node) 0) (= (str/lower-case (hr/attr-of (nth conn-node 0) "streamResponse" "false")) "true"))
+            owner (:corr (:event c))
+            [resp0 rerr0 pid0] (fetch o1 timeout stream? owner)
+            oretry (and (= (:kind auth) "oauth") (= rerr0 "") (or (= (:status resp0) 401) (= (:status resp0) 403)))
+            [ntok nterr] (if oretry (oauth-token auth true) (values "" ""))
+            retry (cond oretry (if (= nterr "") [(str "Bearer " ntok)] [])
+                        :else (challenge-header resp0 rerr0 auth method path-only))
+            [resp rerr pid] (if (= (count retry) 0) (values resp0 rerr0 pid0)
+                              (let [hs2 (swap-auth hmap (nth retry 0))
+                                    o2 (assoc o1 :headers hs2)]
+                                (fetch o2 timeout stream? owner)))
+            st (if (not= rerr "") -1 (:status resp))
+            zst (if (< st 0) 0 (client-status! (:event c) st))
+            rbody (:body resp)
+            [attrs rct] (hr/resp-attrs st (:reason resp) (:headers resp))
+            pmime (hr/payload-mime c rct rbody)
+            payload (cond (not= pid "") (ev/tv-pipe pid pmime)
+                          stream? (ev/as-stream (ev/tv-raw rbody pmime))
+                          :else (ev/tv-raw rbody pmime))]
+        (if (not= nterr "") (conn/fail-result (err/mk "HTTP" "SECURITY" nterr))
+        (if (< st 0)
+          (let [emsg (str/lower-case rerr)]
+            (if (or (str/includes? emsg "timed out") (str/includes? emsg "timeout") (str/includes? emsg "deadline"))
+              (conn/fail-result (err/mk "HTTP" "TIMEOUT" (str what ": Timeout exceeded.")))
+              (conn/fail-result (err/mk "HTTP" "CONNECTIVITY" (str what ": " (conn-fail-text rerr host port))))))
+          (hr/status-result c t b st payload attrs)))))))
+
+(defrecord Auth [kind: Str user: Str pass: Str preemptive: Bool url: Str scopes: Str inbody: Bool key: Str])
+
+(defn no-auth Auth [] (->Auth "" "" "" false "" "" false ""))
+
+(defn- auth-attr Values(Str Str) [c: &conn/OpCall el: &xml/XNode path: &Str name: &Str default: Str]
+  (let [cfgs (:config c)
+        ex (if (= (count cfgs) 0) [] (conn/param (:exprs (nth cfgs 0)) (str path "@" name)))]
+    (if (> (count ex) 0)
+      (let [[x e] ((:eval c) (nth ex 0) (:event c))] (values (hr/val-text x) e))
+      (values (hr/attr-of el name default) ""))))
+
+(defn auth-of Values(Auth Str) [c: &conn/OpCall cn: &xml/XNode]
+  (let [a (hr/child-elem (xml/child-elems cn) "authentication")]
+    (if (= (count a) 0) (values (no-auth) "")
+      (let [ks (xml/child-elems (nth a 0))]
+        (if (= (count ks) 0) (values (no-auth) "")
+          (let [el (nth ks 0)
+                local (xml/elem-local el)
+                path (str (xml/elem-local cn) "/authentication/" local)
+                [u ue] (auth-attr c el path "username" "")
+                [p pe] (auth-attr c el path "password" "")
+                [pre pre-e] (auth-attr c el path "preemptive" "true")]
+            (cond
+              (not= ue "") (values (no-auth) ue)
+              (not= pe "") (values (no-auth) pe)
+              (= local "basic-authentication") (values (->Auth "basic" u p (not= (str/lower-case (str/trim pre)) "false") "" "" false "") "")
+              (= local "digest-authentication") (values (->Auth "digest" u p true "" "" false "") "")
+              (= local "client-credentials-grant-type") (oauth-auth c cn el path)
+              :else (values (no-auth) (str "http:request: <http:" local "> is not supported")))))))))
+
+(def TOKENS: Atom(Map(Str Str)) (atom (let [m: Map(Str Str) {}] m)))
+
+(defn- oauth-auth Values(Auth Str) [c: &conn/OpCall cn: &xml/XNode el: &xml/XNode path: &Str]
+  (let [[id ide] (auth-attr c el path "clientId" "")
+        [sec sece] (auth-attr c el path "clientSecret" "")
+        [url ue] (auth-attr c el path "tokenUrl" "")
+        [sc sce] (auth-attr c el path "scopes" "")
+        [inb ibe] (auth-attr c el path "encodeClientCredentialsInBody" "false")
+        [tm tme] (auth-attr c el path "tokenManager" "")
+        cfg-name (if (= (count (:config c)) 0) "" (:name (nth (:config c) 0)))
+        key (str (if (= tm "") cfg-name (str "tm:" tm)) "|" url "|" id)
+        e (first-err [ide sece ue sce ibe tme])]
+    (if (not= e "") (values (no-auth) e)
+      (values (->Auth "oauth" id sec true url sc (= (str/lower-case (str/trim inb)) "true") key) ""))))
+
+(defn- token-of Str [key: &Str]
+  (let [m (deref TOKENS)] (if (contains? m key) (get! m key) "")))
+
+(defn- forget-token Int [key: &Str]
+  (let [z (swap! TOKENS (fn Map(Str Str) [m: Map(Str Str)] (dissoc m (str key))))] 0))
+
+(defn- remember-token Int [key: &Str tok: &Str]
+  (let [z (swap! TOKENS (fn Map(Str Str) [m: Map(Str Str)] (assoc m (str key) (str tok))))] 0))
+
+(defn- wrapper-text Str [body: &Str]
+  (str "org.mule.service.http.netty.impl.message.ReactorNettyResponseWrapper@5e3c1a0b\n" body))
+
+(defn- fetch-token Values(Str Str) [a: &Auth]
+  (let [sc (if (= (:scopes a) "") "" (str "&scope=" (hr/url-encode (:scopes a))))
+        form (if (:inbody a)
+               (str "grant_type=client_credentials" sc "&client_id=" (hr/url-encode (:user a)) "&client_secret=" (hr/url-encode (:pass a)))
+               (str "grant_type=client_credentials" sc))
+        h0: Vec(hm/Header) [(hr/hpair "Content-Type" "application/x-www-form-urlencoded")]
+        hs (if (:inbody a) h0 (conj h0 (hr/hpair "Authorization" (basic-value a))))
+        o0 (assoc (http/request-opts (:url a)) :method "POST" :headers hs :body form :timeout-ms 10000)
+        o1 (if (str/starts-with? (str/lower-case (:url a)) "https://") (assoc o0 :tls (assoc (ctls/default-config) :alpn ["http/1.1"])) o0)
+        [resp err] (http/request o1)]
+    (cond
+      (not= err "") (values "" (str "Exception when calling token URL '" (:url a) "'."))
+      (>= (:status resp) 400)
+      (values "" (str "Error response when calling token URL '" (:url a) "'. Response was:\n" (wrapper-text (:body resp))))
+      :else
+      (let [[x pe] (reg/read-fmt "application/json" [] (:body resp))
+            t (if (not= pe "") "" (let [r (v/obj-get (hr/obj-fields x) "access_token")]
+                                     (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) s _ ""))))]
+        (if (= t "")
+          (values "" (str "Could not extract access token or refresh token from token URL '" (:url a) "'. Response was:\n" (wrapper-text (:body resp))))
+          (values t ""))))))
+
+(defn- oauth-token Values(Str Str) [a: &Auth fresh: Bool]
+  (let [z (if fresh (forget-token (:key a)) 0)
+        have (token-of (:key a))]
+    (if (not= have "") (values have "")
+      (let [[t e] (fetch-token a)
+            z2 (if (= e "") (remember-token (:key a) t) 0)]
+        (values t e)))))
+
+(defn- basic-value Str [a: &Auth] (str "Basic " (b64/encode (str (:user a) ":" (:pass a)))))
+
+(defn- digest-value Str [pairs: &Vec(Str)] (let [s (str/join "," pairs)] (subs s 0 (- (count s) 1))))
+
+(defn- q Str [k: &Str x: &Str] (str k "=\"" x "\""))
+
+(defn first-auth-header Vec(hm/Header) [hs: Vec(hm/Header) a: &Auth path: &Str]
+  (cond
+    (and (= (:kind a) "basic") (:preemptive a)) (conj hs (hr/hpair "Authorization" (basic-value a)))
+    (= (:kind a) "digest")
+    (conj hs (hr/hpair "Authorization" (str "Digest " (digest-value [(q "username" (:user a)) (q "realm" "null") (q "nonce" "null") (q "uri" path) (q "response" "null")]))))
+    :else hs))
+
+(defn- challenge-param Str [h: &Str k: &Str]
+  (let [l (str/lower-case h)
+        i (loop [from 0]
+            (let [j (str/index-of-after l (str k "=") from)]
+              (cond (< j 0) -1
+                    (or (= j 0) (let [b (nth l (- j 1))] (or (= b 32) (= b 44)))) j
+                    :else (recur (+ j 1)))))]
+    (if (< i 0) ""
+      (let [s (+ i (count k) 1)]
+        (if (and (< s (count h)) (= (nth h s) 34))
+          (let [e (str/index-of-after h "\"" (+ s 1))] (if (< e 0) (subs h (+ s 1) (count h)) (subs h (+ s 1) e)))
+          (let [e (loop [j s] (if (or (>= j (count h)) (= (nth h j) 44)) j (recur (+ j 1))))] (str/trim (subs h s e))))))))
+
+(defn- md5-hex Str [s: &Str] (let [[h ok] (lc/digest "MD5" s)] (hex h)))
+
+(defn- hex Str [b: &Str]
+  (let [d "0123456789abcdef"]
+    (loop [i 0 out ""]
+      (if (>= i (count b)) out
+        (let [x (nth b i)] (recur (+ i 1) (str out (subs d (quot x 16) (+ (quot x 16) 1)) (subs d (mod x 16) (+ (mod x 16) 1)))))))))
+
+(defn challenge-header Vec(Str) [resp: &hm/Resp rerr: &Str a: &Auth method: &Str path: &Str]
+  (if (or (not= rerr "") (not= (:status resp) 401) (= (:kind a) "")) []
+    (match (hm/header-of (:headers resp) "www-authenticate")
+      (None) []
+      (Some w) (let [scheme (str/lower-case (let [sp (str/index-of w " ")] (if (< sp 0) w (subs w 0 sp))))]
+      (cond
+        (and (= (:kind a) "basic") (not (:preemptive a)) (= scheme "basic")) [(basic-value a)]
+        (and (= (:kind a) "digest") (= scheme "digest"))
+        (let [realm (challenge-param w "realm") nonce (challenge-param w "nonce") qop0 (challenge-param w "qop")
+              opaque (challenge-param w "opaque")
+              qop (if (str/includes? (str/lower-case qop0) "auth") "auth" "")
+              ha1 (md5-hex (str (:user a) ":" realm ":" (:pass a)))
+              ha2 (md5-hex (str method ":" path))
+              resp-h (if (= qop "") (md5-hex (str ha1 ":" nonce ":" ha2))
+                       (md5-hex (str ha1 ":" nonce ":00000001:null:" qop ":" ha2)))
+              p0: Vec(Str) [(q "username" (:user a)) (q "realm" realm) (q "nonce" nonce) (q "uri" path) (q "response" resp-h)]
+              p1 (if (= opaque "") p0 (conj p0 (q "opaque" opaque)))
+              p2 (if (= qop "") p1 (conj (conj (conj p1 (q "qop" qop)) (q "nc" "00000001")) (q "cnonce" "null")))]
+          [(str "Digest " (digest-value p2))])
+        :else [])))))
+
+(defn swap-auth Vec(hm/Header) [hs: &Vec(hm/Header) v: &Str]
+  (let [has (loop [i 0] (if (>= i (count hs)) false (if (= (str/lower-case (:hd-name (nth hs i))) "authorization") true (recur (+ i 1)))))]
+    (loop [i 0 acc: Vec(hm/Header) []]
+      (if (>= i (count hs)) acc
+        (let [h (nth hs i) n (str/lower-case (:hd-name h))]
+          (cond
+            (= n "authorization") (recur (+ i 1) (conj acc (hr/hpair "Authorization" (str v))))
+            (and (not has) (= n "x-correlation-id")) (recur (+ i 1) (conj (conj acc (hr/hpair "Authorization" (str v))) h))
+            :else (recur (+ i 1) (conj acc h))))))))
+
+(def ERROR-PARENTS
+  [
+   "HTTP:SECURITY" "MULE:SECURITY"
+   "HTTP:CLIENT_SECURITY" "MULE:CLIENT_SECURITY"
+   "HTTP:SERVER_SECURITY" "MULE:SERVER_SECURITY"
+   "HTTP:TRANSFORMATION" "MULE:TRANSFORMATION"
+   "HTTP:CONNECTIVITY" "MULE:CONNECTIVITY"
+   "HTTP:BASIC_AUTHENTICATION" "HTTP:SERVER_SECURITY"
+   "HTTP:UNAUTHORIZED" "HTTP:CLIENT_SECURITY"
+   "HTTP:FORBIDDEN" "HTTP:CLIENT_SECURITY"])
+
+(def POLL-BINDINGS ["payload" "attributes" "item" "watermark"])
+(def POLL-WRAP "%dw 2.0\n---\n")
+(def HMARK (str (chr 0) "headers"))
+(def UMARK (str (chr 0) "uri-params"))
+(def QMARK (str (chr 0) "query-params"))
+(def BMARK (str (chr 0) "body"))
+
+(defn- empty-compiled Map(Str eng/Compiled) [] (let [m: Map(Str eng/Compiled) {}] m))
+(def POLL-CODE (atom (empty-compiled)))
+
+(defn- expr? Bool [s: &Str] (let [t (str/trim s)] (and (str/starts-with? t "#[") (str/ends-with? t "]"))))
+
+(defn- expr-script Str [s: &Str]
+  (let [t (str/trim s)
+        b (if (expr? t) (subs t 2 (- (count t) 1)) (str t))]
+    (if (or (str/starts-with? (str/trim b) "%dw") (str/includes? b "---")) b (str POLL-WRAP b))))
+
+(defn- poll-code Values(eng/Compiled Str) [s: &conn/SrcCall text: &Str]
+  (let [m (deref POLL-CODE)]
+    (if (contains? m text) (values (get! m text) "")
+      (let [res (:res s)
+            c (eng/compile-with (expr-script text) POLL-BINDINGS
+                                (fn Values(Str Bool) [mn: Str] (res (eng/module-path mn))))]
+        (if (not (eng/ok? c))
+          (values c (str "Invalid expression '" text "' at HTTP Polling Source - " (eng/render-first-error (expr-script text) c "anonymous")))
+          (let [z (swap! POLL-CODE (fn Map(Str eng/Compiled) [old: Map(Str eng/Compiled)] (assoc old (str text) c)))] (values c "")))))))
+
+(defn- poll-eval Values(v/Val Str) [s: &conn/SrcCall text: &Str ins: Vec(v/Val)]
+  (let [[c ce] (poll-code s text)]
+    (if (not= ce "") (values (v/null-v) ce)
+      (let [[x de] (eng/eval-compiled c ins)]
+        (if (dwe/ok? de) (values x "") (values (v/null-v) (:msg de)))))))
+
+(defn- poll-text Values(Str Str) [s: &conn/SrcCall text: &Str wm: &v/Val]
+  (if (not (expr? text)) (values (str text) "")
+    (let [[x e] (poll-eval s text [(v/null-v) (v/null-v) (v/null-v) wm])]
+      (if (not= e "") (values "" e) (values (hr/val-text x) "")))))
+
+(defn- kv-fields Values(Vec(v/Field) Str) [s: &conn/SrcCall group: &Str wm: &v/Val]
+  (let [g (hr/child-elem (:children s) group)]
+    (if (= (count g) 0) (values [] "")
+      (let [kids (xml/child-elems (nth g 0))]
+        (loop [i 0 acc: Vec(v/Field) []]
+          (if (>= i (count kids)) (values acc "")
+            (let [n (nth kids i)
+                  [k ke] (poll-text s (hr/attr-of n "key" "") wm)
+                  [x xe] (poll-text s (hr/attr-of n "value" "") wm)]
+              (cond (not= ke "") (values acc ke) (not= xe "") (values acc xe)
+                    :else (recur (+ i 1) (conj acc (v/field k (v/->VStr x))))))))))))
+
+(defn- poll-request Values(conn/OpResult Str) [s: &conn/SrcCall wm: &v/Val]
+  (let [ps (:params s)
+        [hs he] (kv-fields s "polling-request-headers" wm)
+        [us ue] (kv-fields s "polling-request-uri-params" wm)
+        [qs qe] (kv-fields s "polling-request-query-params" wm)
+        bn (hr/child-elem (:children s) "polling-request-body")
+        [bt be] (if (= (count bn) 0) (values "" "") (poll-text s (uni/java-trim (xml/text-content (nth bn 0))) wm))
+        first-err (cond (not= he "") he (not= ue "") ue (not= qe "") qe :else be)]
+    (if (not= first-err "") (values (conn/fail-result (err/mk "MULE" "EXPRESSION" first-err)) first-err)
+      (let [om (conn/param-lit ps "outputMimeType" "")
+            params0: Vec(m/Param) [(m/->Param "path" (m/->PLit (conn/param-lit ps "path" "/"))) (m/->Param "method" (m/->PLit (conn/param-lit ps "method" "GET")))]
+            params (if (= om "") params0 (conj params0 (m/->Param "outputMimeType" (m/->PLit om))))
+            exprs0: Vec(m/Param) [(m/->Param "headers" (m/->PLit HMARK)) (m/->Param "uri-params" (m/->PLit UMARK)) (m/->Param "query-params" (m/->PLit QMARK))]
+            exprs (if (= (count bn) 0) exprs0 (conj exprs0 (m/->Param "body" (m/->PLit BMARK))))
+            body-tv (ev/tv-val (v/->VStr bt) ev/ANY)
+            evf (fn Values(v/Val Str) [p: m/PVal e: ev/Event]
+                  (match p
+                    (m/PLit x) (cond (= x HMARK) (values (v/->VObj hs) "") (= x UMARK) (values (v/->VObj us) "")
+                                     (= x QMARK) (values (v/->VObj qs) "") :else (values (v/->VStr x) ""))
+                    _ (values (v/null-v) "")))
+            evt (fn Values(ev/TV Str) [p: m/PVal e: ev/Event]
+                  (match p
+                    (m/PLit x) (if (= x BMARK) (values body-tv "") (values (ev/tv-val (v/->VStr x) ev/ANY) ""))
+                    _ (values (ev/tv-null) "")))
+            no-flow (fn Values(ev/Event Vec(err/MErr) Bool) [n: Str e: ev/Event] (values e [] false))
+            call (conn/->OpCall "request" (:config s) params (:children s) exprs
+                                (ev/new-event (ev/tv-null) (ev/tv-null) (conn/corr-id 0) (:flow s))
+                                evf evt (:configs s) no-flow (:res s) (fn Str [u: Str] "") no-flow (conn/no-loc) (res/res-none))]
+        (values (run-request call) "")))))
+
+(defn- item-tv ev/TV [x: &v/Val mime: &Str]
+  (match (v/unmeta x)
+    (v/VStr t) (ev/tv-raw (str t) (str mime))
+    _ (let [[t we] (reg/write-script-output (reg/norm-mime mime) [] [] (v/unmeta x))]
+        (ev/tv-raw (if (dwe/ok? we) t "") (str mime)))))
+
+(defn- poll-items Values(Vec(rp/Item) Str) [s: &conn/SrcCall r: &conn/OpResult wmv: &v/Val]
+  (let [ps (:params s)
+        split (conn/param-lit ps "splitExpression" "")
+        wme (conn/param-lit ps "watermarkExpression" "")
+        ide (conn/param-lit ps "idExpression" "")
+        [pv ptv pe] (ev/value (:payload r))
+        [av atv ae] (ev/value (:attributes r))
+        [vals se] (if (= split "") (values [pv] "")
+                    (let [[x e] (poll-eval s split [pv av (v/null-v) wmv])]
+                      (if (not= e "") (values [] e)
+                        (match (v/unmeta x) (v/VArr xs) (values xs "") (v/VNull) (values [] "") _ (values [x] "")))))]
+    (if (not= se "") (values [] se)
+      (loop [i 0 acc: Vec(rp/Item) []]
+        (if (>= i (count vals)) (values acc "")
+          (let [it (nth vals i)
+                [w we] (if (= wme "") (values (v/null-v) "") (poll-eval s wme [pv av it wmv]))
+                [idv ie] (if (= ide "") (values (v/null-v) "") (poll-eval s ide [pv av it wmv]))]
+            (cond
+              (not= we "") (values acc we)
+              (not= ie "") (values acc ie)
+              :else
+              (recur (+ i 1) (conj acc (rp/->Item (if (= split "") ptv (item-tv it (:mime ptv))) atv
+                                                  (if (v/null? w) [] [(v/->VStr (hr/val-text w))]) (if (v/null? idv) "" (hr/val-text idv))))))))))))
+
+(defn- poll Values(Int Str) [s: conn/SrcCall]
+  (let [key (str (:flow s) " " (:name s))
+        wm (rp/watermark key)
+        wmv (if (= (count wm) 0) (v/null-v) (nth wm 0))
+        [r re] (poll-request s wmv)]
+    (cond
+      (not= re "") (values 0 re)
+      (> (count (:err r)) 0) (values 0 (:description (nth (:err r) 0)))
+      :else
+      (let [[items ie] (poll-items s r wmv)]
+        (if (not= ie "") (values 0 ie)
+          (values (rp/run-items key items (:dispatch s)) ""))))))
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "http" NS
+                         (fn conn/OpResult [c: conn/OpCall]
+                           (cond (= (:op c) "request") (run-request c)
+                                 (= (:op c) "load-static-resource") (hs/run c)
+                                 :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported operation http:" (:op c)))))))
+         :error-parents ERROR-PARENTS
+         :error-classes ["HTTP" "org.mule.extension.http.api.request.validator.ResponseValidatorTypedException"]
+         :sources ["polling-source"]
+         :poll (fn Values(Int Str) [s: conn/SrcCall] (poll s))
+         :raw-sources ["polling-source"]))

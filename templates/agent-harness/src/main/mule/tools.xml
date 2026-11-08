@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ツールの実装。
+  - tool-<名前> のフロー: tools/local-tools.dwl に書いたツール。payload は LLM が渡した引数 (JSON を読んだもの)。
+    結果は payload に置く (文字列でなければ JSON にして LLM に渡る)。
+  - MCP サーバー (Srv): 他のエージェントやクライアントにも出したいツール。エージェントは MCP クライアントで呼ぶ。
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+      xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
+      xmlns:wsc="http://www.mulesoft.org/schema/mule/wsc"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd
+        http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd
+        http://www.mulesoft.org/schema/mule/wsc http://www.mulesoft.org/schema/mule/wsc/current/mule-wsc.xsd">
+
+    <!-- 注文システム (SOAP の Web サービス。wsdl/orders.wsdl)。既定の宛先は mock-llm.xml の偽物 -->
+    <wsc:config name="Orders">
+        <wsc:connection wsdlLocation="wsdl/orders.wsdl" service="OrdersService" port="OrdersPort" address="${orders.url}"/>
+    </wsc:config>
+
+    <flow name="tool-lookup_order">
+        <!-- LLM が渡した引数を確かめる。失敗は run-tool (agent.xml) が "error: .." の結果にして LLM に返す -->
+        <validation:matches-regex value="#[payload.id default '']" regex="[A-Z][0-9]{3}" message="#['invalid order id: ' ++ (payload.id default '')]"/>
+        <!-- 注文システムに SOAP で問う。Fault (偽物では X999) は WSC:SOAP_FAULT になり、run-tool が "error: <faultstring>" にする -->
+        <wsc:consume config-ref="Orders" operation="getOrder">
+            <wsc:message>
+                <wsc:body>#[output application/xml ns o urn:example:orders --- {o#getOrder: {id: payload.id}}]</wsc:body>
+            </wsc:message>
+        </wsc:consume>
+        <set-payload value="#[do { var r = payload.body.getOrderResponse --- write({status: r.status, (eta: r.eta) if (r.eta != null)}, 'application/json', {indent: false}) }]"/>
+    </flow>
+
+    <mcp:server-config name="Srv" serverName="agent-tools" serverVersion="1.0.0">
+        <mcp:streamable-http-server-connection listenerConfig="Http" mcpEndpointPath="/mcp" responseContentType="JSON"/>
+    </mcp:server-config>
+
+    <flow name="mcp-add">
+        <mcp:tool-listener config-ref="Srv" name="add">
+            <mcp:description>Adds two numbers</mcp:description>
+            <mcp:parameters-schema><![CDATA[{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}]]></mcp:parameters-schema>
+            <mcp:responses><mcp:text-tool-response-content text="#[(payload.a + payload.b) as String]"/></mcp:responses>
+        </mcp:tool-listener>
+        <logger level="INFO" message="#['add ' ++ write(payload, 'application/json', {indent: false})]"/>
+    </flow>
+</mule>

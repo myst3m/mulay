@@ -1,0 +1,262 @@
+(ns regex-test (:require [mulay.lib.regex :as re] [clay.string :as cs]))
+
+;; Hand-written tests for the API surface. The JDK comparison is
+;; golden_test.clay (tools/gen-regex-golden.java).
+
+(defn- rx re/Pattern [p: Str]
+  (let [[r e] (re/compile p 0)] r))
+
+(defn- bytes Str [v: Vec(Int)] (loop [i 0 out ""] (if (>= i (count v)) out (recur (+ i 1) (str out (chr (nth v i)))))))
+
+(defn- aaa Str [n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out "a")))))
+
+(deftest search-basics
+  (let [p (rx "a(b+)c")
+        [ms e] (re/search p "xxabbbc abc" 0)
+        m (nth ms 0)
+        [ms2 e2] (re/search p "xxabbbc abc" 3)
+        [ms3 e3] (re/search p "xxabbbc abc" 99)
+        [ms4 e4] (re/search p "nothing" 0)]
+    (is (= e ""))
+    (is (= (count ms) 1))
+    (is (= (re/start m 0) 2))
+    (is (= (re/end m 0) 7))
+    (is (= (re/group m "xxabbbc abc" 1) "bbb"))
+    (is (= (re/groups m) 1))
+    (is (= (re/start m 5) -1))
+    (is (= (re/start (nth ms2 0) 0) 8))
+    (is (= (count ms3) 0))
+    (is (= (count ms4) 0))
+    (is (= e4 ""))))
+
+(deftest named-groups
+  (let [p (rx "(?<year>\\d{4})-(?<mon>\\d\\d)(?<day>-\\d\\d)?")
+        s "on 2024-05!"
+        [ms e] (re/search p s 0)
+        m (nth ms 0)]
+    (is (= (re/named m s "year") "2024"))
+    (is (= (re/named m s "mon") "05"))
+    (is (= (re/group-index m "mon") 2))
+    (is (= (re/group-index m "nope") -1))
+    (is (re/group-matched? m 2))
+    (is-refuted (re/group-matched? m 3))
+    (is (= (re/named m s "day") ""))
+    (is (= (re/group-count p) 3))))
+
+(deftest g-anchor-at-start
+  (let [p (rx "\\Gab")
+        [ms e] (re/search p "xxab" 2)
+        [ms2 e2] (re/search p "xxab" 0)
+        [all e3] (re/find-all p "ababxab")]
+    (is (= (re/start (nth ms 0) 0) 2))
+    (is (= (count ms2) 0))
+    (is (= (count all) 2))))
+
+(deftest byte-offsets-over-utf8
+  (let [p (rx ".")
+        [ms e] (re/find-all p "a日😀")]
+    (is (= (count ms) 3))
+    (is (= (re/start (nth ms 1) 0) 1))
+    (is (= (re/end (nth ms 1) 0) 4))
+    (is (= (re/end (nth ms 2) 0) 8))))
+
+(deftest malformed-input-reads-as-replacement-char
+  (let [s (bytes [0x61 0xFF 0xE2 0x82 0x62])
+        [ms e] (re/find-all (rx ".") s)
+        [ms2 e2] (re/find-all (rx "\\x{FFFD}") s)]
+    (is (= (count ms) 4))
+    (is (= (re/start (nth ms 2) 0) 2))
+    (is (= (re/end (nth ms 2) 0) 4))
+    (is (= (count ms2) 2))))
+
+(deftest step-limit
+  ;; (a+)+b backtracks exponentially on a run of a's without b
+  (let [p (re/with-limit (rx "(a+)+b") 100000)
+        [ms e] (re/search p (aaa 40) 0)
+        [ok e2] (re/matches? p (str (aaa 40) "b"))
+        [r e3] (re/replace-all p (aaa 30) "x")
+        [v e4] (re/split p (aaa 30) 0)
+        [b e5] (re/matches? (rx "(a|aa)+c") (aaa 60))]
+    (is (= (count ms) 0))
+    (is (cs/starts-with? e "regex step limit exceeded"))
+    (is ok)
+    (is (= e2 ""))
+    (is (not= e3 ""))
+    (is (not= e4 ""))
+    (is (not= e5 ""))
+    (is-refuted b)))
+
+(deftest atomic-avoids-blowup
+  (let [p (re/with-limit (rx "(?>a+)+b") 100000)
+        [ms e] (re/search p (aaa 40) 0)
+        ;; a++b over a's is quadratic under find (as on the JVM): the default limit covers it
+        [ms2 e2] (re/search (rx "a++b") (aaa 5000) 0)]
+    (is (= e ""))
+    (is (= (count ms) 0))
+    (is (= e2 ""))))
+
+(deftest large-input
+  ;; the budget grows with the input, so linear work on big text is fine
+  (let [big (loop [i 0 out ""] (if (>= i 20000) out (recur (+ i 1) (str out "word" i " "))))
+        [ms e] (re/find-all (rx "\\w+") big)
+        [v e2] (re/split (rx "\\s+") big 0)
+        [r e3] (re/replace-all (rx "(\\d+)") big "<$1>")]
+    (is (= e ""))
+    (is (= (count ms) 20000))
+    (is (= (count v) 20000))
+    (is (= e3 ""))
+    (is (cs/starts-with? r "word<0> word<1> "))))
+
+(deftest long-greedy-dot-star
+  (let [big (str (aaa 200000) "END")
+        [ms e] (re/search (rx ".*END") big 0)
+        [ms2 e2] (re/search (rx "(?s).*?END") big 0)]
+    (is (= e ""))
+    (is (= (re/end (nth ms 0) 0) 200003))
+    (is (= (re/end (nth ms2 0) 0) 200003))))
+
+(deftest syntax-errors
+  (let [[p e] (re/compile "a(b" 0)
+        [p2 e2] (re/compile "x**" 0)
+        [p3 e3] (re/compile "[z-a]" 0)
+        [p4 e4] (re/compile "a" re/CANON-EQ)
+        [p5 e5] (re/compile "\\X" 0)]
+    (is (= e "Unclosed group near index 3\na(b"))
+    (is (= e2 "Dangling meta character '*' near index 2\nx**\n  ^"))
+    (is (= e3 "Illegal character range near index 3\n[z-a]\n   ^"))
+    (is (= e4 "CANON_EQ is not supported"))
+    (is (cs/starts-with? e5 "\\X is not supported"))))
+
+(deftest flags-api
+  (let [[p e] (re/compile "hello world" (bit-or re/CASE-INSENSITIVE re/COMMENTS))
+        [ok e2] (re/matches? p "HELLOWORLD")
+        [q e3] (re/compile "a.b" re/LITERAL)
+        [ok2 e4] (re/matches? q "a.b")
+        [ok3 e5] (re/matches? q "axb")]
+    (is ok)
+    (is ok2)
+    (is-refuted ok3)
+    (is (= (re/flags q) re/LITERAL))
+    (is (= (re/source q) "a.b"))))
+
+(deftest looking-at
+  (let [p (rx "\\d+")
+        [a e] (re/looking-at? p "123abc")
+        [b e2] (re/looking-at? p "abc123")
+        [ms e3] (re/looking-at p "42x")
+        [c e4] (re/matches? p "42x")]
+    (is a)
+    (is-refuted b)
+    (is (= (re/end (nth ms 0) 0) 2))
+    (is-refuted c)))
+
+(deftest replacement-rules
+  (let [p (rx "(\\w+)@(\\w+)")
+        [r e] (re/replace-all p "a@b c@d" "$2.$1")
+        [r2 e2] (re/replace-first p "a@b c@d" "[$0]")
+        [r3 e3] (re/replace-all p "a@b" "\\$1")
+        [r4 e4] (re/replace-all p "a@b" "$3")
+        [r5 e5] (re/replace-all p "none" "$3")
+        [r6 e6] (re/replace-all (rx "x*") "abc" "-")]
+    (is (= r "b.a d.c"))
+    (is (= r2 "[a@b] c@d"))
+    (is (= r3 "$1"))
+    (is (= e4 "No group 3"))
+    (is (= e5 ""))
+    (is (= r5 "none"))
+    (is (= r6 "-a-b-c-"))))
+
+(deftest split-rules
+  (let [p (rx ",")
+        [a e] (re/split p "a,b,,c,," 0)
+        [b e2] (re/split p "a,b,,c,," -1)
+        [c e3] (re/split p "a,b,,c,," 2)
+        [d e4] (re/split (rx "") "abc" 0)
+        [f e5] (re/split p "" 0)]
+    (is (= (count a) 4))
+    (is (= (count b) 6))
+    (is (= (count c) 2))
+    (is (= (nth c 1) "b,,c,,"))
+    (is (= (count d) 3))
+    (is (= (count f) 1))
+    (is (= (nth f 0) ""))))
+
+(deftest quoting
+  (let [q (re/quote-pattern "a.b\\Ec*")
+        [p e] (re/compile q 0)
+        [ok e2] (re/matches? p "a.b\\Ec*")
+        [ok2 e3] (re/matches? p "aXb\\Ec")
+        rq (re/quote-replacement "$1\\x")
+        [r e4] (re/replace-all (rx "z") "z" rq)]
+    (is (= q "\\Qa.b\\E\\\\E\\Qc*\\E"))
+    (is (= e ""))
+    (is ok)
+    (is-refuted ok2)
+    (is (= rq "\\$1\\\\x"))
+    (is (= r "$1\\x"))))
+
+(deftest lookbehind-wrapped-max
+  ;; (?<=\w+.) has a maximum of MAX_REPS + 1, which wraps in the JDK; the JVM
+  ;; then scans back to the start, and so do we.
+  (let [[ms e] (re/find-all (rx "(?<=\\w+.)x") "ab-x yzx")
+        [ms2 e2] (re/find-all (rx "(?<=a+b+)c") "aabbc")]
+    (is (= (count ms) 2))
+    (is (= (count ms2) 0))))
+
+(deftest empty-and-anchors
+  (let [[ms e] (re/find-all (rx "") "ab")
+        [ms2 e2] (re/find-all (rx "^") "")
+        [ms3 e3] (re/find-all (rx "(?m)^") "")]
+    (is (= (count ms) 3))
+    (is (= (count ms2) 1))
+    (is (= (count ms3) 0))))
+
+(deftest stack-limit
+  ;; (a|b)* pushes backtrack records for every iteration; the stack has a cap
+  ;; (the JVM recurses and throws StackOverflowError at about 10,000 here)
+  (let [[ms e] (re/search (rx "(a|b)*x") (aaa 1000000) 0)
+        [ms2 e2] (re/search (rx "(a|b)*x") (str (aaa 10000) "x") 0)]
+    (is (= (count ms) 0))
+    (is (cs/starts-with? e "regex backtracking stack limit exceeded (1000000 entries)"))
+    (is (= e2 ""))
+    (is (= (count ms2) 1))))
+
+(deftest budget-per-call
+  ;; find-all / split / replace-all share one budget across their searches:
+  ;; a(?=a*$) costs O(n) per match, O(n^2) in all
+  (let [p (re/with-limit (rx "a(?=a*$)") 1000)
+        [ms e] (re/find-all p (aaa 3000))
+        [v e2] (re/split p (aaa 3000) 0)
+        [r e3] (re/replace-all p (aaa 3000) "b")
+        [ms4 e4] (re/find-all (re/with-limit (rx "a") 1000) (aaa 3000))]
+    (is (cs/starts-with? e "regex step limit exceeded"))
+    (is (cs/starts-with? e2 "regex step limit exceeded"))
+    (is (cs/starts-with? e3 "regex step limit exceeded"))
+    (is (= e4 ""))
+    (is (= (count ms4) 3000))))
+
+(defn- rep Str [s: Str n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out s)))))
+
+;; 外から来た長い選択肢の並び (a|a|..) と深い括弧の入れ子は、C のスタックを溢れさせずにコンパイルするか失敗する
+(deftest long-alternation-and-deep-nesting
+  (let [alts (str (rep "a|" 59999) "b")
+        [p e] (re/compile alts 0)
+        [m1 me1] (re/matches? p "b")
+        [m2 me2] (re/matches? p "c")
+        ok (str (rep "(" 1000) "a" (rep ")" 1000))
+        [q qe] (re/compile ok 0)
+        [m3 me3] (re/matches? q "a")
+        deep (str (rep "(" 100000) "a" (rep ")" 100000))
+        [r re2] (re/compile deep 0)
+        cls (str "[" (rep "(" 5000) "]")
+        [s se] (re/compile cls 0)
+        esc (str (rep "\\(" 5000))
+        [t te] (re/compile esc 0)]
+    (is (= e ""))
+    (is m1)
+    (is (not m2))
+    (is (= qe ""))
+    (is m3)
+    (is (cs/starts-with? re2 "Pattern is nested too deeply (the limit is 1000 levels)"))
+    (is (= se ""))
+    (is (= te ""))))

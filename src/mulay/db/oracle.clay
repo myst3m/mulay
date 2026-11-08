@@ -1,0 +1,672 @@
+(ns mulay.db.oracle
+  (:require [mulay.db.sql :as sql] [mulay.db.orawire :as w] [mulay.db.oraproto :as op] [mulay.db.oranum :as on]
+            [mulay.db.ora_sqlstate :as ss] [mulay.lib.crypto :as cr] [mulay.lib.osinfo :as osi]
+            [mulay.lib.time.tz :as tz] [mulay.lib.time.types :as tt] [mulay.lib.dec :as dec]
+            [clay.net :as net] [clay.string :as str] [clay.charset :as ccs]))
+
+(def OPT-PARSE-EXEC 33)
+
+(defrecord Conn [sock: net/Sock sdu: Int fv: Int eor: Bool seq: Int combo: Str closing: Vec(Int) autocommit: Bool opts: Int wr: Atom(Int)])
+
+(defn- sock net/Sock [c: &Conn] (:sock c))
+
+(defn- with-seq Conn [c: &Conn seq: Int closing: Vec(Int)]
+  (->Conn (:sock c) (:sdu c) (:fv c) (:eor c) seq (:combo c) closing (:autocommit c) (:opts c) (:wr c)))
+
+(defn with-autocommit Conn [c: &Conn on: Bool]
+  (->Conn (:sock c) (:sdu c) (:fv c) (:eor c) (:seq c) (:combo c) (:closing c) on (:opts c) (:wr c)))
+
+(defn- next-seq Int [s: Int] (if (>= s 255) 1 (+ s 1)))
+
+(defn- conn-err sql/DbErr [msg: &Str] (sql/->DbErr (str msg) "08006" 17002 "java.sql.SQLRecoverableException"))
+
+(defn- ora-code Str [n: Int] (let [s (str n)] (if (< (count s) 5) (str (subs "00000" 0 (- 5 (count s))) s) s)))
+
+(defn ora-state Values(Str Str) [n: Int]
+  (loop [i 0]
+    (if (>= i (count ss/RANGES)) (values (nth ss/DEFAULT 0) (nth ss/DEFAULT 1))
+      (let [r (nth ss/RANGES i)
+            [lo e1] (parse-long (nth r 0))
+            [hi e2] (parse-long (nth r 1))]
+        (if (and (>= n lo) (<= n hi)) (values (nth r 2) (nth r 3)) (recur (+ i 1)))))))
+
+(defn ora-message Str [num: Int text: &Str]
+  (let [t (loop [k (count text)] (if (and (> k 0) (or (= (nth text (- k 1)) 10) (= (nth text (- k 1)) 13))) (recur (- k 1)) (subs text 0 k)))]
+    (str t "\n\nhttps://docs.oracle.com/error-help/db/ora-" (ora-code num) "/")))
+
+(defn- ora-err sql/DbErr [num: Int text: &Str]
+  (let [[state exc] (ora-state num)] (sql/->DbErr (ora-message num text) state num exc)))
+
+(def WR-FREE 0)
+(def WR-MAIN 1)
+(def WR-CANCEL 2)
+
+(defn- take-wr Int [wr: &Atom(Int) who: Int]
+  (loop [] (if (= (swap! wr (fn Int [x: Int] (if (= x WR-FREE) who x))) who) 0 (let [z (sleep-ms 1)] (recur)))))
+
+(defn- send Str [c: &Conn data: &Str]
+  (let [z (take-wr (:wr c) WR-MAIN) e (net/write (sock c) data) z2 (reset! (:wr c) WR-FREE)] e))
+
+(def OPT-URGENT 1024)
+(def OPT-NO-ATTN-MARKER 2048)
+
+(defn cancel Str [c: &Conn]
+  (let [z (take-wr (:wr c) WR-CANCEL)
+        o (:opts c)
+        e (if (= (bit-and o OPT-URGENT) 0) (net/write (sock c) (w/marker 1 3))
+            (let [e1 (net/write-urgent (sock c) "!")]
+              (if (or (not= e1 "") (not= (bit-and o OPT-NO-ATTN-MARKER) 0)) e1 (net/write (sock c) (w/marker 2 3)))))
+        z2 (reset! (:wr c) WR-FREE)]
+    e))
+
+(defn- read-packet Values(Str Str Str) [s: net/Sock pending: Str large: Bool]
+  (loop [buf pending]
+    (let [[pk rest st] (w/take-packet buf large)]
+      (cond
+       (= st 0) (values pk rest "")
+       (= st 2) (values "" "" "malformed packet from the server")
+       :else
+        (let [[chunk e] (net/read s 65536)]
+          (cond (not= e "") (values "" "" e)
+                (= (count chunk) 0) (values "" "" "connection closed by the server")
+                :else (recur (str rest chunk))))))))
+
+(defn- reset-after-marker Values(Str Str) [c: &Conn got: &Str pending: Str]
+  (let [e (send c (w/marker 1 2))]
+    (cond (not= e "") (values "" e)
+          (w/marker-reset? got) (values pending "")
+          :else
+          (loop [pend pending]
+            (let [[pk rest re] (read-packet (sock c) pend true)]
+              (cond (not= re "") (values "" re)
+                    (and (= (w/packet-type pk) w/T-MARKER) (w/marker-reset? pk)) (values rest "")
+                    :else (recur rest)))))))
+
+(defn- call Values(op/Resp Str) [c: &Conn payload: &Str ctx: &op/Ctx]
+  (let [e (send c (w/data-packets payload (:sdu c) true (:eor c)))]
+    (if (not= e "") (values (op/new-resp (:fv c) []) e)
+      (loop [pend "" body ""]
+        (let [[pk rest re] (read-packet (sock c) pend true)]
+          (if (not= re "") (values (op/new-resp (:fv c) []) re)
+            (let [t (w/packet-type pk)]
+              (cond
+                (= t w/T-MARKER) (let [[rest2 me] (reset-after-marker c pk rest)]
+                                   (if (not= me "") (values (op/new-resp (:fv c) []) me) (recur rest2 "")))
+                (= t w/T-CONTROL) (recur rest body)
+                (not= t w/T-DATA) (values (op/new-resp (:fv c) []) (str "unexpected packet type " t))
+                (not= (bit-and (w/data-flags pk) 64) 0) (values (op/new-resp (:fv c) []) "connection closed by the server")
+                (and (:eor c) (= (bit-and (w/data-flags pk) 8192) 0)) (recur rest (str body (w/data-payload pk)))
+                :else
+                (let [b2 (str body (w/data-payload pk))
+                      [r p] (op/parse b2 ctx)]
+                  (cond
+                    (= p w/SHORT) (recur rest b2)
+                    (< p 0) (values r "malformed response from the server")
+                    (:done r) (values r "")
+                    :else (recur rest b2)))))))))))
+
+(defn- hexd Int [c: Int] (cond (<= c 57) (- c 48) (>= c 97) (- c 87) :else (- c 55)))
+
+(defn- unhex Str [h: &Str]
+  (loop [i 0 out ""] (if (>= (+ i 1) (count h)) out (recur (+ i 2) (str out (chr (+ (* 16 (hexd (nth h i))) (hexd (nth h (+ i 1))))))))))
+
+(defn- hex-upper Str [b: &Str]
+  (let [d "0123456789ABCDEF"]
+    (loop [i 0 out ""]
+      (if (>= i (count b)) out
+        (let [x (nth b i)] (recur (+ i 1) (str out (subs d (bit-shift-right x 4) (+ (bit-shift-right x 4) 1)) (subs d (bit-and x 15) (+ (bit-and x 15) 1)))))))))
+
+(defn- param Str [ps: &Vec(Str) key: &Str]
+  (loop [i 0] (if (>= (+ i 1) (count ps)) "" (if (= (nth ps i) key) (nth ps (+ i 1)) (recur (+ i 2))))))
+
+(defn- iv0 Str [] (loop [i 0 o ""] (if (>= i 16) o (recur (+ i 1) (str o (chr 0))))))
+
+(defn- enc-pad Str [key: &Str data: &Str]
+  (let [n (- 16 (mod (count data) 16))
+        padded (loop [i 0 o (str data)] (if (>= i n) o (recur (+ i 1) (str o (chr n)))))
+        [x ok] (cr/aes-cbc true key (iv0) padded)]
+    x))
+
+(defn- dec-raw Str [key: &Str data: &Str] (let [[x ok] (cr/aes-cbc false key (iv0) data)] x))
+
+(defn- xor-str Str [a: &Str b: &Str]
+  (loop [i 0 o ""] (if (>= i (count a)) o (recur (+ i 1) (str o (chr (bit-xor (nth a i) (nth b i))))))))
+
+(defn verifier Values(Vec(Vec(Str)) Str Str) [ps: &Vec(Str) vfr: Int password: &Str]
+  (let [v (unhex (param ps "AUTH_VFR_DATA"))
+        sk (unhex (param ps "AUTH_SESSKEY"))
+        is12c (= vfr 18453)
+        is11g (or (= vfr 45394) (= vfr 6949))]
+    (cond
+      (not (or is12c is11g)) (values [] "" (str "unsupported password verifier type " vfr))
+      (not (or (= (count sk) 32) (= (count sk) 48))) (values [] "" "malformed AUTH_SESSKEY from the server")
+      :else
+      (let [[vgen ve] (if is12c (pbkdf2-count (param ps "AUTH_PBKDF2_VGEN_COUNT")) (values 0 ""))
+            [sder se] (if (and is12c (= (count sk) 32)) (pbkdf2-count (param ps "AUTH_PBKDF2_SDER_COUNT")) (values 0 ""))
+            [pkey ok1] (if (and is12c (= ve "") (= se "")) (cr/pbkdf2 "SHA512" password (str v "AUTH_PBKDF2_SPEEDY_KEY") vgen 64) (values "" (not is12c)))
+            phash (if is12c
+                    (let [[h ok] (cr/digest "SHA512" (str pkey v))] (subs h 0 32))
+                    (let [[h ok] (cr/digest "SHA1" (str password v))] (str h (chr 0) (chr 0) (chr 0) (chr 0))))
+            a (dec-raw phash sk)]
+        (cond
+          (not= ve "") (values [] "" ve)
+          (not= se "") (values [] "" se)
+          (or (not ok1) (not= (count a) (count sk))) (values [] "" "password key derivation failed")
+          :else
+          (let [[b bok] (cr/random-bytes (count a))
+                [r1 r1ok] (cr/random-bytes 16)
+                [r2 r2ok] (cr/random-bytes 16)
+                rok (and bok r1ok r2ok)
+                bb (if rok b (str a))
+                enc-b (hex-upper (enc-pad phash bb))
+                sesskey (subs enc-b 0 (if (= (count a) 32) 64 96))
+                combo (if (= (count a) 48)
+                        (let [x (xor-str (subs a 16 40) (subs bb 16 40))
+                              [m1 o1] (cr/digest "MD5" (subs x 0 16))
+                              [m2 o2] (cr/digest "MD5" (subs x 16 24))]
+                          (subs (str m1 m2) 0 24))
+                        (let [[k ok] (cr/pbkdf2 "SHA512" (hex-upper (str (subs bb 0 32) (subs a 0 32))) (unhex (param ps "AUTH_PBKDF2_CSK_SALT")) sder 32)]
+                          (if ok k "")))]
+            (cond
+              (not rok) (values [] "" "no random bytes for the session key (RAND_bytes failed)")
+              (= (count combo) 0) (values [] "" "password key derivation failed")
+              :else
+              (let [speedy (if is12c (subs (hex-upper (enc-pad combo (str r1 pkey))) 0 160) "")
+                    enc-pw (hex-upper (enc-pad combo (str r2 password)))
+                    zone (tt/zone-id (tz/system-zone))
+                    alter (str "ALTER SESSION SET TIME_ZONE='" zone "'" (chr 0))
+                    base [["AUTH_SESSKEY" sesskey "1"]]
+                    with-speedy (if is12c (conj base ["AUTH_PBKDF2_SPEEDY_KEY" speedy "0"]) base)
+                    pairs (conj (conj (conj (conj (conj with-speedy ["AUTH_PASSWORD" enc-pw "0"])
+                                                        ["SESSION_CLIENT_CHARSET" "873" "0"])
+                                                  ["SESSION_CLIENT_DRIVER_NAME" "mulay : 0.1" "0"])
+                                            ["SESSION_CLIENT_VERSION" "385875968" "0"])
+                                ["AUTH_ALTER_SESSION" alter "1"])]
+                (values pairs combo "")))))))))
+
+(defn- server-ok? Bool [ps: &Vec(Str) combo: &Str]
+  (let [r (param ps "AUTH_SVR_RESPONSE")]
+    (if (= r "") false
+      (let [d (dec-raw combo (unhex r))] (and (>= (count d) 32) (= (subs d 16 32) "SERVER_TO_CLIENT"))))))
+
+(defn- refuse-err sql/DbErr [text: &Str service: &Str host: &Str port: Int]
+  (let [i (str/index-of text "(ERR=")
+        code (if (< i 0) "" (let [e (str/index-of-after text ")" i)] (if (< e 0) "" (subs text (+ i 5) e))))]
+    (cond
+      (= code "12514") (conn-err (str "ORA-12514: Cannot connect to database. Service " service " is not registered with the listener at host " host " port " port ". (CONNECTION_ID=)"))
+      (= code "12505") (conn-err (str "ORA-12505: Cannot connect to database. SID " service " is not registered with the listener at host " host " port " port ". (CONNECTION_ID=)"))
+      :else (conn-err (str "Listener refused the connection with the following error:\nORA-" code)))))
+
+(defn- descriptor Str [host: &Str port: Int service: &Str sid: &Str]
+  (str "(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=" host ")(PORT=" port "))(CONNECT_DATA="
+       (if (= sid "") (str "(SERVICE_NAME=" service ")") (str "(SID=" sid ")"))
+       "(CID=(PROGRAM=mulay)(HOST=" (osi/uname-nodename) ")(USER=" (osi/user-name) "))))"))
+
+(defn- open-conn Values(Conn sql/DbErr) [host: &Str port: Int service: &Str sid: &Str user: &Str password: &Str]
+  (let [wr (atom WR-FREE)
+        none (->Conn (net/no-sock) 8192 24 false 1 "" [] true 0 wr)
+        [s ce] (net/connect host port)]
+    (if (not= ce "") (values none (conn-err (str "IO Error: The Network Adapter could not establish the connection (" ce ")")))
+      (let [c0 (->Conn s 8192 24 false 1 "" [] true 0 wr)
+            pk0 (op/connect-packets (descriptor host port service sid))
+            e0 (send c0 pk0)
+            [pk rest re] (if (= e0 "") (read-packet s "" false) (values "" "" e0))
+            pt (if (= re "") (w/packet-type pk) 0)
+            [pk2 re2] (if (= pt w/T-RESEND)
+                        (let [e1 (send c0 pk0) [p2 r2 x2] (if (= e1 "") (read-packet s "" false) (values "" "" e1))] (values p2 x2))
+                        (values pk re))
+            pt2 (if (= re2 "") (w/packet-type pk2) 0)]
+        (cond
+          (not= re2 "") (let [z (net/close s)] (values none (conn-err (str "IO Error: " re2))))
+          (= pt2 w/T-REFUSE) (let [z (net/close s)] (values none (refuse-err (op/refuse-text pk2) (if (= sid "") service sid) host port)))
+          (= pt2 w/T-REDIRECT) (let [z (net/close s)] (values none (conn-err "IO Error: the listener redirected the connection (not supported)")))
+          (not= pt2 w/T-ACCEPT) (let [z (net/close s)] (values none (conn-err (str "IO Error: unexpected packet type " pt2))))
+          :else
+          (let [[ver sdu fl2 ae] (op/parse-accept pk2)
+                opts (op/accept-options pk2)
+                eor (and (>= ver 319) (not= (bit-and fl2 33554432) 0))
+                fast (not= (bit-and fl2 268435456) 0)
+                oob (if (and (= ae "") fast (not= (bit-and fl2 1) 0))
+                      (let [u (net/write-urgent s "!")] (send c0 (w/marker 2 3)))
+                      "")]
+            (cond
+              (not= ae "") (let [z (net/close s)] (values none (conn-err ae)))
+              (not fast) (let [z (net/close s)] (values none (conn-err (str "server protocol version " ver " without fast authentication is not supported yet (Oracle 23ai or later is required)"))))
+              (not= oob "") (let [z (net/close s)] (values none (conn-err (str "IO Error: " oob))))
+              :else
+              (let [c1 (->Conn (:sock c0) sdu 24 eor 2 "" [] true opts wr)
+                    [r1 e1] (call c1 (op/fast-auth user "mulay" (osi/uname-nodename) (str (osi/pid)) (osi/user-name) eor)
+                                  (op/->Ctx 13 true 0 [] [] 0 [] false))]
+                (cond
+                  (not= e1 "") (let [z (net/close s)] (values none (conn-err (str "IO Error: " e1))))
+                  (not= (:errnum r1) 0) (let [z (net/close s)] (values none (ora-err (:errnum r1) (:errmsg r1))))
+                  :else
+                  (let [fv (:fv r1)
+                        [pairs combo ve] (verifier (:params r1) (:vfr r1) password)]
+                    (if (not= ve "") (let [z (net/close s)] (values none (conn-err ve)))
+                      (let [c2 (->Conn (:sock c0) sdu fv eor 2 combo [] true opts wr)
+                            [r2 e2] (call c2 (op/auth2 2 fv user pairs) (op/->Ctx fv eor 0 [] [] 0 [] false))]
+                        (cond
+                          (not= e2 "") (let [z (net/close s)] (values none (conn-err (str "IO Error: " e2))))
+                          (not= (:errnum r2) 0) (let [z (net/close s)] (values none (ora-err (:errnum r2) (:errmsg r2))))
+                          (not (server-ok? (:params r2) combo)) (let [z (net/close s)] (values none (conn-err "invalid server response during authentication")))
+                          :else (values (->Conn (:sock c0) sdu fv eor 3 combo [] true opts wr) (sql/ok-err)))))))))))))))
+
+(defn open Values(Vec(Conn) sql/DbErr) [host: &Str port: Int service: &Str sid: &Str user: &Str password: &Str]
+  (let [[c e] (open-conn host port service sid user password)]
+    (if (sql/ok? e) (values [c] e) (values [] e))))
+
+(defn close Int [c: &Conn]
+  (let [[r e] (call c (op/simple (:seq c) (:fv c) op/FN-LOGOFF) (op/->Ctx (:fv c) (:eor c) 1 [] [] 0 [] false))
+        z (send c (w/packet w/T-DATA 0 (w/w16 "" 64) true))]
+    (net/close (sock c))))
+
+(defn finish Values(Conn sql/DbErr) [c: &Conn commit: Bool]
+  (let [seq (:seq c)
+        [r e] (call c (op/simple seq (:fv c) (if commit op/FN-COMMIT op/FN-ROLLBACK)) (op/->Ctx (:fv c) (:eor c) 1 [] [] 0 [] false))
+        c2 (with-seq c (next-seq seq) (:closing c))]
+    (cond (not= e "") (values c2 (conn-err (str "IO Error: " e)))
+          (not= (:errnum r) 0) (values c2 (ora-err (:errnum r) (:errmsg r)))
+          :else (values c2 (sql/ok-err)))))
+
+(def MAX-PBKDF2-COUNT 10000000)
+
+(defn pbkdf2-count Values(Int Str) [s: &Str]
+  (let [[n e] (parse-long s)]
+    (if (or (not= e "") (< n 1) (> n MAX-PBKDF2-COUNT)) (values 0 (str "the server's PBKDF2 iteration count is out of range: " s))
+      (values n ""))))
+
+(defn parse-url Values(Str Int Str Str Str) [u: &Str]
+  (let [s0 (if (str/starts-with? u "@") (subs u 1 (count u)) (str u))
+        s (if (str/starts-with? (str/lower-case s0) "tcp://") (subs s0 6 (count s0)) s0)
+        s2 (if (str/starts-with? s "//") (subs s 2 (count s)) s)
+        sl (str/index-of s2 "/")
+        hostport (if (< sl 0) s2 (subs s2 0 sl))
+        service (if (< sl 0) "" (subs s2 (+ sl 1) (count s2)))
+        c1 (str/index-of hostport ":")
+        host (if (< c1 0) hostport (subs hostport 0 c1))
+        rest (if (< c1 0) "" (subs hostport (+ c1 1) (count hostport)))
+        c2 (str/index-of rest ":")
+        port-s (if (< c2 0) rest (subs rest 0 c2))
+        sid (if (< c2 0) "" (subs rest (+ c2 1) (count rest)))
+        [port pe] (if (= port-s "") (values 1521 "") (parse-long port-s))]
+    (cond
+      (str/starts-with? s "(") (values "" 0 "" "" "Connect descriptors in the URL are not supported yet")
+      (str/starts-with? (str/lower-case s) "tcps://") (values "" 0 "" "" (str "TCPS is not supported yet (jdbc:oracle:thin:" u ")"))
+      (str/includes? s "://") (values "" 0 "" "" (str "Invalid Oracle URL: jdbc:oracle:thin:" u))
+      (or (= host "") (not= pe "") (< port 1) (> port 65535)) (values "" 0 "" "" (str "Invalid Oracle URL: jdbc:oracle:thin:" u))
+      :else (values host port service sid ""))))
+
+(defn batch-check sql/DbErr [parts: &Vec(Str)]
+  (loop [i 0]
+    (if (>= i (count parts)) (sql/ok-err)
+      (if (= (stmt-kind (nth parts i)) "query")
+        (let [[state exc] (ora-state 17080)]
+          (sql/->DbErr (str "ORA-17080: Invalid batch command: invalid SELECT batch command at index " i "\nhttps://docs.oracle.com/error-help/db/ora-17080/") state 17080 exc))
+        (recur (+ i 1))))))
+
+(defn number-params Str [s: &Str]
+  (let [n (count s)]
+    (loop [i 0 k 1 out ""]
+      (if (>= i n) out
+        (let [c (nth s i)]
+          (cond
+            (or (= c 39) (= c 34))
+            (let [e (str/index-of-after s (subs s i (+ i 1)) (+ i 1)) j (if (< e 0) n (+ e 1))] (recur j k (str out (subs s i j))))
+            (and (= c 45) (< (+ i 1) n) (= (nth s (+ i 1)) 45))
+            (let [e (str/index-of-after s "\n" i) j (if (< e 0) n e)] (recur j k (str out (subs s i j))))
+            (and (= c 47) (< (+ i 1) n) (= (nth s (+ i 1)) 42))
+            (let [e (str/index-of-after s "*/" (+ i 2)) j (if (< e 0) n (+ e 2))] (recur j k (str out (subs s i j))))
+            (= c 63) (recur (+ i 1) (+ k 1) (str out ":" k))
+            :else (recur (+ i 1) k (str out (subs s i (+ i 1))))))))))
+
+(defn insert-table Str [sql0: &Str]
+  (let [s (str/trim sql0)
+        u (str/upper-case s)]
+    (if (not (str/starts-with? u "INSERT")) ""
+      (let [into (str/index-of u "INTO")
+            start (if (< into 0) -1 (loop [i (+ into 4)] (if (and (< i (count s)) (<= (nth s i) 32)) (recur (+ i 1)) i)))]
+        (if (< start 0) ""
+          (loop [i start q false]
+            (if (>= i (count s)) (subs s start i)
+              (let [c (nth s i)]
+                (cond (= c 34) (recur (+ i 1) (not q))
+                      (and (not q) (or (<= c 32) (= c 40))) (subs s start i)
+                      :else (recur (+ i 1) q))))))))))
+
+(defn stmt-kind Str [sql0: &Str]
+  (let [s (str/upper-case (str/trim sql0))
+        w (loop [i 0] (if (and (< i (count s)) (let [c (nth s i)] (or (and (>= c 65) (<= c 90)) (= c 95)))) (recur (+ i 1)) (subs s 0 i)))]
+    (cond (or (= w "SELECT") (= w "WITH")) "query"
+          (or (= w "BEGIN") (= w "DECLARE") (= w "CALL")) "plsql"
+          :else "dml")))
+
+(defn- wb Str [v: &Str] (w/wbytes "" v))
+
+(defn bind-of Values(op/Bind Str) [x: &sql/Cell]
+  (match x
+    (sql/CNull) (values (op/->Bind op/T-VARCHAR 1 4) (chr 0))
+    (sql/CInt n) (let [[b e] (on/encode (str n))] (values (op/->Bind op/T-NUMBER 0 22) (wb b)))
+    (sql/CLong n) (let [[b e] (on/encode (str n))] (values (op/->Bind op/T-NUMBER 0 22) (wb b)))
+    (sql/CDecimal s) (let [[b e] (on/encode s)] (values (op/->Bind op/T-NUMBER 0 22) (wb b)))
+    (sql/CDouble f) (let [[b e] (on/encode (dec/float->shortest-str f))] (values (op/->Bind op/T-NUMBER 0 22) (wb b)))
+    (sql/CFloat s) (let [[b e] (on/encode s)] (values (op/->Bind op/T-NUMBER 0 22) (wb b)))
+    (sql/CStr s) (values (op/->Bind op/T-VARCHAR 1 (if (= (count s) 0) 4 (* 4 (count s)))) (wb s))
+    (sql/CClob s) (values (op/->Bind op/T-VARCHAR 1 (if (= (count s) 0) 4 (* 4 (count s)))) (wb s))
+    (sql/CBool b) (values (op/->Bind op/T-BOOLEAN 0 4) (if b (str (chr 2) (chr 1) (chr 1)) (str (chr 1) (chr 0))))
+    (sql/CDate d) (values (op/->Bind op/T-DATE 0 7) (wb (op/date-bytes d false)))
+    (sql/CTimestamp d) (values (op/->Bind op/T-TIMESTAMP 0 11) (wb (op/date-bytes d true)))
+    (sql/CLdt d) (values (op/->Bind op/T-TIMESTAMP 0 11) (wb (op/date-bytes d true)))
+    (sql/CBigInt s) (let [[b e] (on/encode s)] (values (op/->Bind op/T-NUMBER 0 22) (wb b)))
+    (sql/CTime s) (values (op/->Bind op/T-VARCHAR 1 (if (= (count s) 0) 4 (* 4 (count s)))) (wb s))
+    (sql/CZoned s) (values (op/->Bind op/T-VARCHAR 1 (if (= (count s) 0) 4 (* 4 (count s)))) (wb s))
+    (sql/CBytes b) (values (op/->Bind op/T-RAW 0 (if (= (count b) 0) 4000 (count b))) (wb b))
+    (sql/CDatum cls b z) (values (op/->Bind op/T-RAW 0 (if (= (count b) 0) 4000 (count b))) (wb b))))
+
+(defn- define-of op/Bind [c: &op/Col]
+  (let [t (:typ c)]
+    (cond
+      (or (= t op/T-NUMBER) (= t op/T-BINARY-INTEGER)) (op/->Bind t 0 22)
+      (or (= t op/T-CLOB) (= t op/T-BLOB)) (op/->Bind t (:csfrm c) 112)
+      (= t op/T-BOOLEAN) (op/->Bind t 0 4)
+      :else (op/->Bind t (:csfrm c) (:size c)))))
+
+(defn- prefix Values(Str Int) [c: &Conn]
+  (if (= (count (:closing c)) 0) (values "" (:seq c))
+    (values (op/close-cursors (:seq c) (:fv c) (:closing c)) (next-seq (:seq c)))))
+
+(defn- empty-out sql/Outcome [] (sql/->Outcome (sql/no-rows) 0 (sql/no-rows)))
+
+(defn- read-lob Values(Str Str Conn) [c: &Conn l: &op/Lob]
+  (let [loc (:locator l)
+        seq (:seq c)
+        [r e] (call c (op/lob-read seq (:fv c) loc 1 (:size l)) (op/->Ctx (:fv c) (:eor c) 2 [] [] (count loc) [] false))
+        c2 (with-seq c (next-seq seq) (:closing c))
+        data (:lobdata r)
+        text (cond
+               (:blob l) data
+               (and (> (count loc) 6) (not= (bit-and (nth loc 6) 128) 0))
+               (let [[t te] (ccs/decode data (if (and (> (count loc) 7) (not= (bit-and (nth loc 7) 64) 0)) "UTF-16LE" "UTF-16BE") false)] t)
+               :else data)]
+    (cond (not= e "") (values "" e c2)
+          (not= (:errnum r) 0) (values "" (ora-message (:errnum r) (:errmsg r)) c2)
+          :else (values text "" c2))))
+
+(defn- fill-lobs Values(Vec(Vec(sql/Cell)) Str Conn) [c0: Conn rows0: Vec(Vec(sql/Cell)) lobs: &Vec(op/Lob)]
+  (loop [i 0 c c0 rows rows0]
+    (if (>= i (count lobs)) (values rows "" c)
+      (let [l (nth lobs i)
+            [text e c2] (read-lob c l)]
+        (if (not= e "") (values rows e c2)
+          (let [row (nth rows (:row l))
+                cell (if (:blob l) (sql/->CBytes text) (sql/->CClob text))]
+            (recur (+ i 1) c2 (assoc rows (:row l) (assoc row (:col l) cell)))))))))
+
+(defn- has-lob? Bool [cols: &Vec(op/Col)]
+  (loop [i 0] (if (>= i (count cols)) false (let [t (:typ (nth cols i))] (if (or (= t op/T-CLOB) (= t op/T-BLOB)) true (recur (+ i 1)))))))
+
+(defn- col-names Vec(Str) [cols: &Vec(op/Col)]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i (count cols)) acc (recur (+ i 1) (conj acc (:name (nth cols i)))))))
+
+(defn- shift-lobs Vec(op/Lob) [acc: Vec(op/Lob) lobs: &Vec(op/Lob) shift: Int]
+  (loop [i 0 o acc] (if (>= i (count lobs)) o
+                      (let [l (nth lobs i)] (recur (+ i 1) (conj o (op/->Lob (+ (:row l) shift) (:col l) (:locator l) (:size l) (:blob l))))))))
+
+(defn- fetch-rest Values(Vec(Vec(sql/Cell)) Vec(op/Lob) Str Conn) [c0: Conn cursor: Int cols: &Vec(op/Col) rows0: Vec(Vec(sql/Cell)) lobs0: Vec(op/Lob)]
+  (loop [c c0 rows rows0 lobs lobs0]
+    (let [seq (:seq c)
+          prev (if (> (count rows) 0) (nth rows (- (count rows) 1)) [])
+          [r e] (call c (op/fetch seq (:fv c) cursor 100) (op/->Ctx (:fv c) (:eor c) 1 cols prev 0 [] false))
+          c2 (with-seq c (next-seq seq) (:closing c))
+          num (:errnum r)
+          rows2 (loop [i 0 o rows] (if (>= i (count (:rows r))) o (recur (+ i 1) (conj o (nth (:rows r) i)))))
+          lobs2 (shift-lobs lobs (:lobs r) (count rows))]
+      (cond
+        (not= e "") (values rows2 lobs2 e c2)
+        (= num 1403) (values rows2 lobs2 "" c2)
+        (not= num 0) (values rows2 lobs2 (str "ORA:" num ":" (:errmsg r)) c2)
+        (= (count (:rows r)) 0) (values rows2 lobs2 "" c2)
+        :else (recur c2 rows2 lobs2)))))
+
+(defn- failure Values(sql/Outcome sql/DbErr Conn) [c: &Conn e: sql/DbErr] (values (empty-out) e (with-seq c (:seq c) (:closing c))))
+
+(defn run Values(sql/Outcome sql/DbErr Conn) [c0: &Conn text: &Str params: &Vec(sql/Cell) want-keys: Bool key-cols: &Vec(Str)]
+  (let [
+        q (number-params text)
+        kind (stmt-kind q)
+        query (= kind "query")
+        [pre seq] (prefix c0)
+        [binds vals] (loop [i 0 bs: Vec(op/Bind) [] vs ""]
+                       (if (>= i (count params)) (values bs vs)
+                         (let [[b v] (bind-of (nth params i))] (recur (+ i 1) (conj bs b) (str vs v)))))
+        nb (count binds)
+        options (bit-or (bit-or OPT-PARSE-EXEC (if (> nb 0) (if (= kind "plsql") (bit-or op/OPT-BIND op/OPT-PLSQL-BIND) op/OPT-BIND) 0))
+                        (if query (bit-or op/OPT-FETCH op/OPT-NOT-PLSQL) (bit-or (if (:autocommit c0) op/OPT-COMMIT 0) (if (= kind "plsql") 0 op/OPT-NOT-PLSQL))))
+        ex (op/->Exec options 0 q query (if query 100 1) binds (if (> nb 0) [vals] []) [] 0)
+        c1 (with-seq c0 seq [])
+        [r e] (call c1 (str pre (op/execute seq (:fv c1) ex)) (op/->Ctx (:fv c1) (:eor c1) 1 [] [] 0 [] false))
+        c2 (with-seq c1 (next-seq seq) [])
+        num (:errnum r)
+        cursor (:cursor r)
+        c3 (if (> cursor 0) (with-seq c2 (:seq c2) [cursor]) c2)]
+    (cond
+      (not= e "") (failure c3 (conn-err (str "IO Error: " e)))
+      (and (not= num 0) (not (and query (= num 1403)))) (failure c3 (ora-err num (:errmsg r)))
+      (and (not query) want-keys (> (count key-cols) 0) (not= (:rowid r) "") (not= (insert-table q) ""))
+      (let [[ko ke kh] (run c3 (str "SELECT " (str/join ", " key-cols) " FROM " (insert-table q) " WHERE ROWID = ?")
+                            [(sql/->CStr (:rowid r))] false [])]
+        (if (not (sql/ok? ke)) (values (empty-out) ke kh)
+          (values (sql/->Outcome (sql/no-rows) (:rowcount r) (:rows ko)) (sql/ok-err) kh)))
+      (not query)
+      (let [keys (if (and want-keys (not= (:rowid r) ""))
+                   (sql/->Rows ["ROWID"] [[(sql/->CDatum "oracle.sql.ROWID" (:rowid r) "")]])
+                   (sql/no-rows))]
+        (values (sql/->Outcome (sql/no-rows) (:rowcount r) keys) (sql/ok-err) c3))
+      :else
+      (let [cols (:cols r)
+            done (= num 1403)
+            need-define (and (not done) (has-lob? cols) (= (count (:rows r)) 0))
+            [c4 de drows dlobs ddone] (if (not need-define) (values c3 "" [] [] false)
+                      (let [defs (loop [i 0 acc: Vec(op/Bind) []] (if (>= i (count cols)) acc (recur (+ i 1) (conj acc (define-of (nth cols i))))))
+                            s4 (:seq c3)
+                            dex (op/->Exec (bit-or op/OPT-DEFINE op/OPT-NOT-PLSQL) cursor "" true 100 [] [] defs 0)
+                            [rd ed] (call c3 (op/execute s4 (:fv c3) dex) (op/->Ctx (:fv c3) (:eor c3) 1 cols [] 0 [] false))
+                            c5 (with-seq c3 (next-seq s4) (:closing c3))
+                            dn (:errnum rd)]
+                        (cond (not= ed "") (values c5 ed [] [] false)
+                              (and (not= dn 0) (not= dn 1403)) (values c5 (str "ORA:" dn ":" (:errmsg rd)) [] [] false)
+                              :else (values c5 "" (:rows rd) (:lobs rd) (= dn 1403)))))
+            rows1 (loop [i 0 o (:rows r)] (if (>= i (count drows)) o (recur (+ i 1) (conj o (nth drows i)))))
+            lobs1 (shift-lobs (:lobs r) dlobs (count (:rows r)))
+            [rows lobs fe c6] (if (or (not= de "") done ddone) (values rows1 lobs1 de c4)
+                                (fetch-rest c4 cursor cols rows1 lobs1))
+            [rows2 le c7] (if (not= fe "") (values rows "" c6) (fill-lobs c6 rows lobs))]
+        (cond
+          (not= fe "") (failure c7 (if (str/starts-with? fe "ORA:")
+                                   (let [p2 (str/index-of-after fe ":" 4) [n ne] (parse-long (subs fe 4 p2))] (ora-err n (subs fe (+ p2 1) (count fe))))
+                                   (conn-err (str "IO Error: " fe))))
+          (not= le "") (failure c7 (conn-err le))
+          :else (values (sql/->Outcome (sql/->Rows (col-names cols) rows2) -1 (sql/no-rows)) (sql/ok-err) c7))))))
+
+(defrecord Query [names: Vec(Str) cols: Vec(op/Col) cursor: Int rows: Vec(Vec(sql/Cell)) done: Bool])
+
+(defn open-query Values(Query sql/DbErr Conn) [c0: &Conn text: &Str params: &Vec(sql/Cell)]
+  (let [q (number-params text)]
+    (if (not= (stmt-kind q) "query") (whole-query c0 text params)
+      (let [[pre seq] (prefix c0)
+            [binds vals] (loop [i 0 bs: Vec(op/Bind) [] vs ""]
+                           (if (>= i (count params)) (values bs vs)
+                             (let [[b v] (bind-of (nth params i))] (recur (+ i 1) (conj bs b) (str vs v)))))
+            nb (count binds)
+            options (bit-or (bit-or OPT-PARSE-EXEC (if (> nb 0) op/OPT-BIND 0)) (bit-or op/OPT-FETCH op/OPT-NOT-PLSQL))
+            ex (op/->Exec options 0 q true 100 binds (if (> nb 0) [vals] []) [] 0)
+            c1 (with-seq c0 seq [])
+            [r e] (call c1 (str pre (op/execute seq (:fv c1) ex)) (op/->Ctx (:fv c1) (:eor c1) 1 [] [] 0 [] false))
+            c2 (with-seq c1 (next-seq seq) [])
+            num (:errnum r)
+            cursor (:cursor r)
+            c3 (if (> cursor 0) (with-seq c2 (:seq c2) [cursor]) c2)
+            cols (:cols r)]
+        (cond
+          (not= e "") (values (->Query [] [] 0 [] true) (conn-err (str "IO Error: " e)) c3)
+          (and (not= num 0) (not= num 1403)) (values (->Query [] [] 0 [] true) (ora-err num (:errmsg r)) c3)
+          (has-lob? cols) (whole-query c3 text params)
+          :else (values (->Query (col-names cols) cols cursor (:rows r) (= num 1403)) (sql/ok-err) c3))))))
+
+(defn- whole-query Values(Query sql/DbErr Conn) [c0: &Conn text: &Str params: &Vec(sql/Cell)]
+  (let [[o e c] (run c0 text params false [])
+        r (:rows o)]
+    (values (->Query (:cols r) [] 0 (:rows r) true) e c)))
+
+(defn fetch-more Values(Vec(Vec(sql/Cell)) Bool sql/DbErr Conn) [c: &Conn q: &Query prev: &Vec(sql/Cell) n: Int]
+  (let [seq (:seq c)
+        [r e] (call c (op/fetch seq (:fv c) (:cursor q) n) (op/->Ctx (:fv c) (:eor c) 1 (:cols q) prev 0 [] false))
+        c2 (with-seq c (next-seq seq) (:closing c))
+        num (:errnum r)]
+    (cond
+      (not= e "") (values [] true (conn-err (str "IO Error: " e)) c2)
+      (= num 1403) (values (:rows r) true (sql/ok-err) c2)
+      (not= num 0) (values [] true (ora-err num (:errmsg r)) c2)
+      :else (values (:rows r) (= (count (:rows r)) 0) (sql/ok-err) c2))))
+
+(defn- batch-binds Values(Vec(op/Bind) Bool) [bs: &Vec(Vec(op/Bind)) nulls: &Vec(Vec(Bool))]
+  (let [np (count (nth bs 0))]
+    (loop [j 0 acc: Vec(op/Bind) []]
+      (if (>= j np) (values acc true)
+        (let [[typ cs size ok]
+              (loop [i 0 typ -1 cs 1 size 0]
+                (if (>= i (count bs)) (values typ cs size true)
+                  (let [b (nth (nth bs i) j)
+                        null (nth (nth nulls i) j)
+                        sz (if (> (:size b) size) (:size b) size)]
+                    (cond
+                      null (recur (+ i 1) typ cs sz)
+                      (= typ -1) (recur (+ i 1) (:typ b) (:csfrm b) sz)
+                      (= typ (:typ b)) (recur (+ i 1) typ cs sz)
+                      :else (values typ cs size false)))))]
+          (if (not ok) (values acc false)
+            (recur (+ j 1) (conj acc (if (= typ -1) (op/->Bind op/T-VARCHAR 1 size) (op/->Bind typ cs size))))))))))
+
+(defn run-batch Values(Vec(Int) sql/DbErr Conn) [c0: &Conn text: &Str rows: &Vec(Vec(sql/Cell))]
+  (if (= (count rows) 0) (values [] (sql/ok-err) (with-seq c0 (:seq c0) (:closing c0)))
+    (let [q (number-params text)
+          kind (stmt-kind q)
+          [bs ns vs] (loop [i 0 bs: Vec(Vec(op/Bind)) [] ns: Vec(Vec(Bool)) [] vs: Vec(Str) []]
+                (if (>= i (count rows)) (values bs ns vs)
+                  (let [r (nth rows i)
+                        [b n v] (loop [j 0 b: Vec(op/Bind) [] n: Vec(Bool) [] v ""]
+                                  (if (>= j (count r)) (values b n v)
+                                    (let [[bj vj] (bind-of (nth r j))
+                                          isnull (match (nth r j) (sql/CNull) true _ false)]
+                                      (recur (+ j 1) (conj b bj) (conj n isnull) (str v vj)))))]
+                    (recur (+ i 1) (conj bs b) (conj ns n) (conj vs v)))))
+          [binds same] (batch-binds bs ns)]
+      (if (or (not same) (= kind "query") (= kind "plsql"))
+        (run-each c0 text rows)
+        (let [[pre seq] (prefix c0)
+              nb (count binds)
+              options (bit-or (bit-or OPT-PARSE-EXEC (if (> nb 0) op/OPT-BIND 0))
+                              (bit-or (if (:autocommit c0) op/OPT-COMMIT 0) op/OPT-NOT-PLSQL))
+              ex (op/->Exec options 0 q false (count rows) binds (if (> nb 0) vs []) [] op/DML-ROWCOUNTS)
+              c1 (with-seq c0 seq [])
+              [r e] (call c1 (str pre (op/execute seq (:fv c1) ex)) (op/->Ctx (:fv c1) (:eor c1) 1 [] [] 0 [] true))
+              c2 (with-seq c1 (next-seq seq) [])
+              num (:errnum r)
+              cursor (:cursor r)
+              c3 (if (> cursor 0) (with-seq c2 (:seq c2) [cursor]) c2)]
+          (cond
+            (not= e "") (values [] (conn-err (str "IO Error: " e)) c3)
+            (not= num 0) (values [] (batch-err (ora-err num (:errmsg r))) c3)
+            (not= (count (:counts r)) (count rows))
+            (values (loop [i 0 acc: Vec(Int) []] (if (>= i (count rows)) acc (recur (+ i 1) (conj acc -2)))) (sql/ok-err) c3)
+            :else (values (:counts r) (sql/ok-err) c3)))))))
+
+(defn- batch-err sql/DbErr [e: &sql/DbErr]
+  (if (= (:exc e) "java.sql.SQLRecoverableException") (sql/->DbErr (:msg e) (:state e) (:code e) (:exc e))
+    (sql/->DbErr (:msg e) (:state e) (:code e) "java.sql.BatchUpdateException")))
+
+(defn- run-each Values(Vec(Int) sql/DbErr Conn) [c0: &Conn text: &Str rows: &Vec(Vec(sql/Cell))]
+  (loop [i 0 c c0 acc: Vec(Int) []]
+    (if (>= i (count rows)) (values acc (sql/ok-err) c)
+      (let [[o e c2] (run c text (nth rows i) false [])]
+        (if (not (sql/ok? e)) (values acc (batch-err e) c2)
+          (recur (+ i 1) c2 (conj acc (:count o))))))))
+
+(defn call-sql Str [sql0: &Str]
+  (let [s (str/trim sql0)]
+    (if (not (and (str/starts-with? s "{") (str/ends-with? s "}"))) s
+      (let [inner (str/trim (subs s 1 (- (count s) 1)))
+            u (str/upper-case inner)
+            ret (str/starts-with? inner "?")
+            eq (if ret (str/index-of inner "=") -1)
+            rest (if ret (str/trim (subs inner (+ eq 1) (count inner))) inner)
+            ur (str/upper-case rest)
+            body (if (str/starts-with? ur "CALL") (str/trim (subs rest 4 (count rest))) rest)]
+        (if ret (str "BEGIN ? := " body "; END;") (str "BEGIN " body "; END;"))))))
+
+(defn out-bind op/Bind [jdbc: &Str]
+  (cond
+    (or (= jdbc "NUMERIC") (= jdbc "DECIMAL") (= jdbc "INTEGER") (= jdbc "BIGINT") (= jdbc "SMALLINT") (= jdbc "TINYINT")
+        (= jdbc "DOUBLE") (= jdbc "FLOAT") (= jdbc "REAL")) (op/->Bind op/T-NUMBER 0 22)
+    (or (= jdbc "DATE") (= jdbc "TIME")) (op/->Bind op/T-DATE 0 7)
+    (= jdbc "TIMESTAMP") (op/->Bind op/T-TIMESTAMP 0 11)
+    (or (= jdbc "BOOLEAN") (= jdbc "BIT")) (op/->Bind op/T-BOOLEAN 0 4)
+    (or (= jdbc "REF_CURSOR") (= jdbc "OTHER")) (op/->Bind op/T-CURSOR 0 4)
+    (or (= jdbc "BINARY") (= jdbc "VARBINARY") (= jdbc "LONGVARBINARY")) (op/->Bind op/T-RAW 0 32767)
+    (or (= jdbc "NCHAR") (= jdbc "NVARCHAR") (= jdbc "LONGNVARCHAR")) (op/->Bind op/T-VARCHAR 2 32767)
+    :else (op/->Bind op/T-VARCHAR 1 32767)))
+
+(defn- null-of Str [b: &op/Bind]
+  (cond (= (:typ b) op/T-CURSOR) (str (chr 1) (chr 0))
+        (= (:typ b) op/T-BOOLEAN) (str (chr 253) (chr 1))
+        :else (chr 0)))
+
+(defn- cursor-rows Values(sql/Rows Str Conn) [c0: Conn cur: &op/Cur]
+  (let [cols (:cols cur)
+        [rows lobs fe c1] (fetch-rest c0 (:cursor cur) cols [] [])
+        [rows2 le c2] (if (not= fe "") (values rows "" c1) (fill-lobs c1 rows lobs))]
+    (values (sql/->Rows (col-names cols) rows2) (if (not= fe "") fe le) c2)))
+
+(defn call-proc Values(sql/SpResult sql/DbErr Conn) [c0: &Conn text: &Str params: &Vec(sql/SpParam)]
+  (let [
+        q (number-params (call-sql text))
+        [pre seq] (prefix c0)
+        [binds vals] (loop [i 0 bs: Vec(op/Bind) [] vs ""]
+                       (if (>= i (count params)) (values bs vs)
+                         (let [p (nth params i)
+                               d (:dir p)]
+                           (if (= d sql/OUT)
+                             (let [b (out-bind (:type p))] (recur (+ i 1) (conj bs b) (str vs (null-of b))))
+                             (let [[b v] (bind-of (:value p))
+                                   b2 (if (and (= d sql/INOUT) (= (:typ b) op/T-VARCHAR)) (op/->Bind op/T-VARCHAR (:csfrm b) 32767) b)]
+                               (recur (+ i 1) (conj bs b2) (str vs v)))))))
+        nb (count binds)
+        options (bit-or (bit-or OPT-PARSE-EXEC (if (:autocommit c0) op/OPT-COMMIT 0)) (if (> nb 0) (bit-or op/OPT-BIND op/OPT-PLSQL-BIND) 0))
+        ex (op/->Exec options 0 q false 1 binds (if (> nb 0) [vals] []) [] 0)
+        c1 (with-seq c0 seq [])
+        [r e] (call c1 (str pre (op/execute seq (:fv c1) ex)) (op/->Ctx (:fv c1) (:eor c1) 3 [] [] 0 binds false))
+        c2 (with-seq c1 (next-seq seq) [])
+        num (:errnum r)
+        cursor (:cursor r)
+        c3 (if (> cursor 0) (with-seq c2 (:seq c2) [cursor]) c2)
+        none (sql/no-sp)]
+    (cond
+      (not= e "") (values none (conn-err (str "IO Error: " e)) c3)
+      (not= num 0) (values none (ora-err num (:errmsg r)) c3)
+      :else
+      (let [outs (:outs r)
+            curs (:curs r)]
+        (loop [i 0 k 0 c c3 names: Vec(Str) [] vs: Vec(sql/SpVal) [] closing: Vec(Int) (:closing c3)]
+          (if (>= i (count params))
+            (values (sql/->SpResult [] [] names vs) (sql/ok-err) (with-seq c (:seq c) closing))
+            (let [p (nth params i)]
+              (if (= (:dir p) sql/IN) (recur (+ i 1) k c names vs closing)
+                (let [ci (loop [j 0] (if (>= j (count curs)) -1 (if (= (:index (nth curs j)) k) j (recur (+ j 1)))))]
+                  (if (>= ci 0)
+                    (let [cur (nth curs ci)
+                          [rows re c4] (cursor-rows c cur)]
+                      (if (not= re "") (values none (conn-err re) c4)
+                        (recur (+ i 1) (+ k 1) c4 (conj names (:name p)) (conj vs (sql/->SpRows rows))
+                               (conj closing (:cursor cur)))))
+                    (recur (+ i 1) (+ k 1) c (conj names (:name p))
+                           (conj vs (sql/->SpCell (if (< k (count outs)) (nth outs k) (sql/->CNull)))) closing)))))))))))

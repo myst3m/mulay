@@ -1,0 +1,79 @@
+(ns mulay.rt.poll
+  (:require [mulay.dw.val :as v] [mulay.dw.engine :as eng] [mulay.dw.num :as num] [mulay.rt.event :as ev]))
+
+(defrecord Item [payload: ev/TV attributes: ev/TV wm: Vec(v/Val) id: Str])
+
+(defrecord Seen [id: Str wm: v/Val])
+
+(defrecord State [current: Vec(v/Val) updated: Vec(v/Val) recent: Vec(Seen) on-updated: Vec(Seen)])
+
+(def PASSED 0)
+(def REJECT 1)
+(def ON-HIGH 2)
+(def ON-NEW-HIGH 3)
+
+(defn- empty-states Map(Str State) [] (let [m: Map(Str State) {}] m))
+(def STATES (atom (empty-states)))
+
+(defn- fresh State [] (let [z: Vec(v/Val) [] s: Vec(Seen) []] (->State z z s s)))
+
+(defn- state-of State [k: &Str]
+  (let [m (deref STATES)] (if (contains? m k) (get! m k) (fresh))))
+
+(defn watermark Vec(v/Val) [k: &Str] (:current (state-of k)))
+
+(def CMP-SCRIPT "%dw 2.0\n---\nif (a > b) 1 else if (a == b) 0 else -1")
+(defn- no-code Vec(eng/Compiled) [] (let [z: Vec(eng/Compiled) []] z))
+(def CMP (atom (no-code)))
+
+(defn- cmp-code eng/Compiled []
+  (let [c (deref CMP)]
+    (if (> (count c) 0) (nth c 0)
+      (let [x (eng/compile CMP-SCRIPT ["a" "b"]) z (reset! CMP [x])] x))))
+
+(defn compare-wm Int [a: &v/Val b: &v/Val]
+  (let [[x de] (eng/eval-compiled (cmp-code) [(v/unmeta a) (v/unmeta b)])]
+    (match x (v/VInt n) n (v/VNum n) (let [[k ke] (num/to-int n)] k) _ 0)))
+
+(defn- seen-wm Vec(v/Val) [xs: &Vec(Seen) id: &Str]
+  (loop [i 0] (if (>= i (count xs)) [] (if (= (:id (nth xs i)) id) [(:wm (nth xs i))] (recur (+ i 1))))))
+
+(defn- put-seen Vec(Seen) [xs: &Vec(Seen) id: &Str wm: &v/Val]
+  (let [kept (loop [i 0 acc: Vec(Seen) []] (if (>= i (count xs)) acc (recur (+ i 1) (if (= (:id (nth xs i)) id) acc (conj acc (nth xs i))))))]
+    (conj kept (->Seen (str id) wm))))
+
+(defn status Int [st: &State wm: &v/Val id: &Str]
+  (if (and (= (count (:current st)) 0) (= (count (:updated st)) 0)) ON-NEW-HIGH
+    (let [c (if (= (count (:current st)) 0) -1 (compare-wm (nth (:current st) 0) wm))]
+      (cond
+        (< c 0)
+        (let [prev (if (= id "") [] (seen-wm (:recent st) id))]
+          (if (and (> (count prev) 0) (<= (compare-wm wm (nth prev 0)) 0)) REJECT
+            (let [cu (if (= (count (:updated st)) 0) -1 (compare-wm (nth (:updated st) 0) wm))]
+              (cond (= cu 0) ON-HIGH (< cu 0) ON-NEW-HIGH :else PASSED))))
+        (= c 0) (if (and (not= id "") (= (count (seen-wm (:recent st) id)) 0)) PASSED REJECT)
+        :else REJECT))))
+
+(defn- saved State [st: State s: Int wm: &v/Val id: &Str]
+  (let [s1 (if (= s ON-NEW-HIGH) (let [z: Vec(Seen) []] (assoc (assoc st :updated [wm]) :on-updated z)) st)
+        s2 (if (and (or (= s ON-NEW-HIGH) (= s ON-HIGH)) (not= id "")) (assoc s1 :on-updated (put-seen (:on-updated s1) id wm)) s1)]
+    (if (= id "") s2 (assoc s2 :recent (put-seen (:recent s2) id wm)))))
+
+(defn- finish State [st: State]
+  (cond
+    (= (count (:updated st)) 0) st
+    (and (> (count (:current st)) 0) (>= (compare-wm (nth (:current st) 0) (nth (:updated st) 0)) 0)) st
+    :else (let [z: Vec(Seen) []] (->State (:updated st) (:updated st) (:on-updated st) z))))
+
+(defn run-items Int [k: &Str items: &Vec(Item) dispatch: &Fn(ev/TV ev/TV Values(Bool Str))]
+  (loop [i 0 n 0 st (state-of k)]
+    (if (>= i (count items))
+      (let [z (swap! STATES (fn Map(Str State) [old: Map(Str State)] (assoc old (str k) (finish st))))] n)
+      (let [it (nth items i)]
+        (if (= (count (:wm it)) 0)
+          (let [[ok desc] (dispatch (:payload it) (:attributes it))] (recur (+ i 1) (+ n 1) st))
+          (let [w (nth (:wm it) 0)
+                s (status st w (:id it))]
+            (if (= s REJECT) (recur (+ i 1) n st)
+              (let [[ok desc] (dispatch (:payload it) (:attributes it))]
+                (recur (+ i 1) (+ n 1) (saved st s w (:id it)))))))))))

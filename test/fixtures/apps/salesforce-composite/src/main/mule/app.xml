@@ -1,0 +1,350 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Salesforce Composite コネクタ (mule-salesforce-composite-connector 3.1.4)。偽の Salesforce (このアプリの /fake/*) に
+     token-connection でつなぎ、送った要求 (GET /last) と結果の形、失敗の型と文言を記録する。pre-* / post-* は HTTP を使わない -->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:salesforce-composite="http://www.mulesoft.org/schema/mule/salesforce-composite"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/salesforce-composite http://www.mulesoft.org/schema/mule/salesforce-composite/current/mule-salesforce-composite.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18490"/>
+    </http:listener-config>
+
+    <os:object-store name="Seen" persistent="false"/>
+
+    <salesforce-composite:composite-config name="Fake">
+        <salesforce-composite:token-connection sessionId="tok123" instanceUrl="http://localhost:18490/fake"/>
+    </salesforce-composite:composite-config>
+    <salesforce-composite:composite-config name="FakeSlow">
+        <salesforce-composite:token-connection sessionId="tok123" instanceUrl="http://localhost:18490/fake" responseTimeout="1"/>
+    </salesforce-composite:composite-config>
+    <!-- 接続の属性は式でもよい (動的な config) -->
+    <salesforce-composite:composite-config name="FakeDyn">
+        <salesforce-composite:token-connection sessionId="#[vars.tok]" instanceUrl="#['http://localhost:18490/' ++ 'fake']" responseTimeout="#[vars.rt default 5]"/>
+    </salesforce-composite:composite-config>
+    <salesforce-composite:composite-config name="Down">
+        <salesforce-composite:token-connection sessionId="tok123" instanceUrl="http://localhost:18499"/>
+    </salesforce-composite:composite-config>
+
+    <!-- ===== 偽の Salesforce ===== -->
+    <flow name="fake">
+        <http:listener config-ref="L" path="/fake/*" outputMimeType="text/plain">
+            <http:response statusCode="#[vars.resp.status]"/>
+        </http:listener>
+        <os:retrieve key="mode" objectStore="Seen" target="mode">
+            <os:default-value>ok</os:default-value>
+        </os:retrieve>
+        <os:store key="last" objectStore="Seen">
+            <os:value>#[output application/json --- {method: attributes.method, path: attributes.requestPath, query: attributes.queryString, headers: attributes.headers, body: payload default ''}]</os:value>
+        </os:store>
+        <choice>
+            <when expression="#[vars.mode == 'slow']">
+                <set-variable variableName="waited" value="#[dw::Runtime::wait('x', 2500)]"/>
+            </when>
+        </choice>
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="resp" resource="resp.dwl"/>
+            </ee:variables>
+        </ee:transform>
+        <set-payload value="#[vars.resp.body]" mimeType="application/json"/>
+    </flow>
+
+    <flow name="last">
+        <http:listener config-ref="L" path="/last"/>
+        <os:retrieve key="last" objectStore="Seen">
+            <os:default-value>#[output application/json --- {}]</os:default-value>
+        </os:retrieve>
+    </flow>
+
+    <!-- 偽物の応答のモード (?mode=..) を置き、前の要求の記録を消す -->
+    <sub-flow name="mode">
+        <os:store key="mode" objectStore="Seen"><os:value>#[attributes.queryParams.mode default 'ok']</os:value></os:store>
+        <os:store key="last" objectStore="Seen"><os:value>#[output application/json --- {}]</os:value></os:store>
+    </sub-flow>
+
+    <!-- 結果の形: 値ごとの Java の class と値、attributes -->
+    <sub-flow name="show">
+        <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+fun tc(v) = v match {
+  case is Object -> {"class": v.^class default null, entries: v mapObject ((x, k) -> {(k): tc(x)})}
+  case is Array -> {"class": v.^class default null, items: v map tc($)}
+  else -> {"class": v.^class default null, value: v}
+}
+---
+{payload: tc(payload), attributesClass: attributes.^class default null, attributeKeys: keysOf(attributes default {}) map ($ as String),
+ statusCode: attributes.'status-code' default null, contentType: attributes.headers.'content-type' default null}]]></ee:set-payload></ee:message></ee:transform>
+    </sub-flow>
+
+    <error-handler name="report">
+        <on-error-continue>
+            <ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{"type": error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description,
+ hasErrorMessage: error.errorMessage != null}]]></ee:set-payload></ee:message></ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- ===== pre-* (HTTP を使わない) ===== -->
+    <flow name="pre-create">
+        <http:listener config-ref="L" path="/pre-create"/>
+        <salesforce-composite:pre-create config-ref="Fake" type="Account">
+            <salesforce-composite:s-object>#[{Name: 'Acme', Phone: '1', Id: '001X', fieldsToNull: ['Fax', 'Website']}]</salesforce-composite:s-object>
+        </salesforce-composite:pre-create>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="pre-update">
+        <http:listener config-ref="L" path="/pre-update"/>
+        <salesforce-composite:pre-update config-ref="Fake" type="Account">
+            <salesforce-composite:s-object>#[{Id: '001X', Name: 'New', fieldsToNull: ['Phone']}]</salesforce-composite:s-object>
+        </salesforce-composite:pre-update>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="pre-update-noid">
+        <http:listener config-ref="L" path="/pre-update-noid"/>
+        <salesforce-composite:pre-update config-ref="Fake" type="Account">
+            <salesforce-composite:s-object>#[{Name: 'New'}]</salesforce-composite:s-object>
+        </salesforce-composite:pre-update>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="pre-delete">
+        <http:listener config-ref="L" path="/pre-delete"/>
+        <salesforce-composite:pre-delete config-ref="Fake" type="Account" id="#[attributes.queryParams.id default '001X']"/>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="pre-retrieve">
+        <http:listener config-ref="L" path="/pre-retrieve"/>
+        <salesforce-composite:pre-retrieve config-ref="Fake">
+            <salesforce-composite:retrieve-data>#[attributes.queryParams.k match {
+  case 'nofields' -> {Id: '001X', Type: 'Account', Fields: 'Name'}
+  case 'emptyfields' -> {Id: '001X', Type: 'Account', Fields: []}
+  case 'noid' -> {Type: 'Account', Fields: ['Name']}
+  case 'trailing' -> {Id: '001X', Type: 'Account', Fields: ['Name', ' ']}
+  else -> {Id: '001X', Type: 'Account', Fields: ['Name', ' Phone ', '', 'Website']}
+}]</salesforce-composite:retrieve-data>
+        </salesforce-composite:pre-retrieve>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="pre-get-limits">
+        <http:listener config-ref="L" path="/pre-get-limits"/>
+        <salesforce-composite:pre-get-limits config-ref="Fake"/>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="pre-query">
+        <http:listener config-ref="L" path="/pre-query"/>
+        <salesforce-composite:pre-query config-ref="Fake">
+            <salesforce-composite:query>#[attributes.queryParams.q default "SELECT Id, Name FROM Account WHERE Name = :name AND Site = :nameX"]</salesforce-composite:query>
+            <salesforce-composite:parameters>#[{name: "'Acme'", nameX: "'Other'"}]</salesforce-composite:parameters>
+        </salesforce-composite:pre-query>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="pre-query-all">
+        <http:listener config-ref="L" path="/pre-query-all"/>
+        <salesforce-composite:pre-query-all config-ref="Fake">
+            <salesforce-composite:query>SELECT Id FROM Account WHERE IsDeleted = true</salesforce-composite:query>
+        </salesforce-composite:pre-query-all>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="pre-search">
+        <http:listener config-ref="L" path="/pre-search"/>
+        <salesforce-composite:pre-search config-ref="Fake">
+            <salesforce-composite:search>#[attributes.queryParams.s default 'FIND {Acme*} IN ALL FIELDS RETURNING Account(Id, Name) ~日本']</salesforce-composite:search>
+        </salesforce-composite:pre-search>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- ===== post-* ===== -->
+    <flow name="post">
+        <http:listener config-ref="L" path="/post/{op}"/>
+        <set-variable variableName="ok" value="#[{statusCode: 201, result: {id: '001A', success: true, errors: []}}]"/>
+        <set-variable variableName="bad" value="#[{statusCode: 400, result: [{errorCode: 'NOT_FOUND', message: 'gone'}]}]"/>
+        <set-variable variableName="search" value="#[{statusCode: 200, result: {searchRecords: [{attributes: {'type': 'Account'}, Id: '001A'}]}}]"/>
+        <set-variable variableName="in" value="#[if (attributes.queryParams.err == '1') vars.bad else if (attributes.uriParams.op == 'search') vars.search else vars.ok]"/>
+        <choice>
+            <when expression="#[attributes.uriParams.op == 'create']"><salesforce-composite:post-create config-ref="Fake"><salesforce-composite:create-result>#[vars.in]</salesforce-composite:create-result></salesforce-composite:post-create></when>
+            <when expression="#[attributes.uriParams.op == 'update']"><salesforce-composite:post-update config-ref="Fake"><salesforce-composite:update-result>#[vars.in]</salesforce-composite:update-result></salesforce-composite:post-update></when>
+            <when expression="#[attributes.uriParams.op == 'delete']"><salesforce-composite:post-delete config-ref="Fake"><salesforce-composite:delete-result>#[vars.in]</salesforce-composite:delete-result></salesforce-composite:post-delete></when>
+            <when expression="#[attributes.uriParams.op == 'retrieve']"><salesforce-composite:post-retrieve config-ref="Fake" type="Account"><salesforce-composite:retrieve-data>#[vars.in]</salesforce-composite:retrieve-data></salesforce-composite:post-retrieve></when>
+            <when expression="#[attributes.uriParams.op == 'limits']"><salesforce-composite:post-get-limits config-ref="Fake"><salesforce-composite:get-limits-result>#[vars.in]</salesforce-composite:get-limits-result></salesforce-composite:post-get-limits></when>
+            <otherwise><salesforce-composite:post-search config-ref="Fake"><salesforce-composite:search-result>#[vars.in]</salesforce-composite:search-result></salesforce-composite:post-search></otherwise>
+        </choice>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- post-query: 2 ページ目からは nextRecordsUrl を直接 GET する -->
+    <flow name="post-query">
+        <http:listener config-ref="L" path="/post-query"/>
+        <flow-ref name="mode"/>
+        <set-variable variableName="in" value="#[if (attributes.queryParams.err == '1') {statusCode: 400, result: [{errorCode: 'MALFORMED_QUERY', message: 'bad'}]}
+            else {statusCode: 200, result: {totalSize: 3, done: false, nextRecordsUrl: '/services/data/v67.0/query/01gNEXT-2000',
+                  records: [{attributes: {'type': 'Account'}, Id: '001A', Name: 'A'}, {attributes: {'type': 'Account'}, Id: '001B', Name: 'B'}]}}]"/>
+        <choice>
+            <when expression="#[attributes.queryParams.all == '1']">
+                <salesforce-composite:post-query-all config-ref="Fake"><salesforce-composite:query-result>#[vars.in]</salesforce-composite:query-result></salesforce-composite:post-query-all>
+            </when>
+            <otherwise>
+                <salesforce-composite:post-query config-ref="Fake">
+                    <salesforce-composite:query>SELECT Id, Name FROM Account</salesforce-composite:query>
+                    <salesforce-composite:query-result>#[vars.in]</salesforce-composite:query-result>
+                </salesforce-composite:post-query>
+            </otherwise>
+        </choice>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- ===== HTTP を使う操作 ===== -->
+    <!-- batch: pre-* の結果を並べて送る -->
+    <flow name="batch">
+        <http:listener config-ref="L" path="/batch"/>
+        <flow-ref name="mode"/>
+        <salesforce-composite:pre-create config-ref="Fake" type="Account" target="c"><salesforce-composite:s-object>#[{Name: 'Acme'}]</salesforce-composite:s-object></salesforce-composite:pre-create>
+        <salesforce-composite:pre-update config-ref="Fake" type="Account" target="u"><salesforce-composite:s-object>#[{Id: '001A', Name: 'B'}]</salesforce-composite:s-object></salesforce-composite:pre-update>
+        <salesforce-composite:pre-delete config-ref="Fake" type="Account" id="001Z" target="d"/>
+        <salesforce-composite:pre-retrieve config-ref="Fake" target="r"><salesforce-composite:retrieve-data>#[{Id: '001A', Type: 'Account', Fields: ['Name']}]</salesforce-composite:retrieve-data></salesforce-composite:pre-retrieve>
+        <salesforce-composite:pre-query config-ref="Fake" target="q"><salesforce-composite:query>SELECT Id FROM Account</salesforce-composite:query></salesforce-composite:pre-query>
+        <salesforce-composite:execute-composite-batch config-ref="Fake">
+            <salesforce-composite:sub-requests>#[[vars.c, vars.u, vars.d, vars.r, vars.q]]</salesforce-composite:sub-requests>
+        </salesforce-composite:execute-composite-batch>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <!-- 値の型 (応答の数): ?mode=nums -->
+    <flow name="batch-raw">
+        <http:listener config-ref="L" path="/batch-raw"/>
+        <flow-ref name="mode"/>
+        <salesforce-composite:execute-composite-batch config-ref="Fake">
+            <salesforce-composite:sub-requests>#[[{method: 'GET', url: 'v67.0/limits'}, {method: 'PATCH', url: 'v67.0/sobjects/Account/001A', richInput: {Name: 'x', NumberOfEmployees: 5, AnnualRevenue: 1.5, Big: 12345678901, Flag: true, Nothing: null, Esc: "a\"b\\c\n/\u0001 é"}}]]</salesforce-composite:sub-requests>
+        </salesforce-composite:execute-composite-batch>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="tree">
+        <http:listener config-ref="L" path="/tree"/>
+        <flow-ref name="mode"/>
+        <salesforce-composite:create-sobject-tree config-ref="Fake" type="Account">
+            <salesforce-composite:s-objects>#[[{attributes: {'type': 'Account', referenceId: 'ref1'}, Name: 'T', Contacts: {records: [{attributes: {'type': 'Contact', referenceId: 'ref2'}, LastName: 'L'}]}}]]</salesforce-composite:s-objects>
+        </salesforce-composite:create-sobject-tree>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="graph">
+        <http:listener config-ref="L" path="/graph"/>
+        <flow-ref name="mode"/>
+        <salesforce-composite:execute-composite-graph config-ref="Fake">
+            <salesforce-composite:graphs>#[[{graphId: 'g1', compositeRequest: [{method: 'POST', url: '/services/data/v67.0/sobjects/Account/', referenceId: 'newAcc', body: {Name: 'G'}}]}]]</salesforce-composite:graphs>
+        </salesforce-composite:execute-composite-graph>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="composite">
+        <http:listener config-ref="L" path="/composite"/>
+        <flow-ref name="mode"/>
+        <salesforce-composite:execute-composite-request config-ref="Fake">
+            <salesforce-composite:request-body>#[{allOrNone: true, compositeRequest: [{method: 'POST', url: '/services/data/v67.0/sobjects/Account', referenceId: 'r1', body: {Name: 'C'}}, {method: 'GET', url: '/services/data/v67.0/sobjects/Account/@{r1.id}', referenceId: 'r2'}]}]</salesforce-composite:request-body>
+        </salesforce-composite:execute-composite-request>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="coll">
+        <http:listener config-ref="L" path="/coll/{op}"/>
+        <flow-ref name="mode"/>
+        <choice>
+            <when expression="#[attributes.uriParams.op == 'create']">
+                <salesforce-composite:create-sobject-collections config-ref="Fake">
+                    <salesforce-composite:request-body>#[{allOrNone: false, records: [{attributes: {'type': 'Account'}, Name: 'A'}, {attributes: {'type': 'Account'}}]}]</salesforce-composite:request-body>
+                </salesforce-composite:create-sobject-collections>
+            </when>
+            <when expression="#[attributes.uriParams.op == 'get']">
+                <salesforce-composite:get-sobject-collections config-ref="Fake" type="Account" ids="#[['001A', '001Q']]" fields="#[['Id', 'Name']]"/>
+            </when>
+            <when expression="#[attributes.uriParams.op == 'update']">
+                <salesforce-composite:update-sobject-collections config-ref="Fake">
+                    <salesforce-composite:request-body>#[{allOrNone: false, records: [{attributes: {'type': 'Account'}, id: '001A', Name: 'A2'}]}]</salesforce-composite:request-body>
+                </salesforce-composite:update-sobject-collections>
+            </when>
+            <when expression="#[attributes.uriParams.op == 'upsert']">
+                <salesforce-composite:upsert-sobject-collections config-ref="Fake" type="Account" externalFieldName="ExtId__c">
+                    <salesforce-composite:request-body>#[{allOrNone: false, records: [{attributes: {'type': 'Account'}, ExtId__c: 'E1', Name: 'U'}]}]</salesforce-composite:request-body>
+                </salesforce-composite:upsert-sobject-collections>
+            </when>
+            <when expression="#[attributes.uriParams.op == 'delete-all']">
+                <salesforce-composite:delete-sobject-collections config-ref="Fake" ids="#[['001A', '001B']]" allOrNone="true"/>
+            </when>
+            <otherwise>
+                <salesforce-composite:delete-sobject-collections config-ref="Fake" ids="#[['001A']]"/>
+            </otherwise>
+        </choice>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+
+    <!-- ===== 失敗 ===== -->
+    <!-- 日時の値は JSON にできない (Jackson に java.time の扱いが無い) -->
+    <flow name="time">
+        <http:listener config-ref="L" path="/time"/>
+        <flow-ref name="mode"/>
+        <salesforce-composite:execute-composite-request config-ref="Fake">
+            <salesforce-composite:request-body>#[{when: |2026-10-10T01:02:03Z|}]</salesforce-composite:request-body>
+        </salesforce-composite:execute-composite-request>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="slow">
+        <http:listener config-ref="L" path="/slow/{op}"/>
+        <flow-ref name="mode"/>
+        <choice>
+            <when expression="#[attributes.uriParams.op == 'batch']">
+                <salesforce-composite:execute-composite-batch config-ref="FakeSlow"><salesforce-composite:sub-requests>#[[{method: 'GET', url: 'v67.0/limits'}]]</salesforce-composite:sub-requests></salesforce-composite:execute-composite-batch>
+            </when>
+            <otherwise>
+                <salesforce-composite:create-sobject-collections config-ref="FakeSlow"><salesforce-composite:request-body>#[{records: []}]</salesforce-composite:request-body></salesforce-composite:create-sobject-collections>
+            </otherwise>
+        </choice>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="dyn">
+        <http:listener config-ref="L" path="/dyn"/>
+        <flow-ref name="mode"/>
+        <set-variable variableName="tok" value="#[attributes.queryParams.tok default 'dyn456']"/>
+        <set-variable variableName="rt" value="#[(attributes.queryParams.rt default '5') as Number]"/>
+        <salesforce-composite:execute-composite-batch config-ref="FakeDyn">
+            <salesforce-composite:sub-requests>#[[{method: 'GET', url: 'v67.0/limits'}]]</salesforce-composite:sub-requests>
+        </salesforce-composite:execute-composite-batch>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+    <flow name="down">
+        <http:listener config-ref="L" path="/down/{op}"/>
+        <choice>
+            <when expression="#[attributes.uriParams.op == 'batch']">
+                <salesforce-composite:execute-composite-batch config-ref="Down"><salesforce-composite:sub-requests>#[[{method: 'GET', url: 'v67.0/limits'}]]</salesforce-composite:sub-requests></salesforce-composite:execute-composite-batch>
+            </when>
+            <otherwise>
+                <salesforce-composite:create-sobject-collections config-ref="Down"><salesforce-composite:request-body>#[{records: []}]</salesforce-composite:request-body></salesforce-composite:create-sobject-collections>
+            </otherwise>
+        </choice>
+        <flow-ref name="show"/>
+        <error-handler ref="report"/>
+    </flow>
+</mule>

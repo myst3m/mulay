@@ -1,0 +1,336 @@
+(ns mulay.dw.sel (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.num :as num] [mulay.lib.uni :as uni] [mulay.dw.tsel :as tsel]))
+
+(defn- no-ns-match? Bool [k: &v/Key name: &Str] (= (:name k) name))
+
+(defn- arr-items Values(Vec(v/Val) Bool dwe/DwErr) [t: &v/Val]
+  (match t
+    (v/VArr xs) (values xs true (dwe/ok))
+    (v/VSeq q) (let [[xs e] (v/seq-vec q)] (values xs true e))
+    _ (let [z: Vec(v/Val) []] (values z false (dwe/ok)))))
+
+(defn- arr-ret Values(v/Val dwe/DwErr) [r: Vec(v/Val) e: &dwe/DwErr]
+  (if (dwe/ok? e) (rt/ret (if (= (count r) 0) (v/null-v) (v/->VArr r))) (values (v/null-v) e)))
+
+(defn key-sel Values(v/Val dwe/DwErr) [t0: &v/Val name: &Str]
+  (match t0
+    (v/VObj fs) (rt/ret (first-field-val fs name))
+    (v/VOSeq q) (key-scan q name)
+    _ (key-sel-slow t0 name)))
+
+(defn- key-scan Values(v/Val dwe/DwErr) [q: &v/FSeq name: &Str]
+  (let [nx ((:open q) 0)]
+    (loop []
+      (let [[f done e] (nx 0)]
+        (cond (not (dwe/ok? e)) (values (v/null-v) e)
+              done (rt/ret (v/null-v))
+              (= (:name (:key f)) name) (rt/ret (with-key-attrs (:value f) (:key f)))
+              :else (recur))))))
+
+(defn- key-sel-slow Values(v/Val dwe/DwErr) [t0: &v/Val name: &Str]
+  (let [t (v/unmeta t0)
+        [dv dok] (tsel/field t name)]
+    (if dok (rt/ret dv)
+    (match t
+      (v/VObj fs) (rt/ret (first-field-val fs name))
+      (v/VOSeq q) (key-scan q name)
+      (v/VArr xs) (let [[r e] (arr-key-sel xs name)] (if (dwe/ok? e) (rt/ret (v/->VArr r)) (values (v/null-v) e)))
+      (v/VSeq q) (let [[xs se] (v/seq-vec q)]
+                   (if (not (dwe/ok? se)) (values (v/null-v) se)
+                     (let [[r e] (arr-key-sel xs name)] (if (dwe/ok? e) (rt/ret (v/->VArr r)) (values (v/null-v) e)))))
+      (v/VNull) (rt/ret (v/null-v))
+      (v/VNsV n) (rt/ret (cond (= name "uri") (v/->VStr (:uri n)) (= name "prefix") (v/->VStr (:prefix n)) :else (v/null-v)))
+      _ (rt/failure "InvalidSelector" "You called the function 'Value Selector' with these arguments: ")))))
+
+(defn- arr-key-sel Values(Vec(v/Val) dwe/DwErr) [xs: &Vec(v/Val) name: &Str]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (>= i (count xs)) (values acc (dwe/ok))
+      (let [e (v/unmeta (nth xs i))]
+        (match e
+          (v/VObj fs) (let [r (first-field-vals fs name false)] (recur (+ i 1) (if (= (count r) 0) acc (conj acc (nth r 0)))))
+          (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)]
+                        (if (not (dwe/ok? fe)) (values acc fe)
+                          (let [r (first-field-vals fs name false)] (recur (+ i 1) (if (= (count r) 0) acc (conj acc (nth r 0)))))))
+          _ (let [[ys arr ie] (arr-items e)]
+              (cond (not (dwe/ok? ie)) (values acc ie)
+                    (not arr) (recur (+ i 1) acc)
+                    :else (let [[inner ke] (arr-key-sel ys name)]
+                            (if (not (dwe/ok? ke)) (values acc ke)
+                              (recur (+ i 1) (if (= (count inner) 0) acc (conj acc (v/->VArr inner)))))))))))))
+
+(defn multi-sel Values(v/Val dwe/DwErr) [t0: &v/Val name: &Str]
+  (let [t (v/unmeta t0)]
+    (match t
+      (v/VObj fs) (let [r (first-field-vals fs name true)] (rt/ret (if (= (count r) 0) (v/null-v) (v/->VArr r))))
+      (v/VOSeq q) (multi-scan q name)
+      (v/VNull) (rt/ret (v/null-v))
+      _ (let [[xs arr ie] (arr-items t)]
+          (cond (not (dwe/ok? ie)) (values (v/null-v) ie)
+                (not arr) (rt/failure "InvalidSelector" "You called the function 'MultiValue Selector (.*)' with these arguments: ")
+                :else (let [[r re] (loop [i 0 acc: Vec(v/Val) []]
+                                     (if (>= i (count xs)) (values acc (dwe/ok))
+                                       (match (v/unmeta (nth xs i))
+                                         (v/VObj fs) (recur (+ i 1) (vcat acc (first-field-vals fs name true)))
+                                         (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)]
+                                                       (if (dwe/ok? fe) (recur (+ i 1) (vcat acc (first-field-vals fs name true))) (values acc fe)))
+                                         _ (recur (+ i 1) acc))))]
+                        (if (not (dwe/ok? re)) (values (v/null-v) re) (rt/ret (if (= (count r) 0) (v/null-v) (v/->VArr r))))))))))
+
+(defn- multi-scan Values(v/Val dwe/DwErr) [q: &v/FSeq name: &Str]
+  (let [nx ((:open q) 0)]
+    (loop []
+      (let [[f done e] (nx 0)]
+        (cond (not (dwe/ok? e)) (values (v/null-v) e)
+              done (rt/ret (v/null-v))
+              (= (:name (:key f)) name) (rt/ret (v/->VSeq (named-seq q name)))
+              :else (recur))))))
+
+(defn- named-seq v/Seq [q: v/FSeq name: Str]
+  (let [fq q nm name]
+    (v/->Seq (fn Fn(Int Values(v/Val Bool dwe/DwErr)) [k: Int]
+               (let [nx ((:open fq) 0)]
+                 (fn Values(v/Val Bool dwe/DwErr) [k2: Int]
+                   (loop []
+                     (let [[f done e] (nx 0)]
+                       (cond (not (dwe/ok? e)) (values (v/null-v) true e)
+                             done (values (v/null-v) true (dwe/ok))
+                             (= (:name (:key f)) nm) (values (with-key-attrs (:value f) (:key f)) false (dwe/ok))
+                             :else (recur))))))))))
+
+(defn vcat Vec(v/Val) [a: Vec(v/Val) b: &Vec(v/Val)]
+  (loop [acc a i 0] (if (>= i (count b)) acc (recur (conj acc (nth b i)) (+ i 1)))))
+
+(defn desc-sel Values(v/Val dwe/DwErr) [t0: &v/Val name: &Str all: Bool]
+  (if (not (val-coll? t0)) (desc-err)
+    (let [[r e] (if (= name "") (desc-all [] t0) (desc-collect [] t0 name all))] (arr-ret r e))))
+
+(defn- val-coll? Bool [t: &v/Val] (match (v/unmeta t) (v/VObj fs) true (v/VOSeq q) true (v/VArr xs) true (v/VSeq q) true (v/VRange a b) true _ false))
+(defn- desc-err Values(v/Val dwe/DwErr) [] (rt/failure "InvalidSelector" "You called the function 'Descendants Selector ..' with these arguments: "))
+
+(defn- desc-collect Values(Vec(v/Val) dwe/DwErr) [acc: Vec(v/Val) t0: &v/Val name: &Str all: Bool]
+  (let [t (v/unmeta t0)]
+    (match t
+      (v/VObj fs) (let [here: Vec(v/Val) (first-field-vals fs name all)
+                        acc2 (vcat acc here)]
+                    (loop [a acc2 i 0]
+                      (if (>= i (count fs)) (values a (dwe/ok))
+                        (let [[a2 e] (desc-collect a (:value (nth fs i)) name all)] (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e))))))
+      (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (desc-collect acc (v/->VObj fs) name all) (values acc fe)))
+      _ (let [[xs arr ie] (arr-items t)]
+          (if (or (not arr) (not (dwe/ok? ie))) (values acc ie)
+            (loop [a acc i 0]
+              (if (>= i (count xs)) (values a (dwe/ok))
+                (let [[a2 e] (desc-collect a (nth xs i) name all)] (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e))))))))))
+
+(defn- desc-all Values(Vec(v/Val) dwe/DwErr) [acc: Vec(v/Val) t0: &v/Val]
+  (let [t (v/unmeta t0)]
+    (match t
+      (v/VObj fs) (loop [a acc i 0]
+                    (if (>= i (count fs)) (values a (dwe/ok))
+                      (let [x (:value (nth fs i)) [a2 e] (desc-all (conj a x) x)] (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e)))))
+      (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (desc-all acc (v/->VObj fs)) (values acc fe)))
+      _ (let [[xs arr ie] (arr-items t)]
+          (if (or (not arr) (not (dwe/ok? ie))) (values acc ie)
+            (loop [a acc i 0]
+              (if (>= i (count xs)) (values a (dwe/ok))
+                (let [[a2 e] (desc-all a (nth xs i))] (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e))))))))))
+
+(defn- norm-index Int [i: Int n: Int]
+  (let [j (if (< i 0) (+ n i) i)] (if (or (< j 0) (>= j n)) -1 j)))
+
+(defn index-sel Values(v/Val dwe/DwErr) [t0: &v/Val i: Int]
+  (let [t (v/unmeta t0)]
+    (match t
+      (v/VArr xs) (let [j (norm-index i (count xs))] (rt/ret (if (< j 0) (v/null-v) (nth xs j))))
+      (v/VSeq q) (if (>= i 0) (seq-nth q i)
+                   (let [[xs e] (v/seq-vec q)] (if (dwe/ok? e) (index-sel (v/->VArr xs) i) (values (v/null-v) e))))
+      (v/VRange a b) (let [[x ok] (v/range-index a b i)] (rt/ret (if ok (v/int-v x) (v/null-v))))
+      (v/VStr s) (let [n (u8/codepoint-count s) j (norm-index i n)] (rt/ret (if (< j 0) (v/null-v) (v/->VStr (uni/sub-cp s j (+ j 1))))))
+      (v/VObj fs) (let [j (norm-index i (count fs))] (rt/ret (if (< j 0) (v/null-v) (:value (nth fs j)))))
+      (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (index-sel (v/->VObj fs) i) (values (v/null-v) fe)))
+      (v/VNull) (rt/ret (v/null-v))
+      _ (rt/failure "InvalidSelector" (str "Cannot select index " i " from " (v/type-name t))))))
+
+(defn- seq-nth Values(v/Val dwe/DwErr) [q: &v/Seq i: Int]
+  (let [nx ((:open q) 0)]
+    (loop [k 0]
+      (let [[x done e] (nx 0)]
+        (cond (not (dwe/ok? e)) (values (v/null-v) e)
+              done (rt/ret (v/null-v))
+              (= k i) (rt/ret x)
+              :else (recur (+ k 1)))))))
+
+(defn range-sel Values(v/Val dwe/DwErr) [t0: &v/Val a: Int b: Int]
+  (let [t (v/unmeta t0)]
+    (match t
+      (v/VArr xs) (rt/ret (slice-or-null xs a b))
+      (v/VSeq q) (let [[xs e] (v/seq-vec q)] (if (dwe/ok? e) (rt/ret (slice-or-null xs a b)) (values (v/null-v) e)))
+      (v/VRange p q) (let [[x okx] (v/range-index p q a) [y oky] (v/range-index p q b)]
+                       (rt/ret (if (and okx oky) (v/materialize (v/->VRange x y)) (v/null-v))))
+      (v/VStr s) (let [cps (u8/codepoint-count s) i (norm-index a cps) j (norm-index b cps)]
+                   (if (or (< i 0) (< j 0)) (rt/ret (v/null-v))
+                     (if (<= i j) (rt/ret (v/->VStr (uni/sub-cp s i (+ j 1))))
+                       (rt/ret (v/->VStr (reverse-cps (uni/sub-cp s j (+ i 1))))))))
+      (v/VNull) (rt/ret (v/null-v))
+      _ (rt/failure "InvalidSelector" (str "Cannot select a range from " (v/type-name t))))))
+
+(defn- slice-or-null v/Val [xs: &Vec(v/Val) a: Int b: Int]
+  (let [n (count xs)]
+    (if (or (< (norm-index a n) 0) (< (norm-index b n) 0)) (v/null-v) (v/->VArr (slice-vec xs a b)))))
+
+(defn- slice-vec Vec(v/Val) [xs: &Vec(v/Val) a: Int b: Int]
+  (let [n (count xs) i (norm-index a n) j (norm-index b n)]
+    (if (or (< i 0) (< j 0)) []
+      (if (<= i j)
+        (loop [acc: Vec(v/Val) [] k i] (if (> k j) acc (recur (conj acc (nth xs k)) (+ k 1))))
+        (loop [acc: Vec(v/Val) [] k i] (if (< k j) acc (recur (conj acc (nth xs k)) (- k 1))))))))
+
+(defn- reverse-cps Str [s: &Str]
+  (let [n (u8/codepoint-count s)]
+    (loop [out "" k (- n 1)] (if (< k 0) out (recur (str out (uni/sub-cp s k (+ k 1))) (- k 1))))))
+
+(defn first-field-val v/Val [fs: &Vec(v/Field) name: &Str]
+  (loop [i 0]
+    (if (>= i (count fs)) (v/null-v)
+      (let [f (nth fs i)]
+        (if (= (:name (:key f)) name) (with-key-attrs (:value f) (:key f)) (recur (+ i 1)))))))
+
+(defn- first-field-vals Vec(v/Val) [fs: &Vec(v/Field) name: &Str all: Bool]
+  (field-vals fs name all false ""))
+
+(defn- field-vals Vec(v/Val) [fs: &Vec(v/Field) name: &Str all: Bool has-ns: Bool uri: &Str]
+  (loop [i 0 acc: Vec(v/Val) []]
+    (if (or (>= i (count fs)) (and (not all) (> (count acc) 0))) acc
+      (let [f (nth fs i) k (:key f)
+            hit (and (= (:name k) name)
+                     (or (not has-ns)
+                         (if (= (count (:ns k)) 0) (= uri "") (= (:uri (nth (:ns k) 0)) uri))))]
+        (recur (+ i 1) (if hit (conj acc (with-key-attrs (:value f) k)) acc))))))
+
+(defn qname-sel Values(v/Val dwe/DwErr) [t0: &v/Val kind: Int uri: &Str name: &Str]
+  (let [t (v/unmeta t0)]
+    (cond
+      (and (>= kind 2) (not (val-coll? t))) (desc-err)
+      (>= kind 2) (let [[r e] (desc-ns [] t name (= kind 3) uri)] (arr-ret r e))
+      :else
+      (match t
+        (v/VObj fs) (let [r (field-vals fs name (= kind 1) true uri)]
+                      (rt/ret (if (= kind 1) (if (= (count r) 0) (v/null-v) (v/->VArr r))
+                                (if (= (count r) 0) (v/null-v) (nth r 0)))))
+        (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (qname-sel (v/->VObj fs) kind uri name) (values (v/null-v) fe)))
+        _ (let [[xs arr ie] (arr-items t)]
+            (cond (not (dwe/ok? ie)) (values (v/null-v) ie)
+                  (not arr) (rt/ret (v/null-v))
+                  :else (let [[r re] (loop [i 0 acc: Vec(v/Val) []]
+                                       (if (>= i (count xs)) (values acc (dwe/ok))
+                                         (match (v/unmeta (nth xs i))
+                                           (v/VObj fs) (recur (+ i 1) (vcat acc (field-vals fs name (= kind 1) true uri)))
+                                           (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)]
+                                                         (if (dwe/ok? fe) (recur (+ i 1) (vcat acc (field-vals fs name (= kind 1) true uri))) (values acc fe)))
+                                           _ (recur (+ i 1) acc))))]
+                          (if (not (dwe/ok? re)) (values (v/null-v) re) (rt/ret (if (= (count r) 0) (v/null-v) (v/->VArr r)))))))))))
+
+(defn- desc-ns Values(Vec(v/Val) dwe/DwErr) [acc: Vec(v/Val) t0: &v/Val name: &Str all: Bool uri: &Str]
+  (let [t (v/unmeta t0)]
+    (match t
+      (v/VObj fs) (loop [a (vcat acc (field-vals fs name all true uri)) i 0]
+                    (if (>= i (count fs)) (values a (dwe/ok))
+                      (let [[a2 e] (desc-ns a (:value (nth fs i)) name all uri)] (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e)))))
+      (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (desc-ns acc (v/->VObj fs) name all uri) (values acc fe)))
+      _ (let [[xs arr ie] (arr-items t)]
+          (if (or (not arr) (not (dwe/ok? ie))) (values acc ie)
+            (loop [a acc i 0]
+              (if (>= i (count xs)) (values a (dwe/ok))
+                (let [[a2 e] (desc-ns a (nth xs i) name all uri)] (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e))))))))))
+
+(defn with-key-attrs v/Val [x: v/Val k: &v/Key]
+  (if (and (= (count (:attrs k)) 0) (= (count (:ns k)) 0)) x
+    (let [as (:attrs k)
+          fs (loop [i 0 acc: Vec(v/Field) []]
+               (if (>= i (count as)) acc
+                 (let [a (nth as i)] (recur (+ i 1) (conj acc (v/->Field (v/->Key (:ns a) (:name a) []) (:value a)))))))]
+      (v/->VMeta x (if (= (count (:ns k)) 0) [(v/field "@attrs" (v/->VObj fs))]
+                     [(v/field "@attrs" (v/->VObj fs)) (v/field "@ns" (v/->VNsV (nth (:ns k) 0)))])))))
+
+(defn- key-attr-fields Vec(v/Field) [k: &v/Key]
+  (let [as (:attrs k)]
+    (loop [i 0 acc: Vec(v/Field) []]
+      (if (>= i (count as)) acc
+        (let [a (nth as i)] (recur (+ i 1) (conj acc (v/->Field (v/->Key (:ns a) (:name a) []) (:value a)))))))))
+
+(defn- attrs-of Vec(v/Field) [t: &v/Val]
+  (match t
+    (v/VKey k) (key-attr-fields k)
+    (v/VMeta x m) (let [r (v/obj-get m "@attrs")]
+                    (if (= (count r) 0) (attrs-of x)
+                      (match (nth r 0) (v/VObj fs) fs _ [])))
+    _ []))
+
+(defn- key-attrs? Bool [t: &v/Val]
+  (match t (v/VMeta x m) (or (> (count (v/obj-get m "@attrs")) 0) (key-attrs? x)) _ false))
+
+(defn attr-sel Values(v/Val dwe/DwErr) [t: &v/Val name: &Str]
+  (let [[xs arr ie] (arr-items (if (key-attrs? t) (v/null-v) (v/unmeta t)))]
+    (cond (not (dwe/ok? ie)) (values (v/null-v) ie)
+          arr (let [r (loop [i 0 acc: Vec(v/Val) []]
+                        (if (>= i (count xs)) acc
+                          (let [g (v/obj-get (attrs-of (nth xs i)) name)] (recur (+ i 1) (if (= (count g) 0) acc (conj acc (nth g 0)))))))]
+                (rt/ret (if (= (count r) 0) (v/null-v) (v/->VArr r))))
+          :else (let [fs (attrs-of t) r (v/obj-get fs name)]
+                  (rt/ret (if (= (count r) 0) (v/null-v) (nth r 0)))))))
+
+(defn all-attrs-sel Values(v/Val dwe/DwErr) [t: &v/Val]
+  (let [[xs arr ie] (arr-items (if (key-attrs? t) (v/null-v) (v/unmeta t)))]
+    (cond (not (dwe/ok? ie)) (values (v/null-v) ie)
+          arr (let [r (loop [i 0 acc: Vec(v/Val) []]
+                        (if (>= i (count xs)) acc
+                          (let [fs (attrs-of (nth xs i))] (recur (+ i 1) (if (= (count fs) 0) acc (conj acc (v/->VObj fs)))))))]
+                (rt/ret (if (= (count r) 0) (v/null-v) (v/->VArr r))))
+          :else (let [fs (attrs-of t)] (rt/ret (if (= (count fs) 0) (v/null-v) (v/->VObj fs)))))))
+
+(defn meta-sel Values(v/Val dwe/DwErr) [t: &v/Val name: &Str]
+  (let [fs (match t (v/VMeta x m) m _ [])]
+    (if (= name "") (rt/ret (v/->VObj fs))
+      (let [r (v/obj-get fs name)] (rt/ret (if (= (count r) 0) (v/null-v) (nth r 0)))))))
+
+(defn kv-sel Values(v/Val dwe/DwErr) [t0: &v/Val name: &Str]
+  (let [[fs e] (kv-collect [] (v/unmeta t0) name)]
+    (if (dwe/ok? e) (rt/ret (if (= (count fs) 0) (v/null-v) (v/->VObj fs))) (values (v/null-v) e))))
+
+(defn- kv-collect Values(Vec(v/Field) dwe/DwErr) [acc: Vec(v/Field) t: &v/Val name: &Str]
+  (match t
+    (v/VObj fs) (values (loop [a acc i 0]
+                          (if (>= i (count fs)) a
+                            (recur (if (= (:name (:key (nth fs i))) name) (conj a (nth fs i)) a) (+ i 1))))
+                        (dwe/ok))
+    (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (kv-collect acc (v/->VObj fs) name) (values acc fe)))
+    _ (let [[xs arr ie] (arr-items t)]
+        (if (or (not arr) (not (dwe/ok? ie))) (values acc ie)
+          (loop [a acc i 0]
+            (if (>= i (count xs)) (values a (dwe/ok))
+              (let [[a2 e] (kv-collect a (v/unmeta (nth xs i)) name)] (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e)))))))))
+
+(defn desc-kv-sel Values(v/Val dwe/DwErr) [t0: &v/Val name: &Str]
+  (if (not (val-coll? t0)) (desc-err)
+    (let [[r e] (desc-kv-collect [] t0 name)] (arr-ret r e))))
+
+(defn- desc-kv-collect Values(Vec(v/Val) dwe/DwErr) [acc: Vec(v/Val) t0: &v/Val name: &Str]
+  (let [t (v/unmeta t0)]
+    (match t
+      (v/VObj fs) (let [[here he] (kv-collect [] t name)
+                        acc2 (if (= (count here) 0) acc (conj acc (v/->VObj here)))]
+                    (if (not (dwe/ok? he)) (values acc he)
+                      (loop [a acc2 i 0]
+                        (if (>= i (count fs)) (values a (dwe/ok))
+                          (let [[a2 e] (desc-kv-collect a (:value (nth fs i)) name)] (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e)))))))
+      (v/VOSeq q) (let [[fs fe] (v/fseq-vec q)] (if (dwe/ok? fe) (desc-kv-collect acc (v/->VObj fs) name) (values acc fe)))
+      _ (let [[xs arr ie] (arr-items t)]
+          (if (or (not arr) (not (dwe/ok? ie))) (values acc ie)
+            (loop [a acc i 0]
+              (if (>= i (count xs)) (values a (dwe/ok))
+                (let [[a2 e] (desc-kv-collect a (nth xs i) name)] (if (dwe/ok? e) (recur a2 (+ i 1)) (values a2 e))))))))))
+
+(defn ns-sel Values(v/Val dwe/DwErr) [t: &v/Val]
+  (match t
+    (v/VKey k) (rt/ret (if (= (count (:ns k)) 0) (v/null-v) (v/->VNsV (nth (:ns k) 0))))
+    (v/VMeta x m) (let [r (v/obj-get m "@ns")] (if (= (count r) 0) (ns-sel x) (rt/ret (nth r 0))))
+    _ (rt/ret (v/null-v))))

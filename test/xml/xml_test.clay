@@ -1,0 +1,234 @@
+(ns xml-test (:require [mulay.lib.xml :as xml] [clay.string :as str]))
+(deftest decode-basic
+  (is (let [[t enc e] (xml/decode-to-utf8 "<a/>")] (and (= t "<a/>") (= enc "UTF-8") (= e ""))))
+  (is (let [[t enc e] (xml/decode-to-utf8 (str "<?xml version='1.0' encoding='ISO-8859-1'?><a>" (chr 233) "</a>"))]
+        (and (= enc "ISO-8859-1") (= t (str "<?xml version='1.0' encoding='ISO-8859-1'?><a>" (chr 195) (chr 169) "</a>")))))
+  (is (let [[t enc e] (xml/decode-to-utf8 (str "<a>" (chr 13) (chr 10) "x" (chr 13) "y</a>"))] (= t "<a>\nx\ny</a>")))
+  ;; 表の文字コード (clay.charset)
+  (is (let [[t enc e] (xml/decode-to-utf8 (str "<?xml version='1.0' encoding='Shift_JIS'?><a>" (chr 0x82) (chr 0xA0) "</a>"))]
+        (and (= e "") (= enc "Shift_JIS") (= t "<?xml version='1.0' encoding='Shift_JIS'?><a>あ</a>"))))
+  (is (let [[t enc e] (xml/decode-to-utf8 "<?xml version='1.0' encoding='x-nothing'?><a/>")] (= e "unsupported encoding: X-NOTHING"))))
+(defn evs Str [src: Str]
+  (let [[r0 e0] (xml/reader src (xml/default-opts))]
+    (if (not (= e0 "")) (str "ERR " e0)
+      (loop [r r0 out ""]
+        (let [[r2 ev err] (xml/next-event r)]
+          (if (not (= err "")) (str out "ERR " err)
+            (match ev
+              (xml/XeStartDoc v e s) (recur r2 (str out "SD(" v "," e "," s ")"))
+              (xml/XeDoctype n p s) (recur r2 (str out "DT(" n ")"))
+              (xml/XeStart n as ns) (recur r2 (str out "S(" (xml/qname-str n) "{" (:uri n) "}"
+                                               (loop [i 0 o ""] (if (>= i (count as)) o (recur (+ i 1) (str o " " (xml/qname-str (:name (nth as i))) "=" (:value (nth as i))))))
+                                               ")"))
+              (xml/XeEnd n) (recur r2 (str out "E(" (xml/qname-str n) ")"))
+              (xml/XeText t) (recur r2 (str out "T(" t ")"))
+              (xml/XeCData t) (recur r2 (str out "C(" t ")"))
+              (xml/XeComment t) (recur r2 (str out "!(" t ")"))
+              (xml/XePI t d) (recur r2 (str out "?(" t "," d ")"))
+              (xml/XeEndDoc) (str out "ED"))))))))
+(deftest events-basic
+  (is (= (evs "<a/>") "SD(,,)S(a{})E(a)ED"))
+  (is (= (evs "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a x='1'>hi &amp; <b>there</b><!--c--><?p d?><![CDATA[<x>]]></a>\n")
+         "SD(1.0,UTF-8,)S(a{} x=1)T(hi & )S(b{})T(there)E(b)!(c)?(p,d)C(<x>)E(a)ED"))
+  (is (= (evs "<a><b></a>") "SD(,,)S(a{})S(b{})ERR line 1, column 7: mismatched end tag: expected </b> but found </a>")))
+(deftest dom-basic
+  (is (let [[d err] (xml/parse "<?xml version='1.0'?><!--x--><r xmlns='urn:a' xmlns:p='urn:p' p:k='v'><c>t1</c>mid<p:c>t2<![CDATA[t3]]></p:c></r>")
+            root (xml/doc-root d)]
+        (and (= err "") (= (xml/elem-local root) "r") (= (xml/elem-uri root) "urn:a")
+             (= (count (:children d)) 2)
+             (= (xml/attr root "urn:p" "k" "?") "v")
+             (= (count (xml/child-elems root)) 2)
+             (= (xml/elem-uri (nth (xml/child-elems root) 1)) "urn:p")
+             (= (xml/text-content root) "t1midt2t3")
+             (= (:encoding d) "UTF-8")))))
+(defn wopts xml/XwOpts [indent: Str decl: Bool] (assoc (xml/default-wopts) :indent indent :decl decl))
+(deftest writer-basic
+  (is (let [w (xml/writer (wopts "" false))
+            w (xml/w-start w (xml/qname "" "" "a"))
+            w (xml/w-attr w (xml/qname "" "" "x") "1<\"&")
+            w (xml/w-text w "a<b&c>d")
+            w (xml/w-start w (xml/qname "" "" "e"))
+            w (xml/w-end w)
+            w (xml/w-end w)
+            [out err] (xml/w-finish w)]
+        (= out "<a x=\"1&lt;&quot;&amp;\">a&lt;b&amp;c&gt;d<e/></a>")))
+  (is (let [w (xml/writer (wopts "  " true))
+            w (xml/w-start w (xml/qname "urn:a" "" "a"))
+            w (xml/w-start w (xml/qname "urn:b" "p" "b"))
+            w (xml/w-attr w (xml/qname "urn:c" "" "k") "v")
+            w (xml/w-text w "t")
+            w (xml/w-end w)
+            w (xml/w-start w (xml/qname "urn:a" "" "c"))
+            [out err] (xml/w-finish w)]
+        (= out "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a xmlns=\"urn:a\">\n  <p:b xmlns:p=\"urn:b\" xmlns:ns0=\"urn:c\" ns0:k=\"v\">t</p:b>\n  <c/>\n</a>"))))
+(deftest entities
+  (is (= (evs "<!DOCTYPE r [<!ENTITY e \"x&#65;y\"><!ENTITY f \"[&e;]\">]><r a='&f;'>&f;&#x42;&#67;&lt;</r>")
+         "SD(,,)DT(r)S(r{} a=[xAy])T([xAy]BC<)E(r)ED"))
+  ;; entity containing markup is parsed as content
+  (is (= (evs "<!DOCTYPE r [<!ENTITY m \"<b>in</b>t\">]><r>a&m;z</r>")
+         "SD(,,)DT(r)S(r{})T(a)S(b{})T(in)E(b)T(tz)E(r)ED"))
+  ;; external entities are never fetched; a reference to one is an error in content and in an attribute value
+  ;; (Woodstox: isSupportingExternalEntities disabled)
+  (is (= (xml-err "<!DOCTYPE r [<!ENTITY x SYSTEM \"file:///etc/passwd\">]><r>a&x;b</r>")
+         "line 1, column 59: reference to external entity 'x' is not allowed"))
+  (is (= (xml-err "<!DOCTYPE r [<!ENTITY x SYSTEM \"file:///etc/passwd\">]><r a='&x;'/>")
+         "line 1, column 61: reference to external entity 'x' is not allowed in an attribute value"))
+  (is (str/includes? (xml-err "<r>&nope;</r>") "undeclared entity 'nope'"))
+  (is (str/includes? (xml-err "<!DOCTYPE r [<!ENTITY a \"&b;\"><!ENTITY b \"&a;\">]><r>&a;</r>") "recursive reference"))
+  ;; attribute value normalization: literal whitespace -> space, char refs kept
+  (is (= (evs "<r a=\"x\ty\nz&#10;w\"/>") "SD(,,)S(r{} a=x y z\nw)E(r)ED")))
+(deftest billion-laughs
+  (is (let [lol (str "<!DOCTYPE lolz [<!ENTITY lol \"lol\">"
+                     "<!ENTITY lol1 \"&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;\">"
+                     "<!ENTITY lol2 \"&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;\">"
+                     "<!ENTITY lol3 \"&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;\">"
+                     "<!ENTITY lol4 \"&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;\">"
+                     "<!ENTITY lol5 \"&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;\">"
+                     "<!ENTITY lol6 \"&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;\">"
+                     "<!ENTITY lol7 \"&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;\">"
+                     "<!ENTITY lol8 \"&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;\">"
+                     "<!ENTITY lol9 \"&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;\">"
+                     "]><lolz a='&lol9;'>&lol9;</lolz>")
+            [d err] (xml/parse lol)]
+        (str/includes? err "Maximum entity expansion count limit")))
+  (is (let [lol (str "<!DOCTYPE lolz [<!ENTITY lol \"lol\">"
+                     "<!ENTITY lol1 \"&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;\">"
+                     "<!ENTITY lol2 \"&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;\">"
+                     "<!ENTITY lol3 \"&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;\">"
+                     "<!ENTITY lol4 \"&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;\">"
+                     "<!ENTITY lol5 \"&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;\">"
+                     "<!ENTITY lol6 \"&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;\">"
+                     "]><lolz>&lol6;</lolz>")
+            [d err] (xml/parse lol)]
+        (str/includes? err "Maximum entity expansion count limit"))))
+(deftest wf-errors
+  (is (= (xml-err "") "line 1, column 1: no root element"))
+  (is (= (xml-err "<a>") "line 1, column 4: unexpected end of input: element <a> is not closed"))
+  (is (= (xml-err "<a></a><b/>") "line 1, column 8: only one root element is allowed"))
+  (is (= (xml-err "<a x='1' x='2'/>") "line 1, column 10: duplicate attribute 'x'"))
+  (is (= (xml-err "<a xmlns:p='u' xmlns:q='u' p:x='1' q:x='2'/>") "line 1, column 36: duplicate attribute 'x' in namespace 'u'"))
+  (is (= (xml-err "<p:a/>") "line 1, column 1: unbound namespace prefix 'p' on element <p:a>"))
+  (is (= (xml-err "<a x='1' y='2' x='3'/>") "line 1, column 16: duplicate attribute 'x'"))
+  (is (= (xml-err "<a a0='0' a1='1' a2='2' a3='3' a4='4' a5='5' a6='6' a7='7' a8='8' a9='9' a10='10' a11='11' a12='12' a13='13' a14='14' a15='15' a16='16' a5='x'/>") "line 1, column 137: duplicate attribute 'a5'"))
+  (is (= (xml-err "<a xmlns:p='u' xmlns:q='u' p:x='1' q:x='2' r:y='3'/>") "line 1, column 36: duplicate attribute 'x' in namespace 'u'"))
+  (is (= (xml-err "<a xmlns:p='u' xmlns:q='u' p:a0='0' p:a1='1' p:a2='2' p:a3='3' p:a4='4' p:a5='5' p:a6='6' p:a7='7' p:a8='8' p:a9='9' p:a10='10' p:a11='11' p:a12='12' p:a13='13' p:a14='14' p:a15='15' q:a7='x'/>") "line 1, column 184: duplicate attribute 'a7' in namespace 'u'"))
+  (is (= (xml-err "<a>\n  <b>x & y</b></a>") "line 2, column 8: malformed entity reference ('&' must be escaped as &amp;)"))
+  (is (= (xml-err "<a>]]></a>") "line 1, column 4: ']]>' is not allowed in content"))
+  (is (= (xml-err "<a><!-- x -- y --></a>") "line 1, column 11: '--' is not allowed inside a comment"))
+  (is (= (xml-err "<a b=c/>") "line 1, column 6: attribute value must be quoted"))
+  (is (= (xml-err "<a b='<'/>") "line 1, column 7: '<' is not allowed in an attribute value"))
+  (is (= (xml-err "text<a/>") "line 1, column 1: content is not allowed in prolog"))
+  (is (= (xml-err "<a/>x") "line 1, column 5: content is not allowed after the root element"))
+  (is (= (xml-err " <?xml version='1.0'?><a/>") "line 1, column 2: XML declaration is only allowed at the start of the document"))
+  (is (= (xml-err (str "<a>" (chr 1) "</a>")) "line 1, column 4: illegal XML character in content"))
+  (is (= (xml-err "<a>&#0;</a>") "line 1, column 4: character reference to an illegal XML character (#0)"))
+  (is (= (xml-err "<a x='1'y='2'/>") "line 1, column 9: whitespace required between attributes"))
+  (is (= (xml-err "<?xml version='2.0'?><a/>") "line 1, column 7: unsupported XML version '2.0'"))
+  (is (= (xml-err (str "<a>" (chr 255) "</a>")) "invalid UTF-8 byte sequence at byte offset 3"))
+  (is (= (xml-err "<a xmlns:p=''/>") "line 1, column 4: namespace prefix 'p' cannot be undeclared"))
+  (is (= (xml-err "<é>ü</é>") "")))
+(deftest namespaces
+  (is (= (evs "<a xmlns='urn:d' xmlns:x='urn:x'><b x:y='1' z='2'/><c xmlns=''/><x:d/></a>")
+         "SD(,,)S(a{urn:d})S(b{urn:d} x:y=1 z=2)E(b)S(c{})E(c)S(x:d{urn:x})E(x:d)E(a)ED"))
+  (is (let [[r0 e0] (xml/reader "<a xml:lang='en' xmlns:q='urn:q'/>" (xml/default-opts))
+            [r1 e1 x1] (xml/next-event r0)
+            [r2 ev x2] (xml/next-event r1)]
+        (match ev
+          (xml/XeStart n as ns) (and (= (count as) 1) (= (:uri (:name (nth as 0))) "http://www.w3.org/XML/1998/namespace")
+                                     (= (count ns) 1) (= (:prefix (nth ns 0)) "q") (= (:uri (nth ns 0)) "urn:q"))
+          _ false))))
+(deftest encodings
+  ;; UTF-16LE with BOM: <a>é</a>
+  (is (let [src (str (chr 255) (chr 254) "<" (chr 0) "a" (chr 0) ">" (chr 0) (chr 233) (chr 0) "<" (chr 0) "/" (chr 0) "a" (chr 0) ">" (chr 0))
+            [d err] (xml/parse src)]
+        (and (= err "") (= (xml/text-content (xml/doc-root d)) "é") (= (:encoding d) "UTF-16LE"))))
+  (is (let [src (str (chr 254) (chr 255) (chr 0) "<" (chr 0) "a" (chr 0) "/" (chr 0) ">")
+            [d err] (xml/parse src)]
+        (and (= err "") (= (xml/elem-local (xml/doc-root d)) "a"))))
+  (is (let [[d err] (xml/parse (str (chr 239) (chr 187) (chr 191) "<a>x</a>"))] (= (xml/text-content (xml/doc-root d)) "x")))
+  (is (let [[d err] (xml/parse (str "<?xml version='1.0' encoding='windows-1252'?><a>" (chr 128) "</a>"))]
+        (= (xml/text-content (xml/doc-root d)) "€")))
+  (is (let [[d err] (xml/parse "<?xml version='1.0' encoding='EBCDIC'?><a/>")] (= err "unsupported encoding: EBCDIC")))
+  (is (let [[d err] (xml/parse "<a>\r\nx\ry</a>")] (= (xml/text-content (xml/doc-root d)) "\nx\ny")))
+  (is (let [[out err] (xml/encode-from-utf8 "aé€" "ISO-8859-1")] (= out (str "a" (chr 233) "&#8364;"))))
+  (is (let [[out err] (xml/encode-from-utf8 "a€" "UTF-16LE")] (= out (str "a" (chr 0) (chr 172) (chr 32))))))
+(defn deep Str [n: Int]
+  (let [o (loop [i 0 s ""] (if (>= i n) s (recur (+ i 1) (str s "<d>"))))]
+    (loop [i 0 s (str o "x")] (if (>= i n) s (recur (+ i 1) (str s "</d>"))))))
+(deftest deep-nesting
+  (is (let [[d err] (xml/parse (deep 9000))] (and (= err "") (= (xml/text-content (xml/doc-root d)) "x"))))
+  (is (let [[d err] (xml/parse (deep 10001))] (str/includes? err "maximum depth"))))
+(deftest large-flat
+  (is (let [src (loop [i 0 s "<r>"] (if (>= i 20000) (str s "</r>") (recur (+ i 1) (str s "<i n='" i "'>v" i "</i>"))))
+            [d err] (xml/parse src)
+            kids (xml/child-elems (xml/doc-root d))]
+        (and (= err "") (= (count kids) 20000) (= (xml/attr (nth kids 19999) "" "n" "") "19999")))))
+(deftest roundtrip
+  (is (let [src "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!--c-->\n<r xmlns=\"urn:a\" xmlns:b=\"urn:b\" b:at=\"1 &amp; 2\"><b:x>t&lt;</b:x><y/><![CDATA[c]]><?pi d?></r>"
+            [d err] (xml/parse src)
+            [out werr] (xml/write-doc (xml/default-wopts) d)]
+        (= out src)))
+  (is (let [[d err] (xml/parse "<r><a><b>1</b><c>2</c></a><m>t<i>x</i></m></r>")
+            [out werr] (xml/write-doc (assoc (xml/default-wopts) :indent "  " :decl false) d)]
+        (= out "<r>\n  <a>\n    <b>1</b>\n    <c>2</c>\n  </a>\n  <m>t<i>x</i></m>\n</r>"))))
+(defn xml-err Str [src: Str] (let [[d err] (xml/parse src)] err))
+(deftest dom-options
+  (is (let [[d err] (xml/parse-with "<a>\n  <b> x </b>\n  <c/>\n</a>" (assoc (xml/default-opts) :drop-ws-text true))
+            root (xml/doc-root d)]
+        (and (= (count (xml/elem-children root)) 2) (= (xml/text-content root) " x "))))
+  (is (let [[d err] (xml/parse "<!DOCTYPE a PUBLIC \"-//X//Y\" \"a.dtd\"><a/>")
+            [out werr] (xml/write-doc (assoc (xml/default-wopts) :decl false) d)]
+        (and (= (:doctype d) "a") (= (:public-id d) "-//X//Y") (= out "<!DOCTYPE a PUBLIC \"-//X//Y\" \"a.dtd\">\n<a/>"))))
+  (is (let [w (xml/writer (assoc (xml/default-wopts) :decl false :escape-gt false :short-empty false))
+            w (xml/w-start w (xml/qname "" "" "a"))
+            w (xml/w-text w "x > y ]]> z")
+            w (xml/w-start w (xml/qname "" "" "e"))
+            w (xml/w-end w)
+            w (xml/w-cdata w "a]]>b")
+            [out err] (xml/w-finish w)]
+        (= out "<a>x > y ]]&gt; z<e></e><![CDATA[a]]]]><![CDATA[>b]]></a>")))
+  (is (let [w (xml/writer (assoc (xml/default-wopts) :decl true :decl-single-quote true :encoding "ISO-8859-1"))
+            w (xml/w-start w (xml/qname "" "" "a"))
+            w (xml/w-text w "é€")
+            [out err] (xml/w-finish w)]
+        (= out (str "<?xml version='1.0' encoding='ISO-8859-1'?>\n<a>" (chr 233) "&#8364;</a>"))))
+  ;; the same prefix used for two namespaces on one element gets a fresh prefix
+  (is (let [w (xml/writer (assoc (xml/default-wopts) :decl false))
+            w (xml/w-start w (xml/qname "urn:a" "p" "a"))
+            w (xml/w-attr w (xml/qname "urn:b" "p" "x") "1")
+            [out err] (xml/w-finish w)]
+        (= out "<p:a xmlns:p=\"urn:a\" xmlns:ns0=\"urn:b\" ns0:x=\"1\"/>")))
+  (is (let [w (xml/writer (assoc (xml/default-wopts) :decl false))
+            w (xml/w-start w (xml/qname "urn:a" "" "a"))
+            w (xml/w-start w (xml/qname "" "" "b"))
+            [out err] (xml/w-finish w)]
+        (= out "<a xmlns=\"urn:a\"><b xmlns=\"\"/></a>"))))
+
+;; dtd が false なら内部サブセットの ENTITY と ATTLIST を読み飛ばす (DataWeave の supportDtd=false が既定)。
+;; max-expansions は文書全体の展開の回数で、ATTLIST の既定値の中の参照も数える (以前は宣言ごとに数え直し、
+;; ATTLIST を並べると上限を越えられた)。
+(defn- with-opts Str [src: Str dtd: Bool mx: Int]
+  (let [[d err] (xml/parse-with src (assoc (assoc (xml/default-opts) :dtd dtd) :max-expansions mx))]
+    (if (= err "") (xml/attr (nth (xml/child-elems (xml/doc-root d)) 0) "" "a" "-") err)))
+
+(deftest dtd-switch
+  (is (= (with-opts "<!DOCTYPE r [<!ATTLIST b a CDATA \"d\">]><r><b/></r>" true 100) "d"))
+  (is (= (with-opts "<!DOCTYPE r [<!ATTLIST b a CDATA \"d\">]><r><b/></r>" false 100) "-"))
+  (is (= (with-opts "<!DOCTYPE r [<!ENTITY e \"x\">]><r><b a='&e;'/></r>" true 100) "x"))
+  (is (= (with-opts "<!DOCTYPE r [<!ENTITY e \"x\">]><r><b a='&e;'/></r>" false 100) "line 1, column 40: undeclared entity 'e'"))
+  (is (= (with-opts "<!DOCTYPE r [<!ENTITY e \"x\">]><r><b a='&e;&e;'/></r>" true 1) "line 1, column 43: Maximum entity expansion count limit (1) exceeded"))
+  (is (str/includes? (with-opts "<!DOCTYPE r [<!ENTITY e \"x\"><!ATTLIST b a CDATA \"&e;\"><!ATTLIST c a CDATA \"&e;\">]><r><b/></r>" true 1)
+                     "Maximum entity expansion count limit (1) exceeded")))
+
+;; max-attrs: 1 つの要素の属性の数 (DataWeave は 1000、超えると "Attribute limit (1000) exceeded")。
+;; 重複の検査は名前の表で引く (以前は属性の数の 2 乗で、1MB の要素 1 つに 10 万属性で 35 秒)。
+(defn- many-attrs Str [n: Int] (loop [i 0 out "<r"] (if (>= i n) (str out "/>") (recur (+ i 1) (str out " a" i "=\"x\"")))))
+
+(defn- attrs-err Str [n: Int lim: Int]
+  (let [[d err] (xml/parse-with (many-attrs n) (assoc (xml/default-opts) :max-attrs lim))]
+    (if (= err "") (str (count (xml/elem-attrs (xml/doc-root d)))) err)))
+
+(deftest attribute-limit
+  (is (= (attrs-err 1000 1000) "1000"))
+  (is (= (attrs-err 1001 1000) "line 1, column 8894: Attribute limit (1000) exceeded"))
+  (is (= (attrs-err 100000 -1) "100000")))

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
+  <http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="18576"/></http:listener-config>
+  <file:config name="F"><file:connection workingDir="/tmp/mulay-oracle-file-read-large"/></file:config>
+  <flow name="seed">
+    <http:listener config-ref="L" path="/seed"/>
+    <file:write config-ref="F" path="big.txt"><file:content>#[output text/plain --- (1 to 70000) map ("line-" ++ $) joinBy "\n"]</file:content></file:write>
+    <set-payload value="seeded"/>
+  </flow>
+  <flow name="twice">
+    <http:listener config-ref="L" path="/twice"/>
+    <file:read config-ref="F" path="big.txt"/>
+    <set-variable variableName="first" value="#[output application/java --- sizeOf(payload as String)]"/>
+    <set-payload value="#[output application/json --- {first: vars.first, second: sizeOf(payload as String), head: (payload as String)[0 to 5], tail: (payload as String)[-10 to -1], mimeType: payload.^mimeType}]"/>
+  </flow>
+  <flow name="copy">
+    <http:listener config-ref="L" path="/copy"/>
+    <file:read config-ref="F" path="big.txt"/>
+    <file:write config-ref="F" path="copy.txt"/>
+    <file:read config-ref="F" path="copy.txt" target="back"/>
+    <set-payload value="#[output application/json --- {size: sizeOf(vars.back as String), same: (vars.back as String) == (payload as String)}]"/>
+  </flow>
+  <flow name="lines">
+    <http:listener config-ref="L" path="/lines"/>
+    <file:read config-ref="F" path="big.txt" outputMimeType="text/plain"/>
+    <set-payload value="#[output application/json --- do { var ls = (payload as String) splitBy &quot;\n&quot; --- {count: sizeOf(ls), last: ls[-1]} }]"/>
+  </flow>
+</mule>

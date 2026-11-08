@@ -1,0 +1,210 @@
+(ns lib-misc-test
+  (:require [mulay.lib.osinfo :as osi] [mulay.dw.loc :as dwloc] [mulay.dw.lib.binaries :as bin] [mulay.dw.lib.crypto :as cr] [mulay.lib.crypto :as lc] [mulay.dw.lib.url :as url]
+            [mulay.dw.lib.core_misc :as cm] [mulay.dw.lib.runtime :as rtl] [mulay.dw.lib.system :as sys]
+            [mulay.dw.lib.timer :as tm] [mulay.dw.engine :as eng] [mulay.dw.val :as v] [clay.string :as str]))
+
+;; 16 進 (小文字) の要約
+(defn- dg Str [alg: Str data: Str] (let [[h good] (lc/digest alg data)] (if good (bin/hex-lower h) "NOALG")))
+(defn- hm Str [alg: Str key: Str data: Str] (let [[h good] (lc/hmac alg key data)] (if good (bin/hex-lower h) "NOALG")))
+
+;; スクリプトを JSON (indent なし) で実行した結果、または "ERR: <message>"
+(defn- run Str [body: Str]
+  (let [[mime out err] (eng/run-text (str "%dw 2.0\nimport * from dw::Runtime\nimport * from dw::core::URL\nimport * from dw::core::Binaries\noutput application/json indent=false\n---\n" body) [])]
+    (if (= err "") out (str "ERR: " err))))
+
+;; 結果を 1 つの文字列にする補助 (deftest の中で let を使わないため)
+(defn- hexd Str [s: Str] (let [[b e] (bin/hex-decode s)] (if (= e "") (str "OK:" b) e)))
+(defn- b64d Str [s: Str] (let [[b e] (bin/b64-decode s)] (if (= e "") (str "OK:" b) e)))
+(defn- csd Str [b: Str cs: Str strict: Bool] (let [[s k n] (bin/cs-decode b cs strict)] (if (= k "") (str "OK:" s) (str k ":" n))))
+(defn- urld Str [s: Str] (let [[d good] (url/url-decode s)] (if good (str "OK:" d) "BAD")))
+(defn- lines Str [s: Str] (let [xs (bin/split-lines s)] (loop [i 0 out ""] (if (>= i (count xs)) out (recur (+ i 1) (str out "[" (match (nth xs i) (v/VStr t) t _ "?") "]"))))))
+
+(deftest digests-known-vectors
+  (is (= (dg "MD5" "") "d41d8cd98f00b204e9800998ecf8427e"))
+  (is (= (dg "MD5" "asd") "7815696ecbf1c96e6894b779456d330e"))
+  (is (= (dg "SHA1" "abc") "a9993e364706816aba3e25717850c26c9cd0d89d"))
+  (is (= (dg "SHA256" "abc") "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"))
+  (is (= (dg "SHA512-224" "abc") "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa"))
+  (is (= (dg "SHA3-256" "abc") "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532"))
+  (is (= (dg "NOPE" "abc") "NOALG")))
+
+(deftest md2-rfc1319-vectors
+  (is (= (bin/hex-lower (lc/md2 "")) "8350e5a3e24c153df2275c9f80692773"))
+  (is (= (bin/hex-lower (lc/md2 "abc")) "da853b0d3f88d99b30283a69e6ded6bb"))
+  (is (= (bin/hex-lower (lc/md2 "message digest")) "ab4f496bfb2a530b219ff33031fe06b0"))
+  (is (= (bin/hex-lower (lc/md2 "12345678901234567890123456789012345678901234567890123456789012345678901234567890"))
+         "d5976f79d83d3a0dc9806c3c66f3efd8")))
+
+(deftest hmac-rfc-vectors
+  ;; RFC 4231 test case 2 / RFC 2104
+  (is (= (hm "SHA256" "Jefe" "what do ya want for nothing?") "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"))
+  (is (= (hm "MD5" "Jefe" "what do ya want for nothing?") "750c783e6ab0b503eaa86e310a5db738"))
+  (is (= (hm "SHA256" "secret_key" "Some value to hash") "b51b4fe8c4e37304605753272b5b4321f9644a9b09cb1179d7016c25041d1747")))
+
+(deftest algorithm-names-follow-java
+  (is (= (cr/digest-name "sha-256") "SHA256"))
+  (is (= (cr/digest-name "SHA") "SHA1"))
+  (is (= (cr/digest-name "SHA512/224") "SHA512-224"))
+  (is (= (cr/digest-name "OID.2.16.840.1.101.3.4.2.1") "SHA256"))
+  (is (= (cr/digest-name "SHA-512224") ""))
+  (is (= (cr/hmac-name "hmacsha256") "SHA256"))
+  (is (= (cr/hmac-name "HmacSHA-256") ""))
+  (is (= (cr/hmac-name "SHA256") "")))
+
+(deftest hex-and-base64
+  (is (= (bin/hex-upper "Mule") "4D756C65"))
+  (is (= (hexd "4d756C65") "OK:Mule"))
+  (is (= (hexd "4D756C6") "hexBinary needs to be even-length: 4D756C6"))
+  (is (= (hexd "zz") "contains illegal character for hexBinary: zz"))
+  (is (= (bin/b64-encode "") ""))
+  (is (= (bin/b64-encode "M") "TQ=="))
+  (is (= (bin/b64-encode "Mu") "TXU="))
+  (is (= (bin/b64-encode "Mule") "TXVsZQ==")))
+
+(deftest base64-decode-like-java
+  (is (= (b64d "TXVsZQ==") "OK:Mule"))
+  (is (= (b64d "TXVsZQ") "OK:Mule"))
+  (is (= (b64d "TX\nVs ZQ==\t") "OK:Mule"))
+  (is (= (b64d "  ") "OK:"))
+  (is (= (b64d "@@") "Illegal base64 character 40"))
+  (is (= (b64d "TXVsZQ-_") "Illegal base64 character 2d"))
+  (is (= (b64d "TXVs=ZQ==") "Input byte array has wrong 4-byte ending unit"))
+  (is (= (b64d "TXVsZQ=") "Input byte array has wrong 4-byte ending unit"))
+  (is (= (b64d "TXVsZQ===") "Input byte array has incorrect ending byte at 8"))
+  (is (= (b64d "T") "Input byte[] should at least have 2 bytes for base64 bytes"))
+  (is (= (b64d "TXVsZ") "Last unit does not have enough valid bits")))
+
+(deftest charsets
+  (is (= (bin/charset-id "utf8") "UTF-8"))
+  (is (= (bin/charset-id "Latin1") "ISO-8859-1"))
+  (is (= (bin/charset-id "FOO") ""))
+  (is (= (bin/hex-upper (bin/cs-encode "a" "UTF-16")) "FEFF0061"))
+  (is (= (bin/hex-upper (bin/cs-encode "" "UTF-16")) ""))
+  (is (= (bin/cs-encode "éā" "ISO-8859-1") (str (chr 0xE9) "?")))
+  (is (= (bin/hex-upper (bin/cs-encode "€" "windows-1252")) "80"))
+  (is (= (csd (str (chr 0xFF) (chr 0xFE) "a" (chr 0)) "UTF-16" true) "OK:a"))
+  (is (= (csd (str "a" (chr 0xC3)) "UTF-8" true) "Malformed:1"))
+  (is (= (csd (str "a" (chr 0xC3)) "UTF-8" false) "OK:a�"))
+  (is (str/starts-with? (csd (chr 0x81) "windows-1252" true) "Unmappable:"))
+  (is (str/ends-with? (csd (str (chr 0xD8) (chr 0)) "UTF-16BE" true) ":2"))
+  (is (= (csd (str "a" (chr 0xE9)) "ISO-8859-1" true) "OK:aé")))
+
+;; clay.charset の表の文字コード (期待値は JDK 17 の String.getBytes / new String / CharsetDecoder の REPORT)
+(deftest charsets-table
+  (is (= (bin/charset-id "sjis") "Shift_JIS"))
+  (is (= (bin/charset-id "MS932") "windows-31j"))
+  (is (= (bin/charset-id "euc-jp") "EUC-JP"))
+  (is (= (bin/charset-id "ISO-8859-15") "ISO-8859-15"))
+  (is (= (bin/hex-upper (bin/cs-encode "あ～①" "Shift_JIS")) "82A03F3F"))
+  (is (= (bin/hex-upper (bin/cs-encode "あ～①" "windows-31j")) "82A081608740"))
+  (is (= (bin/hex-upper (bin/cs-encode "あ～①" "EUC-JP")) "A4A28FA2B73F"))
+  (is (= (csd (str (chr 0x82) (chr 0xA0)) "Shift_JIS" true) "OK:あ"))
+  (is (= (csd (str (chr 0x82) " ") "Shift_JIS" true) "Malformed:1"))
+  (is (= (csd (str (chr 0x82) " ") "Shift_JIS" false) "OK:� "))
+  (is (= (csd (chr 0xFF) "EUC-JP" true) "Malformed:1"))
+  (is (= (csd (str (chr 0x82) " ") "EUC-JP" false) "OK:�"))
+  (is (= (csd (str (chr 0x82) " ") "EUC-JP" true) "Unmappable:2")))
+
+(deftest readline-splitting
+  (is (= (lines "a\r\nb\rc\n\nd\n\n") "[a][b][c][][d][]"))
+  (is (= (lines "") "")))
+
+(deftest url-encoding
+  (is (= (url/percent-encode "a b+é#" url/COMPONENT-KEEP) "a%20b%2B%C3%A9%23"))
+  (is (= (url/percent-encode "a#b[c]é" url/URI-KEEP) "a#b%5Bc%5D%C3%A9"))
+  (is (= (url/percent-encode "-_.!~*'()" url/COMPONENT-KEEP) "-_.!~*'()"))
+  (is (= (urld "a%2Fb+c%3F") "OK:a/b c?"))
+  (is (= (urld "%E6%97%A5") "OK:日"))
+  (is (= (urld "a%2") "BAD"))
+  (is (= (urld "a%zz") "BAD")))
+
+(deftest parse-uri-like-java-net-uri
+  (is (= (run "parseURI(\"https://user:pass@example.com:8080/p/r?q=v#f\")")
+         "{\"isValid\": true,\"raw\": \"https://user:pass@example.com:8080/p/r?q=v#f\",\"host\": \"example.com\",\"authority\": \"user:pass@example.com:8080\",\"fragment\": \"f\",\"path\": \"/p/r\",\"port\": 8080,\"query\": \"q=v\",\"scheme\": \"https\",\"user\": \"user:pass\",\"isAbsolute\": true,\"isOpaque\": false}"))
+  (is (= (run "parseURI(\"mailto:a@b.c\").isOpaque") "true"))
+  (is (= (run "parseURI(\"not a uri []\").isValid") "false"))
+  (is (= (run "parseURI(\"http://under_score.com/p\").host") "null"))
+  (is (= (run "parseURI(\"http://h:99999999999/\").port") "null"))
+  (is (= (run "parseURI(\"http://[fe80::1%eth0]/\").host") "\"[fe80::1%eth0]\""))
+  (is (= (run "parseURI(\"http://[1:2:3:4:5:6:7]/\").isValid") "false"))
+  (is (= (run "parseURI(\"http://a.com/b%20c\").path") "\"/b c\"")))
+
+(deftest compose-interpolates
+  (is (= (run "compose([\"http://x/\", \"/p\"], [\"a b\"])") "\"http://x/a%20b/p\""))
+  (is (= (run "compose([\"a\"], [\"b\"])") "ERR: You called the function '++' with these arguments: ")))
+
+(deftest runtime-try-and-friends
+  (is (= (run "try(() -> 1)") "{\"success\": true,\"result\": 1}"))
+  (is (= (run "try(() -> fail(\"boom\")).error - \"location\" - \"stack\"") "{\"kind\": \"UserException\",\"message\": \"boom\"}"))
+  (is (= (run "try(() -> fail(\"boom\")).error.stack[0]") "\"fail (dw::Runtime:50:49)\""))
+  (is (= (run "try(() -> {}.a!).error.kind") "\"KeyNotFoundException\""))
+  (is (= (run "try(() -> fail(\"x\")) orElse \"d\"") "\"d\""))
+  (is (= (run "try(() -> 2) orElse \"d\"") "2"))
+  (is (= (run "(try(() -> fail(\"x\")) orElseTry (() -> 3)).result") "3"))
+  (is (= (run "1 failIf ((x) -> false)") "1"))
+  (is (= (run "2 failIf ((x) -> true)") "ERR: Failed"))
+  (is (= (run "failIf(3, (x) -> true, \"custom\")") "ERR: custom"))
+  (is (= (run "\"v\" wait 1") "\"v\""))
+  (is (= (run "version()") "\"2.11\""))
+  (is (= (run "try(() -> dw::Runtime::fail()).error - \"location\" - \"stack\"") "{\"kind\": \"UserException\",\"message\": \"\"}")))
+
+(deftest runtime-descriptors
+  (is (= (count (rtl/descriptors)) 20))
+  (is (= (run "findDataFormatDescriptorByMime({'type': \"*\", subtype: \"json\", parameters: {}}).name") "\"json\""))
+  (is (= (run "findDataFormatDescriptorByMime({'type': \"application\", subtype: \"vnd.x+xml\", parameters: {}}).name") "\"xml\""))
+  (is (= (run "findDataFormatDescriptorByMime({'type': \"*\", subtype: \"*\", parameters: {}})") "null")))
+
+(deftest runtime-props-and-kinds
+  (is (= (dwloc/dw-kind "KeyNotFound") "KeyNotFoundException"))
+  (is (= (dwloc/dw-kind "UserException") "UserException"))
+  (is (= (run "prop(\"os.name\")") "\"Linux\""))
+  (is (= (run "prop(\"no.such\")") "null")))
+
+(deftest system-env
+  (is (= (sys/env-lookup "THIS_VAR_DOES_NOT_EXIST_12345") []))
+  (is (> (count (sys/environ)) 0))
+  (is (= (run "dw::System::envVar(\"THIS_VAR_DOES_NOT_EXIST_12345\")") "null")))
+
+(deftest core-misc
+  (is (= (count (cm/uuid4)) 36))
+  (is (= (subs (cm/uuid4) 14 15) "4"))
+  (is (= (subs (cm/uuid4) 8 9) "-"))
+  (is (= (cm/compat-flag "com.mulesoft.dw.xml_reader.honourMixedContentStructure") [true]))
+  (is (= (cm/compat-flag "com.mulesoft.dw.legacySizeOfNumber") [false]))
+  (is (= (cm/compat-flag "foo") []))
+  (is (= (run "evaluateCompatibilityFlag(\"foo\")") "ERR: Invalid compatibility flag name: `foo`"))
+  (is (= (run "5 then ($ * 2)") "10"))
+  (is (= (run "null then ($ * 2)") "null"))
+  (is (= (run "null onNull \"x\"") "\"x\""))
+  (is (= (run "1 onNull \"x\"") "1"))
+  (is (= (run "[isEmpty([]), isEmpty([1]), isEmpty(\"\"), isEmpty({}), isEmpty(null), isEmpty(fromHex(\"\"))]") "[true,false,true,true,true,true]"))
+  (is (= (run "log(\"p\", 3)") "3"))
+  (is (= (run "logDebug(\"d\")") "\"d\""))
+  (is (= (run "logWith(\"Bad\", \"p\", 1)") "ERR: - Expecting Type: `\"Debug\"`, but got: `\"Bad\"`."))
+  (is (= (run "isLegacySizeOfNumber()") "ERR: `isLegacySizeOfNumber` can not be access from `anonymous` as it is constrained to: `dw::` or `bat::` subdomain."))
+  (is (= (cm/log-line "User" (v/int-v 1)) "User - 1")))
+
+(deftest binaries-functions
+  (is (= (run "toBase64(fromHex(\"4D756C65\"))") "\"TXVsZQ==\""))
+  (is (= (run "toHex(fromBase64(\"TXVsZQ==\"))") "\"4D756C65\""))
+  (is (= (run "fromBase64(\"@@\")") "ERR: Unable to transform String to Base 64 Binary. Reason : `Illegal base64 character 40`"))
+  (is (= (run "readLinesWith(fromHex(\"610A62\"), \"UTF-8\")") "[\"a\",\"b\"]"))
+  (is (= (run "readLinesWith(fromHex(\"61\"), \"FOO\")") "ERR: Exception while reading lines. Caused by: Unsupported Charset: `FOO`."))
+  (is (= (run "readLinesWith(fromHex(\"61FF\"), \"US-ASCII\")") "ERR: java.nio.charset.MalformedInputException - Input length = 1"))
+  (is (= (run "toHex(writeLinesWith([\"a\", \"b\"], \"UTF-8\"))") "\"610A620A\""))
+  (is (= (run "toHex(fromHex(\"CAFE\") concatWith fromHex(\"ABCD\"))") "\"CAFEABCD\""))
+  (is (= (run "toHex(null concatWith fromHex(\"AB\"))") "\"AB\"")))
+
+(deftest timer
+  (is (> (tm/now-millis) 1700000000000))
+  (is (= (run "dw::util::Timer::duration(() -> 3).result") "3")))
+
+;; 値そのものは DW の golden (syntax_mulay/props-env-1、環境変数を変えても passwd の値) で実 DW と照合する
+(deftest osinfo
+  (let [z 0]
+    (is (not= (osi/uname-release) ""))
+    (is (not= (osi/uname-release) "?"))
+    (is (not= (osi/user-name) "?"))
+    (is (str/starts-with? (osi/user-home) "/"))
+    (is (not= (osi/uname-nodename) "?"))
+    (is (> (osi/pid) 1))))

@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18111"/>
+    </http:listener-config>
+
+    <!-- 最初に真になった when だけが動く。otherwise は無くてもよい -->
+    <flow name="choice-basic">
+        <http:listener config-ref="L" path="/choice"/>
+        <set-variable variableName="n" value="#[(attributes.queryParams.n default '0') as Number]"/>
+        <choice>
+            <when expression="#[vars.n &lt; 0]">
+                <set-payload value="negative"/>
+            </when>
+            <when expression="#[vars.n == 0]">
+                <set-payload value="zero"/>
+            </when>
+            <when expression="#[vars.n &lt; 10]">
+                <set-payload value="small"/>
+            </when>
+            <when expression="#[vars.n &lt; 100]">
+                <set-payload value="medium"/>
+            </when>
+            <otherwise>
+                <set-payload value="large"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- otherwise が無く、どれにも当たらないときは payload がそのまま -->
+    <flow name="choice-no-otherwise">
+        <http:listener config-ref="L" path="/no-otherwise"/>
+        <set-payload value="untouched" mimeType="text/plain"/>
+        <choice>
+            <when expression="#[attributes.queryParams.hit == 'yes']">
+                <set-payload value="hit" mimeType="text/plain"/>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- 入れ子の choice と、when の中での変数の書き換え -->
+    <flow name="choice-nested">
+        <http:listener config-ref="L" path="/nested"/>
+        <set-variable variableName="trail" value="#[[]]"/>
+        <choice>
+            <when expression="#[attributes.queryParams.a == '1']">
+                <set-variable variableName="trail" value="#[vars.trail + 'a']"/>
+                <choice>
+                    <when expression="#[attributes.queryParams.b == '1']">
+                        <set-variable variableName="trail" value="#[vars.trail + 'b']"/>
+                    </when>
+                    <otherwise>
+                        <set-variable variableName="trail" value="#[vars.trail + 'not-b']"/>
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <set-variable variableName="trail" value="#[vars.trail + 'not-a']"/>
+            </otherwise>
+        </choice>
+        <set-payload value="#[output application/json --- vars.trail]"/>
+    </flow>
+
+    <!-- when の式が Boolean にならないとき、null のとき -->
+    <flow name="choice-non-boolean">
+        <http:listener config-ref="L" path="/non-boolean"/>
+        <choice>
+            <when expression="#[attributes.queryParams.v]">
+                <set-payload value="when-taken"/>
+            </when>
+            <otherwise>
+                <set-payload value="otherwise-taken"/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- when の式が評価に失敗するとき (MULE:EXPRESSION) -->
+    <flow name="choice-expr-error">
+        <http:listener config-ref="L" path="/expr-error"/>
+        <choice>
+            <when expression="#[(attributes.queryParams.v as Number) &gt; 1]">
+                <set-payload value="big"/>
+            </when>
+            <otherwise>
+                <set-payload value="small"/>
+            </otherwise>
+        </choice>
+        <error-handler>
+            <on-error-continue>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{errorType: error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+</mule>

@@ -1,0 +1,174 @@
+(ns mulay.lib.diag (:require [clay.utf8 :as u8] [mulay.lib.uni :as uni] [clay.string :as str]))
+
+(defrecord Label [start: Int end: Int text: Str primary: Bool])
+
+(defrecord Report [level: Str code: Str msg: Str file: Str src: Str labels: Vec(Label) notes: Vec(Str) helps: Vec(Str)])
+
+(defn report Report [level: Str code: Str msg: Str] (->Report level code msg "" "" [] [] []))
+
+(defn with-src Report [r: Report file: Str src: Str] (assoc (assoc r :file file) :src src))
+
+(defn label Report [r: Report start: Int end: Int text: Str primary: Bool]
+  (let [ls (:labels r)] (assoc r :labels (conj ls (->Label start end text primary)))))
+
+(defn note Report [r: Report s: Str] (let [ns (:notes r)] (assoc r :notes (conj ns s))))
+
+(defn help Report [r: Report s: Str] (let [hs (:helps r)] (assoc r :helps (conj hs s))))
+
+(defn primary-label Vec(Label) [r: &Report]
+  (let [ls (:labels r)]
+    (if (= (count ls) 0) []
+      (loop [i 0] (if (>= i (count ls)) [(nth ls 0)] (if (:primary (nth ls i)) [(nth ls i)] (recur (+ i 1))))))))
+
+(defn- esc Str [code: Str] (str (chr 27) "[" code "m"))
+
+(defn- paint Str [s: &Str code: &Str color: Bool] (if color (str (esc code) s (esc "0")) (str s)))
+
+(defn- level-code Str [level: &Str] (cond (= level "error") "1;31" (= level "warning") "1;33" :else "1;36"))
+
+(defn- spaces Str [n: Int] (loop [i 0 o ""] (if (>= i n) o (recur (+ i 1) (str o " ")))))
+
+(defn- reps Str [c: Str n: Int] (loop [i 0 o ""] (if (>= i n) o (recur (+ i 1) (str o c)))))
+
+(defn- clip Int [x: Int lo: Int hi: Int] (if (< x lo) lo (if (> x hi) hi x)))
+
+(defn- line-starts Vec(Int) [s: &Str]
+  (loop [i 0 acc: Vec(Int) [0]] (if (>= i (count s)) acc (recur (+ i 1) (if (= (nth s i) 10) (conj acc (+ i 1)) acc)))))
+
+(defn- line-of Int [starts: &Vec(Int) off: Int]
+  (loop [lo 0 hi (- (count starts) 1)]
+    (if (>= lo hi) lo
+      (let [mid (quot (+ lo hi 1) 2)] (if (<= (nth starts mid) off) (recur mid hi) (recur lo (- mid 1)))))))
+
+(defn- line-end Int [src: &Str starts: &Vec(Int) ln: Int]
+  (let [e (if (< (+ ln 1) (count starts)) (- (nth starts (+ ln 1)) 1) (count src))]
+    (if (and (> e (nth starts ln)) (= (nth src (- e 1)) 13)) (- e 1) e)))
+
+(defn- cols Int [s: &Str a: Int b: Int]
+  (loop [i a w 0]
+    (if (>= i b) w
+      (let [c (nth s i)]
+        (cond (= c 9) (recur (+ i 1) (+ w 4))
+              (< c 0x80) (recur (+ i 1) (+ w 1))
+              :else (let [[cp j] (uni/decode-at s i)] (recur j (+ w (uni/cp-width cp)))))))))
+
+(defn- show-line Str [s: &Str a: Int b: Int]
+  (loop [i a o ""] (if (>= i b) o (let [c (nth s i)] (recur (+ i 1) (if (= c 9) (str o "    ") (str o (chr c))))))))
+
+(defrecord Mark [col: Int width: Int text: Str primary: Bool])
+
+(defn- rtrim Str [s: Str] (let [n (loop [k (count s)] (if (and (> k 0) (= (nth s (- k 1)) 32)) (recur (- k 1)) k))] (subs s 0 n)))
+
+(defn- put Str [row: Str col: Int s: &Str] (str (if (< (count row) col) (str row (spaces (- col (count row)))) row) s))
+
+(defn- marker-rows Vec(Str) [ms: &Vec(Mark) level: &Str color: Bool]
+  (let [n (count ms)
+        lc (level-code level)
+        row0 (loop [i 0 o ""]
+               (if (>= i n) o
+                 (let [m (nth ms i) mk (reps (if (:primary m) "^" "-") (:width m))]
+                   (recur (+ i 1) (str (put o (:col m) "") (paint mk (if (:primary m) lc "1;34") color))))))
+        last (nth ms (- n 1))
+        row0t (if (= (:text last) "") row0 (str row0 " " (paint (:text last) (if (:primary last) lc "1;34") color)))
+        rest (loop [i 0 acc: Vec(Mark) []] (if (>= i (- n 1)) acc (recur (+ i 1) (if (= (:text (nth ms i)) "") acc (conj acc (nth ms i))))))]
+    (loop [k (- (count rest) 1) acc: Vec(Str) [row0t]]
+      (if (< k 0) acc
+        (let [bar (loop [i 0 o ""] (if (> i k) o (recur (+ i 1) (put o (:col (nth rest i)) (paint "|" "1;34" color)))))
+              txt (loop [i 0 o ""] (if (>= i k) (put o (:col (nth rest k)) (paint (:text (nth rest k)) (if (:primary (nth rest k)) lc "1;34") color))
+                                     (recur (+ i 1) (put o (:col (nth rest i)) (paint "|" "1;34" color)))))]
+          (recur (- k 1) (conj (conj acc bar) txt)))))))
+
+(defn- sort-marks Vec(Mark) [ms: Vec(Mark)]
+  (loop [i 1 v ms]
+    (if (>= i (count v)) v
+      (recur (+ i 1)
+             (loop [j i w v]
+               (if (and (> j 0) (> (:col (nth w (- j 1))) (:col (nth w j))))
+                 (let [a (nth w (- j 1)) b (nth w j)] (recur (- j 1) (assoc (assoc w (- j 1) b) j a)))
+                 w))))))
+
+(defn- tail-lines Str [out: Str pad: &Str r: &Report color: Bool]
+  (let [one (fn Str [o: Str kind: Str s: Str]
+              (let [head (str pad " = " kind ": ")
+                    body (str/replace s "\n" (str "\n" (spaces (count head))))]
+                (str o "\n" pad " " (paint "=" "1;34" color) " " (paint (str kind ":") "1" color) " " body)))
+        o1 (loop [i 0 o out] (if (>= i (count (:notes r))) o (recur (+ i 1) (one o "note" (nth (:notes r) i)))))]
+    (loop [i 0 o o1] (if (>= i (count (:helps r))) o (recur (+ i 1) (one o "help" (nth (:helps r) i)))))))
+
+(defn render Str [r: &Report color: Bool]
+  (let [lv (:level r)
+        head (str (paint (if (= (:code r) "") (str lv) (str lv "[" (:code r) "]")) (level-code lv) color) (paint (str ": " (:msg r)) "1" color))
+        src (:src r)
+        ls (:labels r)
+        has-snip (and (> (count ls) 0) (> (count src) 0))]
+    (if (not has-snip)
+      (let [o (if (= (:file r) "") head (str head "\n " (paint "-->" "1;34" color) " " (:file r)))]
+        (tail-lines o " " r color))
+      (let [starts (line-starts src)
+            n (count src)
+            p (nth (primary-label r) 0)
+            ps (clip (:start p) 0 n)
+            pl (line-of starts ps)
+            pcol (+ 1 (u8/codepoint-count (subs src (nth starts pl) ps)))
+            lnums (loop [i 0 acc: Vec(Int) []]
+                    (if (>= i (count ls)) acc
+                      (let [l (line-of starts (clip (:start (nth ls i)) 0 n))]
+                        (recur (+ i 1) (if (loop [k 0] (if (>= k (count acc)) false (if (= (nth acc k) l) true (recur (+ k 1))))) acc (conj acc l))))))
+            sorted (loop [i 1 v lnums]
+                     (if (>= i (count v)) v
+                       (recur (+ i 1) (loop [j i w v] (if (and (> j 0) (> (nth w (- j 1)) (nth w j))) (let [a (nth w (- j 1)) b (nth w j)] (recur (- j 1) (assoc (assoc w (- j 1) b) j a))) w)))))
+            gw (count (str (+ 1 (nth sorted (- (count sorted) 1)))))
+            pad (spaces gw)
+            bar (paint "|" "1;34" color)
+            o0 (str head "\n" pad (paint "-->" "1;34" color) " " (:file r) ":" (+ pl 1) ":" pcol "\n" pad " " bar)
+            emit-line (fn Str [o: Str l: Int]
+                        (let [a (nth starts l) e (line-end src starts l)
+                              num (str (+ l 1))]
+                          (str o "\n" (paint (str (spaces (- gw (count num))) num " |") "1;34" color) " " (show-line src a e))))
+            body (loop [i 0 o o0 prev -1]
+                   (if (>= i (count sorted)) o
+                     (let [l (nth sorted i)
+                           o1 (cond (or (< prev 0) (= l (+ prev 1))) o
+                                    (= l (+ prev 2)) (emit-line o (+ prev 1))
+                                    :else (str o "\n..."))
+                           o2 (emit-line o1 l)
+                           a (nth starts l) e (line-end src starts l)
+                           ms (loop [k 0 acc: Vec(Mark) []]
+                                (if (>= k (count ls)) acc
+                                  (let [lb (nth ls k) s (clip (:start lb) 0 n)]
+                                    (if (not= (line-of starts s) l) (recur (+ k 1) acc)
+                                      (let [en (clip (:end lb) s n)
+                                            en2 (if (> en e) e en)
+                                            w (cols src s en2)]
+                                        (recur (+ k 1) (conj acc (->Mark (cols src a s) (if (< w 1) 1 w) (:text lb) (:primary lb)))))))))
+                           rows (marker-rows (sort-marks ms) lv color)
+                           o3 (loop [k 0 o o2] (if (>= k (count rows)) o (recur (+ k 1) (str o "\n" (rtrim (str pad " " bar " " (nth rows k)))))))]
+                       (recur (+ i 1) o3 l))))
+            body2 (if (> (+ (count (:notes r)) (count (:helps r))) 0) (str body "\n" pad " " bar) body)]
+        (tail-lines body2 pad r color)))))
+
+(defn- lower Str [s: &Str] (str/lower-case s))
+
+(defn edit-distance Int [a: &Str b: &Str]
+  (let [m (count a) n (count b)
+        row0 (loop [j 0 v: Vec(Int) []] (if (> j n) v (recur (+ j 1) (conj v j))))]
+    (loop [i 1 prev2 row0 prev row0]
+      (if (> i m) (nth prev n)
+        (let [cur (loop [j 1 v: Vec(Int) [i]]
+                    (if (> j n) v
+                      (let [cost (if (= (nth a (- i 1)) (nth b (- j 1))) 0 1)
+                            x (min (+ (nth prev j) 1) (min (+ (nth v (- j 1)) 1) (+ (nth prev (- j 1)) cost)))
+                            x2 (if (and (> i 1) (> j 1) (= (nth a (- i 1)) (nth b (- j 2))) (= (nth a (- i 2)) (nth b (- j 1))))
+                                 (min x (+ (nth prev2 (- j 2)) 1)) x)]
+                        (recur (+ j 1) (conj v x2)))))]
+          (recur (+ i 1) prev cur))))))
+
+(defn closest Vec(Str) [word: &Str cands: &Vec(Str)]
+  (let [w (lower word)
+        lim (let [x (quot (count word) 3)] (if (< x 1) 1 x))]
+    (loop [i 0 best: Vec(Str) [] bd 1000000]
+      (if (>= i (count cands)) best
+        (let [c (nth cands i)
+              dd (if (= c word) 1000000 (edit-distance w (lower c)))
+              dd2 (if (and (< dd 1000000) (= (count word) 1) (> dd 0)) 1000000 dd)]
+          (if (and (<= dd2 lim) (< dd2 bd)) (recur (+ i 1) [c] dd2) (recur (+ i 1) best bd)))))))

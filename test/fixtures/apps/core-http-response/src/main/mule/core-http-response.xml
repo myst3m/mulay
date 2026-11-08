@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18120"/>
+    </http:listener-config>
+
+    <!-- host="localhost" の listener (壊れた要求の対象の 400 の文言は http://127.0.0.1:18127 から始まる) -->
+    <http:listener-config name="Lh">
+        <http:listener-connection host="localhost" port="18127"/>
+    </http:listener-config>
+
+    <flow name="lh">
+        <http:listener config-ref="Lh" path="/lh"/>
+        <set-payload value="lh"/>
+    </flow>
+
+    <!-- statusCode / reasonPhrase / headers を変数から -->
+    <flow name="custom">
+        <http:listener config-ref="L" path="/custom">
+            <http:response statusCode="#[vars.status default 200]" reasonPhrase="#[vars.reason]">
+                <http:headers><![CDATA[#[vars.headers default {}]]]></http:headers>
+            </http:response>
+        </http:listener>
+        <set-variable variableName="status" value="#[(attributes.queryParams.status default '200') as Number]"/>
+        <set-variable variableName="reason" value="#[attributes.queryParams.reason]"/>
+        <set-variable variableName="headers" value="#[{'X-App': 'mulay-fixture', 'Cache-Control': 'no-store'}]"/>
+        <set-payload value="#[output application/json --- {ok: true}]"/>
+    </flow>
+
+    <!-- 同名ヘッダを複数: 値を配列にすると?  キーを重ねると? -->
+    <flow name="multi-header">
+        <http:listener config-ref="L" path="/multi-header/{how}">
+            <http:response>
+                <http:headers><![CDATA[#[if (attributes.uriParams.how == 'array') {'X-Multi': ['one', 'two']} else {'X-Multi': 'one', 'X-Multi': 'two'}]]]></http:headers>
+            </http:response>
+        </http:listener>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- body を上書きする http:response、Content-Type を header で上書き -->
+    <flow name="body-override">
+        <http:listener config-ref="L" path="/body-override">
+            <http:response statusCode="202">
+                <http:body><![CDATA[#[output text/plain --- "overridden: " ++ payload.msg]]]></http:body>
+                <http:headers><![CDATA[#[{'Content-Type': 'text/x-custom'}]]]></http:headers>
+            </http:response>
+        </http:listener>
+        <set-payload value="#[output application/json --- {msg: 'hi'}]"/>
+    </flow>
+
+    <!-- 204 に本文を付けたとき、本文の無い 200 -->
+    <flow name="no-content">
+        <http:listener config-ref="L" path="/no-content">
+            <http:response statusCode="#[(attributes.queryParams.status default '204') as Number]"/>
+        </http:listener>
+        <set-payload value="#[attributes.queryParams.body]"/>
+    </flow>
+
+    <!-- error-response: エラー時の status / headers / body -->
+    <flow name="error-response">
+        <http:listener config-ref="L" path="/error-response">
+            <http:response statusCode="200"/>
+            <http:error-response statusCode="#[vars.errStatus default 500]">
+                <http:body><![CDATA[#[output application/json --- {error: error.description, errorType: error.errorType.identifier}]]]></http:body>
+                <http:headers><![CDATA[#[{'X-Error': 'yes'}]]]></http:headers>
+            </http:error-response>
+        </http:listener>
+        <set-variable variableName="errStatus" value="#[(attributes.queryParams.status default '500') as Number]"/>
+        <raise-error type="APP:FAILED" description="failed for error-response"/>
+    </flow>
+
+    <!-- error-response の body を省略すると payload? (propagate で payload を作る) -->
+    <flow name="error-response-default-body">
+        <http:listener config-ref="L" path="/error-response-default-body">
+            <http:error-response statusCode="418"/>
+        </http:listener>
+        <set-payload value="payload before failure"/>
+        <raise-error type="APP:FAILED" description="failed, default body"/>
+        <error-handler>
+            <on-error-propagate>
+                <set-payload value="payload set in propagate"/>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <!-- 不正な statusCode (文字列、範囲外) -->
+    <flow name="bad-status">
+        <http:listener config-ref="L" path="/bad-status">
+            <http:response statusCode="#[attributes.queryParams.s]"/>
+        </http:listener>
+        <set-payload value="body"/>
+    </flow>
+
+    <!-- 応答ヘッダの値が数値や null のとき -->
+    <flow name="header-types">
+        <http:listener config-ref="L" path="/header-types">
+            <http:response>
+                <http:headers><![CDATA[#[{'X-Number': 42, 'X-Bool': true, 'X-Empty': ''}]]]></http:headers>
+            </http:response>
+        </http:listener>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- 応答本文のバイナリ (application/octet-stream) と、mime の無い String -->
+    <flow name="binary">
+        <http:listener config-ref="L" path="/binary"/>
+        <set-payload value="#[output application/octet-stream --- dw::core::Binaries::fromBase64('AAEC/w==')]"/>
+    </flow>
+
+    <!-- allowedMethods の大小文字、HEAD と OPTIONS -->
+    <flow name="methods">
+        <http:listener config-ref="L" path="/methods" allowedMethods="get, POST"/>
+        <set-payload value="#[attributes.method]"/>
+    </flow>
+
+    <!-- path のワイルドカードと優先順位 -->
+    <flow name="wild">
+        <http:listener config-ref="L" path="/wild/*"/>
+        <set-payload value="#[output application/json --- {flow: 'wild', relativePath: attributes.relativePath, uriParams: attributes.uriParams}]"/>
+    </flow>
+    <flow name="wild-specific">
+        <http:listener config-ref="L" path="/wild/exact"/>
+        <set-payload value="#[output application/json --- {flow: 'wild-specific'}]"/>
+    </flow>
+    <flow name="wild-param">
+        <http:listener config-ref="L" path="/wild/{id}/detail"/>
+        <set-payload value="#[output application/json --- {flow: 'wild-param', uriParams: attributes.uriParams}]"/>
+    </flow>
+
+</mule>

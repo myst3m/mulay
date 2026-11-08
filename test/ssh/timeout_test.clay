@@ -1,0 +1,27 @@
+(ns timeout-test (:require [mulay.lib.ssh :as ssh] [clay.net :as net] [clay.async :as async] [clay.string :as str]))
+
+;; 受け付けるが何も送らないサーバー (listen して accept しない。TCP の接続はカーネルが済ませる) には、timeout-ms で
+;; HANDSHAKE になる。読みの上限は呼ぶ前のもの (無し) に戻る
+(deftest silent-server
+  (let [[srv le] (net/listen 0 4)
+        port (net/local-port srv)
+        t0 (quot (mono-us) 1000)
+        [c kind e] (ssh/connect "127.0.0.1" port 300)
+        ms (- (quot (mono-us) 1000) t0)
+        after (async/deadline-at 0)
+        z (net/close srv)]
+    (is (= le ""))
+    (is (= kind ssh/HANDSHAKE))
+    (is (str/includes? e "timed out"))
+    (is (and (>= ms 250) (< ms 2000)))
+    (is (= after 0))))
+
+;; サーバーが最大パケット長 0 を告げたら、送れないので失敗にする (前は空の CHANNEL_DATA を送り続けて止まらなかった)
+(deftest zero-max-packet
+  (let [[srv le] (net/listen 0 4)
+        port (net/local-port srv)
+        [c kind e] (ssh/connect "127.0.0.1" port 300)
+        c2 (assoc c :ch-open true :ch-rwin 1000 :ch-rmax 0)
+        [c3 se] (ssh/chan-send c2 "abc")
+        z (net/close srv)]
+    (is (= se "the server's maximum packet size is 0"))))

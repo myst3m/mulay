@@ -1,0 +1,294 @@
+(ns mulay.dw.val (:require [mulay.dw.err :as dwe] [mulay.dw.num :as num] [mulay.lib.time.types :as tt] [mulay.lib.time.iso :as ti] [mulay.lib.time.amount :as tam] [mulay.lib.host :as host]))
+
+(defrecord Ns [prefix: Str uri: Str])
+(defrecord Attr [ns: Vec(Ns) name: Str value: Val])
+(defrecord Key [ns: Vec(Ns) name: Str attrs: Vec(Attr)])
+(defrecord Field [key: Key value: Val])
+(defrecord FnV [def: Int caps: Vec(Val) host: Option(Host) arity: Int])
+(defrecord Host [name: Str params: Vec(Str) ptypes: Vec(TypeV) call: Fn(Caller Vec(Val) Int Values(Val dwe/DwErr))])
+(defrecord Caller [wrap: Fn(FnV Val) plain: Fn(FnV Val)])
+(defrecord Seq [open: Fn(Int Fn(Int Values(Val Bool dwe/DwErr)))])
+(defrecord FSeq [open: Fn(Int Fn(Int Values(Field Bool dwe/DwErr)))])
+(defrecord TypeV [kind: Str name: Str args: Vec(TypeV) fields: Vec(TypeField) lits: Vec(Val) meta: Vec(Field)])
+(defrecord TypeField [key: Str optional: Bool repeated: Bool ty: TypeV ns: Str attrs: Vec(TypeField)])
+
+(defvariant Val
+  (VNull)
+  (VBool b: Bool)
+  (VInt i: Int)
+  (VNum n: num/Num)
+  (VStr s: Str)
+  (VArr xs: Vec(Val))
+  (VSeq q: Seq)
+  (VObj fs: Vec(Field))
+  (VOSeq q: FSeq)
+  (VRange from: Int to: Int)
+  (VBin bytes: Str)
+  (VRegex src: Str flags: Str)
+  (VFn f: FnV)
+  (VType t: TypeV)
+  (VKey k: Key)
+  (VNsV ns: Ns)
+  (VDate d: tt/LocalDate)
+  (VDateTime z: tt/ZonedDateTime)
+  (VLocalDateTime x: tt/LocalDateTime)
+  (VTime o: tt/OffsetTime)
+  (VLocalTime t: tt/LocalTime)
+  (VTimeZone z: tt/TimeZone)
+  (VPeriod p: tt/DwPeriod)
+  (VMeta v: Val meta: Vec(Field)))
+
+(def SMALL-INTS (loop [i 0 acc: Vec(Val) []] (if (>= i 1024) acc (recur (+ i 1) (conj acc (->VInt i))))))
+(defn null-v Val [] (->VNull))
+(defn bool-v Val [b: Bool] (if b (->VBool true) (->VBool false)))
+(defn num-v Val [n: num/Num]
+  (match n
+    (num/NInt i) (int-v i)
+    _ (->VNum n)))
+(defn int-v Val [i: Int] (if (and (>= i 0) (< i 1024)) (nth SMALL-INTS i) (->VInt i)))
+(defn num-of num/Num [x: &Val]
+  (match x
+    (VInt i) (num/from-int i)
+    (VNum n) n
+    (VMeta y m) (num-of y)
+    _ (num/from-int 0)))
+(defn num-val? Bool [x: &Val]
+  (match x (VInt i) true (VNum n) true (VMeta y m) (num-val? y) _ false))
+(defn str-v Val [s: Str] (->VStr s))
+(defn simple-key Key [name: Str] (->Key [] name []))
+(defn field Field [name: Str v: Val] (->Field (simple-key name) v))
+
+(defn seq-vec Values(Vec(Val) dwe/DwErr) [q: &Seq]
+  (let [nx ((:open q) 0)]
+    (loop [acc: Vec(Val) []]
+      (let [[x done e] (nx 0)]
+        (cond (not (dwe/ok? e)) (values acc e)
+              done (values acc (dwe/ok))
+              :else (recur (conj acc x)))))))
+
+(defn seq-of Seq [xs: Vec(Val)]
+  (let [v xs]
+    (->Seq (fn Fn(Int Values(Val Bool dwe/DwErr)) [k: Int]
+             (let [i (atom 0) w v]
+               (fn Values(Val Bool dwe/DwErr) [k2: Int]
+                 (let [j (deref i)]
+                   (if (>= j (count w)) (values (->VNull) true (dwe/ok))
+                     (let [z (reset! i (+ j 1))] (values (nth w j) false (dwe/ok)))))))))))
+
+(def NO-FIELD (->Field (->Key [] "" []) (->VNull)))
+
+(defn fseq-vec Values(Vec(Field) dwe/DwErr) [q: &FSeq]
+  (let [nx ((:open q) 0)]
+    (loop [acc: Vec(Field) []]
+      (let [[f done e] (nx 0)]
+        (cond (not (dwe/ok? e)) (values acc e)
+              done (values acc (dwe/ok))
+              :else (recur (conj acc f)))))))
+
+(defn fseq-of FSeq [fs: Vec(Field)]
+  (let [v fs]
+    (->FSeq (fn Fn(Int Values(Field Bool dwe/DwErr)) [k: Int]
+              (let [i (atom 0) w v]
+                (fn Values(Field Bool dwe/DwErr) [k2: Int]
+                  (let [j (deref i)]
+                    (if (>= j (count w)) (values NO-FIELD true (dwe/ok))
+                      (let [z (reset! i (+ j 1))] (values (nth w j) false (dwe/ok)))))))))))
+
+(defn obj-fields Values(Vec(Field) Bool dwe/DwErr) [x: &Val]
+  (match x
+    (VObj fs) (values fs true (dwe/ok))
+    (VOSeq q) (let [[fs e] (fseq-vec q)] (values fs true e))
+    _ (values [] false (dwe/ok))))
+
+(def LAZY-ALL (match (host/env "MULAY_DW_LAZY_ALL") (Some v) (= v "1") (None) false))
+
+(defn lazy-input Val [x: Val] (if LAZY-ALL (all-lazy x) x))
+
+(defn top-seq? Bool [x: &Val] (match x (VSeq q) true (VOSeq q) true (VMeta y m) (top-seq? y) _ false))
+
+(defn any-top-seq? Bool [xs: &Vec(Val)] (loop [i 0] (if (>= i (count xs)) false (if (top-seq? (nth xs i)) true (recur (+ i 1))))))
+
+(defn has-seq? Bool [x: &Val]
+  (match x
+    (VSeq q) true
+    (VOSeq q) true
+    (VArr xs) (loop [i 0] (if (>= i (count xs)) false (if (has-seq? (nth xs i)) true (recur (+ i 1)))))
+    (VObj fs) (loop [i 0] (if (>= i (count fs)) false (if (has-seq? (:value (nth fs i))) true (recur (+ i 1)))))
+    (VMeta y m) (has-seq? y)
+    _ false))
+
+(defn whole-deep Values(Val dwe/DwErr) [x: &Val]
+  (if (not (has-seq? x)) (values x (dwe/ok))
+    (match x
+      (VSeq q) (let [[xs e] (seq-vec q)] (if (dwe/ok? e) (whole-deep (->VArr xs)) (values x e)))
+      (VOSeq q) (let [[fs e] (fseq-vec q)] (if (dwe/ok? e) (whole-deep (->VObj fs)) (values x e)))
+      (VArr xs) (loop [i 0 acc: Vec(Val) []]
+                  (if (>= i (count xs)) (values (->VArr acc) (dwe/ok))
+                    (let [[y e] (whole-deep (nth xs i))] (if (dwe/ok? e) (recur (+ i 1) (conj acc y)) (values x e)))))
+      (VObj fs) (loop [i 0 acc: Vec(Field) []]
+                  (if (>= i (count fs)) (values (->VObj acc) (dwe/ok))
+                    (let [f (nth fs i) [y e] (whole-deep (:value f))] (if (dwe/ok? e) (recur (+ i 1) (conj acc (->Field (:key f) y))) (values x e)))))
+      (VMeta y m) (let [[z e] (whole-deep y)] (values (->VMeta z m) e))
+      _ (values x (dwe/ok)))))
+
+(defn all-lazy Val [x: &Val]
+  (match x
+    (VArr xs) (->VSeq (seq-of (loop [i 0 acc: Vec(Val) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (all-lazy (nth xs i))))))))
+    (VObj fs) (->VOSeq (fseq-of (loop [i 0 acc: Vec(Field) []]
+                                  (if (>= i (count fs)) acc
+                                    (let [f (nth fs i)] (recur (+ i 1) (conj acc (->Field (:key f) (all-lazy (:value f))))))))))
+    (VMeta y m) (->VMeta (all-lazy y) m)
+    _ x))
+
+(defn unmeta Val [v: &Val]
+  (match v
+    (VMeta x m) (unmeta x)
+    _ v))
+
+(defn null? Bool [v: &Val] (match (unmeta v) (VNull) true _ false))
+
+(defn type-display Str [t: &TypeV]
+  (let [k (:kind t)]
+    (cond (= k "obj") "Object" (= k "fn") "Function" (= k "any") "Any" :else (str (:name t)))))
+
+(defn type-name Str [v: &Val]
+  (match v
+    (VNull) "Null"
+    (VBool b) "Boolean"
+    (VInt i) "Number"
+    (VNum n) "Number"
+    (VStr s) "String"
+    (VArr xs) "Array"
+    (VSeq q) "Array"
+    (VObj fs) "Object"
+    (VOSeq q) "Object"
+    (VRange a b) "Range"
+    (VBin b) "Binary"
+    (VRegex s f) "Regex"
+    (VFn f) "Function"
+    (VType t) "Type"
+    (VKey k) "Key"
+    (VNsV n) "Namespace"
+    (VDate d) "Date"
+    (VDateTime z) "DateTime"
+    (VLocalDateTime x) "LocalDateTime"
+    (VTime o) "Time"
+    (VLocalTime t) "LocalTime"
+    (VTimeZone z) "TimeZone"
+    (VPeriod p) "Period"
+    (VMeta x m) (type-name x)))
+
+(defn temporal-str Values(Str Bool) [x: &Val]
+  (match x
+    (VDate d) (values (ti/dw-date-str d) true)
+    (VDateTime z) (values (ti/dw-zdt-str z false) true)
+    (VLocalDateTime y) (values (ti/dw-ldt-str y) true)
+    (VTime o) (values (ti/dw-ot-str o) true)
+    (VLocalTime t) (values (ti/dw-time-str t) true)
+    (VTimeZone z) (values (ti/zone-str z) true)
+    (VPeriod p) (values (tam/dw-period-str p) true)
+    (VMeta y m) (temporal-str y)
+    _ (values "" false)))
+
+(defn- range-wide? Bool [lo: Int hi: Int] (and (<= lo 0) (>= hi (+ 9223372036854775807 lo))))
+
+(defn range-size Int [from: Int to: Int]
+  (let [lo (if (<= from to) from to) hi (if (<= from to) to from)]
+    (if (range-wide? lo hi) 9223372036854775807 (+ (- hi lo) 1))))
+
+(defn range-count num/Num [from: Int to: Int]
+  (let [lo (if (<= from to) from to) hi (if (<= from to) to from)]
+    (if (not (range-wide? lo hi)) (num/from-int (+ (- hi lo) 1))
+      (let [[d e1] (num/sub (num/from-int hi) (num/from-int lo))
+            [n e2] (num/add d (num/from-int 1))]
+        n))))
+
+(defn range-index Values(Int Bool) [from: Int to: Int i: Int]
+  (let [up (<= from to)
+        lo (if up from to)
+        hi (if up to from)
+        wide (range-wide? lo hi)
+        k (if (>= i 0) i (- 0 (+ i 1)))]
+    (cond (and (not wide) (> k (- hi lo))) (values 0 false)
+          (>= i 0) (values (if up (+ from k) (- from k)) true)
+          :else (values (if up (- to k) (+ to k)) true))))
+
+(defn range-at Int [from: Int to: Int i: Int]
+  (if (<= from to) (+ from i) (- from i)))
+
+(defn materialize Val [v: &Val]
+  (match v
+    (VRange a b) (let [n (range-size a b)]
+                   (->VArr (loop [acc: Vec(Val) [] i 0]
+                             (if (>= i n) acc (recur (conj acc (int-v (range-at a b i))) (+ i 1))))))
+    (VMeta x m) (materialize x)
+    _ v))
+
+(defn items Vec(Val) [v: &Val]
+  (match v
+    (VArr xs) xs
+    (VRange a b) (let [n (range-size a b)]
+                   (loop [acc: Vec(Val) [] i 0]
+                     (if (>= i n) acc (recur (conj acc (int-v (range-at a b i))) (+ i 1)))))
+    (VMeta x m) (items x)
+    _ []))
+
+(defn key-name Str [k: &Key] (:name k))
+
+(defn obj-get Vec(Val) [fs: &Vec(Field) name: &Str]
+  (loop [i 0]
+    (if (>= i (count fs)) []
+      (let [f (nth fs i)]
+        (if (= (:name (:key f)) name) [(:value f)] (recur (+ i 1)))))))
+
+(defn obj-get-all Vec(Val) [fs: &Vec(Field) name: &Str]
+  (loop [i 0 acc: Vec(Val) []]
+    (if (>= i (count fs)) acc
+      (let [f (nth fs i)]
+        (recur (+ i 1) (if (= (:name (:key f)) name) (conj acc (:value f)) acc))))))
+
+(defn- key-eq? Bool [a: &Key b: &Key]
+  (and (= (:name a) (:name b))
+       (= (count (:ns a)) (count (:ns b)))
+       (or (= (count (:ns a)) 0) (= (:uri (nth (:ns a) 0)) (:uri (nth (:ns b) 0))))))
+
+(defn equal? Bool [a0: &Val b0: &Val]
+  (let [a (unmeta a0) b (unmeta b0)]
+    (match a
+      (VNull) (null? b)
+      (VBool x) (match b (VBool y) (= x y) _ false)
+      (VInt x) (match b (VInt y) (= x y) (VNum y) (num/eq? (num/from-int x) y) _ false)
+      (VNum x) (match b (VNum y) (num/eq? x y) (VInt y) (num/eq? x (num/from-int y)) _ false)
+      (VStr x) (match b (VStr y) (= x y) _ false)
+      (VBin x) (match b (VBin y) (= x y) _ false)
+      (VArr xs) (match b
+                  (VArr ys) (vec-equal? xs ys)
+                  (VRange c d) (vec-equal? xs (items b))
+                  _ false)
+      (VRange c d) (match b
+                     (VRange e f) (and (= c e) (= d f))
+                     (VArr ys) (vec-equal? (items a) ys)
+                     _ false)
+      (VObj fs) (match b (VObj gs) (fields-equal? fs gs) _ false)
+      (VRegex s f) (match b (VRegex t g) (and (= s t) (= f g)) _ false)
+      (VKey k) (match b (VKey l) (key-eq? k l) _ false)
+      (VNsV n) (match b (VNsV m) (= (:uri n) (:uri m)) _ false)
+      (VType t) (match b (VType u) (and (= (:kind t) (:kind u)) (= (:name t) (:name u))) _ false)
+      (VFn f) false
+      (VMeta x m) false
+      _ (let [[s1 t1] (temporal-str a) [s2 t2] (temporal-str b)]
+          (and t1 t2 (= (type-name a) (type-name b)) (= s1 s2))))))
+
+(defn vec-equal? Bool [xs: &Vec(Val) ys: &Vec(Val)]
+  (if (not= (count xs) (count ys)) false
+    (loop [i 0]
+      (if (>= i (count xs)) true
+        (if (equal? (nth xs i) (nth ys i)) (recur (+ i 1)) false)))))
+
+(defn fields-equal? Bool [fs: &Vec(Field) gs: &Vec(Field)]
+  (if (not= (count fs) (count gs)) false
+    (loop [i 0]
+      (if (>= i (count fs)) true
+        (let [f (nth fs i) g (nth gs i)]
+          (if (and (key-eq? (:key f) (:key g)) (equal? (:value f) (:value g)))
+            (recur (+ i 1)) false))))))

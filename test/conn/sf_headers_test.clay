@@ -1,0 +1,108 @@
+(ns sf-headers-test (:require [mulay.conn.sf_headers :as sh] [mulay.dw.val :as v] [mulay.dw.num :as num] [clay.httpmsg :as hm]))
+
+(defn- obj v/Val [ks: Vec(Str) xs: Vec(v/Val)]
+  (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (v/field (nth ks i) (nth xs i))))))))
+
+(defn- one v/Val [h: Str k: Str x: v/Val] (obj [h] [(obj [k] [x])]))
+
+(def NPE "Cannot invoke \"Object.getClass()\" because the return value of \"java.util.Map$Entry.getValue()\" is null")
+
+(deftest all-or-none-and-case
+  (let [[a la fa] (sh/headers-xml (one "AllOrNoneHeader" "allOrNone" (v/bool-v true)))
+        [b lb fb] (sh/headers-xml (one "allornoneheader" "ALLORNONE" (v/bool-v true)))
+        [c lc fc] (sh/headers-xml (one "AllOrNoneHeader" "allOrNone" (v/bool-v false)))
+        [d ld fd] (sh/headers-xml (obj [] []))]
+    (is (= a "<urn:AllOrNoneHeader><urn:allOrNone>true</urn:allOrNone></urn:AllOrNoneHeader>"))
+    (is (= la []))
+    (is (= fa ""))
+    (is (= b a))
+    (is (= lb []))
+    (is (= c "<urn:AllOrNoneHeader><urn:allOrNone>false</urn:allOrNone></urn:AllOrNoneHeader>"))
+    (is (= d ""))
+    (is (= ld []))))
+
+(deftest ignored-headers-are-logged
+  (let [[a la fa] (sh/headers-xml (obj ["AllOrNoneHeader"] [(v/->VStr "allOrNone")]))
+        [b lb fb] (sh/headers-xml (one "AllOrNoneHeader" "allOrNone" (v/->VStr "true")))
+        [c lc fc] (sh/headers-xml (obj ["Foo" "LocaleOptions" "AllOrNoneHeader"] [(obj ["a"] [(v/int-v 1)]) (obj ["language"] [(v/->VStr "ja")]) (obj ["allOrNone"] [(v/bool-v true)])]))
+        [d ld fd] (sh/headers-xml (obj ["Foo"] [(v/->VStr "x")]))]
+    (is (= a ""))
+    (is (= la ["The header AllOrNoneHeader should be a Map"]))
+    (is (= b ""))
+    (is (= lb ["Header AllOrNoneHeader is incorrect, couldn't be added to the request"]))
+    (is (= c "<urn:AllOrNoneHeader><urn:allOrNone>true</urn:allOrNone></urn:AllOrNoneHeader>"))
+    (is (= lc ["Invalid header name: Foo" "Invalid header name: LocaleOptions"]))
+    (is (= ld ["The header Foo should be a Map"]))))
+
+(deftest null-header-fails-the-operation
+  (let [[a la fa] (sh/headers-xml (obj ["AllOrNoneHeader"] [(v/null-v)]))]
+    (is (= fa NPE))))
+
+(deftest query-options-needs-an-int
+  (let [[n e] (num/parse-lit "3000000000")
+        [a la fa] (sh/headers-xml (one "QueryOptions" "batchSize" (v/int-v 200)))
+        [b lb fb] (sh/headers-xml (one "QueryOptions" "batchSize" (v/->VStr "200")))
+        [c lc fc] (sh/headers-xml (obj ["QueryOptions"] [(obj [] [])]))
+        [d ld fd] (sh/headers-xml (one "QueryOptions" "batchSize" (v/num-v n)))]
+    (is (= a "<urn:QueryOptions><urn:batchSize>200</urn:batchSize></urn:QueryOptions>"))
+    (is (= b ""))
+    (is (= lb ["Header QueryOptions is incorrect, couldn't be added to the request"]))
+    (is (= c ""))
+    (is (= lc ["Header QueryOptions is incorrect, couldn't be added to the request"]))
+    (is (= d ""))))
+
+(deftest booleans-default-to-false-and-strings-are-optional
+  (let [[a la fa] (sh/headers-xml (one "DuplicateRuleHeader" "allowSave" (v/bool-v true)))
+        [b lb fb] (sh/headers-xml (one "AssignmentRuleHeader" "useDefaultRule" (v/bool-v true)))
+        [c lc fc] (sh/headers-xml (one "CallOptions" "client" (v/->VStr "a<b")))
+        [d ld fd] (sh/headers-xml (one "UserTerritoryDeleteHeader" "other" (v/->VStr "x")))]
+    (is (= a "<urn:DuplicateRuleHeader><urn:allowSave>true</urn:allowSave><urn:includeRecordDetails>false</urn:includeRecordDetails><urn:runAsCurrentUser>false</urn:runAsCurrentUser></urn:DuplicateRuleHeader>"))
+    (is (= b "<urn:AssignmentRuleHeader><urn:useDefaultRule>true</urn:useDefaultRule></urn:AssignmentRuleHeader>"))
+    (is (= c "<urn:CallOptions><urn:client>a&lt;b</urn:client></urn:CallOptions>"))
+    (is (= d ""))
+    (is (= ld ["Header UserTerritoryDeleteHeader is incorrect, couldn't be added to the request"]))))
+
+(deftest lists-of-options-and-versions
+  (let [[a la fa] (sh/headers-xml (one "OwnerChangeOptions" "options" (v/->VArr [(obj ["type" "execute"] [(v/->VStr "KeepSalesTeam") (v/bool-v true)])])))
+        [b lb fb] (sh/headers-xml (one "OwnerChangeOptions" "options" (v/->VArr [(obj ["type" "execute"] [(v/->VStr "keepSalesTeam") (v/bool-v true)])])))
+        [c lc fc] (sh/headers-xml (one "PackageVersionHeader" "packageVersions" (v/->VArr [(obj ["majorNumber" "minorNumber" "namespace"] [(v/int-v 1) (v/int-v 2) (v/->VStr "ns")])])))]
+    (is (= a "<urn:OwnerChangeOptions><urn:options><urn:type>KeepSalesTeam</urn:type><urn:execute>true</urn:execute></urn:options></urn:OwnerChangeOptions>"))
+    (is (= b ""))
+    (is (= lb ["Header OwnerChangeOptions is incorrect, couldn't be added to the request"]))
+    (is (= c "<urn:PackageVersionHeader><urn:packageVersions><urn:majorNumber>1</urn:majorNumber><urn:minorNumber>2</urn:minorNumber><urn:namespace>ns</urn:namespace></urn:packageVersions></urn:PackageVersionHeader>"))))
+
+(deftest fixed-order-and-last-wins
+  (let [[a la fa] (sh/headers-xml (obj ["QueryOptions" "AllOrNoneHeader" "allOrNoneHeader"]
+                                       [(obj ["batchSize"] [(v/int-v 500)]) (obj ["allOrNone"] [(v/bool-v true)]) (obj ["allOrNone"] [(v/bool-v false)])]))]
+    (is (= a "<urn:AllOrNoneHeader><urn:allOrNone>false</urn:allOrNone></urn:AllOrNoneHeader><urn:QueryOptions><urn:batchSize>500</urn:batchSize></urn:QueryOptions>"))))
+
+(defn- hs Vec(Str) [xs: &Vec(hm/Header)] (mapv (fn Str [h: hm/Header] (str (:hd-name h) ": " (:hd-value h))) xs))
+
+(deftest metadata-headers-are-only-logged
+  (let [[la fa] (sh/meta-logs (obj ["allornoneheader" "Foo" "PackageVersionHeader" "LocaleOptions" "QueryOptions"]
+                                   [(obj ["allOrNone"] [(v/bool-v true)]) (v/null-v) (obj [] []) (obj ["language"] [(v/->VStr "ja")]) (v/->VStr "x")]))
+        [lb fb] (sh/meta-logs (obj ["Foo" "AllOrNoneHeader" "MruHeader"] [(v/->VStr "x") (v/null-v) (obj [] [])]))
+        [lc fc] (sh/meta-logs (obj [] []))]
+    (is (= la ["Header ALL_OR_NONE is incorrect, couldn't be added to the request" "Invalid header name: Foo" "Invalid header name: PackageVersionHeader"
+               "Header LOCALE_OPTIONS is incorrect, couldn't be added to the request" "The header QueryOptions should be a Map"]))
+    (is (= fa ""))
+    (is (= lb ["Invalid header name: Foo"]))
+    (is (= fb NPE))
+    (is (= lc []))
+    (is (= fc ""))))
+
+(deftest bulk-v1-headers-use-java-to-string
+  (let [xs (sh/bulk1-headers (obj ["Sforce-Enable-PKChunking" "X-Null" "X-Int" "X-Map" "X-Bool"]
+                                  [(v/->VStr "chunkSize=1000") (v/null-v) (v/int-v 1) (obj ["a" "b"] [(v/int-v 1) (v/->VStr "x")]) (v/bool-v true)]))]
+    (is (= (hs xs) ["Sforce-Enable-PKChunking: chunkSize=1000" "X-Int: 1" "X-Map: {a=1, b=x}" "X-Bool: true"]))))
+
+(deftest bulk-v2-headers-must-be-strings
+  (let [[a ae] (sh/bulk2-headers (obj ["Content-Type" "X-Null" "Sforce-Call-Options"] [(v/->VStr "application/xml") (v/null-v) (v/->VStr "client=m")]))
+        [b be] (sh/bulk2-headers (obj ["X-Ok" "X-Int" "X-Map"] [(v/->VStr "y") (v/int-v 1) (obj [] [])]))
+        [c ce] (sh/bulk2-headers (obj ["X-Map"] [(obj ["a"] [(v/int-v 1)])]))
+        [d de] (sh/bulk2-headers (obj ["X-Big"] [(v/int-v 3000000000)]))]
+    (is (= (hs a) ["Content-Type: application/xml" "Sforce-Call-Options: client=m"]))
+    (is (= ae ""))
+    (is (= be "class java.lang.Integer cannot be cast to class java.lang.String (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')"))
+    (is (= ce "class java.util.LinkedHashMap cannot be cast to class java.lang.String (java.util.LinkedHashMap and java.lang.String are in module java.base of loader 'bootstrap')"))
+    (is (= de "class java.lang.Long cannot be cast to class java.lang.String (java.lang.Long and java.lang.String are in module java.base of loader 'bootstrap')"))))

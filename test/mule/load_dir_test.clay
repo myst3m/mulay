@@ -1,0 +1,21 @@
+(ns load-dir-test (:require [mulay.conn.registry :as creg] [mulay.mule.load :as ld] [mulay.mule.model :as m] [mulay.lib.fs :as fs] [mulay.lib.res :as res]))
+(defextern c-symlink symlink)
+(c-include "<unistd.h>")
+(defextern getpid getpid)
+
+(def XML "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\"><flow name=\"f\"><set-payload value=\"x\"/></flow></mule>")
+
+;; Kubernetes の ConfigMap のマウントは、実ファイルを ..2026_xx/ に置き、..data と各ファイル名を symlink にする。
+;; 隠しエントリ (. で始まる名前) を読むと同じ XML を 2 回読んで "duplicate global element" になる。
+(deftest configmap-layout-loads-once
+  (let [d (str "/tmp/mulay-load-dir-test-" (unsafe (getpid)))
+        z0 (fs/remove-tree d)
+        m (str d "/src/main/mule")
+        z1 (fs/mkdirs (str m "/..2026_01_01"))
+        w (write-file (str m "/..2026_01_01/a.xml") XML)
+        l1 (unsafe (c-symlink "..2026_01_01" (str m "/..data")))
+        l2 (unsafe (c-symlink "..data/a.xml" (str m "/a.xml")))
+        a (:app (ld/load-path d (ld/->LoadOpts [] false (creg/hints))))
+        z2 (fs/remove-tree d)]
+    (is (= (count (:diags a)) 0))
+    (is (= (count (:flows a)) 1))))

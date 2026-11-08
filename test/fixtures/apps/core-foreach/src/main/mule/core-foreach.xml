@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18112"/>
+    </http:listener-config>
+
+    <!-- foreach の中の payload は要素、counter は 1 始まり。終わると payload は元に戻る。
+         foreach の中で書いた変数は外に残る -->
+    <flow name="foreach-basic">
+        <http:listener config-ref="L" path="/basic"/>
+        <set-variable variableName="acc" value="#[[]]"/>
+        <foreach collection="#[payload.items]">
+            <set-variable variableName="acc"
+                          value="#[output application/java --- vars.acc + {item: payload, counter: vars.counter, rootIsObject: vars.rootMessage.payload is Object}]"/>
+        </foreach>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{payloadAfter: payload, acc: vars.acc, counterAfter: vars.counter default "absent"}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- collection を省略すると payload を回す。counterVariableName と batchSize -->
+    <flow name="foreach-batch">
+        <http:listener config-ref="L" path="/batch"/>
+        <set-variable variableName="acc" value="#[[]]"/>
+        <foreach batchSize="2" counterVariableName="i">
+            <set-variable variableName="acc" value="#[vars.acc + {batch: payload, i: vars.i}]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- vars.acc]"/>
+    </flow>
+
+    <!-- Object を回したとき (各キーが 1 要素の Object になるか)、文字列 (1 要素扱い)、null -->
+    <flow name="foreach-shapes">
+        <http:listener config-ref="L" path="/shapes"/>
+        <set-variable variableName="acc" value="#[[]]"/>
+        <foreach>
+            <set-variable variableName="acc" value="#[output application/java --- vars.acc + payload]"/>
+        </foreach>
+        <set-payload value="#[output application/json --- {count: sizeOf(vars.acc), acc: vars.acc}]"/>
+    </flow>
+
+    <!-- 本体でエラーが出ると foreach は止まり、エラーはフローへ伝わる -->
+    <flow name="foreach-error">
+        <http:listener config-ref="L" path="/error"/>
+        <set-variable variableName="seen" value="#[[]]"/>
+        <foreach collection="#[[1, 2, 0, 4]]">
+            <set-variable variableName="seen" value="#[vars.seen + payload]"/>
+            <set-variable variableName="q" value="#[10 / payload]"/>
+        </foreach>
+        <error-handler>
+            <on-error-continue type="MULE:EXPRESSION">
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{seen: vars.seen, counter: vars.counter default null, payloadIsElement: payload,
+ errorType: error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- output の無い式で、入力の mime が混ざると出力形式を推論できずに失敗する -->
+    <flow name="infer-error">
+        <http:listener config-ref="L" path="/infer-error"/>
+        <set-variable variableName="acc" value="#[[]]"/>
+        <set-variable variableName="acc" value="#[vars.acc + payload]"/>
+        <set-payload value="#[output application/json --- vars.acc]"/>
+    </flow>
+
+    <!-- 入れ子の foreach -->
+    <flow name="foreach-nested">
+        <http:listener config-ref="L" path="/nested"/>
+        <set-variable variableName="acc" value="#[[]]"/>
+        <foreach collection="#[[[1, 2], [3]]]" counterVariableName="outer">
+            <foreach counterVariableName="inner">
+                <set-variable variableName="acc" value="#[vars.acc + ((vars.outer as String) ++ '.' ++ (vars.inner as String) ++ '=' ++ (payload as String))]"/>
+            </foreach>
+        </foreach>
+        <set-payload value="#[output application/json --- vars.acc]"/>
+    </flow>
+
+    <!-- parallel-foreach: 結果は入力の順に並ぶ Message の配列 -->
+    <flow name="parallel-foreach">
+        <http:listener config-ref="L" path="/parallel"/>
+        <parallel-foreach collection="#[[3, 1, 2]]">
+            <set-payload value="#[payload * 10]"/>
+        </parallel-foreach>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{isArray: payload is Array, values: payload map $.payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>

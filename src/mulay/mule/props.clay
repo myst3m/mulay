@@ -1,0 +1,311 @@
+(ns mulay.mule.props
+  (:require [mulay.lib.host :as host] [clay.core] [clay.string :as str] [clay.io :as io]
+            [mulay.mule.model :as m] [mulay.lib.xml :as xml] [mulay.lib.yaml :as yaml] [mulay.lib.res :as res]
+            [mulay.lib.secure :as sec] [clay.base64 :as b64]))
+
+(def NS-CORE "http://www.mulesoft.org/schema/mule/core")
+(def NS-SECURE "http://www.mulesoft.org/schema/mule/secure-properties")
+
+(defrecord Tab [keys: Vec(Str) vals: Vec(Str) idx: Map(Str Int)])
+
+(defn tab-new Tab [] (let [k: Vec(Str) [] v: Vec(Str) [] ix: Map(Str Int) {}] (->Tab k v ix)))
+
+(defn tab-put Tab [t: Tab k: Str v: Str]
+  (if (contains? (:idx t) k) t
+    (let [n (count (:keys t))] (assoc t :keys (conj (:keys t) k) :vals (conj (:vals t) v) :idx (assoc (:idx t) k n)))))
+
+(defn tab-get Values(Str Bool) [t: &Tab k: &Str]
+  (if (contains? (:idx t) k) (values (nth (:vals t) (get (:idx t) k 0)) true) (values "" false)))
+
+(defn- hexv Int [c: Int]
+  (cond (and (>= c 48) (<= c 57)) (- c 48) (and (>= c 97) (<= c 102)) (- c 87) (and (>= c 65) (<= c 70)) (- c 55) :else -1))
+
+(defn- utf8 Str [cp: Int]
+  (cond (< cp 128) (str (chr cp))
+        (< cp 2048) (str (chr (+ 192 (bit-shift-right cp 6))) (chr (+ 128 (bit-and cp 63))))
+        :else (str (chr (+ 224 (bit-shift-right cp 12))) (chr (+ 128 (bit-and (bit-shift-right cp 6) 63))) (chr (+ 128 (bit-and cp 63))))))
+
+(defn- logical-lines Vec(Str) [text: &Str]
+  (let [ls: Vec(Str) (str/split (str/replace (str text) "\r\n" "\n") "\n")]
+    (loop [i 0 acc: Vec(Str) [] cur "" cont false]
+      (if (>= i (count ls)) (if cont (conj acc cur) acc)
+        (let [raw (nth ls i)
+              l0 (str/replace raw "\r" "")
+              st (loop [j 0] (if (and (< j (count l0)) (or (= (nth l0 j) 32) (= (nth l0 j) 9) (= (nth l0 j) 12))) (recur (+ j 1)) j))
+              l (subs l0 st (count l0))
+              comment (and (not cont) (or (= (count l) 0) (= (nth l 0) 35) (= (nth l 0) 33)))
+              nbs (loop [j (- (count l) 1) n 0] (if (and (>= j 0) (= (nth l j) 92)) (recur (- j 1) (+ n 1)) n))
+              more (= (mod nbs 2) 1)
+              body (if more (subs l 0 (- (count l) 1)) l)]
+          (cond comment (recur (+ i 1) acc "" false)
+                more (recur (+ i 1) acc (str cur body) true)
+                :else (recur (+ i 1) (conj acc (str cur body)) "" false)))))))
+
+(defn- unescape Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (if (or (not= c 92) (>= (+ i 1) (count s))) (recur (+ i 1) (str out (chr c)))
+          (let [d (nth s (+ i 1))]
+            (cond (= d 116) (recur (+ i 2) (str out "\t"))
+                  (= d 110) (recur (+ i 2) (str out "\n"))
+                  (= d 114) (recur (+ i 2) (str out "\r"))
+                  (= d 102) (recur (+ i 2) (str out (chr 12)))
+                  (and (= d 117) (<= (+ i 6) (count s)))
+                  (let [a (hexv (nth s (+ i 2))) b (hexv (nth s (+ i 3))) c2 (hexv (nth s (+ i 4))) e (hexv (nth s (+ i 5)))]
+                    (if (or (< a 0) (< b 0) (< c2 0) (< e 0)) (recur (+ i 2) (str out "u"))
+                      (recur (+ i 6) (str out (utf8 (+ (* a 4096) (* b 256) (* c2 16) e))))))
+                  :else (recur (+ i 2) (str out (chr d))))))))))
+
+(defn- kv-sep? Bool [c: Int] (or (= c 61) (= c 58)))
+(defn- pws? Bool [c: Int] (or (= c 32) (= c 9) (= c 12)))
+
+(defn parse-properties Vec(m/Param) [text: &Str]
+  (let [ls (logical-lines text)]
+    (loop [i 0 acc: Vec(m/Param) []]
+      (if (>= i (count ls)) acc
+        (let [l (nth ls i)
+              n (count l)
+              ke (loop [j 0] (if (>= j n) j
+                               (let [c (nth l j)]
+                                 (cond (= c 92) (recur (+ j 2))
+                                       (or (kv-sep? c) (pws? c)) j
+                                       :else (recur (+ j 1))))))
+              ke2 (if (> ke n) n ke)
+              v0 (loop [j ke2] (if (and (< j n) (pws? (nth l j))) (recur (+ j 1)) j))
+              v1 (if (and (< v0 n) (kv-sep? (nth l v0))) (+ v0 1) v0)
+              v2 (loop [j v1] (if (and (< j n) (pws? (nth l j))) (recur (+ j 1)) j))]
+          (recur (+ i 1) (conj acc (m/->Param (unescape (subs l 0 ke2)) (m/->PLit (unescape (subs l v2 n)))))))))))
+
+(defn- yscalar? Bool [v: &yaml/YVal]
+  (match v (yaml/YSeq xs) false (yaml/YMap ks vs) false _ true))
+
+(defn- flat-into Vec(m/Param) [acc: Vec(m/Param) prefix: Str v: &yaml/YVal]
+  (match v
+    (yaml/YMap ks vs)
+    (loop [i 0 a acc]
+      (if (>= i (count ks)) a
+        (let [k (yaml/scalar-text (nth ks i))
+              key (if (= prefix "") k (str prefix "." k))]
+          (recur (+ i 1) (flat-into a key (nth vs i))))))
+    (yaml/YSeq xs)
+    (let [all-scalar (loop [i 0] (if (>= i (count xs)) true (if (yscalar? (nth xs i)) (recur (+ i 1)) false)))]
+      (if all-scalar
+        (conj acc (m/->Param prefix (m/->PLit (loop [i 0 out ""] (if (>= i (count xs)) out
+                                                          (recur (+ i 1) (if (= i 0) (yaml/scalar-text (nth xs i)) (str out "," (yaml/scalar-text (nth xs i))))))))))
+        (loop [i 0 a acc] (if (>= i (count xs)) a (recur (+ i 1) (flat-into a (str prefix "." i) (nth xs i)))))))
+    _ (if (= prefix "") acc (conj acc (m/->Param prefix (m/->PLit (yaml/scalar-text v)))))))
+
+(defn flatten-yaml Values(Vec(m/Param) Str) [text: &Str]
+  (let [[v err] (yaml/parse text)]
+    (if (not= err "") (let [z: Vec(m/Param) []] (values z err))
+      (let [z: Vec(m/Param) []] (values (flat-into z "" v) "")))))
+
+(defrecord Props [over: Tab use-env: Bool files: Tab globals: Tab res: res/ResSet flabels: Tab builtin: Vec(Str)])
+
+(defn props-new Props [overrides: &Vec(m/Param) use-env: Bool app-name: Str rs: res/ResSet]
+  (let [t0 (loop [i 0 t (tab-new)]
+             (if (>= i (count overrides)) t
+               (let [p (nth overrides i)]
+                 (recur (+ i 1) (match (:v p) (m/PLit s) (tab-put t (:name p) s) _ t)))))
+        [x named] (tab-get t0 "app.name")
+        [h homed] (tab-get t0 "app.home")
+        t1 (tab-put t0 "app.name" app-name)
+        home? (and (not homed) (not= (:home rs) ""))
+        t2 (if home? (tab-put t1 "app.home" (res/abs-home rs)) t1)
+        b0: Vec(Str) (if named [] ["app.name"])
+        b1 (if home? (conj b0 "app.home") b0)]
+    (->Props t2 use-env (tab-new) (tab-new) rs (tab-new) b1)))
+
+(defn add-over Props [p: Props k: Str v: Str] (assoc p :over (tab-put (:over p) k v)))
+(defn add-global Props [p: Props k: Str v: Str] (assoc p :globals (tab-put (:globals p) k v)))
+(defn add-file Props [p: Props ps: &Vec(m/Param)] (add-file-from p ps ""))
+
+(defn add-file-from Props [p: Props ps: &Vec(m/Param) label: &Str]
+  (let [fl (loop [i 0 t (:flabels p)] (if (>= i (count ps)) t (recur (+ i 1) (tab-put t (:name (nth ps i)) (str label)))))]
+    (assoc p :flabels fl
+             :files (loop [i 0 t (:files p)] (if (>= i (count ps)) t
+                                               (recur (+ i 1) (match (:v (nth ps i)) (m/PLit s) (tab-put t (:name (nth ps i)) s) _ t)))))))
+
+(defn origin Str [p: &Props k: &Str]
+  (let [[a oa] (tab-get (:over p) k)
+        e: Str (if (and (not oa) (:use-env p) (not (str/includes? k "::"))) (match (host/env k) (Some v) v (None) "") "")
+        [b ob] (tab-get (:files p) k)
+        [g og] (tab-get (:globals p) k)]
+    (cond oa (if (loop [i 0] (if (>= i (count (:builtin p))) false (if (= (nth (:builtin p) i) k) true (recur (+ i 1))))) "built-in" "command line")
+          (not= e "") "environment"
+          ob (let [[l ol] (tab-get (:flabels p) k)] (if (= l "") "file" l))
+          og "global-property"
+          :else "")))
+
+(defn lookup Values(Str Bool) [p: &Props k: &Str]
+  (let [[a oa] (tab-get (:over p) k)]
+    (if oa (values a true)
+      (let [e: Str (if (and (:use-env p) (not (str/includes? k "::"))) (match (host/env k) (Some v) v (None) "") "")]
+        (if (not= e "") (values e true)
+          (let [[b ob] (tab-get (:files p) k)]
+            (if ob (values b true) (tab-get (:globals p) k))))))))
+
+(defn- close-brace Int [s: &Str from: Int]
+  (loop [j from d 1]
+    (if (>= j (count s)) -1
+      (let [c (nth s j)]
+        (cond (and (= c 36) (< (+ j 1) (count s)) (= (nth s (+ j 1)) 123)) (recur (+ j 2) (+ d 1))
+              (= c 125) (if (= d 1) j (recur (+ j 1) (- d 1)))
+              :else (recur (+ j 1) d))))))
+
+(defn- chain-str Str [chain: &Vec(Str) k: &Str]
+  (loop [i 0 out ""] (if (>= i (count chain)) (str out k) (recur (+ i 1) (str out (nth chain i) " -> ")))))
+
+(defn- in-chain? Bool [chain: &Vec(Str) k: &Str]
+  (loop [i 0] (if (>= i (count chain)) false (if (= (nth chain i) k) true (recur (+ i 1))))))
+
+(defn- resolve-depth Values(Str Vec(Str)) [p: &Props s: &Str chain: &Vec(Str)]
+  (if (not (str/includes? s "${")) (let [z: Vec(Str) []] (values (str s) z))
+    (loop [i 0 out "" errs: Vec(Str) []]
+      (let [k (str/index-of-after s "${" i)]
+        (if (< k 0) (values (str out (subs s i (count s))) errs)
+          (let [e (close-brace s (+ k 2))]
+            (if (< e 0) (values (str out (subs s i (count s))) errs)
+              (let [raw (subs s k (+ e 1))
+                    inner (subs s (+ k 2) e)
+                    [key kerrs] (resolve-depth p inner chain)
+                    errs2 (loop [j 0 a errs] (if (>= j (count kerrs)) a (recur (+ j 1) (conj a (nth kerrs j)))))
+                    out1 (str out (subs s i k))]
+                (cond
+                  (in-chain? chain key)
+                  (recur (+ e 1) (str out1 raw) (conj errs2 (str "circular property reference: " (chain-str chain key))))
+                  (> (count chain) 64)
+                  (recur (+ e 1) (str out1 raw) (conj errs2 (str "property references are nested too deeply at ${" key "}")))
+                  (str/starts-with? key "file::")
+                  (let [[t ok] (res/res-read (:res p) (subs key 6 (count key)))]
+                    (if ok (recur (+ e 1) (str out1 t) errs2)
+                      (recur (+ e 1) (str out1 raw) (conj errs2 (str "file not found for ${" key "}")))))
+                  :else
+                  (let [[v found] (lookup p key)]
+                    (if (not found)
+                      (recur (+ e 1) (str out1 raw) (conj errs2 (str "Couldn't find configuration property value for key ${" key "}")))
+                      (let [[v2 verrs] (resolve-depth p v (conj chain key))
+                            errs3 (loop [j 0 a errs2] (if (>= j (count verrs)) a (recur (+ j 1) (conj a (nth verrs j)))))]
+                        (recur (+ e 1) (if (> (count verrs) 0) (str out1 raw) (str out1 v2)) errs3)))))))))))))
+
+(defn resolve-str Values(Str Vec(Str)) [p: &Props s: &Str] (let [z: Vec(Str) []] (resolve-depth p s z)))
+
+(defn resolved-origins Vec(Str) [p: &Props]
+  (let [ps (resolved-params p)]
+    (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (origin p (:name (nth ps i)))))))))
+
+(defn resolved-params Vec(m/Param) [p: &Props]
+  (let [tabs: Vec(Tab) [(:over p) (:files p) (:globals p)]]
+    (loop [ti 0 seen: Map(Str Int) {} acc: Vec(m/Param) []]
+      (if (>= ti (count tabs)) acc
+        (let [t (nth tabs ti)
+              [seen2 acc2]
+              (loop [i 0 sn seen a acc]
+                (if (>= i (count (:keys t))) (values sn a)
+                  (let [k (nth (:keys t) i)]
+                    (if (contains? sn k) (recur (+ i 1) sn a)
+                      (let [[v found] (lookup p k)
+                            [rv errs] (resolve-str p v)]
+                        (recur (+ i 1) (assoc sn k 1) (conj a (m/->Param k (m/->PLit rv)))))))))]
+          (recur (+ ti 1) seen2 acc2))))))
+
+(defrecord PropDecl [kind: Str a: Str b: Str line: Int x: Vec(Str)])
+
+(defn- nox Vec(Str) [] (let [e: Vec(Str) []] e))
+
+(defn- encrypt-attr Str [c: &xml/XNode name: &Str dflt: Str]
+  (let [kids (xml/child-elems c)]
+    (loop [i 0] (if (>= i (count kids)) dflt
+                  (if (= (xml/elem-local (nth kids i)) "encrypt") (xml/attr (nth kids i) "" name dflt) (recur (+ i 1)))))))
+
+(defn collect-decls Vec(PropDecl) [root: &xml/XNode lines: &xml/XLines]
+  (let [kids (xml/child-elems root)]
+    (loop [i 0 acc: Vec(PropDecl) []]
+      (if (>= i (count kids)) acc
+        (let [c (nth kids i)
+              ln (if (< i (count (:kids lines))) (:line (nth (:kids lines) i)) (:line lines))
+              u (xml/elem-uri c) l (xml/elem-local c)]
+          (recur (+ i 1)
+                 (cond (and (= u NS-CORE) (= l "configuration-properties"))
+                       (conj acc (->PropDecl "file" (xml/attr c "" "file" "") (xml/attr c "" "encoding" "") ln (nox)))
+                       (and (= u NS-CORE) (= l "global-property"))
+                       (conj acc (->PropDecl "global" (xml/attr c "" "name" "") (xml/attr c "" "value" "") ln (nox)))
+                       (and (= u NS-SECURE) (= l "config"))
+                       (conj acc (->PropDecl "secure" (xml/attr c "" "file" "") (xml/attr c "" "key" "") ln
+                                   [(encrypt-attr c "algorithm" "AES") (encrypt-attr c "mode" "CBC") (encrypt-attr c "useRandomIVs" "false")
+                                    (xml/attr c "" "fileLevelEncryption" "false")]))
+                       :else acc)))))))
+
+(defn- file-params Values(Vec(m/Param) Str) [name: &Str text: &Str]
+  (if (or (str/ends-with? name ".yaml") (str/ends-with? name ".yml"))
+    (flatten-yaml text)
+    (values (parse-properties text) "")))
+
+(defn- load-secure Values(Vec(m/Param) Vec(Str)) [p: &Props d: &PropDecl]
+  (let [none: Vec(m/Param) []
+        [fname ferrs] (resolve-str p (:a d))
+        [key kerrs] (resolve-str p (:b d))
+        alg (nth (:x d) 0) mode (nth (:x d) 1) rnd (= (str/lower-case (nth (:x d) 2)) "true") file-level (= (str/lower-case (nth (:x d) 3)) "true")]
+    (cond
+      (= fname "") (values none ["Required attribute 'file' of 'secure-configuration-properties' not found"])
+      (= key "") (values none ["Required attribute 'key' of 'secure-configuration-properties' not found"])
+      (> (count ferrs) 0) (values none [(nth ferrs 0)])
+      (> (count kerrs) 0) (values none [(nth kerrs 0)])
+      (not (or (str/ends-with? fname ".yaml") (str/ends-with? fname ".yml") (str/ends-with? fname ".properties")))
+      (values none [(str "Configuration properties file " fname " must end with yaml or properties extension")])
+      :else
+      (let [[text found] (res/res-read (:res p) fname)]
+        (if (not found) (values none [(str "file not found: " fname)])
+          (let [[text2 terr] (if file-level
+                               (let [[raw be] (b64/decode (str/trim text))]
+                                 (if (not= be "") (values "" be) (sec/decrypt-bytes alg mode rnd key raw)))
+                               (values (str text) ""))]
+            (if (not= terr "") (values none [terr])
+              (let [[ps perr] (file-params fname text2)]
+                (if (not= perr "") (values none [(str fname ": " perr)])
+                  (decrypt-params ps alg mode rnd key))))))))))
+
+(defn- decrypt-params Values(Vec(m/Param) Vec(Str)) [ps: &Vec(m/Param) alg: &Str mode: &Str rnd: Bool key: &Str]
+  (loop [i 0 out: Vec(m/Param) [] errs: Vec(Str) []]
+    (if (>= i (count ps)) (values out errs)
+      (let [q (nth ps i)]
+        (match (:v q)
+          (m/PLit s)
+          (if (sec/encrypted? s)
+            (let [[plain e] (sec/decrypt-value alg mode rnd key s)]
+              (if (not= e "") (recur (+ i 1) out (conj errs e))
+                (recur (+ i 1) (conj out (m/->Param (str "secure::" (:name q)) (m/->PLit plain))) errs)))
+            (recur (+ i 1) (conj out (m/->Param (str "secure::" (:name q)) (m/->PLit (str s)))) errs))
+          _ (recur (+ i 1) out errs))))))
+
+(defn- prop-file-read Values(Str Bool) [rs: &res/ResSet fname: &Str]
+  (let [[text found] (res/res-read rs fname)]
+    (if (or found (not (str/starts-with? fname "/"))) (values text found)
+      (let [[t e] (host/file-read fname)] (values t (= e ""))))))
+
+(defn load-decls Values(Props Vec(m/Diag)) [p0: Props decls: &Vec(PropDecl) file: &Str]
+  (let [p1 (loop [i 0 p p0]
+             (if (>= i (count decls)) p
+               (let [d (nth decls i)] (recur (+ i 1) (if (= (:kind d) "global") (add-global p (:a d) (:b d)) p)))))]
+    (loop [i 0 p p1 errs: Vec(m/Diag) []]
+      (if (>= i (count decls)) (values p errs)
+        (let [d (nth decls i)
+              ln (:line d)]
+          (cond
+            (= (:kind d) "file")
+            (let [[fname ferrs] (resolve-str p (:a d))]
+              (cond
+                (> (count ferrs) 0) (recur (+ i 1) p (conj errs (m/->Diag (str file) ln (str "configuration-properties: " (nth ferrs 0)) "" [])))
+                (= fname "") (recur (+ i 1) p (conj errs (m/->Diag (str file) ln "configuration-properties: missing 'file'" "" [])))
+                :else
+                (let [[text found] (prop-file-read (:res p) fname)]
+                  (if (not found) (recur (+ i 1) p (conj errs (m/->Diag (str file) ln (str "configuration-properties: file not found: " fname) "" [])))
+                    (let [[ps perr] (file-params fname text)]
+                      (if (not= perr "") (recur (+ i 1) p (conj errs (m/->Diag (str file) ln (str "configuration-properties: " fname ": " perr) "" [])))
+                        (recur (+ i 1) (add-file-from p ps fname) errs)))))))
+            (= (:kind d) "secure")
+            (let [[ps serrs] (load-secure p d)
+                  errs2 (loop [j 0 a errs] (if (>= j (count serrs)) a (recur (+ j 1) (conj a (m/->Diag (str file) ln (str "secure-properties: " (nth serrs j)) "" [])))))]
+              (recur (+ i 1) (add-file-from p ps (str "secure-properties: " (:a d))) errs2))
+            :else (recur (+ i 1) p errs)))))))

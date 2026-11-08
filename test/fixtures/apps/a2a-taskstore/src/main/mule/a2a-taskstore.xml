@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18199"/>
+    </http:listener-config>
+    <http:request-config name="Raw">
+        <http:request-connection host="localhost" port="18199"/>
+    </http:request-config>
+
+    <os:object-store name="TS" persistent="false"/>
+    <os:object-store name="Snap" persistent="false"/>
+
+    <a2a:server-config name="Srv">
+        <a2a:connection listenerConfig="L" agentPath="/agent"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{"name": "Store", "description": "Task store", "url": "http://localhost:18199/agent", "version": "1.0.0",
+  "capabilities": {"streaming": true, "pushNotifications": true}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []}]]></a2a:json>
+        </a2a:agent-card>
+        <a2a:history taskRepositoryObjectStore="TS"/>
+    </a2a:server-config>
+
+    <flow name="auth"><a2a:authorization-listener config-ref="Srv"/><logger level="DEBUG" message="ok"/></flow>
+
+    <flow name="agent">
+        <a2a:task-listener config-ref="Srv"/>
+        <set-payload value='#[output application/json --- {kind: "task", id: attributes.taskId, contextId: attributes.contextId, status: {state: "working", timestamp: "2026-01-02T03:04:05Z"}}]'/>
+    </flow>
+
+
+    <flow name="push-config">
+        <a2a:push-notification-config-listener config-ref="Srv">
+            <a2a:on-config-accepted requestTimeout="2" requestTimeoutUnit="SECONDS">
+                <a2a:additional-headers><a2a:additional-header key="X-Extra" value="yes"/></a2a:additional-headers>
+            </a2a:on-config-accepted>
+        </a2a:push-notification-config-listener>
+        <logger level="DEBUG" message="accepted"/>
+    </flow>
+
+    <flow name="stream">
+        <a2a:task-stream-listener config-ref="Srv"/>
+        <a2a:update-task-status config-ref="Srv">
+            <a2a:status-content><![CDATA[#[output application/json --- {kind: "status-update", taskId: attributes.taskId, contextId: attributes.contextId, final: false, status: {state: "working", timestamp: "2026-01-02T03:04:05Z"}}]]]></a2a:status-content>
+        </a2a:update-task-status>
+        <a2a:update-task-artifact config-ref="Srv">
+            <a2a:artifact-content><![CDATA[#[output application/json --- {kind: "artifact-update", taskId: attributes.taskId, contextId: attributes.contextId, artifact: {artifactId: "a1", parts: [{kind: "text", text: "chunk"}]}, lastChunk: true}]]]></a2a:artifact-content>
+        </a2a:update-task-artifact>
+        <a2a:update-task-status config-ref="Srv">
+            <a2a:status-content><![CDATA[#[output application/json --- {kind: "status-update", taskId: attributes.taskId, contextId: attributes.contextId, final: true, status: {state: "completed", timestamp: "2026-01-02T03:04:06Z"}}]]]></a2a:status-content>
+        </a2a:update-task-status>
+    </flow>
+
+    <!-- 生の JSON-RPC。前に返った Task の ID を Snap の tid にしまう -->
+    <flow name="rpc-raw">
+        <http:listener config-ref="L" path="/t/rpc" allowedMethods="POST"/>
+        <flow-ref name="call"/>
+        <set-payload value="#[output text/plain --- vars.norm]"/>
+    </flow>
+
+    <sub-flow name="call">
+        <http:request config-ref="Raw" method="POST" path="/agent" outputMimeType="text/plain">
+            <http:body><![CDATA[#[output text/plain --- vars.body default (payload as String)]]]></http:body>
+            <http:headers><![CDATA[#[{"Content-Type": "application/json"}]]]></http:headers>
+            <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+        </http:request>
+        <set-variable variableName="raw" value="#[payload as String]"/>
+        <set-variable variableName="res" value="#[output application/java --- if (vars.raw startsWith '{') read(vars.raw, 'application/json').result default null else null]"/>
+        <choice>
+            <when expression="#[vars.res is Object and (vars.res.id default '') != '' and (vars.res.kind default '') == 'task']">
+                <os:store key="tid" objectStore="Snap"><os:value><![CDATA[#[vars.res.id]]]></os:value></os:store>
+            </when>
+        </choice>
+        <os:retrieve key="tid" objectStore="Snap" target="tid"><os:default-value>none</os:default-value></os:retrieve>
+        <set-variable variableName="norm" value="#[output text/plain --- vars.raw replace vars.tid with '&lt;tid&gt;' replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with '&lt;uuid&gt;' replace /20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with '&lt;ts&gt;']"/>
+    </sub-flow>
+
+    <flow name="rpc-last">
+        <http:listener config-ref="L" path="/t/rpc-last" allowedMethods="POST"/>
+        <os:retrieve key="tid" objectStore="Snap" target="lasttid"/>
+        <set-variable variableName="body" value="#[output text/plain --- (payload as String) replace '@TID@' with vars.lasttid]"/>
+        <flow-ref name="call"/>
+        <set-payload value="#[output text/plain --- vars.norm]"/>
+    </flow>
+
+    <!-- タスクの記録の Object Store の中身。UUID と時刻とホスト名は伏せる。Java のオブジェクトのフィールドの順は
+         実行ごとに変わるので、決めた順に並べ直して書く -->
+    <flow name="store">
+        <http:listener config-ref="L" path="/t/store"/>
+        <os:retrieve-all objectStore="TS"/>
+        <set-payload value='#[output application/json --- {n: sizeOf(payload), entries: (payload pluck ((v, k) -> {
+  key: k as String replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;",
+  "type": typeOf(v) as String,
+  cls: v.^class,
+  json: write(if ((v.^class default "") endsWith "TaskRepositoryItem") {
+      historyLength: v.historyLength,
+      streamingContext: if (v.streamingContext == null) null else {
+        bufferedEvents: v.streamingContext.bufferedEvents map {eventId: $.eventId, eventType: $.eventType, eventData: $.eventData},
+        workerInstanceId: v.streamingContext.workerInstanceId,
+        requestId: v.streamingContext.requestId
+      },
+      contextId: v.contextId,
+      history: v.history,
+      taskState: v.taskState,
+      task: v.task,
+      pushNotificationConfigs: v.pushNotificationConfigs map {proxyConfig: $.proxyConfig, timeout: $.timeout, url: $.url, token: $.token, additionalHeaders: $.additionalHeaders, id: $.id, authentication: $.authentication}
+    } else {contextId: v.contextId}, "application/json")
+    replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;"
+    replace /"workerInstanceId": "[^"]*"/ with "\"workerInstanceId\": \"&lt;worker&gt;\""
+    replace /20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;"
+}) orderBy $.cls)}]'/>
+    </flow>
+
+    <flow name="clear">
+        <http:listener config-ref="L" path="/t/clear"/>
+        <os:clear objectStore="TS"/>
+        <set-payload value="cleared"/>
+    </flow>
+
+    <!-- 記録の task- を消す -->
+    <flow name="remove-tasks">
+        <http:listener config-ref="L" path="/t/remove-tasks"/>
+        <os:retrieve-all-keys objectStore="TS"/>
+        <foreach collection="#[payload filter ($ startsWith 'task-')]">
+            <os:remove key="#[payload]" objectStore="TS"/>
+        </foreach>
+        <set-payload value="removed"/>
+    </flow>
+</mule>

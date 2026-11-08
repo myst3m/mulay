@@ -1,0 +1,88 @@
+(ns wire-test (:require [mulay.lib.sshwire :as w] [mulay.dw.lib.binaries :as bin]))
+
+;; SSH のデータ型 (RFC 4251 5 節)。mpint の期待値は RFC 4251 5 節の例
+
+(defn- hexd Int [c: Int] (if (<= c 57) (- c 48) (- c 87)))
+(defn- unhex Str [h: &Str]
+  (loop [i 0 out ""] (if (>= i (count h)) out
+    (recur (+ i 2) (str out (chr (+ (* 16 (hexd (nth h i))) (hexd (nth h (+ i 1))))))))))
+(defn- hx Str [s: Str] (bin/hex-lower s))
+
+(deftest put-basic
+  (is (= (hx (w/u32 0)) "00000000"))
+  (is (= (hx (w/u32 699921578)) "29b7f4aa"))
+  (is (= (hx (w/u32 4294967295)) "ffffffff"))
+  (is (= (hx (w/u64 1099511627776)) "0000010000000000"))
+  (is (= (hx (w/byte 20)) "14"))
+  (is (= (hx (w/flag true)) "01"))
+  (is (= (hx (w/flag false)) "00"))
+  (is (= (hx (w/string "testing")) "0000000774657374696e67"))
+  (is (= (hx (w/string "")) "00000000")))
+
+(deftest put-name-list
+  (is (= (hx (w/name-list [])) "00000000"))
+  (is (= (hx (w/name-list ["zlib"])) "000000047a6c6962"))
+  (is (= (hx (w/name-list ["zlib" "none"])) "000000097a6c69622c6e6f6e65")))
+
+;; mpint は符号なしの大きい順のバイト列から作る。先頭の 0 は落とし、最上位のビットが立てば 0 を 1 つ足す
+(deftest put-mpint
+  (is (= (hx (w/mpint "")) "00000000"))
+  (is (= (hx (w/mpint (unhex "0000"))) "00000000"))
+  (is (= (hx (w/mpint (unhex "09a378f9b2e332a7"))) "0000000809a378f9b2e332a7"))
+  (is (= (hx (w/mpint (unhex "0009a378f9b2e332a7"))) "0000000809a378f9b2e332a7"))
+  (is (= (hx (w/mpint (unhex "80"))) "000000020080")))
+
+(deftest get-basic
+  (let [buf (str (w/u32 7) (w/byte 94) (w/flag true) (w/string "abc") (w/u64 1099511627776))
+        [a p1 ok1] (w/get-u32 buf 0)
+        [b p2 ok2] (w/get-byte buf p1)
+        [c p3 ok3] (w/get-bool buf p2)
+        [d p4 ok4] (w/get-string buf p3)
+        [e p5 ok5] (w/get-u64 buf p4)
+        [f p6 ok6] (w/get-u32 buf p5)]
+    (is (and ok1 ok2 ok3 ok4 ok5))
+    (is (= a 7))
+    (is (= b 94))
+    (is c)
+    (is (= d "abc"))
+    (is (= e 1099511627776))
+    (is (= p5 (count buf)))
+    (is (not ok6))))
+
+;; 長さが残りを超える string、途中で切れた u32 は失敗
+(deftest get-bounds
+  (let [[a p1 ok1] (w/get-string (unhex "00000005616263") 0)
+        [b p2 ok2] (w/get-string (unhex "ffffffff") 0)
+        [c p3 ok3] (w/get-u32 (unhex "000000") 0)
+        [d p4 ok4] (w/get-byte "" 0)]
+    (is (not ok1))
+    (is (not ok2))
+    (is (not ok3))
+    (is (not ok4))))
+
+(deftest get-name-list
+  (let [[a p1 ok1] (w/get-name-list (unhex "000000097a6c69622c6e6f6e65") 0)
+        [b p2 ok2] (w/get-name-list (unhex "00000000") 0)]
+    (is ok1)
+    (is (= (count a) 2))
+    (is (= (nth a 0) "zlib"))
+    (is (= (nth a 1) "none"))
+    (is ok2)
+    (is (= (count b) 0))))
+
+;; mpint を読むと符号なしの大きさ (先頭の 0 を落としたもの)。負の数 (RFC の -1234 = ed cc) と、余分な 0 で始まるものは失敗
+(deftest get-mpint
+  (let [[a p1 ok1] (w/get-mpint (unhex "0000000809a378f9b2e332a7") 0)
+        [b p2 ok2] (w/get-mpint (unhex "000000020080") 0)
+        [c p3 ok3] (w/get-mpint (unhex "00000000") 0)
+        [d p4 ok4] (w/get-mpint (unhex "00000002edcc") 0)
+        [e p5 ok5] (w/get-mpint (unhex "000000020001") 0)]
+    (is ok1)
+    (is (= (hx a) "09a378f9b2e332a7"))
+    (is (= p1 12))
+    (is ok2)
+    (is (= (hx b) "80"))
+    (is ok3)
+    (is (= c ""))
+    (is (not ok4))
+    (is (not ok5))))

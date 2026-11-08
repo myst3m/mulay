@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18164"/>
+    </http:listener-config>
+
+    <http:request-config name="Raw">
+        <http:request-connection host="localhost" port="18164"/>
+    </http:request-config>
+
+    <os:object-store name="Snap" persistent="false"/>
+    <os:object-store name="Hooks" persistent="false"/>
+
+    <!-- プッシュ通知あり、config の listener あり -->
+    <a2a:server-config name="Srv">
+        <a2a:connection listenerConfig="L" agentPath="/agent"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{"name": "Push", "description": "Push agent", "url": "http://localhost:18164/agent", "version": "1.0.0",
+  "capabilities": {"pushNotifications": true}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []}]]></a2a:json>
+        </a2a:agent-card>
+    </a2a:server-config>
+
+    <!-- プッシュ通知なし -->
+    <a2a:server-config name="NoPush">
+        <a2a:connection listenerConfig="L" agentPath="/nopush"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{"name": "NoPush", "description": "No push", "url": "http://localhost:18164/nopush", "version": "1.0.0",
+  "capabilities": {}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []}]]></a2a:json>
+        </a2a:agent-card>
+    </a2a:server-config>
+
+    <flow name="auth"><a2a:authorization-listener config-ref="Srv"/><logger level="DEBUG" message="ok"/></flow>
+    <flow name="auth-nopush"><a2a:authorization-listener config-ref="NoPush"/><logger level="DEBUG" message="ok"/></flow>
+
+    <!-- 設定を受けるか決める。url に reject があれば断る -->
+    <flow name="push-config">
+        <a2a:push-notification-config-listener config-ref="Srv">
+            <a2a:on-config-accepted>
+                <a2a:additional-headers>
+                    <a2a:additional-header key="X-Extra" value="yes"/>
+                </a2a:additional-headers>
+            </a2a:on-config-accepted>
+        </a2a:push-notification-config-listener>
+        <os:store key="pushcfg" objectStore="Snap">
+            <os:value><![CDATA[#[output application/json --- {
+  payload: write(payload, "application/json") replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "<uuid>",
+  mime: payload.^mimeType,
+  rpc: attributes.jsonRpcMethod
+}]]]></os:value>
+        </os:store>
+        <choice>
+            <when expression="#[(payload.pushNotificationConfig.url default payload.configuration.pushNotificationConfig.url default '') contains 'reject']">
+                <raise-error type="APP:REJECT" description="url not allowed"/>
+            </when>
+        </choice>
+    </flow>
+
+    <flow name="agent">
+        <a2a:task-listener config-ref="Srv"/>
+        <set-variable variableName="text" value="#[payload.message.parts[0].text default '']"/>
+        <choice>
+            <when expression="#[vars.text == 'fail']">
+                <raise-error type="APP:BOOM" description="the agent failed"/>
+            </when>
+            <when expression="#[vars.text == 'msg']">
+                <set-payload value='#[output application/json --- {kind: "message", role: "agent", messageId: "m-1", taskId: attributes.taskId, contextId: attributes.contextId, parts: [{kind: "text", text: "hello"}]}]'/>
+            </when>
+            <otherwise>
+                <set-payload value='#[output application/json --- {kind: "task", id: attributes.taskId, contextId: attributes.contextId, status: {state: "working", timestamp: "2026-01-02T03:04:05Z"}}]'/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <flow name="agent-nopush">
+        <a2a:task-listener config-ref="NoPush"/>
+        <set-payload value='#[output application/json --- {kind: "task", id: attributes.taskId, contextId: attributes.contextId, status: {state: "working", timestamp: "2026-01-02T03:04:05Z"}}]'/>
+    </flow>
+
+    <!-- 通知を受ける側 (同時に届くので 1 件ずつ別のキーにしまう) -->
+    <flow name="hook">
+        <http:listener config-ref="L" path="/hook/{name}"/>
+        <os:store key="#[attributes.uriParams.name ++ '-' ++ uuid()]" objectStore="Hooks">
+            <os:value><![CDATA[#[output application/json --- {
+  hook: attributes.uriParams.name,
+  method: attributes.method,
+  ctype: attributes.headers."content-type",
+  token: attributes.headers."x-a2a-notification-token",
+  extra: attributes.headers."x-extra",
+  body: payload
+}]]]></os:value>
+        </os:store>
+        <set-payload value="ok"/>
+    </flow>
+
+    <!-- 届いた通知 (n 件そろうまで待つ)。返したら空にする -->
+    <flow name="hooks">
+        <http:listener config-ref="L" path="/t/hooks"/>
+        <set-variable variableName="n" value="#[(attributes.queryParams.n default '1') as Number]"/>
+        <try>
+            <until-successful maxRetries="50" millisBetweenRetries="100">
+                <os:retrieve-all-keys objectStore="Hooks" target="keys"/>
+                <choice>
+                    <when expression="#[sizeOf(vars.keys) &lt; vars.n]">
+                        <raise-error type="APP:WAIT" description="waiting"/>
+                    </when>
+                </choice>
+            </until-successful>
+            <error-handler>
+                <on-error-continue><logger level="DEBUG" message="timeout"/></on-error-continue>
+            </error-handler>
+        </try>
+        <os:retrieve-all objectStore="Hooks" target="hooks"/>
+        <os:clear objectStore="Hooks"/>
+        <os:retrieve key="ids" objectStore="Snap" target="ids">
+            <os:default-value><![CDATA[#[output application/json --- {tid: "none", cid: "none", pid: "none"}]]]></os:default-value>
+        </os:retrieve>
+        <set-payload value='#[output application/json --- (valuesOf(vars.hooks) map read($ as String, "application/json") orderBy $.hook) map ($ - "body" ++ {body: write($.body, "application/json") replace vars.ids.tid with "&lt;tid&gt;" replace vars.ids.cid with "&lt;cid&gt;" replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;" replace /20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;"})]'/>
+    </flow>
+
+    <!-- 生の JSON-RPC。@TID@ / @CID@ は前に Task を返した応答の ID、@PID@ は前に返した通知の設定の ID -->
+    <flow name="rpc-raw">
+        <http:listener config-ref="L" path="/t/rpc" allowedMethods="POST"/>
+        <set-variable variableName="path" value="#[attributes.queryParams.path default '/agent']"/>
+        <os:retrieve key="ids" objectStore="Snap" target="ids">
+            <os:default-value><![CDATA[#[output application/json --- {tid: "none", cid: "none", pid: "none"}]]]></os:default-value>
+        </os:retrieve>
+        <set-variable variableName="body" value="#[output text/plain --- (payload as String) replace '@TID@' with vars.ids.tid replace '@CID@' with vars.ids.cid replace '@PID@' with vars.ids.pid]"/>
+        <http:request config-ref="Raw" method="POST" path="#[vars.path]" outputMimeType="text/plain">
+            <http:body><![CDATA[#[vars.body]]]></http:body>
+            <http:headers><![CDATA[#[{"Content-Type": "application/json"}]]]></http:headers>
+            <http:response-validator><http:success-status-code-validator values="100..599"/></http:response-validator>
+        </http:request>
+        <set-variable variableName="status" value="#[attributes.statusCode]"/>
+        <set-variable variableName="raw" value="#[payload as String]"/>
+        <set-variable variableName="res" value="#[output application/java --- read(vars.raw, 'application/json').result default null]"/>
+        <os:store key="ids" objectStore="Snap">
+            <os:value><![CDATA[#[output application/json --- {
+  tid: if (vars.res is Object and (vars.res.kind default '') == 'task' and vars.path == '/agent') vars.res.id else vars.ids.tid,
+  cid: if (vars.res is Object and (vars.res.kind default '') == 'task' and vars.path == '/agent') vars.res.contextId else vars.ids.cid,
+  pid: if (vars.res is Object and (vars.res.pushNotificationConfig.id default '') != '') vars.res.pushNotificationConfig.id else vars.ids.pid
+}]]]></os:value>
+        </os:store>
+        <os:retrieve key="ids" objectStore="Snap" target="ids2"/>
+        <set-payload value='#[output application/json --- {status: vars.status, body: vars.raw replace vars.ids2.tid with "&lt;tid&gt;" replace vars.ids2.cid with "&lt;cid&gt;" replace vars.ids2.pid with "&lt;pid&gt;" replace /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ with "&lt;uuid&gt;" replace /20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/ with "&lt;ts&gt;"}]'/>
+    </flow>
+
+    <flow name="last-pushcfg">
+        <http:listener config-ref="L" path="/t/last-pushcfg"/>
+        <os:retrieve key="pushcfg" objectStore="Snap"/>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <!-- send-push-notification。?kind=task (前のタスク) / msg / notask / unknown、?cfg=NoPush -->
+    <flow name="push-op">
+        <http:listener config-ref="L" path="/t/push"/>
+        <os:retrieve key="ids" objectStore="Snap" target="ids">
+            <os:default-value><![CDATA[#[output application/json --- {tid: "none", cid: "none", pid: "none"}]]]></os:default-value>
+        </os:retrieve>
+        <set-variable variableName="kind" value="#[attributes.queryParams.kind default 'task']"/>
+        <set-variable variableName="msg" value='#[output application/json --- if (vars.kind == "task") {kind: "task", id: vars.ids.tid, contextId: vars.ids.cid, status: {state: "completed", timestamp: "2026-01-02T03:04:09Z"}}
+  else if (vars.kind == "msg") {kind: "message", role: "agent", messageId: "m-push", taskId: vars.ids.tid, parts: [{kind: "text", text: "pushed"}]}
+  else if (vars.kind == "notask") {kind: "message", role: "agent", messageId: "m-push", parts: [{kind: "text", text: "pushed"}]}
+  else if (vars.kind == "bad") {kind: "nope"}
+  else {kind: "task", id: "unknown-task", contextId: "c", status: {state: "completed"}}]'/>
+        <choice>
+            <when expression="#[attributes.queryParams.cfg == 'NoPush']">
+                <a2a:send-push-notification config-ref="NoPush">
+                    <a2a:notification-message><![CDATA[#[vars.msg]]]></a2a:notification-message>
+                </a2a:send-push-notification>
+            </when>
+            <otherwise>
+                <a2a:send-push-notification config-ref="Srv">
+                    <a2a:notification-message><![CDATA[#[vars.msg]]]></a2a:notification-message>
+                </a2a:send-push-notification>
+            </otherwise>
+        </choice>
+        <set-payload value='#[output application/json --- {ok: true, payload: write(payload, "application/json"), attrClass: attributes.^class, method: attributes.method}]'/>
+        <error-handler>
+            <on-error-continue>
+                <set-payload value='#[output application/json --- {error: error.errorType.namespace ++ ":" ++ error.errorType.identifier, description: error.description replace vars.ids.tid with "&lt;tid&gt;"}]'/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>

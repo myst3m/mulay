@@ -1,0 +1,1 @@
+[9,2,3,4,5] filter (value, index) -> (value > 2)

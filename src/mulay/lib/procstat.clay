@@ -1,0 +1,88 @@
+(ns mulay.lib.procstat
+  (:require [clay.string :as str] [clay.io :as io]))
+(c-include "<unistd.h>")
+(defextern c-sysconf sysconf)
+(defextern c-getpid getpid)
+
+(defn status-field Int [text: &Str key: &Str]
+  (let [lines: Vec(Str) (str/split text "\n")
+        pre (str key ":")]
+    (loop [i 0]
+      (if (>= i (count lines)) -1
+        (let [ln (nth lines i)]
+          (if (not (str/starts-with? ln pre)) (recur (+ i 1))
+            (let [rest (str/trim (subs ln (count pre) (count ln)))
+                  sp (str/index-of rest " ")
+                  num (if (< sp 0) rest (subs rest 0 sp))
+                  unit (if (< sp 0) "" (str/trim (subs rest sp (count rest))))
+                  [n e] (parse-long num)]
+              (if (not= e "") -1 (if (= unit "kB") (* n 1024) n)))))))))
+
+(defn stat-times Values(Int Int Int) [text: &Str]
+  (let [close (loop [i (- (count text) 1)] (if (< i 0) -1 (if (= (nth text i) 41) i (recur (- i 1)))))]
+    (if (< close 0) (values 0 0 0)
+      (let [fs: Vec(Str) (str/split (str/trim (subs text (+ close 1) (count text))) " ")
+            at (fn Int [n: Int] (if (>= (- n 3) (count fs)) 0 (let [[v e] (parse-long (nth fs (- n 3)))] (if (= e "") v 0))))]
+        (values (at 14) (at 15) (at 22))))))
+
+(defn stat-state Str [text: &Str]
+  (let [close (loop [i (- (count text) 1)] (if (< i 0) -1 (if (= (nth text i) 41) i (recur (- i 1)))))
+        rest (if (< close 0) "" (str/trim (subs text (+ close 1) (count text))))]
+    (if (= rest "") "" (subs rest 0 1))))
+
+(defn cpu-ticks Values(Int Int) [text: &Str]
+  (let [lines: Vec(Str) (str/split text "\n")]
+    (if (= (count lines) 0) (values 0 0)
+      (let [fs: Vec(Str) (str/split (nth lines 0) " ")
+            ns (loop [i 0 acc: Vec(Int) []]
+                 (if (>= i (count fs)) acc
+                   (let [f (nth fs i)]
+                     (if (or (= f "") (= f "cpu")) (recur (+ i 1) acc)
+                       (let [[v e] (parse-long f)] (recur (+ i 1) (conj acc (if (= e "") v 0))))))))
+            g (fn Int [k: Int] (if (< k (count ns)) (nth ns k) 0))
+            idle (+ (g 3) (g 4))
+            busy (+ (+ (+ (g 0) (g 1)) (g 2)) (+ (+ (g 5) (g 6)) (g 7)))]
+        (values busy (+ busy idle))))))
+
+(defn loadavg-1 Float [text: &Str]
+  (let [fs: Vec(Str) (str/split (str/trim text) " ")]
+    (if (= (count fs) 0) -1.0
+      (let [[x e] (parse-double (nth fs 0))] (if (= e "") x -1.0)))))
+
+(defn- slurp Str [path: &Str] (let [[s e] (read-file path)] (if (= e "") s "")))
+
+(defn- tick-hz Int [] (let [h (unsafe (c-sysconf 2))] (if (> h 0) h 100)))
+
+(defn ncpu Int [] (let [n (unsafe (c-sysconf 84))] (if (> n 0) n 1)))
+
+(defn self-rss Int [] (status-field (slurp "/proc/self/status") "VmRSS"))
+(defn self-vsize Int [] (status-field (slurp "/proc/self/status") "VmSize"))
+(defn self-threads Int [] (status-field (slurp "/proc/self/status") "Threads"))
+
+(defn self-task-states Vec(Str) []
+  (let [[ids e] (io/list-dir "/proc/self/task")
+        me (str (unsafe (c-getpid)))
+        main (stat-state (slurp (str "/proc/self/task/" me "/stat")))]
+    (loop [i 0 acc: Vec(Str) [main]]
+      (if (>= i (count ids)) acc
+        (let [id (nth ids i)]
+          (recur (+ i 1) (if (= id me) acc (let [st (stat-state (slurp (str "/proc/self/task/" id "/stat")))] (if (= st "") acc (conj acc st))))))))))
+
+(defn meminfo Int [key: &Str] (status-field (slurp "/proc/meminfo") key))
+(defn loadavg Float [] (loadavg-1 (slurp "/proc/loadavg")))
+
+(defn self-cpu-ns Int []
+  (let [[u s st] (stat-times (slurp "/proc/self/stat"))]
+    (quot (* (+ u s) 1000000000) (tick-hz))))
+
+(defn system-cpu Values(Int Int) [] (cpu-ticks (slurp "/proc/stat")))
+
+(defn uptime-ms Int []
+  (let [[u s st] (stat-times (slurp "/proc/self/stat"))
+        up (str/split (str/trim (slurp "/proc/uptime")) " ")
+        [sec e] (if (= (count up) 0) (values 0.0 "x") (parse-double (nth up 0)))]
+    (if (not= e "") 0
+      (let [ms (- (* sec 1000.0) (/ (* (float st) 1000.0) (float (tick-hz))))]
+        (if (< ms 0.0) 0 (int ms))))))
+
+(defn start-ms Int [] (- (epoch-ms) (uptime-ms)))

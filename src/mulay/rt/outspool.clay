@@ -1,0 +1,32 @@
+(ns mulay.rt.outspool (:require [mulay.lib.spool :as spool] [mulay.lib.fs :as fs] [mulay.rt.bodies :as bodies]
+                                [mulay.dw.val :as v] [mulay.dw.err :as dwe] [mulay.dw.fmt.out :as fo] [mulay.dw.fmt.registry :as reg]))
+
+(def SEQ (atom 0))
+(def MADE (atom (let [m: Map(Str Bool) {}] m)))
+
+(defn- ensure-dir Str [d: &Str]
+  (if (contains? (deref MADE) d) ""
+    (let [e (fs/mkdirs-private d)]
+      (if (not= e "") e
+        (let [z (swap! MADE (fn Map(Str Bool) [m: Map(Str Bool)] (assoc m (str d) true)))] "")))))
+
+(defn- add-to dwe/DwErr [a: &Atom(spool/Spool) dir: &Str piece: &Str]
+  (let [sp (deref a)
+        de (if (and (spool/in-memory? sp) (> (+ (spool/size sp) (count piece)) bodies/IN-MEMORY)) (ensure-dir dir) "")]
+    (if (not= de "") (fo/writer-err (str "spool: " de))
+      (let [[s2 e] (spool/add sp piece)
+            z (reset! a s2)]
+        (if (= e "") (dwe/ok) (fo/writer-err e))))))
+
+(defn write Values(spool/Spool dwe/DwErr) [dir: &Str mime: &Str props: &Vec(v/Field) nss: &Vec(v/Ns) x: &v/Val]
+  (let [n (swap! SEQ (fn Int [k: Int] (+ k 1)))
+        a (atom (spool/new (fs/join dir (str "out-" n)) bodies/IN-MEMORY))
+        d (str dir)
+        snk (fo/to (fn dwe/DwErr [s: Str] (add-to a d s)))
+        [rest we] (reg/write-script-output-to mime props nss x snk)
+        ae (if (dwe/ok? we) (add-to a d rest) we)
+        sp (deref a)]
+    (if (dwe/ok? ae) (values sp ae)
+      (let [z (spool/delete sp)] (values (spool/new "" 0) ae)))))
+
+(defn open Str [owner: &Str sp: spool/Spool] (bodies/open owner sp))

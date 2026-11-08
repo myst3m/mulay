@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:grpc="http://www.mulesoft.org/schema/mule/grpc"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/grpc http://www.mulesoft.org/schema/mule/grpc/current/mule-grpc.xsd">
+    <http:listener-config name="G">
+        <http:listener-connection host="0.0.0.0" port="18185">
+            <http:protocol-support>
+                <http:http2-support enable="true"/>
+            </http:protocol-support>
+        </http:listener-connection>
+    </http:listener-config>
+
+    <grpc:server-config name="Srv">
+        <grpc:grpc-server-connection listenerConfig="G">
+            <grpc:idl-definition>
+                <grpc:single-binary-protobuf protobufDescriptorFile="stream.desc"/>
+            </grpc:idl-definition>
+        </grpc:grpc-server-connection>
+    </grpc:server-config>
+
+    <!-- server-streaming: send-stream-message を count 回、end-stream で閉じる -->
+    <flow name="ticks">
+        <grpc:server-streaming-method config-ref="Srv" methodName="st.S/Ticks"/>
+        <logger level="INFO" message="#[output application/json indent=false --- {keys: keysOf(attributes), attrs: attributes - 'connectionId', conn: sizeOf(attributes.connectionId default ''), cls: attributes.^class}]"/>
+        <set-variable variableName="a" value="#[attributes]"/>
+        <foreach collection="#[output application/java --- 1 to (payload.count default 1)]">
+            <grpc:send-stream-message config-ref="Srv" attributes="#[vars.a]">
+                <grpc:stream-message><![CDATA[#[output application/x-protobuf descriptorUrl='stream.desc', messageType='st.Rep' --- {message: 'tick', n: payload}]]]></grpc:stream-message>
+            </grpc:send-stream-message>
+        </foreach>
+        <grpc:end-stream config-ref="Srv" attributes="#[vars.a]"/>
+    </flow>
+    <!-- メッセージを 2 つ送ってから失敗する -->
+    <flow name="ticks-fail">
+        <grpc:server-streaming-method config-ref="Srv" methodName="st.S/TicksFail">
+            <grpc:error-response statusCode="ABORTED" description="#['stopped at ' ++ (payload.name default '')]"/>
+        </grpc:server-streaming-method>
+        <grpc:send-stream-message config-ref="Srv" attributes="#[attributes]">
+            <grpc:stream-message><![CDATA[#[output application/x-protobuf descriptorUrl='stream.desc', messageType='st.Rep' --- {message: 'one', n: 1}]]]></grpc:stream-message>
+        </grpc:send-stream-message>
+        <raise-error type="APP:STOP" description="stop"/>
+    </flow>
+
+    <!-- client-streaming: メッセージごとにフローが動き、最後に streamCompleted で動く -->
+    <flow name="sum">
+        <grpc:client-streaming-method config-ref="Srv" methodName="st.S/Sum">
+            <grpc:output streamState="#[{total: (attributes.streamState.total default 0) + (if (attributes.streamCompleted) 0 else (payload.count default 0)), names: (attributes.streamState.names default '') ++ (if (attributes.streamCompleted) '' else (payload.name default ''))}]" response="#[output application/x-protobuf descriptorUrl='stream.desc', messageType='st.Rep' --- {message: attributes.streamState.names default '', n: attributes.streamState.total default 0}]"/>
+        </grpc:client-streaming-method>
+        <logger level="INFO" message="#[output application/json indent=false --- {keys: keysOf(attributes), attrs: attributes, cls: attributes.^class, p: if (attributes.streamCompleted) (payload default 'null') else payload.name}]"/>
+    </flow>
+    <flow name="sum-fail">
+        <grpc:client-streaming-method config-ref="Srv" methodName="st.S/SumFail">
+            <grpc:error-response statusCode="INVALID_ARGUMENT" description="#['bad ' ++ (attributes.messageCount as String)]"/>
+        </grpc:client-streaming-method>
+        <choice>
+            <when expression="#[attributes.messageCount == 2]">
+                <raise-error type="APP:BAD" description="bad"/>
+            </when>
+        </choice>
+    </flow>
+
+    <!-- bidi: メッセージごとにフローが動く -->
+    <flow name="chat">
+        <grpc:bidirectional-streaming-method config-ref="Srv" methodName="st.S/Chat">
+            <grpc:stream-output streamState="#[{seen: (attributes.streamState.seen default 0) + 1}]" response="#[output application/x-protobuf descriptorUrl='stream.desc', messageType='st.Rep' --- {message: 'echo ' ++ (payload.name default 'end'), n: attributes.messageIndex}]"/>
+        </grpc:bidirectional-streaming-method>
+        <logger level="INFO" message="#[output application/json indent=false --- {keys: keysOf(attributes), attrs: attributes - 'connectionId' - 'timestamp', conn: sizeOf(attributes.connectionId default ''), ts: typeOf(attributes.timestamp) as String, p: payload default 'null', cls: attributes.^class}]"/>
+    </flow>
+
+    <!-- 単項のメソッドに server-streaming-method -->
+    <flow name="plain-as-stream">
+        <grpc:server-streaming-method config-ref="Srv" methodName="st.S/Plain"/>
+        <logger level="INFO" message="plain as stream"/>
+    </flow>
+</mule>

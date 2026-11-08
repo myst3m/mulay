@@ -1,0 +1,126 @@
+(ns mulay.lib.csv
+  (:require [clay.core]))
+
+(defrecord CsvOpts [separator: Str quote: Str escape: Str header: Bool header-line: Int body-start: Int
+                    ignore-empty-line: Bool quote-values: Bool quote-header: Bool line-separator: Str])
+
+(defn default-opts CsvOpts [] (->CsvOpts "," "\"" "\\" true 0 0 true false false "\n"))
+
+(defrecord CsvReader [src: Str pos: Int line: Int opts: CsvOpts])
+
+(defn- at Int [s: &Str i: Int] (if (and (>= i 0) (< i (count s))) (nth s i) -1))
+
+(defn- starts-at? Bool [s: &Str i: Int lit: &Str]
+  (let [m (count lit)]
+    (if (or (= m 0) (> (+ i m) (count s))) false
+      (loop [k 0] (if (>= k m) true (if (= (nth s (+ i k)) (nth lit k)) (recur (+ k 1)) false))))))
+
+(defn- skip-line Int [s: &Str p: Int]
+  (loop [i p]
+    (let [c (at s i)]
+      (cond (< c 0) i
+            (= c 10) (+ i 1)
+            (= c 13) (if (= (at s (+ i 1)) 10) (+ i 2) (+ i 1))
+            :else (recur (+ i 1))))))
+
+(defn- eol-len Int [s: &Str p: Int]
+  (let [c (at s p)] (cond (= c 10) 1 (= c 13) (if (= (at s (+ p 1)) 10) 2 1) :else 0)))
+
+(defn- parse-record Values(Vec(Str) Int Int Str) [s: &Str p: Int o: &CsvOpts]
+  (let [sep (:separator o) q (:quote o) esc (:escape o)
+        n (count s)]
+    (loop [i p fields: Vec(Str) [] cur "" quoted false in-q false nl 0]
+      (cond
+        in-q
+        (cond
+          (>= i n) (values fields i nl "unterminated quoted field")
+          (and (not (= esc q)) (starts-at? s i esc)
+               (or (starts-at? s (+ i (count esc)) q) (starts-at? s (+ i (count esc)) esc)))
+          (let [j (+ i (count esc))
+                lit (if (starts-at? s j q) q esc)]
+            (recur (+ j (count lit)) fields (str cur lit) quoted true nl))
+          (starts-at? s i q)
+          (if (starts-at? s (+ i (count q)) q)
+            (recur (+ i (* 2 (count q))) fields (str cur q) quoted true nl)
+            (recur (+ i (count q)) fields cur quoted false nl))
+          :else
+          (let [k (eol-len s i)]
+            (if (> k 0) (recur (+ i k) fields (str cur (subs s i (+ i k))) quoted true (+ nl 1))
+              (let [j (loop [j (+ i 1)]
+                        (if (or (>= j n) (starts-at? s j q) (starts-at? s j esc) (= (nth s j) 10) (= (nth s j) 13)) j (recur (+ j 1))))]
+                (recur j fields (str cur (subs s i j)) quoted true nl)))))
+        (or (>= i n) (> (eol-len s i) 0))
+        (values (conj fields cur) (+ i (eol-len s i)) (+ nl 1) "")
+        (starts-at? s i sep) (recur (+ i (count sep)) (conj fields cur) "" false false nl)
+        (and (starts-at? s i q) (= (count cur) 0) (not quoted)) (recur (+ i (count q)) fields cur true true nl)
+        :else
+        (let [j (loop [j (+ i 1)]
+                  (if (or (>= j n) (starts-at? s j sep) (= (nth s j) 10) (= (nth s j) 13)) j (recur (+ j 1))))]
+          (recur j fields (str cur (subs s i j)) quoted false nl))))))
+
+(defn reader-line Int [r: &CsvReader] (+ (:line r) 1))
+
+(defn- empty-row? Bool [row: &Vec(Str)] (and (= (count row) 1) (= (count (nth row 0)) 0)))
+
+(defn next-row Values(CsvReader Vec(Str) Bool Str) [r0: CsvReader]
+  (loop [r r0]
+    (let [s (:src r) p (:pos r)]
+      (if (>= p (count s)) (values r (let [z: Vec(Str) []] z) false "")
+        (let [[row e nl err] (parse-record s p (:opts r))]
+          (cond
+            (not (= err "")) (values r row false (str "line " (+ (:line r) 1) ": " err))
+            (and (:ignore-empty-line (:opts r)) (empty-row? row)) (recur (assoc r :pos e :line (+ (:line r) nl)))
+            :else (values (assoc r :pos e :line (+ (:line r) nl)) row true "")))))))
+
+(defn- skip Values(Int Int) [s: &Str from: Int line: Int upto: Int]
+  (loop [p from l line] (if (or (>= l upto) (>= p (count s))) (values p l) (recur (skip-line s p) (+ l 1)))))
+
+(defn reader Values(CsvReader Vec(Str) Str) [text: &Str o: CsvOpts]
+  (let [s (if (starts-at? text 0 (str (chr 239) (chr 187) (chr 191))) (subs text 3 (count text)) (str text))]
+    (if (:header o)
+      (let [[p1 l1] (skip s 0 0 (:header-line o))
+            [hdr e nl err] (if (< p1 (count s)) (parse-record s p1 o) (values (let [z: Vec(Str) []] z) p1 0 ""))
+            l2 (+ l1 nl)
+            [p3 l3] (skip s e l2 (:body-start o))]
+        (if (not (= err "")) (values (->CsvReader s p3 l3 o) hdr (str "line " (+ l1 1) ": " err))
+          (values (->CsvReader s p3 l3 o) (if (empty-row? hdr) (let [z: Vec(Str) []] z) hdr) "")))
+      (let [[p1 l1] (skip s 0 0 (:body-start o))]
+        (values (->CsvReader s p1 l1 o) (let [z: Vec(Str) []] z) "")))))
+
+(defn read-all Values(Vec(Str) Vec(Vec(Str)) Str) [text: &Str o: CsvOpts]
+  (let [[r0 hdr err] (reader text o)]
+    (if (not (= err "")) (values hdr (let [z: Vec(Vec(Str)) []] z) err)
+      (loop [r r0 rows: Vec(Vec(Str)) []]
+        (let [[r2 row has err2] (next-row r)]
+          (cond (not (= err2 "")) (values hdr rows err2)
+                has (recur r2 (conj rows row))
+                :else (values hdr rows "")))))))
+
+(defn- contains-lit? Bool [s: &Str lit: &Str]
+  (if (= (count lit) 0) false
+    (loop [i 0] (if (>= i (count s)) false (if (starts-at? s i lit) true (recur (+ i 1)))))))
+
+(defn quote-field Str [s: &Str o: &CsvOpts force: Bool]
+  (let [q (:quote o) esc (:escape o)
+        need (or force (contains-lit? s (:separator o)) (contains-lit? s q)
+                 (and (not (= esc q)) (contains-lit? s esc) (contains-lit? s q))
+                 (contains-lit? s "\n") (contains-lit? s (chr 13)))]
+    (if (not need) (str s)
+      (let [e (if (= (count esc) 0) q esc)]
+        (loop [i 0 out (str q)]
+          (if (>= i (count s)) (str out q)
+            (cond
+              (starts-at? s i q) (recur (+ i (count q)) (str out e q))
+              (and (not (= e q)) (starts-at? s i e)) (recur (+ i (count e)) (str out e e))
+              :else (recur (+ i 1) (str out (chr (nth s i)))))))))))
+
+(defn write-row Str [fields: &Vec(Str) o: &CsvOpts header: Bool]
+  (let [force (if header (:quote-header o) (:quote-values o))]
+    (loop [i 0 out ""]
+      (if (>= i (count fields)) (str out (:line-separator o))
+        (recur (+ i 1) (str out (if (= i 0) "" (:separator o)) (quote-field (nth fields i) o force)))))))
+
+(defn write Str [header: &Vec(Str) rows: &Vec(Vec(Str)) o: &CsvOpts]
+  (let [h (if (and (:header o) (> (count header) 0)) (write-row header o true) "")]
+    (loop [i 0 out h]
+      (if (>= i (count rows)) out (recur (+ i 1) (str out (write-row (nth rows i) o false)))))))

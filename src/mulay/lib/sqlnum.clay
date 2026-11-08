@@ -1,0 +1,206 @@
+(ns mulay.lib.sqlnum (:require [mulay.lib.ieee :as ieee] [clay.string :as str]))
+
+(def U64-MAX -1)
+
+(defn- ult? Bool [a: Int b: Int] (< (bit-xor a (bit-shift-left 1 63)) (bit-xor b (bit-shift-left 1 63))))
+
+(defn- udiv10 Int [a: Int] (if (>= a 0) (quot a 10) (quot (unsigned-bit-shift-right a 1) 5)))
+
+(defn- u64->float Float [a: Int]
+  (if (>= a 0) (float a)
+    (let [h (bit-or (unsigned-bit-shift-right a 1) (bit-and a 1))] (* 2.0 (float h)))))
+
+(def TWO63: Float 9223372036854775808.0)
+(defn- float->u64 Int [x: Float]
+  (if (< x TWO63) (int x) (+ (int (- x TWO63)) (bit-shift-left 1 63))))
+
+(defn- hi26 Float [x: Float] (ieee/bits->double (bit-and (ieee/double->bits x) -67108864)))
+
+(defn- mul2 Values(Float Float) [x0: Float x1: Float y: Float yy: Float]
+  (let [hx (hi26 x0) tx (- x0 hx)
+        hy (hi26 y) ty (- y hy)
+        p (* hx hy)
+        q (+ (* hx ty) (* tx hy))
+        c (+ p q)
+        cc0 (+ (+ (- p c) q) (* tx ty))
+        cc (+ (+ (* x0 yy) (* x1 y)) cc0)
+        r0 (+ c cc)
+        r1 (+ (- c r0) cc)]
+    (values r0 r1)))
+
+(defn- space? Bool [c: Int] (or (= c 32) (and (>= c 9) (<= c 13))))
+(defn- dig? Bool [c: Int] (and (>= c 48) (<= c 57)))
+
+(def LIM9: Int (udiv10 (- U64-MAX 9)))
+(def LIM7FF: Int (udiv10 (- U64-MAX 2047)))
+
+(defn atof Values(Float Int) [z: &Str]
+  (let [n (count z)
+        i0 (loop [i 0] (if (and (< i n) (space? (nth z i))) (recur (+ i 1)) i))]
+    (if (>= i0 n) (values 0.0 0)
+      (let [sign (if (= (nth z i0) 45) -1 1)
+            i1 (if (or (= (nth z i0) 45) (= (nth z i0) 43)) (+ i0 1) i0)
+            [s1 d1 nd1 i2] (loop [i i1 s 0 d 0 nd 0]
+                             (if (and (< i n) (dig? (nth z i)))
+                               (let [s2 (+ (* s 10) (- (nth z i) 48))]
+                                 (if (ult? s2 LIM9) (recur (+ i 1) s2 d (+ nd 1))
+                                   (let [j (loop [j (+ i 1)] (if (and (< j n) (dig? (nth z j))) (recur (+ j 1)) j))]
+                                     (values s2 (+ d (- j (+ i 1))) (+ nd 1) j))))
+                               (values s d nd i)))
+            dot (and (< i2 n) (= (nth z i2) 46))
+            [s2 d2 nd2 i3] (if (not dot) (values s1 d1 nd1 i2)
+                             (loop [i (+ i2 1) s s1 d d1 nd nd1]
+                               (if (and (< i n) (dig? (nth z i)))
+                                 (if (ult? s LIM9) (recur (+ i 1) (+ (* s 10) (- (nth z i) 48)) (- d 1) (+ nd 1)) (recur (+ i 1) s d nd))
+                                 (values s d nd i))))
+            etype0 (if dot 2 1)
+            has-e (and (< i3 n) (or (= (nth z i3) 101) (= (nth z i3) 69)))
+            [e esign evalid etype i4]
+            (if (not has-e) (values 0 1 true etype0 i3)
+              (let [j0 (+ i3 1)
+                    es (if (and (< j0 n) (= (nth z j0) 45)) -1 1)
+                    j1 (if (and (< j0 n) (or (= (nth z j0) 45) (= (nth z j0) 43))) (+ j0 1) j0)
+                    [ev j2 ok] (loop [j j1 v 0 ok false]
+                                 (if (and (< j n) (dig? (nth z j)))
+                                   (recur (+ j 1) (if (< v 10000) (+ (* v 10) (- (nth z j) 48)) 10000) true)
+                                   (values v j ok)))]
+                (values ev es ok (+ etype0 1) j2)))
+            i5 (loop [i i4] (if (and (< i n) (space? (nth z i))) (recur (+ i 1)) i))
+            kind (cond (and (= i5 n) (> nd2 0) evalid) etype
+                       (and (>= etype 2) (or (= etype 3) evalid) (> nd2 0)) -1
+                       :else 0)]
+        (if (= s2 0) (values (if (< sign 0) -0.0 0.0) kind)
+          (values (scale s2 (+ (* e esign) d2) sign) kind))))))
+
+(defn- scale Float [s0: Int e0: Int sign: Int]
+  (let [[s e1] (loop [s s0 e e0] (if (and (> e 0) (ult? s LIM7FF)) (recur (* s 10) (- e 1)) (values s e)))
+        [s3 e] (loop [s s e e1] (if (and (< e 0) (= (- s (* (udiv10 s) 10)) 0)) (recur (udiv10 s) (+ e 1)) (values s e)))
+        r0 (u64->float s3)
+        r1 (if (<= r0 18446744073709549568.0)
+             (let [s2 (float->u64 r0)] (if (not (ult? s3 s2)) (u64->float (- s3 s2)) (- 0.0 (u64->float (- s2 s3)))))
+             0.0)
+        [x0 x1] (if (> e 0)
+                  (loop [e e a r0 b r1]
+                    (cond (>= e 100) (let [[p q] (mul2 a b 1.0e+100 -1.5902891109759918046e+83)] (recur (- e 100) p q))
+                          (>= e 10) (let [[p q] (mul2 a b 1.0e+10 0.0)] (recur (- e 10) p q))
+                          (>= e 1) (let [[p q] (mul2 a b 10.0 0.0)] (recur (- e 1) p q))
+                          :else (values a b)))
+                  (loop [e e a r0 b r1]
+                    (cond (<= e -100) (let [[p q] (mul2 a b 1.0e-100 -1.99918998026028836196e-117)] (recur (+ e 100) p q))
+                          (<= e -10) (let [[p q] (mul2 a b 1.0e-10 -3.6432197315497741579e-27)] (recur (+ e 10) p q))
+                          (<= e -1) (let [[p q] (mul2 a b 1.0e-01 -5.5511151231257827021e-18)] (recur (+ e 1) p q))
+                          :else (values a b))))
+        r (+ x0 x1)
+        r2 (if (not= r r) (* 1.0e300 1.0e300) r)]
+    (if (< sign 0) (- 0.0 r2) r2)))
+
+(defn- fp-decode Values(Str Int) [x: Float round0: Int mx: Int]
+  (let [[x0 x1 exp]
+        (if (> x 9.223372036854774784e+18)
+          (loop [a x b 0.0 e 0]
+            (cond (> a 9.223372036854774784e+118) (let [[p q] (mul2 a b 1.0e-100 -1.99918998026028836196e-117)] (recur p q (+ e 100)))
+                  (> a 9.223372036854774784e+28) (let [[p q] (mul2 a b 1.0e-10 -3.6432197315497741579e-27)] (recur p q (+ e 10)))
+                  (> a 9.223372036854774784e+18) (let [[p q] (mul2 a b 1.0e-01 -5.5511151231257827021e-18)] (recur p q (+ e 1)))
+                  :else (values a b e)))
+          (loop [a x b 0.0 e 0]
+            (cond (< a 9.223372036854774784e-83) (let [[p q] (mul2 a b 1.0e+100 -1.5902891109759918046e+83)] (recur p q (- e 100)))
+                  (< a 9.223372036854774784e+07) (let [[p q] (mul2 a b 1.0e+10 0.0)] (recur p q (- e 10)))
+                  (< a 9.22337203685477478e+17) (let [[p q] (mul2 a b 10.0 0.0)] (recur p q (- e 1)))
+                  :else (values a b e))))
+        v (if (< x1 0.0) (- (float->u64 x0) (float->u64 (- 0.0 x1))) (+ (float->u64 x0) (float->u64 x1)))
+        digits0 (loop [v v out ""] (if (= v 0) out (let [q (udiv10 v) dgt (- v (* q 10)) c (chr (+ 48 dgt))] (recur q (str c out)))))
+        idp0 (+ (count digits0) exp)
+        [digits idp round] (if (> round0 0) (values digits0 idp0 round0)
+                             (let [r (- idp0 round0)]
+                               (if (and (= r 0) (>= (nth digits0 0) 53)) (values (str "0" digits0) (+ idp0 1) 1) (values digits0 idp0 r))))
+        n (count digits)]
+    (if (or (<= round 0) (not (or (< round n) (> n mx)))) (values (trim-zeros digits) idp)
+      (let [rd (min round mx)
+            head (subs digits 0 rd)]
+        (if (< (nth digits rd) 53) (values (trim-zeros head) idp)
+          (let [[up carry] (loop [j (- rd 1) out ""]
+                             (cond (< j 0) (values out true)
+                                   (= (nth head j) 57) (recur (- j 1) (str "0" out))
+                                   :else (values (str (subs head 0 j) (chr (+ (nth head j) 1)) out) false)))]
+            (if carry (values (trim-zeros (str "1" up)) (+ idp 1))
+              (values (trim-zeros up) idp))))))))
+
+(defn- trim-zeros Str [s: &Str]
+  (let [e (loop [e (count s)] (if (and (> e 1) (= (nth s (- e 1)) 48)) (recur (- e 1)) e))] (subs s 0 e)))
+
+(defn- zeros Str [n: Int] (loop [i 0 out ""] (if (>= i n) out (recur (+ i 1) (str out "0")))))
+
+(defn- dig-at Str [d: &Str j: Int] (if (< j (count d)) (chr (nth d j)) "0"))
+
+(defn printf-double Str [x: Float kind: Int prec0: Int]
+  (cond
+    (not= x x) "NaN"
+    (> x 1.7976931348623157e308) "Inf"
+    (< x -1.7976931348623157e308) "-Inf"
+    :else
+    (let [neg (< x 0.0)
+          ax (if neg (- 0.0 x) x)
+          prec1 (if (and (= kind 103) (= prec0 0)) 1 prec0)
+          iround (cond (= kind 102) (- 0 prec1) (= kind 103) prec1 :else (+ prec1 1))
+          [d idp] (if (= ax 0.0) (values "0" 1) (fp-decode ax iround 26))
+          exp (- idp 1)
+          [k prec] (if (= kind 103)
+                     (if (or (< exp -4) (> exp (- prec1 1))) (values 101 (- prec1 1)) (values 102 (- (- prec1 1) exp)))
+                     (values kind prec1))
+          e2 (if (= k 101) 0 exp)
+          [ip j] (if (< e2 0) (values "0" 0)
+                   (loop [e e2 j 0 out ""] (if (< e 0) (values out j) (recur (- e 1) (+ j 1) (str out (dig-at d j))))))
+          fz (if (< e2 -1) (min prec (- (- 0 e2) 1)) 0)
+          rest (- prec fz)
+          fp (loop [i 0 jj j out (zeros fz)] (if (>= i rest) out (recur (+ i 1) (+ jj 1) (str out (dig-at d jj)))))
+          fp2 (let [e (loop [e (count fp)] (if (and (> e 0) (= (nth fp (- e 1)) 48)) (recur (- e 1)) e))] (subs fp 0 e))
+          body (str ip "." (if (= fp2 "") "0" fp2))
+          tail (if (= k 101) (let [ae (if (< exp 0) (- 0 exp) exp)] (str "e" (if (< exp 0) "-" "+") (if (< ae 10) "0" "") ae)) "")]
+      (str (if neg "-" "") body tail))))
+
+(defn real->text Str [x: Float] (if (= x 0.0) "0.0" (printf-double x 103 15)))
+
+(def I64-MAX: Int 9223372036854775807)
+(def I64-MIN: Int (- -9223372036854775807 1))
+
+(defn atoi64 Values(Int Int) [z: &Str]
+  (let [n (count z)
+        i0 (loop [i 0] (if (and (< i n) (space? (nth z i))) (recur (+ i 1)) i))
+        neg (and (< i0 n) (= (nth z i0) 45))
+        start (if (and (< i0 n) (or (= (nth z i0) 45) (= (nth z i0) 43))) (+ i0 1) i0)
+        i1 (loop [i start] (if (and (< i n) (= (nth z i) 48)) (recur (+ i 1)) i))
+        [u nd] (loop [i i1 u 0] (if (and (< i n) (dig? (nth z i))) (recur (+ i 1) (+ (* u 10) (- (nth z i) 48))) (values u (- i i1))))
+        end (+ i1 nd)
+        v0 (cond (ult? I64-MAX u) (if neg I64-MIN I64-MAX) neg (- 0 u) :else u)
+        rc (cond (and (= nd 0) (= start i1)) -1
+                 (and (< end n) (loop [j end] (cond (>= j n) false (space? (nth z j)) (recur (+ j 1)) :else true))) 1
+                 :else 0)]
+    (if (< nd 19) (values v0 rc)
+      (let [c (if (> nd 19) 1 (cmp-pow63 z i1))]
+        (cond (< c 0) (values v0 rc)
+              (> c 0) (values (if neg I64-MIN I64-MAX) 2)
+              neg (values I64-MIN rc)
+              :else (values I64-MAX 3))))))
+
+(defn- cmp-pow63 Int [z: &Str i: Int]
+  (let [pow "9223372036854775808"]
+    (loop [k 0] (cond (>= k 19) 0 (not= (nth z (+ i k)) (nth pow k)) (- (nth z (+ i k)) (nth pow k)) :else (recur (+ k 1))))))
+
+(defn- hexd? Bool [c: Int] (or (dig? c) (and (>= c 97) (<= c 102)) (and (>= c 65) (<= c 70))))
+(defn- hexv Int [c: Int] (cond (dig? c) (- c 48) (>= c 97) (- c 87) :else (- c 55)))
+
+(defn dec-or-hex Values(Int Int) [z: &Str]
+  (let [n (count z)]
+    (if (and (> n 1) (= (nth z 0) 48) (or (= (nth z 1) 120) (= (nth z 1) 88)))
+      (let [i (loop [i 2] (if (and (< i n) (= (nth z i) 48)) (recur (+ i 1)) i))
+            [u k] (loop [k i u 0] (if (and (< k n) (hexd? (nth z k))) (recur (+ k 1) (+ (bit-shift-left u 4) (hexv (nth z k)))) (values u k)))]
+        (values u (cond (> (- k i) 16) 2 (< k n) 1 :else 0)))
+      (let [m (loop [i 0] (if (and (< i n) (>= (str/index-of "+- \n\t0123456789" (chr (nth z i))) 0)) (recur (+ i 1)) i))
+            m2 (if (< m n) (+ m 1) m)]
+        (atoi64 (subs z 0 m2))))))
+
+(defn real->i64 Int [r: Float]
+  (cond (< r -9223372036854774784.0) I64-MIN (> r 9223372036854774784.0) I64-MAX :else (int r)))
+
+(defn real-same-as-int? Bool [r: Float i: Int]
+  (or (= r 0.0) (and (= (ieee/double->bits r) (ieee/double->bits (float i))) (>= i -2251799813685248) (< i 2251799813685248))))

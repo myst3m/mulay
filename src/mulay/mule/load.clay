@@ -1,0 +1,428 @@
+(ns mulay.mule.load
+  (:require [mulay.lib.host :as host] [clay.core] [clay.string :as str] [clay.io :as io] [clay.json :as json]
+            [mulay.mule.model :as m] [mulay.mule.props :as pr] [mulay.lib.res :as res] [mulay.mule.parse :as ps]
+            [mulay.lib.xml :as xml] [mulay.lib.zip :as zip] [mulay.lib.numparse :as npz] [mulay.dw.lib.mule :as dwm]))
+
+(defrecord LoadOpts [overrides: Vec(m/Param) use-env: Bool hints: m/Hints])
+(defn use-properties! Int [app: &m/App]
+  (let [ps (:properties app)
+        [ns vs] (loop [i 0 a: Vec(Str) [] b: Vec(Str) []]
+                  (if (>= i (count ps)) (values a b)
+                    (match (:v (nth ps i))
+                      (m/PLit x) (recur (+ i 1) (conj a (str (:name (nth ps i)))) (conj b (str x)))
+                      _ (recur (+ i 1) a b))))]
+    (dwm/set-properties! ns vs)))
+
+(defn default-opts LoadOpts [] (let [z: Vec(m/Param) []] (->LoadOpts z true (m/no-hints))))
+
+(defrecord Loaded [app: m/App res: res/ResSet files: Vec(Str) texts: Vec(Str) docs: Vec(ps/SrcDoc) bad: Vec(Str) bad-texts: Vec(Str)])
+
+(defrecord RawCfg [label: Str bytes: Str])
+
+(defn- basename Str [p: &Str]
+  (let [q (if (str/ends-with? p "/") (subs p 0 (- (count p) 1)) (str p))
+        i (str/last-index-of q "/")]
+    (if (< i 0) q (subs q (+ i 1) (count q)))))
+
+(defn- dirname Str [p: &Str]
+  (let [i (str/last-index-of p "/")] (if (< i 0) "." (if (= i 0) "/" (subs p 0 i)))))
+
+(defn- dir? Bool [p: &Str] (let [[fs err] (host/file-list p)] (= err "")))
+
+(defn- xml-files Vec(Str) [root: &Str rel: &Str]
+  (let [d (if (= rel "") (str root) (str root "/" rel))
+        [fs err] (host/file-list d)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count fs)) acc
+        (let [f (nth fs i)
+              r (if (= rel "") (str f) (str rel "/" f))]
+          (cond (str/starts-with? f ".") (recur (+ i 1) acc)
+                (dir? (str d "/" f)) (recur (+ i 1) (let [sub (xml-files root r)] (loop [k 0 a acc] (if (>= k (count sub)) a (recur (+ k 1) (conj a (nth sub k)))))))
+                (str/ends-with? f ".xml") (recur (+ i 1) (conj acc r))
+                :else (recur (+ i 1) acc)))))))
+
+(defn- artifact-json Values(Vec(Str) Str Bool) [text: &Str]
+  (let [[d err] (json/parse (str text))
+        z: Vec(Str) []]
+    (if (or (not= err "") (not (map? d))) (values z "" false)
+      (let [mp: Map(Str Dyn) (dyn->map d)
+            nm (if (and (contains? mp "name") (string? (get mp "name" (->dyn "")))) (dyn->str (get mp "name" (->dyn ""))) "")
+            cfgs (if (and (contains? mp "configs") (vector? (get mp "configs" (->dyn ""))))
+                   (let [xs: Vec(Dyn) (dyn->vec (get mp "configs" (->dyn "")))]
+                     (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (if (string? (nth xs i)) (conj acc (dyn->str (nth xs i))) acc)))))
+                   z)]
+        (values cfgs nm true)))))
+
+(defn- short-name Str [nm: &Str]
+  (let [parts: Vec(Str) (str/split (str nm) ":")] (if (= (count parts) 3) (nth parts 1) (str nm))))
+
+(defn- import-files Vec(Str) [root: &xml/XNode]
+  (let [kids (xml/child-elems root)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count kids)) acc
+        (let [c (nth kids i)]
+          (recur (+ i 1) (if (and (= (xml/elem-uri c) ps/NS-CORE) (= (xml/elem-local c) "import") (xml/has-attr? c "" "file"))
+                           (conj acc (xml/attr c "" "file" "")) acc)))))))
+
+(defn- xml-opts xml/XmlOpts [] (assoc (xml/default-opts) :drop-ws-text true :spans true))
+
+(defn- mule-root? Bool [d: &xml/XDoc]
+  (let [r (xml/doc-root d)] (and (= (xml/elem-uri r) ps/NS-CORE) (= (xml/elem-local r) "mule"))))
+
+(defn- has-label? Bool [docs: &Vec(ps/SrcDoc) label: &Str]
+  (loop [i 0] (if (>= i (count docs)) false (if (= (:file (nth docs i)) label) true (recur (+ i 1))))))
+
+(defn- build Loaded [name: &Str raws: &Vec(RawCfg) rs: res/ResSet opts: &LoadOpts extra: Vec(m/Diag)
+                     find: Fn(Str Values(Str Str Bool))]
+  (let [[docs0 texts0 ds0 bad bad-texts]
+        (loop [i 0 docs: Vec(ps/SrcDoc) [] tx: Vec(Str) [] ds extra bl: Vec(Str) [] bt: Vec(Str) []]
+          (if (>= i (count raws)) (values docs tx ds bl bt)
+            (let [r (nth raws i)
+                  [d ls err] (xml/parse-with-lines (:bytes r) (xml-opts))]
+              (if (not= err "") (recur (+ i 1) docs tx (conj ds (m/->Diag (str (:label r)) 0 (str "XML: " err) "" [])) (conj bl (str (:label r))) (conj bt (str (:bytes r))))
+                (recur (+ i 1) (conj docs (ps/->SrcDoc (:label r) (xml/doc-root d) ls (:bytes r))) (conj tx (:bytes r)) ds bl bt)))))
+        p0 (pr/props-new (:overrides opts) (:use-env opts) (str name) rs)
+        p1 (loop [i 0 p p0]
+             (if (>= i (count docs0)) p
+               (let [dd (pr/collect-decls (:root (nth docs0 i)) (:lines (nth docs0 i)))]
+                 (recur (+ i 1) (loop [k 0 q p] (if (>= k (count dd)) q
+                                                 (recur (+ k 1) (if (= (:kind (nth dd k)) "global") (pr/add-global q (:a (nth dd k)) (:b (nth dd k))) q))))))))
+        [docs texts props ds1]
+        (loop [i 0 docs docs0 texts texts0 p p1 ds ds0]
+          (if (>= i (count docs)) (values docs texts p ds)
+            (let [d (nth docs i)
+                  [p2 errs] (pr/load-decls p (pr/collect-decls (:root d) (:lines d)) (:file d))
+                  ds2 (loop [k 0 a ds] (if (>= k (count errs)) a (recur (+ k 1) (conj a (nth errs k)))))
+                  ims (import-files (:root d))
+                  [docs2 texts2 ds3]
+                  (loop [k 0 dc docs tc texts dd ds2]
+                    (if (>= k (count ims)) (values dc tc dd)
+                      (let [[f ferrs] (pr/resolve-str p2 (nth ims k))
+                            [label text found] (find f)]
+                        (cond
+                          (> (count ferrs) 0) (recur (+ k 1) dc tc dd)
+                          (has-label? dc label) (recur (+ k 1) dc tc dd)
+                          (not found) (recur (+ k 1) dc tc (conj dd (m/->Diag (str (:file d)) 0 (str "<import>: file not found: " f) "" [])))
+                          :else
+                          (let [[x ls err] (xml/parse-with-lines text (xml-opts))]
+                            (if (not= err "") (recur (+ k 1) dc tc (conj dd (m/->Diag (str label) 0 (str "XML: " err) "" [])))
+                              (recur (+ k 1) (conj dc (ps/->SrcDoc label (xml/doc-root x) ls text)) (conj tc text) dd)))))))]
+              (recur (+ i 1) docs2 texts2 p2 ds3))))
+        [app ims2] (ps/parse-app name docs props rs ds1 (:hints opts))
+        labels (loop [i 0 acc: Vec(Str) []] (if (>= i (count docs)) acc (recur (+ i 1) (conj acc (:file (nth docs i))))))]
+    (->Loaded app rs labels texts docs bad bad-texts)))
+
+(defn- no-find Values(Str Str Bool) [f: Str] (values "" "" false))
+
+(defn load-texts Loaded [name: &Str files: &Vec(Str) texts: &Vec(Str) rs: res/ResSet opts: &LoadOpts]
+  (let [raws (loop [i 0 acc: Vec(RawCfg) []] (if (>= i (count files)) acc (recur (+ i 1) (conj acc (->RawCfg (nth files i) (nth texts i))))))
+        z: Vec(m/Diag) []
+        rs2 rs]
+    (build name raws rs opts z (fn Values(Str Str Bool) [f: Str]
+                                 (let [[t ok] (res/res-read rs2 f)] (values (res/norm-res-path f) t ok))))))
+
+(defn- load-project Loaded [dir: &Str opts: &LoadOpts] (let [z: Vec(RawCfg) [] f: Vec(Str) []] (load-project-with dir opts z f f)))
+
+(defn load-test Loaded [dir: &Str suite: &Str opts: &LoadOpts]
+  (let [p (str dir "/src/test/munit/" suite)
+        [t err] (host/file-read p)
+        [ds ats] (pom-resources dir "testResources" "testResource" "src/test/resources")]
+    (load-project-with dir opts [(->RawCfg (str suite) (if (= err "") t "<bad/>"))] ds ats)))
+
+(defn- cat-strs Vec(Str) [a: &Vec(Str) b: &Vec(Str)]
+  (loop [i 0 acc (loop [k 0 x: Vec(Str) []] (if (>= k (count a)) x (recur (+ k 1) (conj x (nth a k)))))]
+    (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+(defn- kids-named Vec(xml/XNode) [n: &xml/XNode local: &Str]
+  (let [ks (xml/child-elems n)]
+    (loop [i 0 acc: Vec(xml/XNode) []] (if (>= i (count ks)) acc (recur (+ i 1) (if (= (xml/elem-local (nth ks i)) local) (conj acc (nth ks i)) acc))))))
+
+(defn- pom-resources Values(Vec(Str) Vec(Str)) [dir: &Str section: &Str item: &Str default-rel: &Str]
+  (let [[text e] (host/file-read (str dir "/pom.xml"))
+        [d pe] (if (= e "") (xml/parse-with text (xml-opts)) (xml/parse-with "<project/>" (xml-opts)))
+        build (kids-named (xml/doc-root d) "build")
+        trs (if (= (count build) 0) [] (kids-named (nth build 0) section))
+        items (if (= (count trs) 0) [] (kids-named (nth trs 0) item))
+        z: Vec(Str) []]
+    (if (= (count items) 0) (if (= default-rel "") (values z z) (values [(str dir "/" default-rel)] [""]))
+      (loop [i 0 ds: Vec(Str) [] ats: Vec(Str) []]
+        (if (>= i (count items)) (values ds ats)
+          (let [it (nth items i)
+                dn (kids-named it "directory")
+                tn (kids-named it "targetPath")
+                rel (if (= (count dn) 0) "" (str/trim (xml/text-content (nth dn 0))))
+                at (if (= (count tn) 0) "" (str/trim (xml/text-content (nth tn 0))))]
+            (if (= rel "") (recur (+ i 1) ds ats)
+              (recur (+ i 1) (conj ds (if (str/starts-with? rel "/") rel (str dir "/" rel))) (conj ats at)))))))))
+
+(defn- pom-props Values(Vec(Str) Vec(Str)) [root: &xml/XNode]
+  (let [ps (kids-named root "properties")
+        es (if (= (count ps) 0) [] (xml/child-elems (nth ps 0)))]
+    (loop [i 0 ks: Vec(Str) [] vs: Vec(Str) []]
+      (if (>= i (count es)) (values ks vs)
+        (recur (+ i 1) (conj ks (xml/elem-local (nth es i))) (conj vs (str/trim (xml/text-content (nth es i)))))))))
+
+(defn- pom-subst Str [s: &Str ks: &Vec(Str) vs: &Vec(Str)]
+  (if (and (str/starts-with? s "${") (str/ends-with? s "}"))
+    (let [k (subs s 2 (- (count s) 1))]
+      (loop [i 0] (if (>= i (count ks)) (str s) (if (= (nth ks i) k) (str (nth vs i)) (recur (+ i 1))))))
+    (str s)))
+
+(defn- child-text Str [n: &xml/XNode local: &Str]
+  (let [cs (kids-named n local)] (if (= (count cs) 0) "" (str/trim (xml/text-content (nth cs 0))))))
+
+(defn pom-deps Vec(m/Dep) [text: &Str]
+  (let [[d pe] (xml/parse-with text (xml-opts))]
+    (if (not= pe "") []
+      (let [root (xml/doc-root d)
+            [ks vs] (pom-props root)
+            dss (kids-named root "dependencies")
+            ds (if (= (count dss) 0) [] (kids-named (nth dss 0) "dependency"))]
+        (loop [i 0 acc: Vec(m/Dep) []]
+          (if (>= i (count ds)) acc
+            (let [x (nth ds i)]
+              (recur (+ i 1) (conj acc (m/->Dep (pom-subst (child-text x "groupId") ks vs) (pom-subst (child-text x "artifactId") ks vs)
+                                                (pom-subst (child-text x "version") ks vs)))))))))))
+
+(defn- dir-deps Vec(m/Dep) [dir: &Str]
+  (let [[text e] (host/file-read (str dir "/pom.xml"))] (if (= e "") (pom-deps text) [])))
+
+(defn- with-deps Loaded [l: Loaded ds: Vec(m/Dep)] (assoc l :app (assoc (:app l) :deps ds)))
+
+(defn munit-dynamic-ports Vec(Str) [dir: &Str]
+  (let [[text e] (host/file-read (str dir "/pom.xml"))
+        [d pe] (if (= e "") (xml/parse-with text (xml-opts)) (xml/parse-with "<project/>" (xml-opts)))
+        build (kids-named (xml/doc-root d) "build")
+        plugins (if (= (count build) 0) [] (kids-named (nth build 0) "plugins"))
+        ps (if (= (count plugins) 0) [] (kids-named (nth plugins 0) "plugin"))]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count ps)) acc
+        (let [p (nth ps i)
+              aid (kids-named p "artifactId")
+              munit (and (> (count aid) 0) (= (str/trim (xml/text-content (nth aid 0))) "munit-maven-plugin"))
+              cfg (if munit (kids-named p "configuration") [])
+              dps (if (= (count cfg) 0) [] (kids-named (nth cfg 0) "dynamicPorts"))
+              names (if (= (count dps) 0) [] (kids-named (nth dps 0) "dynamicPort"))]
+          (recur (+ i 1) (loop [k 0 a acc] (if (>= k (count names)) a (recur (+ k 1) (conj a (str/trim (xml/text-content (nth names k)))))))))))))
+
+(defn test-suites Vec(Str) [dir: &Str] (xml-files (str dir "/src/test/munit") ""))
+
+(defn- load-project-with Loaded [dir: &Str opts: &LoadOpts extra: Vec(RawCfg) first: Vec(Str) first-at: Vec(Str)]
+  (let [mdir (str dir "/src/main/mule")
+        rdir (str dir "/src/main/resources")
+        [mds mats] (pom-resources dir "resources" "resource" "")
+        rs (res/with-first (res/res-dir rdir) (cat-strs first mds) (cat-strs first-at mats))
+        name (basename dir)
+        [ajson aerr] (host/file-read (str dir "/mule-artifact.json"))
+        [cfgs aname has-json] (if (= aerr "") (artifact-json ajson) (let [z: Vec(Str) []] (values z "" false)))
+        listed (> (count cfgs) 0)
+        files (if listed cfgs (xml-files mdir ""))
+        [raws ds]
+        (loop [i 0 acc: Vec(RawCfg) [] ds: Vec(m/Diag) []]
+          (if (>= i (count files)) (values acc ds)
+            (let [f (nth files i)
+                  [t err] (host/file-read (str mdir "/" f))]
+              (cond
+                (not= err "") (recur (+ i 1) acc (conj ds (m/->Diag (str f) 0 (str "cannot read: " err) "" [])))
+                listed (recur (+ i 1) (conj acc (->RawCfg f t)) ds)
+                :else (let [[d e2] (xml/parse-with t (xml-opts))]
+                        (if (or (not= e2 "") (mule-root? d)) (recur (+ i 1) (conj acc (->RawCfg f t)) ds) (recur (+ i 1) acc ds)))))))
+        ds2 (if (and (= (count raws) 0) (= (count ds) 0)) (conj ds (m/->Diag (str dir) 0 "no Mule configuration files in src/main/mule" "" [])) ds)
+        raws2 (loop [i 0 acc raws] (if (>= i (count extra)) acc (recur (+ i 1) (conj acc (nth extra i)))))
+        mdir2 mdir rs2 rs]
+    (with-deps (build name raws2 rs opts ds2
+           (fn Values(Str Str Bool) [f: Str]
+             (let [p (res/norm-res-path f)
+                   [t err] (if (= p "") (values "" "bad path") (host/file-read (str mdir2 "/" p)))]
+               (if (= err "") (values p t true)
+                 (let [[t2 ok] (res/res-read rs2 f)] (values p t2 ok)))))) (dir-deps dir))))
+
+(defn- jar-skip? Bool [e: &zip/ZipEntry pre: &Str]
+  (let [nm (:name e)]
+    (or (:dir e) (not (str/starts-with? nm pre))
+        (str/starts-with? nm (str pre "repository/")) (str/starts-with? nm (str pre "META-INF/")))))
+
+(def JAR-RES-MAX 1073741824)
+
+(defn jar-res Values(res/ResSet Str) [rs: &res/ResSet limit: Int]
+  (let [es (:entries rs) pre (:prefix rs)]
+    (loop [i 0 ks: Vec(Str) [] vs: Vec(Str) [] total 0]
+      (if (>= i (count es)) (values (res/res-mem ks vs) "")
+        (let [e (nth es i)]
+          (if (jar-skip? e pre) (recur (+ i 1) ks vs total)
+            (let [nm (:name e)]
+              (if (or (< (:usize e) 0) (> (:usize e) (- limit total)))
+                (values (res/res-none) (str nm ": the application's resources are too large (more than " limit " bytes in total)"))
+                (let [[t rerr] (zip/read-entry-limit (:zip rs) e 268435456)]
+                  (if (not= rerr "") (values (res/res-none) (str nm ": " rerr))
+                    (recur (+ i 1) (conj ks (subs nm (count pre) (count nm))) (conj vs t) (+ total (count t)))))))))))))
+
+(defn- load-jar Loaded [path: &Str opts: &LoadOpts]
+  (let [[data rerr] (host/file-read (str path))
+        z: Vec(Str) []
+        name0 (let [b (basename path)] (if (str/ends-with? b ".jar") (subs b 0 (- (count b) 4)) b))]
+    (if (not= rerr "")
+      (build name0 [] (res/res-none) opts [(m/->Diag (str path) 0 (str "cannot read: " rerr) "" [])] no-find)
+      (let [[es zerr] (zip/entries data)]
+        (if (not= zerr "")
+          (build name0 [] (res/res-none) opts [(m/->Diag (str path) 0 (str "not a JAR/ZIP: " zerr) "" [])] no-find)
+          (let [rs (res/res-zip data es "")
+                [aj found] (res/res-read rs "META-INF/mule-artifact/mule-artifact.json")
+                [cfgs aname ok] (if found (artifact-json aj) (values z "" false))
+                name (if (= aname "") name0 (short-name aname))]
+            (cond
+              (not found) (build name0 [] rs opts [(m/->Diag (str path) 0 "not a Mule application (no META-INF/mule-artifact/mule-artifact.json)" "" [])] no-find)
+              (= (count cfgs) 0) (build name [] rs opts [(m/->Diag (str path) 0 "mule-artifact.json lists no configs" "" [])] no-find)
+              :else
+              (let [[raws ds]
+                    (loop [i 0 acc: Vec(RawCfg) [] ds: Vec(m/Diag) []]
+                      (if (>= i (count cfgs)) (values acc ds)
+                        (let [[t ok] (res/res-read rs (nth cfgs i))]
+                          (if ok (recur (+ i 1) (conj acc (->RawCfg (nth cfgs i) t)) ds)
+                            (recur (+ i 1) acc (conj ds (m/->Diag (str path) 0 (str "config not found in the JAR: " (nth cfgs i)) "" [])))))))
+                    [mem merr] (jar-res rs JAR-RES-MAX)
+                    ds2 (if (= merr "") ds (conj ds (m/->Diag (str path) 0 (str merr) "" [])))
+                    rs2 (res/with-home mem (if (str/ends-with? path ".jar") (subs path 0 (- (count path) 4)) (str path ".d")))]
+                (with-deps (build name raws rs2 opts ds2
+                                  (fn Values(Str Str Bool) [f: Str]
+                                    (let [[t ok] (res/res-read rs2 f)] (values (res/norm-res-path f) t ok))))
+                           (jar-deps rs es))))))))))
+
+(defn- jar-deps Vec(m/Dep) [rs: &res/ResSet es: &Vec(zip/ZipEntry)]
+  (loop [i 0]
+    (if (>= i (count es)) []
+      (let [nm (:name (nth es i))]
+        (if (and (str/starts-with? nm "META-INF/maven/") (str/ends-with? nm "/pom.xml"))
+          (let [[t ok] (res/res-read rs nm)] (if ok (pom-deps t) []))
+          (recur (+ i 1)))))))
+
+(defn- load-xml-file Loaded [path: &Str opts: &LoadOpts]
+  (let [dir (dirname path)
+        rdir (if (str/ends-with? dir "/src/main/mule") (str (subs dir 0 (- (count dir) 5)) "/resources") dir)
+        rs (res/res-dir rdir)
+        b (basename path)
+        name (if (str/ends-with? b ".xml") (subs b 0 (- (count b) 4)) b)
+        [t err] (host/file-read (str path))
+        dir2 dir rs2 rs]
+    (if (not= err "") (build name [] rs opts [(m/->Diag (str path) 0 (str "cannot read: " err) "" [])] no-find)
+      (with-deps (build name [(->RawCfg b t)] rs opts (let [z: Vec(m/Diag) []] z)
+                        (fn Values(Str Str Bool) [f: Str]
+                          (let [p (res/norm-res-path f)
+                                [t2 e2] (if (= p "") (values "" "bad path") (host/file-read (str dir2 "/" p)))]
+                            (if (= e2 "") (values p t2 true)
+                              (let [[t3 ok] (res/res-read rs2 f)] (values p t3 ok))))))
+                 (if (str/ends-with? dir "/src/main/mule") (dir-deps (subs dir 0 (- (count dir) 14))) [])))))
+
+(defn load-path Loaded [path: &Str opts: &LoadOpts]
+  (cond
+    (dir? path) (load-project path opts)
+    (or (str/ends-with? path ".jar") (str/ends-with? path ".zip")) (load-jar path opts)
+    :else (load-xml-file path opts)))
+
+(defrecord Bundle [name: Str files: Vec(Str) texts: Vec(Str) rkeys: Vec(Str) rvals: Vec(Str) deps: Vec(m/Dep)])
+
+(def BUNDLE-MAX 67108864)
+
+(defn bundle-of Values(Bundle Str) [l: &Loaded]
+  (let [rs (:res l)
+        z: Vec(Str) []
+        [ks vs err]
+        (cond
+          (> (count (:mkeys rs)) 0) (values (:mkeys rs) (:mvals rs) "")
+          (> (count (:entries rs)) 0)
+          (let [es (:entries rs) pre (:prefix rs)]
+            (loop [i 0 ks: Vec(Str) [] vs: Vec(Str) [] total 0]
+              (if (>= i (count es)) (values ks vs "")
+                (let [e (nth es i) nm (:name e)]
+                  (if (jar-skip? e pre)
+                    (recur (+ i 1) ks vs total)
+                    (let [[t rerr] (zip/read-entry-limit (:zip rs) e BUNDLE-MAX)
+                          t2 (+ total (count t))]
+                      (cond
+                        (not= rerr "") (values ks vs (str nm ": " rerr))
+                        (> t2 BUNDLE-MAX) (values ks vs "resources are too large to embed (more than 64 MB)")
+                        :else (recur (+ i 1) (conj ks (subs nm (count pre) (count nm))) (conj vs t) t2))))))))
+          :else (walk-first rs))]
+    (values (->Bundle (:name (:app l)) (:files l) (:texts l) ks vs (:deps (:app l))) err)))
+
+(defn- walk-first Values(Vec(Str) Vec(Str) Str) [rs: &res/ResSet]
+  (let [fs (:first rs) as (:first-at rs) z: Vec(Str) []]
+    (loop [i 0 ks z vs z]
+      (if (>= i (count fs))
+        (if (= (:dir rs) "") (values ks vs "") (walk-res (:dir rs) "" ks vs 0))
+        (let [[k2 v2 e] (walk-res (nth fs i) "" z z 0)
+              at (if (< i (count as)) (nth as i) "")]
+          (if (not= e "") (values ks vs e)
+            (recur (+ i 1)
+                   (loop [j 0 acc ks] (if (>= j (count k2)) acc (recur (+ j 1) (conj acc (if (= at "") (nth k2 j) (str at "/" (nth k2 j)))))))
+                   (loop [j 0 acc vs] (if (>= j (count v2)) acc (recur (+ j 1) (conj acc (nth v2 j))))))))))))
+
+(defn- walk-res Values(Vec(Str) Vec(Str) Str) [dir: &Str rel: &Str ks0: Vec(Str) vs0: Vec(Str) total0: Int]
+  (let [base (if (= rel "") (str dir) (str dir "/" rel))
+        [names lerr] (host/file-list base)]
+    (if (not= lerr "") (values ks0 vs0 "")
+      (loop [i 0 ks ks0 vs vs0 total total0]
+        (if (>= i (count names)) (values ks vs "")
+          (let [nm (nth names i)
+                r (if (= rel "") (str nm) (str rel "/" nm))
+                p (str dir "/" r)]
+            (cond
+              (str/starts-with? nm ".") (recur (+ i 1) ks vs total)
+              (dir? p) (let [[ks2 vs2 e2] (walk-res dir r ks vs total)
+                             t2 (loop [j 0 t total0] (if (>= j (count vs2)) t (recur (+ j 1) (+ t (count (nth vs2 j))))))]
+                         (if (not= e2 "") (values ks2 vs2 e2) (recur (+ i 1) ks2 vs2 t2)))
+              :else (let [[t rerr] (host/file-read p)
+                          t2 (+ total (count t))]
+                      (cond
+                        (not= rerr "") (values ks vs (str p ": " rerr))
+                        (> t2 BUNDLE-MAX) (values ks vs "resources are too large to embed (more than 64 MB)")
+                        :else (recur (+ i 1) (conj ks r) (conj vs t) t2))))))))))
+
+(defn bundle-encode Str [b: &Bundle]
+  (let [put (fn Str [out: Str x: &Str] (str out (count x) ":" x))
+        o1 (put "mulay-bundle-2\n" (:name b))
+        o2 (loop [i 0 o (put o1 (str (count (:files b))))] (if (>= i (count (:files b))) o (recur (+ i 1) (put (put o (nth (:files b) i)) (nth (:texts b) i)))))
+        o3 (loop [i 0 o (put o2 (str (count (:rkeys b))))] (if (>= i (count (:rkeys b))) o (recur (+ i 1) (put (put o (nth (:rkeys b) i)) (nth (:rvals b) i)))))
+        o4 (loop [i 0 o (put o3 (str (count (:deps b))))]
+             (if (>= i (count (:deps b))) o (let [x (nth (:deps b) i)] (recur (+ i 1) (put (put (put o (:group x)) (:artifact x)) (:version x))))))]
+    o4))
+
+(defn bundle-decode Values(Bundle Str) [s: &Str]
+  (let [z: Vec(Str) []
+        empty (->Bundle "" z z z z [])
+        magic "mulay-bundle-2\n"]
+    (if (not (str/starts-with? s magic)) (values empty "not a mulay bundle")
+      (let [[name p1 e1] (take-str s (count magic))
+            [nf p2 e2] (take-str s p1)
+            n (npz/int-or nf -1)
+            [fs ts p3 e3] (loop [i 0 p p2 fs: Vec(Str) [] ts: Vec(Str) []]
+                            (if (>= i n) (values fs ts p "")
+                              (let [[f pa ea] (take-str s p) [t pb eb] (take-str s pa)]
+                                (if (or (not= ea "") (not= eb "")) (values fs ts p "broken bundle") (recur (+ i 1) pb (conj fs f) (conj ts t))))))
+            [nr p4 e4] (take-str s p3)
+            m (npz/int-or nr -1)
+            [ks vs p5a e5] (loop [i 0 p p4 ks: Vec(Str) [] vs: Vec(Str) []]
+                             (if (>= i m) (values ks vs p "")
+                               (let [[k pa ea] (take-str s p) [x pb eb] (take-str s pa)]
+                                 (if (or (not= ea "") (not= eb "")) (values ks vs p "broken bundle") (recur (+ i 1) pb (conj ks k) (conj vs x))))))
+            [ndp p5 e6] (take-str s p5a)
+            nd (npz/int-or ndp -1)
+            [dps e7] (loop [i 0 p p5 acc: Vec(m/Dep) []]
+                       (if (>= i nd) (values acc "")
+                         (let [[g pa ea] (take-str s p) [a pb eb] (take-str s pa) [v pc ec] (take-str s pb)]
+                           (if (or (not= ea "") (not= eb "") (not= ec "")) (values acc "broken bundle") (recur (+ i 1) pc (conj acc (m/->Dep g a v)))))))]
+        (if (or (not= e1 "") (not= e2 "") (< n 0) (not= e3 "") (not= e4 "") (< m 0) (not= e5 "") (not= e6 "") (< nd 0) (not= e7 ""))
+          (values empty "broken bundle")
+          (values (->Bundle name fs ts ks vs dps) ""))))))
+
+(defn- take-str Values(Str Int Str) [s: &Str p: Int]
+  (let [c (str/index-of-after s ":" p)]
+    (if (< c 0) (values "" p "broken bundle")
+      (let [n (npz/int-or (subs s p c) -1)]
+        (if (or (< n 0) (> (+ c 1 n) (count s))) (values "" p "broken bundle")
+          (values (subs s (+ c 1) (+ c 1 n)) (+ c 1 n) ""))))))
+
+(defn load-bundle Loaded [b: &Bundle opts: &LoadOpts]
+  (let [ks (loop [i 0 acc (:rkeys b)] (if (>= i (count (:files b))) acc (recur (+ i 1) (conj acc (nth (:files b) i)))))
+        vs (loop [i 0 acc (:rvals b)] (if (>= i (count (:texts b))) acc (recur (+ i 1) (conj acc (nth (:texts b) i)))))]
+    (with-deps (load-texts (:name b) (:files b) (:texts b) (res/res-mem ks vs) opts) (:deps b))))

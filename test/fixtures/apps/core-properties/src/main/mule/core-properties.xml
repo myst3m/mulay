@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="app.yaml"/>
+    <configuration-properties file="app.properties"/>
+    <global-property name="gp.name" value="global property value"/>
+    <global-property name="greeting.text" value="global-property loses?"/>
+
+    <http:listener-config name="L" basePath="/base">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <flow name="props">
+        <http:listener config-ref="L" path="/props"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  yamlText: p('greeting.text'),
+  yamlDeep: p('greeting.nested.deep'),
+  yamlList: p('list'),
+  propsPlain: p('props.plain'),
+  propsRef: p('props.ref'),
+  propsSpaces: "[" ++ (p('props.spaces') default "null") ++ "]",
+  globalProp: p('gp.name'),
+  missing: p('does.not.exist'),
+  port: p('http.port')
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- ${} は属性値の中で置換される -->
+    <flow name="placeholder">
+        <http:listener config-ref="L" path="/placeholder"/>
+        <set-variable variableName="a" value="${greeting.text}"/>
+        <set-variable variableName="b" value="prefix-${gp.name}-suffix"/>
+        <set-variable variableName="c" value="#['${greeting.nested.deep}' ++ '!']"/>
+        <set-payload value="#[output application/json --- {a: vars.a, b: vars.b, c: vars.c}]"/>
+    </flow>
+
+    <!-- dw::Runtime::prop の JVM のプロパティ (Mule の中では user.timezone が決まっている) -->
+    <flow name="jvm-props">
+        <http:listener config-ref="L" path="/jvm"/>
+        <set-payload value="#[output application/json --- {tzSet: dw::Runtime::prop('user.timezone') != null, sep: dw::Runtime::prop('file.separator')}]"/>
+    </flow>
+
+    <flow name="base-path-info">
+        <http:listener config-ref="L" path="/info/*"/>
+        <set-payload value="#[output application/json --- {listenerPath: attributes.listenerPath, requestPath: attributes.requestPath, relativePath: attributes.relativePath}]"/>
+    </flow>
+
+</mule>

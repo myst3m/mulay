@@ -1,0 +1,62 @@
+(ns avro-event-test (:require [mulay.conn.sf_pubsub_avro :as pa] [mulay.lib.avro :as av] [mulay.dw.val :as v] [mulay.dw.num :as num] [clay.string :as str]))
+
+(def PE "{\"type\":\"record\",\"name\":\"MulayPubSub__e\",\"namespace\":\"com.sforce.eventbus\",\"fields\":[{\"name\":\"CreatedDate\",\"type\":\"long\"},{\"name\":\"CreatedById\",\"type\":\"string\"},{\"name\":\"Amount__c\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"Count__c\",\"type\":[\"null\",\"double\"],\"default\":null},{\"name\":\"Day__c\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"Flag__c\",\"type\":[\"null\",\"boolean\"],\"default\":null},{\"name\":\"Message__c\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"When__c\",\"type\":[\"null\",\"long\"],\"default\":null}]}")
+
+(def CDC "{\"type\":\"record\",\"name\":\"AccountChangeEvent\",\"namespace\":\"com.sforce.eventbus\",\"fields\":[{\"name\":\"ChangeEventHeader\",\"type\":{\"type\":\"record\",\"name\":\"ChangeEventHeader\",\"fields\":[{\"name\":\"entityName\",\"type\":\"string\"},{\"name\":\"changedFields\",\"type\":{\"type\":\"array\",\"items\":\"string\"}},{\"name\":\"nulledFields\",\"type\":{\"type\":\"array\",\"items\":\"string\"}}]}},{\"name\":\"Name\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"LastModifiedDate\",\"type\":[\"null\",\"long\"],\"default\":null},{\"name\":\"BillingAddress\",\"type\":[\"null\",{\"type\":\"record\",\"name\":\"Address\",\"fields\":[{\"name\":\"Street\",\"type\":[\"null\",\"string\"],\"default\":null},{\"name\":\"City\",\"type\":[\"null\",\"string\"],\"default\":null}]}],\"default\":null}]}")
+
+(defn- schema av/Schema [t: Str] (let [[s e] (av/parse-schema t)] s))
+
+(defn- obj v/Val [ks: Vec(Str) xs: Vec(v/Val)]
+  (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i (count ks)) acc (recur (+ i 1) (conj acc (v/field (nth ks i) (nth xs i))))))))
+
+(defn- base Vec(v/Val) [] [(v/int-v 1792600000000) (v/->VStr "005000000000000AAA")])
+
+(defn- field v/Val [x: &v/Val k: &Str] (match (v/unmeta x) (v/VObj fs) (let [r (v/obj-get fs k)] (if (= (count r) 0) (v/null-v) (nth r 0))) _ (v/null-v)))
+
+(defn- cls Str [x: &v/Val] (match x (v/VMeta y m) (let [r (v/obj-get m "class")] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) s _ ""))) _ ""))
+
+(defn- num-text Str [x: &v/Val] (match (v/unmeta x) (v/VNum n) (num/to-string n) (v/VInt i) (str i) _ "?"))
+
+(deftest encode-errors-match-real-mule
+  (let [s (schema PE)
+        [b1 t1 e1] (pa/encode-event s (obj ["Message__c"] [(v/->VStr "x")]))
+        [b2 t2 e2] (pa/encode-event s (obj ["CreatedDate" "CreatedById" "Bogus__c"] (conj (base) (v/int-v 1))))
+        [b3 t3 e3] (pa/encode-event s (obj ["CreatedDate" "CreatedById" "Count__c"] (conj (base) (v/->VStr "abc"))))
+        [b4 t4 e4] (pa/encode-event s (obj ["CreatedDate" "CreatedById" "Message__c"] (conj (base) (v/int-v 5))))
+        [b5 t5 e5] (pa/encode-event s (obj ["CreatedDate" "CreatedById" "Bogus__c"] (conj (base) (v/->VStr "s"))))]
+    (is (= t1 "INVALID_INPUT"))
+    (is (= e1 "null value for (non-nullable) long at MulayPubSub__e.CreatedDate"))
+    (is (= t2 "UNKNOWN"))
+    (is (= e2 pa/NO-FIELD-NPE))
+    (is (= t3 "UNKNOWN"))
+    (is (= e3 "Not in union [\"null\",\"double\"]: abc (field=Count__c)"))
+    (is (= e4 "Not in union [\"null\",\"string\"]: 5 (field=Message__c)"))
+    (is (= e5 "Not a valid schema field: Bogus__c"))))
+
+(deftest round-trip-like-gson
+  (let [s (schema PE)
+        [n9 ne] (num/parse-lit "9007199254740993")
+        [d19 de] (num/parse-lit "1.9")
+        [b t e] (pa/encode-event s (obj ["CreatedDate" "CreatedById" "Count__c" "Message__c" "Flag__c" "When__c" "Day__c"]
+                                        (conj (conj (conj (conj (conj (base) (v/num-v n9)) (v/->VStr "hi")) (v/bool-v true)) (v/num-v d19)) (v/int-v 42))))
+        [x xe] (pa/decode-event s b)]
+    (is (= e ""))
+    (is (= xe ""))
+    (is (= (cls x) pa/MAP-CLASS))
+    (is (= (num-text (field x "Count__c")) "9007199254740992"))
+    (is (= (cls (field x "Count__c")) "java.lang.Double"))
+    (is (= (num-text (field x "When__c")) "1"))
+    (is (= (num-text (field x "Day__c")) "42"))
+    (is (= (cls (field x "Message__c")) "java.lang.String"))
+    (is (= (cls (field x "Flag__c")) "java.lang.Boolean"))
+    (is (v/null? (v/unmeta (field x "Amount__c"))))
+    (is (= (match (v/unmeta x) (v/VObj fs) (count fs) _ 0) 8))))
+
+(deftest bitmaps-become-field-names
+  (let [s (schema CDC)
+        r (av/root s)]
+    (is (= (pa/hex-bits "0x6") "0110llun0000"))
+    (is (= (pa/process-bitmap s r ["0x6"]) ["Name" "LastModifiedDate"]))
+    (is (= (pa/process-bitmap s r ["0x6" "3-0x1"]) ["Name" "LastModifiedDate" "BillingAddress_Street"]))
+    (is (= (pa/process-bitmap s r ["3-0x3"]) ["BillingAddress"]))
+    (is (= (pa/process-bitmap s r []) []))))

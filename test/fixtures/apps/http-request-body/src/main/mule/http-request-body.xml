@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:tls="http://www.mulesoft.org/schema/mule/tls" xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
+  <http:listener-config name="Plain">
+    <http:listener-connection host="0.0.0.0" port="18571">
+      <http:protocol-support><http:http2-support enable="true"/></http:protocol-support>
+    </http:listener-connection>
+  </http:listener-config>
+  <http:listener-config name="Tls">
+    <http:listener-connection host="0.0.0.0" port="18572" protocol="HTTPS">
+      <tls:context><tls:key-store type="pkcs12" path="server.p12" password="changeit" keyPassword="changeit"/></tls:context>
+      <http:protocol-support><http:http2-support enable="true"/></http:protocol-support>
+    </http:listener-connection>
+  </http:listener-config>
+  <flow name="plain">
+    <http:listener config-ref="Plain" path="/size"/>
+    <set-payload value="#[output application/json --- {size: sizeOf(payload as String), head: (payload as String)[0 to 9] default null, version: attributes.version}]"/>
+  </flow>
+  <flow name="tls">
+    <http:listener config-ref="Tls" path="/size"/>
+    <set-payload value="#[output application/json --- {size: sizeOf(payload as String), head: (payload as String)[0 to 9] default null, version: attributes.version}]"/>
+  </flow>
+  <file:config name="F"><file:connection workingDir="/tmp/mulay-oracle-http-request-body"/></file:config>
+  <flow name="twice">
+    <http:listener config-ref="Plain" path="/twice"/>
+    <set-variable variableName="first" value="#[sizeOf(payload as String)]"/>
+    <set-payload value="#[output application/json --- {first: vars.first, second: sizeOf(payload as String), tail: (payload as String)[-10 to -1]}]"/>
+  </flow>
+  <flow name="write">
+    <http:listener config-ref="Plain" path="/write"/>
+    <file:write config-ref="F" path="body.txt"/>
+    <set-variable variableName="after" value="#[sizeOf(payload as String)]"/>
+    <file:read config-ref="F" path="body.txt" target="back"/>
+    <set-payload value="#[output application/json --- {written: sizeOf(vars.back as String), payloadAfter: vars.after, tail: (vars.back as String)[-10 to -1]}]"/>
+  </flow>
+</mule>

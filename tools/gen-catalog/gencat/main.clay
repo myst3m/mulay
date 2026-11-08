@@ -1,0 +1,31 @@
+(ns gencat.main (:require [mulay.conn.registry :as creg] [mulay.rt.conn :as conn] [clay.string :as str]))
+
+(defn- q Str [s: &Str]
+  (loop [i 0 out "\""]
+    (if (>= i (count s)) (str out "\"")
+      (let [c (nth s i)]
+        (recur (+ i 1) (cond (= c 34) (str out "\\\"") (= c 92) (str out "\\\\") (= c 10) (str out "\\n") :else (str out (chr c))))))))
+
+(defn- strs Str [v: &Vec(Str)]
+  (loop [i 0 out "["] (if (>= i (count v)) (str out "]") (recur (+ i 1) (str out (if (> i 0) " " "") (q (nth v i)))))))
+
+(defn- typed Str [v: &Vec(Str)] (if (= (count v) 0) "(let [z: Vec(Str) []] z)" (strs v)))
+
+(defn main Int []
+  (let [h (creg/hints)
+        cs (creg/all)
+        conns (loop [i 0 out ""] (if (>= i (count cs)) out (recur (+ i 1) (str out (if (> i 0) "\n            " "") "[" (q (:name (nth cs i))) " " (q (:uri (nth cs i))) "]"))))
+        chs (:chains h)
+        chains (loop [i 0 out ""] (if (>= i (count chs)) out (recur (+ i 1) (str out (if (> i 0) " " "") "(m/->OpChains " (q (:op (nth chs i))) " " (typed (:names (nth chs i))) ")"))))
+        z (println (str "(ns mulay.conn.catalog_gen (:require [mulay.mule.model :as m]))\n\n"
+                        "(def CONNS [" conns "])\n\n"
+                        "(defn hints m/Hints []\n"
+                        "  (m/->Hints " (typed (:source-uris h)) "\n"
+                        "             " (typed (:sources h)) "\n"
+                        "             " (if (= (count chs) 0) "(let [z: Vec(m/OpChains) []] z)" (str "[" chains "]")) "\n"
+                        "             " (typed (:each h)) "\n"
+                        "             " (typed (:raw-sources h)) "\n"
+                        "             " (typed (:modules h)) "))\n\n"
+                        "(def PARENTS " (strs (conn/error-parents cs)) ")\n\n"
+                        "(def CLASSES " (strs (conn/error-classes cs)) ")"))]
+    0))

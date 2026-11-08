@@ -1,0 +1,80 @@
+(ns load-jar-test (:require [mulay.conn.registry :as creg] [mulay.mule.load :as ld] [mulay.mule.model :as m] [mulay.lib.zip :as zip] [mulay.lib.res :as res] [mulay.lib.fs :as fs]))
+(c-include "<unistd.h>")
+(defextern getpid getpid)
+
+(def XML "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\"><flow name=\"f\"><set-payload value=\"x\"/></flow></mule>")
+
+;; JAR から起動したとき、アプリの資源だけをメモリに持つ。repository/ (Java の依存の JAR。mulay は使わない) と JAR そのものの
+;; バイト列は持たない (max-core の JAR は 73 MB のうち 70 MB 余りが repository/ で、RTF で RSS が 140 MB になっていた)。
+(deftest jar-keeps-only-app-resources
+  (let [d (str "/tmp/mulay-load-jar-test-" (unsafe (getpid)))
+        z0 (fs/remove-tree d)
+        z1 (fs/mkdirs d)
+        p (str d "/app.jar")
+        [bytes werr] (zip/write [(zip/zip-in "META-INF/mule-artifact/mule-artifact.json" "{\"configs\": [\"a.xml\"]}")
+                                 (zip/zip-in "a.xml" XML)
+                                 (zip/zip-in "data/x.txt" "hello")
+                                 (zip/zip-in "repository/org/x/big/1.0/big-1.0.jar" "JARBYTES")])
+        w (write-file p bytes)
+        l (ld/load-path p (ld/->LoadOpts [] false (creg/hints)))
+        rs (:res l)
+        [t ok] (res/res-read rs "data/x.txt")
+        [t2 ok2] (res/res-read rs "classpath:a.xml")
+        [t3 ok3] (res/res-read rs "repository/org/x/big/1.0/big-1.0.jar")
+        z2 (fs/remove-tree d)]
+    (is (= werr ""))
+    (is (= (count (:diags (:app l))) 0))
+    (is (= (count (:flows (:app l))) 1))
+    (is ok) (is (= t "hello"))
+    (is ok2)
+    (is (not ok3))
+    (is (= (:zip rs) ""))
+    (is (= (count (:entries rs)) 0))
+    (is (= (:home rs) (str d "/app")))))
+
+(deftest jar-resources-have-a-total-limit
+  (let [[bytes werr] (zip/write [(zip/zip-in "a.txt" "0123456789")
+                                 (zip/zip-in "b.txt" "0123456789")
+                                 (zip/zip-in "repository/x.jar" "01234567890123456789")])
+        [es zerr] (zip/entries bytes)
+        rs (res/res-zip bytes es "")
+        [m1 e1] (ld/jar-res rs 20)
+        [m2 e2] (ld/jar-res rs 19)]
+    (is (= e1 ""))
+    (is (= e2 "b.txt: the application's resources are too large (more than 19 bytes in total)"))))
+
+(def POM "<project><properties><apikit.version>1.13.4</apikit.version></properties><dependencies><dependency><groupId>org.mule.modules</groupId><artifactId>mule-apikit-module</artifactId><version>${apikit.version}</version><classifier>mule-plugin</classifier></dependency><dependency><groupId>org.mule.connectors</groupId><artifactId>mule-http-connector</artifactId><version>1.10.3</version></dependency></dependencies></project>")
+
+(defn- dep-text Str [ds: &Vec(m/Dep)]
+  (loop [i 0 out ""] (if (>= i (count ds)) out (let [x (nth ds i)] (recur (+ i 1) (str out (:group x) ":" (:artifact x) ":" (:version x) ";"))))))
+
+(deftest jar-reads-pom-dependencies
+  (let [d (str "/tmp/mulay-load-jar-deps-" (unsafe (getpid)))
+        z0 (fs/remove-tree d)
+        z1 (fs/mkdirs d)
+        p (str d "/app.jar")
+        [bytes werr] (zip/write [(zip/zip-in "META-INF/mule-artifact/mule-artifact.json" "{\"configs\": [\"a.xml\"]}")
+                                 (zip/zip-in "META-INF/maven/com.example/app/pom.xml" POM)
+                                 (zip/zip-in "a.xml" XML)])
+        w (write-file p bytes)
+        l (ld/load-path p (ld/->LoadOpts [] false (creg/hints)))
+        z2 (fs/remove-tree d)]
+    (is (= (dep-text (:deps (:app l))) "org.mule.modules:mule-apikit-module:1.13.4;org.mule.connectors:mule-http-connector:1.10.3;"))))
+
+(deftest dir-and-bundle-keep-pom-dependencies
+  (let [d (str "/tmp/mulay-load-dir-deps-" (unsafe (getpid)))
+        z0 (fs/remove-tree d)
+        z1 (fs/mkdirs (str d "/src/main/mule"))
+        w1 (write-file (str d "/src/main/mule/a.xml") XML)
+        w2 (write-file (str d "/pom.xml") POM)
+        l (ld/load-path d (ld/->LoadOpts [] false (creg/hints)))
+        lx (ld/load-path (str d "/src/main/mule/a.xml") (ld/->LoadOpts [] false (creg/hints)))
+        [b be] (ld/bundle-of l)
+        [b2 de] (ld/bundle-decode (ld/bundle-encode b))
+        l2 (ld/load-bundle b2 (ld/->LoadOpts [] false (creg/hints)))
+        z2 (fs/remove-tree d)
+        want "org.mule.modules:mule-apikit-module:1.13.4;org.mule.connectors:mule-http-connector:1.10.3;"]
+    (is (= (dep-text (:deps (:app l))) want))
+    (is (= (dep-text (:deps (:app lx))) want))
+    (is (= de ""))
+    (is (= (dep-text (:deps (:app l2))) want))))

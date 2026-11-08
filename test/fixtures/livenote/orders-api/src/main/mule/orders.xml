@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
+	xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+	xmlns:db="http://www.mulesoft.org/schema/mule/db"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd">
+	<configuration-properties doc:name="設定ファイル" doc:id="aee7af0c-16f8-43ca-9987-a86f5fd18d03" file="config.yaml" />
+	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config" doc:id="c52a37be-64b9-4040-888d-61a14fb8f8b4">
+		<http:listener-connection host="0.0.0.0" port="${http.port}" />
+	</http:listener-config>
+	<db:config name="Database_Config" doc:name="Database Config" doc:id="5b4c3b24-c8a1-4a6f-bd0c-9ed0a7da69b3">
+		<db:generic-connection url="jdbc:postgresql://${db.host}:${db.port}/${db.database}" driverClassName="org.postgresql.Driver" user="${db.user}" password="${db.password}" />
+	</db:config>
+	<salesforce:sfdc-config name="Salesforce_Config" doc:name="Salesforce Config" doc:id="44461d74-5d69-4be7-8b07-9b5475900f3b">
+		<salesforce:oauth-client-credentials-connection>
+			<salesforce:oauth-client-credentials clientId="${sf.clientId}" clientSecret="${sf.clientSecret}" tokenUrl="${sf.tokenUrl}" />
+		</salesforce:oauth-client-credentials-connection>
+	</salesforce:sfdc-config>
+	<flow name="post-orders" doc:id="e3eade08-b3d9-43cb-a7d0-ffa38c635348">
+		<http:listener doc:name="受け取る" doc:id="9ed83c75-731e-47bc-81be-3a913b9629a2" config-ref="HTTP_Listener_config" path="/orders" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 201]" />
+			<http:error-response statusCode="#[vars.httpStatus default 500]">
+				<http:body><![CDATA[#[payload]]]></http:body>
+			</http:error-response>
+		</http:listener>
+		<validation:is-not-null doc:name="注文の形を確かめる" doc:id="7a4e5e14-291c-47ef-b397-d3c0abdce3d9" value="#[payload.customer]" message="customer は必須です" />
+		<db:select doc:name="顧客を探す" doc:id="5df09612-3918-431b-b73e-5a8a8ad97631" config-ref="Database_Config" target="customer">
+			<db:sql><![CDATA[SELECT id, name, tier FROM customers WHERE id = :id]]></db:sql>
+			<db:input-parameters><![CDATA[#[{ id: payload.customer }]]]></db:input-parameters>
+		</db:select>
+		<ee:transform doc:name="注文を組み立てる" doc:id="2a908cff-0492-42fe-9627-6572dd3fb51e">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	customer: vars.customer[0].name,
+	tier: vars.customer[0].tier,
+	total: sum(payload.items map ($.qty * $.price))
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<choice doc:name="ゴールド会員なら" doc:id="aaaed2ec-fe14-4966-ac49-cb3e61bd33b7">
+			<when expression='#[payload.tier == "gold"]'>
+				<ee:transform doc:name="1 割引く" doc:id="c647be8c-7525-4f56-a02a-2b098140273d">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload update {
+	case t at .total -> t * 0.9
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</when>
+		</choice>
+		<salesforce:create doc:name="Salesforce に登録する" doc:id="f1bda104-35fd-4eee-a0bf-84ed32ac5f6f" config-ref="Salesforce_Config" type="Order__c" target="created">
+			<salesforce:records><![CDATA[#[[{ Customer__c: payload.customer, Total__c: payload.total }]]]]></salesforce:records>
+		</salesforce:create>
+		<ee:transform doc:name="応答を作る" doc:id="30d08338-5c32-43c2-860e-6202caa16aba">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: vars.created.items[0].id, total: payload.total }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<error-handler>
+			<on-error-propagate enableNotifications="true" logException="true" doc:name="入力が足りない" doc:id="e914330a-e40a-4d80-9a36-1e872cc4f27d" type="VALIDATION:NULL">
+				<set-variable value="400" doc:name="400 にする" doc:id="ef1baf5c-fed3-419c-9835-1cb3423ecbe4" variableName="httpStatus" />
+				<ee:transform doc:name="エラーの本文" doc:id="5242c58f-349d-4648-8620-f751bb08914e">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ error: error.description }]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</on-error-propagate>
+			<on-error-propagate enableNotifications="true" logException="true" doc:name="DB につながらない" doc:id="3f99ae57-2a7d-4f25-a7e4-3734ce0f9f4d" type="DB:CONNECTIVITY">
+				<set-variable value="503" doc:name="503 にする" doc:id="c8b45e41-6158-4e61-ba29-9283a081104d" variableName="httpStatus" />
+				<ee:transform doc:name="エラーの本文" doc:id="cbc6ae46-118a-408f-b8bc-5cfd9f89af2f">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ error: "一時的に使えません。少し待って送り直してください" }]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</on-error-propagate>
+		</error-handler>
+	</flow>
+</mule>

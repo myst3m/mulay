@@ -1,0 +1,283 @@
+%%% note
+mulet samples/vm-test。VM コネクタ: publish / consume (TRANSIENT と PERSISTENT)、
+publish-consume と vm:listener の request-reply、同じフロー内の publish → consume、
+空キューの consume のタイムアウト (VM:QUEUE_TIMEOUT、5 秒待つ) が既定のエラー応答に
+どう出るか。キューを通したときに JSON / text の mime が保たれるか。
+%%% port 18104
+%%% mask
+"timestamp": "([^"]*)"
+%%% request POST /vm/publish
+Content-Type: application/json
+
+{"order": 1, "items": ["a", "b"]}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "published"
+}
+%%% request GET /vm/consume
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "order": 1,
+  "items": [
+    "a",
+    "b"
+  ]
+}
+%%% request POST /vm/publish
+Content-Type: text/plain
+
+hello queue
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "published"
+}
+%%% request GET /vm/consume
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+"hello queue"
+%%% request GET /vm/consume timeout=20
+%%% response 500
+content-type: text/plain; charset=UTF-8
+
+Tried to consume messages from VM queue 'testQueue' but it was empty after timeout of 5000 MILLISECONDS
+%%% request POST /vm/publish/persistent
+Content-Type: application/json
+
+{"durable": true}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "status": "published"
+}
+%%% request GET /vm/consume/persistent
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "durable": true
+}
+%%% request POST /vm/publish-consume
+Content-Type: application/json
+
+{"q": "ping"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "echo": {
+    "q": "ping"
+  },
+  "processed": true,
+  "timestamp": "***"
+}
+%%% request POST /vm/roundtrip
+Content-Type: application/json
+
+{"round": "trip"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "round": "trip"
+}
+%%% request GET /vm/publish
+%%% response 405
+content-type: text/plain
+
+Method not allowed for endpoint: /vm/publish
+%%% request GET /vm/consume-err
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "VM:EMPTY_QUEUE",
+  "description": "Tried to consume messages from VM queue 'emptyQueue' but it was empty after timeout of 100 MILLISECONDS"
+}
+%%% request POST /vm/attrs
+Content-Type: application/json
+
+{"a": 1}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "qn": "attrQueue",
+  "ts": "LocalDateTime",
+  "keys": [
+    "queueName",
+    "correlationId",
+    "timestamp"
+  ],
+  "cls": "org.mule.extensions.vm.api.VMMessageAttributes",
+  "mime": "application/json",
+  "p": {
+    "a": 1
+  },
+  "sameCid": true
+}
+%%% request POST /vm/chain
+Content-Type: application/json
+
+{"c": "hain"}
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": {
+    "got": {
+      "c": "hain"
+    },
+    "from": "inQueue",
+    "attrKeys": [
+      "queueName",
+      "correlationId",
+      "timestamp"
+    ],
+    "sameCid": true
+  },
+  "qn": "outQueue",
+  "sameCid": true
+}
+%%% request POST /vm/pc-timeout
+Content-Type: text/plain
+
+x
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "VM:QUEUE_TIMEOUT",
+  "description": "Published messages to queue 'noListenerQueue' but got no response after timeout of 300 MILLISECONDS"
+}
+%%% request POST /vm/pc-error
+Content-Type: text/plain
+
+x
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "VM:PUBLISH_CONSUMER_FLOW_ERROR",
+  "description": "APP:BOOM: boom in listener"
+}
+%%% request POST /vm/pc-vars
+Content-Type: text/plain
+
+hi
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "p": "hi!",
+  "mime": "text/plain",
+  "keep": "kept",
+  "qn": "textQueue",
+  "attrKeys": [
+    "queueName",
+    "correlationId",
+    "timestamp"
+  ],
+  "sameCid": true
+}
+%%% request GET /vm/undeclared
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "MULE:UNKNOWN",
+  "description": "queue 'nope' is not defined"
+}
+%%% request GET /vm/cid/consume-default
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "hasCid": true,
+  "sameCid": true,
+  "cid": null
+}
+%%% request GET /vm/cid/consume-never
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "hasCid": false,
+  "sameCid": false,
+  "cid": null
+}
+%%% request GET /vm/cid/consume-op-never
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "hasCid": false,
+  "sameCid": false,
+  "cid": null
+}
+%%% request GET /vm/cid/consume-op-auto
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "hasCid": true,
+  "sameCid": true,
+  "cid": null
+}
+%%% request GET /vm/cid/consume-custom
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "hasCid": true,
+  "sameCid": false,
+  "cid": "custom-9"
+}
+%%% request GET /vm/cid/consume-custom-never
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "hasCid": false,
+  "sameCid": false,
+  "cid": null
+}
+%%% request GET /vm/cid/listener-default
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sameCid": true,
+  "cid": null
+}
+%%% request GET /vm/cid/listener-never
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sameCid": false,
+  "cid": "other"
+}
+%%% request GET /vm/cid/listener-custom
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sameCid": false,
+  "cid": "custom-7"
+}
+%%% request GET /vm/cid/listener-op-never
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "sameCid": false,
+  "cid": "other"
+}

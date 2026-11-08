@@ -1,0 +1,275 @@
+(ns mulay.dw.coerce (:require [clay.string :as str] [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.rt :as rt] [mulay.dw.err :as dwe] [mulay.dw.coerce_time :as ct] [mulay.dw.coerce_num :as cn]
+                              [mulay.dw.lib.binaries :as bin] [mulay.lib.dec :as d] [mulay.lib.uni :as uni] [mulay.lib.regex :as rx]))
+
+(defn- type-label Str [t: &v/TypeV]
+  (if (= (:kind t) "name") (:name t) (:kind t)))
+
+(defn is-type? Bool [x0: &v/Val t: &v/TypeV] (is-type-in? x0 t []))
+
+(defn- rec-target Vec(v/TypeV) [env: &Vec(v/TypeV) name: &Str]
+  (loop [i (- (count env) 1)] (if (< i 0) [] (if (= (:name (nth env i)) name) [(nth env i)] (recur (- i 1))))))
+
+(defn- is-type-in? Bool [x0: &v/Val t: &v/TypeV env: &Vec(v/TypeV)]
+  (cond
+    (= (:kind t) "rec") (let [r (rec-target env (:name t))] (if (= (count r) 0) true (is-type-in? x0 (nth r 0) env)))
+    (alias-kind? t) (if (> (count (:args t)) 0) (is-type-in? x0 (nth (:args t) 0) (conj (copy-env env) t)) true)
+    :else (and (is-type-base-in? x0 t env) (meta-matches? x0 (:meta t)))))
+
+(defn- copy-env Vec(v/TypeV) [env: &Vec(v/TypeV)] (loop [i 0 acc: Vec(v/TypeV) []] (if (>= i (count env)) acc (recur (+ i 1) (conj acc (nth env i))))))
+
+(defn- alias-kind? Bool [t: &v/TypeV] (or (= (:kind t) "alias") (= (:kind t) "ref")))
+
+(defn unalias v/TypeV [t: &v/TypeV]
+  (if (and (alias-kind? t) (> (count (:args t)) 0)) (unalias (nth (:args t) 0)) t))
+
+(defn- meta-matches? Bool [x0: &v/Val tm: &Vec(v/Field)]
+  (if (= (count tm) 0) true
+    (let [vm (match x0 (v/VMeta y m) m _ [])]
+      (loop [i 0]
+        (if (>= i (count tm)) true
+          (let [f (nth tm i) got (v/obj-get vm (:name (:key f)))]
+            (if (and (> (count got) 0) (v/equal? (nth got 0) (:value f))) (recur (+ i 1)) false)))))))
+
+(defn is-type-base? Bool [x0: &v/Val t: &v/TypeV] (is-type-base-in? x0 t []))
+
+(defn- is-type-base-in? Bool [x0: &v/Val t: &v/TypeV env: &Vec(v/TypeV)]
+  (let [x (v/unmeta x0) k (:kind t)]
+    (if (= k "rec") (is-type-in? x0 t env)
+    (if (alias-kind? t) (if (> (count (:args t)) 0) (is-type-base-in? x0 (nth (:args t) 0) (conj (copy-env env) t)) true)
+    (if (= k "fn") (match x (v/VFn f) true _ false)
+    (if (= k "any") true
+      (if (= k "union") (loop [i 0] (if (>= i (count (:args t))) false (if (is-type-in? x0 (nth (:args t) i) env) true (recur (+ i 1)))))
+        (if (= k "inter") (loop [i 0] (if (>= i (count (:args t))) true (if (is-type-in? x0 (nth (:args t) i) env) (recur (+ i 1)) false)))
+          (if (= k "lit") (loop [i 0] (if (>= i (count (:lits t))) false (if (v/equal? x (nth (:lits t) i)) true (recur (+ i 1)))))
+            (if (= k "obj") (match x (v/VObj fs) (obj-matches? fs t env) _ false)
+              (let [n (:name t)]
+                (if (or (= n "Any")) true
+                  (if (= n "Nothing") false
+                    (if (= n "Key") (match x (v/VKey kk) true _ false)
+                    (if (or (= n "Uri") (= n "CData")) (match x (v/VStr s) true _ false)
+                      (rt/val-is? x n))))))))))))))))
+
+(defn- cerr Values(v/Val dwe/DwErr) [x: &v/Val target: &Str]
+  (let [s (match (v/unmeta x)
+            (v/VStr t) (if (or (= target "Number") (= target "Boolean")) (ct/show-val x) (ct/quote-str t))
+            (v/VNull) ""
+            _ (ct/show-val x))
+        shown (if (= s "") "" (str " (" s ")"))]
+    (rt/failure "CoercionException" (str "Cannot coerce " (v/type-name (v/unmeta x)) shown " to " target))))
+
+(defn- wild? Bool [tf: &v/TypeField] (or (= (:key tf) "_") (= (:key tf) "")))
+
+(defn- key-uri Str [k: &v/Key] (if (= (count (:ns k)) 0) "" (:uri (nth (:ns k) 0))))
+
+(defn- key-match? Bool [tf: &v/TypeField k: &v/Key]
+  (and (= (:key tf) (:name k)) (or (= (:ns tf) "") (= (:ns tf) (key-uri k)))))
+
+(defn- named? Bool [tfs: &Vec(v/TypeField) k: &v/Key]
+  (loop [i 0] (if (>= i (count tfs)) false (if (and (not (wild? (nth tfs i))) (key-match? (nth tfs i) k)) true (recur (+ i 1))))))
+
+(defn- attrs-ok? Bool [tas: &Vec(v/TypeField) as: &Vec(v/Attr) env: &Vec(v/TypeV)]
+  (loop [i 0]
+    (if (>= i (count tas)) true
+      (let [ta (nth tas i)
+            hit (loop [k 0] (if (>= k (count as)) -1
+                              (let [a (nth as k) u (if (= (count (:ns a)) 0) "" (:uri (nth (:ns a) 0)))]
+                                (if (and (= (:name a) (:key ta)) (or (= (:ns ta) "") (= (:ns ta) u))) k (recur (+ k 1))))))]
+        (cond
+          (< hit 0) (if (:optional ta) (recur (+ i 1)) false)
+          (:optional ta) (recur (+ i 1))
+          (is-type-in? (:value (nth as hit)) (:ty ta) env) (recur (+ i 1))
+          :else false)))))
+
+(defn- obj-matches? Bool [fs: &Vec(v/Field) t: &v/TypeV env: &Vec(v/TypeV)]
+  (let [tfs (:fields t)
+        rest (loop [i 0 acc: Vec(v/Val) []]
+               (if (>= i (count fs)) acc
+                 (recur (+ i 1) (if (named? tfs (:key (nth fs i))) acc (conj acc (:value (nth fs i)))))))
+        has-wild (loop [i 0] (if (>= i (count tfs)) false (if (wild? (nth tfs i)) true (recur (+ i 1)))))
+        decl-ok (loop [i 0]
+                  (if (>= i (count tfs)) true
+                    (let [tf (nth tfs i)]
+                      (if (wild? tf)
+                        (cond (= (count rest) 0) (if (:optional tf) (recur (+ i 1)) false)
+                              (loop [k 0] (if (>= k (count rest)) true (if (is-type-in? (nth rest k) (:ty tf) env) (recur (+ k 1)) false))) (recur (+ i 1))
+                              :else false)
+                        (let [hits (loop [k 0 acc: Vec(v/Field) []] (if (>= k (count fs)) acc (recur (+ k 1) (if (key-match? tf (:key (nth fs k))) (conj acc (nth fs k)) acc))))]
+                          (if (= (count hits) 0)
+                            (if (:optional tf) (recur (+ i 1)) false)
+                            (if (loop [k 0] (if (>= k (count hits)) true
+                                              (let [h (nth hits k)]
+                                                (if (and (is-type-in? (:value h) (:ty tf) env) (attrs-ok? (:attrs tf) (:attrs (:key h)) env)) (recur (+ k 1)) false))))
+                              (recur (+ i 1)) false)))))))]
+    (and decl-ok (or (not= (:name t) "closed") has-wild (= (count rest) 0)))))
+
+(defn coerce Values(v/Val dwe/DwErr) [x0: &v/Val t0: &v/TypeV]
+  (let [t (unalias t0)
+        [y e] (coerce-inner x0 t)]
+    (if (or (not (dwe/ok? e)) (= (count (:meta t)) 0)) (values y e)
+      (match y
+        (v/VMeta z m) (values y e)
+        _ (values (v/->VMeta y (:meta t)) e)))))
+
+(defn- coerce-inner Values(v/Val dwe/DwErr) [x0: &v/Val t: &v/TypeV]
+  (let [[tv te handled] (ct/coerce-temporal x0 t)]
+    (if handled (values tv te)
+      (if (and (= (:kind t) "name") (= (:name t) "CData"))
+        (let [[s e] (coerce-base x0 (v/->TypeV "name" "String" [] [] [] []))]
+          (if (dwe/ok? e) (rt/ret (v/->VMeta (v/unmeta s) [(v/field "cdata" (v/bool-v true))])) (values s e)))
+        (coerce-base x0 t)))))
+
+(defn- coerce-base Values(v/Val dwe/DwErr) [x0: &v/Val t: &v/TypeV]
+  (let [x (v/unmeta x0) k (:kind t)]
+    (if (or (= k "any") (is-type-base? x0 t)) (rt/ret x0)
+      (if (= k "union")
+        (loop [i 0]
+          (if (>= i (count (:args t))) (cerr x (type-label t))
+            (let [[y e] (coerce x0 (nth (:args t) i))]
+              (if (dwe/ok? e) (values y e) (recur (+ i 1))))))
+        (let [n (:name t)
+              [nv ne handled] (cn/coerce-number x0 t)]
+          (if handled (values nv ne)
+          (if (or (= n "String") (= n "Uri"))
+            (match x
+              (v/VNum m) (rt/ret (v/->VStr (num/to-string m)))
+              (v/VInt m-i) (let [m (num/from-int m-i)] (rt/ret (v/->VStr (num/to-string m))))
+              (v/VBool b) (rt/ret (v/->VStr (if b "true" "false")))
+              (v/VKey kk) (rt/ret (v/->VStr (:name kk)))
+              (v/VRegex s f) (rt/ret (v/->VStr s))
+              (v/VBin b) (bin->str b (:meta t))
+              (v/VType ty) (rt/ret (v/->VStr (v/type-display ty)))
+              (v/VNsV nn) (rt/ret (v/->VStr (:uri nn)))
+              _ (cerr x n))
+            (if (= n "Number")
+              (match x
+                (v/VStr s) (let [[m e] (num/parse-lit s)] (if (= e "") (rt/ret (v/num-v m)) (cerr x n)))
+                _ (cerr x n))
+              (if (= n "Boolean")
+                (match x
+                  (v/VStr s) (let [l (str/lower-case s)] (if (= l "true") (rt/ret (v/bool-v true)) (if (= l "false") (rt/ret (v/bool-v false)) (cerr x n))))
+                  _ (cerr x n))
+                (if (= n "Array")
+                  (match x (v/VRange a b) (rt/ret (v/materialize x)) _ (cerr x n))
+                  (if (= n "Key")
+                    (match x (v/VStr s) (rt/ret (v/->VKey (v/simple-key s))) _ (cerr x n))
+                    (if (= n "Regex")
+                      (match x (v/VStr s) (let [[p e] (rx/compile s 0)] (if (= e "") (rt/ret (v/->VRegex s "")) (rt/failure "PatternSyntax" e))) _ (cerr x n))
+                      (if (= n "Binary") (to-binary x (:meta t))
+                        (if (= n "Namespace") (obj->ns x)
+                          (cerr x n)))))))))))))))
+
+(defn- bin->str Values(v/Val dwe/DwErr) [b: &Str meta: &Vec(v/Field)]
+  (let [bs (v/obj-get meta "base") es (v/obj-get meta "encoding")
+        [base be] (if (= (count bs) 0) (values "" (dwe/ok)) (rt/to-text (nth bs 0)))
+        [enc ee] (if (= (count es) 0) (values "" (dwe/ok)) (rt/to-text (nth es 0)))]
+    (cond
+      (= (count bs) 1)
+      (cond (= base "64") (rt/ret (v/->VStr (bin/b64-encode b)))
+            (= base "16") (rt/ret (v/->VStr (bin/hex-upper b)))
+            :else (rt/failure "UnsupportedBaseProperty" (str "Cannot coerce Binary to String because the specified base '" base "' is not valid (options are 64 or 16).")))
+      (= (count es) 1)
+      (let [cs (bin/charset-id enc)]
+        (if (= cs "") (rt/failure "CoercionException" (str "Cannot coerce Binary to String, caused by: Unsupported Charset: `" enc "`."))
+          (let [[s k n] (bin/cs-decode b cs false)] (rt/ret (v/->VStr s)))))
+      :else (rt/ret (v/->VStr (uni/sanitize (str b)))))))
+
+(defn- to-binary Values(v/Val dwe/DwErr) [x: &v/Val meta: &Vec(v/Field)]
+  (match x
+    (v/VStr s)
+    (let [bs (v/obj-get meta "base") es (v/obj-get meta "encoding")
+          [base be] (if (= (count bs) 0) (values "" (dwe/ok)) (rt/to-text (nth bs 0)))
+          [enc ee] (if (= (count es) 0) (values "" (dwe/ok)) (rt/to-text (nth es 0)))]
+      (cond
+        (= (count bs) 1)
+        (cond
+          (= base "16") (let [[b e] (bin/hex-decode s)]
+                          (if (= e "") (rt/ret (v/->VBin b))
+                            (rt/failure "InvalidHexStringContent" (str "Unable to transform String to hex binary. Reason : `" e "`"))))
+          (= base "64") (let [[b e] (bin/b64-decode s)]
+                          (if (= e "") (rt/ret (v/->VBin b))
+                            (rt/failure "InvalidBase64Content" (str "Unable to transform String to Base 64 Binary. Reason : `" e "`"))))
+          :else (rt/failure "UnsupportedBaseProperty" (str "Cannot coerce Binary to String because the specified base '" base "' is not valid (options are 64 or 16).")))
+        (= (count es) 1)
+        (let [cs (bin/charset-id enc)]
+          (if (= cs "") (rt/failure "CoercionException" (str "Cannot coerce String to String, caused by: Unsupported Charset: `" enc "`."))
+            (rt/ret (v/->VBin (bin/cs-encode s cs)))))
+        :else (rt/ret (v/->VBin s))))
+    (v/VNum m) (rt/ret (v/->VBin (chr (low-byte m))))
+    (v/VInt m-i) (rt/ret (v/->VBin (chr (bit-and m-i 255))))
+    _ (cerr x "Binary")))
+
+(defn- low-byte Int [m: &num/Num]
+  (let [[t e] (d/set-scale (num/to-dec m) 0 d/DOWN)
+        s (d/to-plain-str t)
+        neg (and (> (count s) 0) (= (nth s 0) 45))
+        r (loop [i (if neg 1 0) acc 0] (if (>= i (count s)) acc (recur (+ i 1) (rem (+ (* acc 10) (- (nth s i) 48)) 256))))]
+    (if neg (rem (- 256 r) 256) r)))
+
+(defn- obj->ns Values(v/Val dwe/DwErr) [x: &v/Val]
+  (match x
+    (v/VObj fs) (let [u (v/obj-get fs "uri") p (v/obj-get fs "prefix")]
+                  (if (or (= (count u) 0) (= (count p) 0)) (cerr x "Namespace")
+                    (match (v/unmeta (nth u 0))
+                      (v/VStr us) (match (v/unmeta (nth p 0))
+                                    (v/VStr ps) (rt/ret (v/->VNsV (v/->Ns ps us)))
+                                    _ (cerr x "Namespace"))
+                      _ (cerr x "Namespace"))))
+    _ (cerr x "Namespace")))
+
+(defn type-str Str [t: &v/TypeV]
+  (let [k (:kind t)]
+    (cond
+      (= k "name") (:name t)
+      (or (= k "alias") (= k "ref") (= k "rec")) (:name t)
+      (= k "union") (join-types (:args t) " | ")
+      (= k "inter") (join-types (:args t) " & ")
+      (= k "lit") (if (> (count (:lits t)) 0) (v/type-name (v/unmeta (nth (:lits t) 0))) "Any")
+      (= k "obj") (obj-type-str t)
+      (= k "fn") "Function"
+      :else "Any")))
+
+(defn- join-types Str [ts: &Vec(v/TypeV) sep: &Str]
+  (loop [i 0 out ""] (if (>= i (count ts)) out (let [s (type-str (nth ts i))] (recur (+ i 1) (str out (if (> i 0) sep "") s))))))
+
+(defn- obj-type-str Str [t: &v/TypeV]
+  (let [fs (:fields t) closed (= (:name t) "closed")]
+    (if (and (= (count fs) 0) (not closed)) "Object"
+      (loop [i 0 out (if closed "{|" "{")]
+        (if (>= i (count fs)) (str out (if closed "|}" "}"))
+          (let [f (nth fs i) ts (type-str (:ty f))]
+            (recur (+ i 1) (str out (if (> i 0) ", " "") "(" (:key f) ": " ts ")"))))))))
+
+(defn param-type-str Str [t: &v/TypeV]
+  (if (and (= (:kind t) "lit") (= (count (:lits t)) 1))
+    (let [x (v/unmeta (nth (:lits t) 0))]
+      (match x
+        (v/VStr s) (str "\"" s "\"")
+        (v/VBool b) (if b "true" "false")
+        (v/VInt n) (str n)
+        (v/VNum n) (num/to-string n)
+        _ (type-str t)))
+    (type-str t)))
+
+(defn type-tag Int [t: &v/TypeV]
+  (let [k (:kind t)]
+    (cond
+      (= k "name") (let [n (rt/type-tag (:name t))] (if (< n 0) -2 n))
+      (or (= k "alias") (= k "ref") (= k "rec")) (if (> (count (:args t)) 0) (type-tag (nth (:args t) 0)) -2)
+      (= k "lit") (if (> (count (:lits t)) 0) (rt/val-tag (nth (:lits t) 0)) -2)
+      (= k "obj") 6
+      (= k "fn") 10
+      (= k "any") 0
+      :else -2)))
+
+(defn type-weight Int [t: &v/TypeV]
+  (let [k (:kind t)]
+    (cond
+      (or (= k "alias") (= k "ref") (= k "rec")) (if (> (count (:args t)) 0) (type-weight (nth (:args t) 0)) 10000)
+      (or (= k "union") (= k "inter")) 9990
+      :else (let [g (type-tag t)] (if (= g -2) 10000 (rt/tag-weight g))))))
+
+(defn params-sig rt/Sig [ts: &Vec(v/TypeV)]
+  (loop [i 0 ps: Vec(Str) [] tg: Vec(Int) [] ws: Vec(Int) [] nl false]
+    (if (>= i (count ts)) (rt/->Sig ps tg ws nl)
+      (let [t (nth ts i) g (type-tag t)]
+        (recur (+ i 1) (conj ps (param-type-str t)) (conj tg g) (conj ws (type-weight t)) (or nl (= g 1)))))))

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  統計的なモデル (LLM も埋め込みのモデルも使わない)。計算は stat/text.dwl、ツールの選び方は stat/agent.dwl と stat/hints.dwl。
+  - stat-step: llm.url が空 (llm.provider が auto の既定) のとき、agent-loop が LLM の代わりに呼ぶ。問いを例文と比べ (TF-IDF)、
+    ツールを 1 つ選んで引数を問いから取り出し、結果をひな形に入れて答える。どれにも当たらなければ文書を探す (search_docs)。
+    自由な文章は作らない。履歴の要約 (agent.summarize) もしない。
+  - stat-embed: Ollama 互換の /api/embeddings ({model, prompt} → {embedding})。embed.url の既定で、rag.xml の Embed が呼ぶ。
+    単語と文字の 2 文字ずつをハッシュで 512 次元に振り分けたベクトル。言葉が同じ文どうしが近くなる (言い換えには弱い)。
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <sub-flow name="stat-step">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import step from stat::agent
+output application/java
+---
+step(vars.question, vars.steps default [], vars.tools, {threshold: p('stat.threshold') as Number, noAnswer: p('stat.noAnswer')})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+
+    <flow name="stat-embed">
+        <http:listener config-ref="Http" path="/stat-embed/api/embeddings" allowedMethods="POST"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import embed from stat::text
+output application/json
+---
+{embedding: embed(payload.prompt default '')}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+</mule>

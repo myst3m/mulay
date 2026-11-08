@@ -1,0 +1,20 @@
+# mulay を RTF (Runtime Fabric) のカスタムランタイムにするイメージ (docker build -f deploy/Dockerfile.rtf -t mulay-rtf:dev .)。
+# 契約 (RTF のカスタムランタイムが要るもの): /docker-entrypoint.sh、/readiness-probe.sh、/liveness-probe.sh、
+# curl、/opt/mule/_VERSION_、UID 1000、:8081 (アプリ) と :7777 (ready)、ルート FS は読み取り専用。
+# mulay がリンクするのは libc と libm だけ (glibc)。TLS・暗号・PKCS#12 は clay、SQLite は自前。curl と jq はプローブと entrypoint 用
+# Anypoint の一覧にある名前での tag 付けと kind load は、build-and-load.sh (同名の本物があれば中止する) で行う。
+FROM debian:trixie-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl jq \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -u 1000 -m app \
+ && mkdir -p /opt/mule/deployments/conf /mnt/overlay \
+ && echo "4.11.3-mulay" > /opt/mule/_VERSION_ \
+ && chown -R app /opt/mule /mnt/overlay
+COPY mulay /usr/local/bin/mulay
+COPY deploy/rtf/readiness-probe.sh deploy/rtf/liveness-probe.sh deploy/rtf/docker-entrypoint.sh /
+RUN chmod +x /readiness-probe.sh /liveness-probe.sh /docker-entrypoint.sh
+USER app
+WORKDIR /opt/mule
+EXPOSE 8081 7777
+ENTRYPOINT ["/docker-entrypoint.sh"]

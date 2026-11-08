@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <http:listener-config name="HTTP">
+        <http:listener-connection host="0.0.0.0" port="18540"/>
+    </http:listener-config>
+
+    <http:request-config name="Self">
+        <http:request-connection host="localhost" port="18540"/>
+    </http:request-config>
+
+    <os:object-store name="St" persistent="false"/>
+    <os:object-store name="Seen" persistent="false"/>
+
+    <!-- 取りに行かれる側 -->
+    <flow name="api-items">
+        <http:listener config-ref="HTTP" path="/api/items"/>
+        <os:retrieve key="items" objectStore="St">
+            <os:default-value>#[[{id: 1, ts: 10, v: "a"}, {id: 2, ts: 20, v: "b"}, {id: 3, ts: 30, v: "c"}]]</os:default-value>
+        </os:retrieve>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+
+    <flow name="api-items2">
+        <http:listener config-ref="HTTP" path="/api/items2"/>
+        <os:store key="#['q2-' ++ (attributes.queryParams.since default 'none')]" objectStore="Seen">
+            <os:value>#[attributes.queryParams.since default 'none']</os:value>
+        </os:store>
+        <set-payload value="#[output application/json --- [{id: 1, ts: 10}, {id: 2, ts: 20}] filter ((it) -> it.ts > ((attributes.queryParams.since default '0') as Number))]"/>
+    </flow>
+
+    <flow name="api-add">
+        <http:listener config-ref="HTTP" path="/api/add" allowedMethods="POST"/>
+        <set-variable variableName="more" value="#[payload]"/>
+        <os:retrieve key="items" objectStore="St">
+            <os:default-value>#[[{id: 1, ts: 10, v: "a"}, {id: 2, ts: 20, v: "b"}, {id: 3, ts: 30, v: "c"}]]</os:default-value>
+        </os:retrieve>
+        <os:store key="items" objectStore="St">
+            <os:value>#[output application/json --- payload ++ vars.more]</os:value>
+        </os:store>
+        <set-payload value="added"/>
+    </flow>
+
+    <flow name="api-plain">
+        <http:listener config-ref="HTTP" path="/api/plain"/>
+        <set-payload value='{"a": 1}' mimeType="text/plain"/>
+    </flow>
+
+    <flow name="api-fail">
+        <http:listener config-ref="HTTP" path="/api/fail">
+            <http:response statusCode="500"/>
+        </http:listener>
+        <set-payload value="no"/>
+    </flow>
+
+    <flow name="api-echo">
+        <http:listener config-ref="HTTP" path="/api/echo/{name}" allowedMethods="POST"/>
+        <set-payload value="#[output application/json --- {method: attributes.method, name: attributes.uriParams.name, q: attributes.queryParams.q, xk: attributes.headers.'x-k', ct: attributes.headers.'content-type', body: payload.^raw as String default null}]"/>
+    </flow>
+
+    <!-- p1: 配列を分けて 1 件ずつ。watermark と id で同じものを二度読まない -->
+    <flow name="p1">
+        <http:polling-source config-ref="Self" path="/api/items" splitExpression="#[payload]" watermarkExpression="#[item.ts]" idExpression="#[item.id]">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </http:polling-source>
+        <os:store key="#['p1-' ++ (payload.id as String) ++ '-' ++ uuid()]" objectStore="Seen">
+            <os:value>#[output application/json --- {"type": typeOf(payload), mime: payload.^mimeType, item: payload, attrClass: attributes.^class, status: attributes.statusCode, ct: attributes.headers.'content-type'}]</os:value>
+        </os:store>
+    </flow>
+
+    <!-- p2: 分けない。outputMimeType で text/plain の応答を JSON として読む -->
+    <flow name="p2">
+        <http:polling-source config-ref="Self" path="/api/plain" outputMimeType="application/json">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </http:polling-source>
+        <os:store key="p2" objectStore="Seen">
+            <os:value>#[output application/json --- {"type": typeOf(payload), mime: payload.^mimeType, a: payload.a, status: attributes.statusCode, reason: attributes.reasonPhrase}]</os:value>
+        </os:store>
+    </flow>
+
+    <!-- p3: 500 の応答。フローは動かない -->
+    <flow name="p3">
+        <http:polling-source config-ref="Self" path="/api/fail">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+        </http:polling-source>
+        <os:store key="p3" objectStore="Seen">
+            <os:value>#[payload]</os:value>
+        </os:store>
+    </flow>
+
+    <!-- p4: POST、本文、ヘッダ、uri の引数、クエリ -->
+    <flow name="p4">
+        <http:polling-source config-ref="Self" path="/api/echo/{name}" method="POST">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+            <http:polling-request-body>{"b": 1}</http:polling-request-body>
+            <http:polling-request-headers>
+                <http:polling-request-header key="x-k" value="v1"/>
+            </http:polling-request-headers>
+            <http:polling-request-uri-params>
+                <http:polling-request-uri-param key="name" value="joe"/>
+            </http:polling-request-uri-params>
+            <http:polling-request-query-params>
+                <http:polling-request-query-param key="q" value="1"/>
+            </http:polling-request-query-params>
+        </http:polling-source>
+        <os:store key="p4" objectStore="Seen">
+            <os:value>#[output application/json --- {"type": typeOf(payload), mime: payload.^mimeType, value: payload}]</os:value>
+        </os:store>
+    </flow>
+
+    <!-- p5: クエリの値に今の watermark を使う -->
+    <flow name="p5">
+        <http:polling-source config-ref="Self" path="/api/items2" splitExpression="#[payload]" watermarkExpression="#[item.ts]">
+            <scheduling-strategy>
+                <fixed-frequency frequency="300"/>
+            </scheduling-strategy>
+            <http:polling-request-query-params>
+                <http:polling-request-query-param key="since" value="#[watermark default 0]"/>
+            </http:polling-request-query-params>
+        </http:polling-source>
+        <os:store key="#['p5-' ++ (payload.id as String) ++ '-' ++ uuid()]" objectStore="Seen">
+            <os:value>#[payload]</os:value>
+        </os:store>
+    </flow>
+
+    <flow name="dump">
+        <http:listener config-ref="HTTP" path="/dump"/>
+        <os:retrieve-all objectStore="Seen"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var all = payload
+var ks = (keysOf(all) map ($ as String)) orderBy $
+fun counted(prefix) = (ks filter ($ startsWith prefix)) groupBy ((k) -> (k splitBy "-")[1])
+    mapObject ((v, k) -> {(k): {count: sizeOf(v), first: all[v[0]]}})
+---
+{
+  p1: counted("p1-"),
+  p2: all.p2,
+  p3: all.p3,
+  p4: all.p4,
+  p5: counted("p5-") mapObject ((v, k) -> {(k): v.count}),
+  q2: ks filter ($ startsWith "q2-")
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>

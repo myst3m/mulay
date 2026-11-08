@@ -1,0 +1,82 @@
+(ns btree-test (:require [mulay.lib.sqlbtree :as bt] [mulay.lib.sqlfile :as sf] [mulay.lib.sqlval :as sv]))
+
+;; メモリのページの B-tree: 挿入、置き換え、削除、カーソル、ファイルへの書き出しと読み戻し。
+;; 行は rowid と (a, b) で、a は文字列 (長さを変えて overflow を作る)。索引は (a, rowid)
+
+(defn- cmp-keys Int [a: Str b: Str] (sv/record-compare a b ["BINARY"] [false]))
+(defn- cmp-at Int [a: Str ao: Int b: Str] (sv/record-compare-at a ao b ["BINARY"] [false]))
+(defn- kcmp bt/KeyCmp [] (bt/->KeyCmp cmp-at))
+
+;; 決まった並びの擬似乱数 (線形合同法)
+(defn- rnd Int [x: Int] (bit-and (+ (* x 6364136223846793005) 1442695040888963407) 9223372036854775807))
+
+(defn- text-of-len Str [n: Int seed: Int] (loop [out ""] (if (>= (count out) n) (subs out 0 n) (recur (str out (chr (+ 97 (mod (+ seed (count out)) 26))))))))
+
+(defn- row Str [k: Int] (sf/encode-record [(sf/->VText (text-of-len (mod (* k 37) 2500) k)) (sf/->VInt k)]))
+(defn- ikey Str [k: Int rowid: Int] (sf/encode-record [(sf/->VText (text-of-len (mod (* k 37) 2500) k)) (sf/->VInt rowid)]))
+
+;; n 行を擬似乱数の rowid で入れ、そのうち del 個おきに消した DB → (Pager 表の根 索引の根 残った rowid の和 残った数)
+(defn- build Values(bt/Pager Int Int Int Int) [page-size: Int n: Int del: Int]
+  (let [p0 (bt/new-pager page-size 0)
+        [p1 troot] (bt/create-tree p0 true)
+        [p2 iroot] (bt/create-tree p1 false)
+        [p3 x] (loop [i 0 p p2 x 7]
+                 (if (>= i n) (values p x)
+                   (let [x2 (rnd x) rowid (+ 1 (mod x2 1000000))
+                         [old found] (bt/table-find p troot rowid)
+                         ;; 同じ rowid が出たら飛ばす (索引を壊さないため)
+                         pa (if found p (bt/index-insert (bt/table-insert p troot rowid (row rowid)) iroot (ikey rowid rowid) (kcmp)))]
+                     (recur (+ i 1) pa x2))))
+        ;; del 個おきに消す
+        [p4 sum cnt] (loop [c (bt/cur-first p3 troot) p p3 k 0 rowids: Vec(Int) []]
+                       (if (not (bt/valid? c))
+                         (loop [j 0 q p] (if (>= j (count rowids)) (values q 0 0)
+                                           (let [r (nth rowids j) [q2 ok] (bt/table-delete q troot r) [q3 ok2] (bt/index-delete q2 iroot (ikey r r) (kcmp))]
+                                             (recur (+ j 1) q3))))
+                         (let [r (bt/cur-rowid p c)] (recur (bt/cur-next p c) p (+ k 1) (if (= (mod k del) 0) (conj rowids r) rowids)))))
+        [s2 c2] (loop [c (bt/cur-first p4 troot) s 0 k 0] (if (not (bt/valid? c)) (values s k) (recur (bt/cur-next p4 c) (+ s (bt/cur-rowid p4 c)) (+ k 1))))]
+    (values p4 troot iroot s2 c2)))
+
+;; 表のカーソルは rowid の昇順、索引のカーソルはキーの昇順で、索引の数は表の数と同じ
+(defn- check Bool [page-size: Int n: Int del: Int]
+  (let [[p troot iroot sum cnt] (build page-size n del)
+        [ordered last] (loop [c (bt/cur-first p troot) prev -1 ok true]
+                         (if (not (bt/valid? c)) (values ok prev)
+                           (let [r (bt/cur-rowid p c)
+                                 [pl f] (bt/table-find p troot r)]
+                             (recur (bt/cur-next p c) r (and ok (> r prev) f (= pl (row r)) (= (bt/cur-payload p c) (row r)))))))
+        [iord icnt] (loop [c (bt/cur-first p iroot) prev "" k 0 ok true]
+                      (if (not (bt/valid? c)) (values ok k)
+                        (let [key (bt/cur-payload p c)]
+                          (recur (bt/cur-next p c) key (+ k 1) (and ok (or (= prev "") (< (cmp-keys prev key) 0)))))))
+        ;; ファイルに書いて読み戻す
+        data (bt/to-bytes p 1)
+        [db e] (sf/open-bytes data)
+        [rows re] (sf/table-rows db troot)
+        [keys ke] (sf/index-keys db iroot)]
+    (and ordered iord (= icnt cnt) (= e "") (= re "") (= ke "") (= (count rows) cnt) (= (count keys) cnt))))
+
+(deftest small-pages (is (check 512 600 3)))
+(deftest default-pages (is (check 4096 3000 4)))
+(deftest delete-most (is (check 1024 800 1)))
+(deftest big-pages (is (check 65536 400 5)))
+
+;; 置き換え (同じ rowid) と、空の表、一番大きい rowid
+(deftest replace-and-max
+  (let [p0 (bt/new-pager 1024 0)
+        [p1 root] (bt/create-tree p0 true)
+        [m0 ok0] (bt/table-max p1 root)
+        p2 (bt/table-insert (bt/table-insert (bt/table-insert p1 root 5 "a") root 9 (text-of-len 3000 1)) root 5 "bb")
+        [v5 f5] (bt/table-find p2 root 5)
+        [v9 f9] (bt/table-find p2 root 9)
+        [m ok] (bt/table-max p2 root)
+        [p3 d] (bt/table-delete p2 root 9)
+        [p4 d2] (bt/table-delete p3 root 9)
+        nfree (count (:free p4))]
+    (is (not ok0))
+    (is (= v5 "bb"))
+    (is (= v9 (text-of-len 3000 1)))
+    (is (and ok (= m 9)))
+    (is (and d (not d2)))
+    ;; 9 の overflow のページは空きに戻る
+    (is (> nfree 0))))

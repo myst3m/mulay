@@ -1,0 +1,556 @@
+(ns parse-test (:require [mulay.conn.registry :as creg] [mulay.mule.load :as ld] [mulay.mule.props :as pr] [mulay.lib.res :as res] [mulay.mule.model :as m]
+                         [mulay.mule.parse :as ps] [mulay.mule.dump :as dump] [mulay.dw.engine :as eng]
+                         [clay.string :as str] [mulay.lib.xml :as xml]))
+
+(def HEAD "<mule xmlns=\"http://www.mulesoft.org/schema/mule/core\" xmlns:http=\"http://www.mulesoft.org/schema/mule/http\" xmlns:ee=\"http://www.mulesoft.org/schema/mule/ee/core\" xmlns:db=\"http://www.mulesoft.org/schema/mule/db\" xmlns:vm=\"http://www.mulesoft.org/schema/mule/vm\" xmlns:file=\"http://www.mulesoft.org/schema/mule/file\" xmlns:grpc=\"http://www.mulesoft.org/schema/mule/grpc\" xmlns:doc=\"http://www.mulesoft.org/schema/mule/documentation\">\n")
+
+(defn- opts ld/LoadOpts [] (ld/->LoadOpts [] false (creg/hints)))
+
+(def CFGS (str "\n<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"8081\"/></http:listener-config>"
+               "<http:request-config name=\"R\"><http:request-connection host=\"localhost\"/></http:request-config>"
+               "<db:config name=\"D\"><db:generic-connection url=\"jdbc:sqlite::memory:\"/></db:config><file:config name=\"F\"/>"))
+
+(defn- app-rs m/App [body: &Str rs: res/ResSet]
+  (:app (ld/load-texts "t" ["a.xml"] [(str HEAD body CFGS "\n</mule>")] rs (opts))))
+
+(defn- app-bare m/App [body: &Str] (:app (ld/load-texts "t" ["a.xml"] [(str HEAD body "\n</mule>")] (res/res-none) (opts))))
+
+(defn- app1 m/App [body: &Str] (app-rs body (res/res-none)))
+
+(defn- flow m/Flow [a: &m/App i: Int] (nth (:flows a) i))
+(defn- proc m/Proc [a: &m/App fi: Int pi: Int] (nth (:procs (flow a fi)) pi))
+(defn- ndiag Int [a: &m/App] (count (:diags a)))
+(defn- diag0 Str [a: &m/App] (if (= (count (:diags a)) 0) "" (m/diag-str (nth (:diags a) 0))))
+
+(defn- lit? Bool [v: &m/PVal s: &Str] (match v (m/PLit x) (= x s) _ false))
+(defn- expr? Bool [v: &m/PVal t: &Str]
+  (match v (m/PExpr x c sr) (and (= x t) (= (count (:errors c)) 0)) _ false))
+(defn- line-of Int [p: &m/Proc]
+  (match p
+    (m/PrSetPayload v mi e l) (:line l) (m/PrSetVar n v mi l) (:line l) (m/PrLogger ms lv c l) (:line l)
+    (m/PrUnknown n l) (:line l) _ -1))
+(defn- line-loc m/Loc [p: &m/Proc]
+  (match p
+    (m/PrSetPayload v mi e l) l (m/PrLogger ms lv c l) l (m/PrRaise t d l) l (m/PrTry ps hs r ta l) l
+    _ (m/->Loc "" -1 "" "" "" [])))
+(defn- pget Vec(m/PVal) [ps: &Vec(m/Param) k: &Str]
+  (loop [i 0] (if (>= i (count ps)) [] (if (= (:name (nth ps i)) k) [(:v (nth ps i))] (recur (+ i 1))))))
+
+(deftest set-payload-and-exprs
+  (let [a (app1 "<flow name=\"f\">\n<set-payload value=\"hi\" mimeType=\"text/plain\"/>\n<set-payload value=\"#[payload ++ 'x']\"/>\n<set-payload value=\"n=#[vars.n]!\"/>\n<set-payload value=\"#[output text/plain --- 'a']\"/>\n</flow>")]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0) (m/PrSetPayload v mi e l) (and (lit? v "hi") (= mi "text/plain") (= (:line l) 3) (= (:file l) "a.xml")) _ false))
+    (is (match (proc a 0 1) (m/PrSetPayload v mi e l) (expr? v "#[payload ++ 'x']") _ false))
+    (is (match (proc a 0 2) (m/PrSetPayload v mi e l) (expr? v "n=#[vars.n]!") _ false))
+    (is (match (proc a 0 3) (m/PrSetPayload v mi e l) (expr? v "#[output text/plain --- 'a']") _ false))))
+
+(deftest expr-compile-error-has-location
+  (let [a (app1 "<flow name=\"f\">\n<logger/>\n<set-variable variableName=\"v\" value=\"#[1 +]\"/>\n</flow>")]
+    (is (= (ndiag a) 1))
+    (is (str/starts-with? (diag0 a) "a.xml:4: <set-variable> value: DataWeave compile error"))))
+
+(deftest simple-core-processors
+  (let [a (app1 "<flow name=\"f\"><set-variable variableName=\"v\" value=\"1\" mimeType=\"application/json\"/><remove-variable variableName=\"v\"/><logger level=\"WARN\" category=\"c\" message=\"#[payload]\"/><logger/><flow-ref name=\"g\" target=\"t\"/><raise-error type=\"APP:BAD\" description=\"oops\"/><raise-error type=\"EXPRESSION\"/></flow><sub-flow name=\"g\"><logger/></sub-flow>")]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0) (m/PrSetVar n v mi l) (and (= n "v") (lit? v "1") (= mi "application/json")) _ false))
+    (is (match (proc a 0 1) (m/PrRemoveVar n l) (= n "v") _ false))
+    (is (match (proc a 0 2) (m/PrLogger ms lv c l) (and (= lv "WARN") (= c "c") (= (count ms) 1) (expr? (nth ms 0) "#[payload]")) _ false))
+    (is (match (proc a 0 3) (m/PrLogger ms lv c l) (and (= lv "INFO") (= (count ms) 0)) _ false))
+    (is (match (proc a 0 4) (m/PrFlowRef n t tv l) (and (lit? n "g") (= t "t")) _ false))
+    (is (match (proc a 0 5) (m/PrRaise t d l) (and (= t "APP:BAD") (lit? d "oops")) _ false))
+    (is (match (proc a 0 6) (m/PrRaise t d l) (= t "MULE:EXPRESSION") _ false))
+    (is (:sub (flow a 1)))))
+
+(deftest idempotent-message-validator
+  (let [a (app1 "<flow name=\"f\"><idempotent-message-validator/><idempotent-message-validator idExpression=\"#[payload.id]\" valueExpression=\"#['v']\" objectStore=\"S\"/><idempotent-message-validator xmlns:os=\"http://www.mulesoft.org/schema/mule/os\"><os:private-object-store entryTtl=\"2\" persistent=\"false\"/></idempotent-message-validator></flow>")
+        b (app1 "<flow name=\"f\"><idempotent-message-validator objectStore=\"S\" xmlns:os=\"http://www.mulesoft.org/schema/mule/os\"><os:private-object-store/></idempotent-message-validator></flow>")]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0) (m/PrIdempotent id val st pr l) (and (expr? id "#[correlationId]") (expr? val "#[correlationId]") (= st "") (= (count pr) 0)) _ false))
+    (is (match (proc a 0 1) (m/PrIdempotent id val st pr l) (and (expr? id "#[payload.id]") (expr? val "#['v']") (= st "S")) _ false))
+    (is (match (proc a 0 2) (m/PrIdempotent id val st pr l) (and (= (count pr) 1) (= (count (nth pr 0)) 2)) _ false))
+    (is (str/includes? (diag0 b) "Ambiguous definition of object store, both reference and private were configured"))))
+
+(deftest cache-scope
+  (let [a (app1 "<ee:object-store-caching-strategy xmlns:ee=\"http://www.mulesoft.org/schema/mule/ee/core\" name=\"S\" keyGenerationExpression=\"#[vars.k]\"/><flow name=\"f\" xmlns:ee=\"http://www.mulesoft.org/schema/mule/ee/core\"><ee:cache><logger/></ee:cache><ee:cache cachingStrategy-ref=\"S\" filterExpression=\"#[vars.c]\"><logger/><logger/></ee:cache><ee:invalidate-key cachingStrategy-ref=\"S\" keyGenerationExpression=\"#[vars.k]\"/><ee:invalidate-cache cachingStrategy-ref=\"S\"/></flow>")
+        b (app1 "<ee:object-store-caching-strategy xmlns:ee=\"http://www.mulesoft.org/schema/mule/ee/core\" name=\"S\" keyGenerator-ref=\"g\"/>")]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0) (m/PrCache sr fl ps l) (and (= sr "") (= (count fl) 0) (= (count ps) 1)) _ false))
+    (is (match (proc a 0 1) (m/PrCache sr fl ps l) (and (= sr "S") (expr? (nth fl 0) "#[vars.c]") (= (count ps) 2)) _ false))
+    (is (match (proc a 0 2) (m/PrInvalidateKey sr kx l) (and (= sr "S") (expr? (nth kx 0) "#[vars.k]")) _ false))
+    (is (match (proc a 0 3) (m/PrInvalidateCache sr l) (= sr "S") _ false))
+    (is (str/includes? (diag0 b) "keyGenerator-ref is not supported"))))
+
+(deftest choice-and-scopes
+  (let [a (app1 "<flow name=\"f\"><choice><when expression=\"#[vars.a == 1]\"><logger/></when><when expression=\"vars.b\"><logger/><logger/></when><otherwise><logger/></otherwise></choice><foreach><logger/></foreach><foreach collection=\"#[payload.items]\" counterVariableName=\"i\" batchSize=\"2\"><logger/></foreach><parallel-foreach collection=\"#[[1,2]]\" maxConcurrency=\"4\" target=\"out\"><logger/></parallel-foreach><scatter-gather timeout=\"500\"><route><logger/></route><route><logger/></route></scatter-gather><until-successful maxRetries=\"3\"><logger/></until-successful><async maxConcurrency=\"2\"><logger/></async><first-successful><route><logger/></route></first-successful><round-robin><route><logger/></route></round-robin><round-robin><route><logger/></route></round-robin></flow>")]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0) (m/PrChoice ws o l) (and (= (count ws) 2) (= (count o) 1) (expr? (:cond (nth ws 1)) "vars.b") (= (count (:procs (nth ws 1))) 2)) _ false))
+    (is (match (proc a 0 1) (m/PrForEach c cn rn b ps l) (and (= (count c) 0) (= cn "counter") (= rn "rootMessage") (= b 1) (= (count ps) 1)) _ false))
+    (is (match (proc a 0 2) (m/PrForEach c cn rn b ps l) (and (= (count c) 1) (= cn "i") (= b 2)) _ false))
+    (is (match (proc a 0 3) (m/PrParallelForEach c mc to t ps l) (and (= mc 4) (= to -1) (= t "out") (= (count ps) 1)) _ false))
+    (is (match (proc a 0 4) (m/PrScatterGather rs to mc t l) (and (= (count rs) 2) (= to 500) (= mc -1)) _ false))
+    (is (match (proc a 0 5) (m/PrUntilSuccessful mr mb ps l) (and (= mr 3) (= mb 60000)) _ false))
+    (is (match (proc a 0 6) (m/PrAsync ps mc l) (= mc 2) _ false))
+    (is (match (proc a 0 7) (m/PrFirstSuccessful rs l) (= (count rs) 1) _ false))
+    (is (match (proc a 0 8) (m/PrRoundRobin rs id l) (= id 0) _ false))
+    (is (match (proc a 0 9) (m/PrRoundRobin rs id l) (= id 1) _ false))))
+
+(deftest batch-job
+  (let [a (app1 "<flow name=\"f\"><batch:job xmlns:batch=\"http://www.mulesoft.org/schema/mule/batch\" jobName=\"j\" blockSize=\"2\" maxFailedRecords=\"-1\"><batch:process-records><batch:step name=\"s1\" acceptExpression=\"#[payload > 1]\"><logger/><logger/></batch:step><batch:step name=\"s2\" acceptPolicy=\"ONLY_FAILURES\"><logger/><batch:aggregator size=\"3\"><logger/></batch:aggregator></batch:step></batch:process-records><batch:on-complete><logger/></batch:on-complete></batch:job><batch:job xmlns:batch=\"http://www.mulesoft.org/schema/mule/batch\"><batch:process-records><batch:step name=\"x\" acceptPolicy=\"SOME\"/></batch:process-records></batch:job></flow>")]
+    (is (= (ndiag a) 1))
+    (is (match (proc a 0 0)
+          (m/PrBatchJob nm bs mf mc ss oc l)
+          (and (= nm "j") (= bs 2) (= mf -1) (= mc -1) (= (count ss) 2) (= (count oc) 1)
+               (= (:name (nth ss 0)) "s1") (= (:accept-policy (nth ss 0)) "NO_FAILURES")
+               (= (count (:accept-expr (nth ss 0))) 1) (= (count (:procs (nth ss 0))) 2)
+               (= (count (:aggregator (nth ss 0))) 0)
+               (= (:accept-policy (nth ss 1)) "ONLY_FAILURES") (= (count (:procs (nth ss 1))) 1)
+               (= (:size (nth (:aggregator (nth ss 1)) 0)) 3))
+          _ false))
+    (is (match (proc a 0 1) (m/PrBatchJob nm bs mf mc ss oc l) (and (= nm "") (= bs 100) (= mf 0)) _ false))))
+
+(deftest scope-diags
+  (let [a (app1 "<flow name=\"f\"><choice><otherwise/></choice><scatter-gather><route/><logger/></scatter-gather><foreach batchSize=\"x\"/></flow>")]
+    (is (= (ndiag a) 7))))
+
+(deftest try-and-error-handlers
+  (let [a (app1 "<flow name=\"f\"><try transactionalAction=\"ALWAYS_BEGIN\"><logger/><error-handler><on-error-continue type=\"HTTP:NOT_FOUND, EXPRESSION\" logException=\"false\"><logger/></on-error-continue><on-error-propagate when=\"#[error.description == 'x']\"/></error-handler></try><try><logger/><error-handler ref=\"geh\"/></try><error-handler><on-error-propagate type=\"ANY\"/></error-handler></flow><flow name=\"g\"><logger/><error-handler ref=\"geh\"/></flow><error-handler name=\"geh\"><on-error-continue/></error-handler><configuration defaultErrorHandler-ref=\"geh\"/>")]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0)
+          (m/PrTry ps hs r ta l)
+          (and (= (count ps) 1) (= (count hs) 2) (= ta "ALWAYS_BEGIN") (= r "")
+               (not (:propagate (nth hs 0))) (= (:types (nth hs 0)) ["HTTP:NOT_FOUND" "MULE:EXPRESSION"])
+               (not (:log-exception (nth hs 0))) (= (count (:procs (nth hs 0))) 1)
+               (:propagate (nth hs 1)) (= (count (:when (nth hs 1))) 1) (= (count (:types (nth hs 1))) 0))
+          _ false))
+    (is (match (proc a 0 1) (m/PrTry ps hs r ta l) (and (= r "geh") (= ta "INDEPENDENT")) _ false))
+    (is (= (count (:handlers (flow a 0))) 1))
+    (is (= (:types (nth (:handlers (flow a 0)) 0)) ["MULE:ANY"]))
+    (is (= (:handler-ref (flow a 1)) "geh"))
+    (is (= (count (:global-handlers a)) 1))
+    (is (= (:default-handler a) "geh"))))
+
+(deftest transform
+  (let [a (app-rs "<flow name=\"f\"><ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0\noutput application/json\n---\n{a: payload}]]></ee:set-payload><ee:set-attributes resource=\"attrs.dwl\"/></ee:message><ee:variables><ee:set-variable variableName=\"x\">payload.x</ee:set-variable><ee:set-variable variableName=\"y\" resource=\"classpath:dw/y.dwl\"/></ee:variables></ee:transform></flow>"
+                  (res/res-mem ["attrs.dwl" "dw/y.dwl"] ["%dw 2.0\n---\n{}" "1 + 1"]))]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0)
+          (m/PrTransform pa at vs l)
+          (and (= (count pa) 1) (= (count at) 1) (= (count vs) 2) (= (:name (nth vs 0)) "x") (= (:name (nth vs 1)) "y"))
+          _ false))))
+
+(deftest transform-diags
+  (let [a (app1 "<flow name=\"f\">\n<ee:transform>\n<ee:message>\n<ee:set-payload resource=\"nope.dwl\"/>\n</ee:message>\n<ee:variables><ee:set-variable variableName=\"v\"><![CDATA[%dw 2.0\n---\n{a: }]]></ee:set-variable></ee:variables>\n</ee:transform>\n</flow>")]
+    (is (= (ndiag a) 2))
+    (is (= (diag0 a) "a.xml:5: <ee:set-payload>: resource not found: nope.dwl"))
+    (is (str/starts-with? (m/diag-str (nth (:diags a) 1)) "a.xml:7: <ee:set-variable>: DataWeave compile error"))))
+
+(deftest http-listener
+  (let [a (app1 "<flow name=\"f\"><http:listener config-ref=\"L\" path=\"/p/{id}\" allowedMethods=\"get, POST\"><http:response statusCode=\"#[vars.st default 200]\"><http:body><![CDATA[#[payload]]]></http:body><http:headers><![CDATA[#[{'X-A': 'b'}]]]></http:headers></http:response><http:error-response statusCode=\"500\"><http:headers><http:header key=\"X-E\" value=\"#[error.description]\"/><http:header key=\"X-F\" value=\"lit\"/></http:headers></http:error-response></http:listener><logger/></flow>")
+        f (flow a 0)]
+    (is (= (ndiag a) 0))
+    (is (= (count (:procs f)) 1))
+    (is (match (nth (:source f) 0)
+          (m/SrcHttpListener cr pa ms s1 h1 b1 s2 h2 b2 r1 r2 sm om oe l)
+          (and (= cr "L") (= pa "/p/{id}") (= ms ["GET" "POST"]) (expr? (nth s1 0) "#[vars.st default 200]")
+               (expr? (nth b1 0) "#[payload]") (= (count h1) 1) (lit? (nth s2 0) "500") (= (count h2) 1) (= (count b2) 0))
+          _ false))))
+
+;; responseStreamingMode: 書かなければ AUTO、大文字小文字は問わない、AUTO / ALWAYS / NEVER 以外は診断
+(deftest http-listener-streaming-mode
+  (let [a (app1 "<flow name=\"f\"><http:listener config-ref=\"L\" path=\"/a\"/></flow><flow name=\"g\"><http:listener config-ref=\"L\" path=\"/b\" responseStreamingMode=\"always\"/></flow><flow name=\"h\"><http:listener config-ref=\"L\" path=\"/c\" responseStreamingMode=\"SOMETIMES\"/></flow>")
+        mode (fn Str [i: Int] (match (nth (:source (flow a i)) 0) (m/SrcHttpListener cr pa ms s1 h1 b1 s2 h2 b2 r1 r2 sm om oe l) sm _ "?"))]
+    (is (= (ndiag a) 1))
+    (is (= (mode 0) "AUTO"))
+    (is (= (mode 1) "ALWAYS"))
+    (is (str/includes? (diag0 a) "invalid responseStreamingMode 'SOMETIMES'"))))
+
+(deftest scheduler
+  (let [a (app1 "<flow name=\"a\"><scheduler disallowConcurrentExecution=\"true\"><scheduling-strategy><fixed-frequency frequency=\"2\" timeUnit=\"SECONDS\" startDelay=\"1\"/></scheduling-strategy></scheduler><logger/></flow><flow name=\"b\"><scheduler><scheduling-strategy><cron expression=\"0 0 12 * * ?\" timeZone=\"Asia/Tokyo\"/></scheduling-strategy></scheduler></flow><flow name=\"c\"><scheduler><scheduling-strategy><fixed-frequency/></scheduling-strategy></scheduler></flow><flow name=\"d\"><scheduler><scheduling-strategy><fixed-frequency timeUnit=\"WEEKS\"/></scheduling-strategy></scheduler></flow>")]
+    (is (= (ndiag a) 1))
+    (is (match (nth (:source (flow a 0)) 0) (m/SrcScheduler f sd cr tz dc l) (and (= f 2000) (= sd 1000) (= cr "") dc) _ false))
+    (is (match (nth (:source (flow a 1)) 0) (m/SrcScheduler f sd cr tz dc l) (and (= cr "0 0 12 * * ?") (= tz "Asia/Tokyo") (not dc)) _ false))
+    (is (match (nth (:source (flow a 2)) 0) (m/SrcScheduler f sd cr tz dc l) (and (= f 60000) (= sd 0)) _ false))))
+
+(deftest connector-op-generic
+  (let [a (app1 "<flow name=\"f\"><http:request config-ref=\"R\" method=\"POST\" path=\"#['/x/' ++ vars.id]\" target=\"resp\" targetValue=\"#[payload.body]\" doc:name=\"Req\"><http:body>#[payload]</http:body><http:headers><![CDATA[#[{a: 1}]]]></http:headers><http:query-params>#[{q: 1}]</http:query-params><http:uri-params>#[{id: 1}]</http:uri-params></http:request><db:select config-ref=\"D\"><db:sql>SELECT * FROM t WHERE id = :id</db:sql><db:input-parameters><![CDATA[#[{id: vars.id}]]]></db:input-parameters></db:select><vm:publish queueName=\"q\"><vm:content><vm:item k=\"#[1]\"/><vm:item k=\"#[2]\"/><vm:other>x</vm:other></vm:content></vm:publish></flow>")]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0)
+          (m/PrConnectorOp cn op cr ps cs ex chs t tv l)
+          (and (= cn "http") (= op "request") (= cr "R") (= t "resp") (= (count tv) 1)
+               (lit? (nth (pget ps "method") 0) "POST") (expr? (nth (pget ps "path") 0) "#['/x/' ++ vars.id]")
+               (= (count (pget ps "config-ref")) 1) (= (count (pget ps "doc:name")) 0)
+               (= (count cs) 4) (= (count ex) 4)
+               (expr? (nth (pget ex "body") 0) "#[payload]") (= (count (pget ex "headers")) 1)
+               (= (count (pget ex "query-params")) 1) (= (count (pget ex "uri-params")) 1))
+          _ false))
+    (is (match (proc a 0 1)
+          (m/PrConnectorOp cn op cr ps cs ex chs t tv l)
+          (and (= cn "db") (= op "select") (= (count ex) 1) (= (count (pget ex "input-parameters")) 1) (= t "") (= (count tv) 0))
+          _ false))
+    (is (match (proc a 0 2)
+          (m/PrConnectorOp cn op cr ps cs ex chs t tv l)
+          (and (= cn "vm") (= (count ex) 2) (expr? (nth (pget ex "content/item[0]@k") 0) "#[1]") (expr? (nth (pget ex "content/item[1]@k") 0) "#[2]"))
+          _ false))))
+
+(deftest connector-source-and-configs
+  (let [a (app-bare "<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"8081\"/></http:listener-config><db:config name=\"D\"/><vm:config name=\"V\"><vm:queues><vm:queue queueName=\"q\"/></vm:queues></vm:config><flow name=\"f\"><vm:listener config-ref=\"V\" queueName=\"q\"/><logger/></flow><flow name=\"g\"><logger/><vm:listener config-ref=\"V\" queueName=\"q\"/></flow>")]
+    (is (= (ndiag a) 0))
+    (is (= (count (:configs a)) 3))
+    (is (= (:kind (nth (:configs a) 0)) "http:listener-config"))
+    (is (= (:name (nth (:configs a) 0)) "L"))
+    (is (= (count (:children (nth (:configs a) 0))) 1))
+    (is (= (:kind (nth (:configs a) 1)) "db:config"))
+    (is (match (nth (:source (flow a 0)) 0) (m/SrcConnector cn nm cr ps cs _ex sch l) (and (= cn "vm") (= nm "listener") (= cr "V")) _ false))
+    (is (= (count (:source (flow a 1))) 0))
+    (is (= (count (:procs (flow a 1))) 2))))
+
+(deftest unknown-and-structural-diags
+  (let [a (app1 "<flow name=\"f\">\n<collection-splitter/>\n</flow>\n<sub-flow name=\"s\"><scheduler><scheduling-strategy><fixed-frequency/></scheduling-strategy></scheduler></sub-flow>\n<flow name=\"f\"><logger/></flow>\n<bogus/>\n<http:listener-config name=\"s2\"/><http:request-config name=\"s2\"/>")]
+    (is (match (proc a 0 0) (m/PrUnknown n l) (and (= n "collection-splitter") (= (:line l) 3)) _ false))
+    (is (= (ndiag a) 5))
+    (is (= (diag0 a) "a.xml:3: unsupported core element <collection-splitter>"))
+    (is (str/includes? (dump/dump-app a) "duplicate flow name \"f\" (first defined at a.xml:2)"))
+    (is (str/includes? (dump/dump-app a) "duplicate global element name \"s2\""))))
+
+(deftest parse-template
+  (let [a (app-rs "<flow name=\"f\"><parse-template location=\"t.html\" target=\"out\"/><parse-template><content>A #[payload.a] B #[vars.b]</content></parse-template></flow>"
+                  (res/res-mem ["t.html"] ["<p>#[payload]</p>"]))]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0) (m/PrParseTemplate c pts t l) (and (= c "<p>#[payload]</p>") (= t "out") (= (count pts) 3)
+                                                                 (lit? (nth pts 0) "<p>") (expr? (nth pts 1) "#[payload]") (lit? (nth pts 2) "</p>")) _ false))
+    (is (match (proc a 0 1) (m/PrParseTemplate c pts t l) (= (count pts) 4) _ false))))
+
+(deftest properties-substitution
+  (let [x (str HEAD "<global-property name=\"env\" value=\"dev\"/>\n<configuration-properties file=\"${env}.yaml\"/>\n<configuration-properties file=\"common.properties\"/>\n"
+               "<http:listener-config name=\"L\"><http:listener-connection host=\"${http.host}\" port=\"${http.port}\"/></http:listener-config>\n"
+               "<flow name=\"f\"><set-payload value=\"${greeting}\"/><set-variable variableName=\"v\" value=\"#[${num} + 1]\"/>\n"
+               "<ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0\noutput application/json\n---\n{p: \"${http.port}\"}]]></ee:set-payload></ee:message></ee:transform>\n"
+               "<logger message=\"${nope}\"/>\n<logger message=\"${secure::pw}\"/></flow>\n</mule>")
+        rs (res/res-mem ["dev.yaml" "common.properties"] ["http:\n  port: 8081\nnum: 41\n" "http.port=9999\ngreeting=hello ${env}\nhttp.host=0.0.0.0"])
+        l (ld/load-texts "t" ["a.xml"] [x] rs (ld/->LoadOpts [(m/->Param "http.host" (m/->PLit "127.0.0.1"))] false (creg/hints)))
+        a (:app l)]
+    (is (= (ndiag a) 2))
+    (is (= (diag0 a) "a.xml:11: Couldn't find configuration property value for key ${nope}"))
+    (is (= (m/diag-str (nth (:diags a) 1)) "a.xml:12: Couldn't find configuration property value for key ${secure::pw}"))
+    (is (match (proc a 0 0) (m/PrSetPayload v mi e l) (lit? v "hello dev") _ false))
+    (is (match (proc a 0 1) (m/PrSetVar n v mi l) (expr? v "#[41 + 1]") _ false))
+    (is (lit? (nth (pget (:properties a) "http.port") 0) "8081"))
+    (is (lit? (nth (pget (:properties a) "http.host") 0) "127.0.0.1"))
+    (is (lit? (nth (pget (:properties a) "app.name") 0) "t"))
+    (is (let [c (nth (:children (nth (:configs a) 0)) 0)]
+          (and (= (xml/attr c "" "host" "") "127.0.0.1") (= (xml/attr c "" "port" "") "8081"))))))
+
+(deftest property-file-diags
+  (let [a (app1 "<configuration-properties file=\"missing.yaml\"/>\n<flow name=\"f\"/>")]
+    (is (= (diag0 a) "a.xml:2: configuration-properties: file not found: missing.yaml"))))
+
+(deftest multi-file-and-import
+  (let [x1 (str HEAD "<import file=\"common.xml\"/><flow name=\"a\"><flow-ref name=\"c\"/></flow>\n</mule>")
+        x2 (str HEAD "<flow name=\"b\"><logger/></flow><configuration defaultErrorHandler-ref=\"x\"/>\n</mule>")
+        rs (res/res-mem ["common.xml"] [(str HEAD "<sub-flow name=\"c\"><logger/></sub-flow><error-handler name=\"x\"/>\n</mule>")])
+        l (ld/load-texts "t" ["one.xml" "two.xml"] [x1 x2] rs (opts))
+        a (:app l)]
+    (is (= (ndiag a) 0))
+    (is (= (:files l) ["one.xml" "two.xml" "common.xml"]))
+    (is (= (count (:flows a)) 3))
+    (is (= (:file (:loc (flow a 2))) "common.xml"))
+    (is (= (:default-handler a) "x"))))
+
+(deftest bad-documents
+  (let [l (ld/load-texts "t" ["a.xml" "b.xml"] ["<mule><flow>" "<types xmlns=\"x\"/>"] (res/res-none) (opts))
+        a (:app l)]
+    (is (= (ndiag a) 2))
+    (is (str/starts-with? (diag0 a) "a.xml: XML: "))
+    (is (= (m/diag-str (nth (:diags a) 1)) "b.xml:1: not a Mule configuration: root element <types>"))))
+
+(deftest ns-names
+  (is (= (ps/ns-name "http://www.mulesoft.org/schema/mule/http") "http"))
+  (is (= (ps/ns-name "http://www.mulesoft.org/schema/mule/ee/core") "ee"))
+  (is (= (ps/ns-name "http://www.mulesoft.org/schema/mule/core") "mule"))
+  (is (= (ps/ns-name "http://www.mulesoft.org/schema/mule/apikit-soap/") "apikit-soap")))
+
+(deftest dump-masks-secrets
+  (let [a (app1 "<global-property name=\"db.password\" value=\"s3cret\"/><db:config name=\"D\" password=\"s3cret\"/><flow name=\"f\"/>")
+        d (dump/dump-app a)]
+    (is (not (str/includes? d "s3cret")))
+    (is (str/includes? d "db.password = ****"))))
+
+(deftest dump-masks-secret-values-in-processors
+  ;; 秘密のプロパティの値は、置き換えた後のプロセッサーや DW の中でも隠す (secure:: を復号した値も)
+  (let [a (app1 "<global-property name=\"api.token\" value=\"tok-12345\"/><flow name=\"f\"><set-payload value=\"${api.token}\"/><logger message=\"#['Bearer ${api.token}']\"/></flow>")
+        d (dump/dump-app a)]
+    (is (not (str/includes? d "tok-12345")))
+    (is (str/includes? d "****"))))
+
+(deftest dump-props-origin-and-masks
+  ;; 値の出どころを添える。名前が key / pass で終わるものも秘密として隠す
+  (let [a (app1 "<global-property name=\"llm.key\" value=\"sk-abc\"/><global-property name=\"db.pass\" value=\"pw1\"/><global-property name=\"x.apiKey\" value=\"k9\"/><global-property name=\"keystore.path\" value=\"ks.jks\"/><flow name=\"f\"/>")
+        d (dump/dump-props a)]
+    (is (not (str/includes? d "sk-abc")))
+    (is (not (str/includes? d "pw1")))
+    (is (not (str/includes? d "k9")))
+    (is (str/includes? d "keystore.path = \"ks.jks\"  (global-property)"))
+    (is (str/includes? d "llm.key = ****  (global-property)"))
+    (is (str/includes? d "app.name = \"t\"  (built-in)"))))
+
+(deftest logger-message-parts
+  ;; logger の message は部品 (文字列と式) に分ける。ヘッダ付きの式もそのまま 1 つのスクリプト
+  (let [a (app1 "<flow name=\"f\"><logger message=\"T: #[output application/json --- payload.a] and #[vars.x]\"/><logger message=\"bad #[import dw::core::Strings --- 1]\"/><logger message=\"\"/></flow>")]
+    (is (= (ndiag a) 0))
+    (is (match (proc a 0 0) (m/PrLogger ms lv c l) (and (= (count ms) 4) (lit? (nth ms 0) "T: ") (expr? (nth ms 1) "#[output application/json --- payload.a]") (lit? (nth ms 2) " and ")) _ false))
+    (is (match (proc a 0 1) (m/PrLogger ms lv c l) (= (count ms) 2) _ false))
+    (is (match (proc a 0 2) (m/PrLogger ms lv c l) (and (= (count ms) 1) (lit? (nth ms 0) "")) _ false))))
+
+(deftest component-locations
+  ;; Loc の path は実 Mule の component location、dsl は要素を書き戻した XML
+  (let [a (app1 "<flow name=\"f\"><logger/><try><raise-error type=\"APP:X\" description=\"d\"/><error-handler><on-error-continue><logger message=\"h\"/></on-error-continue></error-handler></try><choice><when expression=\"#[true]\"><logger/></when><otherwise><set-payload value=\"o\"/></otherwise></choice></flow>")
+        f (flow a 0)]
+    (is (= (:path (line-loc (proc a 0 0))) "f/processors/0"))
+    (is (match (proc a 0 1) (m/PrTry ps hs r ta l)
+          (and (= (:path l) "f/processors/1")
+               (= (:path (line-loc (nth ps 0))) "f/processors/1/processors/0")
+               (= (:dsl (line-loc (nth ps 0))) "<raise-error type=\"APP:X\" description=\"d\"></raise-error>")
+               (= (:path (line-loc (nth (:procs (nth hs 0)) 0))) "f/processors/1/errorHandler/0/processors/0"))
+          _ false))
+    (is (match (proc a 0 2) (m/PrChoice ws o l)
+          (and (= (:path (line-loc (nth (:procs (nth ws 0)) 0))) "f/processors/2/route/0/processors/0")
+               (= (:path (line-loc (nth o 0))) "f/processors/2/route/1/processors/0"))
+          _ false))))
+
+(deftest expr-sources
+  ;; #[...] は output 指示子の無いスクリプトとしてコンパイルし (出力形式は実行時に推論する)、
+  ;; エラーの表示のために式の本文と位置を持つ
+  (let [a (app1 "<flow name=\"f\"><set-payload value=\"#[ 1 / 0 ]\"/><choice><when expression=\"#[payload]\"><logger/></when></choice></flow>")]
+    (is (match (proc a 0 0) (m/PrSetPayload v mi e l)
+          (match v (m/PExpr t c sr) (and (= (:expr sr) "1 / 0") (= (subs (:script sr) (:off sr) (count (:script sr))) "1 / 0")
+                                         (= (:where sr) "anonymous::main") (= (eng/output-mime c) "")) _ false)
+          _ false))
+    (is (match (proc a 0 1) (m/PrChoice ws o l) (match (:cond (nth ws 0)) (m/PExpr t c sr) (and (= (:where sr) "main") (= (:uses sr) ["payload"])) _ false) _ false))))
+
+;; 実 Mule (mule-maven-plugin の検証): [brokenapp.xml:21]: 'flow-ref' is pointing to 'no-such-flow' which does not exist
+(deftest flow-ref-to-missing-flow
+  (let [a (app1 "<flow name=\"f\">\n<flow-ref name=\"no-such-flow\"/>\n<flow-ref name=\"g\"/>\n<try><flow-ref name=\"nope2\"/></try>\n<flow-ref name=\"#[vars.n]\"/>\n</flow>\n<sub-flow name=\"g\"><set-payload value=\"x\"/></sub-flow>")]
+    (is (= (ndiag a) 2))
+    (is (= (diag0 a) "a.xml:3: 'flow-ref' is pointing to 'no-such-flow' which does not exist"))
+    (is (= (m/diag-str (nth (:diags a) 1)) "a.xml:5: 'flow-ref' is pointing to 'nope2' which does not exist"))))
+
+;; DataWeave のコンパイルエラーは、スクリプトの抜粋と位置を付けて出す
+(deftest transform-compile-error-excerpt
+  (let [a (app1 "<flow name=\"f\">\n<ee:transform><ee:message><ee:set-payload><![CDATA[%dw 2.0\noutput application/json\n---\n{ a: 1 + }]]></ee:set-payload></ee:message></ee:transform>\n</flow>")
+        d (diag0 a)]
+    (is (str/starts-with? d "a.xml:3: <ee:set-payload>: DataWeave compile error: "))
+    (is (str/includes? d "\n4| { a: 1 + }\n"))
+    ;; 実 DW: "Missing addition expression." の位置は + の終わり
+    (is (str/includes? d "DataWeave compile error: Missing addition expression."))
+    (is (str/includes? d "(line: 4, column: 9)"))))
+
+(deftest connector-source-scheduling
+  (let [a (app1 "<flow name=\"f\">\n<file:listener config-ref=\"F\" directory=\"in\">\n<scheduling-strategy><fixed-frequency frequency=\"2\" timeUnit=\"SECONDS\" startDelay=\"1\"/></scheduling-strategy>\n</file:listener>\n<logger/>\n</flow>\n<flow name=\"g\">\n<file:listener config-ref=\"F\" directory=\"in\">\n<scheduling-strategy><cron expression=\"0 * * * * ?\" timeZone=\"UTC\"/></scheduling-strategy>\n</file:listener>\n<logger/>\n</flow>")]
+    (is (= (count (:diags a)) 0))
+    (is (match (nth (:source (flow a 0)) 0)
+          (m/SrcConnector cn nm cr ps cs _ex sch l) (and (= cn "file") (= nm "listener") (= (count sch) 1)
+                                                     (= (:frequency-ms (nth sch 0)) 2000) (= (:start-delay-ms (nth sch 0)) 1000))
+          _ false))
+    (is (match (nth (:source (flow a 1)) 0)
+          (m/SrcConnector cn nm cr ps cs _ex sch l) (and (= (count sch) 1) (= (:cron (nth sch 0)) "0 * * * * ?") (= (:tz (nth sch 0)) "UTC"))
+          _ false))))
+
+(deftest op-chains
+  ;; a2a:send-stream-message の on-task-status-update / on-task-artifact-update は操作の中の経路。中の式は exprs に入れず、
+  ;; flow-ref の行き先も確かめる
+  (let [a (app1 (str "<flow name=\"f\"><a2a:send-stream-message xmlns:a2a=\"http://www.mulesoft.org/schema/mule/a2a\" config-ref=\"C\">"
+                     "<a2a:stream-message>#[payload]</a2a:stream-message>"
+                     "<a2a:on-task-status-update><logger message=\"#[payload]\"/><flow-ref name=\"nope\"/></a2a:on-task-status-update>"
+                     "<a2a:on-task-artifact-update><set-payload value=\"x\"/></a2a:on-task-artifact-update>"
+                     "</a2a:send-stream-message></flow>"))
+        d (dump/dump-app a)]
+    (is (match (proc a 0 0)
+          (m/PrConnectorOp cn op cr ps cs ex chs t tv l)
+          (and (= (count chs) 2) (= (:name (nth chs 0)) "on-task-status-update") (= (count (:procs (nth chs 0))) 2)
+               (= (:name (nth chs 1)) "on-task-artifact-update") (= (count ex) 1) (= (:name (nth ex 0)) "stream-message"))
+          _ false))
+    (is (str/includes? d "chain on-task-status-update"))
+    (is (str/includes? d "'flow-ref' is pointing to 'nope' which does not exist"))))
+
+;; outputMimeType / outputEncoding (受け取った本文の DataType を付け替える。書かなければ "")
+(deftest http-listener-output-mime
+  (let [a (app1 "<flow name=\"f\"><http:listener config-ref=\"L\" path=\"/a\" outputMimeType=\"text/plain\" outputEncoding=\"ISO-8859-1\"/></flow><flow name=\"g\"><http:listener config-ref=\"L\" path=\"/b\"/></flow>")]
+    (is (= (ndiag a) 0))
+    (is (match (nth (:source (flow a 0)) 0) (m/SrcHttpListener cr pa ms s1 h1 b1 s2 h2 b2 r1 r2 sm om oe l) (and (= om "text/plain") (= oe "ISO-8859-1")) _ false))
+    (is (match (nth (:source (flow a 1)) 0) (m/SrcHttpListener cr pa ms s1 h1 b1 s2 h2 b2 r1 r2 sm om oe l) (and (= om "") (= oe "")) _ false))))
+
+;; gRPC のサーバーの 4 つのソース (unary-method、server-streaming-method、client-streaming-method、bidirectional-streaming-method)
+(deftest grpc-sources
+  (let [a (app1 (str "<flow name=\"u\"><grpc:unary-method config-ref=\"S\" methodName=\"p.S/A\"><grpc:response-unary>#[payload]</grpc:response-unary></grpc:unary-method><logger/></flow>"
+                     "<flow name=\"s\"><grpc:server-streaming-method config-ref=\"S\" methodName=\"p.S/B\"/><logger/></flow>"
+                     "<flow name=\"c\"><grpc:client-streaming-method config-ref=\"S\" methodName=\"p.S/C\"/><logger/></flow>"
+                     "<flow name=\"b\"><grpc:bidirectional-streaming-method config-ref=\"S\" methodName=\"p.S/D\"/><logger/></flow>"
+                     "<flow name=\"x\"><logger/><grpc:unary-method config-ref=\"S\" methodName=\"p.S/E\"/></flow>"))]
+    (is (match (nth (:source (flow a 0)) 0) (m/SrcConnector cn nm cr ps cs ex sch l) (and (= cn "grpc") (= nm "unary-method") (= cr "S") (= (count ex) 1)) _ false))
+    (is (= (count (:procs (flow a 0))) 1))
+    (is (match (nth (:source (flow a 1)) 0) (m/SrcConnector cn nm cr ps cs _ex sch l) (= nm "server-streaming-method") _ false))
+    (is (match (nth (:source (flow a 2)) 0) (m/SrcConnector cn nm cr ps cs _ex sch l) (= nm "client-streaming-method") _ false))
+    (is (match (nth (:source (flow a 3)) 0) (m/SrcConnector cn nm cr ps cs _ex sch l) (= nm "bidirectional-streaming-method") _ false))
+    (is (= (count (:source (flow a 4))) 0))))
+
+(defn- toy-app m/App [h: m/Hints]
+  (:app (ld/load-texts "t" ["a.xml"]
+                       [(str HEAD "<flow name=\"a\"><toy:entry xmlns:toy=\"urn:toy\" config-ref=\"C\"/><logger/></flow>"
+                             "<flow name=\"b\"><toy:wrap xmlns:toy=\"urn:toy\"><toy:on-item><logger message=\"#[payload]\"/></toy:on-item><toy:arg>#[1]</toy:arg></toy:wrap></flow>"
+                             "<flow name=\"c\"><toy:each xmlns:toy=\"urn:toy\"><toy:x v=\"#[1]\"/><toy:y v=\"#[2]\"/></toy:each></flow>"
+                             "\n</mule>")]
+                       (res/res-none) (ld/->LoadOpts [] false h))))
+
+(deftest hints-come-from-connectors
+  (let [h (m/->Hints ["urn:toy"] ["urn:toy entry"] [(m/->OpChains "urn:toy wrap" ["on-item"])] ["urn:toy each"] [] [])
+        a (toy-app h)
+        b (toy-app (m/no-hints))]
+    (is (match (nth (:source (flow a 0)) 0) (m/SrcConnector cn nm cr ps cs _ex sch l) (and (= cn "urn:toy") (= nm "entry")) _ false))
+    (is (match (proc a 1 0)
+          (m/PrConnectorOp cn op cr ps cs ex chs t tv l)
+          (and (= (count chs) 1) (= (:name (nth chs 0)) "on-item") (= (count ex) 1) (= (:name (nth ex 0)) "arg"))
+          _ false))
+    (is (match (proc a 2 0)
+          (m/PrConnectorOp cn op cr ps cs ex chs t tv l) (and (= (count chs) 2) (= (:name (nth chs 0)) "0") (= (:name (nth chs 1)) "1"))
+          _ false))
+    (is (= (count (:source (flow b 0))) 0))
+    (is (match (proc b 1 0) (m/PrConnectorOp cn op cr ps cs ex chs t tv l) (= (count chs) 0) _ false))
+    (is (match (proc b 2 0) (m/PrConnectorOp cn op cr ps cs ex chs t tv l) (= (count chs) 0) _ false))))
+
+(defn- poll-app m/App [raw: Vec(Str)]
+  (:app (ld/load-texts "t" ["a.xml"]
+                       [(str HEAD "<flow name=\"a\"><toy:poll xmlns:toy=\"urn:toy\" config-ref=\"C\" by=\"#[item.ts]\"><toy:q v=\"#[watermark]\"/></toy:poll><logger/></flow><toy:config xmlns:toy=\"urn:toy\" name=\"C\"/>"
+                             "\n</mule>")]
+                       (res/res-none) (ld/->LoadOpts [] false (m/->Hints ["urn:toy"] ["urn:toy poll"] [] [] raw [])))))
+
+(deftest raw-source-expressions-stay-text
+  (let [a (poll-app ["urn:toy poll"])
+        b (poll-app [])]
+    (is (= (ndiag a) 0))
+    (is (match (nth (:source (flow a 0)) 0)
+          (m/SrcConnector cn nm cr ps cs ex sch l)
+          (and (= (count ex) 0) (= (count ps) 2) (match (:v (nth ps 1)) (m/PLit x) (= x "#[item.ts]") _ false))
+          _ false))
+    (is (> (ndiag b) 0))))
+
+(deftest processors-keep-element-and-attributes
+  (let [a (app1 "<flow name=\"f\"><set-payload value=\"x\" doc:name=\"Set it\" doc:id=\"p1\"/><try><raise-error type=\"APP:X\" doc:name=\"Boom\"/></try></flow>")
+        l0 (line-loc (proc a 0 0))
+        inner (match (proc a 0 1) (m/PrTry ps hs r ta l) (line-loc (nth ps 0)) _ (m/->Loc "" -1 "" "" "" []))
+        outer (line-loc (proc a 0 1))]
+    (is (= (:elem l0) "mule:set-payload"))
+    (is (= (:attrs l0) ["value" "x" "doc:name" "Set it" "doc:id" "p1"]))
+    (is (= (:elem inner) "mule:raise-error"))
+    (is (= (:attrs inner) ["type" "APP:X" "doc:name" "Boom"]))
+    (is (= (:elem outer) "mule:try"))
+    (is (= (count (:attrs outer)) 0))))
+
+(deftest munit-suite-is-parsed
+  (let [a (app1 (str "<munit:config xmlns:munit=\"http://www.mulesoft.org/schema/mule/munit\" name=\"s.xml\"/>"
+                     "<munit:before-test xmlns:munit=\"http://www.mulesoft.org/schema/mule/munit\" name=\"bt\"><logger/></munit:before-test>"
+                     "<munit:test xmlns:munit=\"http://www.mulesoft.org/schema/mule/munit\" name=\"t1\" expectedErrorType=\"APP:X\" ignore=\"#[false]\">"
+                     "<munit:behavior><logger/></munit:behavior>"
+                     "<munit:execution><flow-ref name=\"f\"/><set-payload value=\"x\"/></munit:execution>"
+                     "<munit:validation><logger/></munit:validation>"
+                     "<munit:enable-flow-sources><munit:enable-flow-source value=\"f\"/></munit:enable-flow-sources>"
+                     "</munit:test>"
+                     "<flow name=\"f\"><logger/></flow>"))
+        s (nth (:suites a) 0)
+        t (nth (:tests s) 0)]
+    (is (= (ndiag a) 0))
+    (is (= (count (:suites a)) 1))
+    (is (= (:name s) "s.xml"))
+    (is (= (:file s) "a.xml"))
+    (is (= (count (:before-test s)) 1))
+    (is (= (:name t) "t1"))
+    (is (= (:expected-type t) "APP:X"))
+    (is (= (count (:ignore t)) 1))
+    (is (= (count (:behavior t)) 1))
+    (is (= (count (:execution t)) 2))
+    (is (= (count (:validation t)) 1))
+    (is (= (:sources t) ["f"]))
+    (is (= (count (:flows a)) 1))))
+
+;; 実 Mule 4.11.3 のデプロイ: [a.xml:8]: Referenced component 'Missing_Cfg' must be one of stereotypes [HTTP:REQUEST_CONFIG].
+(deftest config-ref-to-missing-config
+  (let [a (app-bare (str "<http:listener-config name=\"L\"><http:listener-connection host=\"0.0.0.0\" port=\"8081\"/></http:listener-config>\n"
+                     "<db:config name=\"D\"><db:generic-connection url=\"jdbc:sqlite::memory:\"/></db:config>\n"
+                     "<flow name=\"f\">\n<http:listener config-ref=\"L\" path=\"/a\"/>\n"
+                     "<http:request config-ref=\"Missing_Cfg\" method=\"GET\" path=\"/x\"/>\n"
+                     "<http:request config-ref=\"L\" method=\"GET\" path=\"/x\"/>\n"
+                     "<db:select config-ref=\"Database_Cfg\"><db:sql>select 1</db:sql></db:select>\n"
+                     "<db:select config-ref=\"D\"><db:sql>select 1</db:sql></db:select>\n"
+                     "</flow>\n<flow name=\"g\"><http:listener config-ref=\"Nope\" path=\"/b\"/><logger/></flow>"))
+        ds (mapv (fn Str [d: m/Diag] (m/diag-str d)) (:diags a))]
+    (is (= (str/join "\n" ds)
+           (str/join "\n" ["a.xml:6: Referenced component 'Missing_Cfg' must be one of stereotypes [HTTP:REQUEST_CONFIG]."
+                           "a.xml:7: Referenced component 'L' must be one of stereotypes [HTTP:REQUEST_CONFIG]."
+                           "a.xml:8: Referenced component 'Database_Cfg' must be one of stereotypes [DB:CONFIG]."
+                           "a.xml:11: Referenced component 'Nope' must be one of stereotypes [HTTP:LISTENER_CONFIG]."])))))
+
+;; 実 Mule 4.11.3 (mule-maven-plugin の XSD の検証): lineNumber: 8; columnNumber: 41; cvc-enumeration-valid: Value 'DEBUGG' is not facet-valid ..
+(deftest enum-attribute-out-of-range
+  (let [a (app-bare "<flow name=\"f\">\n<logger level=\"DEBUGG\" message=\"x\"/>\n<logger level=\"WARN\"/>\n<logger level=\"warn\"/>\n</flow>\n<flow name=\"s\"><scheduler><scheduling-strategy><fixed-frequency frequency=\"1\" timeUnit=\"SECS\"/></scheduling-strategy></scheduler><logger/></flow>")
+        ds (mapv (fn Str [d: m/Diag] (m/diag-str d)) (:diags a))]
+    (is (= (str/join "\n" ds)
+           (str/join "\n" ["a.xml:3: cvc-enumeration-valid: Value 'DEBUGG' is not facet-valid with respect to enumeration '[ERROR, WARN, INFO, DEBUG, TRACE]'. It must be a value from the enumeration."
+                           "a.xml:5: cvc-enumeration-valid: Value 'warn' is not facet-valid with respect to enumeration '[ERROR, WARN, INFO, DEBUG, TRACE]'. It must be a value from the enumeration."
+                           "a.xml:7: cvc-enumeration-valid: Value 'SECS' is not facet-valid with respect to enumeration '[NANOSECONDS, MICROSECONDS, MILLISECONDS, SECONDS, MINUTES, HOURS, DAYS]'. It must be a value from the enumeration."])))))
+
+;; 実 Mule 4.11.3 (mule-maven-plugin の XSD の検証): cvc-complex-type.2.4.b: The content of element 'when' is not complete. ..
+(def CORE-A "One of '{\"http://www.mulesoft.org/schema/mule/core\":annotations, \"http://www.mulesoft.org/schema/mule/core\":abstract-message-processor, \"http://www.mulesoft.org/schema/mule/core\":abstract-mixed-content-message-processor}' is expected.")
+(def CORE-B "One of '{\"http://www.mulesoft.org/schema/mule/core\":annotations, \"http://www.mulesoft.org/schema/mule/core\":description, \"http://www.mulesoft.org/schema/mule/core\":abstract-message-processor, \"http://www.mulesoft.org/schema/mule/core\":abstract-mixed-content-message-processor}' is expected.")
+(def CORE-F "One of '{\"http://www.mulesoft.org/schema/mule/core\":annotations, \"http://www.mulesoft.org/schema/mule/core\":description, \"http://www.mulesoft.org/schema/mule/core\":abstract-message-source, \"http://www.mulesoft.org/schema/mule/core\":abstract-message-processor, \"http://www.mulesoft.org/schema/mule/core\":abstract-mixed-content-message-processor}' is expected.")
+
+(defn- incomplete Str [line: Int el: Str set: &Str] (str "a.xml:" line ": cvc-complex-type.2.4.b: The content of element '" el "' is not complete. " set))
+
+(deftest empty-scopes-are-incomplete
+  (let [a (app-bare (str "<flow name=\"f\">\n<choice><when expression=\"#[true]\"></when><otherwise><logger/></otherwise></choice>\n"
+                         "<try>\n<error-handler><on-error-continue/></error-handler></try>\n"
+                         "<foreach><doc:description>x</doc:description></foreach>\n"
+                         "<scatter-gather><route/><route><logger/></route></scatter-gather>\n"
+                         "<until-successful><logger/></until-successful>\n</flow>\n"
+                         "<sub-flow name=\"s\"/>\n<flow name=\"g\"></flow>\n<flow name=\"h\"><scheduler><scheduling-strategy><fixed-frequency/></scheduling-strategy></scheduler></flow>"))
+        ds (mapv (fn Str [d: m/Diag] (m/diag-str d)) (:diags a))]
+    (is (= (str/join "\n" ds)
+           (str/join "\n" [(incomplete 3 "when" CORE-A)
+                           (str "a.xml:5: cvc-complex-type.2.4.a: Invalid content was found starting with element '{\"http://www.mulesoft.org/schema/mule/core\":error-handler}'. " CORE-A)
+                           (incomplete 6 "foreach" CORE-A) (incomplete 7 "route" CORE-B) (incomplete 10 "sub-flow" CORE-B) (incomplete 11 "flow" CORE-F)])))))
+
+(deftest empty-scope-diags-carry-the-path
+  (let [a (app-bare "<flow name=\"f\">\n<logger/>\n<choice><when expression=\"#[true]\"/><otherwise><logger/></otherwise></choice>\n</flow>\n<sub-flow name=\"s\"/>")
+        ps (mapv (fn Str [d: m/Diag] (:path d)) (:diags a))]
+    (is (= ps ["f/processors/1/route/0" "s"]))))
+
+;; 実 Mule 4.11.3 (mule-maven-plugin): [a.xml:10]: Could not find error 'APP:NEVER'
+(deftest unknown-error-types
+  (let [a (app-bare (str "<flow name=\"f\">\n<logger/>\n<raise-error type=\"APP:BOOM\"/>\n<error-handler>\n"
+                         "<on-error-continue type=\"APP:BOOM, APP:NEVER\"><logger/></on-error-continue>\n"
+                         "<on-error-continue type=\"NOPE\"><logger/></on-error-continue>\n"
+                         "<on-error-continue type=\"MULE:EXPRESSION, ANY, CONNECTIVITY, HTTP:NOPE, MUNIT-TOOLS:X\"><logger/></on-error-continue>\n"
+                         "<on-error-propagate type=\"OTHER:MAPPED\"><logger/></on-error-propagate>\n"
+                         "</error-handler>\n</flow>\n"
+                         "<flow name=\"g\"><http:request config-ref=\"R\" path=\"/\"><error-mapping sourceType=\"HTTP:NOT_FOUND\" targetType=\"OTHER:MAPPED\"/></http:request></flow>"))
+        ds (filterv (fn Bool [d: m/Diag] (str/includes? (:msg d) "Could not find")) (:diags a))]
+    (is (= (mapv (fn Str [d: m/Diag] (m/diag-str d)) ds) ["a.xml:6: Could not find error 'APP:NEVER'" "a.xml:7: Could not find error 'NOPE'"]))
+    (is (= (:path (nth ds 0)) "f/errorHandler/0"))))
+
+;; 実 Mule 4.11.3 (DB コネクタ 1.16.4 の XSD): postgres-connection は無い
+(deftest db-config-unknown-connection
+  (let [a (app-bare (str "<db:config name=\"pg\">\n<db:postgres-connection host=\"h\"/>\n</db:config>\n"
+                         "<db:config name=\"g\"><db:generic-connection url=\"jdbc:postgresql://h/d\"/></db:config>\n"
+                         "<db:config name=\"o\"><db:oracle-connection host=\"h\"/></db:config>\n<flow name=\"f\"><logger/></flow>"))
+        ds (mapv (fn Str [d: m/Diag] (m/diag-str d)) (:diags a))]
+    (is (= ds [(str "a.xml:3: cvc-complex-type.2.4.a: Invalid content was found starting with element '{\"http://www.mulesoft.org/schema/mule/db\":postgres-connection}'. "
+                    "One of '{\"http://www.mulesoft.org/schema/mule/core\":annotations, \"http://www.mulesoft.org/schema/mule/core\":abstractConnectionProvider, \"http://www.mulesoft.org/schema/mule/core\":expiration-policy}' is expected.")]))))
+
+;; 実 Mule 4.11.3 (mule-maven-plugin の XSD の検証): lineNumber: 9; columnNumber: 57; cvc-complex-type.4: Attribute 'outboundHeadersMapName' must appear on element 'apikit:config'.
+(deftest apikit-config-needs-the-variable-names
+  (let [a (app-bare (str "<apikit:config xmlns:apikit=\"http://www.mulesoft.org/schema/mule/mule-apikit\" name=\"c\" api=\"api/a.yaml\"/>\n"
+                         "<apikit:config xmlns:apikit=\"http://www.mulesoft.org/schema/mule/mule-apikit\" name=\"d\" api=\"api/a.yaml\" httpStatusVarName=\"s\"/>\n"
+                         "<apikit:config xmlns:apikit=\"http://www.mulesoft.org/schema/mule/mule-apikit\" name=\"e\" api=\"api/a.yaml\" outboundHeadersMapName=\"h\" httpStatusVarName=\"s\"/>"))
+        ds (mapv (fn Str [d: m/Diag] (m/diag-str d)) (:diags a))]
+    (is (= (str/join "\n" ds)
+           (str/join "\n" ["a.xml:2: cvc-complex-type.4: Attribute 'outboundHeadersMapName' must appear on element 'apikit:config'."
+                           "a.xml:2: cvc-complex-type.4: Attribute 'httpStatusVarName' must appear on element 'apikit:config'."
+                           "a.xml:3: cvc-complex-type.4: Attribute 'outboundHeadersMapName' must appear on element 'apikit:config'."])))))

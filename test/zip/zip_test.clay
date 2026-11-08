@@ -1,0 +1,67 @@
+(ns zip-test (:require [mulay.lib.zip :as zip] [mulay.lib.inflate :as inflate] [clay.string :as str] [clay.io :as io]))
+
+(defn- env Str [k: Str] (getenv k ""))
+(defn- exchange-dir Str [] (match (getenv "MULAY_EXCHANGE_EXAMPLES") (Some v) v (None) (str (env "HOME") "/mule-work/dist/exchange-examples")))
+(defn- jar-files Vec(Str) []
+  (let [dir (exchange-dir)
+        [fs err] (io/list-dir dir)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count fs)) acc
+        (recur (+ i 1) (if (str/ends-with? (nth fs i) ".jar") (conj acc (str dir "/" (nth fs i))) acc))))))
+;; every exchange example JAR opens, and every entry up to 1 MiB (the application's
+;; own files; the big ones are bundled library JARs) inflates with a matching CRC-32.
+;; Split in two so the halves run in parallel under ASan.
+(defn- check-jars Bool [lo: Int hi: Int]
+  (let [fs (jar-files)]
+    (loop [i lo ok true]
+      (if (or (>= i hi) (>= i (count fs))) ok
+        (let [[d rerr] (read-file (nth fs i))
+              [es err] (zip/entries d)
+              bad (loop [k 0 bad ""]
+                    (if (>= k (count es)) bad
+                      (let [e (nth es k)]
+                        (if (> (:usize e) 1048576) (recur (+ k 1) bad)
+                          (let [[out e2] (zip/read-entry d e)] (recur (+ k 1) (if (= e2 "") bad e2)))))))]
+          (if (and (= rerr "") (= err "") (= bad "") (> (count es) 0)) (recur (+ i 1) ok)
+            (do (println (str "FAILED " (nth fs i) ": " rerr err bad)) (recur (+ i 1) false))))))))
+(deftest exchange-jars-a (is (let [n (count (jar-files))] (or (= n 0) (= n 18)))) (is (check-jars 0 9)))
+(deftest exchange-jars-b (is (check-jars 9 18)))
+;; one large entry (a bundled library JAR, several MiB) end to end
+(deftest exchange-jar-large-entry
+  (is (or (= (count (jar-files)) 0) (let [[d rerr] (read-file (str (exchange-dir) "/content-based-routing-2.1.4.jar"))
+            [es err] (zip/entries d)
+            big (loop [k 0 b 0] (if (>= k (count es)) b (recur (+ k 1) (if (> (:usize (nth es k)) (:usize (nth es b))) k b))))
+            [out e2] (zip/read-entry d (nth es big))
+            [inner e3] (zip/entries out)]
+        (and (= e2 "") (> (count out) 1000000) (= e3 "") (> (count inner) 0)))))
+  (is (or (= (count (jar-files)) 0) (let [[d rerr] (read-file (str (exchange-dir) "/content-based-routing-2.1.4.jar"))
+            [x err] (zip/extract d "content-based-routing.xml")]
+        (and (= err "") (str/includes? x "<mule"))))))
+(deftest write-read
+  (is (let [big (loop [i 0 s ""] (if (>= i 5000) s (recur (+ i 1) (str s "row " i ",value\n"))))
+            [z err] (zip/write [(zip/zip-in "dir/" "") (zip/zip-in "dir/a.txt" big) (zip/zip-in "b.bin" (str (chr 0) (chr 255) (chr 7)))
+                                (zip/->ZipIn "stored.txt" "keep me raw" false)])
+            [es e2] (zip/entries z)
+            [a e3] (zip/extract z "dir/a.txt")
+            [b e4] (zip/extract z "b.bin")
+            [s e5] (zip/extract z "stored.txt")]
+        (and (= err "") (= e2 "") (= e3 "") (= e4 "") (= e5 "")
+             (= (count es) 4) (:dir (nth es 0)) (= a big) (= b (str (chr 0) (chr 255) (chr 7))) (= s "keep me raw")
+             (= (:method (nth es 1)) 8) (= (:method (nth es 3)) 0) (< (count z) (count big))))))
+(defn- hv Int [c: Int] (if (<= c 57) (- c 48) (+ 10 (- c 97))))
+(defn- unhex Str [h: &Str]
+  (loop [i 0 out ""] (if (>= (+ i 1) (count h)) out (recur (+ i 2) (str out (chr (+ (* 16 (hv (nth h i))) (hv (nth h (+ i 1))))))))))
+;; written by Python's zipfile with force_zip64=True
+(deftest zip64-read
+  (is (let [d (unhex "504b03042d000000080000002100e5f6fe4fffffffffffffffff090014006269672f612e7478740100100058020000000000001500000000000000cb48cdc9c957a8ca2c303351c818658fb2a9c40600504b03041400000008008d133c5d738c0529050100000001000005000000622e62696e010001fffe000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff504b01022d032d000000080000002100e5f6fe4f15000000580200000900000000000000000000008001000000006269672f612e747874504b010214031400000008008d133c5d738c05290501000000010000050000000000000000000000800150000000622e62696e504b050600000000020002006a000000780100000000")
+            [es err] (zip/entries d)
+            [a e2] (zip/extract d "big/a.txt")
+            [b e3] (zip/extract d "b.bin")]
+        (and (= err "") (= (count es) 2) (= e2 "") (= e3 "") (= (count a) 600) (str/starts-with? a "hello zip64 ") (= (count b) 256)))))
+(deftest corrupt-zip
+  (is (let [[es err] (zip/entries "not a zip")] (= err "not a ZIP archive (no end of central directory)")))
+  (is (let [[z err] (zip/write [(zip/zip-in "a.txt" "hello hello hello hello")])
+            ;; flip a byte inside the compressed data
+            bad (str (subs z 0 40) (chr (bit-xor (nth z 40) 1)) (subs z 41 (count z)))
+            [out e2] (zip/extract bad "a.txt")]
+        (not (= e2 "")))))

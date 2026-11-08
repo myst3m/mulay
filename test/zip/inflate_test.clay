@@ -1,0 +1,24 @@
+(ns inflate-test (:require [mulay.lib.inflate :as z] [clay.string :as str] [clay.io :as io]))
+(deftest crc
+  (is (= (z/crc32 "") 0))
+  (is (= (z/crc32 "123456789") 3421780262))
+  (is (= (z/crc32 "The quick brown fox jumps over the lazy dog") 1095738169)))
+(defn text Str [n: Int] (loop [i 0 s ""] (if (>= i n) s (recur (+ i 1) (str s "line " (mod (* i 7) 13) " of the test corpus, hello hello\n")))))
+(deftest roundtrip
+  (is (let [d (text 2000) c (z/deflate d) [o e err] (z/inflate c 0)] (and (= err "") (= o d) (= e (count c)) (< (count c) (/ (count d) 4)))))
+  (is (let [d "" c (z/deflate d) [o e err] (z/inflate c 0)] (and (= err "") (= o ""))))
+  (is (let [d "a" c (z/deflate d) [o e err] (z/inflate c 0)] (and (= err "") (= o "a"))))
+  (is (let [d (loop [i 0 s ""] (if (>= i 70000) s (recur (+ i 1) (str s (chr (bit-and (* i 2654435761) 255))))))
+            c (z/deflate d) [o e err] (z/inflate c 0)] (and (= err "") (= o d))))
+  (is (let [d (loop [i 0 s ""] (if (>= i 100000) s (recur (+ i 1) (str s "a"))))
+            c (z/deflate-stored d) [o e err] (z/inflate c 0)] (and (= err "") (= o d) (= e (count c))))))
+(deftest gzip-rt
+  (is (let [d (text 300) [o err] (z/gunzip (z/gzip d))] (and (= err "") (= o d))))
+  (is (let [g (z/gzip "abc") bad (str (subs g 0 (- (count g) 8)) (chr 0) (subs g (- (count g) 7) (count g)))
+            [o err] (z/gunzip bad)] (= err "gzip CRC mismatch"))))
+(deftest bomb-limit
+  (is (let [d (loop [i 0 s ""] (if (>= i 200000) s (recur (+ i 1) (str s "z"))))
+            [o e err] (z/inflate-limit (z/deflate d) 0 1000)] (= err "decompressed size exceeds the limit"))))
+(deftest corrupt
+  (is (let [[o e err] (z/inflate (str (chr 7)) 0)] (= err "invalid block type")))
+  (is (let [[o e err] (z/inflate "" 0)] (not (= err "")))))

@@ -1,0 +1,136 @@
+(ns jsonschema-test (:require [mulay.lib.jsonschema :as js] [mulay.lib.yaml :as y] [clay.string :as str]))
+
+;; 期待値は実 Mule 4.11.3 + APIkit 1.12.6 の記録 (test/fixtures/apps/apikit-oas)
+
+(def ROOT "components:
+  schemas:
+    Dims:
+      type: object
+      required: [w]
+      properties:
+        w: {type: number}
+        h: {type: number}
+")
+
+(def ITEM "type: object
+required: [name, price]
+properties:
+  name: {type: string, minLength: 1}
+  price: {type: number}
+  qty: {type: integer, minimum: 0}
+  tags: {type: array, maxItems: 2, items: {type: string}}
+  dims: {$ref: '#/components/schemas/Dims'}
+")
+
+(def PROBE "type: object
+properties:
+  d: {type: string, format: date}
+  dt: {type: string, format: date-time}
+  u: {type: string, format: uri}
+  id: {type: string, format: uuid}
+  ip: {type: string, format: ipv4}
+  m: {type: number, multipleOf: 0.5}
+  big: {type: integer}
+  uniq: {type: array, uniqueItems: true, items: {type: integer}}
+  few: {type: array, minItems: 2, items: {type: string}}
+  small: {type: object, minProperties: 1, maxProperties: 1}
+  any: {anyOf: [{type: string, maxLength: 2}, {type: integer}]}
+  all: {allOf: [{type: string, minLength: 2}, {type: string, maxLength: 3}]}
+  notstr: {not: {type: string}}
+  color: {type: string, enum: [red, green]}
+  n: {type: integer, enum: [1, 2]}
+  maxed: {type: number, maximum: 10, exclusiveMaximum: true}
+  uni: {type: string, maxLength: 2}
+  nested: {type: array, items: {type: object, required: [k], properties: {k: {type: boolean}}}}
+")
+
+(defn- yv y/YVal [s: Str] (let [[v e] (y/parse s)] v))
+(defn- run Str [schema: Str body: Str] (str/join "\n" (js/validate (yv schema) (yv ROOT) (yv body))))
+
+(deftest item-schema
+  (is (= (run ITEM "{\"name\": \"pen\", \"price\": 1.5, \"qty\": 3, \"tags\": [\"a\"], \"dims\": {\"w\": 1}}") ""))
+  (is (= (run ITEM "{\"name\": \"pen\"}") "required key [price] not found"))
+  (is (= (run ITEM "{\"name\": \"\", \"price\": 1}") "/name expected minLength: 1, actual: 0"))
+  (is (= (run ITEM "{\"name\": \"pen\", \"price\": \"x\"}") "/price expected type: Number, found: String"))
+  (is (= (run ITEM "{\"name\": \"pen\", \"price\": 1, \"qty\": -1}") "/qty -1 is not greater or equal to 0"))
+  (is (= (run ITEM "{\"name\": \"pen\", \"price\": 1, \"qty\": 1.5}") "/qty expected type: Integer, found: Double"))
+  (is (= (run ITEM "{\"name\": \"pen\", \"price\": 1, \"tags\": [\"a\", \"b\", \"c\"]}") "/tags expected maximum item count: 2, found: 3"))
+  (is (= (run ITEM "{\"name\": \"pen\", \"price\": 1, \"tags\": [1]}") "/tags/0 expected type: String, found: Integer"))
+  (is (= (run ITEM "{\"name\": \"pen\", \"price\": 1, \"dims\": {}}") "/dims required key [w] not found"))
+  (is (= (run ITEM "{\"name\": \"pen\", \"price\": 1, \"dims\": {\"w\": \"wide\"}}") "/dims/w expected type: Number, found: String"))
+  (is (= (run ITEM "{\"name\": 1, \"price\": \"x\"}") "/name expected type: String, found: Integer\n/price expected type: Number, found: String"))
+  (is (= (run ITEM "[1, 2]") "expected type: JSONObject, found: JSONArray"))
+  (is (= (run ITEM "") "expected type: JSONObject, found: Null")))
+
+(deftest formats-and-numbers
+  (is (= (run PROBE "{\"d\": \"2024-02-30\"}") "/d [2024-02-30] is not a valid date. Expected [yyyy-MM-dd]"))
+  (is (= (run PROBE "{\"d\": \"2024-01-05\", \"dt\": \"2024-01-05T10:00:00Z\", \"u\": \"http://x.y/z\", \"id\": \"123\"}") ""))
+  (is (= (run PROBE "{\"dt\": \"2024-01-05 10:00\"}") "/dt [2024-01-05 10:00] is not a valid date-time. Expected [yyyy-MM-dd'T'HH:mm:ssZ, yyyy-MM-dd'T'HH:mm:ss.[0-9]{1,9}Z, yyyy-MM-dd'T'HH:mm:ss[+-]HH:mm, yyyy-MM-dd'T'HH:mm:ss.[0-9]{1,9}[+-]HH:mm]"))
+  (is (= (run PROBE "{\"u\": \"not a uri\"}") "/u [not a uri] is not a valid URI"))
+  (is (= (run PROBE "{\"ip\": \"300.1.1.1\"}") "/ip [300.1.1.1] is not a valid ipv4 address"))
+  (is (= (run PROBE "{\"m\": 1.25}") "/m 1.25 is not a multiple of 0.5"))
+  ;; 余りを求めると桁を展開しすぎる数は通さない (以前は余りの失敗を「倍数」として通した)
+  (is (= (run PROBE "{\"m\": 1e-20000000}") "/m 1e-20000000 is not a multiple of 0.5"))
+  (is (= (run PROBE "{\"m\": 2, \"big\": 3000000000}") ""))
+  (is (= (run PROBE "{\"big\": 12345678901234567890123}") ""))
+  (is (= (run PROBE "{\"maxed\": 10}") "/maxed 10 is not less than 10"))
+  (is (= (run PROBE "{\"maxed\": 11.5}") "/maxed 11.5 is not less than 10"))
+  (is (= (run PROBE "{\"uni\": \"日本語\"}") "/uni expected maxLength: 2, actual: 3"))
+  (is (= (run PROBE "{\"uni\": \"日本\"}") "")))
+
+(deftest arrays-objects-combinators
+  (is (= (run PROBE "{\"uniq\": [1, 1]}") "/uniq array items are not unique"))
+  (is (= (run PROBE "{\"few\": [\"a\"]}") "/few expected minimum item count: 2, found: 1"))
+  (is (= (run PROBE "{\"small\": {}}") "/small minimum size: [1], found: [0]"))
+  (is (= (run PROBE "{\"small\": {\"a\": 1, \"b\": 2}}") "/small maximum size: [1], found: [2]"))
+  (is (= (run PROBE "{\"any\": \"abc\"}") "/any expected type: Integer, found: String\n/any expected maxLength: 2, actual: 3"))
+  (is (= (run PROBE "{\"any\": 1.5}") "/any expected type: Integer, found: Double\n/any expected type: String, found: Double"))
+  (is (= (run PROBE "{\"all\": \"a\"}") "/all expected minLength: 2, actual: 1"))
+  (is (= (run PROBE "{\"all\": \"abcd\"}") "/all expected maxLength: 3, actual: 4"))
+  (is (= (run PROBE "{\"notstr\": \"s\"}") "/notstr subject must not be valid against schema {\"type\":\"string\"}"))
+  (is (= (run PROBE "{\"notstr\": 1}") ""))
+  (is (= (run PROBE "{\"color\": \"blue\"}") "/color blue is not a valid enum value"))
+  (is (= (run PROBE "{\"n\": 3}") "/n 3 is not a valid enum value"))
+  (is (= (run PROBE "{\"nested\": [{\"k\": true}, {}, {\"k\": 1}]}") "/nested/2/k expected type: Boolean, found: Integer\n/nested/1 required key [k] not found")))
+
+(deftest ordering
+  (is (= (run PROBE "{\"d\": 5, \"u\": 1, \"color\": \"blue\", \"n\": 3, \"few\": [\"a\"], \"m\": 1.25, \"ip\": \"x\", \"uni\": \"abc\"}")
+         "/few expected minimum item count: 2, found: 1\n/u expected type: String, found: Integer\n/uni expected maxLength: 2, actual: 3\n/n 3 is not a valid enum value\n/m 1.25 is not a multiple of 0.5\n/ip [x] is not a valid ipv4 address\n/color blue is not a valid enum value\n/d expected type: String, found: Integer"))
+  (is (= (run PROBE "{\"uni\": \"abcdef\", \"color\": \"x\", \"small\": {}, \"uniq\": [2, 2], \"maxed\": 99}")
+         "/uniq array items are not unique\n/uni expected maxLength: 2, actual: 6\n/maxed 99 is not less than 10\n/color x is not a valid enum value\n/small minimum size: [1], found: [0]"))
+  (is (= (run PROBE "{\"nested\": [{}, {}, {}, {\"k\": 1}, {\"k\": \"s\"}]}")
+         "/nested/4/k expected type: Boolean, found: String\n/nested/3/k expected type: Boolean, found: Integer\n/nested/2 required key [k] not found\n/nested/1 required key [k] not found\n/nested/0 required key [k] not found")))
+
+;; オブジェクトのキーの数の検査はキーの数に対して線形 (以前は重複を除くのが 2 乗で、APIkit に 12.5 万キーの 1MB で 27.5 秒)
+(defn- wide-obj Str [n: Int] (loop [i 0 out "{"] (if (>= i n) (str out "\"k\": 0}") (recur (+ i 1) (str out "\"k" i "\": 0, ")))))
+
+(deftest many-keys
+  (is (= (run "{type: object, maxProperties: 10}" (wide-obj 60000)) "maximum size: [10], found: [60001]")))
+
+(defn- many-items Str [n: Int item: Str]
+  (loop [i 0 out "["] (if (>= i n) (str out "]") (recur (+ i 1) (str out (if (= i 0) "" ",") item)))))
+
+;; 正規表現の手数の上限は検証 1 回の全体で 1 つ (前は文字列ごとに 1 億手から数え直し、`^(a+)+$` に 1000 個の要素で 12 分かかった)。
+;; 上限を超えたら、合わないとはせず検証の失敗にする (docs/compat/deviations.md)
+(deftest pattern-step-budget-is-shared-and-exhaustion-fails
+  (let [bad "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\""
+        r1 (run "{type: array, items: {type: string, pattern: '^(a+)+$'}}" (many-items 40 bad))
+        r2 (run "{not: {type: string, pattern: '^(a+)+$'}}" bad)]
+    (is (>= (str/index-of r1 "regex step limit exceeded") 0))
+    (is (>= (str/index-of r2 "regex step limit exceeded") 0))))
+
+(deftest unique-items-compares-numbers-and-objects-by-value
+  (is (= (run "{type: array, uniqueItems: true}" "[1, 1.0]") "array items are not unique"))
+  (is (= (run "{type: array, uniqueItems: true}" "[100, 1e2]") "array items are not unique"))
+  (is (= (run "{type: array, uniqueItems: true}" "[{\"a\": 1, \"b\": [2]}, {\"b\": [2.0], \"a\": 1}]") "array items are not unique"))
+  (is (= (run "{type: array, uniqueItems: true}" "[1, \"1\", [1], {\"a\": 1}, {\"a\": \"1\"}, 0, 0.5, null, true]") ""))
+  (is (= (run "{type: array, uniqueItems: true}" (str "[" (loop [i 0 o ""] (if (>= i 40000) o (recur (+ i 1) (str o (if (= i 0) "" ",") i)))) "]")) "")))
+
+;; 配列の添字に数字でないもの・桁のあふれるものを書いた $ref は、見つからないとする (前は -1 で nth してプロセスごと落ちた)
+(deftest ref-with-bad-array-index-is-not-found
+  (let [[r1 f1] (js/deref-ptr (yv "{allOf: [{type: string}]}") "#/allOf/-1")
+        [r2 f2] (js/deref-ptr (yv "{allOf: [{type: string}]}") "#/allOf/99999999999999999999")
+        [r3 f3] (js/deref-ptr (yv "{allOf: [{type: string}]}") "#/allOf/0")]
+    (is (not f1))
+    (is (not f2))
+    (is f3)))

@@ -1,0 +1,82 @@
+(ns golden-amount-test
+  (:require [mulay.lib.numparse :as npz] [golden-amount-data :as g]
+            [mulay.lib.time.types :as t]
+            [mulay.lib.time.amount :as am]
+            [mulay.lib.time.local :as l]
+            [mulay.lib.time.zoned :as zd]
+            [mulay.lib.time.iso :as iso]
+            [mulay.lib.time.tz :as tz]
+            [clay.string :as str]))
+
+;; Period / Duration / 月末加算 / between の golden (tools/gen-time-golden.java)。
+
+(defn- date t/LocalDate [s: &Str] (let [[d e] (iso/parse-date s)] d))
+(defn- ldt t/LocalDateTime [s: &Str] (let [[x e] (iso/parse-ldt s)] x))
+(defn- num Int [s: &Str] (npz/int-or s 0))
+(defn- ok-or Str [v: Str e: &Str] (if (= e "") v "ERR"))
+(defn- r2 Str [r: &Str] r)
+
+(defn- check-line Str [f: &Vec(Str)]
+  (let [k: Str (nth f 0)]
+    (case k
+      "pparse" (let [[p e] (am/parse-period (nth f 1))] (str/join "\t" [k (nth f 1) (ok-or (am/period-str p) e)]))
+      "dparse" (let [[d e] (am/parse-duration (nth f 1))] (str/join "\t" [k (nth f 1) (ok-or (am/duration-str d) e)]))
+      "dstr" (let [d (am/duration (num (nth f 1)) (num (nth f 2)))]
+               (str/join "\t" [k (nth f 1) (nth f 2) (am/duration-str d) (str (:seconds d)) (str (:nanos d))]))
+      "dplus" (let [b (date (nth f 1))
+                    [p pe] (am/parse-period (nth f 2))
+                    [x1 e1] (l/date-plus-period b p)
+                    [x2 e2] (l/date-minus-period b p)]
+                (str/join "\t" [k (nth f 1) (nth f 2) (ok-or (iso/date-str x1) e1) (ok-or (iso/date-str x2) e2)]))
+      "between" (let [a (date (nth f 1)) b (date (nth f 2))
+                      u (fn Str [unit: Str] (let [[v e] (l/date-until a b unit)] (ok-or (str v) e)))]
+                  (str/join "\t" [k (nth f 1) (nth f 2) (am/period-str (l/period-between a b))
+                                  (u "DAYS") (u "WEEKS") (u "MONTHS") (u "YEARS") (u "DECADES")]))
+      "ldtbetween" (let [a (ldt (nth f 1)) b (ldt (nth f 2))
+                         u (fn Str [unit: Str] (let [[v e] (l/ldt-until a b unit)] (ok-or (str v) e)))]
+                     (str/join "\t" [k (nth f 1) (nth f 2) (am/duration-str (l/duration-between-ldts a b))
+                                     (u "HOURS") (u "MILLIS") (u "DAYS") (u "MONTHS")]))
+      "ldtplus" (let [a (ldt (nth f 1))
+                      [d de] (am/parse-duration (nth f 2))
+                      [x1 e1] (l/ldt-plus-duration a d)
+                      [x2 e2] (l/ldt-minus-duration a d)]
+                  (str/join "\t" [k (nth f 1) (nth f 2) (ok-or (iso/ldt-str x1) e1) (ok-or (iso/ldt-str x2) e2)
+                                  (iso/time-str (l/time-plus-duration (:time a) d))
+                                  (iso/time-str (l/time-minus-duration (:time a) d))]))
+      "tstr" (let [[tm e] (l/of-time (num (nth f 1)) (num (nth f 2)) (num (nth f 3)) (num (nth f 4)))]
+               (str/join "\t" [k (nth f 1) (nth f 2) (nth f 3) (nth f 4) (iso/time-str tm)]))
+      "datestr" (let [[d e] (l/of-date (num (nth f 1)) (num (nth f 2)) (num (nth f 3)))]
+                  (str/join "\t" [k (nth f 1) (nth f 2) (nth f 3) (iso/date-str d)]))
+      "instant" (let [i (zd/instant (num (nth f 1)) (num (nth f 2)))
+                      [em ee] (zd/instant-epoch-milli i)]
+                  (str/join "\t" [k (nth f 1) (nth f 2) (iso/instant-str i) (ok-or (str em) ee)]))
+      "zoneid" (let [id: Str (nth f 1)
+                     [z e] (tz/zone-of-id id)
+                     [o oe] (tz/offset-of-id id)]
+                 (str/join "\t" [k id (if (= e "") (str (t/zone-id z) "|" (match z (t/TzOffset x) "ZoneOffset" (t/TzRegion r) "ZoneRegion")) (str "ERR:" e))
+                                 (if (= oe "") (str o) (str "ERR:" oe))]))
+      "ot" (let [[a e1] (iso/parse-ot (nth f 1)) [b e2] (iso/parse-ot (nth f 2))
+                 [mins me] (zd/ot-until a b "MINUTES")]
+             (str/join "\t" [k (nth f 1) (nth f 2) (iso/ot-str (zd/ot-plus-duration a (am/duration-of-hours 5)))
+                             (iso/ot-str (zd/ot-minus-duration a (am/duration-of-minutes 90)))
+                             (iso/ot-str (zd/ot-with-offset-same-instant a (:offset b)))
+                             (str (zd/ot-compare a b)) (am/duration-str (zd/duration-between-ots a b)) (str mins)]))
+      "zuntil" (let [[a e1] (iso/parse-zdt (nth f 1)) [b e2] (iso/parse-zdt (nth f 2))
+                     u (fn Str [unit: Str] (let [[v e] (zd/zdt-until a b unit)] (ok-or (str v) e)))]
+                 (str/join "\t" [k (nth f 1) (nth f 2) (u "HOURS") (u "DAYS") (u "MONTHS") (am/duration-str (zd/duration-between-zdts a b))
+                                 (str (zd/zdt-compare a b)) (if (= (zd/zdt-instant-compare a b) 0) "true" "false")]))
+      (str "unknown kind " k))))
+
+(defn- run Int []
+  (let [cs (g/cases)]
+    (loop [i 0 bad 0]
+      (if (>= i (count cs)) bad
+        (let [want: Str (nth cs i)
+              got (check-line (str/split want "\t"))
+              ok (= got want)]
+          (if (not ok) (println (str "  want " want "\n  got  " got)) 0)
+          (recur (+ i 1) (if ok bad (+ bad 1))))))))
+
+(deftest golden-amounts
+  (is (> (count (g/cases)) 400))
+  (is (= (run) 0)))

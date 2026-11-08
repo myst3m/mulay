@@ -1,0 +1,39 @@
+(ns client-test (:require [mulay.conn.mcp_client :as mc] [mulay.conn.mcp :as mcp] [mulay.dw.val :as v] [mulay.dw.fmt.json :as json]))
+
+;; MCP クライアントの結果の形とエラーの型。期待値は実 Mule (mcp 1.5.0) の記録 (test/fixtures/apps/mcp-client)。
+
+(defn- read-json v/Val [s: Str] (let [[x e] (json/read s)] x))
+
+(deftest json-rpc-codes-map-to-error-types
+  (is (= (mc/code-type -32700) "PARSE_ERROR"))
+  (is (= (mc/code-type -32600) "INVALID_REQUEST"))
+  (is (= (mc/code-type -32601) "METHOD_NOT_FOUND"))
+  (is (= (mc/code-type -32602) "INVALID_PARAMS"))
+  (is (= (mc/code-type -32603) "INTERNAL_ERROR"))
+  (is (= (mc/code-type -32002) "SERVER_ERROR"))
+  (is (= (mc/code-type -32000) "SERVER_ERROR"))
+  (is (= (mc/code-type 7) "JSON_RPC_ERROR")))
+
+(deftest first-object-stops-at-the-matching-brace
+  (is (= (mc/first-object "{\"k\":1} tail") "{\"k\":1}"))
+  (is (= (mc/first-object "{\"a\":{\"b\":\"}\"}} x") "{\"a\":{\"b\":\"}\"}}"))
+  (is (= (mc/first-object "{\"s\":\"\\\"}\"}") "{\"s\":\"\\\"}\"}"))
+  (is (= (mc/first-object "{bad") "{bad")))
+
+(deftest structured-needs-one-text-content-with-an-object
+  (let [one (read-json "{\"content\":[{\"type\":\"text\",\"text\":\" {\\\"k\\\":1} tail\"}]}")
+        arr (read-json "{\"content\":[{\"type\":\"text\",\"text\":\"[1,2]\"}]}")
+        bad (read-json "{\"content\":[{\"type\":\"text\",\"text\":\"{bad\"}]}")
+        two (read-json "{\"content\":[{\"type\":\"text\",\"text\":\"{}\"},{\"type\":\"text\",\"text\":\"x\"}]}")
+        img (read-json "{\"content\":[{\"type\":\"image\",\"data\":\"aGk=\",\"mimeType\":\"image/png\"}]}")]
+    (is (= (count (mc/structured one)) 1))
+    (is (= (mcp/compact (nth (mc/structured one) 0)) "{\"k\":1}"))
+    (is (= (count (mc/structured arr)) 0))
+    (is (= (count (mc/structured bad)) 0))
+    (is (= (count (mc/structured two)) 0))
+    (is (= (count (mc/structured img)) 0))))
+
+(deftest call-response-has-the-recorded-shape
+  (let [res (read-json "{\"content\":[{\"type\":\"text\",\"text\":\"3\"},{\"type\":\"image\",\"data\":\"YUdrPQ==\",\"mimeType\":\"image/png\"},{\"type\":\"resource\",\"resource\":{\"uri\":\"mule://b\",\"mimeType\":\"text/plain\",\"blob\":\"Ynl0ZXM=\"}}],\"isError\":true}")]
+    (is (= (mcp/compact (mc/call-response res))
+           "{\"error\":true,\"contents\":[{\"audience\":[],\"data\":null,\"resource\":null,\"mimeType\":null,\"priority\":null,\"type\":\"text\",\"text\":\"3\"},{\"audience\":[],\"data\":\"aGk=\",\"resource\":null,\"mimeType\":\"image/png\",\"priority\":null,\"type\":\"image\",\"text\":null},{\"audience\":[],\"data\":null,\"resource\":{\"mimeType\":\"text/plain\",\"uri\":\"mule://b\",\"blob\":\"bytes\",\"text\":null},\"mimeType\":null,\"priority\":null,\"type\":\"resource\",\"text\":null}]}"))))

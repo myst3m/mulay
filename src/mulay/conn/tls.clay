@@ -1,0 +1,139 @@
+(ns mulay.conn.tls
+  (:require [mulay.mule.model :as m] [mulay.rt.conn :as conn] [mulay.lib.xml :as xml] [mulay.lib.keystore :as ks] [clay.string :as str]))
+
+(defrecord KeyMat [key-pem: Str chain-pem: Str p12: Str p12-pw: Str key-pw: Str])
+(defrecord TrustMat [insecure: Bool ca-pem: Str p12: Str p12-pw: Str])
+(defrecord Tls [key: Vec(KeyMat) trust: Vec(TrustMat) protocols: Vec(Str) suites: Vec(Str)])
+
+(def SUITES-12 ["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"])
+(def SUITES-13 ["TLS_AES_128_GCM_SHA256" "TLS_AES_256_GCM_SHA384" "TLS_CHACHA20_POLY1305_SHA256"])
+
+(defn- csv-list Vec(Str) [s: &Str]
+  (let [parts: Vec(Str) (str/split s ",")]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count parts)) acc
+        (let [t (str/trim (nth parts i))] (recur (+ i 1) (if (= t "") acc (conj acc t))))))))
+
+(defn- has? Bool [xs: &Vec(Str) x: &Str] (loop [i 0] (if (>= i (count xs)) false (if (= (nth xs i) x) true (recur (+ i 1))))))
+
+(defn limits Values(Vec(Str) Vec(Str) Str) [protos-attr: &Str suites-attr: &Str]
+  (let [none: Vec(Str) []
+        ps (csv-list protos-attr)
+        ss (csv-list suites-attr)
+        p12 (or (= (count ps) 0) (has? ps "TLSv1.2"))
+        p13 (or (= (count ps) 0) (has? ps "TLSv1.3"))
+        [kept n12 n13] (loop [i 0 a: Vec(Str) [] n12 0 n13 0]
+                         (if (>= i (count ss)) (values a n12 n13)
+                           (let [n (nth ss i)]
+                             (cond (has? SUITES-12 n) (recur (+ i 1) (conj a n) (+ n12 1) n13)
+                                   (has? SUITES-13 n) (recur (+ i 1) (conj a n) n12 (+ n13 1))
+                                   :else (recur (+ i 1) a n12 n13)))))
+        s12 (and p12 (or (= (count ss) 0) (> n12 0)))
+        s13 (and p13 (or (= (count ss) 0) (> n13 0)))
+        protos (if (and (= (count ps) 0) (= (count ss) 0)) none
+                 (let [a: Vec(Str) (if s12 ["TLSv1.2"] [])] (if s13 (conj a "TLSv1.3") a)))
+        suites (loop [i 0 a: Vec(Str) []]
+                 (if (>= i (count kept)) a
+                   (let [n (nth kept i)]
+                     (recur (+ i 1) (if (or (and s12 (has? SUITES-12 n)) (and s13 (has? SUITES-13 n))) (conj a n) a)))))]
+    (cond
+      (and (> (count ps) 0) (not p12) (not p13))
+      (values none none (str "tls:context enabledProtocols: none of '" protos-attr "' is supported (TLSv1.2, TLSv1.3)"))
+      (and (> (count ss) 0) (= (count kept) 0))
+      (values none none (str "tls:context enabledCipherSuites: none of '" suites-attr "' is supported"))
+      (and (not s12) (not s13))
+      (values none none (str "tls:context enabledCipherSuites: no suite for the enabled protocols (" (str/join ", " ps) ")"))
+      :else (values protos suites ""))))
+
+(defn- attr Str [n: &xml/XNode k: &Str d: &Str] (xml/attr n "" k d))
+
+(defn- child-in Vec(xml/XNode) [cs: &Vec(xml/XNode) local: &Str]
+  (loop [i 0] (if (>= i (count cs)) [] (if (and (xml/elem? (nth cs i)) (= (xml/elem-local (nth cs i)) local)) [(nth cs i)] (recur (+ i 1))))))
+
+(defn- child Vec(xml/XNode) [n: &xml/XNode local: &Str] (child-in (xml/child-elems n) local))
+
+(defn- global-context Values(Vec(xml/XNode) Vec(m/Param) Bool) [cfgs: &Vec(m/Config) name: &Str]
+  (let [cs cfgs]
+    (loop [i 0]
+      (if (>= i (count cs)) (values [] [] false)
+        (let [c (nth cs i)]
+          (if (and (= (:kind c) "tls:context") (= (:name c) name))
+            (values (:children c) (:params c) true)
+            (recur (+ i 1))))))))
+
+(defn- read-res Values(Str Str) [cfgs: &Vec(m/Config) res: &Fn(Str Values(Str Bool)) path: &Str what: &Str]
+  (let [[s ok] (res path)]
+    (if ok (values s "") (values "" (str "Resource " path " could not be found")))))
+
+(defn- store-type Str [n: &xml/XNode] (str/lower-case (attr n "type" "jks")))
+
+(defn- key-mat Values(Vec(KeyMat) Str) [cfgs: &Vec(m/Config) res: &Fn(Str Values(Str Bool)) n: &xml/XNode]
+  (let [path (attr n "path" "")
+        pw (attr n "password" "")
+        kpw (attr n "keyPassword" "")
+        has-kpw (xml/has-attr? n "" "keyPassword")
+        alias (attr n "alias" "")
+        ty (store-type n)]
+    (cond
+      (= path "") (values [] "")
+      (not has-kpw) (values [] "The Key password cannot be null")
+      :else
+      (let [[bytes re] (read-res cfgs res path "key-store")]
+        (cond
+          (not= re "") (values [] re)
+          (or (= ty "pkcs12") (= ty "p12")) (values [(->KeyMat "" "" bytes pw kpw)] "")
+          (= ty "jks")
+          (let [[st e] (ks/read-jks bytes pw kpw)]
+            (if (not= e "") (values [] e)
+              (let [keys (:keys st)
+                    hit (loop [i 0] (if (>= i (count keys)) -1
+                                      (if (or (= alias "") (= (:alias (nth keys i)) alias)) i (recur (+ i 1)))))]
+                (if (< hit 0) (values [] (if (= alias "") "No key found in the key store" (str "No key entry found for alias '" alias "'")))
+                  (let [k (nth keys hit)]
+                    (values [(->KeyMat (:key-pem k) (str/join "" (:chain-pem k)) "" "" "")] ""))))))
+          :else (values [] (str "Unsupported key store type: " ty)))))))
+
+(defn- trust-mat Values(Vec(TrustMat) Str) [cfgs: &Vec(m/Config) res: &Fn(Str Values(Str Bool)) n: &xml/XNode]
+  (let [insecure (= (str/lower-case (attr n "insecure" "false")) "true")
+        path (attr n "path" "")
+        pw (attr n "password" "")
+        ty (store-type n)]
+    (cond
+      insecure (values [(->TrustMat true "" "" "")] "")
+      (= path "") (values [] "")
+      :else
+      (let [[bytes re] (read-res cfgs res path "trust-store")]
+        (cond
+          (not= re "") (values [] re)
+          (or (= ty "pkcs12") (= ty "p12")) (values [(->TrustMat false "" bytes pw)] "")
+          (= ty "jks")
+          (let [[st e] (ks/read-jks bytes pw "")]
+            (if (not= e "") (values [] e)
+              (let [cs (:certs st)
+                    pems (loop [i 0 acc ""] (if (>= i (count cs)) acc (recur (+ i 1) (str acc (:pem (nth cs i))))))]
+                (values [(->TrustMat false pems "" "")] ""))))
+          :else (values [] (str "Unsupported trust store type: " ty)))))))
+
+(defn- of-context Values(Vec(Tls) Str) [cfgs: &Vec(m/Config) res: &Fn(Str Values(Str Bool)) kids: &Vec(xml/XNode) protos: &Str suites: &Str]
+  (let [kn (child-in kids "key-store")
+        tn (child-in kids "trust-store")
+        [km ke] (if (= (count kn) 0) (values [] "") (key-mat cfgs res (nth kn 0)))
+        [tm te] (if (= (count tn) 0) (values [] "") (trust-mat cfgs res (nth tn 0)))
+        [ps cs le] (limits protos suites)]
+    (cond (not= ke "") (values [] ke)
+          (not= te "") (values [] te)
+          (not= le "") (values [] le)
+          :else (values [(->Tls km tm ps cs)] ""))))
+
+(defn of-connection Values(Vec(Tls) Str) [cfgs: &Vec(m/Config) res: &Fn(Str Values(Str Bool)) conn: &xml/XNode]
+  (let [ref (attr conn "tlsContext" "")
+        inline (child conn "context")]
+    (cond
+      (> (count inline) 0) (let [n (nth inline 0)]
+                             (of-context cfgs res (xml/child-elems n) (attr n "enabledProtocols" "") (attr n "enabledCipherSuites" "")))
+      (not= ref "") (let [[g gps found] (global-context cfgs ref)]
+                      (if (not found) (values [] (str "TLS context '" ref "' not found"))
+                        (of-context cfgs res g (conn/param-lit gps "enabledProtocols" "") (conn/param-lit gps "enabledCipherSuites" ""))))
+      :else (values [] ""))))

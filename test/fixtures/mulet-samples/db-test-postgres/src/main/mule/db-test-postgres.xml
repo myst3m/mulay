@@ -1,0 +1,317 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties file="config.yaml"/>
+
+    <http:listener-config name="HTTP_Listener">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <db:config name="Database_Config">
+        <db:generic-connection url="jdbc:postgresql://${db.host}:${db.port}/${db.database}" driverClassName="org.postgresql.Driver"
+                               user="${db.user}" password="${db.password}"/>
+    </db:config>
+
+    <!-- Flow 1: POST /db/setup - Create test tables -->
+    <flow name="db-setup-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/setup" allowedMethods="POST"/>
+        <try>
+            <db:execute-ddl config-ref="Database_Config">
+                <db:sql><![CDATA[CREATE TABLE IF NOT EXISTS products (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, price NUMERIC(10,2), category VARCHAR(50), created_at TIMESTAMP DEFAULT NOW())]]></db:sql>
+            </db:execute-ddl>
+            <db:execute-ddl config-ref="Database_Config">
+                <db:sql><![CDATA[CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, product_id INTEGER, quantity INTEGER, status VARCHAR(20) DEFAULT 'pending')]]></db:sql>
+            </db:execute-ddl>
+            <db:execute-ddl config-ref="Database_Config">
+                <db:sql><![CDATA[TRUNCATE TABLE orders, products RESTART IDENTITY CASCADE]]></db:sql>
+            </db:execute-ddl>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "tables created"}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <error-handler>
+                <on-error-continue type="ANY">
+                    <ee:transform>
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "setup error", message: error.description}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+    <!-- Flow 2: POST /db/insert -->
+    <flow name="db-insert-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/insert" allowedMethods="POST"/>
+        <db:insert config-ref="Database_Config" autoGenerateKeys="true">
+            <db:sql><![CDATA[INSERT INTO products (name, price, category) VALUES (:name, :price, :category)]]></db:sql>
+            <db:input-parameters><![CDATA[#[{name: attributes.queryParams.name, price: attributes.queryParams.price, category: attributes.queryParams.category}]]]></db:input-parameters>
+        </db:insert>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{generatedKey: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 3: GET /db/select -->
+    <flow name="db-select-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/select" allowedMethods="GET"/>
+        <db:select config-ref="Database_Config">
+            <db:sql><![CDATA[SELECT * FROM products ORDER BY id]]></db:sql>
+        </db:select>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 4: GET /db/select/single -->
+    <flow name="db-select-single-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/select/single" allowedMethods="GET"/>
+        <db:select config-ref="Database_Config">
+            <db:sql><![CDATA[SELECT * FROM products WHERE id = :id]]></db:sql>
+            <db:input-parameters><![CDATA[#[{id: attributes.queryParams.id}]]]></db:input-parameters>
+        </db:select>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload[0]]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 5: PUT /db/update -->
+    <flow name="db-update-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/update" allowedMethods="PUT"/>
+        <db:update config-ref="Database_Config">
+            <db:sql><![CDATA[UPDATE products SET name = :name, price = :price WHERE id = :id]]></db:sql>
+            <db:input-parameters><![CDATA[#[{id: attributes.queryParams.id, name: attributes.queryParams.name, price: attributes.queryParams.price}]]]></db:input-parameters>
+        </db:update>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{updated: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 6: DELETE /db/delete -->
+    <flow name="db-delete-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/delete" allowedMethods="DELETE"/>
+        <db:delete config-ref="Database_Config">
+            <db:sql><![CDATA[DELETE FROM products WHERE id = :id]]></db:sql>
+            <db:input-parameters><![CDATA[#[{id: attributes.queryParams.id}]]]></db:input-parameters>
+        </db:delete>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{deleted: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 7: POST /db/bulk-insert -->
+    <flow name="db-bulk-insert-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/bulk-insert" allowedMethods="POST"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+input payload application/json
+output application/java
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <db:bulk-insert config-ref="Database_Config">
+            <db:sql><![CDATA[INSERT INTO products (name, price, category) VALUES (:name, :price, :category)]]></db:sql>
+        </db:bulk-insert>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{inserted: sizeOf(payload)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 8: POST /db/bulk-update -->
+    <flow name="db-bulk-update-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/bulk-update" allowedMethods="POST"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+input payload application/json
+output application/java
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <db:bulk-update config-ref="Database_Config">
+            <db:sql><![CDATA[UPDATE products SET name = :name, price = :price WHERE id = :id]]></db:sql>
+        </db:bulk-update>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{updated: sizeOf(payload)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 9: POST /db/bulk-delete -->
+    <flow name="db-bulk-delete-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/bulk-delete" allowedMethods="POST"/>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+input payload application/json
+output application/java
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <db:bulk-delete config-ref="Database_Config">
+            <db:sql><![CDATA[DELETE FROM products WHERE id = :id]]></db:sql>
+        </db:bulk-delete>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{deleted: sizeOf(payload)}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 10: GET /db/count -->
+    <flow name="db-count-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/count" allowedMethods="GET"/>
+        <db:select config-ref="Database_Config">
+            <db:sql><![CDATA[SELECT COUNT(*) as total FROM products]]></db:sql>
+        </db:select>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{count: payload[0].total}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 11: POST /db/execute -->
+    <flow name="db-execute-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/execute" allowedMethods="POST"/>
+        <db:execute-ddl config-ref="Database_Config">
+            <db:sql><![CDATA[#[payload]]]></db:sql>
+        </db:execute-ddl>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{success: true, result: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 12: GET /db/join -->
+    <flow name="db-join-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/join" allowedMethods="GET"/>
+        <db:select config-ref="Database_Config">
+            <db:sql><![CDATA[SELECT p.name, o.quantity, o.status FROM orders o JOIN products p ON o.product_id = p.id]]></db:sql>
+        </db:select>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 13: POST /db/insert-order -->
+    <flow name="db-insert-order-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/insert-order" allowedMethods="POST"/>
+        <db:insert config-ref="Database_Config" autoGenerateKeys="true">
+            <db:sql><![CDATA[INSERT INTO orders (product_id, quantity) VALUES (:productId, :quantity)]]></db:sql>
+            <db:input-parameters><![CDATA[#[{productId: attributes.queryParams.productId, quantity: attributes.queryParams.quantity}]]]></db:input-parameters>
+        </db:insert>
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{generatedKey: payload}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+    <!-- Flow 14: POST /db/cleanup -->
+    <flow name="db-cleanup-flow">
+        <http:listener config-ref="HTTP_Listener" path="/db/cleanup" allowedMethods="POST"/>
+        <try>
+            <db:execute-ddl config-ref="Database_Config">
+                <db:sql><![CDATA[DROP TABLE IF EXISTS orders]]></db:sql>
+            </db:execute-ddl>
+            <db:execute-ddl config-ref="Database_Config">
+                <db:sql><![CDATA[DROP TABLE IF EXISTS products]]></db:sql>
+            </db:execute-ddl>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "cleaned up"}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <error-handler>
+                <on-error-continue type="ANY">
+                    <ee:transform>
+                        <ee:message>
+                            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{status: "cleanup error", message: error.description}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </flow>
+
+</mule>

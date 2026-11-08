@@ -1,0 +1,445 @@
+(ns mulay.conn.validation
+  (:require [clay.utf8 :as u8] [mulay.dw.val :as v] [mulay.dw.rt :as drt] [mulay.dw.coerce :as co] [mulay.dw.fmt.json :as json] [mulay.dw.lib.validation :as vl]
+            [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.conn :as conn] [mulay.rt.engine :as eng]
+            [mulay.lib.validate :as va] [mulay.lib.regex :as re] [mulay.lib.xml :as xml] [mulay.lib.uni :as uni]
+            [mulay.lib.time.types :as tt] [mulay.lib.time.iso :as iso] [mulay.lib.time.amount :as am] [mulay.lib.time.local :as tl]
+            [mulay.lib.time.zoned :as zd] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/validation")
+
+(defn- text-of Str [x: &v/Val] (match (v/unmeta x) (v/VStr s) (str s) _ (let [[t e] (drt/to-text x)] t)))
+
+(defn- failure conn/OpResult [c: &conn/OpCall id: &Str msg: &Str]
+  (let [p (conn/param (:params c) "message")
+        custom (if (= (count p) 0) ""
+                 (match (nth p 0)
+                   (m/PLit s) (str s)
+                   _ (let [[x e] ((:eval c) (nth p 0) (:event c))] (if (or (not= e "") (v/null? x)) "" (text-of x)))))]
+    (conn/fail-result (err/mk "VALIDATION" id (if (uni/blank? custom) msg custom)))))
+
+(defn- ok conn/OpResult [c: &conn/OpCall] (conn/keep-result c))
+
+(defn- required-err err/MErr [c: &conn/OpCall name: &Str]
+  (err/mk "MULE" "UNKNOWN" (str "Required parameter '" name "' was assigned with value '" (conn/attr-text c name)
+                                "' which resolved to null. Required parameters need to be assigned with non null values")))
+
+(defn- req-str Values(Str Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [[xs x] (conn/attr-val c name)]
+    (cond (> (count x) 0) (values "" x)
+          (or (= (count xs) 0) (v/null? (nth xs 0))) (values "" [(required-err c name)])
+          :else (values (text-of (nth xs 0)) []))))
+
+(defn- opt-str Values(Vec(Str) Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [[xs x] (conn/attr-val c name)]
+    (cond (> (count x) 0) (values [] x)
+          (or (= (count xs) 0) (v/null? (nth xs 0))) (values [] [])
+          :else (values [(text-of (nth xs 0))] []))))
+
+(defn- bool-param Values(Bool Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [p (conn/param (:params c) name)]
+    (if (= (count p) 0) (values false [])
+      (let [[xs x] (conn/attr-val c name)]
+        (cond (> (count x) 0) (values false x)
+              (or (= (count xs) 0) (v/null? (nth xs 0))) (values false [])
+              :else (match (v/unmeta (nth xs 0))
+                      (v/VBool b) (values b [])
+                      (v/VStr s) (let [u (str/lower-case s)]
+                                   (cond (= u "true") (values true []) (= u "false") (values false [])
+                                         :else (values false [(eng/convert-err (nth xs 0) "boolean" (eng/expr-text (nth p 0)))])))
+                      _ (values false [(eng/convert-err (nth xs 0) "boolean" (eng/expr-text (nth p 0)))])))))))
+
+(defn- is-bool conn/OpResult [c: &conn/OpCall want: Bool]
+  (let [[b x] (bool-param c "expression")]
+    (cond (> (count x) 0) (conn/fail-result (nth x 0))
+          (= b want) (ok c)
+          :else (failure c "INVALID_BOOLEAN" (str "Value was expected to be " want " but it was " b " instead")))))
+
+(defn- validation-err? Bool [e: &err/MErr] (err/matches? e "VALIDATION:VALIDATION"))
+
+(defn- aggregate conn/OpResult [c: &conn/OpCall any: Bool]
+  (let [[n errs other]
+        (loop [k 0 errs: Vec(err/MErr) []]
+          (let [[e2 x found] ((:chain c) (str k) (:event c))]
+            (cond (not found) (values k errs [])
+                  (= (count x) 0) (recur (+ k 1) errs)
+                  (validation-err? (nth x 0)) (recur (+ k 1) (conj errs (nth x 0)))
+                  :else (values k errs [(nth x 0)]))))]
+    (cond (> (count other) 0) (conn/fail-result (nth other 0))
+          (or (= (count errs) 0) (and any (< (count errs) n))) (ok c)
+          :else (let [d (loop [i 0 out ""] (if (>= i (count errs)) out (recur (+ i 1) (str out (if (> i 0) "\n" "") (:description (nth errs i))))))]
+                  (conn/fail-result (err/with-kids (err/mk "VALIDATION" "MULTIPLE" d) errs))))))
+
+(defn- check-str conn/OpResult [c: &conn/OpCall name: &Str ok?: Fn(Str Bool) id: &Str suffix: &Str]
+  (let [[s x] (req-str c name)]
+    (cond (> (count x) 0) (conn/fail-result (nth x 0))
+          (ok? s) (ok c)
+          :else (failure c id (str s suffix)))))
+
+(defn- email-ok Bool [s: Str] (vl/email-ok? s))
+(defn- ip-ok Bool [s: Str] (va/inet-address? s))
+(defn- url-ok Bool [s: Str] (va/url? s))
+
+(defn- matches-regex conn/OpResult [c: &conn/OpCall]
+  (let [[value x1] (req-str c "value")
+        [regex x2] (if (> (count x1) 0) (values "" []) (req-str c "regex"))
+        [cs x3] (bool-param-default c "caseSensitive" true)
+        x (if (> (count x1) 0) x1 (if (> (count x2) 0) x2 x3))]
+    (if (> (count x) 0) (conn/fail-result (nth x 0))
+      (let [[m e] (vl/regex-check value regex cs)]
+        (cond (not= e "") (conn/fail-result (err/mk "MULE" "UNKNOWN" e))
+              m (ok c)
+              :else (failure c "MISMATCH" (str value " is not valid under the terms of regex " regex)))))))
+
+(defn- bool-param-default Values(Bool Vec(err/MErr)) [c: &conn/OpCall name: &Str default: Bool]
+  (if (= (count (conn/param (:params c) name)) 0) (values default []) (bool-param c name)))
+
+(defn- blank? Bool [s: &Str]
+  (let [cps (uni/cps s)] (loop [i 0] (if (>= i (count cps)) true (if (uni/java-whitespace? (nth cps i)) (recur (+ i 1)) false)))))
+
+(defn- param-tv Values(ev/TV Vec(err/MErr) Str) [c: &conn/OpCall name: &Str]
+  (let [p (conn/param (:params c) name)]
+    (if (= (count p) 0) (values (:payload (:event c)) [] "payload")
+      (match (nth p 0)
+        (m/PLit s) (values (ev/tv-val (v/->VStr s) ev/JAVA) [] (str s))
+        _ (let [[t e] ((:eval-tv c) (nth p 0) (:event c))]
+            (if (not= e "") (values (ev/tv-null) [(err/mk "MULE" "EXPRESSION" e)] "") (values t [] (eng/expr-text (nth p 0)))))))))
+
+(defn- tv-value Values(v/Val Vec(err/MErr)) [t: &ev/TV]
+  (let [[x t2 e] (ev/value t)] (if (not= e "") (values (v/null-v) [(err/mk "MULE" "EXPRESSION" e)]) (values (v/unmeta x) []))))
+
+(defn- not-blank conn/OpResult [c: &conn/OpCall]
+  (let [[t x expr] (param-tv c "value")]
+    (if (> (count x) 0) (conn/fail-result (nth x 0))
+      (let [[val x2] (tv-value t)]
+        (cond (> (count x2) 0) (conn/fail-result (nth x2 0))
+              (v/null? val) (failure c "BLANK_STRING" "value is null")
+              (blank? (text-of val)) (failure c "BLANK_STRING" "String is blank")
+              :else (ok c))))))
+
+(defn- is-blank conn/OpResult [c: &conn/OpCall]
+  (let [[s x] (req-str c "value")]
+    (cond (> (count x) 0) (conn/fail-result (nth x 0))
+          (blank? s) (ok c)
+          :else (failure c "NOT_BLANK_STRING" "String is not blank"))))
+
+(defn- collection Values(Vec(v/Val) Bool Vec(err/MErr)) [c: &conn/OpCall]
+  (let [[t x expr] (param-tv c "values")]
+    (if (> (count x) 0) (values [] false x)
+      (let [[x0 t2 e] (ev/value t)]
+        (if (not= e "") (values [] false [(err/mk "MULE" "EXPRESSION" e)])
+          (match (v/unmeta x0)
+            (v/VNull) (values [] true [])
+            (v/VArr xs) (values xs false [])
+            _ (values [] false [(eng/coerce-param-err x0 t2 "Array" expr)])))))))
+
+(defn- not-empty conn/OpResult [c: &conn/OpCall]
+  (let [[xs null x] (collection c)]
+    (cond (> (count x) 0) (conn/fail-result (nth x 0))
+          null (failure c "EMPTY_COLLECTION" "value is null")
+          (= (count xs) 0) (failure c "EMPTY_COLLECTION" "Collection is empty")
+          :else (ok c))))
+
+(defn- is-empty conn/OpResult [c: &conn/OpCall]
+  (let [[xs null x] (collection c)]
+    (cond (> (count x) 0) (conn/fail-result (nth x 0))
+          (or null (= (count xs) 0)) (ok c)
+          :else (failure c "NOT_EMPTY_COLLECTION" "Collection is not empty"))))
+
+(defn- null-check conn/OpResult [c: &conn/OpCall want-null: Bool]
+  (let [[t x expr] (param-tv c "value")]
+    (if (> (count x) 0) (conn/fail-result (nth x 0))
+      (let [[val x2] (tv-value t)]
+        (cond (> (count x2) 0) (conn/fail-result (nth x2 0))
+              (= (v/null? val) want-null) (ok c)
+              want-null (failure c "NOT_NULL" "value was expected to be null")
+              :else (failure c "NULL" "value is null"))))))
+
+(defn- int-param Values(Vec(Int) Vec(err/MErr)) [c: &conn/OpCall name: &Str default: Vec(Int)]
+  (let [[xs x] (conn/attr-val c name)]
+    (cond (> (count x) 0) (values [] x)
+          (or (= (count xs) 0) (v/null? (nth xs 0))) (values default [])
+          :else (let [[n e] (parse-long (uni/java-trim (text-of (nth xs 0))))]
+                  (if (= e "") (values [n] []) (values default []))))))
+
+(def STREAM-COUNTER (atom 0))
+
+(defn- value-text Str [t: &ev/TV val: &v/Val]
+  (cond (not (or (= (:state t) ev/VAL) (= (:state t) ev/BOTH)))
+        (let [n (swap! STREAM-COUNTER (fn Int [x: Int] (+ x 1)))]
+          (str "org.mule.runtime.core.internal.streaming.bytes.ManagedCursorStreamDecorator@" (hex (+ 305419896 (* n 7919)))))
+        (ev/java-mime? (:mime t)) (eng/java-str val)
+        (str/includes? (str/lower-case (:mime t)) "json") (let [[s e] (json/write val (json/default-opts))] s)
+        :else (eng/java-str val)))
+
+(defn- hex Str [n: Int]
+  (let [d "0123456789abcdef"]
+    (loop [x n out ""] (if (= x 0) (if (= out "") "0" out) (recur (quot x 16) (str (subs d (mod x 16) (+ (mod x 16) 1)) out))))))
+
+(defn- validate-size conn/OpResult [c: &conn/OpCall]
+  (let [[t x expr] (param-tv c "value")
+        [mn x2] (int-param c "min" [0])
+        [mx x3] (int-param c "max" [])
+        xs (if (> (count x) 0) x (if (> (count x2) 0) x2 x3))]
+    (if (> (count xs) 0) (conn/fail-result (nth xs 0))
+      (let [[val x4] (tv-value t)]
+        (cond
+          (> (count x4) 0) (conn/fail-result (nth x4 0))
+          (v/null? val) (conn/fail-result (err/mk "MULE" "UNKNOWN" "Cannot check size of a null value"))
+          :else
+          (let [java (ev/java-mime? (:mime t))
+                size (match val
+                       (v/VArr ys) (count ys)
+                       (v/VObj fs) (count fs)
+                       (v/VStr s) (if java (va/utf16-len s) (u8/codepoint-count s))
+                       (v/VBin b) (count b)
+                       _ (u8/codepoint-count (text-of val)))
+                lo (nth mn 0)]
+            (cond
+              (< size lo) (failure c "INVALID_SIZE" (str "value " (value-text t val) " was expected to have a size of at least " (fmt-int lo) " but it only has " (fmt-int size)))
+              (and (> (count mx) 0) (> size (nth mx 0)))
+              (failure c "INVALID_SIZE" (str "value " (value-text t val) " was expected to have a size of at most " (fmt-int (nth mx 0)) " but it has " (fmt-int size)))
+              :else (ok c))))))))
+
+(defn- fmt-int Str [n: Int] (vl/format-num (vl/->JNum "Integer" n 0.0)))
+
+(defn- is-number conn/OpResult [c: &conn/OpCall]
+  (let [[value x1] (req-str c "value")
+        type (str/upper-case (conn/param-lit (:params c) "numberType" "INTEGER"))
+        [loc x2] (opt-str c "locale")
+        [pat x3] (opt-str c "pattern")
+        [mins x4] (opt-str c "minValue")
+        [maxs x5] (opt-str c "maxValue")
+        xs (loop [i 0 a: Vec(Vec(err/MErr)) [x1 x2 x3 x4 x5]] (if (>= i (count a)) [] (if (> (count (nth a i)) 0) (nth a i) (recur (+ i 1) a))))]
+    (if (> (count xs) 0) (conn/fail-result (nth xs 0))
+      (let [locale (if (or (= (count loc) 0) (uni/blank? (nth loc 0))) vl/DEFAULT-LOCALE (nth loc 0))
+            [ns e] (vl/parse-number value (if (= (count pat) 0) "" (nth pat 0)) locale type)
+            lo (if (= (count mins) 0) [] (vl/parse-bound (nth mins 0) type))
+            hi (if (= (count maxs) 0) [] (vl/parse-bound (nth maxs 0) type))]
+        (cond
+          (not= e "") (conn/fail-result (err/mk "MULE" "UNKNOWN" e))
+          (= (count ns) 0) (failure c "INVALID_NUMBER" (str value " is not a valid " type " value"))
+          (and (> (count lo) 0) (< (vl/compare-num (nth ns 0) (nth lo 0)) 0))
+          (failure c "INVALID_NUMBER" (str (vl/format-num (nth ns 0)) " is lower that " (vl/format-num (nth lo 0))))
+          (and (> (count hi) 0) (> (vl/compare-num (nth ns 0) (nth hi 0)) 0))
+          (failure c "INVALID_NUMBER" (str (vl/format-num (nth ns 0)) " is greater that " (vl/format-num (nth hi 0))))
+          :else (ok c))))))
+
+(defn- is-time conn/OpResult [c: &conn/OpCall]
+  (let [[time x1] (req-str c "time")
+        [loc x2] (opt-str c "locale")
+        [pat x3] (opt-str c "pattern")
+        xs (if (> (count x1) 0) x1 (if (> (count x2) 0) x2 x3))]
+    (cond
+      (> (count xs) 0) (conn/fail-result (nth xs 0))
+      (= (count pat) 0) (conn/fail-result (err/mk "MULE" "UNKNOWN" "pattern"))
+      :else
+      (let [locale (if (= (count loc) 0) vl/DEFAULT-LOCALE (nth loc 0))
+            [okt e] (vl/time-check time (nth pat 0) locale)]
+        (cond (not= e "") (conn/fail-result (err/mk "MULE" "UNKNOWN" e))
+              okt (ok c)
+              :else (failure c "INVALID_TIME" (str time " is not a valid time for the pattern " (nth pat 0) " under locale " locale)))))))
+
+(defn- duration Vec(tt/Duration) [n: Int unit: &Str]
+  (let [u (str/upper-case (str/trim unit))]
+    (cond (= u "NANOSECONDS") [(am/duration (quot n 1000000000) (rem n 1000000000))]
+          (= u "MICROSECONDS") [(am/duration (quot n 1000000) (* (rem n 1000000) 1000))]
+          (= u "MILLISECONDS") [(am/duration (quot n 1000) (* (rem n 1000) 1000000))]
+          (= u "SECONDS") [(tt/->Duration n 0)]
+          (= u "MINUTES") [(tt/->Duration (* n 60) 0)]
+          (= u "HOURS") [(tt/->Duration (* n 3600) 0)]
+          (= u "DAYS") [(tt/->Duration (* n 86400) 0)]
+          :else [])))
+
+(defn- elapsed conn/OpResult [c: &conn/OpCall want-elapsed: Bool]
+  (let [[tv x1] (conn/attr-val c "time")
+        [sv x2] (conn/attr-val c "since")
+        xs (if (> (count x1) 0) x1 x2)]
+    (cond
+      (> (count xs) 0) (conn/fail-result (nth xs 0))
+      (or (= (count tv) 0) (v/null? (nth tv 0))) (conn/fail-result (required-err c "time"))
+      (or (= (count sv) 0) (v/null? (nth sv 0))) (conn/fail-result (required-err c "since"))
+      :else
+      (let [[n ne] (parse-long (text-of (nth tv 0)))
+            ds (duration n (conn/param-lit (:params c) "timeUnit" ""))]
+        (match (v/unmeta (nth sv 0))
+          (v/VLocalDateTime since)
+          (if (or (not= ne "") (= (count ds) 0)) (conn/fail-result (err/mk "MULE" "UNKNOWN" "Invalid time or timeUnit"))
+            (let [[until ue] (tl/ldt-plus-duration since (nth ds 0))
+                  now (:dt (zd/now-zdt))
+                  before (< (tl/ldt-compare now until) 0)
+                  msg (str (iso/ldt-str now) " occurred " (if want-elapsed "before " "after ") (am/duration-str (nth ds 0)) " from " (iso/ldt-str since))]
+              (cond (= before (not want-elapsed)) (ok c)
+                    want-elapsed (failure c "NOT_ELAPSED_TIME" (str "Time " msg))
+                    :else (failure c "ELAPSED_TIME" (str "Time " msg)))))
+          _ (conn/fail-result (eng/convert-err (nth sv 0) "java.time.LocalDateTime" (conn/attr-text c "since"))))))))
+
+(defn- rx re/Pattern [s: &Str] (let [[p e] (re/compile s 0)] p))
+(def IPV4-FACTORY-RE (rx "^(25[0-5]|2[0-4]\\d|[0-1]?\\d?\\d)(\\.(25[0-5]|2[0-4]\\d|[0-1]?\\d?\\d)){3}$"))
+(def IPV6-STD-RE (rx "^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$"))
+(def IPV6-COMP-RE (rx "^((?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)::((?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)$"))
+(def PARTIAL-RE (rx "(\\d{1,3})(\\.(\\d{1,3})(\\.(\\d{1,3}))?)?"))
+(def FORMAT-RE (rx "([^/]*)/(.*):(.*)"))
+
+(defn- rx-full? Bool [p: &re/Pattern s: &Str] (let [[ok e] (re/matches? p s)] ok))
+
+(defn- ip-kind Int [s: &Str]
+  (cond (rx-full? IPV4-FACTORY-RE s) 4
+        (let [pc (str/index-of s "%") a (if (> pc 0) (subs s 0 pc) s)] (rx-full? IPV6-STD-RE a)) 6
+        (rx-full? IPV6-COMP-RE s) 6
+        :else 0))
+
+(defn- v4-bytes Vec(Int) [s: &Str]
+  (let [ps (str/split s ".")]
+    (if (not= (count ps) 4) []
+      (loop [i 0 acc: Vec(Int) []]
+        (if (>= i 4) acc
+          (let [[n e] (parse-long (nth ps i))] (if (or (not= e "") (< n 0) (> n 255)) [] (recur (+ i 1) (conj acc n)))))))))
+
+(defn- hex-val Int [s: &Str]
+  (if (or (= (count s) 0) (> (count s) 4)) -1
+    (loop [i 0 v 0] (if (>= i (count s)) v (let [d (uni/char-digit (nth s i) 16)] (if (or (< d 0) (> (nth s i) 127)) -1 (recur (+ i 1) (+ (* v 16) d))))))))
+
+(defn- v6-bytes Vec(Int) [s0: &Str]
+  (let [pc (str/index-of s0 "%")
+        s (if (>= pc 0) (subs s0 0 pc) (str s0))
+        dc (str/index-of s "::")
+        [head tail] (if (>= dc 0) (values (subs s 0 dc) (subs s (+ dc 2) (count s))) (values s ""))
+        hs (if (= head "") [] (str/split head ":"))
+        ts (if (= tail "") [] (str/split tail ":"))
+        groups (fn-groups hs ts (>= dc 0))]
+    (if (= (count groups) 0) []
+      (loop [i 0 acc: Vec(Int) []]
+        (if (>= i 8) acc (let [g (nth groups i)] (recur (+ i 1) (conj (conj acc (quot g 256)) (mod g 256)))))))))
+
+(defn- fn-groups Vec(Int) [hs: &Vec(Str) ts: &Vec(Str) compressed: Bool]
+  (let [n (+ (count hs) (count ts))]
+    (if (or (> n 8) (and (not compressed) (not= n 8)) (and compressed (= n 8))) []
+      (let [hv (loop [i 0 acc: Vec(Int) []] (if (>= i (count hs)) acc (let [x (hex-val (nth hs i))] (if (< x 0) [-1] (recur (+ i 1) (conj acc x))))))
+            tv (loop [i 0 acc: Vec(Int) []] (if (>= i (count ts)) acc (let [x (hex-val (nth ts i))] (if (< x 0) [-1] (recur (+ i 1) (conj acc x))))))]
+        (if (or (and (= (count hv) 1) (< (nth hv 0) 0)) (and (= (count tv) 1) (< (nth tv 0) 0))) []
+          (let [mid (loop [k (- 8 n) acc hv] (if (<= k 0) acc (recur (- k 1) (conj acc 0))))]
+            (loop [i 0 acc mid] (if (>= i (count tv)) acc (recur (+ i 1) (conj acc (nth tv i)))))))))))
+
+(defn- addr-bytes Vec(Int) [s: &Str] (if (str/includes? s ":") (v6-bytes s) (v4-bytes s)))
+
+(defn- cidr-match? Bool [range: &Str value: &Str]
+  (let [sl (str/index-of range "/")
+        [a mask] (if (> sl 0)
+                   (let [[m e] (parse-long (str/trim (subs range (+ sl 1) (count range))))] (values (str/trim (subs range 0 sl)) (if (= e "") m -2)))
+                   (values (str range) -1))
+        ab (addr-bytes a)
+        vb (addr-bytes value)]
+    (cond (or (= mask -2) (= (count ab) 0) (= (count vb) 0) (not= (count ab) (count vb))) false
+          (< mask 0) (= ab vb)
+          (> mask (* 8 (count ab))) false
+          :else (let [full (quot mask 8) bits (mod mask 8)]
+                  (and (loop [i 0] (if (>= i full) true (if (= (nth ab i) (nth vb i)) (recur (+ i 1)) false)))
+                       (or (= bits 0)
+                           (let [m (bit-and (bit-shift-left (- (bit-shift-left 1 bits) 1) (- 8 bits)) 255)]
+                             (= (bit-and (nth ab full) m) (bit-and (nth vb full) m)))))))))
+
+(defn- entry-match? Bool [entry: &Str value: &Str]
+  (if (rx-full? PARTIAL-RE entry) (str/includes? value (str entry "."))
+    (cidr-match? entry value)))
+
+(defn- ips-of Values(Vec(Str) Vec(err/MErr)) [c: &conn/OpCall kids: &Vec(xml/XNode) attr: &Vec(m/PVal)]
+  (let [ipss (conn/child-elem kids "ips")
+        lits (if (= (count ipss) 0) []
+               (let [ks (xml/child-elems (nth ipss 0))]
+                 (loop [i 0 acc: Vec(Str) []]
+                   (if (>= i (count ks)) acc
+                     (recur (+ i 1) (if (= (xml/elem-local (nth ks i)) "ip") (conj acc (xml/attr (nth ks i) "" "value" "")) acc))))))]
+    (if (= (count attr) 0) (values lits [])
+      (let [[x e] (match (nth attr 0) (m/PLit s) (values (v/->VStr s) "") _ ((:eval c) (nth attr 0) (:event c)))]
+        (if (not= e "") (values [] [(err/mk "MULE" "EXPRESSION" e)])
+          (match (v/unmeta x)
+            (v/VArr xs) (values (loop [i 0 acc lits] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (text-of (nth xs i)))))) [])
+            (v/VNull) (values lits [])
+            _ (let [ps (str/split (text-of x) ",")]
+                (values (loop [i 0 acc lits] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (str/trim (nth ps i)))))) []))))))))
+
+(defn- ip-filter conn/OpResult [c: &conn/OpCall allow: Bool]
+  (let [[ip x] (req-str c "ipAddress")]
+    (if (> (count x) 0) (conn/fail-result (nth x 0))
+      (let [lname (if allow "allowList" "denyList")
+            inline (conn/child-elem (:children c) (if allow "allow-list" "deny-list"))
+            ref (conn/param-lit (:params c) lname "")
+            gl (if (= ref "") [] (conn/find-config (:configs c) "validation:ip-filter-list" ref))
+            [ips ix] (cond (> (count inline) 0)
+                           (let [node (nth inline 0)
+                                 ex (conn/param (:exprs c) (str (if allow "allow-list" "deny-list") "@ips"))
+                                 lit (xml/attr node "" "ips" "")
+                                 at (if (> (count ex) 0) ex (if (= lit "") [] [(m/->PLit lit)]))]
+                             (ips-of c (xml/child-elems node) at))
+                           (> (count gl) 0) (let [g (nth gl 0)] (ips-of c (:children g) (conn/param (:params g) "ips")))
+                           :else (values [] []))
+            ms (let [[m e] (re/search FORMAT-RE ip 0)] m)
+            f (if (> (count ms) 0) (re/group (nth ms 0) ip 2) (str ip))]
+        (cond (> (count ix) 0) (conn/fail-result (nth ix 0))
+              (= (ip-kind f) 0) (failure c "INVALID_IP" (str ip " is not a valid ip address"))
+              :else
+          (let [in (loop [i 0] (if (>= i (count ips)) false (if (entry-match? (nth ips i) f) true (recur (+ i 1)))))]
+            (if (= (not in) allow) (failure c "REJECTED_IP" (str ip " was rejected by ip filter")) (ok c))))))))
+
+(defn- with-message Values(conn/OpCall Vec(err/MErr)) [c: &conn/OpCall]
+  (let [ps (:params c)
+        k (loop [i 0] (if (>= i (count ps)) -1 (if (= (:name (nth ps i)) "message") i (recur (+ i 1)))))]
+    (if (< k 0) (values (assoc c :params ps) [])
+      (match (:v (nth ps k))
+        (m/PLit s) (values (assoc c :params ps) [])
+        _ (let [[x e] ((:eval c) (:v (nth ps k)) (:event c))]
+            (if (not= e "") (values (assoc c :params ps) [(err/mk "MULE" "EXPRESSION" e)])
+              (values (assoc c :params (assoc ps k (m/->Param "message" (m/->PLit (if (v/null? x) "" (text-of x)))))) [])))))))
+
+(defn- run-op conn/OpResult [c0: &conn/OpCall]
+  (let [[c mx] (with-message c0)
+        op (:op c)]
+    (cond
+      (> (count mx) 0) (conn/fail-result (nth mx 0))
+      (= op "is-true") (is-bool c true)
+      (= op "is-false") (is-bool c false)
+      (= op "is-email") (check-str c "email" email-ok "INVALID_EMAIL" " is not a valid email address")
+      (= op "is-ip") (check-str c "ip" ip-ok "INVALID_IP" " is not a valid ip address")
+      (= op "is-url") (check-str c "url" url-ok "INVALID_URL" " is not a valid url")
+      (= op "matches-regex") (matches-regex c)
+      (= op "validate-size") (validate-size c)
+      (= op "is-not-blank-string") (not-blank c)
+      (= op "is-blank-string") (is-blank c)
+      (= op "is-not-empty-collection") (not-empty c)
+      (= op "is-empty-collection") (is-empty c)
+      (= op "is-not-null") (null-check c false)
+      (= op "is-null") (null-check c true)
+      (= op "is-number") (is-number c)
+      (= op "is-time") (is-time c)
+      (= op "is-elapsed") (elapsed c true)
+      (= op "is-not-elapsed") (elapsed c false)
+      (= op "is-allowed-ip") (ip-filter c true)
+      (= op "is-not-denied-ip") (ip-filter c false)
+      (= op "all") (aggregate c false)
+      (= op "any") (aggregate c true)
+      :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "Unsupported connector operation validation:" op))))))
+
+(def ERROR-PARENTS
+  [
+   "VALIDATION:VALIDATION" "MULE:VALIDATION"
+   "VALIDATION:INVALID_IP" "VALIDATION:VALIDATION"
+   "VALIDATION:REJECTED_IP" "VALIDATION:VALIDATION"
+   "VALIDATION:INVALID_BOOLEAN" "VALIDATION:VALIDATION"
+   "VALIDATION:INVALID_EMAIL" "VALIDATION:VALIDATION"
+   "VALIDATION:NOT_EMPTY_COLLECTION" "VALIDATION:VALIDATION"
+   "VALIDATION:EMPTY_COLLECTION" "VALIDATION:VALIDATION"
+   "VALIDATION:BLANK_STRING" "VALIDATION:VALIDATION"
+   "VALIDATION:NOT_BLANK_STRING" "VALIDATION:VALIDATION"
+   "VALIDATION:NULL" "VALIDATION:VALIDATION"
+   "VALIDATION:NOT_NULL" "VALIDATION:VALIDATION"
+   "VALIDATION:MISMATCH" "VALIDATION:VALIDATION"
+   "VALIDATION:INVALID_NUMBER" "VALIDATION:VALIDATION"
+   "VALIDATION:INVALID_SIZE" "VALIDATION:VALIDATION"
+   "VALIDATION:INVALID_TIME" "VALIDATION:VALIDATION"
+   "VALIDATION:INVALID_URL" "VALIDATION:VALIDATION"
+   "VALIDATION:ELAPSED_TIME" "VALIDATION:VALIDATION"
+   "VALIDATION:NOT_ELAPSED_TIME" "VALIDATION:VALIDATION"
+   "VALIDATION:MULTIPLE" "VALIDATION:VALIDATION"])
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "validation" NS (fn conn/OpResult [c: conn/OpCall] (run-op c))) :each-child ["all" "any"] :error-parents ERROR-PARENTS))

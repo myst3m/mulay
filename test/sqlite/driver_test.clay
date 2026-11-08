@@ -1,0 +1,107 @@
+(ns sqlite-driver-test (:require [mulay.db.sqlite :as d] [mulay.db.sql :as sql] [mulay.lib.fs :as fs]))
+
+(defn- cells Str [rows: &Vec(Vec(sql/Cell))]
+  (loop [i 0 out ""]
+    (if (>= i (count rows)) out
+      (recur (+ i 1) (str out "[" (loop [k 0 o ""] (if (>= k (count (nth rows i))) o
+                                                    (recur (+ k 1) (str o (if (= k 0) "" " ")
+                                                                        (match (nth (nth rows i) k)
+                                                                          (sql/CNull) "null" (sql/CInt n) (str n) (sql/CLong n) (str n "L")
+                                                                          (sql/CDouble f) (str "d" f) (sql/CStr s) (str "'" s "'") (sql/CBytes b) (str "b" (count b))
+                                                                          _ "?"))))) "]")))))
+
+(defn- q Str [h: Int text: Str]
+  (let [none: Vec(sql/Cell) [] [o e] (d/run h text none false)]
+    (if (sql/ok? e) (str (cells (:rows (:rows o))) "#" (:count o)) (:msg e))))
+
+(deftest shared-memory
+  (let [url "file:t1?mode=memory&cache=shared"
+        [a e1] (d/open url)
+        [b e2] (d/open url)
+        r1 (q a "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        r2 (q a "INSERT INTO t (name) VALUES ('x'), ('y')")
+        r3 (q b "SELECT * FROM t ORDER BY id")
+        [o e] (d/run a "INSERT INTO t (name) VALUES (?)" [(sql/->CStr "z")] true)
+        z1 (d/close a) z2 (d/close b)
+        [c e3] (d/open url)
+        r4 (q c "SELECT * FROM t")
+        z3 (d/close c)]
+    (is (= r1 "#0"))
+    (is (= r2 "#2"))
+    (is (= r3 "[1 'x'][2 'y']#-1"))
+    (is (= (cells (:rows (:keys o))) "[3]"))
+    (is (= (:count o) 1))
+    (is (= r4 "[SQLITE_ERROR] SQL error or missing database (no such table: t)"))))
+
+(deftest private-memory
+  (let [[a e1] (d/open ":memory:")
+        [b e2] (d/open ":memory:")
+        r1 (q a "CREATE TABLE t (x)")
+        r2 (q b "SELECT * FROM t")
+        r3 (q a "SELEC 1")
+        r4 (q a "INSERT INTO t VALUES (2147483648), (1.5), (x'00ff'), (NULL)")
+        r5 (q a "SELECT x FROM t")
+        z1 (d/close a) z2 (d/close b)]
+    (is (= r2 "[SQLITE_ERROR] SQL error or missing database (no such table: t)"))
+    (is (= r3 "[SQLITE_ERROR] SQL error or missing database (near \"SELEC\": syntax error)"))
+    (is (= r4 "#4"))
+    (is (= r5 "[2147483648L][d1.5][b2][null]#-1"))))
+
+(deftest transactions
+  (let [url "file:t2?mode=memory&cache=shared"
+        [a e1] (d/open url)
+        [b e2] (d/open url)
+        r1 (q a "CREATE TABLE t (x)")
+        r2 (q a "BEGIN")
+        r3 (q a "INSERT INTO t VALUES (1)")
+        r4 (q b "SELECT count(*) FROM t")
+        r5 (q a "SELECT count(*) FROM t")
+        r6 (q a "ROLLBACK")
+        r7 (q a "SELECT count(*) FROM t")
+        r8 (q a "BEGIN")
+        r9 (q a "INSERT INTO t VALUES (1)")
+        r10 (q a "COMMIT")
+        r11 (q b "SELECT count(*) FROM t")
+        z1 (d/close a) z2 (d/close b)]
+    (is (= r4 "[0]#-1"))
+    (is (= r5 "[1]#-1"))
+    (is (= r7 "[0]#-1"))
+    (is (= r11 "[1]#-1"))))
+
+(deftest batch-and-fetch
+  (let [[a e1] (d/open ":memory:")
+        r1 (q a "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT NOT NULL)")
+        [cs e2] (d/run-batch a "INSERT INTO t VALUES (?, ?)" [[(sql/->CInt 1) (sql/->CStr "a")] [(sql/->CInt 2) (sql/->CStr "b")]])
+        [cs2 e3] (d/run-batch a "INSERT INTO t VALUES (?, ?)" [[(sql/->CInt 3) (sql/->CStr "c")] [(sql/->CInt 3) (sql/->CStr "d")]])
+        [cs3 e4] (d/run-batch a "INSERT INTO nope VALUES (?)" [[(sql/->CInt 1)]])
+        [qq e5] (d/open-query a "SELECT id FROM t ORDER BY id" [])
+        [f1 d1 x1] (d/fetch qq 2)
+        [f2 d2 x2] (d/fetch qq 2)
+        z (d/close-query qq)
+        z1 (d/close a)]
+    (is (= cs [1 1]))
+    (is (= cs2 [1]))
+    (is (= (:msg e3) "[SQLITE_CONSTRAINT_PRIMARYKEY] A PRIMARY KEY constraint failed (UNIQUE constraint failed: t.id)"))
+    (is (= (:msg e4) d/PREPARE-FAILED))
+    (is (= (cells f1) "[1][2]"))
+    (is (= d1 false))
+    (is (= (cells f2) "[3]"))
+    (is (= d2 true))))
+
+(deftest file-db
+  (let [path "sqlite-test-file.db"
+        z0 (if (fs/exists? path) (fs/remove-tree path) "")
+        [a e1] (d/open path)
+        r1 (q a "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT)")
+        [cs e2] (d/run-batch a "INSERT INTO t (n) VALUES (?)" [[(sql/->CStr "a")] [(sql/->CStr "b")]])
+        r2 (q a "INSERT INTO t (n) VALUES ('c')")
+        z1 (d/close a)
+        ;; 閉じた後に開き直して読む (ファイルから)
+        [b e3] (d/open (str "file:" path))
+        r3 (q b "SELECT id, n FROM t ORDER BY id")
+        z2 (d/close b)
+        [data re] (read-file path)
+        z3 (fs/remove-tree path)]
+    (is (= cs [1 1]))
+    (is (= r3 "[1 'a'][2 'b'][3 'c']#-1"))
+    (is (= (subs data 0 15) "SQLite format 3"))))

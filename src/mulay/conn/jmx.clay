@@ -1,0 +1,243 @@
+(ns mulay.conn.jmx
+  (:require [mulay.dw.val :as v] [mulay.mule.model :as m] [mulay.rt.event :as ev] [mulay.rt.error :as err]
+            [mulay.rt.conn :as conn] [mulay.rt.log :as log] [mulay.lib.logfile :as lf] [mulay.lib.fs :as fs]
+            [mulay.lib.uni :as uni] [mulay.lib.procstat :as ps] [mulay.lib.osinfo :as osi] [mulay.lib.dec :as dec] [clay.string :as str]))
+
+(def NS "http://www.mulesoft.org/schema/mule/jmx")
+
+(def OWNER (atom ""))
+(def HOME (atom ""))
+
+(defn- lit Str [ps: &Vec(m/Param) name: &Str default: Str] (conn/param-lit ps name default))
+
+(defn- cap-of Int [c: &m/Config]
+  (let [[n e] (parse-long (str/trim (lit (:params c) "logBufferSize" "5000")))] (if (= e "") n 5000)))
+
+(defn- first-jmx Vec(m/Config) [cs: &Vec(m/Config)]
+  (loop [i 0] (if (>= i (count cs)) [] (if (= (:kind (nth cs i)) "jmx:config") [(nth cs i)] (recur (+ i 1))))))
+
+(defn- home-of Str [app: &m/App]
+  (let [ps (:properties app)
+        found (loop [i 0] (if (>= i (count ps)) "" (if (= (:name (nth ps i)) "mule.home") (match (:v (nth ps i)) (m/PLit x) (str x) _ "") (recur (+ i 1)))))]
+    (if (not= found "") found (getenv "MULE_HOME" ""))))
+
+(defn- init Vec(Str) [app: &m/App]
+  (let [h (reset! HOME (home-of app))
+        f (first-jmx (:configs app))]
+    (if (= (count f) 0) []
+      (let [a (reset! OWNER (:name (nth f 0)))
+            b (log/ring-install! (cap-of (nth f 0)))]
+        []))))
+
+(defn- hex4 Str [n: Int]
+  (let [d "0123456789abcdef"]
+    (str "\\u00" (subs d (bit-shift-right n 4) (+ (bit-shift-right n 4) 1)) (subs d (bit-and n 15) (+ (bit-and n 15) 1)))))
+
+(defn esc Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [c (nth s i)]
+        (recur (+ i 1) (cond (= c 92) (str out "\\\\") (= c 34) (str out "\\\"") (= c 10) (str out "\\n")
+                             (= c 13) (str out "\\r") (= c 9) (str out "\\t") (< c 32) (str out (hex4 c))
+                             :else (str out (chr c))))))))
+
+(defn- js Str [s: &Str] (str "\"" (esc s) "\""))
+
+(defn- json-list Str [xs: &Vec(Str)]
+  (loop [i 0 out "["] (if (>= i (count xs)) (str out "]") (recur (+ i 1) (str out (if (= i 0) "" ",") (nth xs i))))))
+
+(defn- required Values(Str Vec(err/MErr)) [c: &conn/OpCall name: &Str]
+  (let [[xs x] (conn/attr-val c name)]
+    (cond (> (count x) 0) (values "" x)
+          (or (= (count xs) 0) (v/null? (nth xs 0)))
+          (values "" [(err/mk "MULE" "UNKNOWN" (str "Required parameter '" name "' was assigned with value '" (conn/attr-text c name)
+                                                    "' which resolved to null. Required parameters need to be assigned with non null values"))])
+          :else (conn/attr-str c name ""))))
+
+(defn- lines-of Values(Int Vec(err/MErr)) [c: &conn/OpCall default: Str]
+  (let [[s x] (conn/attr-str c "lines" default)]
+    (if (> (count x) 0) (values 0 x)
+      (let [[n e] (parse-long (str/trim s))]
+        (if (= e "") (values n [])
+          (values 0 [(err/mk "MULE" "EXPRESSION" (str "Unable to convert '" s "' with class 'java.lang.String' to class 'int'"))]))))))
+
+(defn- json-result conn/OpResult [body: Str]
+  (conn/ok-result (ev/tv-val (v/->VStr body) "application/json; charset=UTF-8") (ev/tv-null)))
+
+(defn- error-json conn/OpResult [msg: &Str] (json-result (str "{\"error\":" (js msg) "}")))
+
+(defn norm-path Str [p: &Str]
+  (let [sq (loop [i 0 out ""] (if (>= i (count p)) out (recur (+ i 1) (if (and (= (nth p i) 47) (> (count out) 0) (= (nth out (- (count out) 1)) 47)) out (str out (chr (nth p i)))))))]
+    (if (and (> (count sq) 1) (str/ends-with? sq "/")) (subs sq 0 (- (count sq) 1)) sq)))
+
+(defn- log-dir Str [c: &conn/OpCall]
+  (let [ps (if (> (count (:config c)) 0) (:params (nth (:config c) 0)) [])
+        explicit (lit ps "logDir" "")]
+    (if (not= explicit "") (norm-path explicit)
+      (let [home (deref HOME)]
+        (cond (not= home "") (norm-path (str home "/logs"))
+              (fs/dir? "/opt/mule/logs") "/opt/mule/logs"
+              :else "logs")))))
+
+(defn escapes? Bool [name: &Str]
+  (or (str/starts-with? name "/")
+      (loop [i 0 segs (str/split name "/")] (if (>= i (count segs)) false (if (= (nth segs i) "..") true (recur (+ i 1) segs))))))
+
+(defn- level-ord Int [l: &Str]
+  (let [u (str/upper-case l)]
+    (cond (= u "TRACE") 0 (= u "DEBUG") 1 (= u "INFO") 2 (= u "WARN") 3 (= u "ERROR") 4 (= u "FATAL") 5 :else 0)))
+
+(defn- rec-json Str [r: &log/Rec]
+  (str "{\"timestamp\":" (js (:ts r)) ",\"epochMillis\":" (:ms r) ",\"level\":" (js (str/trim (log/level-name (:level r))))
+       ",\"logger\":" (js (:logger r)) ",\"message\":" (js (:msg r)) ",\"thread\":" (js (:thread r)) "}"))
+
+(defn- recent conn/OpResult [c: &conn/OpCall]
+  (let [[lines lx] (lines-of c "100")
+        [level l2] (conn/attr-str c "level" "")
+        [pattern p2] (conn/attr-str c "pattern" "")
+        cfg (if (> (count (:config c)) 0) [(nth (:config c) 0)] [])
+        cap (if (> (count cfg) 0) (cap-of (nth cfg 0)) 5000)
+        mine (and (> (count cfg) 0) (= (:name (nth cfg 0)) (deref OWNER)))
+        all (if mine (log/ring-snapshot) (let [e: Vec(log/Rec) []] e))
+        pat (uni/lower pattern)
+        want (if (= level "") 0 (level-ord level))
+        hit (loop [i 0 acc: Vec(log/Rec) []]
+              (if (>= i (count all)) acc
+                (let [r (nth all i)
+                      ok-level (or (= level "") (>= (- (:level r) 0) want))
+                      ok-pat (or (= pattern "") (str/includes? (uni/lower (:msg r)) pat) (str/includes? (uni/lower (:logger r)) pat))]
+                  (recur (+ i 1) (if (and ok-level ok-pat) (conj acc r) acc)))))
+        from (if (and (> lines 0) (> (count hit) lines)) (- (count hit) lines) 0)
+        parts (loop [i from acc: Vec(Str) []] (if (>= i (count hit)) acc (recur (+ i 1) (conj acc (rec-json (nth hit i))))))]
+    (cond (> (count lx) 0) (conn/fail-result (nth lx 0))
+          (> (count l2) 0) (conn/fail-result (nth l2 0))
+          (> (count p2) 0) (conn/fail-result (nth p2 0))
+          :else (json-result (str "{\"bufferCapacity\":" cap ",\"bufferSize\":" (if mine (count all) 0) ",\"count\":" (count parts)
+                                  ",\"entries\":" (json-list parts) "}")))))
+
+(defn- list-files conn/OpResult [c: &conn/OpCall]
+  (let [dir (log-dir c)
+        fs (lf/list-files dir)
+        parts (loop [i 0 acc: Vec(Str) []]
+                (if (>= i (count fs)) acc
+                  (let [f (nth fs i)]
+                    (recur (+ i 1) (conj acc (str "{\"name\":" (js (:name f)) ",\"size\":" (:size f) ",\"lastModified\":" (:mtime-ms f) "}"))))))]
+    (json-result (str "{\"logDir\":" (js dir) ",\"files\":" (json-list parts) "}"))))
+
+(defn- not-found conn/OpResult [path: &Str] (error-json (str "Log file not found: " path)))
+
+(defn- tail conn/OpResult [c: &conn/OpCall]
+  (let [[name nx] (required c "fileName")
+        [lines lx] (lines-of c "100")
+        dir (log-dir c)
+        path (str dir "/" name)]
+    (cond (> (count nx) 0) (conn/fail-result (nth nx 0))
+          (> (count lx) 0) (conn/fail-result (nth lx 0))
+          (escapes? name) (error-json (str "Invalid log file name: " name))
+          (not (fs/file? path)) (not-found path)
+          :else
+          (let [[ls e] (lf/tail path lines)]
+            (if (not= e "") (error-json (str path " (Permission denied)"))
+              (json-result (str "{\"file\":" (js name) ",\"lines\":" (count ls) ",\"content\":"
+                                (json-list (mapv (fn Str [s: &Str] (js (lf/latin1->utf8 s))) ls)) "}")))))))
+
+(defn- search conn/OpResult [c: &conn/OpCall]
+  (let [[name nx] (required c "fileName")
+        [pattern px] (required c "pattern")
+        [lines lx] (lines-of c "50")
+        dir (log-dir c)
+        path (str dir "/" name)]
+    (cond (> (count nx) 0) (conn/fail-result (nth nx 0))
+          (> (count px) 0) (conn/fail-result (nth px 0))
+          (> (count lx) 0) (conn/fail-result (nth lx 0))
+          (escapes? name) (error-json (str "Invalid log file name: " name))
+          (not (fs/file? path)) (not-found path)
+          :else
+          (let [[ls e fatal] (lf/search path pattern lines)]
+            (cond (and (not= e "") fatal) (conn/fail-result (err/mk "MULE" "UNKNOWN" e))
+                  (not= e "") (error-json e)
+                  :else (json-result (str "{\"file\":" (js name) ",\"pattern\":" (js pattern) ",\"matches\":" (count ls) ",\"content\":"
+                                          (json-list (mapv (fn Str [s: &Str] (js s)) ls)) "}")))))))
+
+(def PREV-CPU: Atom(Vec(Int)) (atom (let [v: Vec(Int) []] v)))
+(def PREV-SYS: Atom(Vec(Int)) (atom (let [v: Vec(Int) []] v)))
+(def PEAK-THREADS (atom 0))
+
+(defn- num Str [x: Int] (str x))
+(defn- flt Str [x: Float] (dec/float->shortest-str x))
+(defn- kv Str [k: &Str v: &Str] (str (js k) ":" v))
+(defn- obj Str [kvs: &Vec(Str)] (str "{" (str/join "," kvs) "}"))
+
+(defn- clamp01 Float [x: Float] (if (< x 0.0) 0.0 (if (> x 1.0) 1.0 x)))
+
+(defn- process-cpu-load Float [cpu-ns: Int now-ms: Int]
+  (let [prev (deref PREV-CPU)
+        base-cpu (if (= (count prev) 0) 0 (nth prev 0))
+        base-ms (if (= (count prev) 0) (- now-ms (ps/uptime-ms)) (nth prev 1))
+        z (reset! PREV-CPU [cpu-ns now-ms])
+        dt (- now-ms base-ms)]
+    (if (<= dt 0) 0.0
+      (clamp01 (/ (float (- cpu-ns base-cpu)) (* (float dt) 1000000.0 (float (ps/ncpu))))))))
+
+(defn- system-cpu-load Float []
+  (let [[busy total] (ps/system-cpu)
+        prev (deref PREV-SYS)
+        b0 (if (= (count prev) 0) 0 (nth prev 0))
+        t0 (if (= (count prev) 0) 0 (nth prev 1))
+        z (reset! PREV-SYS [busy total])]
+    (if (<= (- total t0) 0) 0.0 (clamp01 (/ (float (- busy b0)) (float (- total t0)))))))
+
+(defn- nz Int [x: Int] (if (< x 0) 0 x))
+
+(defn- m-os Str []
+  (obj [(kv "name" (js "Linux")) (kv "arch" (js (osi/java-arch))) (kv "version" (js (osi/uname-release)))
+        (kv "availableProcessors" (num (ps/ncpu))) (kv "systemLoadAverage" (flt (ps/loadavg)))
+        (kv "totalPhysicalMemorySize" (num (nz (ps/meminfo "MemTotal")))) (kv "freePhysicalMemorySize" (num (nz (ps/meminfo "MemAvailable"))))
+        (kv "committedVirtualMemorySize" (num (nz (ps/self-vsize))))
+        (kv "totalSwapSpaceSize" (num (nz (ps/meminfo "SwapTotal")))) (kv "freeSwapSpaceSize" (num (nz (ps/meminfo "SwapFree"))))]))
+
+(defn- m-cpu Str []
+  (obj [(kv "processCpuLoad" (flt (process-cpu-load (ps/self-cpu-ns) (epoch-ms)))) (kv "processCpuTime" (num (ps/self-cpu-ns)))
+        (kv "systemCpuLoad" (flt (system-cpu-load)))
+        (kv "availableProcessors" (num (ps/ncpu))) (kv "systemLoadAverage" (flt (ps/loadavg)))]))
+
+(defn- usage Str [used: Int committed: Int]
+  (obj [(kv "init" "0") (kv "used" (num (nz used))) (kv "committed" (num (nz committed))) (kv "max" "-1")]))
+
+(defn- m-memory Str []
+  (let [[st se] (read-file "/proc/self/status")]
+    (obj [(kv "heap" (usage (ps/status-field st "RssAnon") (ps/status-field st "VmData")))
+          (kv "nonHeap" (usage (ps/status-field st "RssFile") (ps/status-field st "RssFile")))
+          (kv "objectPendingFinalizationCount" "0")])))
+
+(defn- m-threads Str []
+  (let [n (nz (ps/self-threads))
+        pk (swap! PEAK-THREADS (fn Int [o: Int] (if (> n o) n o)))]
+    (obj [(kv "threadCount" (num n)) (kv "peakThreadCount" (num pk)) (kv "totalStartedThreadCount" (num pk))
+          (kv "daemonThreadCount" (num n)) (kv "states" (obj [(kv "RUNNABLE" (num n))]))])))
+
+(defn- m-all Str []
+  (obj [(kv "timestamp" (num (epoch-ms))) (kv "os" (m-os)) (kv "cpu" (m-cpu)) (kv "memory" (m-memory)) (kv "memoryPools" "[]") (kv "gc" "[]")
+        (kv "threads" (m-threads))
+        (kv "classLoading" (obj [(kv "loadedClassCount" "0") (kv "totalLoadedClassCount" "0") (kv "unloadedClassCount" "0")]))
+        (kv "runtime" (obj [(kv "vmName" (js "mulay")) (kv "vmVendor" (js "mulay")) (kv "vmVersion" (js "mulay")) (kv "specVersion" (js "0"))
+                            (kv "uptime" (num (ps/uptime-ms))) (kv "startTime" (num (ps/start-ms))) (kv "inputArguments" "[]")
+                            (kv "pid" (num (osi/pid)))]))
+        (kv "bufferPools" "[]")]))
+
+(defn- run-op conn/OpResult [c: &conn/OpCall]
+  (let [op (:op c)]
+    (cond (= op "get-recent-logs") (recent c)
+          (= op "list-log-files") (list-files c)
+          (= op "tail-log-file") (tail c)
+          (= op "search-log-file") (search c)
+          (= op "collect-metrics") (json-result (m-all))
+          (= op "collect-cpu") (json-result (m-cpu))
+          (= op "collect-memory") (json-result (obj [(kv "memory" (m-memory)) (kv "memoryPools" "[]")]))
+          (= op "collect-gc") (json-result "[]")
+          (= op "collect-threads") (json-result (m-threads))
+          :else (conn/fail-result (err/mk "MULE" "UNKNOWN" (str "jmx:" op " is not supported by mulay"))))))
+
+(defn connector conn/Connector []
+  (assoc (conn/connector "jmx" NS (fn conn/OpResult [c: conn/OpCall] (run-op c)))
+         :init (fn Vec(Str) [a: m/App] (init a))))

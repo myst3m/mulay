@@ -1,0 +1,38 @@
+<!doctype html><html><body><pre id="out"></pre><script type="module">
+import { instantiate, hasJSPI } from './host.mjs';
+const out = document.getElementById('out');
+let bad = 0;
+const check = (name, ok) => { out.textContent += (ok ? 'ok   ' : 'FAIL ') + name + '\n'; if (!ok) bad++; };
+try {
+  check('JSPI is there', hasJSPI);
+  const bytes = await (await fetch('mulay.wasm')).arrayBuffer();
+  const callee = await instantiate(bytes);
+  const xml = `<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http">
+<http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="8081"/></http:listener-config>
+<http:request-config name="R"><http:request-connection host="HOST" port="PORT"/></http:request-config>
+<flow name="f"><http:listener config-ref="L" path="/p/{w}"/><http:request config-ref="R" method="GET" path="#['/' ++ attributes.uriParams.w]"/>
+<set-payload value="#[output application/json --- {n: payload.name, h: attributes.headers.'content-type', st: attributes.statusCode}]"/>
+<error-handler><on-error-continue><set-payload value="#[error.errorType.identifier ++ ': ' ++ error.description]"/></on-error-continue></error-handler></flow>
+<flow name="g"><http:listener config-ref="L" path="/q"/><http:request config-ref="R" method="POST" path="/x"/></flow></mule>`
+    .replace('HOST', location.hostname).replace('PORT', location.port);
+  const app = await instantiate(bytes, { allow: (u) => u.startsWith(location.origin + '/') });
+  const load = (st, x) => st.call('load', 'src/main/mule/a.xml\n' + new TextEncoder().encode(x).length + '\n' + x);
+  load(app, xml);
+  const run = async (st, w) => { const t = JSON.parse(await st.run('run', JSON.stringify({ id: w, flow: 'f', request: { method: 'GET', path: '/p/' + w } }))); return JSON.parse(st.call('get_value', t.response.body.id)).text.replace(/\s+/g, ''); };
+  check('GET through fetch', (await run(app, 'data.json')) === '{"n":"A","h":"application/json","st":200}');
+  check('404 is HTTP:NOT_FOUND', (await run(app, 'missing.json')).startsWith('NOT_FOUND:HTTPGETonresource'));
+  check('twice in a row', (await run(app, 'data.json')).includes('"n":"A"'));
+  const shut = await instantiate(bytes);
+  load(shut, xml);
+  check('nothing is fetched without opts.allow', (await run(shut, 'data.json')).startsWith('CONNECTIVITY:'));
+  const g = JSON.parse(await app.run('run', JSON.stringify({ id: 'g', flow: 'g', request: { method: 'GET', path: '/q' } })));
+  check('POST is held by default', g.stoppedAt === 'g/processors/0');
+  load(callee, `<mule xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:http="http://www.mulesoft.org/schema/mule/http">
+<http:listener-config name="L"><http:listener-connection host="0.0.0.0" port="8082"/></http:listener-config>
+<flow name="c"><http:listener config-ref="L" path="/*"/><set-payload value='#[output application/json --- {name: "from-callee"}]'/></flow></mule>`);
+  const routed = await instantiate(bytes, { route: () => callee });
+  load(routed, xml);
+  check('route to another instance with JSPI', (await run(routed, 'data.json')).includes('"n":"from-callee"'));
+} catch (e) { check('no exception: ' + e.message, false); }
+out.textContent += bad ? 'FAILED\n' : 'PASSED\n';
+</script></body></html>

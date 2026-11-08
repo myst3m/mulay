@@ -1,0 +1,58 @@
+(ns mulay.mule.lint (:require [mulay.lib.xml :as xml] [mulay.mule.ignored :as ign] [clay.string :as str]))
+
+(def NS-HTTP "http://www.mulesoft.org/schema/mule/http")
+
+(def REQUEST-ORDER ["body" "headers" "uri-params" "query-params" "response-validator"])
+
+(defn- rank Int [local: &Str]
+  (loop [i 0] (if (>= i (count REQUEST-ORDER)) -1 (if (= (nth REQUEST-ORDER i) local) i (recur (+ i 1))))))
+
+(defn- check-request Vec(Str) [file: &Str n: &xml/XNode ls: &xml/XLines]
+  (let [cs (xml/child-elems n)
+        kids (:kids ls)]
+    (loop [i 0 top -1 topname: Str "" acc: Vec(Str) []]
+      (if (>= i (count cs)) acc
+        (let [c (nth cs i)
+              r (if (= (xml/elem-uri c) NS-HTTP) (rank (xml/elem-local c)) -1)]
+          (cond
+            (< r 0) (recur (+ i 1) top topname acc)
+            (< r top)
+            (recur (+ i 1) top topname
+                   (conj acc (str file ":" (:line (nth kids i)) ": <http:request>: <http:" (xml/elem-local c)
+                                  "> must come before <http:" topname "> (the schema order is body, headers, uri-params, query-params, response-validator; real Mule rejects this at build time)")))
+            :else (recur (+ i 1) r (xml/elem-local c) acc)))))))
+
+(defn- ignored-of Str [uri: &Str]
+  (let [t ign/TABLE]
+    (loop [i 0] (if (>= i (count t)) "" (if (= (nth (nth t i) 0) uri) (nth (nth t i) 1) (recur (+ i 1)))))))
+
+(defn- check-ignored Vec(Str) [file: &Str n: &xml/XNode ls: &xml/XLines]
+  (let [tab (ignored-of (xml/elem-uri n))
+        as (xml/elem-attrs n)
+        q (xml/elem-name n)]
+    (if (= tab "") (let [z: Vec(Str) []] z)
+      (loop [i 0 acc: Vec(Str) []]
+        (if (>= i (count as)) acc
+          (let [a (:name (nth as i))]
+            (recur (+ i 1)
+                   (if (and (= (:uri a) "") (str/includes? tab (str "," (:local a) ",")))
+                     (conj acc (str file ":" (:line ls) ": <" (if (= (:prefix q) "") "" (str (:prefix q) ":")) (:local q) ">: attribute '" (:local a)
+                                    "' is not supported and is ignored (docs/connectors.md)"))
+                     acc))))))))
+
+(defn- walk Vec(Str) [file: &Str n: &xml/XNode ls: &xml/XLines acc0: Vec(Str)]
+  (let [h0 (if (and (= (xml/elem-uri n) NS-HTTP) (= (xml/elem-local n) "request"))
+             (let [w (check-request file n ls)]
+               (loop [i 0 a acc0] (if (>= i (count w)) a (recur (+ i 1) (conj a (nth w i))))))
+             acc0)
+        wi (check-ignored file n ls)
+        here (loop [i 0 a h0] (if (>= i (count wi)) a (recur (+ i 1) (conj a (nth wi i)))))
+        cs (xml/child-elems n)]
+    (loop [i 0 a here]
+      (if (>= i (count cs)) a
+        (recur (+ i 1) (walk file (nth cs i) (nth (:kids ls) i) a))))))
+
+(defn check Vec(Str) [file: &Str text: &Str]
+  (let [[d ls err] (xml/parse-with-lines text (assoc (xml/default-opts) :drop-ws-text true))]
+    (if (not= err "") (let [z: Vec(Str) []] z)
+      (let [z: Vec(Str) []] (walk file (xml/doc-root d) ls z)))))

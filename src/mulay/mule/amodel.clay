@@ -1,0 +1,615 @@
+(ns mulay.mule.amodel
+  (:require [clay.string :as str] [clay.json :as json] [mulay.lib.xml :as xml] [mulay.mule.model :as m] [mulay.mule.parse :as ps] [mulay.mule.load :as ld]))
+
+(defrecord Info [support: Str effect: Str])
+
+(defrecord ANode [kind: Str path: Str element: Str doc-id: Vec(Str) label: Vec(Str) cond: Vec(Str) types: Vec(Str) file: Str
+                  span: xml/XSpan has-span: Bool support: Str effect: Str kids: Vec(ANode)])
+
+(defrecord AFlow [name: Str element: Str file: Str span: xml/XSpan source: Vec(ANode) steps: Vec(ANode)
+                  body-start: Int eh: Vec(xml/XSpan) entries: Vec(ANode)])
+
+(defrecord AGlobal [name: Vec(Str) element: Str file: Str span: xml/XSpan])
+
+(defrecord AFile [path: Str root: Vec(xml/XSpan)])
+
+(defrecord ADiag [severity: Str message: Str file: Str path: Str span: Vec(Int) code: Str data: Str])
+
+(defrecord AEntry [kind: Str flow: Str source: Str element: Str method: Str path: Str frequency-ms: Int cron: Str tz: Str
+                   main: Str api: Str op: Int implemented: Bool])
+
+(defrecord AParam [name: Str in: Str required: Bool type: Str example: Vec(Str)])
+
+(defrecord AEx [status: Str mime: Str body: Str])
+
+(defrecord AOp [method: Str path: Str key: Vec(Int) block: Vec(Int) params: Vec(AParam) media: Vec(Str) codes: Vec(Str)
+                flow: Str implemented: Bool resp-ex: Vec(AEx) req-ex: Vec(AEx) req-sample: Vec(AEx) req-required: Vec(Str)])
+
+(defrecord AApi [config: Str file: Str format: Str error: Str ops: Vec(AOp)])
+
+(defrecord AModel [files: Vec(AFile) flows: Vec(AFlow) globals: Vec(AGlobal) diags: Vec(ADiag) entries: Vec(AEntry) apis: Vec(AApi)])
+
+(defrecord- W [file: Str hints: m/Hints kinds: Map(Str Str) info: Fn(Str Str Vec(xml/XAttr) Info)])
+
+(defn elem-end Int [s: &xml/XSpan] (if (>= (:close-end s) 0) (:close-end s) (:open-end s)))
+
+(defn- kind-of Str [p: &m/Proc]
+  (match p
+    (m/PrChoice a b l) "router" (m/PrScatterGather a b d f l) "router" (m/PrFirstSuccessful a l) "router" (m/PrRoundRobin a b l) "router"
+    (m/PrForEach a b d f g l) "scope" (m/PrParallelForEach a b d f g l) "scope" (m/PrTry a b d f l) "scope"
+    (m/PrUntilSuccessful a b d l) "scope" (m/PrAsync a b l) "scope" (m/PrCache a b d l) "scope"
+    (m/PrConnectorOp a b d f g h chs i j l) (if (> (count chs) 0) "chains" "processor")
+    (m/PrUnknown a l) "unknown"
+    (m/PrBatchJob a b d f g h l) "scope"
+    _ "processor"))
+
+(defn- walk-procs Map(Str Str) [ps: &Vec(m/Proc) acc0: Map(Str Str)]
+  (loop [i 0 acc acc0]
+    (if (>= i (count ps)) acc
+      (let [p (nth ps i)
+            k (kind-of p)
+            path (:path (m/proc-loc p))
+            a2 (assoc acc path k)]
+        (recur (+ i 1) (walk-kids p a2))))))
+
+(defn- walk-routes Map(Str Str) [rs: &Vec(m/Route) acc0: Map(Str Str)]
+  (loop [i 0 acc acc0] (if (>= i (count rs)) acc (recur (+ i 1) (walk-procs (:procs (nth rs i)) acc)))))
+
+(defn- walk-kids Map(Str Str) [p: &m/Proc acc: Map(Str Str)]
+  (match p
+    (m/PrChoice ws ow l) (walk-procs ow (loop [k 0 a acc] (if (>= k (count ws)) a (recur (+ k 1) (walk-procs (:procs (nth ws k)) a)))))
+    (m/PrForEach a b d f ps l) (walk-procs ps acc)
+    (m/PrParallelForEach a b d f ps l) (walk-procs ps acc)
+    (m/PrScatterGather rs a b d l) (walk-routes rs acc)
+    (m/PrTry ps hs d f l) (walk-procs ps (loop [k 0 a acc] (if (>= k (count hs)) a (recur (+ k 1) (walk-procs (:procs (nth hs k)) a)))))
+    (m/PrUntilSuccessful a b ps l) (walk-procs ps acc)
+    (m/PrAsync ps b l) (walk-procs ps acc)
+    (m/PrCache a b ps l) (walk-procs ps acc)
+    (m/PrFirstSuccessful rs l) (walk-routes rs acc)
+    (m/PrRoundRobin rs b l) (walk-routes rs acc)
+    (m/PrConnectorOp a b d f g h chs i j l) (loop [k 0 x acc] (if (>= k (count chs)) x (recur (+ k 1) (walk-procs (:procs (nth chs k)) x))))
+    (m/PrBatchJob a b d f steps oc l)
+    (walk-procs oc (loop [k 0 x acc]
+                     (if (>= k (count steps)) x
+                       (let [st (nth steps k) x1 (walk-procs (:procs st) x)]
+                         (recur (+ k 1) (if (= (count (:aggregator st)) 0) x1 (walk-procs (:procs (nth (:aggregator st) 0)) x1)))))))
+    _ acc))
+
+(defn- model-kinds Map(Str Str) [app: &m/App]
+  (let [fs (:flows app)]
+    (loop [i 0 acc: Map(Str Str) {}]
+      (if (>= i (count fs)) acc
+        (let [f (nth fs i)
+              a1 (walk-procs (:procs f) acc)
+              hs (:handlers f)]
+          (recur (+ i 1) (loop [k 0 a a1] (if (>= k (count hs)) a (recur (+ k 1) (walk-procs (:procs (nth hs k)) a))))))))))
+
+(defn model-paths Vec(Str) [app: &m/App]
+  (let [ks (model-kinds app)] (sort (keys ks))))
+
+(defn- attr-of Vec(Str) [n: &xml/XNode uri: &Str local: &Str]
+  (let [as (xml/elem-attrs n)]
+    (loop [i 0] (if (>= i (count as)) []
+                  (let [q (:name (nth as i))] (if (and (= (:uri q) uri) (= (:local q) local)) [(str (:value (nth as i)))] (recur (+ i 1))))))))
+
+(defn- raw-of Vec(Str) [s: &xml/XSpan name: &Str]
+  (let [as (:attrs s)] (loop [i 0] (if (>= i (count as)) [] (if (= (:name (nth as i)) name) [(str (:raw (nth as i)))] (recur (+ i 1)))))))
+
+(defn- doc-attr Vec(Str) [n: &xml/XNode local: &Str] (attr-of n ps/NS-DOC local))
+
+(defn- core-ish? Bool [u: &Str] (or (= u ps/NS-CORE) (= u ps/NS-EE) (= u ps/NS-BATCH)))
+
+(defn- info-of Info [w: &W n: &xml/XNode kind: &Str]
+  (let [u (xml/elem-uri n)]
+    (cond (= kind "unknown") (->Info "unsupported" "none")
+          (core-ish? u) (->Info "browser" "none")
+          :else ((:info w) (str u) (str (xml/elem-local n)) (xml/elem-attrs n)))))
+
+(defn- skip? Bool [c: &xml/XNode]
+  (let [u (xml/elem-uri c) l (xml/elem-local c)]
+    (or (= u ps/NS-DOC) (and (= u ps/NS-CORE) (= l "error-handler")) (and (= u ps/NS-BATCH) (= l "aggregator")))))
+
+(defn- kid-ln xml/XLines [ln: &xml/XLines i: Int]
+  (if (< i (count (:kids ln))) (nth (:kids ln) i) (let [z: Vec(xml/XLines) []] (xml/->XLines (:line ln) z xml/NO-SPAN))))
+
+(defn- steps-of Vec(ANode) [w: &W n: &xml/XNode ln: &xml/XLines from: Int base: &Str]
+  (let [kids (xml/child-elems n)]
+    (loop [i from k 0 acc: Vec(ANode) []]
+      (if (>= i (count kids)) acc
+        (let [c (nth kids i)]
+          (if (skip? c) (recur (+ i 1) k acc)
+            (let [s (step-of w c (kid-ln ln i) (str base "/processors/" k))]
+              (recur (+ i 1) (+ k 1) (conj acc s)))))))))
+
+(defn- route-node ANode [w: &W kind: &Str path: &Str c: &xml/XNode cl: &xml/XLines cnd: Vec(Str)]
+  (let [z: Vec(Str) []]
+    (->ANode (str kind) (str path) (xml/qname-str (xml/elem-name c)) z z cnd z (str (:file w)) (:span cl) true "browser" "none"
+             (steps-of w c cl 0 path))))
+
+(defn- no-route ANode [w: &W kind: &Str path: &Str]
+  (let [z: Vec(Str) [] k: Vec(ANode) []]
+    (->ANode (str kind) (str path) "" z z z z (str (:file w)) xml/NO-SPAN false "browser" "none" k)))
+
+(defn- choice-routes Vec(ANode) [w: &W n: &xml/XNode ln: &xml/XLines path: &Str]
+  (let [kids (xml/child-elems n)
+        [ws ow] (loop [i 0 ws: Vec(ANode) [] ow: Vec(ANode) []]
+                  (if (>= i (count kids)) (values ws ow)
+                    (let [c (nth kids i) cl (kid-ln ln i) l (xml/elem-local c)]
+                      (cond
+                        (not= (xml/elem-uri c) ps/NS-CORE) (recur (+ i 1) ws ow)
+                        (= l "when") (let [r (route-node w "when" (str path "/route/" (count ws)) c cl (raw-of (:span cl) "expression"))]
+                                       (recur (+ i 1) (conj ws r) ow))
+                        (= l "otherwise") (let [r (route-node w "otherwise" (str path "/route/" (count ws)) c cl [])]
+                                            (recur (+ i 1) ws [r]))
+                        :else (recur (+ i 1) ws ow)))))
+        last (if (= (count ow) 0) (no-route w "otherwise" (str path "/route/" (count ws))) (nth ow 0))]
+    (conj ws last)))
+
+(defn- plain-routes Vec(ANode) [w: &W n: &xml/XNode ln: &xml/XLines path: &Str]
+  (let [kids (xml/child-elems n)]
+    (loop [i 0 acc: Vec(ANode) []]
+      (if (>= i (count kids)) acc
+        (let [c (nth kids i)]
+          (if (and (= (xml/elem-uri c) ps/NS-CORE) (= (xml/elem-local c) "route"))
+            (recur (+ i 1) (conj acc (route-node w "route" (str path "/route/" (count acc)) c (kid-ln ln i) [])))
+            (recur (+ i 1) acc)))))))
+
+(defn- chain-routes Vec(ANode) [w: &W n: &xml/XNode ln: &xml/XLines path: &Str]
+  (let [key (str (xml/elem-uri n) " " (xml/elem-local n))
+        z: Vec(Str) []]
+    (if (ps/op-each-child? (:hints w) key)
+      [(->ANode "body" (str path) (xml/qname-str (xml/elem-name n)) z z z z (str (:file w)) (:span ln) true "browser" "none" (steps-of w n ln 0 path))]
+      (let [names (ps/op-chain-names (:hints w) key)
+            kids (xml/child-elems n)]
+        (loop [i 0 acc: Vec(ANode) []]
+          (if (>= i (count kids)) acc
+            (let [c (nth kids i)
+                  hit (loop [k 0] (if (>= k (count names)) false (if (= (nth names k) (xml/elem-local c)) true (recur (+ k 1)))))]
+              (recur (+ i 1) (if hit (conj acc (route-node w "body" path c (kid-ln ln i) z)) acc)))))))))
+
+(defn- kid-named Vec(Int) [n: &xml/XNode uri: &Str local: &Str]
+  (let [ks (xml/child-elems n)] (loop [i 0] (if (>= i (count ks)) [] (if (and (= (xml/elem-uri (nth ks i)) uri) (= (xml/elem-local (nth ks i)) local)) [i] (recur (+ i 1)))))))
+
+(defn- batch-step-nodes Vec(ANode) [w: &W c: &xml/XNode cl: &xml/XLines sp: &Str]
+  (let [z: Vec(Str) []
+        pol (let [x (str/upper-case (attr1 c "acceptPolicy"))] (if (= x "") "NO_FAILURES" x))
+        st (->ANode "batch-step" (str sp) "batch:step" z (attr-of c "" "name") (raw-of (:span cl) "acceptExpression") [pol] (str (:file w)) (:span cl) true "browser" "none" (steps-of w c cl 0 sp))
+        ag (kid-named c ps/NS-BATCH "aggregator")]
+    (if (= (count ag) 0) [st]
+      (let [gn (nth (xml/child-elems c) (nth ag 0))
+            gl (kid-ln cl (nth ag 0))
+            gp (str sp "/aggregator")]
+        [st (->ANode "aggregator" gp "batch:aggregator" z z z [(attr1 gn "size")] (str (:file w)) (:span gl) true "browser" "none" (steps-of w gn gl 0 gp))]))))
+
+(defn- batch-routes Vec(ANode) [w: &W n: &xml/XNode ln: &xml/XLines path: &Str]
+  (let [z: Vec(Str) []
+        ks (xml/child-elems n)
+        pr (kid-named n ps/NS-BATCH "process-records")
+        steps (if (= (count pr) 0) (let [e: Vec(ANode) []] e)
+                (let [pn (nth ks (nth pr 0)) pl (kid-ln ln (nth pr 0)) sk (xml/child-elems pn)]
+                  (loop [i 0 k 0 acc: Vec(ANode) []]
+                    (if (>= i (count sk)) acc
+                      (let [c (nth sk i)]
+                        (if (not (and (= (xml/elem-uri c) ps/NS-BATCH) (= (xml/elem-local c) "step"))) (recur (+ i 1) k acc)
+                          (let [xs (batch-step-nodes w c (kid-ln pl i) (str path "/process-records/" k))]
+                            (recur (+ i 1) (+ k 1) (loop [q 0 a acc] (if (>= q (count xs)) a (recur (+ q 1) (conj a (nth xs q)))))))))))))
+        oc (kid-named n ps/NS-BATCH "on-complete")]
+    (if (= (count oc) 0) steps
+      (let [on (nth ks (nth oc 0)) ol (kid-ln ln (nth oc 0)) op (str path "/on-complete")]
+        (conj steps (->ANode "on-complete" op "batch:on-complete" z z z z (str (:file w)) (:span ol) true "browser" "none" (steps-of w on ol 0 op)))))))
+
+(defn- attr1 Str [n: &xml/XNode k: &Str] (let [v (attr-of n "" k)] (if (= (count v) 0) "" (nth v 0))))
+
+(defn- step-of ANode [w: &W n: &xml/XNode ln: &xml/XLines path: &Str]
+  (let [mk (get (:kinds w) path "processor")
+        kind (if (= mk "chains") "scope" mk)
+        inf (info-of w n kind)
+        z: Vec(Str) []
+        routes (cond (= kind "router") (if (and (= (xml/elem-uri n) ps/NS-CORE) (= (xml/elem-local n) "choice"))
+                                         (choice-routes w n ln path) (plain-routes w n ln path))
+                     (= mk "chains") (chain-routes w n ln path)
+                     (and (= kind "scope") (= (xml/elem-uri n) ps/NS-BATCH) (= (xml/elem-local n) "job")) (batch-routes w n ln path)
+                     (= kind "scope") [(->ANode "body" (str path) (xml/qname-str (xml/elem-name n)) z z z z (str (:file w)) (:span ln) true "browser" "none" (steps-of w n ln 0 path))]
+                     :else (let [e: Vec(ANode) []] e))
+        tryeh (if (and (= kind "scope") (= (xml/elem-uri n) ps/NS-CORE) (= (xml/elem-local n) "try"))
+                (let [[eh hs] (handler-of w n ln path)]
+                  (if (= (count eh) 0) routes
+                    (conj routes (->ANode "eh" (str path "/errorHandler") "error-handler" z z z z (str (:file w)) (nth eh 0) true "browser" "none" hs))))
+                routes)]
+    (->ANode kind (str path) (xml/qname-str (xml/elem-name n)) (doc-attr n "id") (doc-attr n "name") z z (str (:file w)) (:span ln) true
+             (:support inf) (:effect inf) tryeh)))
+
+(defn routes-of Vec(ANode) [x: &ANode]
+  (let [ks (:kids x)] (loop [i 0 acc: Vec(ANode) []] (if (>= i (count ks)) acc (recur (+ i 1) (if (= (:kind (nth ks i)) "eh") acc (conj acc (nth ks i))))))))
+
+(defn handlers-of Vec(ANode) [x: &ANode]
+  (let [ks (:kids x)] (loop [i 0] (if (>= i (count ks)) [] (if (= (:kind (nth ks i)) "eh") (:kids (nth ks i)) (recur (+ i 1)))))))
+
+(defn- types-of Vec(Str) [s: &Str]
+  (let [parts: Vec(Str) (str/split (str s) ",")]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count parts)) acc
+        (let [t (str/trim (nth parts i))] (recur (+ i 1) (if (= t "") acc (conj acc t))))))))
+
+(defn- handler-of Values(Vec(xml/XSpan) Vec(ANode)) [w: &W n: &xml/XNode ln: &xml/XLines name: &Str]
+  (let [kids (xml/child-elems n)
+        ei (loop [i 0] (if (>= i (count kids)) -1 (let [c (nth kids i)] (if (and (= (xml/elem-uri c) ps/NS-CORE) (= (xml/elem-local c) "error-handler")) i (recur (+ i 1))))))]
+    (if (< ei 0) (let [a: Vec(xml/XSpan) [] b: Vec(ANode) []] (values a b))
+      (let [eh (nth kids ei) el (kid-ln ln ei) es (xml/child-elems eh)
+            hs (loop [i 0 acc: Vec(ANode) []]
+                 (if (>= i (count es)) acc
+                   (let [c (nth es i) cl (kid-ln el i) l (xml/elem-local c)]
+                     (if (and (= (xml/elem-uri c) ps/NS-CORE) (or (= l "on-error-propagate") (= l "on-error-continue")))
+                       (let [path (str name "/errorHandler/" (count acc))
+                             ty (attr-of c "" "type")
+                             wh (raw-of (:span cl) "when")]
+                         (recur (+ i 1) (conj acc (->ANode "entry" path (str l) (doc-attr c "id") (doc-attr c "name") wh
+                                                           (if (= (count ty) 0) [] (types-of (nth ty 0))) (str (:file w)) (:span cl) true "browser" "none"
+                                                           (steps-of w c cl 0 path)))))
+                       (recur (+ i 1) acc)))))]
+        (values [(:span el)] hs)))))
+
+(defn- source-info Info [w: &W n: &xml/XNode]
+  (let [u (xml/elem-uri n) l (xml/elem-local n)]
+    (if (or (and (= u ps/NS-CORE) (= l "scheduler")) (and (= u ps/NS-HTTP) (= l "listener"))) (->Info "browser" "none")
+      (let [i (info-of w n "processor")]
+        (->Info (if (= (:support i) "unsupported") "unsupported" "relay") "none")))))
+
+(defn- flow-of AFlow [w: &W n: &xml/XNode ln: &xml/XLines]
+  (let [na (attr-of n "" "name")
+        name (if (= (count na) 0) "" (nth na 0))
+        kids (xml/child-elems n)
+        fi (loop [i 0] (if (>= i (count kids)) -1 (if (= (xml/elem-uri (nth kids i)) ps/NS-DOC) (recur (+ i 1)) i)))
+        has-src (and (>= fi 0) (ps/source-elem? (nth kids fi) (:hints w)))
+        src (if has-src
+              (let [c (nth kids fi) cl (kid-ln ln fi) inf (source-info w c) z: Vec(Str) [] k: Vec(ANode) []]
+                [(->ANode "processor" (str name "/source") (xml/qname-str (xml/elem-name c)) (doc-attr c "id") (doc-attr c "name") z z (str (:file w))
+                          (:span cl) true (:support inf) (:effect inf) k)])
+              (let [z: Vec(ANode) []] z))
+        steps (steps-of w n ln (if has-src (+ fi 1) 0) name)
+        bs (if has-src (elem-end (:span (nth src 0))) (:open-end (:span ln)))
+        [eh hs] (handler-of w n ln name)]
+    (->AFlow (str name) (str (xml/elem-local n)) (str (:file w)) (:span ln) src steps bs eh hs)))
+
+(defn- label-of Bool [labels: &Vec(Str) f: &Str]
+  (loop [i 0] (if (>= i (count labels)) false (if (= (nth labels i) f) true (recur (+ i 1))))))
+
+(defn- add-spans Map(Str Vec(Int)) [ns: &Vec(ANode) acc0: Map(Str Vec(Int))]
+  (loop [i 0 acc acc0]
+    (if (>= i (count ns)) acc
+      (let [x (nth ns i)
+            a2 (if (and (:has-span x) (not (contains? acc (:path x)))) (assoc acc (:path x) [(:open (:span x)) (elem-end (:span x))]) acc)]
+        (recur (+ i 1) (add-spans (:kids x) a2))))))
+
+(defn- span-map Map(Str Vec(Int)) [fs: &Vec(AFlow)]
+  (loop [i 0 acc: Map(Str Vec(Int)) {}]
+    (if (>= i (count fs)) acc
+      (let [f (nth fs i)
+            a1 (assoc acc (:name f) [(:open (:span f)) (elem-end (:span f))])
+            a2 (add-spans (:source f) (add-spans (:steps f) a1))
+            a3 (add-spans (:entries f) a2)]
+        (recur (+ i 1) a3)))))
+
+(defn- num-at Values(Int Int) [s: &Str i0: Int]
+  (loop [i i0 n 0] (if (and (< i (count s)) (>= (nth s i) 48) (<= (nth s i) 57)) (recur (+ i 1) (+ (* n 10) (- (nth s i) 48))) (values n i))))
+
+(defn- xml-err-span Vec(Int) [msg: &Str text: &Str]
+  (let [h "XML: line "]
+    (if (not (str/starts-with? msg h)) []
+      (let [[line e1] (num-at msg (count h))
+            c0 (str/index-of-after msg ", column " e1)
+            [col e2] (if (< c0 0) (values 0 0) (num-at msg (+ c0 9)))
+            bom (if (and (> (count text) 2) (= (nth text 0) 239) (= (nth text 1) 187) (= (nth text 2) 191)) 3 0)
+            ls (loop [i bom l 1] (cond (>= l line) i (>= i (count text)) -1 (= (nth text i) 10) (recur (+ i 1) (+ l 1)) :else (recur (+ i 1) l)))
+            p (if (< ls 0) -1
+                (loop [i ls k 1]
+                  (cond (>= k col) i
+                        (>= i (count text)) i
+                        :else (let [j (loop [q (+ i 1)] (if (and (< q (count text)) (= (bit-and (nth text q) 192) 128)) (recur (+ q 1)) q))]
+                                (recur j (+ k 1))))))]
+        (if (or (< p 0) (= col 0)) []
+          (let [q (loop [x (+ p 1)] (if (and (< x (count text)) (= (bit-and (nth text x) 192) 128)) (recur (+ x 1)) x))]
+            [p (if (> q (count text)) (count text) q)]))))))
+
+(defn build AModel [l: &ld/Loaded hints: &m/Hints info: Fn(Str Str Vec(xml/XAttr) Info) pre: &Str]
+  (let [app (:app l)
+        docs (:docs l)
+        kinds (model-kinds app)
+        [files flows globals]
+        (loop [i 0 fs: Vec(AFile) [] fl: Vec(AFlow) [] gs: Vec(AGlobal) []]
+          (if (>= i (count docs)) (values fs fl gs)
+            (let [d (nth docs i)
+                  file (str pre (:file d))
+                  root (:root d)
+                  ln (:lines d)
+                  w (->W file hints kinds info)]
+              (if (not (and (= (xml/elem-uri root) ps/NS-CORE) (= (xml/elem-local root) "mule")))
+                (recur (+ i 1) (conj fs (->AFile file [])) fl gs)
+                (let [kids (xml/child-elems root)
+                      [fl2 gs2] (loop [k 0 a fl b gs]
+                                  (if (>= k (count kids)) (values a b)
+                                    (let [c (nth kids k) cl (kid-ln ln k) u (xml/elem-uri c) l (xml/elem-local c)]
+                                      (cond
+                                        (= u ps/NS-DOC) (recur (+ k 1) a b)
+                                        (and (= u ps/NS-CORE) (or (= l "flow") (= l "sub-flow"))) (recur (+ k 1) (conj a (flow-of w c cl)) b)
+                                        :else (recur (+ k 1) a (conj b (->AGlobal (attr-of c "" "name") (xml/qname-str (xml/elem-name c)) (str file) (:span cl))))))))]
+                  (recur (+ i 1) (conj fs (->AFile file [(:span ln)])) fl2 gs2))))))
+        bad (:bad l)
+        files2 (loop [i 0 acc files] (if (>= i (count bad)) acc (recur (+ i 1) (conj acc (->AFile (str pre (nth bad i)) [])))))
+        labels (loop [i 0 acc: Vec(Str) []] (if (>= i (count docs)) acc (recur (+ i 1) (conj acc (str (:file (nth docs i)))))))
+        labels2 (loop [i 0 acc labels] (if (>= i (count bad)) acc (recur (+ i 1) (conj acc (str (nth bad i))))))
+        sm (span-map flows)
+        ds (:diags app)
+        diags (loop [i 0 acc: Vec(ADiag) []]
+                (if (>= i (count ds)) acc
+                  (let [d (nth ds i)
+                        f (if (label-of labels2 (:file d)) (str pre (:file d)) (str (:file d)))
+                        bi (loop [k 0] (if (>= k (count bad)) -1 (if (= (nth bad k) (:file d)) k (recur (+ k 1)))))
+                        sp (cond (>= bi 0) (xml-err-span (:msg d) (nth (:bad-texts l) bi))
+                                 (= (:path d) "") []
+                                 :else (get sm (:path d) []))]
+                    (recur (+ i 1) (conj acc (->ADiag "error" (str (:msg d)) f (str (:path d)) sp "" ""))))))]
+    (->AModel files2 flows globals diags (source-entries app flows) [])))
+
+(defn- entry AEntry [kind: &Str flow: &Str src: &Str el: &Str]
+  (->AEntry (str kind) (str flow) (str src) (str el) "" "" -1 "" "" "" "" -1 false))
+
+(defn- param-of Str [ps: &Vec(m/Param) k: &Str]
+  (loop [i 0] (if (>= i (count ps)) "" (if (= (:name (nth ps i)) k) (match (:v (nth ps i)) (m/PLit s) (str s) _ "") (recur (+ i 1))))))
+
+(defn join-path Str [base: &Str p: &Str]
+  (let [b (if (str/ends-with? base "/") (subs base 0 (- (count base) 1)) (str base))
+        b2 (if (or (= b "") (str/starts-with? b "/")) b (str "/" b))
+        q (if (str/starts-with? p "/") (str p) (str "/" p))]
+    (str b2 q)))
+
+(defn listener-base Str [app: &m/App cfg: &Str]
+  (let [cs (:configs app)]
+    (loop [i 0] (if (>= i (count cs)) "" (if (= (:name (nth cs i)) cfg) (param-of (:params (nth cs i)) "basePath") (recur (+ i 1)))))))
+
+(defn- source-entries Vec(AEntry) [app: &m/App afs: &Vec(AFlow)]
+  (loop [i 0 acc: Vec(AEntry) []]
+    (if (>= i (count afs)) acc
+      (let [af (nth afs i)]
+        (if (= (count (:source af)) 0) (recur (+ i 1) acc)
+          (let [sn (nth (:source af) 0)
+                fl (:flows app)
+                k (loop [j 0] (if (>= j (count fl)) -1 (if (= (:name (nth fl j)) (:name af)) j (recur (+ j 1)))))
+                e0 (entry "connector" (:name af) (:path sn) (:element sn))]
+            (if (or (< k 0) (= (count (:source (nth fl k))) 0)) (recur (+ i 1) (conj acc e0))
+              (match (nth (:source (nth fl k)) 0)
+                (m/SrcHttpListener cref p ms a b c d e f g h o q w l)
+                (let [full (join-path (listener-base app cref) p)
+                      e1 (assoc e0 :kind "http" :path full)
+                      ms2 (loop [j 0 v: Vec(Str) []] (if (>= j (count ms)) v (recur (+ j 1) (let [x (str/upper-case (str/trim (nth ms j)))] (if (= x "") v (conj v x))))))]
+                  (if (= (count ms2) 0) (recur (+ i 1) (conj acc (assoc e1 :method "*")))
+                    (recur (+ i 1) (loop [j 0 a2 acc] (if (>= j (count ms2)) a2 (recur (+ j 1) (conj a2 (assoc e1 :method (nth ms2 j)))))))))
+                (m/SrcScheduler fq sd cron tz dc l)
+                (recur (+ i 1) (conj acc (if (= cron "") (assoc e0 :kind "scheduler" :frequency-ms fq) (assoc e0 :kind "scheduler" :cron cron :tz tz))))
+                _ (recur (+ i 1) (conj acc e0))))))))))
+
+(defn- collect-paths Map(Str Bool) [ns: &Vec(ANode) acc0: Map(Str Bool)]
+  (loop [i 0 acc acc0]
+    (if (>= i (count ns)) acc
+      (let [x (nth ns i)
+            a2 (if (or (route? (:kind x)) (= (:kind x) "eh") (= (:kind x) "entry")) acc (assoc acc (:path x) true))]
+        (recur (+ i 1) (collect-paths (:kids x) a2))))))
+
+(defn step-paths Map(Str Bool) [a: &AModel]
+  (let [fs (:flows a)]
+    (loop [i 0 acc: Map(Str Bool) {}]
+      (if (>= i (count fs)) acc
+        (let [f (nth fs i)
+              a1 (collect-paths (:steps f) acc)]
+          (recur (+ i 1) (collect-paths (:entries f) a1)))))))
+
+(defn- jstr Str [out: Str s: &Str] (let [e (json/escape (str s))] (str out "\"" e "\"")))
+
+(defn- jrange Str [out: Str a: Int b: Int] (str out "{\"start\":" a ",\"end\":" b "}"))
+
+(defn- jspans Str [out: Str s: &xml/XSpan]
+  (let [o1 (jrange (str out "{\"element\":") (:open s) (elem-end s))
+        o2 (jrange (str o1 ",\"open\":") (:open s) (:open-end s))]
+    (if (>= (:close s) 0) (str (jrange (str o2 ",\"close\":") (:close s) (:close-end s)) "}") (str o2 ",\"close\":null}"))))
+
+(defn- jattrs Str [out: Str s: &xml/XSpan]
+  (let [as (:attrs s)]
+    (loop [i 0 o (str out "[")]
+      (if (>= i (count as)) (str o "]")
+        (let [a (nth as i)
+              o1 (jstr (str o (if (> i 0) "," "") "{\"name\":") (:name a))
+              o2 (jstr (str o1 ",\"raw\":") (:raw a))
+              o3 (jrange (str o2 ",\"whole\":") (:start a) (:end a))
+              o4 (jrange (str o3 ",\"value\":") (:vstart a) (:vend a))]
+          (recur (+ i 1) (str o4 ",\"quote\":" (if (= (:quote a) 39) "\"'\"" "\"\\\"\"") "}")))))))
+
+(defn- jopt Str [out: Str key: &Str v: &Vec(Str)] (if (= (count v) 0) out (jstr (str out ",\"" key "\":") (nth v 0))))
+
+(defn- jstrs Str [out: Str v: &Vec(Str)]
+  (loop [i 0 o (str out "[")] (if (>= i (count v)) (str o "]") (recur (+ i 1) (jstr (if (> i 0) (str o ",") o) (nth v i))))))
+
+(defn route? Bool [k: &Str] (or (= k "when") (= k "otherwise") (= k "route") (= k "body") (= k "batch-step") (= k "aggregator") (= k "on-complete")))
+
+(defn- jnodes Str [out: Str ns: &Vec(ANode)]
+  (loop [i 0 o (str out "[")] (if (>= i (count ns)) (str o "]") (recur (+ i 1) (jnode (if (> i 0) (str o ",") o) (nth ns i))))))
+
+(defn- jnode Str [out: Str x: &ANode]
+  (if (route? (:kind x))
+    (let [o1 (jstr (str out "{\"kind\":") (:kind x))
+          o2 (cond
+               (= (:kind x) "batch-step")
+               (jopt (jstr (str (jopt (jstr (str o1 ",\"path\":") (:path x)) "name" (:label x)) ",\"acceptPolicy\":") (nth (:types x) 0)) "acceptExpression" (:cond x))
+               (= (:kind x) "aggregator")
+               (let [o (jstr (str o1 ",\"path\":") (:path x)) sz (nth (:types x) 0) [n ne] (parse-long sz)]
+                 (if (or (= sz "") (not= ne "")) o (str o ",\"size\":" n)))
+               :else (jopt (jstr (str o1 ",\"path\":") (:path x)) "condition" (:cond x)))
+          o3 (if (:has-span x) (jspans (str o2 ",\"spans\":") (:span x)) (str o2 ",\"spans\":null"))]
+      (str (jnodes (str o3 ",\"steps\":") (:kids x)) "}"))
+    (let [o1 (jopt (jstr (str out "{\"path\":") (:path x)) "docId" (:doc-id x))
+          o2 (jopt (jstr (str o1 ",\"element\":") (:element x)) "label" (:label x))
+          o3 (jstr (str (jstr (str o2 ",\"kind\":") (:kind x)) ",\"file\":") (:file x))
+          o4 (jattrs (str (jspans (str o3 ",\"spans\":") (:span x)) ",\"attrs\":") (:span x))
+          o5 (jnodes (str o4 ",\"routes\":") (routes-of x))
+          ehs (loop [i 0] (if (>= i (count (:kids x))) -1 (if (= (:kind (nth (:kids x) i)) "eh") i (recur (+ i 1)))))
+          o6 (if (< ehs 0) o5 (jeh (str o5 ",\"errorHandler\":") (:span (nth (:kids x) ehs)) (:kids (nth (:kids x) ehs))))]
+      (str (jstr (str (jstr (str o6 ",\"support\":") (:support x)) ",\"effect\":") (:effect x)) "}"))))
+
+(defn- jeh Str [out: Str sp: &xml/XSpan hs: &Vec(ANode)]
+  (let [o5 (jspans (str out "{\"spans\":") sp)
+        o6 (loop [i 0 o (str o5 ",\"entries\":[")] (if (>= i (count hs)) (str o "]") (recur (+ i 1) (jhandler (if (> i 0) (str o ",") o) (nth hs i)))))]
+    (str o6 "}")))
+
+(defn- jhandler Str [out: Str h: &ANode]
+  (let [o1 (jopt (jstr (str out "{\"path\":") (:path h)) "docId" (:doc-id h))
+        o2 (jstr (str (jopt o1 "label" (:label h)) ",\"element\":") (:element h))
+        o3 (jopt (jstrs (str o2 ",\"types\":") (:types h)) "when" (:cond h))
+        o4 (jspans (str o3 ",\"spans\":") (:span h))]
+    (str (jnodes (str o4 ",\"steps\":") (:kids h)) "}")))
+
+(defn- jflow Str [out: Str f: &AFlow]
+  (let [o1 (jstr (str (jstr (str (jstr (str out "{\"name\":") (:name f)) ",\"element\":") (:element f)) ",\"file\":") (:file f))
+        o2 (jspans (str o1 ",\"spans\":") (:span f))
+        o3 (if (= (count (:source f)) 0) o2 (jnode (str o2 ",\"source\":") (nth (:source f) 0)))
+        o4 (str (jnodes (str o3 ",\"steps\":") (:steps f)) ",\"bodyStart\":" (:body-start f))]
+    (if (= (count (:eh f)) 0) (str o4 "}")
+      (str (jeh (str o4 ",\"errorHandler\":") (nth (:eh f) 0) (:entries f)) "}"))))
+
+(defn to-json Str [a: &AModel]
+  (let [fs (:files a)
+        o1 (loop [i 0 o "{\"files\":["]
+             (if (>= i (count fs)) (str o "]")
+               (let [f (nth fs i)
+                     o2 (jstr (str (if (> i 0) (str o ",") o) "{\"path\":") (:path f))]
+                 (recur (+ i 1) (if (= (count (:root f)) 0) (str o2 ",\"root\":null}")
+                                  (let [r (nth (:root f) 0)
+                                        o3 (jspans (str o2 ",\"root\":{\"spans\":") r)]
+                                    (str (jattrs (str o3 ",\"attrs\":") r) "}}")))))))
+        fl (:flows a)
+        o4 (loop [i 0 o (str o1 ",\"flows\":[")] (if (>= i (count fl)) (str o "]") (recur (+ i 1) (jflow (if (> i 0) (str o ",") o) (nth fl i)))))
+        gs (:globals a)
+        o5 (loop [i 0 o (str o4 ",\"globals\":[")]
+             (if (>= i (count gs)) (str o "]")
+               (let [g (nth gs i)
+                     o2 (if (= (count (:name g)) 0) (str (if (> i 0) (str o ",") o) "{") (str (jstr (str (if (> i 0) (str o ",") o) "{\"name\":") (nth (:name g) 0)) ","))
+                     o3 (jstr (str (jstr (str o2 "\"element\":") (:element g)) ",\"file\":") (:file g))
+                     o6 (jspans (str o3 ",\"spans\":") (:span g))]
+                 (recur (+ i 1) (str (jattrs (str o6 ",\"attrs\":") (:span g)) "}")))))
+        ds (:diags a)
+        o7 (loop [i 0 o (str o5 ",\"diagnostics\":[")]
+             (if (>= i (count ds)) (str o "]")
+               (let [d (nth ds i)
+                     o2 (jstr (str (jstr (str (jstr (str (if (> i 0) (str o ",") o) "{\"severity\":") (:severity d)) ",\"message\":") (:message d)) ",\"file\":") (:file d))
+                     o3 (if (= (count (:span d)) 2) (jrange (str o2 ",\"span\":") (nth (:span d) 0) (nth (:span d) 1)) o2)
+                     o4 (if (= (:path d) "") o3 (jstr (str o3 ",\"path\":") (:path d)))
+                     q5 (if (= (:code d) "") o4 (jstr (str o4 ",\"code\":") (:code d)))
+                     q6 (if (= (:data d) "") q5 (str q5 ",\"data\":" (:data d)))]
+                 (recur (+ i 1) (str q6 "}")))))]
+    (str (japis (jentries (str o7 ",\"entries\":") (:entries a)) (:apis a)) "}")))
+
+(defn- jentry Str [out: Str e: &AEntry]
+  (let [o1 (jstr (str (jstr (str (jstr (str out "{\"kind\":") (:kind e)) ",\"flow\":") (:flow e)) ",\"source\":") (:source e))
+        o2 (jstr (str o1 ",\"element\":") (:element e))]
+    (cond
+      (= (:kind e) "http") (str (jstr (str (jstr (str o2 ",\"method\":") (:method e)) ",\"path\":") (:path e)) "}")
+      (= (:kind e) "scheduler")
+      (if (= (:cron e) "") (str o2 ",\"schedule\":{\"frequencyMs\":" (:frequency-ms e) "}}")
+        (let [o3 (jstr (str o2 ",\"schedule\":{\"cron\":") (:cron e))]
+          (str (if (= (:tz e) "") o3 (jstr (str o3 ",\"timeZone\":") (:tz e))) "}}")))
+      (= (:kind e) "apikit")
+      (let [o3 (jstr (str (jstr (str (jstr (str (jstr (str out "{\"kind\":") (:kind e)) ",\"flow\":") (:flow e)) ",\"source\":null,\"element\":") (:element e)) ",\"method\":") (:method e))
+            o4 (jnull-str (str (jnull-str (str (jstr (str o3 ",\"path\":") (:path e)) ",\"main\":") (:main e)) ",\"router\":") (:source e))]
+        (str (jstr (str o4 ",\"api\":") (:api e)) ",\"operation\":" (:op e) ",\"implemented\":" (if (:implemented e) "true" "false") "}"))
+      :else (str o2 "}"))))
+
+(defn- jentries Str [out: Str es: &Vec(AEntry)]
+  (loop [i 0 o (str out "[")] (if (>= i (count es)) (str o "]") (recur (+ i 1) (jentry (if (> i 0) (str o ",") o) (nth es i))))))
+
+(defn- jints Str [out: Str v: &Vec(Int)] (if (= (count v) 2) (jrange out (nth v 0) (nth v 1)) (str out "null")))
+
+(defn- jop Str [out: Str o: &AOp]
+  (let [o1 (jstr (str (jstr (str out "{\"method\":") (:method o)) ",\"path\":") (:path o))
+        o2 (jints (str (jints (str o1 ",\"key\":") (:key o)) ",\"block\":") (:block o))
+        ps (:params o)
+        o3 (loop [i 0 x (str o2 ",\"params\":[")]
+             (if (>= i (count ps)) (str x "]")
+               (let [p (nth ps i)
+                     x1 (jstr (str (jstr (str (if (> i 0) (str x ",") x) "{\"name\":") (:name p)) ",\"in\":") (:in p))
+                     x2 (str x1 ",\"required\":" (if (:required p) "true" "false") ",\"type\":")
+                     x3 (if (= (:type p) "") (str x2 "null") (jstr x2 (:type p)))]
+                 (recur (+ i 1) (str (if (= (count (:example p)) 0) x3 (jstr (str x3 ",\"example\":") (nth (:example p) 0))) "}")))))
+        o4 (jstrs (str (jstrs (str o3 ",\"requestMediaTypes\":") (:media o)) ",\"responses\":") (:codes o))
+        o5 (str (jstr (str o4 ",\"flow\":") (:flow o)) ",\"implemented\":" (if (:implemented o) "true" "false"))
+        xs (:resp-ex o)
+        o6 (loop [i 0 x (str o5 ",\"responseExamples\":[")]
+             (if (>= i (count xs)) (str x "]")
+               (let [e (nth xs i)]
+                 (recur (+ i 1) (str (jstr (str (jstr (str (jstr (str (if (> i 0) (str x ",") x) "{\"status\":") (:status e)) ",\"mediaType\":") (:mime e)) ",\"body\":") (:body e)) "}")))))
+        o7 (jex (str o6 ",\"requestExample\":") (:req-ex o))
+        o8 (jex (str o7 ",\"requestSample\":") (:req-sample o))]
+    (str (jstrs (str o8 ",\"requestRequired\":") (:req-required o)) "}")))
+
+(defn- jex Str [out: Str rq: &Vec(AEx)]
+  (if (= (count rq) 0) (str out "null")
+    (str (jstr (str (jstr (str out "{\"mediaType\":") (:mime (nth rq 0))) ",\"body\":") (:body (nth rq 0))) "}")))
+
+(defn- japis Str [out: Str as: &Vec(AApi)]
+  (loop [i 0 o (str out ",\"apis\":[")]
+    (if (>= i (count as)) (str o "]")
+      (let [a (nth as i)
+            o1 (jstr (str (jstr (str (jstr (str (if (> i 0) (str o ",") o) "{\"config\":") (:config a)) ",\"file\":") (:file a)) ",\"format\":") (:format a))
+            o2 (if (= (:error a) "") (str o1 ",\"error\":null") (jstr (str o1 ",\"error\":") (:error a)))
+            ops (:ops a)
+            o3 (loop [k 0 x (str o2 ",\"operations\":[")] (if (>= k (count ops)) (str x "]") (recur (+ k 1) (jop (if (> k 0) (str x ",") x) (nth ops k)))))]
+        (recur (+ i 1) (str o3 "}"))))))
+
+(defn- jnull-str Str [out: Str s: &Str] (if (= s "") (str out "null") (jstr out s)))
+
+(defn router-of Vec(Str) [f: &m/Flow cfg: &Str]
+  (let [ps (:procs f)]
+    (loop [i 0] (if (>= i (count ps)) []
+                  (match (nth ps i)
+                    (m/PrConnectorOp cn op cref a b c d g h l)
+                    (if (and (= cn "mule-apikit") (= op "router") (= cref cfg)) [(str (:name f) "/processors/" i)] (recur (+ i 1)))
+                    _ (recur (+ i 1)))))))
+
+(defn with-apis AModel [md: AModel app: &m/App apis: Vec(AApi)]
+  (let [es0 (:entries md)
+        fl (:flows app)
+        es (loop [i 0 acc es0]
+             (if (>= i (count apis)) acc
+               (let [a (nth apis i)
+                     mains (loop [k 0 v: Vec(Vec(Str)) []]
+                             (if (>= k (count fl)) v
+                               (let [r (router-of (nth fl k) (:config a))]
+                                 (recur (+ k 1) (if (= (count r) 0) v (conj v [(str (:name (nth fl k))) (nth r 0)]))))))
+                     bases (loop [k 0 v: Vec(Vec(Str)) []]
+                             (if (>= k (count mains)) (if (= (count v) 0) [["" "" ""]] v)
+                               (let [mn (nth (nth mains k) 0)
+                                     hs (loop [q 0 w: Vec(Str) []] (if (>= q (count es0)) w (recur (+ q 1) (let [e (nth es0 q)] (if (and (= (:flow e) mn) (= (:kind e) "http")) (conj w (str (:path e))) w)))))
+                                     b0 (if (= (count hs) 0) "" (nth hs 0))
+                                     b1 (cond (str/ends-with? b0 "/*") (subs b0 0 (- (count b0) 2)) (str/ends-with? b0 "*") (subs b0 0 (- (count b0) 1)) :else b0)]
+                                 (recur (+ k 1) (conj v [mn (nth (nth mains k) 1) b1])))))
+                     ops (:ops a)]
+                 (recur (+ i 1)
+                        (loop [b 0 acc2 acc]
+                          (if (>= b (count bases)) acc2
+                            (let [mb (nth bases b)]
+                              (recur (+ b 1)
+                                     (loop [k 0 acc3 acc2]
+                                       (if (>= k (count ops)) acc3
+                                         (let [o (nth ops k)]
+                                           (recur (+ k 1) (conj acc3 (->AEntry "apikit" (str (:flow o)) (str (nth mb 1)) "apikit:router" (str (:method o))
+                                                                               (if (= (nth mb 2) "") (str (:path o)) (join-path (nth mb 2) (:path o)))
+                                                                               -1 "" "" (str (nth mb 0)) (str (:config a)) k (:implemented o)))))))))))))))]
+    (assoc md :entries es :apis apis)))
+
+(defn warning ADiag [md: &AModel path: &Str msg: &Str code: &Str data: &Str]
+  (let [fs (:flows md)
+        k (str/index-of path "/")
+        fname (if (< k 0) (str path) (subs path 0 k))
+        file (loop [i 0] (if (>= i (count fs)) "" (if (= (:name (nth fs i)) fname) (str (:file (nth fs i))) (recur (+ i 1)))))
+        sm (span-map fs)]
+    (->ADiag "warning" (str msg) file (str path) (get sm path []) (str code) (str data))))
+
+(defn with-diags AModel [md: AModel ds: &Vec(ADiag)]
+  (let [old (:diags md)] (assoc md :diags (loop [i 0 acc old] (if (>= i (count ds)) acc (recur (+ i 1) (conj acc (nth ds i))))))))

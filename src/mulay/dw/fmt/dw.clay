@@ -1,0 +1,231 @@
+(ns mulay.dw.fmt.dw
+  (:require [mulay.dw.val :as v] [mulay.dw.num :as num] [mulay.dw.fmt.props :as p] [clay.base64 :as b64]
+            [clay.string :as str]))
+
+(defrecord Ctx [indent: Str ignore-schema: Bool max: Int])
+
+(defn opts-of Values(Ctx Str) [props: &Vec(v/Field)]
+  (let [r (p/get-prop props "indent")
+        [ind e1] (if (= (count r) 0) (values "  " "")
+                   (match (v/unmeta (nth r 0))
+                     (v/VStr s) (values s "")
+                     (v/VBool b) (values "  " "Option `indent` expects 'String' but was 'Boolean'")
+                     _ (values "  " (str "Option `indent` expects 'String' but was '" (v/type-name (v/unmeta (nth r 0))) "'"))))
+        [ig e2] (p/pbool props "ignoreSchema" false)
+        [mx e3] (p/pint props "maxCollectionSize" -1)
+        [od e4] (p/pbool props "onlyData" true)]
+    (values (->Ctx ind ig mx) (p/either-err (p/either-err e1 e2) (p/either-err e3 e4)))))
+
+(defn default-ctx Ctx [] (->Ctx "  " false -1))
+
+(defn- hex1 Str [n: Int] (subs "0123456789abcdef" n (+ n 1)))
+
+(defn escape-into Str [out: Str s: &Str]
+  (let [n (count s)]
+    (loop [acc out i 0 run 0]
+      (if (>= i n)
+        (if (< run i) (str acc (subs s run i)) acc)
+        (let [c (nth s i)
+              e: Str (case c
+                       34 "\\\""
+                       92 "\\\\"
+                       8 "\\b"
+                       12 "\\f"
+                       10 "\\n"
+                       13 "\\r"
+                       9 "\\t"
+                       36 "\\$"
+                       127 "\\u007f"
+                       (if (< c 32) (str "\\u00" (hex1 (quot c 16)) (hex1 (mod c 16))) ""))]
+          (if (= (count e) 0) (recur acc (+ i 1) run)
+            (let [a2 (if (< run i) (str acc (subs s run i)) acc)
+                  a3 (str a2 e)]
+              (recur a3 (+ i 1) (+ i 1)))))))))
+
+(defn- quoted Str [out: Str s: &Str] (let [a (str out "\"") b (escape-into a s)] (str b "\"")))
+
+(def KEYWORDS ["async" "and" "or" "unless" "input" "output" "false" "true" "null" "throw" "is" "default" "private"
+               "using" "enum" "case" "var" "for" "yield" "if" "do" "ns" "as" "fun" "import" "type" "else"])
+
+(defn- ident? Bool [s: &Str]
+  (let [n (count s)
+        alpha? (fn Bool [c: Int] (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))]
+    (and (> n 0) (alpha? (nth s 0))
+         (loop [i 1] (if (>= i n) true
+                       (let [c (nth s i)] (if (or (alpha? c) (and (>= c 48) (<= c 57)) (= c 95)) (recur (+ i 1)) false))))
+         (loop [i 0] (if (>= i (count KEYWORDS)) true (if (= (nth KEYWORDS i) s) false (recur (+ i 1))))))))
+
+(defn- name-into Str [out: Str s: &Str] (if (ident? s) (str out s) (quoted out s)))
+
+(defn- prefix-of Vec(Str) [nss: &Vec(v/Ns) uri: &Str]
+  (loop [i (- (count nss) 1)]
+    (if (< i 0) [] (if (= (:uri (nth nss i)) uri) [(:prefix (nth nss i))] (recur (- i 1))))))
+
+(defn- prefix-used? Bool [nss: &Vec(v/Ns) pre: &Str]
+  (loop [i 0] (if (>= i (count nss)) false (if (= (:prefix (nth nss i)) pre) true (recur (+ i 1))))))
+
+(defn- fresh-prefix Str [nss: &Vec(v/Ns)]
+  (loop [k 0] (let [c (str "ns" k)] (if (prefix-used? nss c) (recur (+ k 1)) c))))
+
+(defn- declare Values(Vec(v/Ns) Vec(v/Ns)) [nss: Vec(v/Ns) news: Vec(v/Ns) ns: &Vec(v/Ns)]
+  (if (= (count ns) 0) (values nss news)
+    (let [n (nth ns 0) uri (:uri n)]
+      (if (> (count (prefix-of nss uri)) 0) (values nss news)
+        (let [pre (if (or (= (:prefix n) "") (prefix-used? nss (:prefix n))) (fresh-prefix nss) (:prefix n))
+              d (v/->Ns pre (str uri))]
+          (values (conj nss d) (conj news d)))))))
+
+(defn- qname-into Str [out: Str ns: &Vec(v/Ns) name: &Str nss: &Vec(v/Ns)]
+  (if (= (count ns) 0) (name-into out name)
+    (let [pr (prefix-of nss (:uri (nth ns 0)))
+          a (if (= (count pr) 0) out (str out (nth pr 0) "#"))]
+      (name-into a name))))
+
+(defn- nl Str [out: Str c: &Ctx] (if (= (count (:indent c)) 0) out (str out "\n")))
+
+(defn- pad Str [out: Str c: &Ctx depth: Int]
+  (loop [acc out i 0] (if (>= i depth) acc (recur (str acc (:indent c)) (+ i 1)))))
+
+(defn- meta-fields Vec(v/Field) [m: &Vec(v/Field)]
+  (loop [i 0 acc: Vec(v/Field) []]
+    (if (>= i (count m)) acc
+      (let [f (nth m i) k (:name (:key f))]
+        (recur (+ i 1) (if (or (= k "@attrs")
+                               (and (= k "raw") (match (v/unmeta (:value f)) (v/VObj fs) true (v/VArr xs) true (v/VFn g) true _ false)))
+                         acc (conj acc f)))))))
+
+(defn- schema-type-name Str [x: &v/Val]
+  (match x
+    (v/VRange a b) "Range"
+    (v/VKey k) "Key"
+    _ (v/type-name x)))
+
+(defn write-into Values(Str Str) [out: Str x0: &v/Val c: &Ctx depth: Int nss: &Vec(v/Ns)]
+  (let [[x m0] (p/split-meta x0)
+        m (if (:ignore-schema c) [] (meta-fields m0))
+        [o1 err] (write-bare out x c depth nss)]
+    (if (or (not= err "") (= (count m) 0)) (values o1 err)
+      (let [o2 (str o1 " as " (schema-type-name x) " ")]
+        (write-inline-obj o2 m c depth nss)))))
+
+(defn- write-inline-obj Values(Str Str) [out: Str fs: &Vec(v/Field) c: &Ctx depth: Int nss: &Vec(v/Ns)]
+  (loop [acc (str out "{") i 0]
+    (if (>= i (count fs)) (values (str acc "}") "")
+      (let [f (nth fs i)
+            k (:key f)
+            a1 (if (> i 0) (str acc ", ") acc)
+            a2 (qname-into a1 (:ns k) (:name k) nss)
+            a3 (str a2 ": ")
+            [a4 e] (write-into a3 (:value f) c depth nss)]
+        (if (not= e "") (values a4 e) (recur a4 (+ i 1)))))))
+
+(defn- write-bare Values(Str Str) [out: Str x: &v/Val c: &Ctx depth: Int nss: &Vec(v/Ns)]
+  (match x
+    (v/VNull) (values (str out "null") "")
+    (v/VBool b) (values (str out (if b "true" "false")) "")
+    (v/VNum n) (let [t (num/to-string n)] (values (str out t) ""))
+    (v/VInt n-i) (let [n (num/from-int n-i)] (let [t (num/to-string n)] (values (str out t) "")))
+    (v/VStr s) (values (quoted out s) "")
+    (v/VKey k) (values (quoted out (:name k)) "")
+    (v/VRegex s f) (values (str out "/" s "/") "")
+    (v/VBin b) (let [e (b64/encode (str b))] (values (str out "\"" e "\" as Binary {base: \"64\"}") ""))
+    (v/VType t) (values (quoted out (v/type-display t)) "")
+    (v/VNsV n) (let [a1 (pad (nl (str out "{") c) c (+ depth 1))
+                     a2 (quoted (str a1 "uri: ") (:uri n))
+                     a3 (pad (nl (str a2 ",") c) c (+ depth 1))
+                     a4 (quoted (str a3 "prefix: ") (:prefix n))
+                     a5 (pad (nl a4 c) c depth)]
+                 (values (str a5 "}as Namespace") ""))
+    (v/VFn f) (values (str out "(" (fn-params f) ") -> ???") "")
+    (v/VArr xs) (write-arr out xs c depth nss)
+    (v/VRange a b) (write-arr out (v/items x) c depth nss)
+    (v/VObj fs) (write-obj out fs c depth nss)
+    (v/VMeta y m) (write-into out x c depth nss)
+    _ (let [[t ok] (v/temporal-str x)] (if ok (values (str out "|" t "|") "") (values out (str "Cannot write " (v/type-name x)))))))
+
+(defn- fn-params Str [f: &v/FnV]
+  (match (:host f)
+    (Some h) (let [ps (:params h) ts (:ptypes h)]
+               (loop [i 0 acc ""] (if (>= i (count ps)) acc (recur (+ i 1) (str acc (if (> i 0) ", " "") (nth ps i) ":" (:name (nth ts i)))))))
+    (None) (let [n (:arity f)]
+             (loop [i 0 acc ""] (if (>= i n) acc (recur (+ i 1) (str acc (if (> i 0) ", " "") "arg" i ":Any")))))))
+
+(defn- write-arr Values(Str Str) [out: Str xs: &Vec(v/Val) c: &Ctx depth: Int nss: &Vec(v/Ns)]
+  (let [n0 (count xs)
+        n (if (and (>= (:max c) 0) (< (:max c) n0)) (:max c) n0)]
+    (if (= n 0)
+      (if (> n0 0)
+        (let [a1 (nl (str out "[") c) a2 (nl (pad a1 c (+ depth 1)) c)] (values (str (pad a2 c depth) "]") ""))
+        (values (str out "[]") ""))
+      (loop [acc (str out "[") i 0]
+        (if (>= i n)
+          (let [a1 (nl acc c) a2 (pad a1 c depth)] (values (str a2 "]") ""))
+          (let [a1 (nl (if (> i 0) (str acc ", ") acc) c)
+                a2 (pad a1 c (+ depth 1))
+                [a3 e] (write-into a2 (nth xs i) c (+ depth 1) nss)]
+            (if (not= e "") (values a3 e) (recur a3 (+ i 1)))))))))
+
+(defn- write-obj Values(Str Str) [out: Str fs0: &Vec(v/Field) c: &Ctx depth: Int nss0: &Vec(v/Ns)]
+  (let [fs (if (and (>= (:max c) 0) (< (:max c) (count fs0)))
+             (loop [i 0 acc: Vec(v/Field) []] (if (>= i (:max c)) acc (recur (+ i 1) (conj acc (nth fs0 i)))))
+             fs0)
+        [nss news] (loop [i 0 ns1: Vec(v/Ns) (clone-ns nss0) nw: Vec(v/Ns) []]
+                     (if (>= i (count fs)) (values ns1 nw)
+                       (let [k (:key (nth fs i))
+                             [ns2 nw2] (declare ns1 nw (:ns k))
+                             [ns3 nw3] (loop [j 0 a ns2 b nw2]
+                                         (if (>= j (count (:attrs k))) (values a b)
+                                           (let [[a2 b2] (declare a b (:ns (nth (:attrs k) j)))] (recur (+ j 1) a2 b2))))]
+                         (recur (+ i 1) ns3 nw3))))]
+    (if (and (= (count fs) 0) (> (count fs0) 0))
+      (let [a1 (nl (str out "{") c) a2 (nl (pad a1 c (+ depth 1)) c)] (values (str (pad a2 c depth) "}") ""))
+    (if (= (count news) 0) (write-fields out fs c depth nss)
+      (let [a0 (str out "do {")
+            a1 (loop [acc a0 i 0]
+                 (if (>= i (count news)) acc
+                   (let [n (nth news i) b1 (nl acc c) b2 (pad b1 c (+ depth 1))]
+                     (recur (str b2 "ns " (:prefix n) " " (:uri n)) (+ i 1)))))
+            a2 (pad (nl a1 c) c (+ depth 1))
+            a3 (pad (nl (str a2 "---") c) c (+ depth 1))
+            [a4 e] (write-fields a3 fs c (+ depth 1) nss)]
+        (if (not= e "") (values a4 e)
+          (let [a5 (pad (nl a4 c) c depth)] (values (str a5 "}") ""))))))))
+
+(defn- clone-ns Vec(v/Ns) [xs: &Vec(v/Ns)] (loop [i 0 acc: Vec(v/Ns) []] (if (>= i (count xs)) acc (recur (+ i 1) (conj acc (nth xs i))))))
+
+(defn- write-fields Values(Str Str) [out: Str fs: &Vec(v/Field) c: &Ctx depth: Int nss: &Vec(v/Ns)]
+  (if (= (count fs) 0) (values (str out "{}") "")
+    (loop [acc (str out "{") i 0]
+      (if (>= i (count fs))
+        (let [a1 (nl acc c) a2 (pad a1 c depth)] (values (str a2 "}") ""))
+        (let [f (nth fs i)
+              k (:key f)
+              a1 (nl (if (> i 0) (str acc ",") acc) c)
+              a2 (pad a1 c (+ depth 1))
+              a3 (qname-into a2 (:ns k) (:name k) nss)
+              [a4 e0] (write-attrs a3 (:attrs k) c (+ depth 1) nss)
+              a5 (str a4 ": ")
+              [a6 e] (if (not= e0 "") (values a5 e0) (write-into a5 (:value f) c (+ depth 1) nss))]
+          (if (not= e "") (values a6 e) (recur a6 (+ i 1))))))))
+
+(defn- write-attrs Values(Str Str) [out: Str as: &Vec(v/Attr) c: &Ctx depth: Int nss: &Vec(v/Ns)]
+  (if (= (count as) 0) (values out "")
+    (loop [acc (str out " @(") i 0]
+      (if (>= i (count as)) (values (str acc ")") "")
+        (let [a (nth as i)
+              a1 (if (> i 0) (str acc ", ") acc)
+              a2 (qname-into a1 (:ns a) (:name a) nss)
+              a3 (str a2 ": ")
+              [a4 e] (write-into a3 (:value a) c depth nss)]
+          (if (not= e "") (values a4 e) (recur a4 (+ i 1))))))))
+
+(defn write Values(Str Str) [x: &v/Val props: &Vec(v/Field)] (write-ns x props []))
+
+(defn write-ns Values(Str Str) [x: &v/Val props: &Vec(v/Field) nss: &Vec(v/Ns)]
+  (let [[c e] (opts-of props)]
+    (if (not= e "") (values "" e)
+      (if (= (count nss) 0) (write-into "" x c 0 [])
+        (let [h (loop [i 0 acc "%dw 2.0\n"]
+                  (if (>= i (count nss)) (str acc "---\n")
+                    (recur (+ i 1) (str acc "ns " (:prefix (nth nss i)) " " (:uri (nth nss i)) "\n"))))]
+          (write-into h x c 0 (clone-ns nss)))))))

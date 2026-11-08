@@ -1,0 +1,419 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Web Service Consumer (mule-wsc-connector 2.2.2) の照合。
+  偽の SOAP サービス (soap-server: /soap/<11|12>/<mode>) は受け取った要求を Object Store に置き (GET /last)、
+  resp.dwl の応答を返す。呼ぶ側の口は /call?ver=11|12&mode=..&op=.. (本文がそのまま wsc:body になる) など。
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:wsc="http://www.mulesoft.org/schema/mule/wsc"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/wsc http://www.mulesoft.org/schema/mule/wsc/current/mule-wsc.xsd">
+
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18470"/>
+    </http:listener-config>
+
+    <os:object-store name="Seen" persistent="false"/>
+
+    <!-- 宛先は mode ごとに式で変える (動的な config) -->
+    <wsc:config name="W11">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort"
+                        address="#['http://localhost:18470/soap/11/' ++ (vars.mode default 'echo')]"/>
+    </wsc:config>
+    <wsc:config name="W12">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort12" soapVersion="SOAP12"
+                        address="#['http://localhost:18470/soap/12/' ++ (vars.mode default 'echo')]"/>
+    </wsc:config>
+    <!-- address を書かない (WSDL の soap:address) -->
+    <wsc:config name="Wplain">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort"/>
+    </wsc:config>
+    <wsc:config name="Wsec">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort" address="http://localhost:18470/soap/11/echo">
+            <wsc:web-service-security>
+                <wsc:username-token-security-strategy username="alice" password="s3cret"/>
+                <wsc:timestamp-security-strategy timeToLive="120"/>
+            </wsc:web-service-security>
+        </wsc:connection>
+    </wsc:config>
+    <wsc:config name="Wsec12">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort" address="http://localhost:18470/soap/12/echo" soapVersion="SOAP12">
+            <wsc:web-service-security actor="urn:act">
+                <wsc:username-token-security-strategy username="carol" password="a&amp;b&lt;c" addNonce="true"/>
+                <wsc:timestamp-security-strategy timeToLive="2" timeToLiveUnit="MINUTES"/>
+            </wsc:web-service-security>
+        </wsc:connection>
+    </wsc:config>
+    <wsc:config name="Wnomust">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort" address="http://localhost:18470/soap/11/echo">
+            <wsc:web-service-security mustUnderstand="false" securityHeadersOrder="TimestampAtStart">
+                <wsc:username-token-security-strategy username="dave" password="pw" addCreated="true"/>
+                <wsc:timestamp-security-strategy/>
+            </wsc:web-service-security>
+        </wsc:connection>
+    </wsc:config>
+    <!-- Created の規則: 1.1 で addNonce だけ、1.2 で addCreated だけ -->
+    <wsc:config name="Wnonce11">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort" address="http://localhost:18470/soap/11/echo">
+            <wsc:web-service-security>
+                <wsc:username-token-security-strategy username="erin" password="pw" addNonce="true"/>
+            </wsc:web-service-security>
+        </wsc:connection>
+    </wsc:config>
+    <wsc:config name="Wcreated12">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort" address="http://localhost:18470/soap/12/echo" soapVersion="SOAP12">
+            <wsc:web-service-security>
+                <wsc:username-token-security-strategy username="fay" password="pw" addCreated="true"/>
+            </wsc:web-service-security>
+        </wsc:connection>
+    </wsc:config>
+    <wsc:config name="Wdigest">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort" address="http://localhost:18470/soap/11/echo">
+            <wsc:web-service-security>
+                <wsc:username-token-security-strategy username="bob" password="pw" passwordType="DIGEST" addNonce="true" addCreated="true"/>
+            </wsc:web-service-security>
+        </wsc:connection>
+    </wsc:config>
+    <wsc:config name="Wtimeout">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort" address="http://localhost:18470/soap/11/slow">
+            <wsc:custom-transport-configuration>
+                <wsc:default-http-transport-configuration timeout="1000"/>
+            </wsc:custom-transport-configuration>
+        </wsc:connection>
+    </wsc:config>
+    <wsc:config name="Wdown">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort" address="http://localhost:18479/nobody"/>
+    </wsc:config>
+    <wsc:config name="Wlatin">
+        <wsc:connection wsdlLocation="wsdl/echo.wsdl" service="EchoService" port="EchoPort" address="http://localhost:18470/soap/11/echo" encoding="ISO-8859-1"/>
+    </wsc:config>
+    <wsc:config name="Wrpc">
+        <wsc:connection wsdlLocation="wsdl/calc-rpc.wsdl" service="CalcService" port="CalcPort"/>
+    </wsc:config>
+    <wsc:config name="Wimp">
+        <wsc:connection wsdlLocation="wsdl/imp/service.wsdl" service="PingService" port="PingPort"/>
+    </wsc:config>
+    <!-- WSDL、service、port を式にして、誤りを実行時に試す -->
+    <wsc:config name="Wdyn">
+        <wsc:connection wsdlLocation="#[vars.wsdl]" service="#[vars.svc]" port="#[vars.port]" address="http://localhost:18470/soap/11/echo"/>
+    </wsc:config>
+
+    <!-- ===== 偽の SOAP サービス ===== -->
+    <flow name="soap-server">
+        <http:listener config-ref="L" path="/soap/*" outputMimeType="text/plain">
+            <http:response statusCode="#[vars.resp.status]"/>
+        </http:listener>
+        <set-variable variableName="ver" value="#[(attributes.requestPath splitBy '/')[-2]]"/>
+        <set-variable variableName="mode" value="#[(attributes.requestPath splitBy '/')[-1]]"/>
+        <os:store key="last" objectStore="Seen">
+            <os:value>#[output application/json --- {method: attributes.method, path: attributes.requestPath, query: attributes.queryString, headers: attributes.headers, body: payload default ''}]</os:value>
+        </os:store>
+        <choice>
+            <when expression="#[vars.mode == 'slow']">
+                <set-variable variableName="waited" value="#[dw::Runtime::wait('x', 3000)]"/>
+            </when>
+        </choice>
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="resp" resource="resp.dwl"/>
+            </ee:variables>
+        </ee:transform>
+        <choice>
+            <when expression="#[vars.resp.ct == 'xml11']"><set-payload value="#[vars.resp.body]" mimeType="text/xml; charset=UTF-8"/></when>
+            <when expression="#[vars.resp.ct == 'xml12']"><set-payload value="#[vars.resp.body]" mimeType="application/soap+xml; charset=UTF-8"/></when>
+            <when expression="#[vars.resp.ct == 'latin1']"><set-payload value="#[vars.resp.body]" mimeType="text/xml; charset=ISO-8859-1"/></when>
+            <when expression="#[vars.resp.ct == 'html']"><set-payload value="#[vars.resp.body]" mimeType="text/html"/></when>
+            <otherwise><set-payload value="#[vars.resp.body]" mimeType="text/plain"/></otherwise>
+        </choice>
+    </flow>
+
+    <flow name="last">
+        <http:listener config-ref="L" path="/last"/>
+        <os:retrieve key="last" objectStore="Seen">
+            <os:default-value>#[output application/json --- {}]</os:default-value>
+        </os:retrieve>
+    </flow>
+
+    <!-- ===== 呼ぶ側 ===== -->
+    <!-- 結果の形: payload (body、headers、attachments) と attributes を JSON に。raw=1 なら body をそのまま -->
+    <sub-flow name="show">
+        <choice>
+            <when expression="#[vars.raw == '1']">
+                <set-payload value="#[payload.body]"/>
+            </when>
+            <when expression="#[vars.raw != '0' and vars.raw != null]">
+                <set-payload value="#[payload.headers[vars.raw]]"/>
+            </when>
+            <otherwise>
+                <set-payload value="#[output application/json --- {
+                    body: payload.body, bodyMime: payload.body.^mimeType,
+                    headers: payload.headers, headerMimes: payload.headers mapObject ((v, k) -> {(k): v.^mimeType}),
+                    attachments: payload.attachments,
+                    attributes: attributes update { case ph at .protocolHeaders -&gt; ph - 'date' }, attributesClass: attributes.^class, payloadClass: payload.^class}]"/>
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <flow name="call">
+        <http:listener config-ref="L" path="/call"/>
+        <set-variable variableName="mode" value="#[attributes.queryParams.mode default 'echo']"/>
+        <set-variable variableName="op" value="#[attributes.queryParams.op default 'echo']"/>
+        <set-variable variableName="raw" value="#[attributes.queryParams.raw default '0']"/>
+        <choice>
+            <when expression="#[attributes.queryParams.ver == '12']">
+                <wsc:consume config-ref="W12" operation="#[vars.op]">
+                    <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+                </wsc:consume>
+            </when>
+            <otherwise>
+                <wsc:consume config-ref="W11" operation="#[vars.op]">
+                    <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+                </wsc:consume>
+            </otherwise>
+        </choice>
+        <flow-ref name="show"/>
+    </flow>
+
+    <!-- 本文を DW で作る (XML の宣言と字下げの付いた本文) -->
+    <flow name="call-dw">
+        <http:listener config-ref="L" path="/call-dw"/>
+        <wsc:consume config-ref="Wplain" operation="echo">
+            <wsc:message>
+                <wsc:body>#[output application/xml ns e urn:mulay:echo --- {e#echo: {text: attributes.queryParams.text default 'hi'}}]</wsc:body>
+            </wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <!-- SOAP の Header (本文は要求の本文、headers は DW) -->
+    <flow name="call-headers">
+        <http:listener config-ref="L" path="/call-headers"/>
+        <set-variable variableName="mode" value="#[attributes.queryParams.mode default 'header']"/>
+        <wsc:consume config-ref="W11" operation="echoTraced">
+            <wsc:message>
+                <wsc:body>#[payload]</wsc:body>
+                <wsc:headers>#[output application/xml ns e urn:mulay:echo --- {headers: {e#trace: 'tr-1'}}]</wsc:headers>
+            </wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <!-- HTTP のヘッダーを足す (子要素と transportHeaders の式) -->
+    <flow name="call-th">
+        <http:listener config-ref="L" path="/call-th"/>
+        <wsc:consume config-ref="Wplain" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+            <wsc:transport-headers>
+                <wsc:transport-header key="X-Static" value="s1"/>
+                <wsc:transport-header key="SOAPAction" value="override"/>
+            </wsc:transport-headers>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-th2">
+        <http:listener config-ref="L" path="/call-th2"/>
+        <wsc:consume config-ref="Wplain" operation="echo" transportHeaders="#[{'X-Expr': 'e1', 'Content-Type': 'text/plain'}]">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-prolog">
+        <http:listener config-ref="L" path="/call-prolog"/>
+        <set-variable variableName="raw" value="#[attributes.queryParams.raw default '0']"/>
+        <wsc:consume config-ref="Wplain" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+            <wsc:message-customizations forceXMLProlog="true"/>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-sec">
+        <http:listener config-ref="L" path="/call-sec"/>
+        <wsc:consume config-ref="Wsec" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-sec12">
+        <http:listener config-ref="L" path="/call-sec12"/>
+        <wsc:consume config-ref="Wsec12" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-nomust">
+        <http:listener config-ref="L" path="/call-nomust"/>
+        <wsc:consume config-ref="Wnomust" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <!-- headers の根が headers でない -->
+    <flow name="call-badheaders">
+        <http:listener config-ref="L" path="/call-badheaders"/>
+        <wsc:consume config-ref="Wplain" operation="echo">
+            <wsc:message>
+                <wsc:body>#[payload]</wsc:body>
+                <wsc:headers>#[output application/xml ns e urn:mulay:echo --- {hdrs: {e#trace: 'x'}}]</wsc:headers>
+            </wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <!-- headers の子が 2 つ (属性付き、祖先の名前空間を使う) -->
+    <flow name="call-headers2">
+        <http:listener config-ref="L" path="/call-headers2"/>
+        <wsc:consume config-ref="Wplain" operation="echo">
+            <wsc:message>
+                <wsc:body>#[payload]</wsc:body>
+                <wsc:headers>#[output application/xml ns e urn:mulay:echo ns f urn:f --- {headers @(xmlns: 'urn:d'): {e#auth @(id: 'a&amp;1'): {f#token: 'tk'}, plain: 'p &lt; q'}}]</wsc:headers>
+            </wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-nonce11">
+        <http:listener config-ref="L" path="/call-nonce11"/>
+        <wsc:consume config-ref="Wnonce11" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-created12">
+        <http:listener config-ref="L" path="/call-created12"/>
+        <wsc:consume config-ref="Wcreated12" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <!-- WSDL を http で配る (wsdlLocation に http の URL) -->
+    <flow name="wsdl-serve">
+        <http:listener config-ref="L" path="/wsdl-serve"/>
+        <set-payload value="#[readUrl('classpath://wsdl/echo.wsdl', 'text/plain')]" mimeType="text/xml"/>
+    </flow>
+
+    <flow name="call-digest">
+        <http:listener config-ref="L" path="/call-digest"/>
+        <wsc:consume config-ref="Wdigest" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-timeout">
+        <http:listener config-ref="L" path="/call-timeout"/>
+        <wsc:consume config-ref="Wtimeout" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-down">
+        <http:listener config-ref="L" path="/call-down"/>
+        <wsc:consume config-ref="Wdown" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-down-notify">
+        <http:listener config-ref="L" path="/call-down-notify"/>
+        <wsc:consume config-ref="Wdown" operation="notify">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-latin">
+        <http:listener config-ref="L" path="/call-latin"/>
+        <wsc:consume config-ref="Wlatin" operation="echo">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-rpc">
+        <http:listener config-ref="L" path="/call-rpc"/>
+        <wsc:consume config-ref="Wrpc" operation="add">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-imp">
+        <http:listener config-ref="L" path="/call-imp"/>
+        <wsc:consume config-ref="Wimp" operation="ping">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <flow name="call-dyn">
+        <http:listener config-ref="L" path="/call-dyn"/>
+        <set-variable variableName="wsdl" value="#[attributes.queryParams.wsdl default 'wsdl/echo.wsdl']"/>
+        <set-variable variableName="svc" value="#[attributes.queryParams.svc default 'EchoService']"/>
+        <set-variable variableName="port" value="#[attributes.queryParams.port default 'EchoPort']"/>
+        <wsc:consume config-ref="Wdyn" operation="#[attributes.queryParams.op default 'echo']">
+            <wsc:message><wsc:body>#[payload]</wsc:body></wsc:message>
+        </wsc:consume>
+        <flow-ref name="show"/>
+    </flow>
+
+    <!-- 本文を書かない (payload が既定か) -->
+    <flow name="call-nobody">
+        <http:listener config-ref="L" path="/call-nobody"/>
+        <wsc:consume config-ref="Wplain" operation="echo"/>
+        <flow-ref name="show"/>
+    </flow>
+
+    <error-handler name="errors">
+        <on-error-continue>
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+import try from dw::Runtime
+output application/json
+var em = error.errorMessage
+var p = em.payload
+fun t(f) = do { var r = try(f) --- if (r.success) r.result else 'ERR' }
+fun qn(q) = {local: q.localPart, uri: q.namespaceURI, prefix: q.prefix}
+---
+{
+    'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier,
+    description: error.description,
+    detailedDescription: error.detailedDescription,
+    hasErrorMessage: em != null,
+    errorPayloadMime: if (em == null) null else p.^mimeType,
+    errorPayloadClass: if (em == null) null else p.^class,
+    fault: if (error.errorType.identifier == 'SOAP_FAULT') {
+        faultCode: t(() -> qn(p.faultCode)),
+        subCode: t(() -> if (p.subCode == null) null else qn(p.subCode)),
+        reason: t(() -> p.reason),
+        detail: t(() -> p.detail),
+        role: t(() -> p.role),
+        node: t(() -> p.node),
+        message: t(() -> p.message)
+    } else null,
+    childErrors: sizeOf(error.childErrors default [])
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+    <configuration defaultErrorHandler-ref="errors"/>
+</mule>

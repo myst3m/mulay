@@ -1,0 +1,347 @@
+%%% note
+Salesforce コネクタ (mule-salesforce-connector 11.3、OAuth client credentials) の Bulk API v2: ingest のジョブ
+(CSV で Account を 3 件、うち 1 件は失敗)、get-job-state で終わるまで待つ、成功・失敗・未処理の結果、ジョブの一覧
+(形だけ)、query のジョブ、get-query-job-info、結果 (maxRecordsPerPage で 1 ページ 1 件)、終わったジョブの abort
+(失敗)、delete、query のジョブの一覧 (自分のジョブを ID で探す)。ジョブの値 (HashMap) はキーの順に並べて比べる
+(同じ桶の中の並びは実 Mule でも実行ごとに変わる)。未処理の結果は安定して作れないので、手で叩く /probe/unprocessed。組織は d30。レコードの名前は "mulay bulk2 ..." で、最初と最後に消す。
+ジョブの ID は ObjectStore で要求をまたいで引き継ぐ。ID・時刻・処理時間は伏せる。
+認証情報は src/main/resources/sf-secret.yaml (リポジトリに入れない。sf.clientId、sf.clientSecret、sf.tokenUrl)。
+%%% requires src/main/resources/sf-secret.yaml
+%%% port 18171
+%%% mask
+"(?:id|Id|sf__Id|createdById|jobId)": "([A-Za-z0-9]{15,18})"
+"(?:createdDate|systemModstamp|CreatedDate)": "([^"]*)"
+"(?:totalProcessingTime|apiActiveProcessingTime|apexProcessingTime|retries)": ([0-9.]+)
+(750[A-Za-z0-9]{12,15})
+%%% request POST /setup
+%%% response 200
+
+clean
+%%% request POST /ingest
+Content-Type: text/csv
+
+Name,NumberOfEmployees
+mulay bulk2 A,10
+mulay bulk2 B,abc
+mulay bulk2 C,30
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "org.mule.extension.salesforce.api.bulk.BulkJobState",
+  "mime": "application/java",
+  "type": "Object",
+  "itemClass": null,
+  "keys": 21,
+  "value": {
+    "apexProcessingTime": ***,
+    "apiActiveProcessingTime": ***,
+    "apiVersion": "65.0",
+    "columnDelimiter": "COMMA",
+    "concurrencyMode": "Parallel",
+    "contentType": "CSV",
+    "createdById": "***",
+    "createdDate": "***",
+    "errorMessage": null,
+    "externalIdFieldName": null,
+    "id": "***",
+    "jobType": "V2Ingest",
+    "lineEnding": "LF",
+    "numberRecordsFailed": 0,
+    "numberRecordsProcessed": 0,
+    "object": "Account",
+    "operation": "insert",
+    "retries": ***,
+    "state": "UploadComplete",
+    "systemModstamp": "***",
+    "totalProcessingTime": ***
+  }
+}
+%%% request GET /ingest/wait timeout=120
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "org.mule.extension.salesforce.api.bulk.BulkJobState",
+  "mime": "application/java",
+  "type": "Object",
+  "itemClass": null,
+  "keys": 21,
+  "value": {
+    "apexProcessingTime": ***,
+    "apiActiveProcessingTime": ***,
+    "apiVersion": "65.0",
+    "columnDelimiter": "COMMA",
+    "concurrencyMode": "Parallel",
+    "contentType": "CSV",
+    "createdById": "***",
+    "createdDate": "***",
+    "errorMessage": null,
+    "externalIdFieldName": null,
+    "id": "***",
+    "jobType": "V2Ingest",
+    "lineEnding": "LF",
+    "numberRecordsFailed": 1,
+    "numberRecordsProcessed": 3,
+    "object": "Account",
+    "operation": "insert",
+    "retries": ***,
+    "state": "JobComplete",
+    "systemModstamp": "***",
+    "totalProcessingTime": ***
+  }
+}
+%%% request GET /ingest/successful
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "mime": "application/java",
+  "type": "Array",
+  "itemClass": "org.mule.extension.salesforce.api.bulk.JobSuccessfulRecordResult",
+  "keys": null,
+  "value": [
+    {
+      "originalFields": {
+        "Name": "mulay bulk2 A",
+        "NumberOfEmployees": "10"
+      },
+      "created": true,
+      "id": "***"
+    },
+    {
+      "originalFields": {
+        "Name": "mulay bulk2 C",
+        "NumberOfEmployees": "30"
+      },
+      "created": true,
+      "id": "***"
+    }
+  ]
+}
+%%% request GET /ingest/failed
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "mime": "application/java",
+  "type": "Array",
+  "itemClass": "org.mule.extension.salesforce.api.bulk.JobFailedRecordResults",
+  "keys": null,
+  "value": [
+    {
+      "originalFields": {
+        "Name": "mulay bulk2 B",
+        "NumberOfEmployees": "abc"
+      },
+      "errorMessage": "INVALID_FIELD:Failed to deserialize field at col 1. Due to, 'abc' is not a valid value for the type xsd:int:NumberOfEmployees --",
+      "id": ""
+    }
+  ]
+}
+%%% request GET /ingest/unprocessed
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "mime": "application/java",
+  "type": "Array",
+  "itemClass": null,
+  "keys": null,
+  "value": [
+    
+  ]
+}
+%%% request GET /all-jobs
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "type": "Array",
+  "recordClass": "org.mule.extension.salesforce.api.bulk.BulkJobV2Result",
+  "found": 1,
+  "mine": {
+    "apiVersion": "65",
+    "columnDelimiter": "COMMA",
+    "concurrencyMode": "Parallel",
+    "contentType": "CSV",
+    "contentUrl": null,
+    "createdById": "***",
+    "createdDate": "***",
+    "externalIdFieldName": null,
+    "id": "***",
+    "jobType": "V2Ingest",
+    "lineEnding": "LF",
+    "object": "Account",
+    "operation": "insert",
+    "state": "JobComplete",
+    "systemModstamp": "***"
+  }
+}
+%%% request POST /query
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "org.mule.extension.salesforce.api.bulk.QueryJobState",
+  "mime": "application/java",
+  "type": "Object",
+  "itemClass": null,
+  "keys": 12,
+  "value": {
+    "apiVersion": "65",
+    "columnDelimiter": "COMMA",
+    "concurrencyMode": "Parallel",
+    "contentType": "CSV",
+    "createdById": "***",
+    "createdDate": "***",
+    "id": "***",
+    "lineEnding": "CRLF",
+    "object": "Account",
+    "operation": "query",
+    "state": "UploadComplete",
+    "systemModstamp": "***"
+  }
+}
+%%% request GET /query/wait timeout=120
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "org.mule.extension.salesforce.api.bulk.QueryJobInfo",
+  "mime": "application/java",
+  "type": "Object",
+  "itemClass": null,
+  "keys": 17,
+  "value": {
+    "apiVersion": "65",
+    "columnDelimiter": "COMMA",
+    "concurrencyMode": "Parallel",
+    "contentType": "CSV",
+    "createdById": "***",
+    "createdDate": "***",
+    "id": "***",
+    "jobType": "V2Query",
+    "lineEnding": "CRLF",
+    "numberRecordsProcessed": 2,
+    "object": "Account",
+    "operation": "query",
+    "pkChunkingSupported": false,
+    "retries": ***,
+    "state": "JobComplete",
+    "systemModstamp": "***",
+    "totalProcessingTime": ***
+  }
+}
+%%% request GET /query/results
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "org.mule.runtime.core.internal.streaming.object.ManagedCursorIteratorProvider",
+  "mime": "application/java",
+  "type": "Array",
+  "itemClass": "java.util.LinkedHashMap",
+  "keys": null,
+  "value": [
+    {
+      "Name": "mulay bulk2 A",
+      "NumberOfEmployees": "10"
+    },
+    {
+      "Name": "mulay bulk2 C",
+      "NumberOfEmployees": "30"
+    }
+  ]
+}
+%%% request GET /query/results?max=1
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "org.mule.runtime.core.internal.streaming.object.ManagedCursorIteratorProvider",
+  "mime": "application/java",
+  "type": "Array",
+  "itemClass": "java.util.LinkedHashMap",
+  "keys": null,
+  "value": [
+    {
+      "Name": "mulay bulk2 A",
+      "NumberOfEmployees": "10"
+    },
+    {
+      "Name": "mulay bulk2 C",
+      "NumberOfEmployees": "30"
+    }
+  ]
+}
+%%% request POST /query/abort
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "SALESFORCE:INVALID_INPUT",
+  "description": "Invalid status code: 400, response body: [{\"errorCode\":\"INVALIDJOBSTATE\",\"message\":\"Aborting already Completed Job not allowed\"}]"
+}
+%%% request GET /all-query-jobs
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "java.util.ArrayList",
+  "type": "Array",
+  "recordClass": "org.mule.extension.salesforce.api.bulk.QueryJobsInfoResult",
+  "found": 1,
+  "mine": {
+    "apiVersion": "65",
+    "columnDelimiter": "COMMA",
+    "concurrencyMode": "Parallel",
+    "contentType": "CSV",
+    "createdById": "***",
+    "createdDate": "***",
+    "id": "***",
+    "jobType": "V2Query",
+    "lineEnding": "CRLF",
+    "object": "Account",
+    "operation": "query",
+    "state": "JobComplete",
+    "systemModstamp": "***"
+  }
+}
+%%% request POST /query/delete
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "class": "org.mule.runtime.core.internal.streaming.bytes.ManagedCursorStreamProvider",
+  "mime": "*/*",
+  "type": "Binary",
+  "itemClass": null,
+  "keys": null,
+  "value": ""
+}
+%%% request GET /bogus/state
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "SALESFORCE:NOT_FOUND",
+  "description": "Invalid status code: 404, response body: [{\"errorCode\":\"NOT_FOUND\",\"message\":\"The requested resource does not exist\"}]"
+}
+%%% request GET /bogus/query-info
+%%% response 200
+content-type: application/json; charset=UTF-8
+
+{
+  "type": "SALESFORCE:NOT_FOUND",
+  "description": "Invalid status code: 404, response body: [{\"errorCode\":\"NOT_FOUND\",\"message\":\"The requested resource does not exist\"}]"
+}
+%%% request POST /cleanup
+%%% response 200
+content-type: text/plain; charset=UTF-8
+
+Deleted

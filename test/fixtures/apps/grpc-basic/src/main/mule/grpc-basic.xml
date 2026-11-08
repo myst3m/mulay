@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:grpc="http://www.mulesoft.org/schema/mule/grpc"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/grpc http://www.mulesoft.org/schema/mule/grpc/current/mule-grpc.xsd">
+    <!-- gRPC は http:listener の上で動く (h2c は http2-support を書いた listener だけ) -->
+    <http:listener-config name="G">
+        <http:listener-connection host="0.0.0.0" port="18190">
+            <http:protocol-support>
+                <http:http2-support enable="true"/>
+            </http:protocol-support>
+        </http:listener-connection>
+    </http:listener-config>
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18191"/>
+    </http:listener-config>
+    <os:object-store name="Snap" persistent="false"/>
+
+    <!-- 受けるメッセージの大きさの上限は 64 バイト (/demo.Lab/Echo の 100 バイトのメッセージで確かめる) -->
+    <grpc:server-config name="Srv" maxInboundMessageSize="64">
+        <grpc:grpc-server-connection listenerConfig="G">
+            <grpc:idl-definition>
+                <grpc:single-binary-protobuf protobufDescriptorFile="demo.desc"/>
+            </grpc:idl-definition>
+        </grpc:grpc-server-connection>
+    </grpc:server-config>
+
+
+    <!-- クライアント: 同じアプリのサーバー (h2c) を呼ぶ -->
+    <grpc:client-config name="Cli">
+        <grpc:no-auth-connection host="localhost" port="18190">
+            <grpc:idl-definition>
+                <grpc:single-binary-protobuf protobufDescriptorFile="demo.desc"/>
+            </grpc:idl-definition>
+            <grpc:connection-mode>
+                <grpc:plain-text/>
+            </grpc:connection-mode>
+        </grpc:no-auth-connection>
+    </grpc:client-config>
+
+    <error-handler name="cli-report">
+        <on-error-continue>
+            <set-payload value="#[output application/json --- {'type': error.errorType.namespace ++ ':' ++ error.errorType.identifier, description: error.description}]"/>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- 既定の応答は #[payload] (読んだ HelloRequest をそのまま書く。HelloReply と番号が同じ) -->
+    <flow name="say-hello">
+        <grpc:unary-method config-ref="Srv" methodName="demo.Greeter/SayHello"/>
+        <logger level="INFO" message="#['hello ' ++ payload.name]"/>
+    </flow>
+    <flow name="lab-echo">
+        <grpc:unary-method config-ref="Srv" methodName="demo.Lab/Echo"/>
+        <logger level="INFO" message="echo"/>
+    </flow>
+    <!-- DW の protobuf で応答を書く -->
+    <flow name="lab-build">
+        <grpc:unary-method config-ref="Srv" methodName="demo.Lab/Build">
+            <grpc:response-unary><![CDATA[#[output application/x-protobuf descriptorUrl='demo.desc', messageType='demo.HelloReply' --- {message: 'Hello ' ++ payload.name, n: payload.count + 1, tags: 'x', tags: 'y'}]]]></grpc:response-unary>
+        </grpc:unary-method>
+        <logger level="INFO" message="build"/>
+    </flow>
+    <!-- 応答のバイト列はそのまま本文になる (JSON は JSON のまま、output の無いオブジェクトは Java の直列化) -->
+    <flow name="lab-build-json">
+        <grpc:unary-method config-ref="Srv" methodName="demo.Lab/BuildJson"/>
+        <set-payload value="#[output application/json --- {message: 'J ' ++ payload.name, n: 7}]"/>
+    </flow>
+    <flow name="lab-build-java">
+        <grpc:unary-method config-ref="Srv" methodName="demo.Lab/Inspect"/>
+        <set-variable variableName="whole" value="#[payload]"/>
+        <os:store key="inspect" objectStore="Snap">
+            <os:value><![CDATA[#[output application/json --- {mimeType: payload.^mimeType default null, mtParam: payload.^mediaType contains 'messagetype="demo.HelloRequest"', descParam: payload.^mediaType contains 'descriptorurl="demo.desc"', charset: payload.^mediaType contains 'charset=UTF-8', name: payload.name, count: payload.count, tags: payload.*tags, keys: keysOf(payload), raw64: (payload.^raw as String {base: "64"}) default null, attrClass: attributes.^class, attrKeys: keysOf(attributes), methodName: attributes.methodName, connectionId: attributes.connectionId, trace: attributes.headers.'x-trace' default null, ct: attributes.headers.'content-type' default null, wholeMime: vars.whole.^mimeType default null, wholeName: vars.whole.name}]]]></os:value>
+        </os:store>
+        <set-payload value="#[{message: 'ok'}]"/>
+    </flow>
+    <!-- 式の出力形式は payload から推論される (protobuf を記述子の設定なしで書こうとして失敗する)。logger の message は推論しない -->
+    <flow name="lab-infer">
+        <grpc:unary-method config-ref="Srv" methodName="demo.Lab/Infer">
+            <grpc:error-response statusCode="INVALID_ARGUMENT" description="#[error.description]"/>
+        </grpc:unary-method>
+        <logger level="INFO" message="#['infer ' ++ payload.name]"/>
+        <set-variable variableName="n" value="#[payload.name]"/>
+    </flow>
+    <flow name="lab-fail">
+        <grpc:unary-method config-ref="Srv" methodName="demo.Lab/Fail"/>
+        <raise-error type="APP:BOOM" description="it broke"/>
+    </flow>
+    <flow name="lab-fail-status">
+        <grpc:unary-method config-ref="Srv" methodName="demo.Lab/FailStatus">
+            <grpc:error-response statusCode="NOT_FOUND" description="#['no such ' ++ payload.name]"/>
+        </grpc:unary-method>
+        <raise-error type="APP:MISSING" description="missing"/>
+    </flow>
+    <flow name="greeter-list">
+        <grpc:unary-method config-ref="Srv" methodName="demo.Greeter/ListGreetings"/>
+        <logger level="INFO" message="list as unary"/>
+    </flow>
+
+    <flow name="inspect">
+        <http:listener config-ref="L" path="/inspect"/>
+        <os:retrieve key="inspect" objectStore="Snap"/>
+        <set-payload value="#[output application/json --- payload]"/>
+    </flow>
+    <!-- 変数だけの式 #[vars.msg] は値を読まずに TypedValue をそのまま渡す -->
+    <flow name="var-pass">
+        <http:listener config-ref="L" path="/var-pass"/>
+        <set-variable variableName="msg" value="#[output application/x-protobuf descriptorUrl='demo.desc', messageType='demo.HelloRequest' --- {name: 'Zed', count: 3}]"/>
+        <set-payload value="#[vars.msg]"/>
+    </flow>
+    <flow name="var-pass-rev">
+        <http:listener config-ref="L" path="/var-pass-rev"/>
+        <set-payload value="#[output application/x-protobuf messageType='demo.HelloRequest', descriptorUrl='demo.desc' --- {name: 'Zed', count: 3}]"/>
+    </flow>
+    <flow name="plain">
+        <http:listener config-ref="G" path="/plain"/>
+        <set-payload value="plain over G" mimeType="text/plain"/>
+    </flow>
+    <flow name="cli-echo">
+        <http:listener config-ref="L" path="/cli/echo"/>
+        <grpc:unary-call config-ref="Cli" method="demo.Lab/Echo">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='demo.desc', messageType='demo.HelloRequest' --- {name: 'Zed', count: 3, tags: 'm'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType default null, mtParam: (payload.^mediaType default '') contains 'messagetype=&quot;demo.HelloReply&quot;', descParam: (payload.^mediaType default '') contains 'descriptorurl', attrs: attributes default null}]"/>
+        <error-handler ref="cli-report"/>
+    </flow>
+    <flow name="cli-build">
+        <http:listener config-ref="L" path="/cli/build"/>
+        <grpc:unary-call config-ref="Cli" method="demo.Lab/Build">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='demo.desc', messageType='demo.HelloRequest' --- {name: 'Zed', count: 3, tags: 'm'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType default null, mtParam: (payload.^mediaType default '') contains 'messagetype=&quot;demo.HelloReply&quot;', descParam: (payload.^mediaType default '') contains 'descriptorurl', attrs: attributes default null}]"/>
+        <error-handler ref="cli-report"/>
+    </flow>
+    <flow name="cli-fail">
+        <http:listener config-ref="L" path="/cli/fail"/>
+        <grpc:unary-call config-ref="Cli" method="demo.Lab/Fail">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='demo.desc', messageType='demo.HelloRequest' --- {name: 'Zed', count: 3, tags: 'm'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType default null, mtParam: (payload.^mediaType default '') contains 'messagetype=&quot;demo.HelloReply&quot;', descParam: (payload.^mediaType default '') contains 'descriptorurl', attrs: attributes default null}]"/>
+        <error-handler ref="cli-report"/>
+    </flow>
+    <flow name="cli-fail-status">
+        <http:listener config-ref="L" path="/cli/fail-status"/>
+        <grpc:unary-call config-ref="Cli" method="demo.Lab/FailStatus">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='demo.desc', messageType='demo.HelloRequest' --- {name: 'Zed', count: 3, tags: 'm'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType default null, mtParam: (payload.^mediaType default '') contains 'messagetype=&quot;demo.HelloReply&quot;', descParam: (payload.^mediaType default '') contains 'descriptorurl', attrs: attributes default null}]"/>
+        <error-handler ref="cli-report"/>
+    </flow>
+    <flow name="cli-noflow">
+        <http:listener config-ref="L" path="/cli/noflow"/>
+        <grpc:unary-call config-ref="Cli" method="demo.Lab/NoFlow">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='demo.desc', messageType='demo.HelloRequest' --- {name: 'Zed', count: 3, tags: 'm'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType default null, mtParam: (payload.^mediaType default '') contains 'messagetype=&quot;demo.HelloReply&quot;', descParam: (payload.^mediaType default '') contains 'descriptorurl', attrs: attributes default null}]"/>
+        <error-handler ref="cli-report"/>
+    </flow>
+    <flow name="cli-json">
+        <http:listener config-ref="L" path="/cli/json"/>
+        <grpc:unary-call config-ref="Cli" method="demo.Lab/BuildJson">
+            <grpc:content><![CDATA[#[output application/x-protobuf descriptorUrl='demo.desc', messageType='demo.HelloRequest' --- {name: 'Zed', count: 3, tags: 'm'}]]]></grpc:content>
+        </grpc:unary-call>
+        <set-payload value="#[output application/json --- {p: payload, mime: payload.^mimeType default null, mtParam: (payload.^mediaType default '') contains 'messagetype=&quot;demo.HelloReply&quot;', descParam: (payload.^mediaType default '') contains 'descriptorurl', attrs: attributes default null}]"/>
+        <error-handler ref="cli-report"/>
+    </flow>
+
+
+</mule>

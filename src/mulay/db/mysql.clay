@@ -1,0 +1,361 @@
+(ns mulay.db.mysql
+  (:require [mulay.db.sql :as sql] [mulay.db.mywire :as w] [mulay.lib.host :as host] [mulay.lib.keystore :as ks]
+            [clay.net :as net] [clay.tls :as tls] [clay.pkix :as pkix] [clay.string :as str]))
+
+(defvariant Wire (WPlain s: net/Sock) (WTls s: tls/Sock))
+
+(defrecord Conn [wire: Wire buf: Atom(Str) pos: Atom(Int) caps: Int thread: Int max-packet: Int])
+
+(def MAX-PACKET 67108864)
+
+(defn- wire-write Str [x: &Wire data: &Str] (match x (WPlain s) (net/write s data) (WTls s) (tls/write s data)))
+(defn- wire-read Values(Str Str) [x: &Wire] (match x (WPlain s) (net/read s 65536) (WTls s) (tls/read s 65536)))
+(defn- wire-close Int [x: &Wire] (match x (WPlain s) (net/close s) (WTls s) (tls/close s)))
+
+(defn- read-one Values(Str Int Str) [c: &Conn]
+  (loop []
+    (let [buf (deref (:buf c)) p (deref (:pos c))
+          [pk seq np] (w/take-packet buf p)]
+      (if (>= np 0) (let [z (reset! (:pos c) np)] (values pk seq ""))
+        (let [[chunk e] (wire-read (:wire c))]
+          (cond (not= e "") (values "" 0 e)
+                (= (count chunk) 0) (values "" 0 "connection closed by the server")
+                :else (let [rest (subs buf p (count buf))
+                            z1 (reset! (:buf c) (str rest chunk))
+                            z2 (reset! (:pos c) 0)]
+                        (recur))))))))
+
+(defn- too-big sql/DbErr [n: Int limit: Int]
+  (sql/->DbErr (str "Packet for query is too large (" n " > " limit "). You can change this value on the server by setting the 'max_allowed_packet' variable.")
+               "S1000" 0 "com.mysql.cj.jdbc.exceptions.PacketTooBigException"))
+
+(defn- read-packet Values(Str Int sql/DbErr) [c: &Conn]
+  (loop [body ""]
+    (let [[pk seq e] (read-one c)
+          n (+ (count body) (count pk))]
+      (cond (not= e "") (values "" 0 (io-err e))
+            (> n (:max-packet c)) (let [z (wire-close (:wire c))] (values "" 0 (too-big n (:max-packet c))))
+            (= (count pk) 16777215) (recur (str body pk))
+            :else (values (str body pk) seq (sql/ok-err))))))
+
+(defn- send Str [c: &Conn seq: Int body: &Str] (let [[b n] (w/packets seq body)] (wire-write (:wire c) b)))
+
+(defn- io-err sql/DbErr [e: &Str] (w/comm-err "Communications link failure\n\nThe last packet successfully received from the server was 0 milliseconds ago. The last packet sent successfully to the server was 0 milliseconds ago."))
+
+(defn- fail-open Values(Vec(Conn) sql/DbErr) [c: &Conn e: sql/DbErr] (let [z (wire-close (:wire c))] (values [] e)))
+
+(defn- auth-err sql/DbErr [b: &Str]
+  (let [[code msg st] (w/parse-err b)] (sql/->DbErr (str msg) (str st) code "java.sql.SQLException")))
+
+(defn- auth-loop sql/DbErr [c: &Conn seq0: Int plugin0: &Str nonce0: &Str password: &Str tls: Bool allow-key: Bool]
+  (loop [plugin (str plugin0) nonce (str nonce0)]
+    (let [[b seq e] (read-packet c)]
+      (cond
+        (not (sql/ok? e)) e
+        (= (count b) 0) (io-err "empty authentication packet")
+        (= (nth b 0) 0) (sql/ok-err)
+        (= (nth b 0) 255) (auth-err b)
+        (= (nth b 0) 254)
+        (let [[p2 q] (w/rnul b 1)
+              data (subs b q (count b))
+              n2 (if (and (> (count data) 0) (= (nth data (- (count data) 1)) 0)) (subs data 0 (- (count data) 1)) data)
+              se (send c (+ seq 1) (w/auth-response p2 password n2))]
+          (if (not= se "") (io-err se) (recur p2 n2)))
+        (and (= (nth b 0) 1) (= plugin "caching_sha2_password") (>= (count b) 2) (= (nth b 1) 3)) (recur plugin nonce)
+        (and (= (nth b 0) 1) (= plugin "caching_sha2_password") (>= (count b) 2) (= (nth b 1) 4))
+        (cond
+          tls (let [se (send c (+ seq 1) (w/wnul "" password))] (if (not= se "") (io-err se) (recur plugin nonce)))
+          allow-key (sql/->DbErr "mulay does not support the RSA public key exchange of caching_sha2_password (use TLS)" "08001" 0 "java.sql.SQLNonTransientConnectionException")
+          :else (sql/->DbErr "Public Key Retrieval is not allowed" "08001" 0 "java.sql.SQLNonTransientConnectionException"))
+        :else (io-err (str "unexpected authentication packet " (nth b 0)))))))
+
+(def NTCE "java.sql.SQLNonTransientConnectionException")
+
+(defn- flag Str [kvs: &Vec(Str) k: &Str] (str/lower-case (w/prop kvs k "")))
+
+(defn- ssl-mode Str [kvs: &Vec(Str)]
+  (let [m (str/upper-case (w/prop kvs "sslMode" ""))]
+    (cond (not= m "") m
+          (= (flag kvs "useSSL") "false") "DISABLED"
+          (= (flag kvs "verifyServerCertificate") "true") "VERIFY_CA"
+          (= (flag kvs "requireSSL") "true") "REQUIRED"
+          :else "PREFERRED")))
+
+(defn- store-err sql/DbErr [msg: &Str] (sql/->DbErr (str msg) "08000" 0 NTCE))
+
+(defn- scheme-of Str [url: &Str]
+  (let [c (str/index-of url ":")]
+    (if (< c 1) ""
+      (let [sc (str/lower-case (subs url 0 c))
+            ok (loop [i 0] (if (>= i (count sc)) true (let [b (nth sc i)] (if (or (and (>= b 97) (<= b 122)) (and (> i 0) (or (and (>= b 48) (<= b 57)) (= b 43) (= b 45) (= b 46)))) (recur (+ i 1)) false))))]
+        (if ok sc "")))))
+
+(defn- file-path Str [url: &Str]
+  (let [rest (subs url 5 (count url))]
+    (cond (str/starts-with? rest "//localhost/") (subs rest 11 (count rest))
+          (str/starts-with? rest "///") (subs rest 2 (count rest))
+          :else rest)))
+
+(defn- trust-store Values(tls/Config sql/DbErr) [kvs: &Vec(Str)]
+  (let [c0 (tls/default-config)
+        url (w/prop kvs "trustCertificateKeyStoreUrl" "")
+        ty0 (str/upper-case (w/prop kvs "trustCertificateKeyStoreType" ""))
+        ty (if (= ty0 "") "JKS" ty0)
+        pw (w/prop kvs "trustCertificateKeyStorePassword" "")
+        sc (scheme-of url)]
+    (cond
+      (= url "")
+      (if (= (flag kvs "fallbackToSystemTrustStore") "false")
+        (values c0 (store-err "Failed setting up server certificate validation because no X.509 Trust Manager was found."))
+        (values c0 (sql/ok-err)))
+      (and (not= ty "JKS") (not= ty "PKCS12")) (values c0 (store-err (str "Could not create KeyStore instance [" ty0 " not found]")))
+      (= sc "") (values c0 (store-err (str url " does not appear to be a valid URL.")))
+      (not= sc "file") (values c0 (store-err (str "Cannot open " url " [mulay reads trustCertificateKeyStoreUrl only from file: URLs]")))
+      :else
+      (let [path (file-path url)
+            [bytes re] (host/file-read path)]
+        (cond
+          (not= re "") (values c0 (store-err (str "Cannot open " url " [" path (if (host/file-exists? path) (str " (" re ")") " (No such file or directory)") "]")))
+          (ks/jks? bytes)
+          (let [[st e] (ks/read-jks-certs bytes pw)]
+            (if (not= e "") (values c0 (store-err (str "Cannot open " url " [" e "]")))
+              (let [cs (:certs st)]
+                (values (assoc c0 :ca (loop [i 0 acc ""] (if (>= i (count cs)) acc (recur (+ i 1) (str acc (:pem (nth cs i))))))) (sql/ok-err)))))
+          :else
+          (let [[p pe] (pkix/pkcs12-decode bytes pw "")]
+            (if (not= pe "") (values c0 (store-err (str "Cannot open " url " [" pe "]")))
+              (values (assoc (assoc c0 :ca-pkcs12 bytes) :ca-pkcs12-password pw) (sql/ok-err)))))))))
+
+(defn max-packet-of Values(Int sql/DbErr) [kvs: &Vec(Str)]
+  (let [v (w/prop kvs "maxAllowedPacket" "")]
+    (if (= v "") (values MAX-PACKET (sql/ok-err))
+      (let [[n e] (parse-long v)]
+        (if (not= e "")
+          (values 0 (sql/->DbErr (str "The connection property 'maxAllowedPacket' only accepts integer values. The value '" v "' can not be converted to an integer.") "S1009" 0 "java.sql.SQLException"))
+          (values n (sql/ok-err)))))))
+
+(defn ssl-config Values(Str tls/Config sql/DbErr) [kvs: &Vec(Str)]
+  (let [mode (ssl-mode kvs)
+        insecure (assoc (tls/default-config) :verify (tls/->VerifyNone))]
+    (cond
+      (or (= mode "DISABLED") (= mode "PREFERRED") (= mode "REQUIRED")) (values mode insecure (sql/ok-err))
+      (= mode "VERIFY_CA") (let [[c e] (trust-store kvs)] (values mode (assoc c :verify (tls/->VerifyCa)) e))
+      (= mode "VERIFY_IDENTITY") (let [[c e] (trust-store kvs)] (values mode c e))
+      :else
+      (values mode insecure
+              (sql/->DbErr (str "The connection property 'sslMode' acceptable values are: 'DISABLED', 'PREFERRED', 'REQUIRED', 'VERIFY_CA' or 'VERIFY_IDENTITY'. The value '" (w/prop kvs "sslMode" "") "' is not acceptable.")
+                           "S1009" 0 "java.sql.SQLException")))))
+
+(defn open Values(Vec(Conn) sql/DbErr) [host: &Str port: Int db: &Str user0: &Str password0: &Str kvs: &Vec(Str)]
+  (let [[mode tcfg me] (ssl-config kvs)
+        user (if (= user0 "") (w/prop kvs "user" "") (str user0))
+        password (if (= password0 "") (w/prop kvs "password" "") (str password0))
+        allow-key (= (str/lower-case (w/prop kvs "allowPublicKeyRetrieval" "false")) "true")
+        [max-packet xe] (max-packet-of kvs)]
+    (cond
+      (not (sql/ok? me)) (values [] me)
+      (not (sql/ok? xe)) (values [] xe)
+      :else
+      (let [[s ce] (net/connect host port)]
+        (if (not= ce "") (values [] (w/comm-err w/COMM-FAIL))
+          (let [c0 (->Conn (->WPlain s) (atom "") (atom 0) 0 0 max-packet)
+                [hb hseq he] (read-packet c0)
+                [h pe] (if (sql/ok? he) (w/parse-hello hb) (values (w/->Hello "" 0 0 "" "") ""))]
+            (cond
+              (not (sql/ok? he)) (fail-open c0 (if (= (:state he) "08S01") (w/comm-err w/COMM-FAIL) he))
+              (and (> (count hb) 0) (= (nth hb 0) 255)) (fail-open c0 (auth-err hb))
+              (not= pe "") (fail-open c0 (io-err pe))
+              :else
+              (let [server-tls (not= (bit-and (:caps h) w/SSL) 0)
+                    want-tls (and server-tls (not= mode "DISABLED"))]
+                (if (and (not= mode "DISABLED") (not= mode "PREFERRED") (not server-tls))
+                  (fail-open c0 (sql/->DbErr "SSL Connection required, but not provided by server." "08001" 0 NTCE))
+                  (let [caps (w/client-caps (:caps h) (not= db "") want-tls)
+                        [c1 seq te] (if (not want-tls) (values c0 1 "")
+                                      (let [se (send c0 1 (w/ssl-request caps))]
+                                        (if (not= se "") (values c0 2 se)
+                                          (let [[ts tse] (tls/upgrade s host tcfg)]
+                                            (values (->Conn (->WTls ts) (atom "") (atom 0) caps (:thread h) max-packet) 2 tse)))))]
+                    (if (not= te "") (values [] (w/comm-err w/COMM-FAIL))
+                      (let [plugin (if (= (:plugin h) "") "mysql_native_password" (:plugin h))
+                            c2 (->Conn (:wire c1) (:buf c1) (:pos c1) caps (:thread h) max-packet)
+                            se (send c2 seq (w/handshake-response caps user (w/auth-response plugin password (:nonce h)) db plugin))
+                            ae (if (not= se "") (io-err se) (auth-loop c2 seq plugin (:nonce h) password want-tls allow-key))]
+                        (if (not (sql/ok? ae)) (fail-open c2 ae) (values [c2] (sql/ok-err)))))))))))))))
+
+(defn close Int [c: &Conn]
+  (let [z (send c 0 (str (chr 1)))] (wire-close (:wire c))))
+
+(defrecord Res [has-rows: Bool cols: Vec(w/Col) rows: Vec(Vec(sql/Cell)) affected: Int insert-id: Int])
+
+(defn- terminator? Bool [b: &Str] (and (> (count b) 0) (= (nth b 0) 254) (< (count b) 16777215)))
+
+(defn- end-status Int [c: &Conn b: &Str]
+  (if (not= (bit-and (:caps c) w/DEPRECATE-EOF) 0) (let [[a i st] (w/parse-ok b)] st)
+    (let [[st p] (w/r16 b 3)] (if (< p 0) 0 st))))
+
+(defn- read-rows Values(Res Int sql/DbErr) [c: &Conn n: Int]
+  (let [[cols ce] (loop [i 0 acc: Vec(w/Col) []]
+                    (if (>= i n) (values acc (sql/ok-err))
+                      (let [[b seq e] (read-packet c)]
+                        (if (not (sql/ok? e)) (values acc e)
+                          (let [[col pe] (w/parse-col b)] (if (not= pe "") (values acc (io-err pe)) (recur (+ i 1) (conj acc col))))))))
+        none (->Res true cols [] 0 0)]
+    (if (not (sql/ok? ce)) (values none 0 ce)
+      (let [ee (if (not= (bit-and (:caps c) w/DEPRECATE-EOF) 0) (sql/ok-err) (let [[b seq e] (read-packet c)] e))]
+        (if (not (sql/ok? ee)) (values none 0 ee)
+          (loop [acc: Vec(Vec(sql/Cell)) []]
+            (let [[b seq e] (read-packet c)]
+              (cond
+                (not (sql/ok? e)) (values none 0 e)
+                (terminator? b) (values (->Res true cols acc 0 0) (end-status c b) (sql/ok-err))
+                (and (> (count b) 0) (= (nth b 0) 255)) (let [[code msg st] (w/parse-err b)] (values none 0 (w/server-err code msg st)))
+                :else (let [[row re] (w/parse-row b cols)]
+                        (if (not= re "") (values none 0 (io-err re)) (recur (conj acc row))))))))))))
+
+(defn- command Values(Vec(Res) sql/DbErr) [c: &Conn payload: &Str]
+  (let [z1 (reset! (:buf c) "") z2 (reset! (:pos c) 0)
+        se (send c 0 payload)]
+    (if (not= se "") (values [] (io-err se))
+      (loop [acc: Vec(Res) []]
+        (let [[b seq e] (read-packet c)]
+          (cond
+            (not (sql/ok? e)) (values acc e)
+            (= (count b) 0) (values acc (io-err "empty packet"))
+            (= (nth b 0) 0)
+            (let [[aff id st] (w/parse-ok b)
+                  acc2 (conj acc (->Res false [] [] aff id))]
+              (if (not= (bit-and st w/MORE-RESULTS) 0) (recur acc2) (values acc2 (sql/ok-err))))
+            (= (nth b 0) 255) (let [[code msg st] (w/parse-err b)] (values acc (w/server-err code msg st)))
+            (= (nth b 0) 251) (values acc (sql/->DbErr "mulay does not support LOAD DATA LOCAL INFILE" "HY000" 0 "java.sql.SQLException"))
+            :else
+            (let [[n p] (w/rlenenc b 0)
+                  [r st re] (read-rows c n)]
+              (cond (not (sql/ok? re)) (values acc re)
+                    (not= (bit-and st w/MORE-RESULTS) 0) (recur (conj acc r))
+                    :else (values (conj acc r) (sql/ok-err))))))))))
+
+(defn query Values(Vec(Res) sql/DbErr) [c: &Conn q: &Str] (command c (str (chr 3) q)))
+
+(defn- lits Vec(Str) [ps: &Vec(sql/Cell)]
+  (loop [i 0 acc: Vec(Str) []] (if (>= i (count ps)) acc (recur (+ i 1) (conj acc (w/literal (nth ps i)))))))
+
+(defn- unescape-call Str [q: &Str]
+  (let [s (str/trim q)]
+    (if (and (str/starts-with? s "{") (str/ends-with? s "}"))
+      (let [inner (str/trim (subs s 1 (- (count s) 1)))]
+        (if (and (>= (count inner) 4) (= (str/upper-case (subs inner 0 4)) "CALL")) (str "CALL" (subs inner 4 (count inner))) inner))
+      (str q))))
+
+(defn- rows-of sql/Rows [r: &Res]
+  (let [names (loop [i 0 acc: Vec(Str) []] (if (>= i (count (:cols r))) acc (recur (+ i 1) (conj acc (:name (nth (:cols r) i))))))]
+    (sql/->Rows names (:rows r))))
+
+(def MAX-KEYS 1000000)
+
+(defn gen-keys Values(sql/Rows Str) [insert-id: Int affected: Int]
+  (let [n (if (> affected 0) affected 1)]
+    (cond (<= insert-id 0) (values (sql/no-rows) "")
+          (> n MAX-KEYS) (values (sql/no-rows) (str "the server reported " affected " affected rows, but mulay returns at most " MAX-KEYS " generated keys"))
+          (> (- n 1) (- 9223372036854775807 insert-id)) (values (sql/no-rows) "the server reported generated keys past 9223372036854775807")
+          :else (values (sql/->Rows ["GENERATED_KEY"]
+                                    (loop [k 0 acc: Vec(Vec(sql/Cell)) []]
+                                      (if (>= k n) acc
+                                        (recur (+ k 1) (conj acc [(sql/->CBigInt (str (+ insert-id k)))])))))
+                        ""))))
+
+(defn run Values(sql/Outcome sql/DbErr) [c: &Conn text: &Str params: &Vec(sql/Cell) want-keys: Bool]
+  (let [q (w/fill-params (unescape-call text) (lits params))
+        [rs e] (query c q)
+        none (sql/->Outcome (sql/no-rows) 0 (sql/no-rows))]
+    (if (not (sql/ok? e)) (values none e)
+      (let [first-rows (loop [i 0] (if (>= i (count rs)) -1 (if (:has-rows (nth rs i)) i (recur (+ i 1)))))
+            last (if (> (count rs) 0) (nth rs (- (count rs) 1)) (->Res false [] [] 0 0))
+            [keys ke] (if want-keys (gen-keys (:insert-id last) (:affected last)) (values (sql/no-rows) ""))]
+        (cond
+          (not= ke "") (values none (sql/->DbErr ke "HY000" 0 "java.sql.SQLException"))
+          (>= first-rows 0) (values (sql/->Outcome (rows-of (nth rs first-rows)) -1 keys) e)
+          :else (values (sql/->Outcome (sql/no-rows) (:affected last) keys) e))))))
+
+(defn- batch-err sql/DbErr [e: &sql/DbErr] (sql/->DbErr (:msg e) (:state e) (:code e) "java.sql.BatchUpdateException"))
+
+(defn run-batch Values(Vec(Int) sql/DbErr) [c: &Conn text: &Str rows: &Vec(Vec(sql/Cell))]
+  (loop [i 0 acc: Vec(Int) [] first (sql/ok-err)]
+    (if (>= i (count rows)) (if (sql/ok? first) (values acc first) (values acc (batch-err first)))
+      (let [[o e] (run c text (nth rows i) false)]
+        (cond
+          (str/starts-with? (:state e) "08") (values acc (batch-err e))
+          (sql/ok? e) (recur (+ i 1) (conj acc (if (< (:count o) 0) 0 (:count o))) first)
+          :else (recur (+ i 1) (conj acc -3) (if (sql/ok? first) e first)))))))
+
+(def NOT-UPDATE "Statement.executeUpdate() or Statement.executeLargeUpdate() cannot issue statements that produce result sets.")
+
+(defn run-script Values(Vec(Int) sql/DbErr) [c: &Conn parts: &Vec(Str)]
+  (loop [i 0 acc: Vec(Int) [] first (sql/ok-err)]
+    (if (>= i (count parts)) (values acc first)
+      (let [q (nth parts i)]
+        (if (w/result-set-query? q)
+          (recur (+ i 1) (conj acc -3) (if (sql/ok? first) (sql/->DbErr NOT-UPDATE "01S03" 0 "java.sql.SQLException") first))
+          (let [[rs e] (query c q)]
+            (cond
+              (str/starts-with? (:state e) "08") (values acc e)
+              (sql/ok? e) (recur (+ i 1) (conj acc (if (> (count rs) 0) (:affected (nth rs (- (count rs) 1))) 0)) first)
+              :else (recur (+ i 1) (conj acc -3) (if (sql/ok? first) e first)))))))))
+
+(defn begin sql/DbErr [c: &Conn] (let [[rs e] (query c "SET autocommit=0")] e))
+
+(defn finish sql/DbErr [c: &Conn commit: Bool]
+  (let [[rs e] (query c (if commit "COMMIT" "ROLLBACK"))
+        [rs2 e2] (query c "SET autocommit=1")]
+    (if (sql/ok? e) e2 e)))
+
+(defn- var-of Str [p: &sql/SpParam] (str "@com_mysql_jdbc_outparam_" (:name p)))
+
+(defn- call-parts Values(Bool Str) [q: &Str]
+  (let [s (str/trim q)
+        braced (and (str/starts-with? s "{") (str/ends-with? s "}"))
+        inner (if braced (str/trim (subs s 1 (- (count s) 1))) s)
+        func (and braced (str/starts-with? inner "?"))
+        after-eq (if func (let [e (str/index-of inner "=")] (str/trim (subs inner (+ e 1) (count inner)))) inner)
+        body (if (and (>= (count after-eq) 4) (= (str/upper-case (subs after-eq 0 4)) "CALL")) (subs after-eq 4 (count after-eq)) after-eq)]
+    (values func (str/trim body))))
+
+(defn call-proc Values(sql/SpResult sql/DbErr) [c: &Conn text: &Str params: &Vec(sql/SpParam)]
+  (let [[func body] (call-parts text)
+        args (loop [i (if func 1 0) acc: Vec(Str) []]
+               (if (>= i (count params)) acc
+                 (let [p (nth params i)]
+                   (recur (+ i 1) (conj acc (if (= (:dir p) sql/IN) (w/literal (:value p)) (var-of p)))))))
+        ]
+    (if func
+      (let [q (w/fill-params body args)
+            [rs e] (query c (str "SELECT " q))]
+        (if (not (sql/ok? e)) (values (sql/no-sp) (proc-err e))
+          (let [r (if (> (count rs) 0) (nth rs 0) (->Res false [] [] 0 0))
+                v (if (and (> (count (:rows r)) 0) (> (count (nth (:rows r) 0)) 0)) (nth (nth (:rows r) 0) 0) (sql/->CNull))]
+            (values (sql/->SpResult [] [] [(:name (nth params 0))] [(sql/->SpCell v)]) e))))
+      (let [outs (loop [i 0 acc: Vec(Int) []] (if (>= i (count params)) acc (recur (+ i 1) (if (= (:dir (nth params i)) sql/IN) acc (conj acc i)))))
+            sets (loop [k 0 acc: Vec(Str) []]
+                   (if (>= k (count outs)) acc
+                     (let [p (nth params (nth outs k))]
+                       (recur (+ k 1) (conj acc (str (var-of p) "=" (if (= (:dir p) sql/INOUT) (w/literal (:value p)) "null")))))))
+            [r0 e0] (if (= (count sets) 0) (values [] (sql/ok-err)) (query c (str "SET " (str/join ", " sets))))]
+        (if (not (sql/ok? e0)) (values (sql/no-sp) (proc-err e0))
+          (let [[rs e] (query c (str "CALL " (w/fill-params body args)))]
+            (if (not (sql/ok? e)) (values (sql/no-sp) (proc-err e))
+              (let [rsets (loop [i 0 acc: Vec(sql/Rows) []] (if (>= i (count rs)) acc (recur (+ i 1) (if (:has-rows (nth rs i)) (conj acc (rows-of (nth rs i))) acc))))
+                    last (if (> (count rs) 0) (nth rs (- (count rs) 1)) (->Res false [] [] 0 0))
+                    counts (if (:has-rows last) [] [(:affected last)])]
+                (if (= (count outs) 0) (values (sql/->SpResult rsets counts [] []) e)
+                  (let [vars (loop [k 0 acc: Vec(Str) []] (if (>= k (count outs)) acc (recur (+ k 1) (conj acc (var-of (nth params (nth outs k)))))))
+                        [vr ve] (query c (str "SELECT " (str/join "," vars)))]
+                    (if (not (sql/ok? ve)) (values (sql/no-sp) (proc-err ve))
+                      (let [row (if (and (> (count vr) 0) (> (count (:rows (nth vr 0))) 0)) (nth (:rows (nth vr 0)) 0) [])]
+                        (loop [k 0 names: Vec(Str) [] vs: Vec(sql/SpVal) []]
+                          (if (>= k (count outs)) (values (sql/->SpResult rsets counts names vs) e)
+                            (recur (+ k 1) (conj names (:name (nth params (nth outs k))))
+                                   (conj vs (sql/->SpCell (if (< k (count row)) (nth row k) (sql/->CNull)))))))))))))))))))
+
+(defn- proc-err sql/DbErr [e: &sql/DbErr]
+  (if (str/starts-with? (:state e) "08") (sql/->DbErr (:msg e) (:state e) (:code e) (:exc e))
+    (sql/->DbErr (:msg e) (:state e) (:code e) "java.sql.SQLException")))

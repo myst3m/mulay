@@ -1,0 +1,57 @@
+(ns json-stream-test (:require [mulay.dw.fmt.json :as j] [mulay.dw.val :as v] [mulay.dw.err :as dwe]))
+
+(defn- feeder Fn(Int Values(Str Bool Str)) [src: Str step: Int]
+  (let [pos (atom 0) s src]
+    (fn Values(Str Bool Str) [n: Int]
+      (let [p (deref pos)
+            q (if (> (+ p step) (count s)) (count s) (+ p step))
+            z (reset! pos q)]
+        (values (subs s p q) (>= q (count s)) "")))))
+
+(defn- compact Str [x: &v/Val] (let [[o e] (j/write x (j/opts-of false ""))] o))
+
+(defn- streamed Str [src: Str step: Int]
+  (let [f (feeder src step)
+        [rd arr e0] (j/arr-open f)]
+    (cond (not= e0 "") (str "ERR " e0)
+          (not arr) "NOT-ARRAY"
+          :else (loop [r rd out ""]
+                  (let [[xs r2 done e] (j/arr-next r f "payload")
+                        o2 (loop [i 0 o out] (if (>= i (count xs)) o (recur (+ i 1) (str o (compact (nth xs i)) ";"))))]
+                    (cond (not= e "") (str o2 "ERR")
+                          done o2
+                          :else (recur r2 o2)))))))
+
+(defn- whole Str [src: Str]
+  (let [[x e] (j/read src)]
+    (match x (v/VArr xs) (loop [i 0 o ""] (if (>= i (count xs)) o (recur (+ i 1) (str o (compact (nth xs i)) ";")))) _ "?")))
+
+(def SRC (str "﻿ [ {\"id\": 1, \"name\": \"a\\\"b\", \"n\": 12345, \"tags\": [\"x\", [1, 2]]},\n"
+              "  true, false, null, -0.5e10, \"\\u3042\", {}, [], 1234567890123456789012, {\"k\": {\"j\": [null]}} ]  "))
+
+(deftest every-chunk-size-reads-the-same-elements
+  (let [w (whole SRC)]
+    (is (= (streamed SRC 1) w))
+    (is (= (streamed SRC 2) w))
+    (is (= (streamed SRC 3) w))
+    (is (= (streamed SRC 7) w))
+    (is (= (streamed SRC 4096) w))))
+
+(deftest numbers-at-a-chunk-end-wait-for-the-delimiter
+  (is (= (streamed "[123,4567]" 2) "123;4567;"))
+  (is (= (streamed "[true,false]" 3) "true;false;")))
+
+(deftest empty-and-not-an-array
+  (is (= (streamed "[]" 1) ""))
+  (is (= (streamed "  [ ]  " 1) ""))
+  (is (= (streamed "{\"a\": 1}" 2) "NOT-ARRAY"))
+  (is (= (streamed "" 2) "NOT-ARRAY")))
+
+(deftest broken-input-is-an-error
+  (is (= (streamed "[1, 2" 1) "1;2;ERR"))
+  (is (= (streamed "[1, {\"a\": }]" 3) "1;ERR")))
+
+(deftest one-large-element-grows-the-buffer
+  (let [big (loop [i 0 o ""] (if (>= i 20000) o (recur (+ i 1) (str o "x"))))
+        src (str "[\"" big "\", 1]")]
+    (is (= (count (streamed src 5)) (+ 20000 2 1 2)))))

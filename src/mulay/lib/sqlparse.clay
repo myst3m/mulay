@@ -1,0 +1,867 @@
+(ns mulay.lib.sqlparse (:require [mulay.lib.sqlfile :as sf] [clay.string :as str]))
+
+(defrecord Tok [kind: Int text: Str pos: Int end: Int])
+
+(def T-EOF 0)
+(def T-ID 1)
+(def T-QID 2)
+(def T-STR 3)
+(def T-BLOB 4)
+(def T-INT 5)
+(def T-REAL 6)
+(def T-OP 7)
+(def T-PARAM 8)
+(def T-DQID 9)
+
+(defn- qid? Bool [k: Int] (or (= k T-QID) (= k T-DQID)))
+
+(defn- id-start? Bool [c: Int] (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (= c 95) (>= c 128)))
+(defn- id-char? Bool [c: Int] (or (id-start? c) (and (>= c 48) (<= c 57)) (= c 36)))
+(defn- dig? Bool [c: Int] (and (>= c 48) (<= c 57)))
+(defn- hexd? Bool [c: Int] (or (dig? c) (and (>= c 97) (<= c 102)) (and (>= c 65) (<= c 70))))
+(defn- hexv Int [c: Int] (cond (dig? c) (- c 48) (>= c 97) (- c 87) :else (- c 55)))
+
+(defn- quoted Values(Str Int Bool) [s: &Str p0: Int q: Int]
+  (loop [p p0 out ""]
+    (cond (>= p (count s)) (values out p false)
+          (and (= (nth s p) q) (< (+ p 1) (count s)) (= (nth s (+ p 1)) q)) (recur (+ p 2) (str out (chr q)))
+          (= (nth s p) q) (values out (+ p 1) true)
+          :else (recur (+ p 1) (str out (chr (nth s p)))))))
+
+(defn- ch-at Int [s: &Str i: Int] (if (< i (count s)) (nth s i) 0))
+
+(defn- number-end Values(Int Int Bool) [s: &Str p: Int]
+  (let [n (count s)]
+    (if (and (= (ch-at s p) 48) (or (= (ch-at s (+ p 1)) 120) (= (ch-at s (+ p 1)) 88)) (hexd? (ch-at s (+ p 2))))
+      (let [[e q] (loop [i (+ p 3) q false] (cond (hexd? (ch-at s i)) (recur (+ i 1) q) (= (ch-at s i) 95) (recur (+ i 1) true) :else (values i q)))]
+        (values T-INT e q))
+      (let [[i1 q1] (loop [i p q false] (cond (dig? (ch-at s i)) (recur (+ i 1) q) (= (ch-at s i) 95) (recur (+ i 1) true) :else (values i q)))
+            frac (= (ch-at s i1) 46)
+            [i2 q2] (if frac (loop [i (+ i1 1) q q1] (cond (dig? (ch-at s i)) (recur (+ i 1) q) (= (ch-at s i) 95) (recur (+ i 1) true) :else (values i q))) (values i1 q1))
+            ex (and (or (= (ch-at s i2) 101) (= (ch-at s i2) 69))
+                    (or (dig? (ch-at s (+ i2 1))) (and (or (= (ch-at s (+ i2 1)) 43) (= (ch-at s (+ i2 1)) 45)) (dig? (ch-at s (+ i2 2))))))
+            [i3 q3] (if ex (loop [i (+ i2 2) q q2] (cond (dig? (ch-at s i)) (recur (+ i 1) q) (= (ch-at s i) 95) (recur (+ i 1) true) :else (values i q))) (values i2 q2))]
+        (values (if (or frac ex) T-REAL T-INT) i3 q3)))))
+
+(defn- dequote-number Values(Str Bool) [t: &Str]
+  (loop [i 0 out "" ok true]
+    (if (>= i (count t)) (values out ok)
+      (let [c (nth t i)]
+        (if (= c 95)
+          (recur (+ i 1) out (and ok (> i 0) (< (+ i 1) (count t)) (hexd? (nth t (- i 1))) (hexd? (nth t (+ i 1)))))
+          (recur (+ i 1) (str out (chr c)) ok))))))
+
+(def OPS2 ["||" "<<" ">>" "<=" ">=" "==" "!=" "<>" "->"])
+
+(defn tokens Values(Vec(Tok) Str) [s: &Str]
+  (let [n (count s)]
+    (loop [p 0 acc: Vec(Tok) []]
+      (if (>= p n) (values (conj acc (->Tok T-EOF "" n n)) "")
+        (let [c (nth s p)]
+          (cond
+            (or (= c 32) (= c 9) (= c 10) (= c 13) (= c 12)) (recur (+ p 1) acc)
+            (and (= c 45) (< (+ p 1) n) (= (nth s (+ p 1)) 45))
+            (recur (let [e (str/index-of-after s "\n" p)] (if (< e 0) n (+ e 1))) acc)
+            (and (= c 47) (< (+ p 1) n) (= (nth s (+ p 1)) 42))
+            (let [e (str/index-of-after s "*/" (+ p 2))]
+              (if (< e 0) (values acc "incomplete input") (recur (+ e 2) acc)))
+            (and (or (= c 120) (= c 88)) (< (+ p 1) n) (= (nth s (+ p 1)) 39))
+            (let [[h e ok] (quoted s (+ p 2) 39)]
+              (if (or (not ok) (not= (mod (count h) 2) 0) (not (all-hex? h))) (values acc (str "unrecognized token: \"" (subs s p (min n e)) "\""))
+                (recur e (conj acc (->Tok T-BLOB (unhex h) p e)))))
+            (id-start? c)
+            (let [e (loop [i p] (if (and (< i n) (id-char? (nth s i))) (recur (+ i 1)) i))] (recur e (conj acc (->Tok T-ID (subs s p e) p e))))
+            (or (dig? c) (and (= c 46) (< (+ p 1) n) (dig? (nth s (+ p 1)))))
+            (let [[k e q] (number-end s p)
+                  e2 (loop [i e] (if (and (< i n) (id-char? (nth s i))) (recur (+ i 1)) i))
+                  [txt ok] (if q (dequote-number (subs s p e)) (values (subs s p e) true))]
+              (if (or (> e2 e) (not ok))
+                (values acc (str "unrecognized token: \"" (subs s p e2) "\""))
+                (recur e (conj acc (->Tok k txt p e)))))
+            (= c 39) (let [[t e ok] (quoted s (+ p 1) 39)]
+                       (if ok (recur e (conj acc (->Tok T-STR t p e))) (values acc (str "unrecognized token: \"" (subs s p n) "\""))))
+            (or (= c 34) (= c 96)) (let [[t e ok] (quoted s (+ p 1) c)]
+                                     (if ok (recur e (conj acc (->Tok (if (= c 34) T-DQID T-QID) t p e))) (values acc (str "unrecognized token: \"" (subs s p n) "\""))))
+            (= c 91) (let [e (str/index-of-after s "]" p)]
+                       (if (< e 0) (values acc (str "unrecognized token: \"" (subs s p n) "\""))
+                         (recur (+ e 1) (conj acc (->Tok T-QID (subs s (+ p 1) e) p (+ e 1))))))
+            (= c 63) (let [e (loop [i (+ p 1)] (if (and (< i n) (dig? (nth s i))) (recur (+ i 1)) i))]
+                       (recur e (conj acc (->Tok T-PARAM (subs s p e) p e))))
+            (or (= c 58) (= c 64) (= c 36))
+            (let [e (loop [i (+ p 1)] (if (and (< i n) (id-char? (nth s i))) (recur (+ i 1)) i))]
+              (if (= e (+ p 1)) (values acc (str "unrecognized token: \"" (chr c) "\""))
+                (recur e (conj acc (->Tok T-PARAM (subs s p e) p e)))))
+            (and (< (+ p 1) n) (member? (subs s p (+ p 2)) OPS2))
+            (if (and (= (subs s p (+ p 2)) "->") (< (+ p 2) n) (= (nth s (+ p 2)) 62))
+              (recur (+ p 3) (conj acc (->Tok T-OP "->>" p (+ p 3))))
+              (recur (+ p 2) (conj acc (->Tok T-OP (subs s p (+ p 2)) p (+ p 2)))))
+            (>= (str/index-of "(),;.*/%+-<>=&|~" (chr c)) 0) (recur (+ p 1) (conj acc (->Tok T-OP (chr c) p (+ p 1))))
+            :else (values acc (str "unrecognized token: \"" (chr c) "\""))))))))
+
+(defn- all-hex? Bool [h: &Str] (loop [i 0] (cond (>= i (count h)) true (hexd? (nth h i)) (recur (+ i 1)) :else false)))
+(defn- unhex Str [h: &Str] (loop [i 0 out ""] (if (>= i (count h)) out (recur (+ i 2) (str out (chr (+ (* 16 (hexv (nth h i))) (hexv (nth h (+ i 1))))))))))
+(defn- member? Bool [x: &Str xs: &Vec(Str)] (loop [i 0] (cond (>= i (count xs)) false (= (nth xs i) x) true :else (recur (+ i 1)))))
+
+(defvariant Ex
+  (ELit v: sf/Val)
+  (ETrue b: Bool)
+  (EInt text: Str)
+  (EReal text: Str)
+  (EParam index: Int name: Str)
+  (ECol table: Str name: Str dq: Bool)
+  (EUn op: Str e: Node)
+  (EBin op: Str a: Node b: Node)
+  (EFn name: Str args: Vec(Node) star: Bool distinct: Bool)
+  (ECast e: Node type: Str)
+  (ECase base: Vec(Node) whens: Vec(Node) thens: Vec(Node) else: Vec(Node))
+  (EIn e: Node items: Vec(Node) not: Bool)
+  (EBetween e: Node lo: Node hi: Node not: Bool)
+  (ELike op: Str e: Node pat: Node esc: Vec(Node) not: Bool)
+  (EIsNull e: Node not: Bool)
+  (ECollate e: Node name: Str)
+  (ESubq q: Select)
+  (EExists q: Select)
+  (EInSub e: Node q: Select not: Bool))
+(defrecord Node [ex: Ex h: Int])
+
+(def MAX-DEPTH 1000)
+(def TOO-LARGE "Expression tree is too large (maximum depth 1000)")
+(def RECURSION "Recursion limit")
+
+(defn- hv Int [ns: &Vec(Node)] (loop [i 0 m 0] (if (>= i (count ns)) m (recur (+ i 1) (max m (:h (nth ns i)))))))
+
+(defn node Node [e: Ex]
+  (->Node e (+ 1 (match e
+                   (EUn op a) (:h a)
+                   (EBin op a b) (max (:h a) (:h b))
+                   (EFn name args star distinct) (hv args)
+                   (ECast a t) (:h a)
+                   (ECase base whens thens el) (max (max (hv base) (hv whens)) (max (hv thens) (hv el)))
+                   (EIn a items neg) (max (:h a) (hv items))
+                   (EBetween a lo hi neg) (max (:h a) (max (:h lo) (:h hi)))
+                   (ELike op a pat esc neg) (max (max (:h a) (:h pat)) (hv esc))
+                   (EIsNull a neg) (:h a)
+                   (ECollate a c) (:h a)
+                   (EInSub a q neg) (:h a)
+                   _ 0))))
+
+(defn- too-deep? Bool [n: &Node] (> (:h n) MAX-DEPTH))
+
+(def MAX-NESTING 250)
+
+(defn- nesting-err Str [ts: &Vec(Tok)]
+  (loop [i 0 d 0 run 0]
+    (if (>= i (count ts)) ""
+      (let [t (nth ts i)
+            pre (or (op? t "-") (op? t "+") (op? t "~") (kw? t "NOT"))
+            d2 (cond (or (op? t "(") (kw? t "CASE")) (+ d 1)
+                     (or (op? t ")") (kw? t "END")) (max 0 (- d 1))
+                     :else d)
+            run2 (if pre (+ run 1) 0)]
+        (cond (> d2 MAX-NESTING) RECURSION
+              (> run2 MAX-DEPTH) TOO-LARGE
+              :else (recur (+ i 1) d2 run2))))))
+
+(defrecord P [toks: Vec(Tok) i: Int nparam: Int src: Str])
+
+(defn- cur Tok [p: &P] (nth (:toks p) (:i p)))
+(defn- adv P [p: P] (assoc p :i (min (+ (:i p) 1) (- (count (:toks p)) 1))))
+
+(defn- kw? Bool [t: &Tok w: &Str] (and (= (:kind t) T-ID) (= (str/upper-case (:text t)) w)))
+(defn- op? Bool [t: &Tok o: &Str] (and (= (:kind t) T-OP) (= (:text t) o)))
+
+(defn- syntax-err Str [t: &Tok]
+  (if (= (:kind t) T-EOF) "incomplete input" (str "near \"" (tok-src t) "\": syntax error")))
+
+(defn- tok-src Str [t: &Tok]
+  (cond (= (:kind t) T-STR) (str "'" (:text t) "'")
+        (qid? (:kind t)) (str "\"" (:text t) "\"")
+        :else (str (:text t))))
+
+(def NONE: Vec(Node) [])
+
+(def RESERVED ["ADD" "ALL" "ALTER" "AND" "AS" "AUTOINCREMENT" "BETWEEN" "CASE" "CHECK" "COLLATE" "COMMIT" "CONSTRAINT"
+               "CREATE" "CROSS" "DEFAULT" "DEFERRABLE" "DELETE" "DISTINCT" "DROP" "ELSE" "ESCAPE" "EXCEPT" "EXISTS" "FILTER"
+               "FOREIGN" "FROM" "FULL" "GROUP" "HAVING" "IN" "INDEX" "INNER" "INSERT" "INTERSECT" "INTO" "IS" "ISNULL" "JOIN"
+               "LEFT" "LIMIT" "NATURAL" "NOT" "NOTHING" "NOTNULL" "NULL" "ON" "OR" "ORDER" "OUTER" "OVER" "PRIMARY"
+               "REFERENCES" "RETURNING" "RIGHT" "SELECT" "SET" "TABLE" "THEN" "TO" "TRANSACTION" "UNION" "UNIQUE" "UPDATE"
+               "USING" "VALUES" "WHEN" "WHERE" "WINDOW"])
+
+(defn- reserved? Bool [t: &Tok] (and (= (:kind t) T-ID) (member? (str/upper-case (:text t)) RESERVED)))
+
+(defn parse-expr Values(Node Str) [sql: &Str]
+  (let [[ts e] (tokens sql)]
+    (cond
+      (not= e "") (values (node (->ELit (sf/->VNull))) e)
+      (not= (nesting-err ts) "") (values (node (->ELit (sf/->VNull))) (nesting-err ts))
+      :else
+      (let [[n p2 e2] (expr (->P ts 0 0 (str sql)))]
+        (cond (not= e2 "") (values n e2)
+              (not= (:kind (cur p2)) T-EOF) (values n (syntax-err (cur p2)))
+              :else (values n ""))))))
+
+(defn expr Values(Node P Str) [p: P] (or-expr p))
+
+(defn- or-expr Values(Node P Str) [p0: P]
+  (let [[a p e] (and-expr p0)]
+    (loop [l a q p]
+      (if (or (not= e "") (not (kw? (cur q) "OR"))) (values l q e)
+        (let [[b q2 e2] (and-expr (adv q))]
+          (if (not= e2 "") (values l q2 e2) (let [n (node (->EBin "OR" l b))] (if (too-deep? n) (values n q2 TOO-LARGE) (recur n q2)))))))))
+
+(defn- and-expr Values(Node P Str) [p0: P]
+  (let [[a p e] (not-expr p0)]
+    (loop [l a q p]
+      (if (or (not= e "") (not (kw? (cur q) "AND"))) (values l q e)
+        (let [[b q2 e2] (not-expr (adv q))]
+          (if (not= e2 "") (values l q2 e2) (let [n (node (->EBin "AND" l b))] (if (too-deep? n) (values n q2 TOO-LARGE) (recur n q2)))))))))
+
+(defn- not-expr Values(Node P Str) [p: P]
+  (if (kw? (cur p) "NOT")
+    (let [[a q e] (not-expr (adv p)) n (node (->EUn "NOT" a))] (values n q (if (and (= e "") (too-deep? n)) TOO-LARGE e)))
+    (eq-expr p)))
+
+(defn- eq-expr Values(Node P Str) [p0: P]
+  (let [[a p e] (cmp-expr p0)]
+    (loop [l a q p]
+      (if (or (not= e "") (too-deep? l)) (values l q (if (not= e "") e TOO-LARGE))
+        (let [t (cur q)
+              neg (and (kw? t "NOT") (let [t2 (nth (:toks q) (min (+ (:i q) 1) (- (count (:toks q)) 1)))]
+                                       (or (kw? t2 "IN") (kw? t2 "LIKE") (kw? t2 "GLOB") (kw? t2 "BETWEEN") (kw? t2 "NULL"))))
+              q1 (if neg (adv q) q)
+              t1 (cur q1)]
+          (cond
+            (or (op? t "=") (op? t "==") (op? t "!=") (op? t "<>"))
+            (let [[b q2 e2] (cmp-expr (adv q))
+                  o (cond (op? t "==") "=" (op? t "<>") "!=" :else (:text t))]
+              (if (not= e2 "") (values l q2 e2) (recur (node (->EBin o l b)) q2)))
+            (kw? t "IS")
+            (let [qa (adv q)
+                  isnot (kw? (cur qa) "NOT")
+                  qb (if isnot (adv qa) qa)
+                  dist (kw? (cur qb) "DISTINCT")
+                  qc (if dist (if (kw? (cur (adv qb)) "FROM") (adv (adv qb)) qb) qb)]
+              (if (and dist (not (kw? (cur (adv qb)) "FROM"))) (values l qb (syntax-err (cur (adv qb))))
+                (let [[b q2 e2] (cmp-expr qc)
+                      o (if (= isnot dist) "IS" "IS NOT")]
+                  (if (not= e2 "") (values l q2 e2) (recur (node (->EBin o l b)) q2)))))
+            (kw? t "ISNULL") (recur (node (->EIsNull l false)) (adv q))
+            (kw? t "NOTNULL") (recur (node (->EIsNull l true)) (adv q))
+            (and neg (kw? t1 "NULL")) (recur (node (->EIsNull l true)) (adv q1))
+            (and (kw? t1 "IN") (op? (cur (adv q1)) "(") (select-start? (cur (adv (adv q1)))))
+            (let [[sq q2 e2] (select-stmt (adv (adv q1)))]
+              (cond (not= e2 "") (values l q2 e2)
+                    (not (op? (cur q2) ")")) (values l q2 (syntax-err (cur q2)))
+                    :else (recur (node (->EInSub l sq neg)) (adv q2))))
+            (kw? t1 "IN")
+            (let [[items q2 e2] (in-list (adv q1))]
+              (if (not= e2 "") (values l q2 e2) (recur (node (->EIn l items neg)) q2)))
+            (or (kw? t1 "LIKE") (kw? t1 "GLOB"))
+            (let [[pat q2 e2] (cmp-expr (adv q1))
+                  has-esc (and (= e2 "") (kw? (cur q2) "ESCAPE"))
+                  [esc q3 e3] (if has-esc (cmp-expr (adv q2)) (values pat q2 e2))]
+              (cond (not= e2 "") (values l q2 e2)
+                    (not= e3 "") (values l q3 e3)
+                    :else (recur (node (->ELike (str/upper-case (:text t1)) l pat (if has-esc [esc] NONE) neg)) q3)))
+            (kw? t1 "BETWEEN")
+            (let [[lo q2 e2] (cmp-expr (adv q1))]
+              (cond (not= e2 "") (values l q2 e2)
+                    (not (kw? (cur q2) "AND")) (values l q2 (syntax-err (cur q2)))
+                    :else (let [[hi q3 e3] (cmp-expr (adv q2))]
+                            (if (not= e3 "") (values l q3 e3) (recur (node (->EBetween l lo hi neg)) q3)))))
+            (kw? t "NOT") (values l q (syntax-err (cur (adv q))))
+            :else (values l q "")))))))
+
+(defn- in-list Values(Vec(Node) P Str) [p: P]
+  (if (not (op? (cur p) "(")) (values NONE p (syntax-err (cur p)))
+    (if (op? (cur (adv p)) ")") (values NONE (adv (adv p)) "")
+      (let [[xs q e] (expr-list (adv p))]
+        (cond (not= e "") (values xs q e)
+              (not (op? (cur q) ")")) (values xs q (syntax-err (cur q)))
+              :else (values xs (adv q) ""))))))
+
+(defn- expr-list Values(Vec(Node) P Str) [p0: P]
+  (loop [p p0 acc NONE]
+    (let [[x q e] (expr p)]
+      (cond (not= e "") (values acc q e)
+            (op? (cur q) ",") (recur (adv q) (conj acc x))
+            :else (values (conj acc x) q "")))))
+
+(defn- binary-level Values(Node P Str) [p0: P level: Int]
+  (let [[a p e] (next-level p0 level)]
+    (loop [l a q p]
+      (let [t (cur q)
+            o (level-op t level)]
+        (if (or (not= e "") (= o "")) (values l q e)
+          (let [[b q2 e2] (next-level (adv q) level)]
+            (if (not= e2 "") (values l q2 e2) (let [n (node (->EBin o l b))] (if (too-deep? n) (values n q2 TOO-LARGE) (recur n q2))))))))))
+
+(defn- level-op Str [t: &Tok level: Int]
+  (if (not= (:kind t) T-OP) ""
+    (let [x (:text t)]
+      (cond (and (= level 0) (or (= x "<") (= x ">") (= x "<=") (= x ">="))) (str x)
+            (and (= level 1) (or (= x "&") (= x "|") (= x "<<") (= x ">>"))) (str x)
+            (and (= level 2) (or (= x "+") (= x "-"))) (str x)
+            (and (= level 3) (or (= x "*") (= x "/") (= x "%"))) (str x)
+            (and (= level 4) (or (= x "||") (= x "->") (= x "->>"))) (str x)
+            :else ""))))
+
+(defn- next-level Values(Node P Str) [p: P level: Int]
+  (if (= level 4) (unary p) (binary-level p (+ level 1))))
+
+(defn- cmp-expr Values(Node P Str) [p: P] (binary-level p 0))
+
+(defn- unary Values(Node P Str) [p: P]
+  (let [t (cur p)]
+    (if (or (op? t "-") (op? t "+") (op? t "~"))
+      (let [[a q e] (unary (adv p)) n (node (->EUn (:text t) a))] (values n q (if (and (= e "") (too-deep? n)) TOO-LARGE e)))
+      (let [[a q e] (primary p)]
+        (loop [x a r q]
+          (if (or (not= e "") (too-deep? x) (not (kw? (cur r) "COLLATE"))) (values x r (if (and (= e "") (too-deep? x)) TOO-LARGE e))
+            (let [t2 (cur (adv r))]
+              (if (or (= (:kind t2) T-ID) (qid? (:kind t2)) (= (:kind t2) T-STR))
+                (recur (node (->ECollate x (str/upper-case (:text t2)))) (adv (adv r)))
+                (values x r (syntax-err t2))))))))))
+
+(defn- primary Values(Node P Str) [p: P]
+  (let [t (cur p) k (:kind t)]
+    (cond
+      (= k T-INT) (values (node (->EInt (:text t))) (adv p) "")
+      (= k T-REAL) (values (node (->EReal (:text t))) (adv p) "")
+      (= k T-STR) (values (node (->ELit (sf/->VText (:text t)))) (adv p) "")
+      (= k T-BLOB) (values (node (->ELit (sf/->VBlob (:text t)))) (adv p) "")
+      (= k T-PARAM)
+      (if (= (nth (:text t) 0) 63)
+        (let [n (if (= (count (:text t)) 1) (+ (:nparam p) 1) (let [[v e] (parse-long (subs (:text t) 1 (count (:text t))))] v))]
+          (values (node (->EParam n "")) (assoc (adv p) :nparam (max n (:nparam p))) ""))
+        (values (node (->EParam 0 (:text t))) (adv p) ""))
+      (and (op? t "(") (select-start? (cur (adv p))))
+      (let [[sq q e] (select-stmt (adv p))]
+        (cond (not= e "") (values (node (->ELit (sf/->VNull))) q e)
+              (not (op? (cur q) ")")) (values (node (->ELit (sf/->VNull))) q (syntax-err (cur q)))
+              :else (values (node (->ESubq sq)) (adv q) "")))
+      (op? t "(")
+      (let [[a q e] (expr (adv p))]
+        (cond (not= e "") (values a q e)
+              (not (op? (cur q) ")")) (values a q (syntax-err (cur q)))
+              :else (values a (adv q) "")))
+      (and (kw? t "EXISTS") (op? (cur (adv p)) "("))
+      (let [[sq q e] (select-stmt (adv (adv p)))]
+        (cond (not= e "") (values (node (->ELit (sf/->VNull))) q e)
+              (not (op? (cur q) ")")) (values (node (->ELit (sf/->VNull))) q (syntax-err (cur q)))
+              :else (values (node (->EExists sq)) (adv q) "")))
+      (kw? t "NULL") (values (node (->ELit (sf/->VNull))) (adv p) "")
+      (kw? t "TRUE") (values (node (->ETrue true)) (adv p) "")
+      (kw? t "FALSE") (values (node (->ETrue false)) (adv p) "")
+      (kw? t "CAST") (cast-expr (adv p))
+      (kw? t "CASE") (case-expr (adv p))
+      (and (or (= k T-ID) (qid? k)) (not (reserved? t)))
+      (let [q (adv p)]
+        (cond
+          (and (= k T-ID) (op? (cur q) "(")) (call (:text t) (adv q))
+          (op? (cur q) ".")
+          (let [t2 (cur (adv q))]
+            (if (or (= (:kind t2) T-ID) (qid? (:kind t2)))
+              (values (node (->ECol (:text t) (:text t2) false)) (adv (adv q)) "")
+              (values (node (->ECol "" "" false)) q (syntax-err t2))))
+          :else (values (node (->ECol "" (:text t) (= k T-DQID))) q "")))
+      :else (values (node (->ELit (sf/->VNull))) p (syntax-err t)))))
+
+(defn- cast-expr Values(Node P Str) [p: P]
+  (if (not (op? (cur p) "(")) (values (node (->ELit (sf/->VNull))) p (syntax-err (cur p)))
+    (let [[a q e] (expr (adv p))]
+      (cond (not= e "") (values a q e)
+            (not (kw? (cur q) "AS")) (values a q (syntax-err (cur q)))
+            :else
+            (let [[ty r e2] (type-name (adv q))]
+              (cond (not= e2 "") (values a r e2)
+                    (not (op? (cur r) ")")) (values a r (syntax-err (cur r)))
+                    :else (values (node (->ECast a ty)) (adv r) "")))))))
+
+(defn type-name Values(Str P Str) [p0: P]
+  (let [[name p] (loop [q p0 out ""]
+                   (let [t (cur q)]
+                     (if (and (or (= (:kind t) T-ID) (qid? (:kind t))) (not (reserved? t)))
+                       (recur (adv q) (if (= out "") (str (:text t)) (str out " " (:text t))))
+                       (values out q))))]
+    (cond
+      (= name "") (values "" p "")
+      (op? (cur p) "(")
+      (let [q (loop [r (adv p)] (let [t (cur r)] (if (or (= (:kind t) T-EOF) (op? t ")")) r (recur (adv r)))))]
+        (if (op? (cur q) ")") (values name (adv q) "") (values name q (syntax-err (cur q)))))
+      :else (values name p ""))))
+
+(defn- case-expr Values(Node P Str) [p: P]
+  (let [has-base (not (kw? (cur p) "WHEN"))
+        [base q e] (if has-base (expr p) (values (node (->ELit (sf/->VNull))) p ""))]
+    (if (not= e "") (values base q e)
+      (loop [r q ws NONE ts NONE]
+        (cond
+          (kw? (cur r) "WHEN")
+          (let [[w r2 e2] (expr (adv r))]
+            (cond (not= e2 "") (values w r2 e2)
+                  (not (kw? (cur r2) "THEN")) (values w r2 (syntax-err (cur r2)))
+                  :else (let [[th r3 e3] (expr (adv r2))]
+                          (if (not= e3 "") (values th r3 e3) (recur r3 (conj ws w) (conj ts th))))))
+          (= (count ws) 0) (values base r (syntax-err (cur r)))
+          (kw? (cur r) "ELSE")
+          (let [[el r2 e2] (expr (adv r))]
+            (cond (not= e2 "") (values el r2 e2)
+                  (not (kw? (cur r2) "END")) (values el r2 (syntax-err (cur r2)))
+                  :else (values (node (->ECase (if has-base [base] NONE) ws ts [el])) (adv r2) "")))
+          (kw? (cur r) "END") (values (node (->ECase (if has-base [base] NONE) ws ts NONE)) (adv r) "")
+          :else (values base r (syntax-err (cur r))))))))
+
+(defn- call Values(Node P Str) [name: &Str p: P]
+  (cond
+    (op? (cur p) "*")
+    (if (op? (cur (adv p)) ")") (values (node (->EFn (str name) NONE true false)) (adv (adv p)) "")
+      (values (node (->ELit (sf/->VNull))) (adv p) (syntax-err (cur (adv p)))))
+    (op? (cur p) ")") (values (node (->EFn (str name) NONE false false)) (adv p) "")
+    :else
+    (let [dist (kw? (cur p) "DISTINCT")
+          [args q e] (expr-list (if dist (adv p) p))]
+      (cond (not= e "") (values (node (->ELit (sf/->VNull))) q e)
+            (not (op? (cur q) ")")) (values (node (->ELit (sf/->VNull))) q (syntax-err (cur q)))
+            :else (values (node (->EFn (str name) args false dist)) (adv q) "")))))
+
+(defrecord ResultCol [e: Vec(Node) star: Bool table: Str alias: Str text: Str])
+(defrecord OrderTerm [e: Node desc: Bool coll: Str nulls: Int])
+(defrecord Cte [name: Str cols: Vec(Str) q: Select])
+
+(defvariant From
+  (FTable name: Str alias: Str)
+  (FSub q: Select alias: Str)
+  (FJoin left: FromN right: FromN kind: Str on: Vec(Node) using: Vec(Str) natural: Bool))
+(defrecord FromN [f: From])
+
+(defrecord Core [distinct: Bool cols: Vec(ResultCol) from: Vec(FromN) where: Vec(Node) group: Vec(Node) having: Vec(Node)
+                 values: Vec(Vec(Node)) is-values: Bool])
+(defrecord Select [ctes: Vec(Cte) recursive: Bool cores: Vec(Core) ops: Vec(Str) order: Vec(OrderTerm) limit: Vec(Node) offset: Vec(Node)])
+
+(defrecord ColDef [name: Str type: Str pk: Bool desc: Bool autoinc: Bool notnull: Bool unique: Bool dflt: Vec(Node) coll: Str
+                   check: Vec(Node) check-labels: Vec(Str)])
+(defrecord TableCons [kind: Str cols: Vec(Str) check: Vec(Node) label: Str])
+(defrecord IdxCol [e: Node coll: Str desc: Bool])
+
+(defvariant Stmt
+  (SSelect q: Select)
+  (SInsert table: Str cols: Vec(Str) src: Select defaults: Bool conflict: Str)
+  (SUpdate table: Str cols: Vec(Str) vals: Vec(Node) where: Vec(Node) conflict: Str)
+  (SDelete table: Str where: Vec(Node))
+  (SCreateTable name: Str if-not: Bool cols: Vec(ColDef) cons: Vec(TableCons) without-rowid: Bool sql: Str)
+  (SCreateIndex name: Str table: Str unique: Bool if-not: Bool cols: Vec(IdxCol) where: Vec(Node) sql: Str)
+  (SDrop kind: Str name: Str if-exists: Bool)
+  (SBegin)
+  (SCommit)
+  (SRollback)
+  (SEmpty))
+
+(defn- select-start? Bool [t: &Tok] (or (kw? t "SELECT") (kw? t "WITH") (kw? t "VALUES")))
+
+(defn parse Values(Stmt Str) [sql: &Str]
+  (let [[ts e] (tokens sql)]
+    (cond
+      (not= e "") (values (->SEmpty) e)
+      (not= (nesting-err ts) "") (values (->SEmpty) (nesting-err ts))
+      :else
+      (let [p0 (->P ts 0 0 (str sql))
+            p (loop [q p0] (if (op? (cur q) ";") (recur (adv q)) q))
+            [st p2 e2] (statement p)]
+        (cond (not= e2 "") (values st e2)
+              (or (= (:kind (cur p2)) T-EOF) (op? (cur p2) ";")) (values st "")
+              :else (values st (syntax-err (cur p2))))))))
+
+(defn- statement Values(Stmt P Str) [p: P]
+  (let [t (cur p)]
+    (cond
+      (= (:kind t) T-EOF) (values (->SEmpty) p "")
+      (select-start? t) (let [[q p2 e] (select-stmt p)]
+                          (values (->SSelect q) p2 e))
+      (or (kw? t "INSERT") (kw? t "REPLACE")) (insert-stmt p)
+      (kw? t "UPDATE") (update-stmt (adv p))
+      (kw? t "DELETE") (delete-stmt (adv p))
+      (kw? t "CREATE") (create-stmt (adv p))
+      (kw? t "DROP") (drop-stmt (adv p))
+      (kw? t "BEGIN") (let [q (adv p)
+                            q2 (if (or (kw? (cur q) "DEFERRED") (kw? (cur q) "IMMEDIATE") (kw? (cur q) "EXCLUSIVE")) (adv q) q)
+                            q3 (if (kw? (cur q2) "TRANSACTION") (adv q2) q2)]
+                        (values (->SBegin) q3 ""))
+      (or (kw? t "COMMIT") (kw? t "END")) (let [q (adv p)] (values (->SCommit) (if (kw? (cur q) "TRANSACTION") (adv q) q) ""))
+      (kw? t "ROLLBACK") (let [q (adv p)] (values (->SRollback) (if (kw? (cur q) "TRANSACTION") (adv q) q) ""))
+      :else (values (->SEmpty) p (syntax-err t)))))
+
+(defn- name-tok? Bool [t: &Tok] (or (qid? (:kind t)) (= (:kind t) T-STR) (and (= (:kind t) T-ID) (not (reserved? t)))))
+
+(defn- take-name Values(Str P Str) [p: P]
+  (let [t (cur p)] (if (name-tok? t) (values (str (:text t)) (adv p) "") (values "" p (syntax-err t)))))
+
+(defn- qualified-name Values(Str P Str) [p: P]
+  (let [[a q e] (take-name p)]
+    (if (and (= e "") (op? (cur q) ".")) (take-name (adv q)) (values a q e))))
+
+(defn- expect-kw Values(P Str) [p: P w: &Str] (if (kw? (cur p) w) (values (adv p) "") (values p (syntax-err (cur p)))))
+(defn- expect-op Values(P Str) [p: P o: &Str] (if (op? (cur p) o) (values (adv p) "") (values p (syntax-err (cur p)))))
+
+(defn- name-list Values(Vec(Str) P Str) [p0: P]
+  (let [[p e] (expect-op p0 "(")]
+    (if (not= e "") (values [] p e)
+      (loop [q p acc: Vec(Str) []]
+        (let [[n q2 e2] (take-name q)]
+          (cond (not= e2 "") (values acc q2 e2)
+                (op? (cur q2) ",") (recur (adv q2) (conj acc n))
+                (op? (cur q2) ")") (values (conj acc n) (adv q2) "")
+                :else (values acc q2 (syntax-err (cur q2)))))))))
+
+(def NO-CTES: Vec(Cte) [])
+
+(defn select-stmt Values(Select P Str) [p0: P]
+  (let [[ctes rec p e] (if (kw? (cur p0) "WITH") (with-clause (adv p0)) (values NO-CTES false p0 ""))]
+    (if (not= e "") (values (empty-select) p e)
+      (let [[core p2 e2] (select-core p)]
+        (if (not= e2 "") (values (empty-select) p2 e2)
+          (loop [q p2 cores [core] ops: Vec(Str) []]
+            (let [t (cur q)
+                  op (cond (kw? t "UNION") (if (kw? (cur (adv q)) "ALL") "UNION ALL" "UNION")
+                           (kw? t "INTERSECT") "INTERSECT" (kw? t "EXCEPT") "EXCEPT" :else "")]
+              (if (not= op "")
+                (let [q2 (if (= op "UNION ALL") (adv (adv q)) (adv q))
+                      [c q3 e3] (select-core q2)]
+                  (if (not= e3 "") (values (empty-select) q3 e3) (recur q3 (conj cores c) (conj ops op))))
+                (let [[order q4 e4] (cond (and (kw? (cur q) "ORDER") (kw? (cur (adv q)) "BY")) (order-by (adv (adv q)))
+                                          (kw? (cur q) "ORDER") (values [] q (syntax-err (cur (adv q))))
+                                          :else (values [] q ""))
+                      [lim off q5 e5] (if (and (= e4 "") (kw? (cur q4) "LIMIT")) (limit-clause (adv q4)) (values NONE NONE q4 ""))]
+                  (cond (not= e4 "") (values (empty-select) q4 e4)
+                        (not= e5 "") (values (empty-select) q5 e5)
+                        :else (values (->Select ctes rec cores ops order lim off) q5 "")))))))))))
+
+(defn- empty-select Select [] (->Select NO-CTES false [] [] [] NONE NONE))
+
+(defn- with-clause Values(Vec(Cte) Bool P Str) [p0: P]
+  (let [rec (kw? (cur p0) "RECURSIVE")
+        p1 (if rec (adv p0) p0)]
+    (loop [p p1 acc NO-CTES]
+      (let [[name q e] (take-name p)
+            [cols q2 e2] (if (and (= e "") (op? (cur q) "(")) (name-list q) (values [] q e))
+            [q3 e3] (if (= e2 "") (expect-kw q2 "AS") (values q2 e2))
+            q4 (if (and (= e3 "") (kw? (cur q3) "NOT") (kw? (cur (adv q3)) "MATERIALIZED")) (adv (adv q3))
+                 (if (and (= e3 "") (kw? (cur q3) "MATERIALIZED")) (adv q3) q3))
+            [q5 e5] (if (= e3 "") (expect-op q4 "(") (values q4 e3))
+            [sel q6 e6] (if (= e5 "") (select-stmt q5) (values (empty-select) q5 e5))
+            [q7 e7] (if (= e6 "") (expect-op q6 ")") (values q6 e6))]
+        (cond (not= e7 "") (values acc rec q7 e7)
+              (op? (cur q7) ",") (recur (adv q7) (conj acc (->Cte name cols sel)))
+              :else (values (conj acc (->Cte name cols sel)) rec q7 ""))))))
+
+(def CLAUSE-WORDS ["FROM" "WHERE" "GROUP" "HAVING" "ORDER" "LIMIT" "OFFSET" "UNION" "INTERSECT" "EXCEPT" "JOIN" "ON" "USING"
+                   "LEFT" "RIGHT" "FULL" "INNER" "CROSS" "NATURAL" "OUTER" "WINDOW" "INDEXED" "NOT" "VALUES" "SET" "RETURNING"])
+
+(defn- alias-tok? Bool [t: &Tok]
+  (or (qid? (:kind t)) (= (:kind t) T-STR) (and (= (:kind t) T-ID) (not (reserved? t)) (not (member? (str/upper-case (:text t)) CLAUSE-WORDS)))))
+
+(defn- opt-alias Values(Str P Str) [p: P]
+  (cond (kw? (cur p) "AS") (let [t (cur (adv p))] (if (name-tok? t) (values (str (:text t)) (adv (adv p)) "") (values "" (adv p) (syntax-err t))))
+        (alias-tok? (cur p)) (values (str (:text (cur p))) (adv p) "")
+        :else (values "" p "")))
+
+(defn- select-core Values(Core P Str) [p: P]
+  (cond
+    (kw? (cur p) "VALUES") (values-core (adv p))
+    (not (kw? (cur p) "SELECT")) (values (empty-core) p (syntax-err (cur p)))
+    :else
+    (let [q0 (adv p)
+          dist (kw? (cur q0) "DISTINCT")
+          q1 (if (or dist (kw? (cur q0) "ALL")) (adv q0) q0)
+          [cols q2 e2] (result-cols q1)
+          [from q3 e3] (if (and (= e2 "") (kw? (cur q2) "FROM")) (from-clause (adv q2)) (values [] q2 e2))
+          [w q4 e4] (if (and (= e3 "") (kw? (cur q3) "WHERE")) (let [[x q e] (expr (adv q3))] (values [x] q e)) (values NONE q3 e3))
+          [g q5 e5] (cond (not= e4 "") (values NONE q4 e4)
+                          (and (kw? (cur q4) "GROUP") (kw? (cur (adv q4)) "BY")) (expr-list (adv (adv q4)))
+                          (kw? (cur q4) "GROUP") (values NONE q4 (syntax-err (cur (adv q4))))
+                          :else (values NONE q4 ""))
+          [h q6 e6] (if (and (= e5 "") (kw? (cur q5) "HAVING")) (let [[x q e] (expr (adv q5))] (values [x] q e)) (values NONE q5 e5))]
+      (values (->Core dist cols from w g h [] false) q6 e6))))
+
+(defn- empty-core Core [] (->Core false [] [] NONE NONE NONE [] false))
+
+(defn- values-core Values(Core P Str) [p0: P]
+  (loop [p p0 rows: Vec(Vec(Node)) []]
+    (let [[q e] (expect-op p "(")
+          [xs q2 e2] (if (= e "") (expr-list q) (values NONE q e))
+          [q3 e3] (if (= e2 "") (expect-op q2 ")") (values q2 e2))]
+      (cond (not= e3 "") (values (empty-core) q3 e3)
+            (op? (cur q3) ",") (recur (adv q3) (conj rows xs))
+            :else (values (->Core false [] [] NONE NONE NONE (conj rows xs) true) q3 "")))))
+
+(defn- result-cols Values(Vec(ResultCol) P Str) [p0: P]
+  (loop [p p0 acc: Vec(ResultCol) []]
+    (let [t (cur p)
+          [rc q e] (cond
+                     (op? t "*") (values (->ResultCol NONE true "" "" "*") (adv p) "")
+                     (and (name-tok? t) (op? (cur (adv p)) ".") (op? (cur (adv (adv p))) "*"))
+                     (values (->ResultCol NONE true (str (:text t)) "" "") (adv (adv (adv p))) "")
+                     :else
+                     (let [start (:pos t)
+                           [x q1 e1] (expr p)
+                           endp (:end (nth (:toks q1) (max 0 (- (:i q1) 1))))
+                           text (if (= e1 "") (subs (:src p) start endp) "")
+                           [al q2 e2] (if (= e1 "") (opt-alias q1) (values "" q1 e1))]
+                       (values (->ResultCol [x] false "" al text) q2 e2)))]
+      (cond (not= e "") (values acc q e)
+            (op? (cur q) ",") (recur (adv q) (conj acc rc))
+            :else (values (conj acc rc) q "")))))
+
+(defn- from-clause Values(Vec(FromN) P Str) [p0: P]
+  (let [[first q e] (from-item p0)]
+    (if (not= e "") (values [] q e)
+      (loop [left first q q]
+        (let [t (cur q)
+              natural (kw? t "NATURAL")
+              q1 (if natural (adv q) q)
+              t1 (cur q1)
+              [kind q2] (cond (op? t "," ) (values "INNER" (adv q))
+                              (kw? t1 "JOIN") (values "INNER" (adv q1))
+                              (and (kw? t1 "INNER") (kw? (cur (adv q1)) "JOIN")) (values "INNER" (adv (adv q1)))
+                              (and (kw? t1 "CROSS") (kw? (cur (adv q1)) "JOIN")) (values "CROSS" (adv (adv q1)))
+                              (and (kw? t1 "LEFT") (kw? (cur (adv q1)) "JOIN")) (values "LEFT" (adv (adv q1)))
+                              (and (kw? t1 "LEFT") (kw? (cur (adv q1)) "OUTER") (kw? (cur (adv (adv q1))) "JOIN")) (values "LEFT" (adv (adv (adv q1))))
+                              (or (kw? t1 "RIGHT") (kw? t1 "FULL")) (values "UNSUPPORTED" q1)
+                              :else (values "" q))]
+          (cond
+            (= kind "") (values [left] q "")
+            (= kind "UNSUPPORTED") (values [left] q1 "unsupported: RIGHT and FULL JOIN")
+            :else
+            (let [[right q3 e3] (from-item q2)
+                  [on q4 e4] (if (and (= e3 "") (kw? (cur q3) "ON")) (let [[x q e] (expr (adv q3))] (values [x] q e)) (values NONE q3 e3))
+                  [us q5 e5] (if (and (= e4 "") (kw? (cur q4) "USING")) (name-list (adv q4)) (values [] q4 e4))]
+              (if (not= e5 "") (values [left] q5 e5)
+                (recur (->FromN (->FJoin left right kind on us natural)) q5)))))))))
+
+(defn- from-item Values(FromN P Str) [p: P]
+  (let [t (cur p)]
+    (cond
+      (and (op? t "(") (select-start? (cur (adv p))))
+      (let [[sq q e] (select-stmt (adv p))
+            [q2 e2] (if (= e "") (expect-op q ")") (values q e))
+            [al q3 e3] (if (= e2 "") (opt-alias q2) (values "" q2 e2))]
+        (values (->FromN (->FSub sq al)) q3 e3))
+      (op? t "(")
+      (let [[fs q e] (from-clause (adv p))
+            [q2 e2] (if (= e "") (expect-op q ")") (values q e))]
+        (values (if (> (count fs) 0) (nth fs 0) (->FromN (->FTable "" ""))) q2 e2))
+      :else
+      (let [[name q e] (qualified-name p)
+            [al q2 e2] (if (= e "") (opt-alias q) (values "" q e))
+            q3 (cond (and (kw? (cur q2) "INDEXED") (kw? (cur (adv q2)) "BY")) (adv (adv (adv q2)))
+                     (and (kw? (cur q2) "NOT") (kw? (cur (adv q2)) "INDEXED")) (adv (adv q2))
+                     :else q2)]
+        (values (->FromN (->FTable name al)) q3 e2)))))
+
+(defn- order-by Values(Vec(OrderTerm) P Str) [p0: P]
+  (loop [p p0 acc: Vec(OrderTerm) []]
+    (let [[x q e] (expr p)]
+      (if (not= e "") (values acc q e)
+        (let [[x2 coll] (match (:ex x) (ECollate inner c) (values inner (str c)) _ (values x ""))
+              desc (kw? (cur q) "DESC")
+              q2 (if (or desc (kw? (cur q) "ASC")) (adv q) q)
+              [nulls q3] (if (kw? (cur q2) "NULLS")
+                           (values (if (kw? (cur (adv q2)) "FIRST") 1 2) (adv (adv q2)))
+                           (values 0 q2))
+              term (->OrderTerm x2 desc coll nulls)]
+          (if (op? (cur q3) ",") (recur (adv q3) (conj acc term)) (values (conj acc term) q3 "")))))))
+
+(defn- limit-clause Values(Vec(Node) Vec(Node) P Str) [p: P]
+  (let [[a q e] (expr p)]
+    (cond (not= e "") (values NONE NONE q e)
+          (kw? (cur q) "OFFSET") (let [[b q2 e2] (expr (adv q))] (values [a] [b] q2 e2))
+          (op? (cur q) ",") (let [[b q2 e2] (expr (adv q))] (values [b] [a] q2 e2))
+          :else (values [a] NONE q ""))))
+
+(defn- conflict-clause Values(Str P) [p: P]
+  (if (kw? (cur p) "OR")
+    (let [t (cur (adv p))] (values (str/upper-case (:text t)) (adv (adv p))))
+    (values "" p)))
+
+(defn- insert-stmt Values(Stmt P Str) [p: P]
+  (let [replace (kw? (cur p) "REPLACE")
+        [conflict q0] (if replace (values "REPLACE" (adv p)) (conflict-clause (adv p)))
+        [q1 e1] (expect-kw q0 "INTO")
+        [name q2 e2] (if (= e1 "") (qualified-name q1) (values "" q1 e1))
+        q2b (if (and (= e2 "") (kw? (cur q2) "AS")) (adv (adv q2)) q2)
+        [cols q3 e3] (if (and (= e2 "") (op? (cur q2b) "(")) (name-list q2b) (values [] q2b e2))]
+    (cond
+      (not= e3 "") (values (->SEmpty) q3 e3)
+      (and (kw? (cur q3) "DEFAULT") (kw? (cur (adv q3)) "VALUES"))
+      (values (->SInsert name cols (empty-select) true conflict) (adv (adv q3)) "")
+      (select-start? (cur q3))
+      (let [[sq q4 e4] (select-stmt q3)
+            [q5 e5] (if (and (= e4 "") (kw? (cur q4) "ON") (kw? (cur (adv q4)) "CONFLICT")) (values q4 "unsupported: upsert") (values q4 e4))
+            [q6 e6] (if (and (= e5 "") (kw? (cur q5) "RETURNING")) (values q5 "unsupported: RETURNING") (values q5 e5))]
+        (values (->SInsert name cols sq false conflict) q6 e6))
+      :else (values (->SEmpty) q3 (syntax-err (cur q3))))))
+
+(defn- update-stmt Values(Stmt P Str) [p0: P]
+  (let [[conflict p] (conflict-clause p0)
+        [name q e] (qualified-name p)
+        [q1 e1] (if (= e "") (expect-kw q "SET") (values q e))]
+    (if (not= e1 "") (values (->SEmpty) q1 e1)
+      (loop [q2 q1 cols: Vec(Str) [] vals NONE]
+        (let [[c q3 e3] (take-name q2)
+              [q4 e4] (if (= e3 "") (expect-op q3 "=") (values q3 e3))
+              [x q5 e5] (if (= e4 "") (expr q4) (values (node (->ELit (sf/->VNull))) q4 e4))]
+          (cond (not= e5 "") (values (->SEmpty) q5 e5)
+                (op? (cur q5) ",") (recur (adv q5) (conj cols c) (conj vals x))
+                :else
+                (let [[w q6 e6] (if (kw? (cur q5) "WHERE") (let [[x2 q e] (expr (adv q5))] (values [x2] q e)) (values NONE q5 ""))]
+                  (values (->SUpdate name (conj cols c) (conj vals x) w conflict) q6 e6))))))))
+
+(defn- delete-stmt Values(Stmt P Str) [p0: P]
+  (let [[p e] (expect-kw p0 "FROM")
+        [name q e2] (if (= e "") (qualified-name p) (values "" p e))]
+    (cond (not= e2 "") (values (->SEmpty) q e2)
+          (kw? (cur q) "WHERE") (let [[x q2 e3] (expr (adv q))] (values (->SDelete name [x]) q2 e3))
+          :else (values (->SDelete name NONE) q ""))))
+
+(defn- create-stmt Values(Stmt P Str) [p: P]
+  (let [start (:pos (nth (:toks p) (- (:i p) 1)))
+        q0 (if (or (kw? (cur p) "TEMP") (kw? (cur p) "TEMPORARY")) (adv p) p)
+        unique (kw? (cur q0) "UNIQUE")
+        q1 (if unique (adv q0) q0)]
+    (cond
+      (and (kw? (cur q1) "TABLE") (not unique)) (create-table (adv q1) start)
+      (kw? (cur q1) "INDEX") (create-index (adv q1) unique start)
+      (or (kw? (cur q1) "VIEW") (kw? (cur q1) "TRIGGER") (kw? (cur q1) "VIRTUAL")) (values (->SEmpty) q1 (str "unsupported: CREATE " (str/upper-case (:text (cur q1)))))
+      :else (values (->SEmpty) q1 (syntax-err (cur q1))))))
+
+(defn- if-not-exists Values(Bool P Str) [p: P]
+  (if (kw? (cur p) "IF")
+    (let [[q e] (expect-kw (adv p) "NOT") [q2 e2] (if (= e "") (expect-kw q "EXISTS") (values q e))] (values true q2 e2))
+    (values false p "")))
+
+(defn- source-from Str [p: &P start: Int] (subs (:src p) start (:end (nth (:toks p) (max 0 (- (:i p) 1))))))
+
+(defn- create-table Values(Stmt P Str) [p0: P start: Int]
+  (let [[ine p e] (if-not-exists p0)
+        [name q e1] (if (= e "") (qualified-name p) (values "" p e))
+        [q1 e2] (if (= e1 "") (expect-op q "(") (values q e1))]
+    (if (not= e2 "") (values (->SEmpty) q1 e2)
+      (loop [q2 q1 cols: Vec(ColDef) [] cons: Vec(TableCons) []]
+        (let [t (cur q2)
+              table-cons (or (kw? t "CONSTRAINT") (kw? t "PRIMARY") (kw? t "UNIQUE") (kw? t "CHECK") (kw? t "FOREIGN"))
+              [cols2 cons2 q3 e3] (if (or table-cons (> (count cons) 0))
+                                    (let [[tc q e] (table-constraint q2)] (values cols (conj cons tc) q e))
+                                    (let [[cd q e] (column-def q2)] (values (conj cols cd) cons q e)))]
+          (cond (not= e3 "") (values (->SEmpty) q3 e3)
+                (op? (cur q3) ",") (recur (adv q3) cols2 cons2)
+                (op? (cur q3) ")")
+                (let [q4 (adv q3)
+                      wr (and (kw? (cur q4) "WITHOUT") (kw? (cur (adv q4)) "ROWID"))
+                      q5 (if wr (adv (adv q4)) q4)
+                      q6 (if (kw? (cur q5) "STRICT") (adv q5) q5)]
+                  (values (->SCreateTable name ine cols2 cons2 wr (source-from q6 start)) q6 ""))
+                :else (values (->SEmpty) q3 (syntax-err (cur q3)))))))))
+
+(defn- column-def Values(ColDef P Str) [p: P]
+  (let [[name q e] (take-name p)
+        [ty q1 e1] (if (= e "") (type-name q) (values "" q e))]
+    (if (not= e1 "") (values (empty-coldef) q1 e1)
+      (loop [q2 q1 cd (->ColDef name ty false false false false false NONE "" NONE [])]
+        (let [t (cur q2)
+              cname (if (kw? t "CONSTRAINT") (str (:text (cur (adv q2)))) "")
+              q3 (if (kw? t "CONSTRAINT") (adv (adv q2)) q2)
+              t3 (cur q3)]
+          (cond
+            (and (kw? t3 "PRIMARY") (kw? (cur (adv q3)) "KEY"))
+            (let [q4 (adv (adv q3))
+                  desc (kw? (cur q4) "DESC")
+                  q5 (if (or desc (kw? (cur q4) "ASC")) (adv q4) q4)
+                  q6 (skip-on-conflict q5)
+                  ai (kw? (cur q6) "AUTOINCREMENT")]
+              (recur (if ai (adv q6) q6) (assoc cd :pk true :desc desc :autoinc ai)))
+            (and (kw? t3 "NOT") (kw? (cur (adv q3)) "NULL")) (recur (skip-on-conflict (adv (adv q3))) (assoc cd :notnull true))
+            (kw? t3 "NULL") (recur (adv q3) cd)
+            (kw? t3 "UNIQUE") (recur (skip-on-conflict (adv q3)) (assoc cd :unique true))
+            (kw? t3 "CHECK")
+            (let [[q4 e4] (expect-op (adv q3) "(") [x q5 e5] (if (= e4 "") (expr q4) (values (node (->ELit (sf/->VNull))) q4 e4))
+                  [q6 e6] (if (= e5 "") (expect-op q5 ")") (values q5 e5))]
+              (if (not= e6 "") (values cd q6 e6)
+                (recur q6 (assoc cd :check (conj (:check cd) x) :check-labels (conj (:check-labels cd) (if (not= cname "") cname (span-text q4 q5)))))))
+            (kw? t3 "DEFAULT")
+            (let [q4 (adv q3) t4 (cur q4)
+                  [x q5 e5] (cond (op? t4 "(") (let [[x q e] (expr (adv q4)) [q6 e6] (if (= e "") (expect-op q ")") (values q e))] (values x q6 e6))
+                                  (or (op? t4 "-") (op? t4 "+")) (unary q4)
+                                  :else (primary q4))]
+              (if (not= e5 "") (values cd q5 e5) (recur q5 (assoc cd :dflt [x]))))
+            (kw? t3 "COLLATE") (let [t4 (cur (adv q3))] (recur (adv (adv q3)) (assoc cd :coll (str/upper-case (:text t4)))))
+            (kw? t3 "REFERENCES") (recur (skip-references q3) cd)
+            (or (kw? t3 "GENERATED") (kw? t3 "AS")) (values cd q3 "unsupported: generated columns")
+            :else (values cd q3 "")))))))
+
+(defn- empty-coldef ColDef [] (->ColDef "" "" false false false false false NONE "" NONE []))
+
+(defn- span-text Str [from: &P to: &P] (subs (:src from) (:pos (cur from)) (:end (nth (:toks to) (max 0 (- (:i to) 1))))))
+
+(defn- skip-on-conflict P [p: P] (if (and (kw? (cur p) "ON") (kw? (cur (adv p)) "CONFLICT")) (adv (adv (adv p))) p))
+
+(defn- skip-references P [p: P]
+  (let [q (adv (adv p)) q2 (if (op? (cur q) "(") (let [[ns q3 e] (name-list q)] q3) q)]
+    (loop [r q2]
+      (cond (and (kw? (cur r) "ON") (or (kw? (cur (adv r)) "DELETE") (kw? (cur (adv r)) "UPDATE")))
+            (let [r2 (adv (adv r))] (recur (if (or (kw? (cur r2) "SET") (kw? (cur r2) "NO")) (adv (adv r2)) (adv r2))))
+            (kw? (cur r) "MATCH") (recur (adv (adv r)))
+            (or (kw? (cur r) "DEFERRABLE") (and (kw? (cur r) "NOT") (kw? (cur (adv r)) "DEFERRABLE")))
+            (let [r2 (if (kw? (cur r) "NOT") (adv (adv r)) (adv r))] (if (kw? (cur r2) "INITIALLY") (adv (adv r2)) r2))
+            :else r))))
+
+(defn- table-constraint Values(TableCons P Str) [p: P]
+  (let [cname (if (kw? (cur p) "CONSTRAINT") (str (:text (cur (adv p)))) "")
+        q (if (kw? (cur p) "CONSTRAINT") (adv (adv p)) p) t (cur q)]
+    (cond
+      (and (kw? t "PRIMARY") (kw? (cur (adv q)) "KEY"))
+      (let [[cols q2 e] (idx-name-list (adv (adv q)))] (values (->TableCons "PRIMARY KEY" cols NONE "") (skip-on-conflict q2) e))
+      (kw? t "UNIQUE") (let [[cols q2 e] (idx-name-list (adv q))] (values (->TableCons "UNIQUE" cols NONE "") (skip-on-conflict q2) e))
+      (kw? t "CHECK")
+      (let [[q2 e2] (expect-op (adv q) "(") [x q3 e3] (if (= e2 "") (expr q2) (values (node (->ELit (sf/->VNull))) q2 e2))
+            [q4 e4] (if (= e3 "") (expect-op q3 ")") (values q3 e3))]
+        (values (->TableCons "CHECK" [] [x] (if (or (not= e3 "") (not= cname "")) cname (span-text q2 q3))) q4 e4))
+      (and (kw? t "FOREIGN") (kw? (cur (adv q)) "KEY"))
+      (let [[cols q2 e] (name-list (adv (adv q)))] (values (->TableCons "FOREIGN KEY" cols NONE "") (if (= e "") (skip-references q2) q2) e))
+      :else (values (->TableCons "" [] NONE "") q (syntax-err t)))))
+
+(defn- idx-name-list Values(Vec(Str) P Str) [p: P]
+  (let [[cs q e] (idx-cols p)]
+    (values (loop [i 0 acc: Vec(Str) []] (if (>= i (count cs)) acc (recur (+ i 1) (conj acc (match (:ex (:e (nth cs i))) (ECol t n d) (str n) _ "")))))
+            q e)))
+
+(defn- idx-cols Values(Vec(IdxCol) P Str) [p0: P]
+  (let [[p e] (expect-op p0 "(")]
+    (if (not= e "") (values [] p e)
+      (loop [q p acc: Vec(IdxCol) []]
+        (let [[x q2 e2] (expr q)]
+          (if (not= e2 "") (values acc q2 e2)
+            (let [[x2 coll] (match (:ex x) (ECollate inner c) (values inner (str c)) _ (values x ""))
+                  desc (kw? (cur q2) "DESC")
+                  q3 (if (or desc (kw? (cur q2) "ASC")) (adv q2) q2)
+                  ic (->IdxCol x2 coll desc)]
+              (cond (op? (cur q3) ",") (recur (adv q3) (conj acc ic))
+                    (op? (cur q3) ")") (values (conj acc ic) (adv q3) "")
+                    :else (values acc q3 (syntax-err (cur q3)))))))))))
+
+(defn- create-index Values(Stmt P Str) [p0: P unique: Bool start: Int]
+  (let [[ine p e] (if-not-exists p0)
+        [name q e1] (if (= e "") (qualified-name p) (values "" p e))
+        [q1 e2] (if (= e1 "") (expect-kw q "ON") (values q e1))
+        [table q2 e3] (if (= e2 "") (take-name q1) (values "" q1 e2))
+        [cols q3 e4] (if (= e3 "") (idx-cols q2) (values [] q2 e3))
+        [w q4 e5] (if (and (= e4 "") (kw? (cur q3) "WHERE")) (let [[x q e] (expr (adv q3))] (values [x] q e)) (values NONE q3 e4))]
+    (values (->SCreateIndex name table unique ine cols w (if (= e5 "") (source-from q4 start) "")) q4 e5)))
+
+(defn- drop-stmt Values(Stmt P Str) [p: P]
+  (let [t (cur p)
+        kind (str/upper-case (:text t))]
+    (if (not (or (= kind "TABLE") (= kind "INDEX") (= kind "VIEW") (= kind "TRIGGER"))) (values (->SEmpty) p (syntax-err t))
+      (let [q (adv p)
+            [ie q2 e] (if (kw? (cur q) "IF") (let [[q3 e3] (expect-kw (adv q) "EXISTS")] (values true q3 e3)) (values false q ""))
+            [name q4 e4] (if (= e "") (qualified-name q2) (values "" q2 e))]
+        (values (->SDrop kind name ie) q4 e4)))))

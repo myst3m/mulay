@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd">
+
+    <!-- A2A コネクタ 1.1.1 のスパン: task-listener / task-stream-listener の SERVER、send-message の CLIENT、
+         traceparent の受け渡し -->
+    <http:listener-config name="L">
+        <http:listener-connection host="0.0.0.0" port="18590"/>
+    </http:listener-config>
+
+    <http:request-config name="R">
+        <http:request-connection host="localhost" port="18590"/>
+    </http:request-config>
+
+    <a2a:server-config name="Srv">
+        <a2a:connection listenerConfig="L" agentPath="/agent"/>
+        <a2a:agent-card>
+            <a2a:json><![CDATA[{"name": "Guard", "description": "Trace test", "url": "http://localhost:18590/agent", "version": "1.0.0",
+  "capabilities": {"streaming": true}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"], "skills": []}]]></a2a:json>
+        </a2a:agent-card>
+    </a2a:server-config>
+
+    <a2a:client-config name="Cl">
+        <a2a:client-connection serverUrl="http://localhost:18590/agent"/>
+    </a2a:client-config>
+
+    <flow name="hello">
+        <http:listener config-ref="L" path="/hello"/>
+        <set-payload value="hello"/>
+    </flow>
+
+    <flow name="auth">
+        <a2a:authorization-listener config-ref="Srv"/>
+        <logger level="DEBUG" message="ok"/>
+    </flow>
+
+    <flow name="agent">
+        <a2a:task-listener config-ref="Srv"/>
+        <choice>
+            <when expression="#[payload.message.parts[0].text == 'fail']">
+                <raise-error type="APP:BOOM" description="guard failed"/>
+            </when>
+        </choice>
+        <http:request config-ref="R" method="GET" path="/hello"/>
+        <set-payload value='#[output application/json --- {kind: "message", role: "agent", messageId: "m-1", parts: [{kind: "text", text: "ok"}]}]'/>
+    </flow>
+
+    <flow name="stream">
+        <a2a:task-stream-listener config-ref="Srv"/>
+        <set-variable variableName="tid" value="#[attributes.taskId]"/>
+        <set-variable variableName="cid" value="#[attributes.contextId]"/>
+        <http:request config-ref="R" method="GET" path="/hello"/>
+        <a2a:update-task-status config-ref="Srv">
+            <a2a:status-content><![CDATA[#[output application/json --- {kind: "status-update", taskId: vars.tid, contextId: vars.cid, final: true, status: {state: "completed", timestamp: "2026-01-02T03:04:06Z"}}]]]></a2a:status-content>
+        </a2a:update-task-status>
+    </flow>
+
+    <flow name="send">
+        <http:listener config-ref="L" path="/send"/>
+        <a2a:send-message config-ref="Cl">
+            <a2a:message><![CDATA[#[output application/json --- {message: {kind: "message", role: "user", messageId: "u-1", parts: [{kind: "text", text: attributes.queryParams.text default "hi"}]}}]]]></a2a:message>
+        </a2a:send-message>
+        <set-payload value='#[output text/plain --- payload.parts[0].text default "none"]'/>
+    </flow>
+</mule>

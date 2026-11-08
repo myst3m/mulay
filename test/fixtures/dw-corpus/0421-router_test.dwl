@@ -1,0 +1,1 @@
+payload.age >= 18 and payload.country == 'US'

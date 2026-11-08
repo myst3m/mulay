@@ -1,0 +1,135 @@
+(ns mulay.conn.http_static
+  (:require [mulay.rt.conn :as conn] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.dw.val :as v] [mulay.dw.rt :as drt]
+            [mulay.lib.res :as res] [mulay.conn.httpmsg :as hx] [mulay.lib.host :as host] [mulay.lib.uni :as uni] [clay.string :as str]))
+
+(def MIME-EXTS: Vec(Str) ["txt" "cgi" "json" "xml" "htm" "html" "shtml" "csv" "bin" "class" "ps" "eps" "ai" "pdf" "xbm" "xpm" "xwd" "ras" "pnm" "pbm" "pgm" "rgb" "gif" "jpeg" "jpe" "jpg" "tiff" "tif" "au" "snd" "wav" "mpeg" "mpe" "mpg" "mov" "qt" "movie" "java" "csh" "sh" "tcl" "shar" "tar" "dvi" "hdf" "cer" "cert" "zip" "js" "css" "HTML" "HTM" "text" "TXT" "TEXT" "GIF" "ief" "JPG" "png" "PNG" "rtf" "tex" "texinfo" "texi" "t" "tr" "roff" "midi" "mid" "aifc" "aif" "aiff" "avi"])
+
+(def MIME-TYPES: Vec(Str) ["text/plain" "text/plain" "text/json" "text/xml" "text/html" "text/html" "text/html" "text/csv" "application/octet-stream" "application/octet-stream" "application/postscript" "application/postscript" "application/postscript" "application/pdf" "image/x-xbitmap" "image/x-xpixmap" "image/x-xwindowdump" "image/x-cmu-raster" "image/x-portable-anymap" "image/x-portable-bitmap" "image/x-portable-graymap" "image/x-rgb" "image/gif" "image/jpeg" "image/jpeg" "image/jpeg" "image/tiff" "image/tiff" "audio/basic" "audio/basic" "audio/x-wav" "video/mpeg" "video/mpeg" "video/mpeg" "video/quicktime" "video/quicktime" "video/x-sgi-movie" "application/java" "application/x-csh" "application/x-sh" "application/x-tcl" "application/x-shar" "application/x-tar" "application/x-dvi" "application/x-hdf" "application/x-x509-ca-cert" "application/x-x509-ca-cert" "application/zip" "text/javascript" "text/css" "text/html" "text/html" "text/plain" "text/plain" "text/plain" "image/gif" "image/ief" "image/jpeg" "image/png" "image/png" "application/rtf" "application/x-tex" "application/x-texinfo" "application/x-texinfo" "application/x-troff" "application/x-troff" "application/x-troff" "audio/midi" "audio/midi" "audio/x-aifc" "audio/x-aiff" "audio/x-aiff" "video/x-msvideo"])
+
+(def ESC-CPS: Vec(Int) [34 38 60 62 160 161 162 163 164 165 166 167 168 169 170 171 172 173 174 175 176 177 178 179 180 181 182 183 184 185 186 187 188 189 190 191 192 193 194 195 196 197 198 199 200 201 202 203 204 205 206 207 208 209 210 211 212 213 214 215 216 217 218 219 220 221 222 223 224 225 226 227 228 229 230 231 232 233 234 235 236 237 238 239 240 241 242 243 244 245 246 247 248 249 250 251 252 253 254 255 338 339 352 353 376 402 710 732 913 914 915 916 917 918 919 920 921 922 923 924 925 926 927 928 929 931 932 933 934 935 936 937 945 946 947 948 949 950 951 952 953 954 955 956 957 958 959 960 961 962 963 964 965 966 967 968 969 977 978 982 8194 8195 8201 8204 8205 8206 8207 8211 8212 8216 8217 8218 8220 8221 8222 8224 8225 8226 8230 8240 8242 8243 8249 8250 8254 8260 8364 8465 8472 8476 8482 8501 8592 8593 8594 8595 8596 8629 8656 8657 8658 8659 8660 8704 8706 8707 8709 8711 8712 8713 8715 8719 8721 8722 8727 8730 8733 8734 8736 8743 8744 8745 8746 8747 8756 8764 8773 8776 8800 8801 8804 8805 8834 8835 8836 8838 8839 8853 8855 8869 8901 8968 8969 8970 8971 9001 9002 9674 9824 9827 9829 9830])
+
+(def ESC-NAMES: Vec(Str) ["&quot;" "&amp;" "&lt;" "&gt;" "&nbsp;" "&iexcl;" "&cent;" "&pound;" "&curren;" "&yen;" "&brvbar;" "&sect;" "&uml;" "&copy;" "&ordf;" "&laquo;" "&not;" "&shy;" "&reg;" "&macr;" "&deg;" "&plusmn;" "&sup2;" "&sup3;" "&acute;" "&micro;" "&para;" "&middot;" "&cedil;" "&sup1;" "&ordm;" "&raquo;" "&frac14;" "&frac12;" "&frac34;" "&iquest;" "&Agrave;" "&Aacute;" "&Acirc;" "&Atilde;" "&Auml;" "&Aring;" "&AElig;" "&Ccedil;" "&Egrave;" "&Eacute;" "&Ecirc;" "&Euml;" "&Igrave;" "&Iacute;" "&Icirc;" "&Iuml;" "&ETH;" "&Ntilde;" "&Ograve;" "&Oacute;" "&Ocirc;" "&Otilde;" "&Ouml;" "&times;" "&Oslash;" "&Ugrave;" "&Uacute;" "&Ucirc;" "&Uuml;" "&Yacute;" "&THORN;" "&szlig;" "&agrave;" "&aacute;" "&acirc;" "&atilde;" "&auml;" "&aring;" "&aelig;" "&ccedil;" "&egrave;" "&eacute;" "&ecirc;" "&euml;" "&igrave;" "&iacute;" "&icirc;" "&iuml;" "&eth;" "&ntilde;" "&ograve;" "&oacute;" "&ocirc;" "&otilde;" "&ouml;" "&divide;" "&oslash;" "&ugrave;" "&uacute;" "&ucirc;" "&uuml;" "&yacute;" "&thorn;" "&yuml;" "&OElig;" "&oelig;" "&Scaron;" "&scaron;" "&Yuml;" "&fnof;" "&circ;" "&tilde;" "&Alpha;" "&Beta;" "&Gamma;" "&Delta;" "&Epsilon;" "&Zeta;" "&Eta;" "&Theta;" "&Iota;" "&Kappa;" "&Lambda;" "&Mu;" "&Nu;" "&Xi;" "&Omicron;" "&Pi;" "&Rho;" "&Sigma;" "&Tau;" "&Upsilon;" "&Phi;" "&Chi;" "&Psi;" "&Omega;" "&alpha;" "&beta;" "&gamma;" "&delta;" "&epsilon;" "&zeta;" "&eta;" "&theta;" "&iota;" "&kappa;" "&lambda;" "&mu;" "&nu;" "&xi;" "&omicron;" "&pi;" "&rho;" "&sigmaf;" "&sigma;" "&tau;" "&upsilon;" "&phi;" "&chi;" "&psi;" "&omega;" "&thetasym;" "&upsih;" "&piv;" "&ensp;" "&emsp;" "&thinsp;" "&zwnj;" "&zwj;" "&lrm;" "&rlm;" "&ndash;" "&mdash;" "&lsquo;" "&rsquo;" "&sbquo;" "&ldquo;" "&rdquo;" "&bdquo;" "&dagger;" "&Dagger;" "&bull;" "&hellip;" "&permil;" "&prime;" "&Prime;" "&lsaquo;" "&rsaquo;" "&oline;" "&frasl;" "&euro;" "&image;" "&weierp;" "&real;" "&trade;" "&alefsym;" "&larr;" "&uarr;" "&rarr;" "&darr;" "&harr;" "&crarr;" "&lArr;" "&uArr;" "&rArr;" "&dArr;" "&hArr;" "&forall;" "&part;" "&exist;" "&empty;" "&nabla;" "&isin;" "&notin;" "&ni;" "&prod;" "&sum;" "&minus;" "&lowast;" "&radic;" "&prop;" "&infin;" "&ang;" "&and;" "&or;" "&cap;" "&cup;" "&int;" "&there4;" "&sim;" "&cong;" "&asymp;" "&ne;" "&equiv;" "&le;" "&ge;" "&sub;" "&sup;" "&nsub;" "&sube;" "&supe;" "&oplus;" "&otimes;" "&perp;" "&sdot;" "&lceil;" "&rceil;" "&lfloor;" "&rfloor;" "&lang;" "&rang;" "&loz;" "&spades;" "&clubs;" "&hearts;" "&diams;"])
+
+(defn mime-of Str [name: &Str]
+  (let [d (str/last-index-of name ".")
+        ext (if (< d 0) "" (subs name (+ d 1) (count name)))]
+    (if (= ext "") "application/octet-stream"
+      (loop [i 0] (if (>= i (count MIME-EXTS)) "application/octet-stream"
+                    (if (= (nth MIME-EXTS i) ext) (nth MIME-TYPES i) (recur (+ i 1))))))))
+
+(defn- esc-of Str [cp: Int]
+  (loop [i 0] (if (>= i (count ESC-CPS)) "" (if (= (nth ESC-CPS i) cp) (nth ESC-NAMES i) (recur (+ i 1))))))
+
+(defn escape-html4 Str [s: &Str]
+  (loop [i 0 out ""]
+    (if (>= i (count s)) out
+      (let [[cp j0] (uni/decode-at s i)
+            j (if (<= j0 i) (+ i 1) j0)
+            e (if (< cp 34) "" (esc-of cp))]
+        (recur j (if (= e "") (str out (subs s i j)) (str out e)))))))
+
+(defn- segs Vec(Str) [p: &Str]
+  (let [xs (str/split p "/")]
+    (loop [i 0 acc: Vec(Str) []] (if (>= i (count xs)) acc (recur (+ i 1) (if (= (nth xs i) "") acc (conj acc (nth xs i))))))))
+
+(defn- join-segs Str [abs: Bool xs: &Vec(Str)]
+  (let [body (str/join "/" xs)] (if abs (str "/" body) body)))
+
+(defn normalize Str [p: &Str]
+  (let [abs (str/starts-with? p "/")
+        xs (segs p)
+        out (loop [i 0 acc: Vec(Str) []]
+              (if (>= i (count xs)) acc
+                (let [x (nth xs i)]
+                  (cond (= x ".") (recur (+ i 1) acc)
+                        (= x "..") (cond (and (> (count acc) 0) (not= (nth acc (- (count acc) 1)) "..")) (recur (+ i 1) (pop acc))
+                                         abs (recur (+ i 1) acc)
+                                         :else (recur (+ i 1) (conj acc x)))
+                        :else (recur (+ i 1) (conj acc x))))))]
+    (join-segs abs out)))
+
+(defn under? Bool [p: &Str base: &Str]
+  (let [pa (str/starts-with? p "/") ba (str/starts-with? base "/")
+        ps (segs p) bs (segs base)]
+    (and (= pa ba) (<= (count bs) (count ps))
+         (loop [i 0] (if (>= i (count bs)) true (if (= (nth bs i) (nth ps i)) (recur (+ i 1)) false))))))
+
+(defn strip-listener Str [req: &Str lp0: &Str]
+  (let [lp1 (if (= lp0 "/*") "/" (str lp0))
+        lp (if (str/ends-with? lp1 "/*") (subs lp1 0 (- (count lp1) 2)) lp1)]
+    (cond (= lp "/") (str req)
+          (> (count lp) (count req)) ""
+          :else (subs req (count lp) (count req)))))
+
+(defrecord Store [home: Str rs: res/ResSet])
+
+(defn- rel-of Values(Str Bool) [st: &Store p: &Str]
+  (let [h (:home st)]
+    (cond (= h "") (values "" false)
+          (= p h) (values "" true)
+          (str/starts-with? p (str h "/")) (values (subs p (+ (count h) 1) (count p)) true)
+          :else (values "" false))))
+
+(defn- dir-at? Bool [st: &Store p: &Str]
+  (let [[r in] (rel-of st p)]
+    (if in (res/res-dir? (:rs st) r) (host/file-dir? p))))
+
+(defn- walk Values(Str Bool) [st: &Store p: &Str]
+  (let [abs (str/starts-with? p "/")
+        xs (segs p)]
+    (loop [i 0 acc: Vec(Str) []]
+      (if (>= i (count xs)) (values (join-segs abs acc) true)
+        (let [x (nth xs i)]
+          (cond (= x ".") (recur (+ i 1) acc)
+                (= x "..") (if (not (dir-at? st (join-segs abs acc))) (values "" false)
+                             (recur (+ i 1) (if (> (count acc) 0) (pop acc) acc)))
+                :else (recur (+ i 1) (conj acc x))))))))
+
+(defn- read-at Values(Str Bool) [st: &Store p: &Str]
+  (let [[q ok] (walk st p)]
+    (if (or (not ok) (dir-at? st q)) (values "" false)
+      (let [[r in] (rel-of st q)]
+        (if in (res/res-read (:rs st) r)
+          (let [[t e] (host/file-read q)] (values t (= e ""))))))))
+
+(defrecord Loaded [bytes: Str mime: Str missing: Str])
+
+(defn load Loaded [st: &Store base: &Str req0: &Str lp: &Str dflt: &Str]
+  (let [req (strip-listener req0 lp)
+        p (normalize (str base req))]
+    (if (not (under? p base)) (->Loaded "" "" req)
+      (let [dir (dir-at? st p)
+            req2 (if (and dir (not (str/ends-with? req "/"))) (str req "/") req)
+            file (if dir (str base req2 dflt) p)
+            [t ok] (read-at st file)]
+        (if (not ok) (->Loaded "" "" req2)
+          (->Loaded t (mime-of (let [k (str/last-index-of file "/")] (if (< k 0) file (subs file (+ k 1) (count file))))) ""))))))
+
+(defn- text-of Values(Str Str) [c: &conn/OpCall name: &Str dflt: &Str]
+  (let [p (conn/param (:params c) name)]
+    (if (= (count p) 0) (values (str dflt) "")
+      (let [[x e] ((:eval c) (nth p 0) (:event c))] (if (not= e "") (values "" e) (values (let [[s se] (drt/to-text x)] s) ""))))))
+
+(defn- field-str Str [fs: &Vec(v/Field) k: &Str]
+  (let [r (v/obj-get fs k)] (if (= (count r) 0) "" (match (v/unmeta (nth r 0)) (v/VStr s) (str s) _ ""))))
+
+(defn run conn/OpResult [c: &conn/OpCall]
+  (let [[base be] (text-of c "resourceBasePath" "")
+        [dflt de] (text-of c "defaultFile" "index.html")
+        ap (conn/param (:params c) "attributes")
+        [av ae] (if (= (count ap) 0) (let [[x t e] (ev/value (:attributes (:event c)))] (values x e))
+                  ((:eval c) (nth ap 0) (:event c)))
+        fs (match (v/unmeta av) (v/VObj xs) xs _ [])]
+    (cond
+      (not= be "") (conn/fail-result (err/mk "MULE" "EXPRESSION" be))
+      (not= de "") (conn/fail-result (err/mk "MULE" "EXPRESSION" de))
+      (not= ae "") (conn/fail-result (err/mk "MULE" "EXPRESSION" ae))
+      (v/null? av) (conn/fail-result (err/mk "MULE" "UNKNOWN" "There are no HTTP attributes defined."))
+      :else
+      (let [rs (:rset c)
+            st (->Store (res/abs-home rs) rs)
+            l (load st base (field-str fs "requestPath") (field-str fs "listenerPath") dflt)]
+        (if (not= (:missing l) "")
+          (conn/fail-result (assoc (err/mk "HTTP" "NOT_FOUND" (str "Resource '" (escape-html4 (:missing l)) "' was not found."))
+                                   :payload [(v/null-v)] :attrs [(hx/listener-attrs 404 "Not Found")]))
+          (conn/ok-result (ev/tv-raw (:bytes l) (ev/with-charset (:mime l))) (ev/tv-null)))))))

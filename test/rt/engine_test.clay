@@ -1,0 +1,348 @@
+(ns engine-test (:require [mulay.rt.conn :as conn] [mulay.conn.registry :as creg] [mulay.rt.engine :as en] [mulay.rt.event :as ev] [mulay.rt.error :as err] [mulay.rt.javaser :as js]
+                          [mulay.mule.model :as m] [mulay.lib.res :as res] [mulay.mule.parse :as ps] [mulay.dw.engine :as eng] [mulay.dw.val :as v]
+                          [clay.string :as str] [clay.base64 :as b64] [mulay.dw.num :as num] [mulay.conn.os :as os] [mulay.dw.lib.mule :as dwm]))
+
+(defn- loc m/Loc [] (m/->Loc "t.xml" 1 "f/processors/0" "<x></x>" "" []))
+;; mule/parse と同じ: ヘッダ付き ("output .. --- x") はそのまま、それ以外は "%dw 2.0\n---\n" で包む
+(defn- ex m/PVal [s: Str]
+  (let [hdr (str/includes? s "---")
+        script (if hdr (str s) (str "%dw 2.0\n---\n" s))]
+    (m/->PExpr (str "#[" s "]") (eng/compile script m/BINDINGS) (m/->ExprSrc s script (if hdr 0 12) "anonymous::main" false (ps/refs s) "" -1))))
+(defn- no-res Values(Str Bool) [p: Str] (values "" false))
+(defn- no-res-url Str [p: Str] "")
+(defn- app m/App [fs: Vec(m/Flow)] (m/->App "t" fs [] [] "" [] [] [] no-res no-res-url [] (let [m: Map(Str Str) {}] m) [] (res/res-none)))
+(defn- ctx en/Ctx [fs: Vec(m/Flow)] (en/new-ctx (app fs) [] 5))
+(defn- ev0 ev/Event [] (ev/new-event (ev/tv-raw "{\"n\": 2}" "application/json; charset=UTF-8") (ev/tv-null) "c1" "main"))
+
+(defn- payload-bytes Str [e: &ev/Event] (let [[b be] (ev/bytes (:payload e))] b))
+(defn- desc0 Str [x: &Vec(err/MErr)] (if (= (count x) 0) "" (:description (nth x 0))))
+
+(deftest set-payload-and-vars
+  (let [ps [(m/->PrSetVar "x" (ex "payload.n * 10") "" (loc))
+            (m/->PrSetPayload (ex "output application/json --- {r: vars.x + 1}") "" "" (loc))]
+        [e x] (en/run-procs (ctx []) ps (ev0))]
+    (is (= (count x) 0))
+    (is (= (payload-bytes e) "{\n  \"r\": 21\n}"))
+    (is (= (ev/content-type (:payload e)) "application/json; charset=UTF-8"))))
+
+(deftest choice-and-foreach
+  (let [ps [(m/->PrSetVar "acc" (ex "0") "" (loc))
+            (m/->PrForEach [(ex "[1,2,3]")] "" "" 1 [(m/->PrSetVar "acc" (ex "vars.acc + payload") "" (loc))] (loc))
+            (m/->PrChoice [(m/->When (ex "vars.acc == 6") [(m/->PrSetPayload (ex "\"six\"") "" "" (loc))])] [(m/->PrSetPayload (ex "\"other\"") "" "" (loc))] (loc))]
+        [e x] (en/run-procs (ctx []) ps (ev0))]
+    (is (= (count x) 0))
+    (is (= (payload-bytes e) "six"))))
+
+(deftest foreach-batch-and-shapes
+  ;; batchSize でまとめる。String は回せない (実 Mule と同じ文言)
+  (let [ps [(m/->PrSetVar "acc" (ex "[]") "" (loc))
+            (m/->PrForEach [(ex "[1,2,3]")] "i" "" 2 [(m/->PrSetVar "acc" (ex "vars.acc + sizeOf(payload)") "" (loc))] (loc))
+            (m/->PrSetPayload (ex "output application/json indent=false --- vars.acc") "" "" (loc))]
+        [e x] (en/run-procs (ctx []) ps (ev0))
+        [e2 x2] (en/run-procs (ctx []) [(m/->PrForEach [(ex "'text'")] "" "" 1 [] (loc))] (ev0))]
+    (is (= (payload-bytes e) "[2,1]"))
+    (is (= (desc0 x2) "\"Expecting Array or Object but got String.\" evaluating expression: \"'text'\"."))))
+
+(deftest foreach-error-keeps-element-and-counter
+  (let [ps [(m/->PrForEach [(ex "[1, 0]")] "" "" 1 [(m/->PrSetVar "q" (ex "10 / payload") "" (loc))] (loc))]
+        [e x] (en/run-procs (ctx []) ps (ev0))]
+    (is (= (count x) 1))
+    (is (= (count (ev/get-var e "counter")) 1))
+    (is (= (en/java-str (:val (:payload e))) "0"))))
+
+(deftest try-continue-and-propagate
+  (let [h-cont (m/->Handler false ["APP:BOOM"] [] false [(m/->PrSetPayload (ex "error.errorType.identifier ++ \":\" ++ error.description") "" "" (loc))] (loc))
+        ps [(m/->PrTry [(m/->PrRaise "APP:BOOM" (m/->PLit "bad") (loc))] [h-cont] "" "" (loc))]
+        [e x] (en/run-procs (ctx []) ps (ev0))
+        ps2 [(m/->PrTry [(m/->PrRaise "APP:OTHER" (m/->PLit "no") (loc))] [h-cont] "" "" (loc))]
+        [e2 x2] (en/run-procs (ctx []) ps2 (ev0))]
+    (is (= (count x) 0))
+    (is (= (payload-bytes e) "BOOM:bad"))
+    (is (= (count x2) 1))
+    (is (= (err/type-str (nth x2 0)) "APP:OTHER"))
+    ;; 起きた要素が記録される
+    (is (= (:elem (nth x2 0)) "f/processors/0 @ t:t.xml:1"))))
+
+(deftest raise-error-default-description
+  (let [[e x] (en/run-procs (ctx []) [(m/->PrRaise "APP:X" (m/->PLit "") (loc))] (ev0))]
+    (is (= (desc0 x) "An error occurred."))))
+
+(deftest flow-ref-and-dw-error
+  (let [sub (m/->Flow "sub" true [] [(m/->PrSetPayload (ex "payload.n + 1") "" "" (loc))] [] "" -1 "" (loc))
+        ps [(m/->PrFlowRef (m/->PLit "sub") "" [] (loc)) (m/->PrSetPayload (ex "payload / 0") "" "" (loc))]
+        [e x] (en/run-procs (ctx [sub]) ps (ev0))]
+    (is (= (count x) 1))
+    (is (= (err/type-str (nth x 0)) "MULE:EXPRESSION"))
+    ;; 実 Mule の形: 式の抜粋、キャレット、Trace
+    (is (= (desc0 x) "\"Division by zero\n\n1| payload / 0\n   ^^^^^^^^^^^\nTrace:\n  at anonymous::main (line: 1, column: 1)\" evaluating expression: \"payload / 0\"."))))
+
+(deftest flow-ref-target-keeps-event
+  (let [sub (m/->Flow "sub" true [] [(m/->PrSetVar "inSub" (ex "1") "" (loc)) (m/->PrSetPayload (ex "{from: 'sub'}") "" "" (loc))] [] "" -1 "" (loc))
+        ps [(m/->PrFlowRef (m/->PLit "sub") "r" [] (loc)) (m/->PrFlowRef (m/->PLit "sub") "only" [(ex "payload.from")] (loc))]
+        [e x] (en/run-procs (ctx [sub]) ps (ev0))]
+    (is (= (count x) 0))
+    (is (= (payload-bytes e) "{\"n\": 2}"))
+    (is (= (count (ev/get-var e "inSub")) 0))
+    (is (= (count (ev/get-var e "r")) 1))
+    (is (= (let [[b be] (ev/bytes (nth (ev/get-var e "only") 0))] b) "sub"))))
+
+(deftest error-description-format
+  (let [src (m/->ExprSrc "(a as Number) > 1" "%dw 2.0\n---\n(a as Number) > 1" 12 "main" false [] "" -1)]
+    (is (= (en/dw-desc "Boom" 13 24 src) "\"Boom\n\n1| (a as Number) > 1\n    ^^^^^^^^^^^\nTrace:\n  at main (line: 1, column: 2)\" evaluating expression: \"(a as Number) > 1\"."))
+    ;; span が式の外 (ヘッダ) なら抜粋を付けない
+    (is (= (en/dw-desc "Boom" 0 3 src) "\"Boom\" evaluating expression: \"(a as Number) > 1\"."))
+    ;; 2 行目
+    (is (str/includes? (en/dw-desc "X" 5 6 (m/->ExprSrc "s" "abc\nxyz" 0 "anonymous::main" false [] "" -1)) "\n2| xyz\n    ^\n"))))
+
+(deftest output-inference
+  ;; output の無い式: 参照する入力の mime が 1 種類ならその形式、混ざると失敗
+  (let [[e x] (en/run-procs (ctx []) [(m/->PrSetPayload (ex "'n=' ++ payload.n") "" "" (loc))] (ev0))
+        [e2 x2] (en/run-procs (ctx []) [(m/->PrSetVar "acc" (ex "[]") "" (loc)) (m/->PrSetVar "acc" (ex "vars.acc + payload") "" (loc))] (ev0))
+        [e3 x3] (en/run-procs (ctx []) [(m/->PrSetPayload (ex "payload") "" "" (loc))] (ev0))
+        [e4 x4] (en/run-procs (ctx []) [(m/->PrSetPayload (ex "{a: 1}") "" "" (loc))] (ev0))]
+    (is (= (payload-bytes e) "\"n=2\""))
+    (is (= (ev/content-type (:payload e)) "application/json; charset=UTF-8"))
+    (is (str/starts-with? (desc0 x2) "\"Unable to infer a output media type as more than one is being used: application/java,application/json please specify using: 'output <your mime-type> --- <expr>'\n\n1| vars.acc + payload\n   ^^^^^^^^^^^^^^^^^^\n"))
+    ;; payload そのものは書き直さない
+    (is (= (payload-bytes e3) "{\"n\": 2}"))
+    ;; Java の値
+    (is (= (ev/content-type (:payload e4)) "application/java; charset=UTF-8"))))
+
+;; 変数は自分の mime で数える (実 Mule 4.11.3、core-infer-mix): JSON の payload から作った変数は JSON、
+;; Java の値や文字列リテラルの変数は application/java。p(..) は Java の入力。
+(deftest output-inference-var-mimes
+  (let [z0 (dwm/set-properties! ["a"] ["h"])
+        [e x] (en/run-procs (ctx []) [(m/->PrSetVar "v" (ex "payload.n") "" (loc)) (m/->PrSetPayload (ex "vars.v ++ '-' ++ payload.n") "" "" (loc))] (ev0))
+        [e2 x2] (en/run-procs (ctx []) [(m/->PrSetVar "v" (m/->PLit "x") "" (loc)) (m/->PrSetPayload (ex "vars.v ++ payload.n") "" "" (loc))] (ev0))
+        [e3 x3] (en/run-procs (ctx []) [(m/->PrSetPayload (ex "p('a') ++ payload.n") "" "" (loc))] (ev0))
+        [e4 x4] (en/run-procs (ctx []) [(m/->PrSetPayload (ex "p('a') ++ '/x'") "" "" (loc))] (ev0))
+        z1 (dwm/set-properties! [] [])]
+    (is (= (count x) 0))
+    (is (= (payload-bytes e) "\"2-2\""))
+    (is (str/starts-with? (desc0 x2) "\"Unable to infer a output media type as more than one is being used: application/java,application/json "))
+    (is (str/starts-with? (desc0 x3) "\"Unable to infer a output media type as more than one is being used: application/java,application/json "))
+    (is (= (desc0 x4) ""))))
+
+(deftest set-payload-literals
+  (let [[e x] (en/run-procs (ctx []) [(m/->PrSetPayload (m/->PLit "hi") "" "" (loc))] (ev0))
+        [e2 x2] (en/run-procs (ctx []) [(m/->PrSetPayload (m/->PLit "{\"k\": 1}") "application/json" "" (loc)) (m/->PrSetVar "k" (ex "payload.k") "" (loc))] (ev0))
+        [e3 x3] (en/run-procs (ctx []) [(m/->PrSetPayload (m/->PLit "café") "text/plain" "ISO-8859-1" (loc))] (ev0))
+        [e4 x4] (en/run-procs (ctx []) [(m/->PrSetPayload (ex "'x'") "text/plain" "" (loc))] (ev0))]
+    (is (= (ev/content-type (:payload e)) ""))
+    (is (= (payload-bytes e) "hi"))
+    (is (= (ev/content-type (:payload e2)) "application/json"))
+    (is (= (payload-bytes e2) "{\"k\": 1}"))
+    (is (= (count (ev/get-var e2 "k")) 1))
+    (is (= (ev/content-type (:payload e3)) "text/plain; charset=ISO-8859-1"))
+    ;; 値は String のまま (ファイルへは UTF-8)、HTTP に出すときに charset で符号化する (実 Mule と同じ)
+    (is (= (payload-bytes e3) "café"))
+    (is (= (let [[b be] (ev/wire-bytes (:payload e3))] b) (str "caf" (chr 233))))
+    ;; 式の Java の値 (String) に mimeType: charset は付かない (実 Mule の応答は "text/plain")
+    (is (= (ev/content-type (:payload e4)) "text/plain"))))
+
+(deftest when-coercion
+  (let [run (fn Str [x: Str]
+              (let [[e errs] (en/run-procs (ctx []) [(m/->PrChoice [(m/->When (ex x) [(m/->PrSetPayload (m/->PLit "w") "" "" (loc))])] [(m/->PrSetPayload (m/->PLit "o") "" "" (loc))] (loc))] (ev0))]
+                (if (> (count errs) 0) (desc0 errs) (payload-bytes e))))]
+    (is (= (run "'TRUE'") "w"))
+    (is (= (run "null") "o"))
+    (is (= (run "vars.x.y") "o"))
+    (is (= (run "'1'") "\"Unable to convert '1' with class 'java.lang.String' to class 'Boolean'.\" evaluating expression: \"'1'\"."))))
+
+(deftest until-successful-exhausted
+  ;; 試行ごとに変数は戻る。使い果たすと RETRY_EXHAUSTED (親は CONNECTIVITY)、元の型にも一致し、
+  ;; description は元のエラーのもの
+  (let [ps [(m/->PrSetVar "n" (ex "0") "" (loc))
+            (m/->PrUntilSuccessful 2 0 [(m/->PrSetVar "n" (ex "vars.n + 1") "" (loc)) (m/->PrRaise "APP:ALWAYS" (m/->PLit "always fails") (loc))] (loc))]
+        [e x] (en/run-procs (ctx []) ps (ev0))
+        er (nth x 0)]
+    (is (= (err/type-str er) "MULE:RETRY_EXHAUSTED"))
+    (is (= (:description er) "always fails"))
+    (is (err/matches? er "APP:ALWAYS"))
+    (is (err/matches? er "MULE:CONNECTIVITY"))
+    (is (= (err/parent "MULE:RETRY_EXHAUSTED") "MULE:CONNECTIVITY"))
+    (is (= (let [[b be] (ev/bytes (nth (ev/get-var e "n") 0))] b) (let [[b be] (ev/bytes (ev/tv-val (v/int-v 1) ev/JAVA))] b)))))
+
+(deftest routers
+  (let [r (fn m/Route [s: Str] (m/->Route [(m/->PrRaise s (m/->PLit (str s " failed")) (loc))]))
+        [e x] (en/run-procs (ctx []) [(m/->PrFirstSuccessful [(r "APP:R1") (r "APP:R2")] (loc))] (ev0))
+        c (ctx [])
+        rr [(m/->PrRoundRobin [(m/->Route [(m/->PrSetPayload (m/->PLit "a") "" "" (loc))]) (m/->Route [(m/->PrSetPayload (m/->PLit "b") "" "" (loc))])] 0 (loc))]
+        [e1 x1] (en/run-procs c rr (ev0))
+        [e2 x2] (en/run-procs c rr (ev0))
+        [e3 x3] (en/run-procs c rr (ev0))]
+    (is (= (err/type-str (nth x 0)) "APP:R2"))
+    (is (= (str (payload-bytes e1) (payload-bytes e2) (payload-bytes e3)) "aba"))))
+
+(deftest scatter-gather-failures
+  (let [ps [(m/->PrScatterGather [(m/->Route [(m/->PrSetPayload (m/->PLit "ok") "" "" (loc))])
+                                  (m/->Route [(m/->PrRaise "APP:BOOM" (m/->PLit "boom") (loc))])] -1 -1 "" (loc))]
+        [e x] (en/run-procs (ctx []) ps (ev0))
+        er (nth x 0)]
+    (is (= (err/type-str er) "MULE:COMPOSITE_ROUTING"))
+    (is (= (:description er) "Error(s) were found for route(s):\n\tRoute 1: org.mule.runtime.api.exception.DefaultMuleException: boom"))
+    (is (= (count (:payload er)) 1))))
+
+(deftest connector-error-parents
+  (let [z (err/set-conn-parents! ["TOY:DOWN" "MULE:CONNECTIVITY"])]
+    (is (= (err/parent "TOY:DOWN") "MULE:CONNECTIVITY"))
+    (is (err/matches? (err/mk "TOY" "DOWN" "") "MULE:CONNECTIVITY"))
+    (is (= (err/parent "TOY:UP") "MULE:ANY"))
+    (is (= (err/parent "MULE:RETRY_EXHAUSTED") "MULE:CONNECTIVITY"))))
+
+(deftest connector-error-classes
+  (let [z (err/set-conn-classes! ["TOY" "com.example.ToyException"])]
+    (is (= (err/exception-class (err/mk "TOY" "DOWN" "")) "com.example.ToyException"))
+    (is (= (err/exception-class (err/mk "HTTP" "NOT_FOUND" "")) "org.mule.runtime.api.exception.DefaultMuleException"))
+    (is (= (err/exception-class (err/mk "MULE" "EXPRESSION" "")) "org.mule.runtime.core.api.expression.ExpressionRuntimeException"))
+    (is (= (err/set-conn-classes! (conn/error-classes (creg/all))) 0))
+    (is (= (err/exception-class (err/mk "HTTP" "NOT_FOUND" "")) "org.mule.extension.http.api.request.validator.ResponseValidatorTypedException"))))
+
+(deftest cursor-error-type-comes-from-the-cursor
+  (let [[n1 i1] (ev/cursor-error-type (ev/tv-cursor-typed "c1" "DB" "QUERY_EXECUTION"))
+        [n2 i2] (ev/cursor-error-type (ev/tv-cursor "c2"))]
+    (is (= (str n1 ":" i1) "DB:QUERY_EXECUTION"))
+    (is (= (str n2 ":" i2) "MULE:UNKNOWN"))))
+
+(deftest error-types
+  (is (= (err/set-conn-parents! (conn/error-parents (creg/all))) 0))
+  (is (err/matches? (err/mk "HTTP" "UNAUTHORIZED" "") "MULE:CLIENT_SECURITY"))
+  (is (err/matches? (err/mk "HTTP" "UNAUTHORIZED" "") "MULE:ANY"))
+  (is (not (err/matches? (err/mk "HTTP" "NOT_FOUND" "") "MULE:CONNECTIVITY")))
+  (is (not (err/matches? (err/mk "MULE" "OVERLOAD" "") "MULE:ANY")))
+  (is (= (err/norm-type "EXPRESSION") "MULE:EXPRESSION")))
+
+(deftest java-serialization
+  ;; 実 Mule が application/java の payload として送るバイト列 (base64 を戻したもの) と同じ
+  (let [b (js/serialize (v/->VObj [(v/field "javaObject" (v/->VBool true))]))
+        d (js/serialize (v/->VNum (let [[n e] (num/parse-lit "12.50")] n)))
+        l (js/serialize (v/->VArr [(v/->VObj [(v/field "id" (v/int-v 1)) (v/field "name" (v/->VStr "Ann")) (v/field "tags" (v/->VArr [(v/->VStr "a") (v/->VStr "b")]))])
+                                   (v/->VObj [(v/field "id" (v/int-v 2)) (v/field "name" (v/->VStr "Bob, Jr.")) (v/field "tags" (v/->VArr []))])]))]
+    (is (= (b64/encode b) "rO0ABXNyABdqYXZhLnV0aWwuTGlua2VkSGFzaE1hcDTATlwQbMD7AgABWgALYWNjZXNzT3JkZXJ4cgARamF2YS51dGlsLkhhc2hNYXAFB9rBwxZg0QMAAkYACmxvYWRGYWN0b3JJAAl0aHJlc2hvbGR4cD9AAAAAAAAMdwgAAAAQAAAAAXQACmphdmFPYmplY3RzcgARamF2YS5sYW5nLkJvb2xlYW7NIHKA1Zz67gIAAVoABXZhbHVleHABeAA="))
+    (is (= (b64/encode d) "rO0ABXNyABBqYXZhLmxhbmcuRG91YmxlgLPCSilr+wQCAAFEAAV2YWx1ZXhyABBqYXZhLmxhbmcuTnVtYmVyhqyVHQuU4IsCAAB4cEApAAAAAAAA"))
+    (is (= (b64/encode l) "rO0ABXNyABNqYXZhLnV0aWwuQXJyYXlMaXN0eIHSHZnHYZ0DAAFJAARzaXpleHAAAAACdwQAAAACc3IAF2phdmEudXRpbC5MaW5rZWRIYXNoTWFwNMBOXBBswPsCAAFaAAthY2Nlc3NPcmRlcnhyABFqYXZhLnV0aWwuSGFzaE1hcAUH2sHDFmDRAwACRgAKbG9hZEZhY3RvckkACXRocmVzaG9sZHhwP0AAAAAAAAx3CAAAABAAAAADdAACaWRzcgARamF2YS5sYW5nLkludGVnZXIS4qCk94GHOAIAAUkABXZhbHVleHIAEGphdmEubGFuZy5OdW1iZXKGrJUdC5TgiwIAAHhwAAAAAXQABG5hbWV0AANBbm50AAR0YWdzc3EAfgAAAAAAAncEAAAAAnQAAWF0AAFieHgAc3EAfgACP0AAAAAAAAx3CAAAABAAAAADdAACaWRzcQB+AAYAAAACdAAEbmFtZXQACEJvYiwgSnIudAAEdGFnc3NxAH4AAAAAAAB3BAAAAAB4eAB4"))))
+
+(deftest mime-metadata
+  ;; Mule は DW に渡す payload に DataType の mime を付ける (payload.^mimeType)
+  (let [[e x] (en/run-procs (ctx []) [(m/->PrSetPayload (ex "output text/plain --- payload.^mimeType") "" "" (loc))] (ev0))]
+    (is (= (payload-bytes e) "application/json"))))
+
+(deftest objectstore
+  (let [c (en/new-ctx (app []) [(os/connector)] 5)
+        op (fn m/Proc [name: Str ps: Vec(m/Param) ex: Vec(m/Param) target: Str] (m/->PrConnectorOp "os" name "" ps [] ex [] target [] (loc)))
+        k [(m/->Param "key" (m/->PLit "k1")) (m/->Param "objectStore" (m/->PLit "s"))]
+        ps [(op "store" k [(m/->Param "value" (ex "output application/json --- {a: 1}"))] "")
+            (op "retrieve" k [] "got")
+            (op "contains" k [] "has")
+            (op "retrieve-all" [(m/->Param "objectStore" (m/->PLit "s"))] [] "all")
+            (op "remove" k [] "")
+            (op "retrieve" k [(m/->Param "default-value" (ex "'dflt'"))] "dv")]
+        [e x] (en/run-procs c ps (ev0))
+        [e2 x2] (en/run-procs c [(op "remove" k [] "")] (ev0))
+        vb (fn Str [n: Str] (let [[b be] (ev/bytes (nth (ev/get-var e n) 0))] b))]
+    (is (= (count x) 0))
+    (is (= (vb "got") "{\n  \"a\": 1\n}"))
+    (is (= (en/java-str (:val (nth (ev/get-var e "has") 0))) "true"))
+    (is (= (en/java-str (:val (nth (ev/get-var e "all") 0))) "{k1={\n  \"a\": 1\n}}"))
+    (is (= (vb "dv") "dflt"))
+    (is (= (desc0 x2) "ObjectStore doesn't contain any value for key 'k1'"))))
+
+
+;; 1e400 は double では Infinity (BigDecimal.doubleValue)。Java の直列化は Double の Infinity のビット列で書く
+;; (以前は Infinity を 2 で割り続けて止まらなかった)
+(deftest javaser-infinity
+  (let [b (js/serialize (v/->VNum (let [[n e] (num/parse-lit "1e400")] n)))]
+    (is (str/includes? b (str (chr 127) (chr 240) (chr 0) (chr 0) (chr 0) (chr 0) (chr 0) (chr 0))))))
+
+;; parallel-foreach / scatter-gather の worker の数: maxConcurrency が無ければ (実 Mule は共有のスレッドプール)
+;; 上限 MAX-PAR-WORKERS まで。以前は要素ごとにスレッドを作り、数千要素の配列でスレッドを作れずプロセスごと落ちた。
+(deftest par-workers
+  (is (= (en/par-workers 10 -1) 10))
+  (is (= (en/par-workers 100000 -1) en/MAX-PAR-WORKERS))
+  (is (= (en/par-workers 100000 4) 4))
+  (is (= (en/par-workers 3 8) 3))
+  (is (= (en/par-workers 0 -1) 0)))
+
+;; message の無い logger の表示 (Message の toString)。HttpRequestAttributes は実 Mule と同じく秘密らしい値を伏せる
+;; (キーが password / pass か secret / authorization を含むヘッダと問い合わせの引数、そういう引数があれば Query String も)。
+(defn- secret-attrs v/Val []
+  (v/->VMeta (v/->VObj [(v/field "listenerPath" (v/->VStr "/x")) (v/field "queryString" (v/->VStr "password=p&x=1"))
+                        (v/field "headers" (v/->VObj [(v/field "authorization" (v/->VStr "Basic YWRtaW46aHVudGVyMg==")) (v/field "x-secret-key" (v/->VStr "s3cr3t")) (v/field "accept" (v/->VStr "*/*"))]))
+                        (v/field "queryParams" (v/->VObj [(v/field "password" (v/->VStr "p")) (v/field "x" (v/->VStr "1"))]))])
+             [(v/field "class" (v/->VStr "org.mule.extension.http.api.HttpRequestAttributes"))]))
+
+(deftest logger-masks-secrets
+  (let [e (ev/new-event (ev/tv-null) (ev/tv-val (secret-attrs) ev/JAVA) "c1" "f")
+        s (en/describe-event e)]
+    (is (str/includes? s "authorization=****"))
+    (is (str/includes? s "x-secret-key=****"))
+    (is (str/includes? s "Query String=****"))
+    (is (str/includes? s "password=****"))
+    (is (str/includes? s "accept=*/*"))
+    (is (not (str/includes? s "YWRtaW46aHVudGVyMg")))
+    (is (not (str/includes? s "s3cr3t")))))
+
+;; Java の直列化の重複キーの除去は線形 (以前は 2 乗で、9 万キーで 110 秒)
+(defn- wide-obj-val v/Val [n: Int] (v/->VObj (loop [i 0 acc: Vec(v/Field) []] (if (>= i n) acc (recur (+ i 1) (conj acc (v/field (str "k" i) (v/int-v i))))))))
+
+(deftest javaser-many-keys
+  (is (> (count (js/serialize (wide-obj-val 60000))) 600000)))
+
+;; Binary として読む生のストリーム (*/*、octet-stream) の payload.^class は Mule のストリームの提供者。JSON などの
+;; 形式で読むものには付かない (実 Mule: salesforce-bulk2 の /query/delete、dw-deferred)
+(defn- class-of-raw Str [mime: Str]
+  (let [e0 (ev/new-event (ev/tv-raw "{}" mime) (ev/tv-null) "c1" "main")
+        [e x] (en/run-procs (ctx []) [(m/->PrSetPayload (ex "output text/plain --- payload.^class default 'none'") "" "" (loc))] e0)]
+    (payload-bytes e)))
+
+(deftest stream-class-metadata
+  (is (= (class-of-raw "*/*") "org.mule.runtime.core.internal.streaming.bytes.ManagedCursorStreamProvider"))
+  (is (= (class-of-raw "application/octet-stream") "org.mule.runtime.core.internal.streaming.bytes.ManagedCursorStreamProvider"))
+  (is (= (class-of-raw "application/json") "none")))
+
+;; mime の無いリテラルの文字列は Java の String: ^class と、変数は "*/*; charset=UTF-8" の DataType (core-infer-mix)
+(deftest literal-string-is-java-string
+  (let [ps [(m/->PrSetVar "lit" (m/->PLit "x") "" (loc))
+            (m/->PrSetPayload (m/->PLit "y") "" "" (loc))
+            (m/->PrSetPayload (ex "output application/json --- {v: vars.lit.^class, p: payload.^class, vm: vars.lit.^mediaType, pm: payload.^mediaType}") "" "" (loc))]
+        [e x] (en/run-procs (ctx []) ps (ev0))]
+    (is (= (count x) 0))
+    (is (= (payload-bytes e) "{\n  \"v\": \"java.lang.String\",\n  \"p\": \"java.lang.String\",\n  \"vm\": \"*/*; charset=UTF-8\",\n  \"pm\": \"*/*\"\n}"))))
+
+(defn- lp m/Loc [p: Str] (m/->Loc "t.xml" 1 p "<x></x>" "" []))
+
+(deftest hooks-trace-and-route
+  (let [log (atom (let [z: Vec(Str) []] z))
+        add (fn Int [s: Str] (let [z (swap! log (fn Vec(Str) [v: Vec(Str)] (conj v s)))] 0))
+        h (en/->Hook (fn Int [l: m/Loc e: ev/Event] (add (str "B " (:path l))))
+                     (fn Int [l: m/Loc e: ev/Event x: Vec(err/MErr)] (add (str "A " (:path l) " " (count x))))
+                     (fn Int [l: m/Loc i: Int] (add (str "R " (:path l) " " i)))
+                     (fn Int [l: m/Loc] (add (str "H " (:path l)))))
+        c (assoc (ctx []) :hook [h])
+        ps [(m/->PrSetVar "n" (ex "2") "" (lp "f/processors/0"))
+            (m/->PrChoice [(m/->When (ex "vars.n == 1") [(m/->PrSetPayload (ex "1") "" "" (lp "f/processors/1/route/0/processors/0"))])
+                           (m/->When (ex "vars.n == 2") [(m/->PrSetPayload (ex "2") "" "" (lp "f/processors/1/route/1/processors/0"))])]
+                          [] (lp "f/processors/1"))
+            (m/->PrChoice [(m/->When (ex "false") [])] [] (lp "f/processors/2"))]
+        [e x] (en/run-procs c ps (ev0))
+        got: Vec(Str) (deref log)]
+    (is (= (count x) 0))
+    (is (= (str/join "|" got)
+           "B f/processors/0|A f/processors/0 0|B f/processors/1|R f/processors/1 1|B f/processors/1/route/1/processors/0|A f/processors/1/route/1/processors/0 0|A f/processors/1 0|B f/processors/2|R f/processors/2 1|A f/processors/2 0"))))
+
+(deftest halt-is-not-handled
+  (let [h (m/->Handler false [] [] false [(m/->PrSetPayload (ex "\"handled\"") "" "" (loc))] (loc))
+        c (ctx [])
+        [e x] (en/handle-error c [h] "" (ev0) (err/halt "no recording") true)]
+    (is (= (count x) 1))
+    (is (err/halt? (nth x 0)))
+    (is (= (payload-bytes e) "{\"n\": 2}"))
+    (is (= (:description (nth x 0)) "no recording"))))
+
+(deftest compile-errors-run-as-the-compile-error
+  (let [ps [(m/->PrSetPayload (ex "output application/json --- sum(payload.items map ($.qty * $.price)") "" "" (loc))]
+        [e x] (en/run-procs (ctx []) ps (ev0))]
+    (is (= (count x) 1))
+    (is (= (err/type-str (nth x 0)) "MULE:EXPRESSION"))
+    (is (str/starts-with? (desc0 x) "DataWeave compile error: "))
+    (is (str/includes? (desc0 x) "expected ')'"))))

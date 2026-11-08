@@ -1,0 +1,33 @@
+(ns mulay.dw.urls
+  (:require [mulay.lib.host :as host] [mulay.lib.res :as res] [mulay.lib.fs :as fs] [clay.string :as str]))
+
+(def CLASSPATH (atom (->dyn false)))
+
+(defn set-classpath! Int [rs: res/ResSet] (let [z (reset! CLASSPATH (->dyn rs))] 0))
+(defn clear-classpath! Int [] (let [z (reset! CLASSPATH (->dyn false))] 0))
+
+(defn- read-regular Values(Str Str) [path: &Str]
+  (if (not= (:kind (fs/stat path)) fs/FILE) (values "" (str path ": not a regular file"))
+    (host/file-read path)))
+
+(defn load-url Values(Str Str) [url: &Str]
+  (cond
+   (>= (str/index-of url (chr 0)) 0) (values "" (str "Unable to find resource '" url "'."))
+   (str/starts-with? url "classpath://")
+    (let [rel0 (subs url 12 (count url))
+          rel (if (str/starts-with? rel0 "/") (subs rel0 1 (count rel0)) rel0)
+          cp (deref CLASSPATH)
+          np (res/norm-res-path url)
+          [t e] (if (boolean? cp) (if (= np "") (values "" "not found") (read-regular np))
+                  (let [rs: res/ResSet (dyn->rec cp) [x ok] (res/res-read rs url)] (values x (if ok "" "not found"))))]
+      (cond
+        (= e "") (values t "")
+        (not (boolean? cp)) (values "" (str "Unable to find resource '" rel "'."))
+        (= np "") (values "" (str "Unable to find resource '" rel "'."))
+        :else
+        (let [[t2 e2] (read-regular (str "src/main/resources/" np))]
+          (if (= e2 "") (values t2 "") (values "" (str "Unable to find resource '" rel "'."))))))
+   :else
+    (let [path (if (str/starts-with? url "file://") (subs url 7 (count url)) (str url))
+          [t e] (read-regular path)]
+      (if (= e "") (values t "") (values "" (str "Unable to find resource '" url "'."))))))

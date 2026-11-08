@@ -1,0 +1,217 @@
+(ns mulay.lib.x509 (:require [mulay.lib.bigint :as bi] [mulay.lib.time.civil :as cv] [clay.base64 :as b64] [clay.string :as str]))
+
+(defrecord Cert
+  [der: Str
+   version: Int
+   serial: Str
+   sig-oid: Str
+   sig-name: Str
+   sig-params: Str
+   issuer: Str
+   subject: Str
+   not-before: Int
+   not-after: Int
+   public-key-alg: Str
+   public-key: Str
+   signature: Str
+   critical: Vec(Str)
+   non-critical: Vec(Str)
+   ext-key-usage: Vec(Str)
+   has-ext-key-usage: Bool
+   key-usage: Vec(Bool)
+   basic-constraints: Int])
+
+(defn- tlv Values(Int Int Int Int) [b: &Str i: Int]
+  (if (>= (+ i 1) (count b)) (values 0 0 -1 0)
+    (let [tag (nth b i)
+          l0 (nth b (+ i 1))]
+      (if (< l0 128)
+        (if (> (+ i 2 l0) (count b)) (values 0 0 -1 0) (values tag (+ i 2) l0 (+ i 2 l0)))
+        (let [n (bit-and l0 127)]
+          (if (or (= n 0) (> n 4) (> (+ i 2 n) (count b))) (values 0 0 -1 0)
+            (let [len (loop [k 0 acc 0] (if (>= k n) acc (recur (+ k 1) (+ (* acc 256) (nth b (+ i 2 k))))))
+                  s (+ i 2 n)]
+              (if (> (+ s len) (count b)) (values 0 0 -1 0) (values tag s len (+ s len))))))))))
+
+(defn- oid-str Str [b: &Str s: Int n: Int]
+  (if (= n 0) ""
+    (let [f (nth b s)
+          head (if (< f 40) (str "0." f) (if (< f 80) (str "1." (- f 40)) (str "2." (- f 80))))]
+      (loop [i (+ s 1) acc 0 out head]
+        (if (>= i (+ s n)) out
+          (let [c (nth b i) v (+ (* acc 128) (bit-and c 127))]
+            (if (>= c 128) (recur (+ i 1) v out) (recur (+ i 1) 0 (str out "." v)))))))))
+
+(defn- hex Str [b: &Str]
+  (let [ds "0123456789abcdef"]
+    (loop [i 0 out ""]
+      (if (>= i (count b)) out
+        (recur (+ i 1) (str out (subs ds (bit-shift-right (nth b i) 4) (+ (bit-shift-right (nth b i) 4) 1))
+                            (subs ds (bit-and (nth b i) 15) (+ (bit-and (nth b i) 15) 1))))))))
+
+(defn- uint-dec Str [b: &Str s: Int n: Int]
+  (loop [i s acc (bi/zero)]
+    (if (>= i (+ s n)) (bi/to-string acc)
+      (let [m (bi/mul-int acc 256)] (recur (+ i 1) (bi/add-int m (nth b i)))))))
+
+(defn- attr-name Str [oid: &Str]
+  (cond (= oid "2.5.4.3") "CN" (= oid "2.5.4.10") "O" (= oid "2.5.4.11") "OU" (= oid "2.5.4.6") "C"
+        (= oid "2.5.4.7") "L" (= oid "2.5.4.8") "ST" (= oid "2.5.4.9") "STREET" (= oid "2.5.4.5") "SERIALNUMBER"
+        (= oid "0.9.2342.19200300.100.1.25") "DC" (= oid "0.9.2342.19200300.100.1.1") "UID"
+        (= oid "1.2.840.113549.1.9.1") "EMAILADDRESS"
+        :else oid))
+
+(defn- sig-name Str [oid: &Str]
+  (cond (= oid "1.2.840.113549.1.1.4") "MD5withRSA" (= oid "1.2.840.113549.1.1.5") "SHA1withRSA"
+        (= oid "1.2.840.113549.1.1.14") "SHA224withRSA" (= oid "1.2.840.113549.1.1.11") "SHA256withRSA"
+        (= oid "1.2.840.113549.1.1.12") "SHA384withRSA" (= oid "1.2.840.113549.1.1.13") "SHA512withRSA"
+        (= oid "1.2.840.113549.1.1.10") "RSASSA-PSS"
+        (= oid "1.2.840.10045.4.1") "SHA1withECDSA" (= oid "1.2.840.10045.4.3.2") "SHA256withECDSA"
+        (= oid "1.2.840.10045.4.3.3") "SHA384withECDSA" (= oid "1.2.840.10045.4.3.4") "SHA512withECDSA"
+        (= oid "1.3.101.112") "Ed25519" (= oid "1.3.101.113") "Ed448"
+        (= oid "2.16.840.1.101.3.4.3.2") "SHA256withDSA"
+        :else oid))
+
+(defn- key-alg Str [oid: &Str]
+  (cond (= oid "1.2.840.113549.1.1.1") "RSA" (= oid "1.2.840.10045.2.1") "EC" (= oid "1.2.840.10040.4.1") "DSA"
+        (= oid "1.3.101.112") "Ed25519" (= oid "1.3.101.113") "Ed448" (= oid "1.2.840.113549.1.1.10") "RSASSA-PSS"
+        :else oid))
+
+(defn- dn-value Str [b: &Str tag: Int s: Int n: Int e: Int start: Int]
+  (if (or (= tag 12) (= tag 19) (= tag 22) (= tag 20) (= tag 26))
+    (let [raw (subs b s (+ s n))]
+      (loop [i 0 out ""]
+        (if (>= i (count raw)) out
+          (let [c (nth raw i)
+                esc (or (= c 44) (= c 43) (= c 34) (= c 92) (= c 60) (= c 62) (= c 59)
+                        (and (= i 0) (or (= c 35) (= c 32))) (and (= i (- (count raw) 1)) (= c 32)))]
+            (recur (+ i 1) (if esc (str out "\\" (chr c)) (str out (chr c))))))))
+    (str "#" (hex (subs b start e)))))
+
+(defn- dn-str Str [b: &Str s: Int n: Int]
+  (let [rdns (loop [i s acc: Vec(Str) []]
+               (if (>= i (+ s n)) acc
+                 (let [[t rs rn nx] (tlv b i)]
+                   (if (< rn 0) acc
+                     (let [one (loop [j rs out ""]
+                                 (if (>= j (+ rs rn)) out
+                                   (let [[t2 as an anx] (tlv b j)
+                                         [t3 os on onx] (if (< an 0) (values 0 0 -1 0) (tlv b as))
+                                         [t4 vs vn vnx] (if (< on 0) (values 0 0 -1 0) (tlv b onx))]
+                                     (if (or (< an 0) (< on 0) (< vn 0)) out
+                                       (let [item (str (attr-name (oid-str b os on)) "=" (dn-value b t4 vs vn vnx onx))]
+                                         (recur anx (if (= out "") item (str out " + " item))))))))]
+                       (recur nx (conj acc one)))))))]
+    (loop [k (- (count rdns) 1) out ""]
+      (if (< k 0) out (recur (- k 1) (if (= out "") (nth rdns k) (str out ", " (nth rdns k))))))))
+
+(defn- d2 Int [b: &Str i: Int] (+ (* (- (nth b i) 48) 10) (- (nth b (+ i 1)) 48)))
+
+(defn- time-secs Values(Int Bool) [b: &Str tag: Int s: Int n: Int]
+  (let [[y i] (cond (and (= tag 23) (>= n 13)) (let [yy (d2 b s)] (values (if (< yy 50) (+ 2000 yy) (+ 1900 yy)) (+ s 2)))
+                    (and (= tag 24) (>= n 15)) (values (+ (* (d2 b s) 100) (d2 b (+ s 2))) (+ s 4))
+                    :else (values 0 -1))]
+    (if (< i 0) (values 0 false)
+      (values (+ (* (cv/epoch-day y (d2 b i) (d2 b (+ i 2))) 86400)
+                 (* (d2 b (+ i 4)) 3600) (* (d2 b (+ i 6)) 60) (d2 b (+ i 8)))
+              true))))
+
+(defn- oid-list Vec(Str) [b: &Str s: Int n: Int]
+  (loop [i s acc: Vec(Str) []]
+    (if (>= i (+ s n)) acc
+      (let [[t os on nx] (tlv b i)]
+        (if (< on 0) acc (recur nx (if (= t 6) (conj acc (oid-str b os on)) acc)))))))
+
+(defn- key-usage-bits Vec(Bool) [b: &Str s: Int n: Int]
+  (let [[t bs bn nx] (tlv b s)]
+    (loop [k 0 acc: Vec(Bool) []]
+      (if (>= k 9) acc
+        (let [byte-i (+ bs 1 (quot k 8))]
+          (recur (+ k 1) (conj acc (and (< byte-i (+ bs bn))
+                                        (not= (bit-and (nth b byte-i) (bit-shift-right 128 (mod k 8))) 0)))))))))
+
+(defn- basic-constraints Int [b: &Str s: Int n: Int]
+  (let [[t ss sn snx] (tlv b s)]
+    (if (or (< sn 0) (= sn 0)) -1
+      (let [[t1 s1 n1 nx1] (tlv b ss)
+            ca (and (= t1 1) (> n1 0) (not= (nth b s1) 0))]
+        (if (not ca) -1
+          (if (>= nx1 (+ ss sn)) 2147483647
+            (let [[t2 s2 n2 nx2] (tlv b nx1)]
+              (if (= t2 2) (loop [i s2 acc 0] (if (>= i (+ s2 n2)) acc (recur (+ i 1) (+ (* acc 256) (nth b i))))) 2147483647))))))))
+
+(defrecord- Exts [critical: Vec(Str) non-critical: Vec(Str) eku: Vec(Str) has-eku: Bool ku: Vec(Bool) bc: Int])
+
+(defn- read-exts Exts [b: &Str s: Int n: Int]
+  (loop [i s ex (->Exts [] [] [] false [] -1)]
+    (if (>= i (+ s n)) ex
+      (let [[t es en nx] (tlv b i)]
+        (if (< en 0) ex
+          (let [[t1 os on onx] (tlv b es)
+                oid (if (< on 0) "" (oid-str b os on))
+                [t2 cs cn cnx] (if (< on 0) (values 0 0 -1 0) (tlv b onx))
+                crit (and (= t2 1) (> cn 0) (not= (nth b cs) 0))
+                [t3 vs vn vnx] (if (= t2 1) (tlv b cnx) (values t2 cs cn cnx))
+                crits (if crit (conj (:critical ex) oid) (:critical ex))
+                nons (if crit (:non-critical ex) (conj (:non-critical ex) oid))
+                [eku has] (if (= oid "2.5.29.37")
+                            (let [[t4 ls ln lnx] (tlv b vs)] (values (oid-list b ls ln) true))
+                            (values (:eku ex) (:has-eku ex)))
+                ku (if (= oid "2.5.29.15") (key-usage-bits b vs vn) (:ku ex))
+                bc (if (= oid "2.5.29.19") (basic-constraints b vs vn) (:bc ex))]
+            (recur nx (->Exts crits nons eku has ku bc))))))))
+
+(defn parse-der Values(Cert Str) [b: &Str]
+  (let [bad (->Cert "" 0 "" "" "" "" "" "" 0 0 "" "" "" [] [] [] false [] -1)
+        [t0 s0 n0 e0] (tlv b 0)
+        [t1 s1 n1 e1] (tlv b s0)]
+    (if (or (< n0 0) (< n1 0) (not= t0 48) (not= t1 48)) (values bad "Invalid X.509 certificate")
+      (let [[tv sv nv ev] (tlv b s1)
+            has-v (= tv 160)
+            version (if has-v (let [[ti si ni ei] (tlv b sv)] (if (> ni 0) (+ (nth b (+ si (- ni 1))) 1) -1)) 1)
+            p1 (if has-v ev s1)
+            [ts ss sn se] (tlv b p1)
+            [ta sa na ea] (tlv b se)
+            [ti si ni ei] (tlv b ea)
+            [tvl svl nvl evl] (tlv b ei)
+            [tsu ssu nsu esu] (tlv b evl)
+            [tk sk nk ek] (tlv b esu)
+            [tb sb nb eb] (tlv b sk)
+            [tbo sbo nbo ebo] (tlv b sb)
+            [tnb snb nnb enb] (tlv b svl)
+            [tna sna nna ena] (tlv b enb)
+            [nbf ok1] (time-secs b tnb snb nnb)
+            [naf ok2] (time-secs b tna sna nna)
+            exts (loop [i ek] (if (>= i (+ s1 n1)) (->Exts [] [] [] false [] -1)
+                                (let [[tx sx nx ex] (tlv b i)]
+                                  (cond (< nx 0) (->Exts [] [] [] false [] -1)
+                                        (= tx 163) (let [[ty sy ny ey] (tlv b sx)] (read-exts b sy ny))
+                                        :else (recur ex)))))
+            [tsa ssa nsa esa] (tlv b e1)
+            [toid soid noid eoid] (tlv b ssa)
+            params (if (< eoid (+ ssa nsa))
+                     (let [[tp sp np ep] (tlv b eoid)] (if (or (= tp 5) (< np 0)) "" (subs b eoid ep)))
+                     "")
+            [tsig ssig nsig esig] (tlv b esa)
+            sig (if (and (= tsig 3) (> nsig 0)) (subs b (+ ssig 1) (+ ssig nsig)) "")
+            sig-oid (oid-str b soid noid)]
+        (if (or (< nv 0) (< sn 0) (< na 0) (< ni 0) (< nvl 0) (< nsu 0) (< nk 0) (< nsa 0) (< nsig 0) (< version 0)
+                (not ok1) (not ok2) (not= ts 2))
+          (values bad "Invalid X.509 certificate")
+          (values (->Cert (subs b 0 e0) version (uint-dec b ss sn) sig-oid (sig-name sig-oid) params
+                          (dn-str b si ni) (dn-str b ssu nsu) nbf naf
+                          (key-alg (oid-str b sbo nbo)) (subs b esu ek) sig
+                          (:critical exts) (:non-critical exts) (:eku exts) (:has-eku exts)
+                          (:ku exts) (:bc exts))
+                  ""))))))
+
+(defn parse-pem Values(Cert Str) [s: &Str]
+  (let [begin "-----BEGIN CERTIFICATE-----"
+        a (str/index-of s begin)
+        z (if (< a 0) -1 (str/index-of-after s "-----END CERTIFICATE-----" a))]
+    (if (or (< a 0) (< z 0)) (parse-der s)
+      (let [body (subs s (+ a (count begin)) z)
+            clean (loop [i 0 out ""] (if (>= i (count body)) out
+                                       (let [c (nth body i)] (recur (+ i 1) (if (or (= c 10) (= c 13) (= c 32) (= c 9)) out (str out (chr c)))))))]
+        (let [[der de] (b64/decode clean)]
+          (if (not= de "") (let [[c ce] (parse-der "")] (values c (str "bad PEM body: " de))) (parse-der der)))))))

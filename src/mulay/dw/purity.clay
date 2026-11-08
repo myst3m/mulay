@@ -1,0 +1,46 @@
+(ns mulay.dw.purity (:require [mulay.dw.rir :as r] [mulay.dw.rt :as rt]))
+
+(defn- fn-param? Bool [b: &rt/Builtin k: Int]
+  (let [os (:overloads b)]
+    (loop [i 0] (if (>= i (count os)) false
+                  (let [ps (:params (nth os i))]
+                    (if (and (< k (count ps)) (= (nth ps k) "Function")) true (recur (+ i 1))))))))
+
+(defn- opaque-fn? Bool [x: &r/R]
+  (match (:x x)
+    (r/RClosure d caps) false
+    (r/RSibling d) false
+    (r/RBuiltinRef id) false
+    (r/RConst v) false
+    _ true))
+
+(defn- impure? Bool [x: &r/R bs: &Vec(rt/Builtin) pure: &Vec(Bool)]
+  (let [here (match (:x x)
+               (r/RCall f args) true
+               (r/RCallB id args) (let [b (nth bs id)]
+                                    (or (rt/impure-builtin? b)
+                                        (loop [k 0] (if (>= k (count args)) false (if (and (fn-param? b k) (opaque-fn? (nth args k))) true (recur (+ k 1)))))))
+               (r/RBuiltinRef id) (rt/impure-builtin? (nth bs id))
+               (r/RCallG d args) (not (nth pure d))
+               (r/RClosure d caps) (not (nth pure d))
+               (r/RSibling d) (not (nth pure d))
+               _ false)]
+    (or here
+        (let [ks (r/kids x)] (loop [i 0] (if (>= i (count ks)) false (if (impure? (nth ks i) bs pure) true (recur (+ i 1)))))))))
+
+(defn- fn-impure? Bool [fd: &r/FnDef bs: &Vec(rt/Builtin) pure: &Vec(Bool)]
+  (or (impure? (:body fd) bs pure)
+      (let [ps (:params fd)]
+        (loop [i 0] (if (>= i (count ps)) false
+                      (let [d (:default (nth ps i))]
+                        (if (loop [k 0] (if (>= k (count d)) false (if (impure? (nth d k) bs pure) true (recur (+ k 1))))) true (recur (+ i 1)))))))))
+
+(defn of-fns Vec(Bool) [p: &r/Prog bs: &Vec(rt/Builtin)]
+  (let [n (count (:fns p))
+        start (loop [i 0 acc: Vec(Bool) []] (if (>= i n) acc (recur (+ i 1) (conj acc true))))]
+    (loop [pure start]
+      (let [[next changed] (loop [i 0 acc: Vec(Bool) [] ch false]
+                             (if (>= i n) (values acc ch)
+                               (let [now (and (nth pure i) (not (fn-impure? (nth (:fns p) i) bs pure)))]
+                                 (recur (+ i 1) (conj acc now) (or ch (not= now (nth pure i)))))))]
+        (if changed (recur next) next)))))
